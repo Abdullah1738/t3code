@@ -1151,6 +1151,53 @@ export const DraftSourceKind = Schema.Union([DraftSourceKindLiteral, LegacyForkS
 export type DraftSourceKind = typeof DraftSourceKindLiteral.Type;
 // --- end asks additions ---
 
+/**
+ * What a draft answers: the message, comment or ticket it replies to, or for
+ * new outbound text the situation it is about. Shown to the approver above the
+ * text and never posted: sending uses the approved text only.
+ */
+export const DraftReplyContext = Schema.Struct({
+  /** Plain text: what was said or asked, or what the text is about. */
+  summary: Schema.String,
+  /** The exact words being answered, when short enough to quote. */
+  quote: Schema.optional(Schema.String),
+  /** Who wrote them. */
+  author: Schema.optional(Schema.String),
+  /** When they were written. */
+  at: Schema.optional(IsoDateTime),
+  /** Where they are: the message, comment or ticket. */
+  link: Schema.optional(MissionLink),
+});
+export type DraftReplyContext = typeof DraftReplyContext.Type;
+
+const isIsoTime = Schema.makeFilter((value: string) =>
+  /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
+    ? true
+    : "at must be an ISO date-time, e.g. 2026-10-24T09:30:00Z.",
+);
+
+/** The reply context as a writer sends it: bounded, with a real time. */
+export const DraftReplyContextInput = Schema.Struct({
+  summary: TrimmedNonEmptyString.check(Schema.isMaxLength(1500)).annotate({
+    description:
+      "Plain text, 1500 characters at most: what the message, comment or ticket says or asks (a faithful summary), or for new outbound text the situation it is about.",
+  }),
+  quote: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2000))).annotate({
+    description:
+      "The exact words being answered, copied as written, 2000 characters at most. Give it when the message or comment is short; leave it out rather than trim or paraphrase.",
+  }),
+  author: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(120))).annotate({
+    description: "Who wrote what is being answered.",
+  }),
+  at: Schema.optional(TrimmedNonEmptyString.check(isIsoTime)).annotate({
+    description: "When it was written, ISO date-time.",
+  }),
+  link: Schema.optional(MissionLink).annotate({
+    description: "The message, comment or ticket being answered (same shape as target).",
+  }),
+});
+export type DraftReplyContextInput = typeof DraftReplyContextInput.Type;
+
 /** Every outward text is a draft until the owner approves it. */
 export const Draft = Schema.Struct({
   id: DraftId,
@@ -1225,6 +1272,8 @@ export const Draft = Schema.Struct({
   /** When the current text was written. The owner's comments before it were about text a revision replaced; a reopen keeps it. Missing means revisedAt. */
   textRevisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   // --- end r22 comments ---
+  /** What the text answers, shown above it to the approver; never posted. Kept across revisions. */
+  inReplyTo: Schema.optional(Schema.NullOr(DraftReplyContext)),
 });
 export type Draft = typeof Draft.Type;
 
@@ -3858,6 +3907,8 @@ export const OpenSystemDraftInput = Schema.Struct({
   summary: Schema.optional(Schema.NullOr(Schema.String)),
   flags: Schema.optional(Schema.Array(Schema.String)),
   view: Schema.optional(RecordView),
+  /** What the text answers (the review comment or thread), shown to the approver; never posted. */
+  inReplyTo: Schema.optional(DraftReplyContextInput),
 });
 export type OpenSystemDraftInput = typeof OpenSystemDraftInput.Type;
 

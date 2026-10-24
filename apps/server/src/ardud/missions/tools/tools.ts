@@ -11,6 +11,7 @@ import {
   DecideSuggestionInput,
   DraftChannel,
   DraftId,
+  DraftReplyContextInput,
   DraftStatus,
   LaneId,
   MergeLanesInput,
@@ -217,7 +218,7 @@ const MissionCallTool = Tool.make("mission_call", {
 
 const MissionDraftTool = Tool.make("mission_draft", {
   description:
-    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Pass workItemId and/or subMissionId when the text is about one, so routing rows for it apply (the sub-mission defaults to the work item's, then your lane's). Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text; the mission's master may revise any draft in its mission this way, and the draft keeps the text it replaced as previousText.",
+    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. `text` is exactly what gets posted, so never put context in it: put it in inReplyTo, which the approver reads above the text and which is never sent. For any reply (a Cliq/GitHub/Linear comment, a ticket reply, an answer to a message) always fill inReplyTo with the message, comment or ticket being answered: its exact words as quote when short, else a faithful summary, plus author, at and its link. For new outbound text with nothing to reply to, set inReplyTo.summary to the situation it is about. Pass workItemId and/or subMissionId when the text is about one, so routing rows for it apply (the sub-mission defaults to the work item's, then your lane's). Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text; the mission's master may revise any draft in its mission this way, and the draft keeps the text it replaced as previousText. A revision keeps the draft's inReplyTo unless you pass a new one.",
   parameters: Schema.Struct({
     draftId: Schema.optional(DraftId),
     missionId: Schema.optional(MissionId),
@@ -228,6 +229,10 @@ const MissionDraftTool = Tool.make("mission_draft", {
     subMissionId: Schema.optional(SubMissionId),
     workItemId: Schema.optional(WorkItemId),
     view: Schema.optional(RecordView),
+    inReplyTo: Schema.optional(DraftReplyContextInput).annotate({
+      description:
+        "What the text answers: the message, comment or ticket it replies to (or, for new outbound text, the situation it is about). Shown to the approver above the draft; never posted.",
+    }),
   }),
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

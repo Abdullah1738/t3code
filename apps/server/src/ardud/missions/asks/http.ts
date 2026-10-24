@@ -52,7 +52,13 @@ import * as MissionStore from "../store/MissionStore.ts";
 import { askEpochOf, askReopened } from "./askModel.ts";
 import { AsksService } from "./AsksService.ts";
 import { epochOf, revisionOf } from "./draftModel.ts";
-import { draftAttachments, pendingAndRecent, progressOf } from "./ownerView.ts";
+import {
+  draftAttachments,
+  pendingAndRecent,
+  progressOf,
+  replyingToText,
+  withReplyingTo,
+} from "./ownerView.ts";
 import { attachComments } from "./inboxMarks.ts"; // ardud missions: r22 comments
 import { canRedeemInbound } from "./provenance.ts";
 import {
@@ -434,7 +440,10 @@ const makeRoutes = Effect.gen(function* () {
         missionId: missionParam(query.get("mission")),
         status: listParam(query.get("status")),
       });
-      return json({ ok: true, drafts: yield* attachComments(store, "draft", result) });
+      return json({
+        ok: true,
+        drafts: withReplyingTo(yield* attachComments(store, "draft", result)),
+      });
     }),
   );
 
@@ -693,7 +702,7 @@ const makeRoutes = Effect.gen(function* () {
           : yield* store.listAllInMission("owner-request", missionId, ["answered"]);
       return json({
         ok: true,
-        inbox,
+        inbox: { ...inbox, drafts: withReplyingTo(inbox.drafts) },
         // ardud missions: router (a discussion counts on its record, not here)
         requests: answered.filter((request) => request.unreadForOwner && request.subject == null),
       });
@@ -738,6 +747,8 @@ const makeRoutes = Effect.gen(function* () {
       return json({
         ok: true,
         draft,
+        // What it answers, ready to send above the text; null when the writer gave none.
+        replyingTo: replyingToText(found.value),
         attachments: draftAttachments(found.value),
       });
     }),

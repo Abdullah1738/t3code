@@ -14,7 +14,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import { McpSchema, McpServer } from "effect/ai";
+import { McpSchema, McpServer, Tool } from "effect/ai";
 
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -256,6 +256,79 @@ describe("mission MCP tools", () => {
       }
       const still = yield* asks.drafts({ missionId });
       expect(still.find((row) => row.id === draft.id)?.status).toBe("pending");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it("mission_draft advertises inReplyTo and tells writers to fill it", () => {
+    const tool = MissionsToolkit.tools.mission_draft;
+    const schema = Tool.getJsonSchema(tool) as {
+      properties: Record<string, { anyOf?: ReadonlyArray<unknown>; description?: string }>;
+    };
+    expect(Object.keys(schema.properties)).toContain("inReplyTo");
+    const description = Tool.getDescription(tool) ?? "";
+    expect(description).toContain("always fill inReplyTo");
+    expect(description).toContain("never sent");
+    expect(JSON.stringify(schema.properties.inReplyTo)).toContain("summary");
+    expect(JSON.stringify(schema.properties.inReplyTo)).toContain("quote");
+  });
+
+  it.effect("mission_draft keeps what the text replies to across a revision", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const writer = threadCaller(writerThread);
+      const link = {
+        kind: "url",
+        label: "Cliq message",
+        url: "https://cliq.example/m/9",
+        ref: null,
+      };
+      const inReplyTo = {
+        summary: "Sam asks if dev is back up.",
+        quote: "is dev back?",
+        author: "Sam",
+        at: "2026-10-24T08:00:00.000Z",
+        link,
+      };
+      const base = {
+        missionId,
+        audience: "Sam",
+        channel: "cliq",
+        target: { kind: "url", label: "Cliq DM", url: null, ref: "sam" },
+      };
+      const submitted = yield* call("mission_draft", writer, {
+        ...base,
+        text: "Yes, back since 9.",
+        inReplyTo,
+      });
+      expect(submitted.isError).toBe(false);
+      const draft = submitted.structured.draft as { id: string; inReplyTo: unknown };
+      expect(draft.inReplyTo).toEqual(inReplyTo);
+
+      const revised = yield* call("mission_draft", writer, {
+        draftId: draft.id,
+        text: "Yes, it's been back since 9.",
+      });
+      expect(revised.isError).toBe(false);
+      expect((revised.structured.draft as { inReplyTo: unknown }).inReplyTo).toEqual(inReplyTo);
+
+      const asks = yield* AsksService.AsksService;
+      const stored = (yield* asks.drafts({ missionId })).find((row) => row.id === draft.id);
+      expect(stored?.inReplyTo).toEqual(inReplyTo);
+
+      // Strict: unknown keys inside inReplyTo and an over-long summary are refused.
+      for (const bad of [
+        { ...inReplyTo, sendWith: true },
+        { summary: "x".repeat(1501) },
+        { quote: "no summary" },
+      ]) {
+        const refused = yield* Effect.exit(
+          call("mission_draft", writer, { ...base, text: "Another one.", inReplyTo: bad }),
+        );
+        expect(refused._tag === "Failure" || refused.value.isError).toBe(true);
+      }
+      const all = yield* asks.drafts({ missionId });
+      expect(all.filter((row) => row.text === "Another one.")).toEqual([]);
     }).pipe(Effect.provide(layer));
   });
 

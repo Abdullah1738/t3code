@@ -2,6 +2,7 @@ import {
   AskId,
   DraftChannel,
   DraftId,
+  DraftReplyContextInput,
   MissionId,
   MissionLink,
   MissionRecordRef,
@@ -54,6 +55,8 @@ export const SubmitDraftInput = Schema.Struct({
   workItemId: Schema.optional(WorkItemId),
   /** The card template that draws it and its field values. */
   view: Schema.optional(RecordView),
+  /** What the text answers, shown to the approver above it; never posted. */
+  inReplyTo: Schema.optional(DraftReplyContextInput),
 });
 export type SubmitDraftInput = typeof SubmitDraftInput.Type;
 
@@ -63,6 +66,8 @@ export const ReviseDraftInput = Schema.Struct({
   text: TrimmedNonEmptyString,
   /** Replaces the card's view when given; otherwise the draft keeps its own. */
   view: Schema.optional(RecordView),
+  /** Replaces what the draft replies to when given; otherwise it keeps its own. */
+  inReplyTo: Schema.optional(DraftReplyContextInput),
 });
 export type ReviseDraftInput = typeof ReviseDraftInput.Type;
 

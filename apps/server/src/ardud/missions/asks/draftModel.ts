@@ -25,6 +25,7 @@ import {
   type DraftNote,
   type DraftNoteId,
   type DraftNoteScope,
+  type DraftReplyContext,
   type InboxComment,
   type MissionActor,
   type MissionId,
@@ -191,6 +192,60 @@ export const routeDraftApprover = (
     : { approver: row.approver, routeId: row.id };
 };
 
+export const REPLY_SUMMARY_MAX = 1500;
+export const REPLY_QUOTE_MAX = 2000;
+const REPLY_AUTHOR_MAX = 120;
+
+/**
+ * Checks and trims what a draft replies to. The MCP schema bounds it already;
+ * this keeps every other caller (HTTP, tests) to the same rules.
+ */
+export const cleanReplyContext = (input: DraftReplyContext): Outcome<DraftReplyContext> => {
+  const summary = input.summary.trim();
+  if (summary.length === 0) {
+    return refuse("invalid", "inReplyTo needs a summary of what the text answers.");
+  }
+  if (summary.length > REPLY_SUMMARY_MAX) {
+    return refuse(
+      "invalid",
+      `inReplyTo.summary is ${summary.length} characters; keep it to ${REPLY_SUMMARY_MAX}.`,
+    );
+  }
+  const quote = input.quote?.trim() ?? "";
+  if (quote.length > REPLY_QUOTE_MAX) {
+    return refuse(
+      "invalid",
+      `inReplyTo.quote is ${quote.length} characters; quote at most ${REPLY_QUOTE_MAX} or summarize instead.`,
+    );
+  }
+  const author = input.author?.trim() ?? "";
+  if (author.length > REPLY_AUTHOR_MAX) {
+    return refuse("invalid", `inReplyTo.author is longer than ${REPLY_AUTHOR_MAX} characters.`);
+  }
+  const at = input.at?.trim() ?? "";
+  if (at !== "" && !(/^\d{4}-\d{2}-\d{2}T/.test(at) && Number.isFinite(Date.parse(at)))) {
+    return refuse("invalid", "inReplyTo.at must be an ISO date-time, e.g. 2026-10-24T09:30:00Z.");
+  }
+  return ok({
+    summary,
+    ...(quote === "" ? {} : { quote }),
+    ...(author === "" ? {} : { author }),
+    ...(at === "" ? {} : { at }),
+    ...(input.link === undefined ? {} : { link: input.link }),
+  });
+};
+
+const sameReplyContext = (
+  left: DraftReplyContext | null | undefined,
+  right: DraftReplyContext | null | undefined,
+) => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+
+/** The reply context a command carries, cleaned; undefined when it carries none. */
+const replyContextFrom = (
+  input: DraftReplyContext | undefined,
+): Outcome<DraftReplyContext | undefined> =>
+  input === undefined ? ok(undefined) : cleanReplyContext(input);
+
 const PULL_LABEL = /^([\w.-]+\/[\w.-]+)#(\d+)$/;
 const PULL_URL = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/i;
 
@@ -225,6 +280,8 @@ export interface SubmitDraftCommand {
   /** What it is about; missing means nothing in particular. */
   readonly about?: DraftAbout;
   readonly view?: RecordView;
+  /** What the text answers, shown to the approver; never posted. */
+  readonly inReplyTo?: DraftReplyContext;
   readonly now: string;
 }
 
@@ -257,6 +314,9 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
   if (duplicate !== undefined) {
     return refuse("conflict", `Same draft already waiting as ${duplicate.id}.`);
   }
+  const replyContext = replyContextFrom(command.inReplyTo);
+  if (Result.isFailure(replyContext)) return Result.fail(replyContext.failure);
+  const inReplyTo = replyContext.success;
   const address = { missionId: command.missionId, channel: command.channel, audience };
   const applied = notesFor(address, command.notes);
   const record: Draft = {
@@ -289,6 +349,7 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
     textRevisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
     ...(command.view === undefined ? {} : { view: command.view }),
+    ...(inReplyTo === undefined ? {} : { inReplyTo }),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
@@ -307,6 +368,7 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
           routeId: command.route.routeId,
           subMissionId: record.subMissionId ?? null,
           workItemId: record.workItemId ?? null,
+          ...(inReplyTo === undefined ? {} : { inReplyTo }),
         },
       },
     ],
@@ -581,6 +643,8 @@ export interface ReviseDraftCommand {
   readonly notes: ReadonlyArray<DraftNote>;
   /** Replaces the draft's view when given. */
   readonly view?: RecordView;
+  /** Replaces what the draft replies to when given; otherwise it keeps its own. */
+  readonly inReplyTo?: DraftReplyContext;
   /** The caller is the draft mission's master: it may revise any writer's draft. */
   readonly callerIsMaster?: boolean;
   readonly now: string;
@@ -617,7 +681,15 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   }
   const text = command.text.trim();
   if (text.length === 0) return refuse("invalid", "A draft needs text.");
-  if (text === draft.text) return refuse("conflict", "The revision is the same text.");
+  const replyContext = replyContextFrom(command.inReplyTo);
+  if (Result.isFailure(replyContext)) return Result.fail(replyContext.failure);
+  const inReplyTo = replyContext.success;
+  if (text === draft.text) {
+    if (inReplyTo === undefined || sameReplyContext(inReplyTo, draft.inReplyTo)) {
+      return refuse("conflict", "The revision is the same text.");
+    }
+    return replaceReplyContext(draft, inReplyTo, caller, command);
+  }
   const applied = notesFor(draft, command.notes);
   const record: Draft = {
     ...draft,
@@ -631,6 +703,7 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
     ...nextEpoch(draft, command.now),
     textRevisedAt: command.now,
     ...(command.view === undefined ? {} : { view: command.view }),
+    ...(inReplyTo === undefined ? {} : { inReplyTo }),
   };
   return ok({
     record,
@@ -645,6 +718,53 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
           revision: true,
           epoch: revisionOf(record),
           previousText: draft.text,
+          rewriteNote: draft.rewriteNote,
+          appliedNoteIds: record.appliedNoteIds,
+          ...(inReplyTo === undefined ? {} : { inReplyTo }),
+        },
+      },
+    ],
+  });
+};
+
+/**
+ * Same text, new reply context: what the approver reads changed, so it starts
+ * a new epoch and goes back to pending, but the text and the owner's comments
+ * on it stand.
+ */
+const replaceReplyContext = (
+  draft: Draft,
+  inReplyTo: DraftReplyContext,
+  caller: MissionCaller,
+  command: ReviseDraftCommand,
+): Outcome<Transition<Draft>> => {
+  const record: Draft = {
+    ...draft,
+    inReplyTo,
+    status: "pending",
+    decidedBy: null,
+    decidedAt: null,
+    ...conditionOf(draft, null),
+    ...nextEpoch(draft, command.now),
+    textRevisedAt: draft.textRevisedAt ?? epochOf(draft),
+    ...(command.view === undefined ? {} : { view: command.view }),
+  };
+  return ok({
+    record,
+    events: [
+      {
+        kind: "draft.opened",
+        actor: actorOf(caller.provenance),
+        provenance: caller.provenance,
+        summary: clipSummary(
+          `New reply context for the draft to ${draft.audience} (${draft.channel}): ${inReplyTo.summary}`,
+        ),
+        subject: draftRef(record),
+        payload: {
+          revision: true,
+          epoch: revisionOf(record),
+          replyContextOnly: true,
+          inReplyTo,
           rewriteNote: draft.rewriteNote,
           appliedNoteIds: record.appliedNoteIds,
         },
@@ -1019,6 +1139,9 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
     }
     return ok({ record: current, closed: [], events: [] });
   }
+  const replyContext = replyContextFrom(input.inReplyTo);
+  if (Result.isFailure(replyContext)) return Result.fail(replyContext.failure);
+  const inReplyTo = replyContext.success;
   // One waiting system draft per target: a new head or a re-draft replaces the older ones.
   const closed = command.existing
     .filter(
@@ -1071,6 +1194,7 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
     textRevisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
     ...(input.view === undefined ? {} : { view: input.view }),
+    ...(inReplyTo === undefined ? {} : { inReplyTo }),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({

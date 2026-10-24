@@ -1,9 +1,10 @@
-import type { ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   MailIcon,
   MessageCircleIcon,
   MessageSquareIcon,
   PencilIcon,
+  ReplyIcon,
   SendIcon,
   TicketIcon,
   Undo2Icon,
@@ -14,12 +15,14 @@ import {
   DRAFT_CHANNEL_LABEL,
   type DiffLine,
   type DiffSegment,
+  type ReplyContextView,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { GitHubIcon } from "../../../components/Icons";
 import { Badge } from "../../../components/ui/badge";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
+import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
 import {
   AnyLinkChip,
@@ -337,6 +340,89 @@ export function DraftBlock(props: {
       )}
       {changed ? <WordDiffText segments={edit.diff} /> : null}
     </div>
+  );
+}
+
+/**
+ * What a draft answers, above its text: who and when, the quoted words clamped
+ * to a few lines, and the writer's summary. One toggle opens both when either
+ * is cut.
+ */
+export function ReplyContextBlock(props: { reply: ReplyContextView }) {
+  const { reply } = props;
+  const id = useId();
+  const quote = useRef<HTMLQuoteElement>(null);
+  const summary = useRef<HTMLParagraphElement>(null);
+  const [open, setOpen] = useState(false);
+  const [cut, setCut] = useState(false);
+  useLayoutEffect(() => {
+    if (open) return;
+    const measure = () => {
+      const over = (element: HTMLElement | null) =>
+        element !== null && element.scrollHeight > element.clientHeight + 1;
+      setCut(over(quote.current) || over(summary.current));
+    };
+    measure();
+    const stops = [quote.current, summary.current].flatMap((element) =>
+      element === null ? [] : [observeResize(element, measure)],
+    );
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [open]);
+  return (
+    <section aria-label={reply.label} className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-h-6 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-(--m-muted)">
+        <span className="inline-flex items-center gap-1.5">
+          <ReplyIcon aria-hidden className="size-3.5 shrink-0" />
+          {reply.label}
+        </span>
+        {reply.author ? (
+          <span className="min-w-0 truncate font-medium text-(--m-text)">{reply.author}</span>
+        ) : null}
+        {reply.when && reply.at ? (
+          <time dateTime={reply.at} className="tabular-nums">
+            {reply.when}
+          </time>
+        ) : null}
+        {reply.link ? <LinkChip link={reply.link} /> : null}
+      </div>
+      <div id={id} className="flex min-w-0 flex-col gap-1.5">
+        {reply.quote ? (
+          <blockquote
+            ref={quote}
+            className={cn(
+              "min-w-0 border-s-2 border-(--m-control) ps-2.5 text-sm leading-5.5 whitespace-pre-line wrap-anywhere text-(--m-muted)",
+              !open && "line-clamp-3",
+            )}
+          >
+            {reply.quote}
+          </blockquote>
+        ) : null}
+        <p
+          ref={summary}
+          className={cn(
+            "min-w-0 text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere text-(--m-text)",
+            !open && "line-clamp-3",
+          )}
+        >
+          {reply.summary}
+        </p>
+      </div>
+      {cut || open ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          className="self-start"
+          aria-expanded={open}
+          aria-controls={id}
+          onClick={() => setOpen((value) => !value)}
+        >
+          {open ? "Show less" : "Show all"}
+        </Button>
+      ) : null}
+    </section>
   );
 }
 

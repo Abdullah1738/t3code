@@ -13,6 +13,7 @@ import {
   entryHeadline,
   ownerConditionOf,
   refLabel,
+  replyContextView,
   routeLine,
   type InboxEntry,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -53,6 +54,7 @@ import {
   Facts,
   LinkChips,
   Meta,
+  ReplyContext,
   TextField,
 } from "./parts";
 import { useTemplatedItem } from "./ViewBlocks";
@@ -267,6 +269,7 @@ function DraftItem(props: FrameProps & { readonly draft: Draft }) {
   const card = useDraftCard(props.draft);
   const move = useMoveRecord("draft", props.draft);
   const moved = routeLine(props.draft);
+  const reply = replyContextView(props.draft, props.nowMs);
   const actions = move.open ? (
     <MoveActions move={move} />
   ) : card.mode === "editing" ? (
@@ -307,6 +310,7 @@ function DraftItem(props: FrameProps & { readonly draft: Draft }) {
           moved ? { label: "Moved because", value: moved } : null,
         )}
       />
+      {reply ? <ReplyContext reply={reply} /> : null}
       {card.mode === "editing" ? (
         <TextField
           autoFocus

@@ -30,7 +30,7 @@ const HELP = `mission <command> [options]
   draft approve DRAFT [--edit TEXT] [--note T] --via imessage --inbound ID
   draft rewrite DRAFT --note TEXT --via imessage --inbound ID
   draft drop DRAFT [--note T] --via imessage --inbound ID
-  draft show DRAFT                          full text plus attachments (paths, urls)
+  draft show DRAFT                          full text, what it replies to, attachments
   requests MISSION [--status waiting-on-master|answered|settled]
   request open MISSION --text T [--image PATH]... --via imessage --inbound ID
   request reply REQUEST --text T [--image PATH]... --via imessage --inbound ID
@@ -60,6 +60,10 @@ request open ... --via imessage --inbound ID.
 --image attaches a screenshot or photo he sent (PNG, JPEG, WebP or GIF, 10 MiB
 at most; repeat it for more). Each one sits where {image1}, {image2}... is in
 --text, else at the end, and the master gets it as [image N: /path] in place.
+
+Drafts carry replyingTo when the writer said what the text answers (the
+message, comment or ticket, or the situation): send it to him above the draft
+text so he sees what it responds to. It is never posted; only the text is.
 
 Watch kinds: ask-opened, ask-answered, draft-opened, draft-decided,
 suggestion-opened, milestone-at-risk, lane-stalled, swarm-paused,

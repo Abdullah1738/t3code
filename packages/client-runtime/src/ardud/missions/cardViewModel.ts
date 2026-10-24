@@ -5,6 +5,7 @@ import type {
   LaneCounts,
   MissionHealth,
   MissionId,
+  MissionLink,
   MissionListSnapshot,
   Note,
   SubMissionId,
@@ -17,7 +18,7 @@ import {
   type InboxEntry,
 } from "./inboxViewModel.ts";
 import type { MissionInboxSnapshot } from "./source.ts";
-import { formatDayLabel, laneTotal, refLabel } from "./viewModel.ts";
+import { formatDayLabel, formatRelative, laneTotal, refLabel } from "./viewModel.ts";
 
 // Wording for the card frame: kickers, flags and the sub-mission link. Pure,
 // so the views track can reuse it when a template binds the same fields.
@@ -38,6 +39,40 @@ export function draftKicker(draft: Pick<Draft, "requestedBy">): string {
 export function draftTitle(draft: Pick<Draft, "summary" | "audience">): string {
   const summary = draft.summary?.trim() ?? "";
   return summary === "" ? `To ${draft.audience}` : summary;
+}
+
+/** What a draft answers, as its card shows it above the text. */
+export interface ReplyContextView {
+  /** "Replying to" for a message, comment or ticket; "About" for a situation summary alone. */
+  readonly label: "Replying to" | "About";
+  readonly author: string | null;
+  /** "3h ago", or a date past a week; null without a time. */
+  readonly when: string | null;
+  readonly at: string | null;
+  readonly quote: string | null;
+  readonly summary: string;
+  readonly link: MissionLink | null;
+}
+
+export function replyContextView(
+  draft: Pick<Draft, "inReplyTo">,
+  nowMs: number,
+): ReplyContextView | null {
+  const reply = draft.inReplyTo ?? null;
+  if (reply === null || reply.summary.trim() === "") return null;
+  const author = reply.author?.trim() || null;
+  const quote = reply.quote?.trim() || null;
+  const link = reply.link ?? null;
+  const when = reply.at ? formatRelative(reply.at, nowMs) || null : null;
+  return {
+    label: author !== null || quote !== null || link !== null ? "Replying to" : "About",
+    author,
+    when,
+    at: when === null ? null : (reply.at ?? null),
+    quote,
+    summary: reply.summary.trim(),
+    link,
+  };
 }
 
 export function noteKicker(note: Pick<Note, "type">): string {

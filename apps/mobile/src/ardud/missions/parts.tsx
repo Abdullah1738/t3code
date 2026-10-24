@@ -1,6 +1,7 @@
 import type { LaneStatus, MissionLink } from "@t3tools/contracts";
+import type { ReplyContextView } from "@t3tools/client-runtime/ardud/missions";
 import type { HealthTone } from "@t3tools/client-runtime/ardud/missions/mobile";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Linking, Pressable, ScrollView, View } from "react-native";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
@@ -246,6 +247,54 @@ export function Facts(props: {
           </Text>
         </View>
       ))}
+    </View>
+  );
+}
+
+const REPLY_LINES = 3;
+
+/** Roughly more than REPLY_LINES lines at phone width; RN can't report a clamp. */
+const longerThanClamp = (text: string | null) =>
+  text !== null && (text.length > 160 || text.split("\n").length > REPLY_LINES);
+
+/** What a draft answers, above its text: who and when, the quote clamped, the summary. */
+export function ReplyContext(props: { readonly reply: ReplyContextView }) {
+  const { reply } = props;
+  const [open, setOpen] = useState(false);
+  const foldable = longerThanClamp(reply.quote) || longerThanClamp(reply.summary);
+  const lines = open ? undefined : REPLY_LINES;
+  return (
+    <View className="gap-1.5" accessibilityLabel={reply.label}>
+      <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
+        <Text className="text-xs text-foreground-muted">{reply.label}</Text>
+        {reply.author ? (
+          <Text numberOfLines={1} className="text-xs font-t3-semibold text-foreground">
+            {reply.author}
+          </Text>
+        ) : null}
+        {reply.when ? <Text className="text-xs text-foreground-muted">{reply.when}</Text> : null}
+      </View>
+      {reply.link ? <LinkChips links={[reply.link]} /> : null}
+      {reply.quote ? (
+        <View className="flex-row gap-2.5">
+          <View className="w-[2px] rounded-full bg-border" />
+          <Text
+            selectable
+            numberOfLines={lines}
+            className="flex-1 text-[13px] leading-5 text-foreground-muted"
+          >
+            {reply.quote}
+          </Text>
+        </View>
+      ) : null}
+      <Text selectable numberOfLines={lines} className="text-[13px] leading-5 text-foreground">
+        {reply.summary}
+      </Text>
+      {foldable ? (
+        <View className="items-start">
+          <LinkButton label={open ? "Show less" : "Show all"} onPress={() => setOpen(!open)} />
+        </View>
+      ) : null}
     </View>
   );
 }

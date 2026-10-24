@@ -1225,6 +1225,7 @@ const make = Effect.gen(function* () {
           writtenBy: { roleId: drafting?.id ?? null, model: binding?.observedModel ?? null },
           about,
           ...(input.view === undefined ? {} : { view: input.view }),
+          ...(input.inReplyTo === undefined ? {} : { inReplyTo: input.inReplyTo }),
           notes,
           existing,
           now: yield* now,
@@ -1248,6 +1249,7 @@ const make = Effect.gen(function* () {
           callerIsMaster: standing.isMaster,
           notes: yield* allDraftNotes(draft.missionId),
           ...(input.view === undefined ? {} : { view: input.view }),
+          ...(input.inReplyTo === undefined ? {} : { inReplyTo: input.inReplyTo }),
           now: yield* now,
         }),
       );

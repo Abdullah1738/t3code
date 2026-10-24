@@ -18,10 +18,56 @@ export interface DraftAttachment {
   readonly label: string;
   readonly url: string | null;
   readonly path: string | null;
-  readonly from: "target" | "view" | "sent";
+  readonly from: "target" | "reply" | "view" | "sent";
 }
 
-/** Every link a draft carries (its target, link fields on its card, where it was sent), once each. */
+/** "Mon 19 Oct 14:05" in Dubai time, where the owner reads. */
+const replyTime = (at: string): string => {
+  const ms = Date.parse(at);
+  if (!Number.isFinite(ms)) return at;
+  return new Intl.DateTimeFormat("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Dubai",
+  })
+    .format(ms)
+    .replace(",", "");
+};
+
+/**
+ * What a draft replies to as plain text for the owner's chat, or null when the
+ * writer gave none. The agent sends it above the draft text.
+ */
+export const replyingToText = (draft: Pick<Draft, "inReplyTo">): string | null => {
+  const reply = draft.inReplyTo ?? null;
+  if (reply === null) return null;
+  const who = [reply.author, reply.at === undefined ? undefined : replyTime(reply.at)]
+    .filter((part): part is string => part !== undefined && part !== "")
+    .join(", ");
+  const lines = [who === "" ? "Replying to:" : `Replying to ${who}:`];
+  if (reply.quote !== undefined) {
+    lines.push(...reply.quote.split("\n").map((line) => `> ${line}`));
+  }
+  lines.push(reply.summary);
+  const link = reply.link?.url ?? reply.link?.ref ?? null;
+  if (link !== null) lines.push(link);
+  return lines.join("\n");
+};
+
+/** Drafts for the owner's reads, each with `replyingTo` text when it has a reply context. */
+export const withReplyingTo = <D extends Pick<Draft, "inReplyTo">>(
+  drafts: ReadonlyArray<D>,
+): ReadonlyArray<D & { readonly replyingTo?: string }> =>
+  drafts.map((draft) => {
+    const replyingTo = replyingToText(draft);
+    return replyingTo === null ? draft : { ...draft, replyingTo };
+  });
+
+/** Every link a draft carries (its target, what it replies to, link fields on its card, where it was sent), once each. */
 export const draftAttachments = (draft: Draft): ReadonlyArray<DraftAttachment> => {
   const seen = new Set<string>();
   const out: DraftAttachment[] = [];
@@ -33,6 +79,7 @@ export const draftAttachments = (draft: Draft): ReadonlyArray<DraftAttachment> =
     out.push({ kind: link.kind, label: link.label, url: link.url, path: link.ref, from });
   };
   add(draft.target, "target");
+  if (draft.inReplyTo?.link !== undefined) add(draft.inReplyTo.link, "reply");
   for (const field of Object.values(draft.view?.fields ?? {})) {
     if (field._tag === "links") for (const link of field.value) add(link, "view");
   }

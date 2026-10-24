@@ -31,6 +31,7 @@ import {
   ownerConditionOf,
   parseDiffLines,
   PLAN_KICKER,
+  replyContextView,
   routeLine,
   SUGGESTION_AUTHOR_LABEL,
   SUGGESTION_TARGET_LABEL,
@@ -52,6 +53,7 @@ import {
   LineDiffBlock,
   LinksBlock,
   RefsBlock,
+  ReplyContextBlock,
   TextBlock,
   type DraftPerson,
 } from "./cards/blocks";
@@ -289,6 +291,7 @@ export function DraftCard(
     props.nowMs,
   );
   const notes = draftNotesFor(draft, props.notes);
+  const reply = replyContextView(draft, props.nowMs);
   const edit = textEdit(draft.text, edited);
   const writerRole = draft.writtenBy?.roleId ?? draft.writerRoleId;
   const writer =
@@ -394,6 +397,8 @@ export function DraftCard(
       </LinksBlock>
       <FlagsBlock flags={draft.flags ?? []} />
       <TextBlock text={routeLine(draft) ?? ""} tone="meta" maxLines={2} />
+      {/* A new reply context only comes with a revision; remount so it measures afresh. */}
+      {reply ? <ReplyContextBlock key={draft.revision ?? 0} reply={reply} /> : null}
       <DraftBlock
         channel={draft.channel}
         people={people}

@@ -408,6 +408,106 @@ describe("drafts", () => {
   });
 });
 
+describe("reply context", () => {
+  const comment: MissionLink = {
+    kind: "pull-request",
+    label: "acme/api#42 comment",
+    url: "https://github.com/acme/api/pull/42#issuecomment-1",
+    ref: null,
+  };
+  const replyTo = {
+    summary: "  Sami asks whether the retry fix also covers the webhook path.  ",
+    quote: " Does this cover webhooks too? ",
+    author: " Sami ",
+    at: "2026-10-17T09:30:00.000Z",
+    link: comment,
+  };
+  const code = (outcome: { _tag: string; failure?: { code: string } }) =>
+    outcome._tag === "Failure" ? outcome.failure?.code : "ok";
+
+  it("stores a trimmed reply context on submit and refuses a bad one", () => {
+    const draft = Result.getOrThrow(submit({ inReplyTo: replyTo })).record;
+    expect(draft.inReplyTo).toEqual({
+      summary: "Sami asks whether the retry fix also covers the webhook path.",
+      quote: "Does this cover webhooks too?",
+      author: "Sami",
+      at: "2026-10-17T09:30:00.000Z",
+      link: comment,
+    });
+    expect(draft.text).toBe("Hi Sami, hope you're well! The fix is merged.");
+    expect(Result.getOrThrow(submit({ inReplyTo: replyTo })).events[0]?.payload).toMatchObject({
+      inReplyTo: { author: "Sami" },
+    });
+    expect(Result.getOrThrow(submit()).record.inReplyTo).toBeUndefined();
+
+    expect(code(submit({ inReplyTo: { summary: "   " } }))).toBe("invalid");
+    expect(code(submit({ inReplyTo: { summary: "x".repeat(1501) } }))).toBe("invalid");
+    expect(code(submit({ inReplyTo: { summary: "ok", quote: "q".repeat(2001) } }))).toBe("invalid");
+    expect(code(submit({ inReplyTo: { summary: "ok", at: "yesterday" } }))).toBe("invalid");
+    expect(
+      code(submit({ inReplyTo: { summary: "x".repeat(1500), quote: "q".repeat(2000) } })),
+    ).toBe("ok");
+  });
+
+  it("keeps the reply context across revisions unless the writer replaces it", () => {
+    const draft = Result.getOrThrow(submit({ inReplyTo: replyTo })).record;
+    const revise = (on: Draft, text: string, inReplyTo?: typeof replyTo | { summary: string }) =>
+      reviseDraft({
+        draft: on,
+        text,
+        caller: writer,
+        notes,
+        now: "2026-10-17T11:00:00.000Z",
+        ...(inReplyTo === undefined ? {} : { inReplyTo }),
+      });
+
+    const kept = Result.getOrThrow(revise(draft, "Yes, webhooks too.")).record;
+    expect(kept.text).toBe("Yes, webhooks too.");
+    expect(kept.inReplyTo).toEqual(draft.inReplyTo);
+
+    const replaced = Result.getOrThrow(
+      revise(kept, "Yes, both paths.", { summary: "Sami asks about both retry paths." }),
+    ).record;
+    expect(replaced.inReplyTo).toEqual({ summary: "Sami asks about both retry paths." });
+    expect(replaced.revision).toBe(2);
+
+    // Same text with a new context only swaps the context and starts a new epoch.
+    const contextOnly = Result.getOrThrow(
+      revise(replaced, "Yes, both paths.", { summary: "Sami asks about the webhook path." }),
+    );
+    expect(contextOnly.record).toMatchObject({
+      text: "Yes, both paths.",
+      status: "pending",
+      revision: 3,
+      inReplyTo: { summary: "Sami asks about the webhook path." },
+      textRevisedAt: replaced.textRevisedAt,
+    });
+    expect(contextOnly.record.previousText).toBe(replaced.previousText);
+    expect(contextOnly.events[0]?.payload).toMatchObject({ replyContextOnly: true });
+
+    // Nothing new at all is still refused.
+    expect(code(revise(contextOnly.record, "Yes, both paths."))).toBe("conflict");
+    expect(
+      code(
+        revise(contextOnly.record, "Yes, both paths.", {
+          summary: "Sami asks about the webhook path.",
+        }),
+      ),
+    ).toBe("conflict");
+    expect(code(revise(contextOnly.record, "Again.", { summary: " " }))).toBe("invalid");
+  });
+
+  it("never reaches the writer's posting notice or the approved text", () => {
+    const draft = Result.getOrThrow(submit({ inReplyTo: replyTo })).record;
+    const approved = approveEdited(draft, draft.text, now).record;
+    const notice = draftDecisionNotice(approved);
+    expect(notice?.body).not.toContain("webhooks");
+    expect(notice?.body).not.toContain("Sami asks");
+    expect(approved.approvedText).toBeNull();
+    expect(approved.inReplyTo).toEqual(draft.inReplyTo);
+  });
+});
+
 describe("draft notes", () => {
   it("only the owner writes notes and duplicates are refused", () => {
     const base = {

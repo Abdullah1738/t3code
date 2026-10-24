@@ -238,6 +238,7 @@ const handlers = {
               draftId: input.draftId,
               text: input.text,
               ...(input.view === undefined ? {} : { view: input.view }),
+              ...(input.inReplyTo === undefined ? {} : { inReplyTo: input.inReplyTo }),
             },
             provenance,
           )
@@ -263,6 +264,7 @@ const handlers = {
             ...(input.subMissionId === undefined ? {} : { subMissionId: input.subMissionId }),
             ...(input.workItemId === undefined ? {} : { workItemId: input.workItemId }),
             ...(input.view === undefined ? {} : { view: input.view }),
+            ...(input.inReplyTo === undefined ? {} : { inReplyTo: input.inReplyTo }),
           },
           provenance,
         )

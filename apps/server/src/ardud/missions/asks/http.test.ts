@@ -279,6 +279,7 @@ describe("missions desk HTTP", () => {
           channel: "linear",
           target: { kind: "file", label: "Mobile designs", url: null, ref: "designs/mobile.png" },
           text: "New mobile designs attached.",
+          inReplyTo: { summary: "Sara asked for the new mobile designs.", author: "Sara" },
         },
         agent(writerThread),
       );
@@ -335,6 +336,11 @@ describe("missions desk HTTP", () => {
       expect(view.approvals.approvals.map((a: { id: string }) => a.id)).toEqual([approvalId]);
       expect(view.calls.calls.map((c: { id: string }) => c.id)).toEqual([call.id]);
       expect(view.draft.draft.text).toBe("New mobile designs attached.");
+      const replyingTo = "Replying to Sara:\nSara asked for the new mobile designs.";
+      expect(view.draft.replyingTo).toBe(replyingTo);
+      expect(
+        view.needs.inbox.drafts.find((row: { id: string }) => row.id === draft.id)?.replyingTo,
+      ).toBe(replyingTo);
       expect(view.draft.attachments).toEqual([
         {
           kind: "file",

@@ -13,6 +13,7 @@ import {
   masterRoutedEntries,
   noteFlags,
   ownerWaitingEntries,
+  replyContextView,
 } from "./cardViewModel.ts";
 import type { InboxEntry } from "./inboxViewModel.ts";
 import { formatDayLabel } from "./viewModel.ts";
@@ -50,6 +51,42 @@ describe("card wording", () => {
     expect(draftTitle({ summary: null, audience: "Dylan" })).toBe("To Dylan");
     expect(draftKicker({ requestedBy: "crw" })).toBe("Review feedback");
     expect(draftKicker({})).toBe("Draft");
+  });
+
+  it("shows what a draft replies to, or the situation it is about", () => {
+    const nowMs = Date.parse("2026-10-24T12:00:00.000Z");
+    const link = { kind: "url" as const, label: "Cliq", url: "https://cliq.example/m", ref: null };
+    expect(
+      replyContextView(
+        {
+          inReplyTo: {
+            summary: " Asks if dev is up. ",
+            quote: " is dev back? ",
+            author: "Sam",
+            at: "2026-10-24T09:00:00.000Z",
+            link,
+          },
+        },
+        nowMs,
+      ),
+    ).toEqual({
+      label: "Replying to",
+      author: "Sam",
+      when: "3h ago",
+      at: "2026-10-24T09:00:00.000Z",
+      quote: "is dev back?",
+      summary: "Asks if dev is up.",
+      link,
+    });
+    expect(replyContextView({ inReplyTo: { summary: "Dev was down." } }, nowMs)).toMatchObject({
+      label: "About",
+      author: null,
+      when: null,
+      quote: null,
+    });
+    expect(replyContextView({ inReplyTo: { summary: "x", at: "nope" } }, nowMs)?.when).toBeNull();
+    expect(replyContextView({}, nowMs)).toBeNull();
+    expect(replyContextView({ inReplyTo: null }, nowMs)).toBeNull();
   });
 
   it("flags only the loud parts of a note", () => {
