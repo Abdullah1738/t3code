@@ -45,3 +45,21 @@ export function cardSafeText(text: string): string {
   } while (clean !== previous);
   return clean;
 }
+
+export const CARD_TEXT_FIELDS = ["caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary"] as const;
+export type CardText = Partial<Record<(typeof CARD_TEXT_FIELDS)[number], string>>;
+
+// Used when a caption is nothing but a time or date; the page still has the details.
+const BLANK_CAPTION = "Open card";
+
+/** The text a card's bubble shows, as sent: each field cleaned, undefined when no caption was given. */
+export function cardLayout(card: CardText): CardText | undefined {
+  const layout: CardText = {};
+  for (const key of CARD_TEXT_FIELDS) {
+    const clean = card[key] ? cardSafeText(card[key]) : "";
+    if (clean) layout[key] = clean;
+  }
+  if (layout.caption || layout.subcaption || layout.trailingCaption || layout.trailingSubcaption) return layout;
+  if (!CARD_TEXT_FIELDS.some(key => key !== "summary" && card[key]?.trim())) return undefined;
+  return { ...layout, caption: BLANK_CAPTION };
+}

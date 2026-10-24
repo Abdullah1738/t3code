@@ -442,7 +442,11 @@ test("errors are classified for retry and uncertainty", async () => {
     code: "http_400:invalid_number",
   });
   await expect(failing(500).getMessage("h1")).rejects.toMatchObject({ retryable: true, uncertain: false });
-  await expect(failing(200, {}).sendText("dm:+15550001", "x")).rejects.toMatchObject({ code: "no_handle", uncertain: true });
+  await expect(failing(200, {}).sendText("dm:+15550001", "x")).rejects.toMatchObject({ code: "no_handle", retryable: true, uncertain: true });
+  await expect(failing(200, {}).upload({ data: new Uint8Array([1]), name: "a.png", mimeType: "image/png" }))
+    .rejects.toMatchObject({ code: "no_media_url", retryable: true, uncertain: false });
+  await expect(failing(200, {}).outbound("dm:+15550001", 0)).rejects.toMatchObject({ code: "bad_response", retryable: true, uncertain: false });
+  await expect(failing(200, { data: [] }).outbound("dm:+15550001", 0)).resolves.toEqual([]);
 
   const dropped = makeClient(
     fakeFetch(() => {

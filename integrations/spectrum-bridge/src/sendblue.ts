@@ -3,7 +3,7 @@
  * are read defensively (unknown + narrowing) because Sendblue's responses carry
  * many optional, string-or-null fields and we only need a handful of them.
  */
-import { cardSafeText } from "./card-text.ts";
+import { CARD_TEXT_FIELDS, cardLayout, cardSafeText, type CardText } from "./card-text.ts";
 import type { SendblueOptions } from "./chats.ts";
 import { SPECTRUM_CARD_APP, type CardApp } from "./config.ts";
 import { chatKey, LineError, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
@@ -13,8 +13,6 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const PAGE_SIZE = 100;
 const EVENT_DEDUPE_LIMIT = 512;
 
-// Used when a caption is nothing but a time or date; the page still has the details.
-const BLANK_CAPTION = "Open card";
 
 export type SendblueClientOptions = SendblueOptions & {
   /** Messages extension the cards open in; defaults to Photon's Spectrum app. */
@@ -70,12 +68,23 @@ export function toInbound(message: Json): LineInbound {
   };
 }
 
+function storedLayout(layout: unknown): CardText {
+  const out: CardText = {};
+  if (!isObject(layout)) return out;
+  for (const key of CARD_TEXT_FIELDS) {
+    const value = str(layout[key]);
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
 export function toOutbound(message: Json): LineOutbound {
   return {
     handle: str(message.message_handle) ?? "",
     chat: chatOf(message, false),
     text: str(message.content) ?? "",
     mediaUrl: str(message.media_url),
+    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout) } } : {}),
     sentAt: timeMs(message.date_sent) ?? Date.now(),
     status: str(message.status) ?? "",
   };
@@ -85,7 +94,8 @@ function handleOf(response: unknown): string {
   const direct = isObject(response) ? str(response.message_handle) : undefined;
   const nested = isObject(response) && isObject(response.data) ? str(response.data.message_handle) : undefined;
   const handle = direct ?? nested;
-  if (!handle) throw new LineError("Sendblue accepted the send without a message handle", "no_handle", false, true);
+  // Also what a body lost mid-read looks like, so the send may be out: retry, and look for it first.
+  if (!handle) throw new LineError("Sendblue accepted the send without a message handle", "no_handle", true, true);
   return handle;
 }
 
@@ -331,7 +341,9 @@ export class Sendblue implements Line {
           offset: String(offset),
         },
       });
-      const page = isObject(response) && Array.isArray(response.data) ? response.data.filter((row): row is Json => isObject(row)) : [];
+      // A body lost mid-read is not an empty history: a retry would take it for "never sent".
+      if (!isObject(response) || !Array.isArray(response.data)) throw new LineError("Sendblue message list came back without data", "bad_response", true, false);
+      const page = response.data.filter((row): row is Json => isObject(row));
       out.push(...page);
       if (page.length < PAGE_SIZE) return out;
     }
@@ -367,7 +379,8 @@ export class Sendblue implements Line {
     form.append("file", new Blob([new Uint8Array(file.data)], { type: file.mimeType }), file.name);
     const response = await this.#call("POST", "/api/upload-file", { form });
     const mediaUrl = isObject(response) ? str(response.media_url) : undefined;
-    if (!mediaUrl) throw new LineError("Sendblue upload returned no media_url", "no_media_url", false, false);
+    // Likely a response body lost mid-read; uploading again only leaves an unused copy behind.
+    if (!mediaUrl) throw new LineError("Sendblue upload returned no media_url", "no_media_url", true, false);
     return mediaUrl;
   }
 
@@ -384,25 +397,9 @@ export class Sendblue implements Line {
     // Sendblue's App Card docs define only one-to-one iMessage sends; no fallback to SMS.
     if (chatKey.isGroup(chat)) throw new LineError("App cards are one-to-one only", "unsupported", false, false);
     // Every text field can become the bubble's body, so each one is kept free of times and dates.
-    const text: Array<[string, string | undefined]> = [
-      ["caption", card.caption],
-      ["subcaption", card.subcaption],
-      ["trailingCaption", card.trailingCaption],
-      ["trailingSubcaption", card.trailingSubcaption],
-      ["summary", card.summary],
-    ];
-    const layout: Json = {};
-    const given = text.some(([key, value]) => key !== "summary" && value?.trim());
-    for (const [key, value] of text) {
-      const clean = value ? cardSafeText(value) : "";
-      if (clean) layout[key] = clean;
-    }
-    if (card.imageUrl) layout.imageUrl = card.imageUrl;
-    const captioned = str(layout.caption) || str(layout.subcaption) || str(layout.trailingCaption) || str(layout.trailingSubcaption);
-    if (!captioned) {
-      if (!given) throw new LineError("App card needs at least one caption", "invalid_app_card", false, false);
-      layout.caption = BLANK_CAPTION;
-    }
+    const text = cardLayout(card);
+    if (!text) throw new LineError("App card needs at least one caption", "invalid_app_card", false, false);
+    const layout: Json = { ...text, ...(card.imageUrl ? { imageUrl: card.imageUrl } : {}) };
     const appCard: Json = { ...this.#cardApp, url: card.url, layout };
     const fallbackText = card.fallbackText ? cardSafeText(card.fallbackText) : "";
     if (fallbackText) appCard.fallbackText = fallbackText;

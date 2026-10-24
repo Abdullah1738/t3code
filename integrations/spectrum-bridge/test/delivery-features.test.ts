@@ -78,7 +78,7 @@ test("a definite rejection of rich options still delivers the plain text under i
   await h.delivery.tick();
   expect(calls).toBe(2);
   expect(h.texts[0]!.id).toBe(stableId("rich", 0));
-  expect(h.texts[1]).toEqual({ id: plainId("rich", 0), chatGuid, text: "Done see the doc" });
+  expect(h.texts[1]).toEqual({ id: plainId("rich", 0), retryOf: stableId("rich", 0), chatGuid, text: "Done see the doc" });
   expect(h.store.getOperation("rich")).toMatchObject({ state: "sent", providerId: "plain-guid" });
   expect(h.log).toHaveBeenCalledWith("outbound-plain-fallback", "internalError");
 });

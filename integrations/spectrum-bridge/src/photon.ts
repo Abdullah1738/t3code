@@ -11,6 +11,7 @@ import {
 } from "@photon-ai/advanced-imessage/grpc";
 import type { SharedTokenData, TokenData } from "@spectrum-ts/core";
 import type { Format } from "./formatting.ts";
+import { LINE_FAILURE_CODE } from "./line.ts";
 
 export type { CatchUpEvent } from "@photon-ai/advanced-imessage/grpc";
 
@@ -47,7 +48,9 @@ export function classifySendFailure(error: unknown): { retryable: boolean; uncer
       "sharedPlanRequired", "invalidTokenLifetime", "invalidOperationId", "invalidOwner", "invalidOwnerChat",
       "unauthorized", "invalidAttachmentLimit", "invalidAttachment", "attachmentTooLarge",
       "catchupTimeout", "catchupIncomplete", "attachmentTimeout", "invalidEffect", "invalidPoll", "invalidApp",
-    ].includes(error.code) || (error.code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(error.code));
+    ].includes(error.code) || (error.code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(error.code))
+      // Sendblue line failures carry their own retry and uncertainty flags (sb-transport.ts).
+      || LINE_FAILURE_CODE.test(error.code);
     if (knownCode) return { retryable: error.retryable, uncertain: error.ambiguous, code: error.code };
   }
   if (error instanceof IMessageError) {
@@ -64,6 +67,10 @@ export function classifySendFailure(error: unknown): { retryable: boolean; uncer
 /** Downloads are read-only. A not-yet-available received file can be retried. */
 export function classifyDownloadFailure(cause: unknown) {
   if (cause instanceof IMessageError && cause.grpcCode === 5) return { retryable: true, code: "attachmentNotReady" };
+  if (cause instanceof TransportError && LINE_FAILURE_CODE.test(cause.code)) {
+    // Sendblue download failures keep their earlier handling: a few tries, unless the file is too big.
+    return cause.code === "too_large" ? { retryable: false, code: "attachmentTooLarge" } : { retryable: true, code: "attachmentUnavailable" };
+  }
   const failure = classifySendFailure(cause);
   return { retryable: failure.retryable, code: failure.code === "unknownSendFailure" ? "attachmentUnavailable" : failure.code };
 }
@@ -191,6 +198,8 @@ export class Photon {
   async sendText(input: {
     id: string; chatGuid: string; text: string; replyTo?: string;
     effect?: EffectName; subject?: string; formatting?: readonly Format[]; enableLinkPreview?: boolean;
+    /** Id of the send this variant replaces. Photon dedupes by clientMessageId alone and ignores it. */
+    retryOf?: string;
   }): Promise<SendResult> {
     if (!input.id.trim()) throw new TransportError("invalidOperationId");
     const chatGuid = canonicalRpcChat(input.chatGuid);

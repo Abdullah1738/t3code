@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { decide, slugFor, roleOf, chatInfo } from "../src/access.ts";
 import type { Access } from "../src/chats.ts";
 import { chatKey, LineError, type ChatKey, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
 import { handleInbound, type IngressDeps } from "../src/sb-ingress.ts";
+import { classifyDownloadFailure, classifySendFailure, TransportError } from "../src/photon.ts";
 import { inboundFromLine, sbTransport } from "../src/sb-transport.ts";
+import { Delivery } from "../src/delivery.ts";
+import { Sendblue } from "../src/sendblue.ts";
 import { Store } from "../src/store.ts";
+import { cardLayout } from "../src/card-text.ts";
 
 const owner = "+15555550123";
 const moni = "+15555550199";
@@ -127,13 +131,301 @@ describe("transport shim", () => {
         if (failNext) { failNext = false; throw new LineError("timeout", "timeout", true, true); }
         return { handle: "out-retry" };
       },
-      outbound: async () => [{ handle: "out-earlier", chat: chatKey.dm(owner), text: "hello", sentAt: 100, status: "sent" } as LineOutbound],
+      outbound: async () => [{ handle: "out-earlier", chat: chatKey.dm(owner), text: "hello", sentAt: 300, status: "sent" } as LineOutbound],
     });
     const transport = sbTransport(line, chatKey.dm(owner), s, () => 200);
     await expect(transport.sendText({ id: "op-1", chatGuid: "x", text: "hello" })).rejects.toMatchObject({ retryable: true, ambiguous: true });
     const retried = await transport.sendText({ id: "op-1", chatGuid: "x", text: "hello" });
     expect(retried).toEqual({ providerId: "out-earlier", duplicate: true });
     expect(line.sent).toHaveLength(0);
+  });
+
+  describe("uncertain sends (the 23 Oct board went out three times)", () => {
+    const board = "Board for today (you fly today). I'll keep it short: \"gate\" first.";
+    const delivered = (over: Partial<LineOutbound> = {}): LineOutbound =>
+      ({ handle: "be6c5134", chat: chatKey.dm(owner), text: "Board for today (you fly today). I\u2019ll keep it short: \u201cgate\u201d first.", sentAt: 51_000, status: "DELIVERED", ...over });
+    const timeout = () => new LineError("Sendblue POST /api/send-message failed: timeout", "network", true, true);
+
+    test("a copy Messages stored with curly quotes is found, not sent again", async () => {
+      let clock = 0;
+      let fail = true;
+      const looked: number[] = [];
+      const line = fakeLine({
+        sendText: async () => { if (fail) { fail = false; throw timeout(); } return { handle: "again" }; },
+        outbound: async (_chat, since) => { looked.push(since); return [delivered()]; },
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), store(), () => clock);
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: board })).rejects.toMatchObject({ code: "network", ambiguous: true });
+      clock = 40_000;
+      expect(await transport.sendText({ id: "op", chatGuid: "x", text: board })).toEqual({ providerId: "be6c5134", duplicate: true });
+      expect(looked).toEqual([-60_000]);
+      expect(line.sent).toHaveLength(0);
+    });
+
+    test("a miss waits for the slow copy instead of resending, then sends once the copy is overdue", async () => {
+      let clock = 0;
+      let landed = false;
+      let fail = true;
+      const s = store();
+      const line = fakeLine({
+        sendText: async (chat, text) => {
+          if (fail) { fail = false; throw timeout(); }
+          line.sent.push({ chat, text, handle: "second" });
+          return { handle: "second" };
+        },
+        outbound: async () => landed ? [delivered()] : [],
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), s, () => clock);
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: board })).rejects.toMatchObject({ ambiguous: true });
+      clock = 30_000;
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: board })).rejects.toMatchObject({ code: "sendUnconfirmed", retryable: true, ambiguous: true });
+      landed = true;
+      expect(await transport.sendText({ id: "op", chatGuid: "x", text: board })).toEqual({ providerId: "be6c5134", duplicate: true });
+      expect(line.sent).toHaveLength(0);
+
+      landed = false;
+      fail = true;
+      await expect(transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).rejects.toMatchObject({ ambiguous: true });
+      clock += 119_000;
+      await expect(transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).rejects.toMatchObject({ code: "sendUnconfirmed" });
+      clock += 1_000;
+      expect(await transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).toEqual({ providerId: "second" });
+      expect(s.get<unknown>("sent-attempt:late")).toEqual({ first: 30_000, last: 150_000 });
+    });
+
+    test("the lookback covers the first attempt, and a copy another row already owns is not taken", async () => {
+      let clock = 0;
+      const s = store();
+      const looked: number[] = [];
+      s.enqueue({ id: "yesterday", kind: "conversation", text: "Done." });
+      s.outboxState("yesterday", "sent", "claimed");
+      const line = fakeLine({
+        sendText: async () => { throw timeout(); },
+        outbound: async (_chat, since) => {
+          looked.push(since);
+          return [delivered({ handle: "claimed", text: "Done." }), delivered({ handle: "failed", text: "Done.", status: "ERROR" })];
+        },
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), s, () => clock);
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: "Done." })).rejects.toMatchObject({ ambiguous: true });
+      clock = 200_000;
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: "Done." })).rejects.toMatchObject({ ambiguous: true });
+      clock = 400_000;
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: "Done." })).rejects.toMatchObject({ ambiguous: true });
+      expect(looked).toEqual([-60_000, -60_000]);
+      expect(s.get<unknown>("sent-attempt:op")).toEqual({ first: 0, last: 400_000 });
+    });
+
+    test("files match on the uploaded URL and cards on their page URL", async () => {
+      let clock = 0;
+      let fail = 2;
+      const sends: string[] = [];
+      const line = fakeLine({
+        sendText: async (_chat, _text, options) => { sends.push(options?.mediaUrl ?? ""); if (fail-- > 0) throw timeout(); return { handle: "x" }; },
+        sendApp: async (_chat, card) => { sends.push(card.url); if (fail-- > 0) throw timeout(); return { handle: "x" }; },
+        outbound: async () => [
+          delivered({ handle: "photo", text: "", mediaUrl: "https://storage.example/en28_body.png" }),
+          delivered({ handle: "card", text: "Board", card: { url: "https://robob.example/board/?v=1", layout: { caption: "Board" } } }),
+        ],
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), store(), () => clock);
+      const file = { id: "file", chatGuid: "x", attachmentGuid: "https://storage.example/en28_body.png" };
+      const card = { id: "card", chatGuid: "x", url: "https://robob.example/board/?v=1", caption: "Board" };
+      await expect(transport.sendAttachment(file)).rejects.toMatchObject({ ambiguous: true });
+      await expect(transport.sendApp(card)).rejects.toMatchObject({ ambiguous: true });
+      clock = 10_000;
+      expect(await transport.sendAttachment(file)).toEqual({ providerId: "photo", duplicate: true });
+      expect(await transport.sendApp(card)).toEqual({ providerId: "card", duplicate: true });
+      expect(sends).toHaveLength(2);
+    });
+
+    test("a live card's retry does not take a newer card to the same page", async () => {
+      // A ride card keeps one page and changes its caption; each update is its own row. The first
+      // update timed out without going out, the second went out but its response was lost.
+      let clock = 0;
+      const page = "https://robob.example/ride/abc";
+      const sends: string[] = [];
+      const sent: LineOutbound[] = [];
+      const line = fakeLine({
+        sendApp: async (_chat, card) => {
+          // What Sendblue stores is the layout sendApp cleaned, without the time.
+          const layout = cardLayout(card)!;
+          sends.push(layout.caption!);
+          const handle = `h${sends.length}`;
+          if (sends.length === 1) throw timeout();
+          sent.push(delivered({ handle, text: layout.caption!, card: { url: page, layout }, sentAt: clock + 1_000 }));
+          if (sends.length === 2) throw timeout();
+          return { handle };
+        },
+        outbound: async () => sent,
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), store(), () => clock);
+      const approaching = { id: "approaching", chatGuid: "x", url: page, caption: "Driver approaching" };
+      const arrived = { id: "arrived", chatGuid: "x", url: page, caption: "Driver 3 min away, 10:42" };
+      await expect(transport.sendApp(approaching)).rejects.toMatchObject({ ambiguous: true });
+      clock = 30_000;
+      await expect(transport.sendApp(arrived)).rejects.toMatchObject({ ambiguous: true });
+      clock = 200_000;
+      expect(await transport.sendApp(approaching)).toEqual({ providerId: "h3" });
+      expect(await transport.sendApp(arrived)).toEqual({ providerId: "h2", duplicate: true });
+      expect(sends).toEqual(["Driver approaching", "Driver 3 min away", "Driver approaching"]);
+    });
+
+    test("an unthreaded copy finds what the threaded attempt it replaces already sent", async () => {
+      let clock = 0;
+      const line = fakeLine({
+        sendText: async () => { throw timeout(); },
+        outbound: async () => [delivered({ handle: "threaded", text: "Reply" })],
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), store(), () => clock);
+      await expect(transport.sendText({ id: "threaded-id", chatGuid: "x", text: "Reply", replyTo: "parent" })).rejects.toMatchObject({ ambiguous: true });
+      clock = 5_000;
+      expect(await transport.sendText({ id: "unthreaded-id", retryOf: "threaded-id", chatGuid: "x", text: "Reply" }))
+        .toEqual({ providerId: "threaded", duplicate: true });
+    });
+
+    test("a definite failure clears the attempt so the next try sends at once", async () => {
+      let clock = 0;
+      let fail = true;
+      const s = store();
+      const looked: number[] = [];
+      const line = fakeLine({
+        sendText: async (chat, text) => {
+          if (fail) { fail = false; throw new LineError("rate limited", "http_429", true, false); }
+          line.sent.push({ chat, text, handle: "ok" });
+          return { handle: "ok" };
+        },
+        outbound: async (_chat, since) => { looked.push(since); return []; },
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), s, () => clock);
+      await expect(transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).rejects.toMatchObject({ code: "http_429", ambiguous: false });
+      expect(s.get("sent-attempt:op")).toBeUndefined();
+      clock = 5_000;
+      expect(await transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).toEqual({ providerId: "ok" });
+      expect(looked).toEqual([]);
+    });
+
+    test("a copy sent before this send's first attempt belongs to another row, even when nothing claims it", async () => {
+      // An earlier card to the same page timed out, landed late and was then dropped by /new.
+      let clock = 100_000;
+      let fail = true;
+      const looked: number[] = [];
+      const line = fakeLine({
+        sendApp: async () => { if (fail) { fail = false; throw timeout(); } return { handle: "new-card" }; },
+        outbound: async (_chat, since) => { looked.push(since); return [delivered({ handle: "old-card", text: "Board", card: { url: "https://robob.example/board/", layout: { caption: "Board" } }, sentAt: 42_000 })]; },
+      });
+      const transport = sbTransport(line, chatKey.dm(owner), store(), () => clock);
+      const card = { id: "card", chatGuid: "x", url: "https://robob.example/board/", caption: "Board" };
+      await expect(transport.sendApp(card)).rejects.toMatchObject({ ambiguous: true });
+      clock = 110_000;
+      await expect(transport.sendApp(card)).rejects.toMatchObject({ code: "sendUnconfirmed" });
+      clock = 220_000;
+      expect(await transport.sendApp(card)).toEqual({ providerId: "new-card" });
+      expect(looked).toEqual([40_000, 40_000]);
+    });
+
+    test("a send whose response body was lost is looked for, and the rest of the message still goes", async () => {
+      const start = Date.parse("2026-10-23T07:00:00Z");
+      setSystemTime(start);
+      try {
+        const posted: string[] = [];
+        const delivered: Record<string, unknown>[] = [];
+        const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+          if (init?.method === "POST") {
+            const content = String(JSON.parse(String(init.body)).content);
+            posted.push(content);
+            const handle = `h${posted.length}`;
+            delivered.push({ message_handle: handle, is_outbound: true, number: owner, content, status: "DELIVERED", date_sent: new Date(Date.now() + 1_000).toISOString() });
+            // The first send went out, but its response body never arrived.
+            return posted.length === 1 ? new Response("", { status: 200 }) : Response.json({ message_handle: handle });
+          }
+          expect(url.pathname).toBe("/api/v2/messages");
+          return Response.json({ data: delivered });
+        }) as unknown as typeof fetch;
+        const line = new Sendblue({ keyId: "k", secret: "s", number: "+19362300565", fetch: fetchFn });
+        const s = store();
+        s.set("route", { id: "session", generation: 1 });
+        const delivery = new Delivery(s, sbTransport(line, chatKey.dm(owner), s), {
+          projectScope: "scope", enabled: () => true, chatGuid: () => chatKey.dm(owner), log: () => {}, sleep: async () => {},
+        });
+        s.enqueue({ id: "board", kind: "conversation", text: "word ".repeat(800).trim(), sessionId: "session", generation: 1 });
+        await delivery.tick();
+        expect(s.getOperation("board")).toMatchObject({ state: "pending", attempts: 1 });
+        setSystemTime(start + 60_000);
+        await delivery.tick();
+        expect(posted).toHaveLength(2);
+        expect(posted.join("").replace(/\s/g, "")).toBe("word".repeat(800));
+        expect(s.getOperation("board")).toMatchObject({ state: "sent", attempts: 2 });
+        expect([s.byProviderId("h1")?.id, s.byProviderId("h2")?.id]).toEqual(["board", "board"]);
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    test("a lost upload response or a history read with no data is tried again, and the file goes once", async () => {
+      const start = Date.parse("2026-10-24T07:00:00Z");
+      setSystemTime(start);
+      try {
+        const calls: string[] = [];
+        const delivered: Record<string, unknown>[] = [];
+        let lists = 0;
+        const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+          calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+          if (url.pathname === "/api/upload-file") {
+            // The first upload's response body never arrived.
+            return calls.filter(call => call.endsWith("/api/upload-file")).length === 1
+              ? new Response("", { status: 200 }) : Response.json({ media_url: "https://storage.example/ab12_report.pdf" });
+          }
+          if (url.pathname === "/api/send-message") {
+            const media = String(JSON.parse(String(init!.body)).media_url);
+            delivered.push({ message_handle: "f1", is_outbound: true, number: owner, content: "", media_url: media, status: "DELIVERED", date_sent: new Date(Date.now() + 1_000).toISOString() });
+            return new Response("", { status: 200 });
+          }
+          // The first history read came back empty-handed too.
+          return ++lists === 1 ? new Response("", { status: 200 }) : Response.json({ data: delivered });
+        }) as unknown as typeof fetch;
+        const line = new Sendblue({ keyId: "k", secret: "s", number: "+19362300565", fetch: fetchFn });
+        const s = store();
+        s.set("route", { id: "session", generation: 1 });
+        const delivery = new Delivery(s, sbTransport(line, chatKey.dm(owner), s), {
+          projectScope: "scope", enabled: () => true, chatGuid: () => chatKey.dm(owner), log: () => {}, sleep: async () => {},
+        });
+        const data = new Uint8Array([1, 2, 3]);
+        s.enqueue({ id: "file", kind: "conversation", text: "", sessionId: "session", generation: 1,
+          attachment: { sha256: s.putBlob(data), name: "report.pdf", mimeType: "application/pdf", size: data.byteLength } });
+        for (const at of [0, 60_000, 180_000, 300_000]) {
+          setSystemTime(start + at);
+          await delivery.tick();
+        }
+        expect(s.getOperation("file")).toMatchObject({ state: "sent" });
+        expect(calls.filter(call => call === "POST /api/send-message")).toHaveLength(1);
+        expect(s.byProviderId("f1")?.id).toBe("file");
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    test("an attempt stored by the previous build still triggers the lookup", async () => {
+      const s = store();
+      s.set("sent-attempt:op", 1_000);
+      const line = fakeLine({ outbound: async () => [delivered({ handle: "old", text: "hi" })] });
+      expect(await sbTransport(line, chatKey.dm(owner), s, () => 500_000).sendText({ id: "op", chatGuid: "x", text: "hi" }))
+        .toEqual({ providerId: "old", duplicate: true });
+    });
+  });
+
+  test("line failure codes reach the logs and keep their flags; free text in an HTTP error key does not", async () => {
+    const fail = (error: LineError) => sbTransport(fakeLine({ typing: async () => { throw error; } }), chatKey.dm(owner), store()).typing("x", true);
+    await expect(fail(new LineError("x", "http_400:invalid_number", false, false))).rejects.toMatchObject({ code: "http_400:invalid_number", retryable: false });
+    await expect(fail(new LineError("x", "http_400:Number is not valid, see https://x", false, false))).rejects.toMatchObject({ code: "http_400" });
+    await expect(fail(new LineError("x", "weird\ncode", true, true))).rejects.toMatchObject({ code: "lineFailure", retryable: true, ambiguous: true });
+    expect(classifySendFailure(new TransportError("http_400:invalid_number", false, false))).toEqual({ retryable: false, uncertain: false, code: "http_400:invalid_number" });
+    expect(classifySendFailure(new TransportError("network", true, true))).toEqual({ retryable: true, uncertain: true, code: "network" });
+    expect(classifySendFailure(new TransportError("http_429", true, false))).toEqual({ retryable: true, uncertain: false, code: "http_429" });
+    expect(classifyDownloadFailure(new TransportError("too_large"))).toEqual({ retryable: false, code: "attachmentTooLarge" });
+    expect(classifyDownloadFailure(new TransportError("http_404"))).toEqual({ retryable: true, code: "attachmentUnavailable" });
   });
 
   test("a successful send records its handle so a later repeat is a duplicate", async () => {

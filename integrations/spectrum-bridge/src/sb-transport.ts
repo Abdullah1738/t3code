@@ -3,19 +3,36 @@
  * Sendblue has no idempotency key; an uncertain send is checked against the line's outbound
  * history before it is sent again.
  */
-import type { ChatKey, Line, LineFile, LineAppCard } from "./line.ts";
-import { LineError, chatKey } from "./line.ts";
+import type { ChatKey, Line, LineFile, LineAppCard, LineOutbound } from "./line.ts";
+import { LINE_FAILURE_CODE, LineError, chatKey } from "./line.ts";
 import { TransportError, type NormalizedInbound } from "./photon.ts";
 import type { Store } from "./store.ts";
+import { CARD_TEXT_FIELDS, cardLayout, type CardText } from "./card-text.ts";
 
 const RESEND_LOOKBACK_MS = 60_000;
+/**
+ * How long after an uncertain attempt its copy may still turn up. Sendblue has delivered sends
+ * 37-42 s after they started, past the request timeout, so a retry inside this only looks.
+ */
+const SETTLE_MS = 2 * 60_000;
+/** Statuses of a send that never went out. */
+const UNSENT = /^(error|declined|failed)$/i;
 /** A start outlives a crashed bridge by at most this long; the router refreshes well inside it. */
 export const TYPING_MAX_MS = 60_000;
 
 export function classifyLineFailure(error: unknown): TransportError {
-  if (error instanceof LineError) return new TransportError(error.code, error.retryable, error.uncertain);
-  return new TransportError("operationFailed", false, false);
+  if (!(error instanceof LineError)) return new TransportError("operationFailed", false, false);
+  const code = LINE_FAILURE_CODE.test(error.code) ? error.code : /^http_[1-5]\d{2}/.exec(error.code)?.[0] ?? "lineFailure";
+  return new TransportError(code, error.retryable, error.uncertain);
 }
+
+/** Sendblue stores what Messages shows, so smart quotes and spacing can differ from what was sent. */
+const sameText = (text: string) => text.normalize("NFKC")
+  .replace(/[\u2018\u2019\u201a\u201b]/g, "'").replace(/[\u201c\u201d\u201e\u201f]/g, "\"")
+  .replace(/\s+/g, " ").trim();
+
+/** First and latest start of the attempts at one send. Older rows kept a bare number. */
+type Attempts = { first: number; last: number };
 
 export type SbTransport = ReturnType<typeof sbTransport>;
 
@@ -32,6 +49,53 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
   };
   const sentKey = (id: string) => `sent:${id}`;
   const attemptKey = (id: string) => `sent-attempt:${id}`;
+  const attempts = (id: string): Attempts | undefined => {
+    const kept = store.get<Attempts | number>(attemptKey(id));
+    return typeof kept === "number" ? { first: kept, last: kept } : kept ?? undefined;
+  };
+  /**
+   * Sends once per id. After an uncertain attempt (at this id, or at `retryOf`, the id a variant
+   * such as an unthreaded copy replaces) it first looks for that copy among the chat's outbound
+   * messages no other row has claimed. Until SETTLE_MS have passed since the latest attempt a miss
+   * only fails again as `sendUnconfirmed`; after that the send goes out again.
+   */
+  const once = async (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean,
+    send: () => Promise<{ handle: string }>): Promise<{ providerId?: string; duplicate?: boolean }> => {
+    const saved = store.get<{ handle: string }>(sentKey(id));
+    if (saved) return { providerId: saved.handle, duplicate: true };
+    const own = attempts(id);
+    const earlier = [own, retryOf === undefined ? undefined : attempts(retryOf)].filter(value => value !== undefined);
+    if (earlier.length) {
+      const first = Math.min(...earlier.map(value => value.first));
+      const last = Math.max(...earlier.map(value => value.last));
+      const sent = await wrap(() => line.outbound(chat, first - RESEND_LOOKBACK_MS));
+      // Only copies sent since this send's first attempt: an older one is another row's, whose
+      // response may have been lost so nothing claims it. Sendblue stamps a send ~1 s after it starts.
+      const match = sent.find(message => message.handle && message.sentAt >= first && !UNSENT.test(message.status)
+        && store.byProviderId(message.handle) === undefined && landed(message));
+      if (match) {
+        store.set(sentKey(id), { handle: match.handle });
+        return { providerId: match.handle, duplicate: true };
+      }
+      if (now() < last + SETTLE_MS) throw new TransportError("sendUnconfirmed", true, true);
+    }
+    const start = now();
+    store.set(attemptKey(id), { first: own?.first ?? start, last: start } satisfies Attempts);
+    let sent: { handle: string };
+    try {
+      sent = await wrap(send);
+    } catch (error) {
+      // Nothing went out, so the next try need not wait for a copy that will never show up.
+      if (error instanceof TransportError && !error.ambiguous) {
+        if (own) store.set(attemptKey(id), own);
+        else store.db.query("DELETE FROM kv WHERE key = ?").run(attemptKey(id));
+      }
+      throw error;
+    }
+    store.set(sentKey(id), { handle: sent.handle });
+    rearm();
+    return { providerId: sent.handle };
+  };
   // One queue keeps a re-arm after a send from landing after the turn's stop.
   let typingOn = false;
   let typingQueue: Promise<unknown> = Promise.resolve();
@@ -64,53 +128,34 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       const outbound = "status" in message;
       return { chatGuids: [chat], content: { text: message.text }, isFromMe: outbound };
     },
-    async sendText(input: { id: string; chatGuid: string; text: string; replyTo?: string; effect?: string; subject?: string }):
+    async sendText(input: { id: string; chatGuid: string; text: string; replyTo?: string; effect?: string; subject?: string; retryOf?: string }):
       Promise<{ providerId?: string; duplicate?: boolean }> {
-      const saved = store.get<{ handle: string }>(sentKey(input.id));
-      if (saved) return { providerId: saved.handle, duplicate: true };
-      const attemptStart = now();
-      const earlier = store.get<number>(attemptKey(input.id));
-      if (earlier !== undefined) {
-        // An earlier attempt for this id was uncertain: it may already be out, so look before resending.
-        const sent = await wrap(() => line.outbound(chat, earlier - RESEND_LOOKBACK_MS));
-        const match = sent.find(message => message.text === input.text);
-        if (match) {
-          store.set(sentKey(input.id), { handle: match.handle });
-          return { providerId: match.handle, duplicate: true };
-        }
-      }
-      store.set(attemptKey(input.id), attemptStart);
-      const sent = await wrap(() => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined));
-      store.set(sentKey(input.id), { handle: sent.handle });
-      rearm();
-      return { providerId: sent.handle };
+      const text = sameText(input.text);
+      return once(input.id, input.retryOf, message => !message.mediaUrl && !message.card && sameText(message.text) === text,
+        () => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined));
     },
     async uploadAttachment(input: { id: string; data: Uint8Array; name: string; mimeType: string }): Promise<{ guid: string }> {
       return { guid: await wrap(() => line.upload({ data: input.data, name: input.name, mimeType: input.mimeType })) };
     },
     async sendAttachment(input: { id: string; chatGuid: string; attachmentGuid: string; replyTo?: string }): Promise<{ providerId?: string; duplicate?: boolean }> {
-      const saved = store.get<{ handle: string }>(sentKey(input.id));
-      if (saved) return { providerId: saved.handle, duplicate: true };
-      const sent = await wrap(() => line.sendText(chat, "", {
-        mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-      }));
-      store.set(sentKey(input.id), { handle: sent.handle });
-      rearm();
-      return { providerId: sent.handle };
+      // Sendblue keeps the uploaded file's URL as the message's media_url.
+      return once(input.id, undefined, message => message.mediaUrl === input.attachmentGuid,
+        () => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) }));
     },
     async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<{ providerId?: string; duplicate?: boolean }> {
-      const saved = store.get<{ handle: string }>(sentKey(input.id));
-      if (saved) return { providerId: saved.handle, duplicate: true };
-      const { id: _id, chatGuid: _chat, ...given } = input;
-      let card: LineAppCard = given;
-      if (cards.static) {
-        const imageUrl = card.imageUrl ?? await cards.previewImage?.(card.url).catch(() => undefined);
-        card = { ...card, interactive: false, ...(imageUrl ? { imageUrl } : {}) };
-      }
-      const sent = await wrap(() => line.sendApp(chat, card));
-      store.set(sentKey(input.id), { handle: sent.handle });
-      rearm();
-      return { providerId: sent.handle };
+      const { id, chatGuid: _chat, ...given } = input;
+      // Live cards reuse one page URL with new captions, so the text has to match too.
+      const layout = cardLayout(given);
+      const sameLayout = (stored: CardText) => layout !== undefined
+        && CARD_TEXT_FIELDS.every(key => sameText(stored[key] ?? "") === sameText(layout[key] ?? ""));
+      return once(id, undefined, message => message.card?.url === given.url && sameLayout(message.card.layout), async () => {
+        let card: LineAppCard = given;
+        if (cards.static) {
+          const imageUrl = card.imageUrl ?? await cards.previewImage?.(card.url).catch(() => undefined);
+          card = { ...card, interactive: false, ...(imageUrl ? { imageUrl } : {}) };
+        }
+        return line.sendApp(chat, card);
+      });
     },
     /** Polls are unsupported on Sendblue; the title and numbered options go out as plain text. */
     async sendPoll(input: { id: string; chatGuid: string; title: string; options: readonly string[] }): Promise<{ providerId?: string; duplicate?: boolean }> {

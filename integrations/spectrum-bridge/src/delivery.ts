@@ -422,7 +422,8 @@ export class Delivery {
               const suffix = `${unthreaded ? ":unthreaded" : ""}${plain ? ":plain" : ""}`;
               return this.photon.sendText(Object.freeze({
                 ...(unthreaded ? { chatGuid } : input),
-                id: suffix ? `bridge-${createHash("sha256").update(`${this.options.projectScope}:${item.id}:${index}${suffix}`).digest("hex")}` : id,
+                // retryOf lets a Sendblue retry find a copy an earlier variant may have sent.
+                ...(suffix ? { id: `bridge-${createHash("sha256").update(`${this.options.projectScope}:${item.id}:${index}${suffix}`).digest("hex")}`, retryOf: id } : { id }),
                 text: chunk.text, ...(plain ? {} : rich),
               }));
             };

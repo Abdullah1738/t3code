@@ -258,7 +258,7 @@ test("chunks at 3500 codepoints, checkpoints and aliases survive reopen, and ret
   await resumed.delivery.tick();
   // A failed reply goes again without its thread target, under its own id, from then on.
   const { replyTo: _parent, ...unthreaded } = rejected!;
-  expect(resumed.calls[0]).toEqual({ ...unthreaded, id: unthreadedId("chunked", 1) });
+  expect(resumed.calls[0]).toEqual({ ...unthreaded, id: unthreadedId("chunked", 1), retryOf: stableId("chunked", 1) });
   expect(resumed.calls.map(call => call.id)).toEqual([unthreadedId("chunked", 1), unthreadedId("chunked", 2)]);
   expect(h.calls[0]!.text + resumed.calls.map(call => call.text).join("")).toBe(text);
   expect(resumed.calls.every(call => call.replyTo === undefined && call.chatGuid === chatGuid)).toBe(true);

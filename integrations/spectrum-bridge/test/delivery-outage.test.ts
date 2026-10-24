@@ -59,7 +59,7 @@ test("a failed threaded reply is retried once without its thread target under it
     throw internal();
   });
   await h.delivery.tick();
-  expect(h.calls[1]).toEqual({ id: variantId("reply", 0, ":unthreaded"), chatGuid, text: "Reply text" });
+  expect(h.calls[1]).toEqual({ id: variantId("reply", 0, ":unthreaded"), retryOf: variantId("reply", 0), chatGuid, text: "Reply text" });
   setSystemTime(now + 60_000);
   await h.delivery.tick();
   expect(h.calls[2]).toEqual(h.calls[1]!);

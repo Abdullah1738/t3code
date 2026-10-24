@@ -4,6 +4,8 @@
  * transport shim consume it, so neither depends on Sendblue's wire format.
  */
 
+import type { CardText } from "./card-text.ts";
+
 /** "dm:<E.164 or Apple ID email>" for a 1:1 chat, "group:<Sendblue group_id>" for a group. */
 export type ChatKey = `dm:${string}` | `group:${string}`;
 
@@ -64,7 +66,15 @@ export type LineAppCard = {
   interactive?: boolean;
 };
 
-export type LineOutbound = { handle: string; chat: ChatKey; text: string; mediaUrl?: string; sentAt: number; status: string };
+export type LineOutbound = {
+  handle: string; chat: ChatKey; text: string; mediaUrl?: string;
+  /** An app card: its page and the text its bubble shows, as sendApp cleaned it. */
+  card?: { url: string; layout: CardText };
+  sentAt: number; status: string;
+};
+
+/** Failure codes a Line raises once sb-transport has cut any free text off an HTTP error key. Safe to log. */
+export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(:[a-z0-9_]{1,40})?)$/;
 
 export type SendOptions = { replyTo?: string; sendStyle?: string; /** From upload(). */ mediaUrl?: string };
 
