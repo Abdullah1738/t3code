@@ -192,9 +192,12 @@ class MarketplacePayment:
                     self._payment_observation('PAYMENT_FAILED', payment)
                     # Order cancellation/refund propagation can lag payment status.
                     declined = True
-                confirmed = confirmed or state == 'payment_confirmed'
-                if not (declined or confirmed) and (state in ('pending', 'challenge_required')
-                                                    or summary['has_redirect']):
+                challenge = state in ('pending', 'challenge_required') or summary['has_redirect']
+                if state == 'payment_confirmed':
+                    confirmed = True
+                elif challenge:
+                    confirmed = False  # a fresh challenge outranks an earlier approval
+                if not (declined or confirmed) and challenge:
                     alert('owner_3ds_notified', notify)
             elif (not declined and not confirmed and status == 'pending' and not secret
                   and (self._financial_operation() != 'place'

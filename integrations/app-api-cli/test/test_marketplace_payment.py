@@ -454,6 +454,22 @@ class PaymentTests(unittest.TestCase):
         self.assertIn('Treat the card as charged', details['tell'])
         self.assertNotIn('waiting on the bank', details['tell'])
 
+    def test_fresh_challenge_after_an_approval_alerts_again(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}] * 400,
+                                 payment_complete={'status': 'payment_confirmed'},
+                                 payment_status={'status': 'payment_ready_to_redirect'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_called_once_with(main.ORDER, 1980)
+        stall.assert_called_once_with(main.ORDER, 1980)
+        self.assertIn('still waiting on the bank', caught.exception.details['tell'])
+        self.assertNotIn('approved', caught.exception.details['tell'])
+
     def test_pending_to_failed_closes_only_with_full_native_no_capture_proof(self):
         failed = failed_responses(main.ORDER, 1980)
         flow, wire = self.placed(**failed)

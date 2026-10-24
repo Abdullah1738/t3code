@@ -87,15 +87,17 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                 flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
                     'review': {}, 'readback': {'verified': True}}
                 flow.place.return_value = {'order': flow.order}
-                flow.await_success.side_effect = MarketplaceError('REQUEST_TIMEOUT')
-                with patch(target,return_value=flow), patch.object(c,'CommerceAuth'), \
-                     patch.object(c,'cvv_from_keychain',return_value=b'123'), \
-                     contextlib.redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(c.main(['order',lane,'--sku-config','Z1','--cvv-from-keychain']),1)
-                result = json.loads(output.getvalue().strip().splitlines()[-1])
-                self.assertEqual((result['error'], result['charge'], result['financial_retry']),
-                                 ('REQUEST_TIMEOUT', 'unknown', False))
-                self.assertIn('AED 19.80 went out but I lost its status', result['tell'])
+                for error, code in ((MarketplaceError('REQUEST_TIMEOUT'), 'REQUEST_TIMEOUT'),
+                                    (KeyError('status'), 'COMMERCE_OPERATION_FAILED')):
+                    flow.await_success.side_effect = error
+                    with patch(target,return_value=flow), patch.object(c,'CommerceAuth'), \
+                         patch.object(c,'cvv_from_keychain',return_value=b'123'), \
+                         contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(c.main(['order',lane,'--sku-config','Z1','--cvv-from-keychain']),1)
+                    result = json.loads(output.getvalue().strip().splitlines()[-1])
+                    self.assertEqual((result['error'], result['charge'], result['financial_retry']),
+                                     (code, 'unknown', False))
+                    self.assertIn('AED 19.80 went out but I lost its status', result['tell'])
 
     def test_lost_place_answer_says_charge_unknown_but_a_refusal_does_not(self):
         from unittest.mock import Mock
@@ -125,7 +127,12 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                     if guidance:
                         self.assertEqual(result['charge'], 'unknown')
                         self.assertIn('AED 19.80 went out but I lost its status', result['tell'])
-                        self.assertIn('commerce order-status fixture-flow', ' '.join(result['next']))
+                        # No command can find an order without its number: say so, keep the fence.
+                        steps = ' '.join(result['next'])
+                        self.assertIn("Orders page; its order number never came back", steps)
+                        self.assertIn('leave flow fixture-flow fenced', steps)
+                        self.assertNotIn('order-status', steps)
+                        self.assertNotIn('commerce reconcile-order', steps)
 
     def test_already_paid_marketplace_resume_does_not_need_checkout_record(self):
         from unittest.mock import Mock
@@ -359,15 +366,16 @@ class MinutesOrderTests(unittest.TestCase):
         result=json.loads(output.getvalue().strip().splitlines()[-1])
         self.assertEqual(result['error'],'MINUTES_AUTH_EXPIRED_NEEDS_APP_REBIND')
 
-    def minutes_order(self, complete=None, complete_error=None, paid=None):
+    def minutes_order(self, complete=None, complete_error=None, paid=None, notify=None, flows=None):
         from unittest.mock import Mock
         import commerce_minutes as cm
         snapshot=Mock();snapshot.projection={'count':0,'active':[],'resend_allowed':False}
         with patch.object(c,'CommerceAuth'), \
                 patch.object(cm,'readback_active_orders',return_value=snapshot), \
                 patch.object(cm,'MinutesFlow') as flow, \
-                patch.object(cm,'telegram_3ds_notify',return_value={'notified':True}), \
+                patch.object(cm,'telegram_3ds_notify',**(notify or {'return_value':{'notified':True}})), \
                 patch.object(c,'cvv_from_keychain',return_value=b'007'):
+            if flows is not None:flows.append(flow.return_value)
             f=flow.return_value
             f.flow_id='10000000-0000-4000-8000-000000000009'
             f.review={'order':'IAEGA123','amount':1725}
@@ -393,6 +401,21 @@ class MinutesOrderTests(unittest.TestCase):
         self.assertIn("AED 17.25 didn't go through",result['tell'])
         result=self.minutes_order(complete_error=mt.MinutesError('MINUTES_EXACT_PENDING_INTENT_REQUIRED'))
         self.assertNotIn('charge',result)
+
+    def test_minutes_lost_3ds_alert_still_waits_and_any_stop_says_charge_unknown(self):
+        import commerce_minutes as cm
+        paid={'paid':False,'payment_status':'payment_pending','transaction_status':'CREATED',
+              'polls':40,'timed_out':True}
+        flows=[]
+        with patch.object(cm.subprocess,'run',side_effect=OSError):
+            result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
+                                      notify={'wraps':cm.telegram_3ds_notify},flows=flows)
+        flows[0].await_payment.assert_called_once_with()
+        self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
+        result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
+                                  notify={'side_effect':RuntimeError('telegram down')})
+        self.assertEqual((result['error'],result['charge']),('COMMERCE_OPERATION_FAILED','unknown'))
+        self.assertIn('AED 17.25 went out but I lost its status',result['tell'])
 
     def test_minutes_bank_approved_but_not_captured_says_treat_as_charged(self):
         result=self.minutes_order(complete={'payment_status':'payment_pending'},paid={
@@ -445,6 +468,32 @@ class MinutesOrderTests(unittest.TestCase):
         result=json.loads(output.getvalue().strip().splitlines()[-1])
         self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
         self.assertIn('AED 17.25 is still waiting on the bank',result['tell'])
+
+    def test_minutes_bank_approval_seen_before_a_lost_last_read_still_counts(self):
+        import commerce_minutes as cm
+        from unittest.mock import Mock
+        flow=object.__new__(cm.MinutesFlow)
+        flow.flow_id='10000000-0000-4000-8000-000000000001'
+        flow.review={'order':'IAEGA123','amount':1725,'digest':'a'*64}
+        flow.intent={'secret':'synthetic-intent'}
+        flow.client=Mock()
+        approved=Mock(projection={'paid':False,'state':'payment_in_progress','payment_status':'payment_confirmed',
+                                  'transaction_status':'AUTHORIZED'})
+        flow.client.payment_intent_status.side_effect=[approved,cm.m.MinutesError('REQUEST_TIMEOUT')]
+        flow.store=Mock()
+        clock=iter([0,5,601])
+        real=cm.MinutesFlow.await_payment
+        def wait(self,**kw):
+            return real(self,**{**kw,'sleep':lambda _:None,'clock':clock.__next__})
+        with patch.object(cm.MinutesFlow,'resume_payment',return_value=flow), \
+                patch.object(cm.MinutesFlow,'await_payment',wait), \
+                patch.object(c.journal,'binding',return_value={'app':'noon','vertical':'minutes'}), \
+                patch.object(c.journal,'payment_reported',return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(c.main(['await-payment',flow.flow_id,'--no-notify']),1)
+        result=json.loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
+        self.assertIn('The bank approved the payment for AED 17.25',result['tell'])
 
     def test_release_flow_is_minutes_only_and_evidence_gated(self):
         import json

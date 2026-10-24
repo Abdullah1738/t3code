@@ -299,18 +299,18 @@ def order_minutes(args):
         if exc.code in ('AUTH_EXPIRED','AUTH_FORBIDDEN'):
             journal.fail('MINUTES_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
-    if payment['payment_status']=='payment_pending':
-        notify=telegram_3ds_notify(placed['order'],review['payable_minor'])
-    elif payment['payment_status']=='payment_confirmed':
-        # Captured flow always challenges, but a confirmed direct return is paid,
-        # not an error; the status readback below still proves the terminal triple.
-        notify={'notified':False,'reason':'payment_confirmed_without_challenge'}
-    else:
-        # The card was sent; a refused answer still isn't proof nothing was charged.
-        journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
-                             amount_minor=flow.review.get('amount'))
-    print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
     with minutes_after_send(flow):
+        if payment['payment_status']=='payment_pending':
+            notify=telegram_3ds_notify(placed['order'],review['payable_minor'])
+        elif payment['payment_status']=='payment_confirmed':
+            # Captured flow always challenges, but a confirmed direct return is paid,
+            # not an error; the status readback below still proves the terminal triple.
+            notify={'notified':False,'reason':'payment_confirmed_without_challenge'}
+        else:
+            # The card was sent; a refused answer still isn't proof nothing was charged.
+            journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
+                                 amount_minor=flow.review.get('amount'))
+        print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
         paid=flow.await_payment()
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],

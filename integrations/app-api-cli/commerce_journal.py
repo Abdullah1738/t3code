@@ -111,10 +111,13 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
     a lost status read can still show up as a charge (a 3DS approval that lands late, a hold
     the bank keeps), so the person isn't told otherwise."""
     amount = f'AED {amount_minor / 100:.2f}' if isinstance(amount_minor, int) else 'the order'
-    # Without an order number (the place answer was lost) only the order readback can find it.
-    status = (f'commerce await-payment {flow_id} (status only, never resends)' if order
-              else f'commerce order-status {flow_id} (reads the store\'s orders, never resends)')
-    reconcile = f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)'
+    if order:
+        status = f'commerce await-payment {flow_id} (status only, never resends)'
+        reconcile = f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)'
+    else:
+        # The place answer was lost: no command can look up an order without its number.
+        status = 'look for this order by hand in the store\'s Orders page; its order number never came back'
+        reconcile = f'leave flow {flow_id} fenced: reconcile-order needs that order number'
     unknown = 'I can\'t say yet whether the card was charged'
     if outcome == 'not_charged':
         tell = f'The payment for {amount} didn\'t go through, and the store confirms nothing was captured.'
