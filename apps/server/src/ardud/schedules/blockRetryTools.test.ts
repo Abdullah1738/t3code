@@ -20,7 +20,7 @@ import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
 import { master, membershipGuard, outsider } from "../missions/guard/guard.testkit.ts";
 import * as BlockRetry from "./blockRetryTools.ts";
-import { readBlockRetry, writeBlockRetry } from "./runFollow.ts";
+import { ensureRunFollowTables, readBlockRetry, writeBlockRetry } from "./runFollow.ts";
 
 const lowCaller = ThreadId.make("t-low");
 const fallback = { instanceId: "opencode", model: "opus/gpt-6-astra" } as never;
@@ -33,6 +33,14 @@ const task = {
   createdAt: "2026-10-22T00:00:00.000Z",
   runtimeMode: "approval-required",
   interactionMode: "default",
+} as unknown as ScheduledTask;
+
+/** Starts new threads; lowered to approval-required after a full-access run started. */
+const unbound = {
+  ...task,
+  id: ScheduledTaskId.make("scheduled-task:unbound"),
+  title: "Nightly",
+  threadId: null,
 } as unknown as ScheduledTask;
 
 const modesOf: Record<string, RuntimeMode> = { [lowCaller]: "approval-required" };
@@ -78,7 +86,7 @@ const layer = McpHttpServer.toolkitRegistration(
   ),
   Layer.provideMerge(
     Layer.mock(ScheduledTaskService.ScheduledTaskService)({
-      list: () => Effect.succeed({ tasks: [task], timeZone: "UTC" } as never),
+      list: () => Effect.succeed({ tasks: [task, unbound], timeZone: "UTC" } as never),
     }),
   ),
   Layer.provideMerge(Sqlite.layerMemory),
@@ -119,6 +127,40 @@ describe("t3_scheduled_task_block_retry", () => {
       const fromMaster = yield* call(master, clear);
       expect(fromMaster.isError).toBe(false);
       expect(yield* readBlockRetry(sql, task)).toHaveLength(0);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.effect("arming checks the modes a run already started with", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* ensureRunFollowTables(sql);
+      const launch = JSON.stringify({
+        projectId: "project-1",
+        title: unbound.title,
+        workspaceStrategy: { type: "root" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      yield* sql`
+        INSERT INTO ardud_scheduled_task_follows
+          (task_id, task_created_at, started_at, since, fire_key, prompt, launch_json, thread_id)
+        VALUES (${unbound.id}, ${unbound.createdAt}, '2026-10-22T20:00:00.000Z',
+          '2026-10-22T20:00:00.000Z', 'fire', 'Run the review.', ${launch}, 'thread-run')
+      `;
+      const arm = { scheduledTaskId: unbound.id, fallbacks: [fallback] };
+
+      const fromLow = yield* call(lowCaller, arm);
+      expect(fromLow.isError).toBe(true);
+      expect(fromLow.text).toContain("broader than");
+      expect(yield* readBlockRetry(sql, unbound)).toHaveLength(0);
+
+      // Once that run has been retried, arming can't reach it any more.
+      yield* sql`UPDATE ardud_scheduled_task_follows SET attempt = 1`;
+      const later = yield* call(lowCaller, arm);
+      expect(later.isError).toBe(false);
+      expect(yield* readBlockRetry(sql, unbound)).toHaveLength(1);
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 });

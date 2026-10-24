@@ -217,9 +217,7 @@ const LIVE_TURN_STATUSES = new Set(["pending", "running"]);
 const OWED_TASK_DELIVERIES = new Set(["pending", "claimed"]);
 
 /** The run still owed a delegated task report, which wakes the thread when sent. */
-export const owedDelegatedCompletion = (
-  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "subagents">,
-): string | null => {
+const owedDelegatedCompletion = (projection: IdleInput["projection"]): string | null => {
   const open = projection.runs.filter((run) => run.delegatedCompletion?.disposition === "open");
   const reserved = open.find((run) => (run.delegatedCompletion?.delivery?.taskIds.length ?? 0) > 0);
   if (reserved !== undefined) return reserved.id;

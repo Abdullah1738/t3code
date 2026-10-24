@@ -19,6 +19,7 @@ interface RunFixture {
   readonly status: string;
   readonly endsAt?: number;
   readonly queueHeld?: boolean;
+  readonly userMessageId?: string;
   readonly delegatedCompletion?: unknown;
 }
 
@@ -28,6 +29,8 @@ interface Fixture {
     readonly id: string;
     readonly status: string;
     readonly endsAt?: number;
+    readonly runId?: string;
+    readonly completionDelivery?: { readonly state: string };
   }>;
   readonly requests?: ReadonlyArray<{ readonly status: string }>;
   readonly turns?: ReadonlyArray<{ readonly status: string; readonly runAttemptId: string | null }>;
@@ -219,9 +222,17 @@ describe("threadVerdict", () => {
             delivery: { generation: 1, messageId: "wake", taskIds: ["task-1"] },
           },
         },
-        { id: "wake", status: "queued", queueHeld: true },
+        { id: "wake", status: "queued", queueHeld: true, userMessageId: "wake" },
       ],
-      subagents: [{ id: "task-1", status: "completed", endsAt: 1 }],
+      subagents: [
+        {
+          id: "task-1",
+          status: "completed",
+          endsAt: 1,
+          runId: "a",
+          completionDelivery: { state: "claimed" },
+        },
+      ],
       errors: [{ runId: "a", ...BLOCKED }],
     });
     expect(verdict).toMatchObject({
@@ -229,6 +240,47 @@ describe("threadVerdict", () => {
       error: "Provider blocked the response",
       blocked: true,
     });
+  });
+
+  it("waits on a report that isn't sent yet, even behind an unrelated held run", () => {
+    const blockedParent = {
+      id: "a",
+      status: "failed",
+      delegatedCompletion: {
+        disposition: "open",
+        nextGeneration: 2,
+        delivery: { generation: 1, messageId: "report", taskIds: ["task-1"] },
+      },
+    };
+    const unrelated = {
+      id: "later",
+      status: "queued",
+      queueHeld: true,
+      userMessageId: "later-message",
+    };
+    const child = { id: "task-1", status: "completed", endsAt: 1, runId: "a" };
+    // Reserved for a message that hasn't been dispatched as a run yet.
+    expect(
+      settledAfterQuiet({
+        runs: [blockedParent, unrelated],
+        subagents: [{ ...child, completionDelivery: { state: "claimed" } }],
+        errors: [{ runId: "a", ...BLOCKED }],
+      })._tag,
+    ).toBe("wait");
+    // Not reserved at all: the report is still pending.
+    expect(
+      settledAfterQuiet({
+        runs: [
+          {
+            ...blockedParent,
+            delegatedCompletion: { disposition: "open", nextGeneration: 1, delivery: null },
+          },
+          unrelated,
+        ],
+        subagents: [{ ...child, completionDelivery: { state: "pending" } }],
+        errors: [{ runId: "a", ...BLOCKED }],
+      })._tag,
+    ).toBe("wait");
   });
 
   it("only treats the content filter as blocked", () => {

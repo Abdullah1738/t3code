@@ -14,7 +14,7 @@ import * as ThreadManagementService from "../../orchestration-v2/ThreadManagemen
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
 import { mcpPrincipal, scheduleFailure, schedulesAs } from "../missions/guard/mcp.ts";
 import { authorizeScheduleChange } from "../missions/guard/schedules.ts";
-import { readBlockRetry, writeBlockRetry } from "./runFollow.ts";
+import { readBlockRetry, retryableLaunchModes, writeBlockRetry } from "./runFollow.ts";
 
 const ScheduledTaskBlockRetryTool = Tool.make("t3_scheduled_task_block_retry", {
   description:
@@ -70,6 +70,13 @@ const handlers = {
             message:
               "Only tasks that start a new thread can retry; this one posts into an existing thread.",
           });
+        }
+        if (input.fallbacks !== null) {
+          // A run already started keeps the modes it started with, and so would its retry.
+          const inFlight = yield* retryableLaunchModes(sql, task).pipe(
+            Effect.mapError(unavailable),
+          );
+          for (const modes of inFlight) yield* assertTargetWithinLimits(limits, modes);
         }
         // Any change to a bound task goes through the mission guard, as an edit would.
         yield* authorizeScheduleChange({

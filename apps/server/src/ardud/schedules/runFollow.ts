@@ -40,7 +40,6 @@ import type * as SqlError from "effect/sql/SqlError";
 
 import type * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import type * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
-import { owedDelegatedCompletion } from "../archive-if-idle/idle.ts";
 import { runningBackgroundWork } from "../context-reset/backgroundWork.ts";
 
 const FOLLOWS_DDL = `CREATE TABLE IF NOT EXISTS ardud_scheduled_task_follows (
@@ -157,6 +156,34 @@ const latestCompletion = (projection: FollowedThread, sinceMs: number): number =
   return latest;
 };
 
+/**
+ * A delegated report can still wake the thread, unless the run it was sent as
+ * is parked in a held queue. A held queue elsewhere in the thread doesn't stop
+ * a report that hasn't been sent yet.
+ */
+const owesReport = (projection: FollowedThread): boolean => {
+  const open = new Set<string>();
+  const parked = new Set<string>();
+  for (const run of projection.runs) {
+    const cohort = run.delegatedCompletion;
+    if (cohort?.disposition !== "open") continue;
+    open.add(run.id);
+    if (cohort.delivery === null || cohort.delivery.taskIds.length === 0) continue;
+    const { messageId, taskIds } = cohort.delivery;
+    const sentAs = projection.runs.find((candidate) => candidate.userMessageId === messageId);
+    if (sentAs?.status !== "queued" || sentAs.queueHeld !== true) return true;
+    for (const taskId of taskIds) parked.add(taskId);
+  }
+  return projection.subagents.some(
+    (subagent) =>
+      subagent.runId !== null &&
+      open.has(subagent.runId) &&
+      !parked.has(subagent.id) &&
+      (subagent.completionDelivery?.state === "pending" ||
+        subagent.completionDelivery?.state === "claimed"),
+  );
+};
+
 /** A new thread's outcome, once nothing in it is still working or owed. */
 export const threadVerdict = (
   projection: FollowedThread,
@@ -174,11 +201,10 @@ export const threadVerdict = (
       turn.runAttemptId === null && (turn.status === "pending" || turn.status === "running"),
   );
   if (runlessTurn) return WAIT;
+  if (owesReport(projection)) return WAIT;
+  if (thread.limitRecovery?.autoResume === true) return WAIT;
   // Held queued runs stay held; they never count as finished work.
   const held = runs.some((run) => run.status === "queued");
-  // A report owed into a held queue is parked with it, so it can't wake the thread.
-  if (!held && owedDelegatedCompletion(projection) !== null) return WAIT;
-  if (thread.limitRecovery?.autoResume === true) return WAIT;
   if (nowMs - latestCompletion(projection, sinceMs) < FOLLOW_QUIET_MS) return WAIT;
 
   const latest = latestExecutedRun(runs);
@@ -275,6 +301,28 @@ export const writeBlockRetry = Effect.fn("ScheduledTaskRunFollow.writeBlockRetry
       updated_at = excluded.updated_at
   `;
 });
+
+/**
+ * The modes of the task's runs still followed and not yet retried. A retry
+ * armed now launches with these, not the task's current ones.
+ */
+export const retryableLaunchModes = Effect.fn("ScheduledTaskRunFollow.retryableLaunchModes")(
+  function* (
+    sql: SqlClient.SqlClient,
+    task: Pick<ScheduledTask, "id" | "createdAt">,
+  ): Effect.fn.Return<
+    ReadonlyArray<Pick<ScheduledTask, "runtimeMode" | "interactionMode">>,
+    SqlError.SqlError
+  > {
+    yield* ensureRunFollowTables(sql);
+    const rows = yield* sql<{ readonly launch_json: string }>`
+      SELECT launch_json FROM ardud_scheduled_task_follows
+      WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt}
+        AND attempt = 0 AND run_id IS NULL
+    `;
+    return rows.flatMap((row) => Option.toArray(decodeLaunchSettings(row.launch_json)));
+  },
+);
 
 interface FollowRow {
   readonly task_id: string;
