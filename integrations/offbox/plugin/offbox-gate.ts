@@ -8,7 +8,8 @@
 // Mode comes from ~/.config/opencode/offbox-gate.json (mtime-cached, so a flip
 // needs no restart). OFFBOX_GATE_MODE in the server env overrides it (tests).
 // The shell create hook puts remote-compute/scripts/blockers first on PATH
-// (docker shim) and exports OFFBOX_GATE=1. Fails open on every error.
+// (docker shim), exports OFFBOX_GATE=1 and blanks BUN_INSPECT (the server's own
+// inspector port; bun children can't bind it). Fails open on every error.
 import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -164,10 +165,14 @@ export default {
 
     await ctx.shell.hook("create.before", (e: any) => {
       try {
+        const env = e.env ?? (e.env = {})
+        // The server runs with BUN_INSPECT pointing at its own inspector port, so
+        // every bun script an agent starts would fail to bind it (EADDRINUSE).
+        // Empty means off to bun. Done in every gate mode.
+        if (process.env.BUN_INSPECT) env.BUN_INSPECT = ""
         if (mode() === "off") return
         // OPENCODE_SESSION_ID is set by the shell tool after this hook runs, so it
         // can't be checked here; the shim itself passes through without it.
-        const env = e.env ?? (e.env = {})
         if (process.env.OFFBOX_GATE_DEBUG || shellHookSeen++ < 3) log({ event: "shell-hook", cwd: e.cwd, has_env: !!e.env, keys: Object.keys(e) })
         const path = env.PATH ?? process.env.PATH ?? "/usr/bin:/bin"
         if (!path.split(":").includes(BLOCKERS)) env.PATH = `${BLOCKERS}:${path}`

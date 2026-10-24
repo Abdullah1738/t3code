@@ -883,6 +883,10 @@ def card_enrollment(new, cfg, args):
 
 
 def main(argv=None, _locked=False):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['aftercare']:
+        import aftercare
+        return aftercare.main(argv[1:], session=SESSION)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'add', 'check', 'remove', 'reconcile'])
     parser.add_argument('--app', required=True, choices=list(PACKAGES) + list(ALIASES))

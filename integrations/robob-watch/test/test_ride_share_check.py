@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import sqlite3
@@ -87,8 +88,15 @@ if fail and os.environ.get("FAKE_BRIDGE_QUEUED"):
     queue(os.environ["FAKE_BRIDGE_QUEUED"])  # accepted, but the reply never came back
 if fail:
     print(os.environ.get("FAKE_BRIDGE_ERR") or "boom", file=sys.stderr); sys.exit(1)
+if args[0] == "share" and os.environ.get("FAKE_BRIDGE_CAP"):
+    with open(log) as f:  # all 10 shares are live until something is unshared
+        if not any(json.loads(x)[0] == "unshare" for x in f):
+            print('{"error":"Bridge request failed (HTTP 409): At most 10 live shares; unshare one first"}',
+                  file=sys.stderr); sys.exit(1)
 if args[0] in ("send", "app"):
     print(json.dumps(queue(os.environ.get("FAKE_BRIDGE_ACK_STATE") or "sent")))
+elif args[0] == "unshare":
+    print(json.dumps({"app": args[2], "removed": True}))
 elif args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -231,6 +239,13 @@ class Base(unittest.TestCase):
             return []
         with open(self.blog) as f:
             return [json.loads(x) for x in f]
+
+    def share_log(self):
+        p = os.path.join(self.journal, f"{A}.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
 
     def mark_sent(self, uuid):
         self.set_state(trip(uuid, "Accepted"), {})
@@ -702,6 +717,227 @@ class RecipientTest(Base):
         self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "omar", "lina"])
 
 
+class UnshareTest(Base):
+    def unshares(self):
+        return [c[2] for c in self.bridge_calls() if c[0] == "unshare"]
+
+    def ended(self, uuid, status="COMPLETED", at=30):
+        self.mark_sent(uuid)
+        self.run_check(0)
+        self.set_state(None, {uuid: {"status": status}})
+        self.run_check(at)
+        self.assertTrue(self.card(uuid)["terminal"])
+
+    def test_ended_ride_link_goes_an_hour_after_the_end_once(self):
+        self.ended(A)
+        self.assertEqual(self.run_check(30 + 3599), [])
+        self.assertEqual(self.unshares(), [], "the page stays up for an hour after the ride")
+        self.assertEqual(self.run_check(30 + 3600), [])
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "taken down once")
+
+    def unconfirmed(self, uuid, start):
+        """A shared ride Uber stops showing with no history status: frozen as unconfirmed at
+        start + 30 + 3h. Returns the freeze time."""
+        self.set_state(trip(uuid, "OnTrip"), {})
+        self.card_cli("send", "--trip", uuid, "--session", "thread-1@3")
+        self.run_check(start)
+        self.set_state(None, {})
+        frozen = start + 30 + 3 * 3600
+        for t in (start + 30, start + 60, frozen):
+            self.run_check(t)
+        self.assertEqual((self.card(uuid)["state"], self.card(uuid)["terminal"]), ("unknown", True))
+        return frozen
+
+    def test_cancelled_and_unconfirmed_rides_are_unshared_too(self):
+        self.ended(A, status="CANCELED")
+        self.run_check(30 + 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        frozen = self.unconfirmed(B, 4000)
+        self.run_check(frozen + 12 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}", f"ride-{B}"])
+
+    def test_unconfirmed_ride_keeps_its_link_for_12h_after_it_froze(self):
+        # "Checking" started 3h before the freeze; the link's clock starts at the freeze itself.
+        frozen = self.unconfirmed(A, 0)
+        for t in (frozen + 30, frozen + 3600, frozen + 12 * 3600 - 30):
+            self.run_check(t)
+        self.assertEqual(self.unshares(), [], "a ride Uber never confirmed ended may still be going")
+        self.run_check(frozen + 12 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+
+    def test_unconfirmed_ride_that_shows_up_again_reopens_and_keeps_its_link(self):
+        frozen = self.unconfirmed(A, 0)
+        self.set_state(trip(A, "OnTrip"), {})
+        self.run_check(frozen + 600)
+        c = self.card(A)
+        self.assertEqual((c["state"], c["terminal"]), ("ontrip", False), "the ride was live all along")
+        for t in (frozen + 12 * 3600, frozen + 30 * 3600):
+            self.run_check(t)
+        self.assertEqual(self.unshares(), [], "a ride Uber shows right now keeps its link")
+        self.set_state(None, {A: {"status": "COMPLETED"}})
+        self.run_check(frozen + 30 * 3600 + 30)
+        self.assertEqual(self.card(A)["state"], "done")
+        self.run_check(frozen + 31 * 3600 + 30)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+
+    def test_trip_uber_shows_now_is_never_unshared(self):
+        self.ended(A)
+        self.set_state(trip(A, "OnTrip"), {A: {"status": "COMPLETED"}})  # history and status disagree
+        self.run_check(30 + 7200)
+        self.assertEqual(self.unshares(), [])
+        self.assertEqual(self.card(A)["state"], "done", "a history-confirmed end stays frozen")
+
+    def hold(self, uuid):
+        f = open(os.path.join(self.journal, f".{uuid}.lock"), "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        self.addCleanup(f.close)
+        return f
+
+    def test_busy_trip_is_skipped_not_waited_on(self):
+        self.ended(A)
+        self.ended(B)
+        for u in (A, B):  # previews current, so the preview retry has no reason to touch A
+            open(os.path.join(self.cards, f"ride-{u}", "preview.png"), "w").close()
+        self.run_check(30 + 60)
+        held = self.hold(A)
+        start = time.time()
+        self.run_check(30 + 3600)
+        self.assertLess(time.time() - start, 20, "the check never waits on another trip's lock")
+        self.assertEqual(self.unshares(), [f"ride-{B}"])
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{B}", f"ride-{A}"])
+
+    def test_share_cap_skips_a_trip_someone_is_sending(self):
+        # The cap path takes each candidate's lock without waiting: a busy one is left alone.
+        self.ended(A)
+        self.ended("cccccccc-0000-4000-8000-000000000001")
+        self.hold(A)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), ["ride-cccccccc-0000-4000-8000-000000000001"])
+
+    def test_share_cap_frees_no_ride_that_may_still_be_going(self):
+        self.unconfirmed(A, int(time.time()) - 3 * 3600 - 60)  # froze a minute ago (send uses the real clock)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
+
+    def test_share_cap_spares_a_frozen_ride_uber_shows_again(self):
+        # A froze as "never confirmed" over 12h ago, but Uber shows it on a trip again; B's share hits
+        # the cap before the watcher has reopened A's card.
+        self.unconfirmed(A, int(time.time()) - 16 * 3600)
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("refresh", "--trip", B)  # B's card, without a watcher run that would reopen A
+        self.set_state(trip(A, "OnTrip"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [], "the ride Uber shows right now keeps its link")
+
+    def test_share_cap_frees_nothing_when_uber_cant_be_read(self):
+        self.unconfirmed(A, int(time.time()) - 16 * 3600)
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("refresh", "--trip", B)
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1",
+                          UBER_BIN=os.path.join(self.dir, "no-such-uber"))
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "with Uber read, a ride frozen 12h+ ago can go")
+
+    def test_unshared_ride_that_shows_up_again_gets_a_new_link(self):
+        frozen = self.unconfirmed(A, 0)
+        self.run_check(frozen + 12 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        old = self.share_log()["recipients"]["moni"]["payload"]["url"]
+        self.set_state(trip(A, "OnTrip"), {})
+        out = self.run_check(frozen + 13 * 3600)
+        self.assertEqual(len(out), 1, "the watcher wakes the owner thread to send the new link")
+        self.assertTrue(out[0].startswith(f"CARD_READY trip={A}") and "missing=moni" in out[0], out)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent", "moni": "sent"})
+        shares = [c for c in self.bridge_calls() if c[0] == "share"]
+        self.assertEqual(len(shares), 2, "the card is shared again")
+        moni = [c for c in self.bridge_calls() if c[0] == "send" and c[c.index("--to") + 1] == "moni"]
+        self.assertEqual(len(moni), 2)
+        self.assertEqual(moni[-1][moni[-1].index("--key") + 1], f"uber:{A}:card:moni:relink1")
+        self.assertIn(old, moni[-1][moni[-1].index("--text") + 1], "same page, shared again")
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+        j = self.share_log()
+        self.assertEqual([r["who"] for r in j["retired"]], ["moni"])
+        self.assertEqual(self.run_check(frozen + 13 * 3600 + 60), [])
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent", "moni": "already sent"})
+
+    def test_old_unconfirmed_card_without_a_freeze_time_keeps_its_link(self):
+        # Frozen before ended_at existed and with no readable checked_at: `since` is when "Checking"
+        # began, hours before the freeze, so it can't start the 12h clock. The 2-day share runs out.
+        frozen = self.unconfirmed(A, 0)
+        path = os.path.join(self.cards, f"ride-{A}", "data.json")
+        with open(path) as f:
+            c = json.load(f)
+        c.pop("ended_at", None)
+        c["checked_at"] = None
+        with open(path, "w") as f:
+            json.dump(c, f)
+        self.run_check(frozen + 30 * 3600)
+        self.assertEqual(self.unshares(), [])
+
+    def test_live_ride_and_owner_only_card_keep_their_pages(self):
+        self.set_state(trip(A, "OnTrip"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.run_check(10 * 3600)
+        self.assertEqual(self.unshares(), [], "a ride still going keeps its link")
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("send", "--trip", B, "--session", "thread-1@3", "--chat", "abdullah")
+        self.run_check(10 * 3600 + 30)
+        self.set_state(None, {A: {"status": "COMPLETED"}, B: {"status": "COMPLETED"}})
+        self.run_check(10 * 3600 + 60)
+        self.run_check(20 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "the owner's tailnet card is no share")
+
+    def test_failed_unshare_is_tried_again_next_run(self):
+        self.ended(A)
+        p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(30 + 3600), FAKE_BRIDGE_FAIL="unshare"))
+        self.assertEqual(p.returncode, 0, "a bridge hiccup must not fail the watcher")
+        self.assertIn(f"unshare {A} failed", p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{A}", f"ride-{A}"])
+        self.assertTrue(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+
+    def test_share_cap_frees_ended_rides_then_shares(self):
+        # All 10 live shares in use (trip e44d36f9): an ended ride's link goes and the share is retried.
+        self.ended(A)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "sent", "moni": "sent"})
+        calls = [c[:3] for c in self.bridge_calls() if c[0] in ("share", "unshare")]
+        self.assertEqual(calls[-3:], [["share", "--app", f"ride-{B}"], ["unshare", "--app", f"ride-{A}"],
+                                      ["share", "--app", f"ride-{B}"]])
+
+    def test_a_backlog_goes_a_few_per_run(self):
+        uuids = [f"cccccccc-0000-4000-8000-00000000000{i}" for i in range(4)]
+        for u in uuids:
+            self.ended(u)
+        self.run_check(30 + 3600)
+        self.assertEqual(len(self.unshares()), 3)
+        self.run_check(30 + 3630)
+        self.assertEqual(sorted(self.unshares()), sorted(f"ride-{u}" for u in uuids))
+
+    def test_share_cap_with_nothing_ended_still_fails_plainly(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
+
+
 class PreviewRetryTest(Base):
     def test_failed_preview_retried_next_check_without_version_bump(self):
         lib = os.path.join(self.dir, "plib")
@@ -810,13 +1046,6 @@ class SendTest(Base):
                     with open(path, "rb") as fh:
                         snap[path] = (fh.read(), os.stat(path).st_mtime_ns)
         return snap
-
-    def share_log(self):
-        p = os.path.join(self.journal, f"{A}.json")
-        if not os.path.exists(p):
-            return None
-        with open(p) as f:
-            return json.load(f)
 
     def test_group_from_owner_session_gets_one_public_link_and_joins_the_ride(self):
         self.set_state(trip(A, "Accepted"), {})

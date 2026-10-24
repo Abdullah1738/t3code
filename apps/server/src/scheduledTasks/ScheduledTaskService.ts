@@ -53,6 +53,13 @@ import {
   nextScheduledRunAt,
 } from "./Schedule.ts";
 import { ONCE_IN_PAST_MESSAGE, onceRunInPast } from "../ardud/schedules/onceTasks.ts";
+// ardud schedules: run status follows the work a run started.
+import {
+  ensureRunFollowTables,
+  followKey,
+  makeRunFollower,
+  type FollowTarget,
+} from "../ardud/schedules/runFollow.ts";
 import {
   redactHeaders,
   redactQuery,
@@ -345,10 +352,17 @@ export const listDueTasks = Effect.fn("ScheduledTaskService.listDueTasks")(funct
   now: DateTime.DateTime,
 ) {
   const sql = yield* SqlClient.SqlClient;
+  // ardud schedules: a dispatched run that is only being followed doesn't
+  // block the next occurrence, same as upstream's dispatch-time success.
+  yield* ensureRunFollowTables(sql);
   const rows = yield* sql<ScheduledTaskRow>`
     SELECT * FROM scheduled_tasks
     WHERE enabled = 1 AND next_run_at IS NOT NULL
-      AND next_run_at <= ${iso(now)} AND last_run_status <> 'running'
+      AND next_run_at <= ${iso(now)}
+      AND (last_run_status <> 'running' OR EXISTS (
+        SELECT 1 FROM ardud_scheduled_task_follows f
+        WHERE f.task_id = scheduled_tasks.task_id AND f.started_at = scheduled_tasks.last_run_at
+      ))
     ORDER BY next_run_at ASC, task_id ASC
   `;
   const tasks: ScheduledTask[] = [];
@@ -637,7 +651,8 @@ export const layer = Layer.effect(
       readonly id: ScheduledTaskId;
       readonly completedAtIso: string;
       readonly nextRunAtIso: string | null;
-      readonly status: "succeeded" | "failed";
+      // ardud schedules: "running" while the dispatched run is followed.
+      readonly status: "succeeded" | "failed" | "running";
       readonly error: string | null;
       readonly startedAtIso: string;
     }) =>
@@ -656,6 +671,15 @@ export const layer = Layer.effect(
           taskError("Could not record schedule task run.", { taskId: input.id, cause }),
         ),
       );
+
+    // ardud schedules: run status follows the work a run started.
+    const runFollower = makeRunFollower({
+      sql,
+      threads: threadManagement,
+      launcher: threadLaunch,
+      findTask: (id) => findTask(id),
+      notifyChanged,
+    });
 
     const disableTask = (id: ScheduledTaskId, atIso: string) =>
       sql`
@@ -830,7 +854,22 @@ export const layer = Layer.effect(
 
         const completedAt = yield* localNow;
         const runSucceeded = result._tag === "Success";
-        const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
+        // ardud schedules: a dispatched run stays "running" until the work it
+        // started settles; a bound task follows only the run it queued.
+        const followTarget: FollowTarget | null =
+          result._tag !== "Success"
+            ? null
+            : "threadId" in result.value
+              ? { threadId: result.value.threadId, runId: null }
+              : active.threadId === null
+                ? null
+                : { threadId: ThreadId.make(active.threadId), runId: result.value.run.id };
+        const lastRunStatus =
+          followTarget !== null
+            ? ("running" as const)
+            : runSucceeded
+              ? ("succeeded" as const)
+              : ("failed" as const);
         const lastRunError = runSucceeded ? null : errorMessage(result.cause);
         const current = yield* findTask(task.id);
         const scheduleSource = current ?? task;
@@ -853,7 +892,7 @@ export const layer = Layer.effect(
           // startedAtIso in the guard ensures this writes only to the row this
           // run marked as running — a task deleted mid-run and recreated with
           // the same id (idempotent commandId replay) must not be stamped.
-          yield* markCompleted({
+          const recordRun = markCompleted({
             id: task.id,
             completedAtIso: completed.updatedAt,
             nextRunAtIso: completed.nextRunAt,
@@ -861,6 +900,34 @@ export const layer = Layer.effect(
             error: lastRunError,
             startedAtIso,
           });
+          // ardud schedules: one transaction, so a crash can't leave a
+          // dispatched run that is neither followed nor recorded.
+          yield* followTarget === null
+            ? recordRun
+            : sql
+                .withTransaction(
+                  recordRun.pipe(
+                    Effect.andThen(
+                      runFollower.record({
+                        task: active,
+                        startedAtIso,
+                        fireKey,
+                        prompt,
+                        target: followTarget,
+                      }),
+                    ),
+                  ),
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    cause._tag === "ScheduledTaskError"
+                      ? cause
+                      : taskError("Could not record schedule task run.", {
+                          taskId: task.id,
+                          cause,
+                        }),
+                  ),
+                );
           if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
           yield* notifyChanged;
         }
@@ -959,7 +1026,14 @@ export const layer = Layer.effect(
     // would otherwise be skipped by the due-task filter forever.
     yield* Effect.gen(function* () {
       const rows = yield* selectAllRows();
-      const stuck = rows.filter((row) => row.last_run_status === "running");
+      // ardud schedules: a dispatched run that is being followed survives the
+      // restart; the follower settles it.
+      const followed = yield* runFollower.followedKeys;
+      const stuck = rows.filter(
+        (row) =>
+          row.last_run_status === "running" &&
+          !followed.has(followKey(row.task_id, row.last_run_at)),
+      );
       if (stuck.length === 0) return;
       const now = yield* localNow;
       yield* Effect.forEach(
@@ -1002,6 +1076,8 @@ export const layer = Layer.effect(
     );
 
     yield* scheduler.register("scheduled-tasks", runDueTasks());
+    // ardud schedules: settle followed runs once their work is done.
+    yield* scheduler.register("scheduled-task-follows", runFollower.sweep);
 
     const list: ScheduledTaskService["Service"]["list"] = () =>
       listRows().pipe(

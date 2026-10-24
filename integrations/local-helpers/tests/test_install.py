@@ -131,7 +131,11 @@ exit 0
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 3, self.calls_log())
+        self.assertEqual(len(loads), 6, self.calls_log())
+        for rel in (".local/share/juno-proxy/juno_proxy.py", ".local/bin/power-unplug-telegram.sh",
+                    ".local/bin/battery-low-telegram.sh"):
+            self.assertTrue(os.path.isfile(self.live(rel)), rel)
+        self.assertTrue(os.access(self.live(".local/bin/power-unplug-telegram.sh"), os.X_OK))
         self.assertIn("no Uber CLI under ~/.nvm", err)
         self.assertIn("installed", out)
         rc, _, err = self.run_install("--check")
@@ -197,6 +201,36 @@ exit 0
         uid = os.getuid()
         self.assertIn(f"kickstart -k gui/{uid}/local.ardud.otp-idle", self.calls_log())
         self.assertFalse([c for c in self.calls_log() if c.startswith("bootstrap")])
+
+    def test_new_juno_proxy_code_restarts_the_proxy_only(self):
+        self.ready()
+        self.run_install()
+        os.remove(self.calls)
+        with open(self.live(".local/share/juno-proxy/juno_proxy.py"), "a") as fh:
+            fh.write("\n# drift\n")
+        rc, out, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        uid = os.getuid()
+        self.assertEqual([c for c in self.calls_log() if c.startswith(("kickstart", "bootstrap", "bootout"))],
+                         [f"kickstart -k gui/{uid}/com.abdullah.juno-proxy"])
+        self.assertIn("restarted com.abdullah.juno-proxy", out)
+        rc, _, err = self.run_install("--check")
+        self.assertEqual(rc, 0, err)
+
+    def test_failed_proxy_restart_is_reported_by_check_and_redone(self):
+        self.run_install()
+        with open(self.live(".local/share/juno-proxy/juno_proxy.py"), "a") as fh:
+            fh.write("\n# drift\n")
+        rc, _, err = self.run_install(kick_fail="1")
+        self.assertEqual(rc, 1)
+        self.assertIn("com.abdullah.juno-proxy restart failed", err)
+        rc, _, err = self.run_install("--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("com.abdullah.juno-proxy still runs older code (restart pending)", err)
+        rc, out, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("restarted com.abdullah.juno-proxy", out)
+        self.assertNotIn("otp-idle", out)
 
     def test_failed_idle_restart_stays_pending_until_a_later_run_does_it(self):
         self.run_install()
@@ -275,7 +309,8 @@ exit 0
         for d in logs:
             self.assertTrue(os.path.isdir(d), d)
         self.assertEqual(sorted(os.listdir(self.loaded)),
-                         ["local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
+                         ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.power-unplug-telegram",
+                          "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
     def test_modes_are_checked_and_repaired_on_their_own(self):
         self.run_install()

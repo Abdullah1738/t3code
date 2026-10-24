@@ -1,0 +1,55 @@
+#!/bin/zsh
+# Agent-only email send guard (himalaya and himalaya-heal). Agents send through `mailsend`,
+# which checks Abdullah's later OK on the exact message (owner rule 18 Oct 2026, nightly 22 Oct).
+# mailsend and the mail watchers call himalaya by absolute path, so only direct agent calls land here.
+emulate -L zsh
+setopt NO_UNSET
+typeset name=${0:t} shim=${0:A} blockers=${0:A:h} real='' candidate dir a
+for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  [[ -n "$dir" ]] || dir=.
+  [[ "${dir:A}" == "$blockers" ]] && continue
+  candidate="$dir/$name"
+  if [[ -x "$candidate" && "${candidate:A}" != "$shim" ]]; then
+    real="$candidate"
+    break
+  fi
+done
+
+# Does WORD pick one of NAMES? clap takes a name, an alias or any unambiguous prefix (`msg s` is `message send`),
+# so any prefix counts here: an ambiguous one is refused by himalaya anyway.
+picks() { local w=$1 n; shift; [[ -n $w ]] || return 1; for n; do [[ $n == $w* ]] && return 0; done; return 1; }
+
+if [[ -n "${OPENCODE_SESSION_ID:-}" ]]; then
+  # Options that take a value (with their aliases), so a value is never read as a command word.
+  typeset -a words value_flags=(-c --config -a --account -b --backend --log-level --log --log-file
+    -m --mailbox -f --folder -t --to --cc --bcc -s --subject --body --body-file --attach
+    --signature --signature-file --save --from -P --posting-style -Q --quote-headline
+    -d --downloads-dir -p --page -w --max-width --flag --mail-from --rcpt-to -H --header -q --query)
+  typeset -i i=1 send_flag=0 rest=0
+  # --send anywhere counts, even where it might be read as another option's value.
+  (( ${@[(I)--send]} || ${@[(I)--send=*]} )) && send_flag=1
+  while (( i <= $# )); do
+    a=${@[i]}
+    if (( ! rest )) && [[ $a == -- ]]; then rest=1
+    elif (( ! rest )) && [[ $a == -* ]]; then
+      [[ $a != *=* ]] && (( ${value_flags[(Ie)$a]} )) && (( i++ ))
+    elif (( ${#words} < 3 )); then
+      words+=("$a")
+    fi
+    (( i++ ))
+  done
+  typeset w1=${words[1]:-} w2=${words[2]:-} w3=${words[3]:-} verbs="${words[*]}"
+  if (( send_flag )) || picks "$w1" smtp jmap || { picks "$w1" message messages msg && picks "$w2" send; } \
+      || { picks "$w1" gmail && picks "$w2" messages message msg drafts draft && picks "$w3" send; } \
+      || { picks "$w1" msgraph && picks "$w2" message messages msg && picks "$w3" send; }; then
+    print -u2 -- "Blocked: agents don't send email with $name directly${verbs:+ ($verbs)}."
+    print -u2 -- 'Draft it with `mailsend draft|reply|forward ...`, show Abdullah the preview it prints,'
+    print -u2 -- 'and after his OK: `mailsend send --approved <id> --inbound <incoming message ID of his reply>` (agent-mail skill).'
+    exit 2
+  fi
+fi
+if [[ -z "$real" ]]; then
+  print -u2 -- "send guard: real $name executable not found on PATH."
+  exit 127
+fi
+exec "$real" "$@"

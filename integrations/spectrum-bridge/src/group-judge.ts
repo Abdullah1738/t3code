@@ -157,6 +157,11 @@ export function replyTarget(db: Database, lines: GroupLine[], id: string, nameOf
   return text ? `${input.sender ? nameOf(input.sender) : "Someone"}: ${clip(text, 300)}` : undefined;
 }
 
+/** A swipe target resolved elsewhere, as "Name: text". No name means Robob. */
+export function targetLine(who: string | undefined, text: string): string | undefined {
+  return text.trim() ? `${who ?? ROBOB}: ${clip(text, 300)}` : undefined;
+}
+
 /** What Jev sees for one new message. `addressed` says whether an earlier row reached Robob. */
 export function judgeState(lines: GroupLine[], item: GroupLine, options: {
   timezone: string; replyTo?: string; working: boolean; addressed: (id: string) => boolean;

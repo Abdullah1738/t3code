@@ -1279,27 +1279,37 @@ export const make = Effect.gen(function* () {
       delivery.timeZone,
     );
     const context = { cause: incident.cause, at };
+    // The note's facts are from when the incident was opened, not from now.
+    const stamped = (text: string) =>
+      queue
+        ? `${text}\n${Model.queuedNoteStamp(
+            Model.clockLabel(incident.detectedAt, delivery.timeZone),
+            Model.clockLabel(now, delivery.timeZone),
+          )}`
+        : text;
     if (incident.cause === "succession" || thread.roleKind !== "master") {
-      return Model.threadNotice(context, thread);
+      return stamped(Model.threadNotice(context, thread));
     }
     const mission = yield* store.get("mission", thread.missionId);
     const settings = yield* settingsOf(thread.missionId);
-    return Model.masterNotice({
-      context,
-      missionTitle: Option.isSome(mission) ? mission.value.title : thread.missionId,
-      downSeconds: incident.downSeconds,
-      master: thread,
-      others: missionThreads(incident, thread.missionId).filter(
-        (other) => other.threadId !== thread.threadId,
-      ),
-      settings,
-      lanesStartAt: queue
-        ? Model.clockLabel(
-            iso(lanesStartAfter(incident, true, Date.parse(now), settings)),
-            delivery.timeZone,
-          )
-        : null,
-    });
+    return stamped(
+      Model.masterNotice({
+        context,
+        missionTitle: Option.isSome(mission) ? mission.value.title : thread.missionId,
+        downSeconds: incident.downSeconds,
+        master: thread,
+        others: missionThreads(incident, thread.missionId).filter(
+          (other) => other.threadId !== thread.threadId,
+        ),
+        settings,
+        lanesStartAt: queue
+          ? Model.clockLabel(
+              iso(lanesStartAfter(incident, true, Date.parse(now), settings)),
+              delivery.timeZone,
+            )
+          : null,
+      }),
+    );
   });
 
   /**
@@ -1316,6 +1326,27 @@ export const make = Effect.gen(function* () {
     const lead = noticeAtMs + settings.masterLeadSeconds * 1000;
     return queued ? Math.max(lead, Date.parse(incident.detectedAt) + MASTER_WAIT_MS) : lead;
   };
+
+  /**
+   * The plan skips a cut turn that was already continued, but delivery can come
+   * much later (master first, rate limit): a turn that got going again in
+   * between needs no notice either, or it lands hours later as stale news.
+   */
+  const continuedSincePlan = Effect.fn("RecoveryService.continuedSincePlan")(function* (
+    target: RecoveryThread,
+  ) {
+    if (
+      target.roleKind === "master" ||
+      target.action !== "resume" ||
+      target.cutRunId === null ||
+      target.lostChildren.length > 0 ||
+      target.decidedBy !== null
+    ) {
+      return false;
+    }
+    const [cut] = yield* recovery.cutRunsById([target.cutRunId]);
+    return cut?.continued === true;
+  });
 
   /**
    * Sends one thread's notice. An idle thread gets it through its doorbell; a
@@ -1378,6 +1409,14 @@ export const make = Effect.gen(function* () {
           alongside: recovery.saveIncident(next, now),
         });
         return { incident: next, sent: false };
+      }
+      // Only a note that never went out can be dropped: a run started after an
+      // unconfirmed send may be that note's own turn.
+      if (claim?.state !== "sent" && (yield* continuedSincePlan(target))) {
+        return yield* settle({
+          state: "skipped",
+          stateReason: "turn already continued, nothing lost",
+        });
       }
       let outcome: SystemNoticeOutcome | null = null;
       if (claim?.state !== "sent") {

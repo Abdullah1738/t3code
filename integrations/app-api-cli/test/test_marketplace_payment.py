@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+import time
 
 import commerce_cli as cli
 import commerce_journal as j
@@ -190,6 +191,284 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(now[0], 7)
         self.assertEqual(j.inspect(flow.flow_id)['state'], 'FENCED')
         self.assertEqual(len([x for x in wire.calls if x[0] == 'place']), 1)
+
+    def test_unconfirmed_payment_gets_one_stall_alert_at_five_minutes(self):
+        flow, wire = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        now, stalled = [0.0], []
+        def sleep(seconds): now[0] += seconds
+        def stall(*args):
+            stalled.append((now[0], args))
+            return {'queued': True}
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(), stall_notify=stall)
+        self.assertEqual(stalled, [(300.0, (main.ORDER, 1980))])
+        details = caught.exception.details
+        self.assertEqual((details['charge'], details['flow_id']), ('unknown', flow.flow_id))
+        self.assertIn('still waiting on the bank', details['tell'])
+        self.assertIn(f'commerce await-payment {flow.flow_id} (status only, never resends)', details['next'])
+
+    def test_payment_that_confirms_inside_five_minutes_has_no_stall_alert(self):
+        pending = {'status': 'pending'}
+        flow, wire = self.placed(order_status=[pending] * 100 + [main.FIXTURE['status_success']])
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        stall = Mock(return_value={'queued': True})
+        self.assertTrue(flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(),
+                                           stall_notify=stall)['paid'])
+        stall.assert_not_called()
+
+    def test_no_notify_silences_the_stall_alert_too(self):
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        stall = Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError):
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=None, stall_notify=stall)
+        stall.assert_not_called()
+
+    def test_stall_alert_text_and_key_differ_from_the_3ds_alert(self):
+        with patch.object(payment.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+            result = payment.telegram_stall_notify(main.ORDER, 13348)
+        command = run.call_args.args[0]
+        text = command[command.index('--text') + 1]
+        self.assertTrue(text.startswith('noon AED 133.48 still not confirmed after 5 min.'))
+        self.assertIn('check noon > Orders before ordering in the app', text)
+        self.assertEqual(result, {'queued': True, 'key': f'noon-marketplace-stall-{main.ORDER}'})
+
+    def test_decline_never_says_not_charged_without_the_stores_proof(self):
+        failed = failed_responses(main.ORDER, 1980)
+        failed['order_refund']['sections']['completedRefunds']['refundMediums'][0]['description'] = 'Refund processed'
+        flow, wire = self.placed(**failed)
+        flow.place()
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(notify=None)
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertNotIn('nothing', details['tell'].lower())
+        self.assertNotIn('not charged', details['tell'].lower())
+        self.assertIn("can't say yet whether the card was charged", details['tell'])
+        self.assertIn('never re-place or resend this payment', details['next'])
+
+    def test_decline_with_native_no_capture_proof_says_so(self):
+        failed = failed_responses(main.ORDER, 1980)
+        flow, wire = self.placed(**failed)
+        self.setup_cvv(flow, wire)
+        flow.place()
+        wire.responses['order_status'] = [{'status': 'pending', 'clientSecret': 'intent'},
+                                          failed['order_status'], failed['order_status']]
+        wire.responses['payment_complete'] = {'status': 'payment_pending'}
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(sleep=lambda _: None, notify=None)
+        self.assertEqual(caught.exception.details['charge'], 'not_charged')
+        self.assertIn('confirms nothing was captured', caught.exception.details['tell'])
+
+    def test_cli_prints_the_charge_state_of_a_failed_payment(self):
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        err = None
+        try:
+            j.payment_fail('SUPERMALL_PAYMENT_ERROR_NO_RETRY', flow_id=flow.flow_id, order=main.ORDER,
+                           amount_minor=13348)
+        except j.PaymentError as exc:
+            err = exc
+        out = io.StringIO()
+        with patch.object(cli, 'card_preflight', return_value=None), \
+             patch.object(cli.journal, 'inspect', side_effect=err), contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(['inspect', flow.flow_id]), 1)
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed['error'], printed['charge'], printed['financial_retry']),
+                         ('SUPERMALL_PAYMENT_ERROR_NO_RETRY', 'unknown', False))
+        self.assertIn('AED 133.48', printed['tell'])
+
+    def test_open_flows_lists_only_unsettled_recent_payment_sends(self):
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        open_now = j.open_payments()
+        self.assertEqual([f['flow_id'] for f in open_now], [flow.flow_id])
+        self.assertEqual((open_now[0]['order_id'], open_now[0]['amount_minor']), (main.ORDER, 1980))
+        self.assertEqual(j.open_payments(now=time.time() + 3600), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(['open-flows']), 0)
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed['bank_prompt'], 'ours: approve it')
+        self.assertFalse(printed['financial_send'])
+        with self.assertRaises(j.PaymentError):
+            flow.await_success(attempts=1, sleep=lambda _: None, notify=None)
+        self.assertEqual([f['state'] for f in j.open_payments()], ['FENCED'])
+
+    def test_open_flows_reads_while_the_payment_holds_its_journal(self):
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        with j._db():
+            self.assertEqual([f['flow_id'] for f in j.open_payments()], [flow.flow_id])
+
+    def test_open_flows_takes_no_journal_lock_a_payment_write_could_hit(self):
+        # open-flows runs exactly while a payment waits. A sqlite reader that stalls mid-read
+        # holds a lock the payment's next commit can't get past, so it reads a copy instead.
+        import builtins
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        journal_file = str(self.root / 'journal.sqlite')
+        real_open, real_connect = builtins.open, j.sqlite3.connect
+        readers, wrote = [], []
+        def connect(target, *args, **kwargs):
+            if 'mode=ro' in str(target):
+                readers.append(target)
+            return real_connect(target, *args, **kwargs)
+        def open_mid_read(path, *args, **kwargs):
+            if str(path) == journal_file and not wrote:
+                wrote.append(True)
+                # The live payment writes while the read is in flight; it must not hit a lock.
+                with self.assertRaises(j.PaymentError):
+                    flow.await_success(attempts=1, sleep=lambda _: None, notify=None)
+            return real_open(path, *args, **kwargs)
+        with patch.object(j.sqlite3, 'connect', connect), patch('builtins.open', open_mid_read):
+            listed = j.open_payments()
+        self.assertEqual(readers, [], 'no sqlite reader on the live journal')
+        self.assertEqual(wrote, [True])
+        self.assertEqual([f['state'] for f in listed], ['FENCED'], 'the copy is the state after that write')
+
+    def test_open_flows_refuses_a_journal_it_does_not_understand(self):
+        import sqlite3
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        with sqlite3.connect(self.root / 'journal.sqlite') as db:
+            db.execute('PRAGMA user_version=4')
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
+            j.open_payments()
+        with sqlite3.connect(self.root / 'journal.sqlite') as db:
+            db.execute('PRAGMA user_version=3')
+            db.execute('CREATE TABLE payments_v4 (id TEXT)')
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
+            j.open_payments()
+
+    def test_stall_alert_still_fires_when_the_wait_ends_at_five_minutes(self):
+        for limits in ({'wait_seconds': 300}, {'attempts': 150}):
+            # A fresh journal each: the first fenced flow holds the account.
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            root = Path(temp.name).resolve() / 'commerce'
+            with self.subTest(**limits), patch.object(j, 'ROOT', root), patch.object(receipts, 'ROOT', root):
+                flow, _ = self.placed(order_status={'status': 'pending'})
+                flow.place()
+                now, stalled = [0.0], []
+                def sleep(seconds): now[0] += seconds
+                def stall(*args):
+                    stalled.append(now[0])
+                    return {'queued': True}
+                with self.assertRaises(j.PaymentError):
+                    flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(),
+                                       stall_notify=stall, **limits)
+                self.assertEqual(stalled, [300.0])
+
+    def test_read_that_confirms_at_five_minutes_has_no_stall_alert(self):
+        pending = {'status': 'pending'}
+        flow, _ = self.placed(order_status=[pending] * 150 + [main.FIXTURE['status_success']])
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        stall = Mock(return_value={'queued': True})
+        self.assertTrue(flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(),
+                                           stall_notify=stall)['paid'])
+        self.assertEqual(now[0], 300)
+        stall.assert_not_called()
+
+    def test_declined_payment_has_no_approve_or_stall_alert_and_says_so(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}]
+                                 + [{'status': 'pending'}] * 400,
+                                 payment_complete={'status': 'payment_failed'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_not_called()
+        stall.assert_not_called()
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertIn("didn't go through", details['tell'])
+        self.assertIn("can't say yet whether the card was charged", details['tell'])
+
+    def test_lost_status_read_after_the_send_still_says_charge_unknown(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending'},
+                                               market.MarketplaceError('REQUEST_TIMEOUT')])
+        flow.place()
+        with self.assertRaises(j.PaymentError) as caught, \
+                j.after_payment_send(flow_id=flow.flow_id, order=flow.order, amount_minor=1980):
+            flow.await_success(sleep=lambda _: None, notify=None)
+        self.assertEqual(str(caught.exception), 'REQUEST_TIMEOUT')
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertIn('AED 19.80 went out but I lost its status', details['tell'])
+        self.assertIn('never re-place or resend this payment', details['next'])
+        with self.assertRaises(j.PaymentError) as caught, \
+                j.after_payment_send(flow_id=flow.flow_id, order=flow.order, amount_minor=1980):
+            raise KeyError('paid')
+        # The code stays what the CLI prints for any unexpected error; only guidance is added.
+        self.assertEqual(str(caught.exception), 'COMMERCE_OPERATION_FAILED')
+        self.assertEqual(caught.exception.details['charge'], 'unknown')
+
+    def test_decline_seen_before_a_restart_still_stops_the_alerts(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}]
+                                 + [{'status': 'pending'}] * 5,
+                                 payment_complete={'status': 'payment_failed'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        with self.assertRaises(j.PaymentError):
+            flow.await_success(attempts=3, sleep=lambda _: None, notify=None)
+        recovery = main.Harness({'order_status': [{'status': 'pending', 'clientSecret': 'intent'}] * 400,
+                                 'payment_status': {'status': 'payment_pending'}})
+        resumed = main.c.MainOrderFlow.resume_payment(flow.flow_id, auth=main.FakeAuth(),
+                                                      request=recovery.request)
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            resumed.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_not_called()
+        stall.assert_not_called()
+        self.assertIn("didn't go through", caught.exception.details['tell'])
+
+    def test_bank_approved_payment_stops_the_alerts_and_says_charged_until_confirmed(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}] * 400,
+                                 payment_complete={'status': 'payment_confirmed'},
+                                 payment_status={'status': 'payment_confirmed'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_not_called()
+        stall.assert_not_called()
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertIn('The bank approved the payment for AED 19.80', details['tell'])
+        self.assertIn('Treat the card as charged', details['tell'])
+        self.assertNotIn('waiting on the bank', details['tell'])
+
+    def test_fresh_challenge_after_an_approval_alerts_again(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}] * 400,
+                                 payment_complete={'status': 'payment_confirmed'},
+                                 payment_status={'status': 'payment_ready_to_redirect'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_called_once_with(main.ORDER, 1980)
+        stall.assert_called_once_with(main.ORDER, 1980)
+        self.assertIn('still waiting on the bank', caught.exception.details['tell'])
+        self.assertNotIn('approved', caught.exception.details['tell'])
 
     def test_pending_to_failed_closes_only_with_full_native_no_capture_proof(self):
         failed = failed_responses(main.ORDER, 1980)

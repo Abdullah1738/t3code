@@ -80,6 +80,15 @@ Webhook tasks only run when their URL is called, so they can't be run
 immediately.
 Leaving an edited form asks before discarding unsaved changes.
 
+A task's last run shows as running until the work it started settles. For a task
+that starts a new thread, that means the thread, its subagents and the runs they
+wake have been quiet for a few minutes. For a task that posts into a thread, it
+means the run for that message has ended. A run that ends in a provider error, is
+stopped, or is left held in the queue shows as failed with the reason. A task that
+starts a new thread can opt in, through the `t3_scheduled_task_block_retry` agent
+tool, to one retry on a fallback model when the provider blocks the response. The
+blocked thread is left as it is.
+
 ## Webhook automations
 
 In **Settings → Scheduled tasks**, choose **On webhook**

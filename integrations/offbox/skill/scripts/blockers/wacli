@@ -1,0 +1,46 @@
+#!/bin/zsh
+# Agent-only WhatsApp send guard. Agents send through `wa draft` + `wa send --approved`,
+# which checks Abdullah's later OK on the exact text (owner rule 18 Oct 2026, nightly 22 Oct).
+# wa itself calls wacli by absolute path, so only direct agent calls land here.
+emulate -L zsh
+setopt NO_UNSET
+typeset name=${0:t} shim=${0:A} blockers=${0:A:h} real='' candidate dir a
+for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  [[ -n "$dir" ]] || dir=.
+  [[ "${dir:A}" == "$blockers" ]] && continue
+  candidate="$dir/$name"
+  if [[ -x "$candidate" && "${candidate:A}" != "$shim" ]]; then
+    real="$candidate"
+    break
+  fi
+done
+
+if [[ -n "${OPENCODE_SESSION_ID:-}" ]]; then
+  typeset -a words value_flags=(--account --lock-wait --store --timeout)
+  typeset -i i=1 for_me=0
+  while (( i <= $# )); do
+    a=${@[i]}
+    [[ $a == -- ]] && break
+    [[ $a == --for-me ]] && for_me=1
+    if [[ $a == -* ]]; then
+      (( ${value_flags[(Ie)$a]} )) && (( i++ ))
+    elif (( ${#words} < 2 )); then
+      words+=("$a")
+    fi
+    (( i++ ))
+  done
+  typeset pair="${words[1]:-} ${words[2]:-}"
+  if [[ ${words[1]:-} == send || ${words[2]:-} == send || $pair == "poll vote" \
+        || $pair == (messages\ forward|messages\ edit|messages\ revoke) \
+        || ( $pair == "messages delete" && $for_me == 0 ) ]]; then
+    print -u2 -- "Blocked: agents don't send WhatsApp with wacli directly (wacli $pair)."
+    print -u2 -- 'Draft it with `wa draft <jid> <text>` (or `wa draftfile`), show Abdullah the preview it prints,'
+    print -u2 -- 'and after his OK: `wa send --approved <id> --inbound <incoming message ID of his reply>` (whatsapp skill).'
+    exit 2
+  fi
+fi
+if [[ -z "$real" ]]; then
+  print -u2 -- "send guard: real $name executable not found on PATH."
+  exit 127
+fi
+exec "$real" "$@"

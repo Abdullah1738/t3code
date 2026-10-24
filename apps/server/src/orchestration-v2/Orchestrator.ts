@@ -144,6 +144,7 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
 // ardud: archive only while idle
 import {
@@ -1356,8 +1357,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null) {
         return;
       }
-      const queuedRun = nextQueuedRun(projection);
-      if (queuedRun === undefined) {
+      const nextRun = nextQueuedRun(projection);
+      if (nextRun === undefined) {
         return;
       }
       // A message queued behind a worktree that was cancelled or never created
@@ -1372,32 +1373,49 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         failedRun?.workspacePreparation?.type === "worktree" &&
         projection.thread.worktreePath === null;
       const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
-      const projectOverride =
-        settings.projectSettingsOverrides[projection.thread.projectId]?.providerInstances?.[
-          queuedRun.providerInstanceId
-        ]?.enabled;
-      const machineInstance = Object.hasOwn(
-        settings.providerInstances,
-        queuedRun.providerInstanceId,
-      )
-        ? settings.providerInstances[queuedRun.providerInstanceId]
-        : undefined;
-      const instanceDisabledForProject =
-        projectOverride !== undefined
+      const disabledForProject = (instanceId: ProviderInstanceId) => {
+        const projectOverride =
+          settings.projectSettingsOverrides[projection.thread.projectId]?.providerInstances?.[
+            instanceId
+          ]?.enabled;
+        const machineInstance = Object.hasOwn(settings.providerInstances, instanceId)
+          ? settings.providerInstances[instanceId]
+          : undefined;
+        return projectOverride !== undefined
           ? !projectOverride
           : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
-      if (
-        worktreeMissing ||
-        instanceDisabledForProject ||
-        (failureClass !== undefined &&
-          failureClass !== "validation_error" &&
-          failedRun?.providerInstanceId === queuedRun.providerInstanceId)
-      ) {
+      };
+      const instanceDisabledForProject = disabledForProject(nextRun.providerInstanceId);
+      const failureHolds =
+        failureClass !== undefined &&
+        failureClass !== "validation_error" &&
+        failedRun?.providerInstanceId === nextRun.providerInstanceId;
+      // ardud: a context-reset note starts a fresh provider thread, so the
+      // failure that ended the old one is no reason to hold it. It runs next;
+      // the rest of the queue stays held. Not while children the failed turn
+      // left running still report to the old thread, and only on the failed
+      // run's instance, so the bypass never doubles as a provider switch.
+      const resetNote =
+        failureHolds &&
+        !worktreeMissing &&
+        !instanceDisabledForProject &&
+        runningBackgroundWork(projection).length === 0
+          ? queuedRunsInDeliveryOrder(projection).find(
+              (run) =>
+                run.queueHeld !== true &&
+                run.contextReset === true &&
+                run.providerInstanceId === nextRun.providerInstanceId,
+            )
+          : undefined;
+      const queuedRun = resetNote ?? nextRun;
+      if (worktreeMissing || instanceDisabledForProject || failureHolds) {
         const now = yield* DateTime.now;
-        yield* writeSystemEvents(
-          projection.runs
-            .filter((run) => run.status === "queued")
-            .map((run) => ({
+        const toHold = projection.runs.filter(
+          (run) => run.status === "queued" && run.id !== resetNote?.id,
+        );
+        if (toHold.length > 0) {
+          yield* writeSystemEvents(
+            toHold.map((run) => ({
               type: "run.updated" as const,
               threadId,
               runId: run.id,
@@ -1405,8 +1423,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               occurredAt: now,
               payload: { ...run, queueHeld: true },
             })),
-        );
-        return;
+          );
+        }
+        if (resetNote === undefined) return;
       }
       // Run ordinals order the transcript, checkpoints, and the latest run. A
       // run that started while this one waited (a resume of a held queue, a
@@ -1490,7 +1509,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const activeProviderThread = projection.providerThreads.find(
         (candidate) => candidate.id === projection.thread.activeProviderThreadId,
       );
+      // ardud: a context-reset note's only context is the note, so it never
+      // resumes the old native thread or folds earlier runs into a handoff.
+      const freshContext = queuedRun.contextReset === true;
       const canResumeAcrossInstances =
+        !freshContext &&
         switchPlan?.instanceChanged === true &&
         switchPlan.transition.type === "restart_and_resume" &&
         activeProviderThread !== undefined &&
@@ -1531,6 +1554,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         queuedProviderThread.id,
       );
       const coveredRuns =
+        freshContext ||
         canResumeAcrossInstances ||
         latestHandoffRun === undefined ||
         latestHandoffRun.providerInstanceId === queuedRun.providerInstanceId
@@ -1543,7 +1567,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
       const legacyImportItems =
-        projection.thread.historyOrigin === "v1_import"
+        !freshContext && projection.thread.historyOrigin === "v1_import"
           ? yield* readHandoffItems(threadId, [null])
           : [];
       const handoffStrategy = needsFullContext
@@ -5139,6 +5163,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : undefined;
     const queueBehindRun = activeRun ?? worktreeMissingRun;
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
+    // ardud: a pending fork or merge-back would carry another thread's context
+    // into the run a context reset starts, so refuse and leave it pending.
+    if (
+      command.contextReset === true &&
+      (pendingMergeBackTransfers.length > 0 ||
+        pendingForkTransferForThread(projection) !== undefined)
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} has a pending fork or merge-back context transfer; send an ordinary message to take it in first, then reset.`,
+      });
+    }
     const startsOrQueuesRun =
       dispatchMode.type === "defer_start" ||
       dispatchMode.type === "start_immediately" ||
@@ -5516,8 +5553,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
     const latestCompletedRun = projection.runs.findLast((run) => run.status === "completed");
     const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
+    // ardud: a context reset's only context is its note, so no imported history either.
     const legacyImportItems =
-      projection.thread.historyOrigin === "v1_import"
+      command.contextReset !== true && projection.thread.historyOrigin === "v1_import"
         ? yield* readHandoffItems(command.threadId, [null])
         : [];
     const isProviderSwitch =
@@ -5559,10 +5597,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-      // ardud: a context reset always mints a fresh provider thread.
+      // ardud: a context reset always mints a fresh provider thread, and a fresh
+      // session where the adapter runs one conversation per session.
       const reusedProviderThread = command.contextReset === true ? undefined : activeProviderThread;
       const providerSessionId =
-        activeProviderThread?.providerSessionId ??
+        reusedProviderThread?.providerSessionId ??
         (yield* mapDispatchError(command)(
           providerSessionIdFor({
             adapter,
@@ -6114,8 +6153,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       targetProviderThread === undefined
         ? undefined
         : lastDeliveredRunForProviderThread(projection, targetProviderThread.id);
+    // ardud: a context reset's only context is its note, on any instance.
     const providerSwitchCoveredRuns =
-      !isProviderSwitch || canResumeAcrossInstances || latestHandoffRun === undefined
+      command.contextReset === true ||
+      !isProviderSwitch ||
+      canResumeAcrossInstances ||
+      latestHandoffRun === undefined
         ? []
         : projection.runs.filter(
             (run) =>
@@ -6202,6 +6245,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ),
             );
     const legacyImportRecoveryHandoff =
+      command.contextReset !== true &&
       isProviderSwitch &&
       !canResumeAcrossInstances &&
       latestCompletedRun === undefined &&

@@ -15,8 +15,12 @@ lctl="${LOCAL_HELPERS_LAUNCHCTL:-launchctl}"
 domain="gui/$(id -u)"
 stamp="$(date +%Y%m%d-%H%M%S)"
 state_dir="$HOME/.local/state/local-helpers"
-# Set before new mail code lands, cleared once otp-idle runs it: a failed run leaves the restart pending.
-pending="$state_dir/restart-otp-idle"
+# Agents that keep running old code until restarted: label -> marker set before their new code lands and
+# cleared once they run it, so a failed run leaves the restart pending.
+typeset -A restarts=(
+  local.ardud.otp-idle "$state_dir/restart-otp-idle"
+  com.abdullah.juno-proxy "$state_dir/restart-juno-proxy"
+)
 # Same for plists: reload-<label> is set before a new plist lands and cleared once launchd has loaded it,
 # so a run that dies between the copy and the reload leaves the reload for the next run. It holds
 # "bak:<path>" (the backup of the plist launchd ran when it was set) or "new" (there was no plist), so
@@ -55,6 +59,7 @@ typeset -A live=(
   libexec/mail "$HOME/.local/libexec/mail"
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"
+  juno-proxy "$HOME/.local/share/juno-proxy"
   bin "$HOME/.local/bin"
   launchd "$HOME/Library/LaunchAgents"
 )
@@ -154,7 +159,9 @@ if [[ $mode == check ]]; then
     loaded "$(label_of "$f")" || { print -u2 "local-helpers: $(label_of "$f") is not loaded"; rc=1 }
     [[ -e "$(reload_mark "$f")" ]] && { print -u2 "local-helpers: $(label_of "$f") still runs an older plist (reload pending); run install.zsh"; rc=1 }
   done
-  [[ -e "$pending" ]] && { print -u2 "local-helpers: local.ardud.otp-idle still runs older mail code (restart pending); run install.zsh"; rc=1 }
+  for label marker in "${(@kv)restarts}"; do
+    [[ -e "$marker" ]] && { print -u2 "local-helpers: $label still runs older code (restart pending); run install.zsh"; rc=1 }
+  done
   (( rc == 0 )) && print "local-helpers: live copy matches $(git -C "$repo" rev-parse --short HEAD)"
   exit $rc
 fi
@@ -196,7 +203,9 @@ for p in "${pairs[@]}"; do
   changed+=("$dst")
   (( dry )) && continue
   case "$dst" in
-    */libexec/mail/mail_oauth.py|*/libexec/mail/otp-idle.py|*/libexec/mail/otp-watch.py) mkdir -p "$state_dir"; : > "$pending" ;;
+    */libexec/mail/mail_oauth.py|*/libexec/mail/otp-idle.py|*/libexec/mail/otp-watch.py)
+      mkdir -p "$state_dir"; : > "${restarts[local.ardud.otp-idle]}" ;;
+    */juno-proxy/juno_proxy.py) mkdir -p "$state_dir"; : > "${restarts[com.abdullah.juno-proxy]}" ;;
     */LaunchAgents/*.plist)
       mkdir -p "$state_dir" "${dst:h}"
       backup "$dst" || exit 1
@@ -269,7 +278,7 @@ for f in "${plists[@]}"; do
   if up "$f"; then
     rm -f "$mark"
     print "reloaded $label"
-    [[ $label == local.ardud.otp-idle ]] && rm -f "$pending"
+    [[ -n "${restarts[$label]:-}" ]] && rm -f "${restarts[$label]}"
     continue
   fi
   agent_fail=1
@@ -287,19 +296,20 @@ for f in "${plists[@]}"; do
   if up "$f"; then
     rm -f "$(reload_mark "$f")"
     print "loaded $label"
-    [[ $label == local.ardud.otp-idle ]] && rm -f "$pending"
+    [[ -n "${restarts[$label]:-}" ]] && rm -f "${restarts[$label]}"
   else
     agent_fail=1; print -u2 "local-helpers: $label is not loaded and failed to load"
   fi
 done
-# otp-idle stays running, so new mail code needs a restart; otp-watch and mail-token-refresh are short runs.
-if [[ -e "$pending" ]] && loaded local.ardud.otp-idle; then
-  if "$lctl" kickstart -k "$domain/local.ardud.otp-idle"; then
-    rm -f "$pending"; print "restarted local.ardud.otp-idle"
+# otp-idle and the Juno proxy stay running, so their new code needs a restart; the other agents are short runs.
+for label marker in "${(@kv)restarts}"; do
+  [[ -e "$marker" ]] && loaded "$label" || continue
+  if "$lctl" kickstart -k "$domain/$label"; then
+    rm -f "$marker"; print "restarted $label"
   else
-    agent_fail=1; print -u2 "local-helpers: otp-idle restart failed; it stays pending for the next run"
+    agent_fail=1; print -u2 "local-helpers: $label restart failed; it stays pending for the next run"
   fi
-fi
+done
 
 # Smoke test the installed copy (offline: parses, imports, plist lint, a qcard sample, the uber wrapper).
 fail=0
@@ -317,6 +327,7 @@ smoke env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -c "import sys; sys.path[:0
 smoke env PYTHONDONTWRITEBYTECODE=1 "$HOME/.local/bin/qcard" templates
 for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
+for f in power-unplug-telegram.sh battery-low-telegram.sh; do smoke zsh -n "$HOME/.local/bin/$f"; done
 # The way the watchers run it: bare PATH, no nvm.
 uber_ours && smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version
 (( fail )) && { print -u2 "local-helpers: installed, but the smoke test failed; the previous files are kept as *.bak-$stamp*"; exit 1 }

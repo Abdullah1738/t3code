@@ -32,6 +32,7 @@ import { getSecretRequest, sweepSecrets } from "./secrets.ts";
 import { cloudflaredTunnel, Shares } from "./share.ts";
 import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
+import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
 import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
@@ -180,6 +181,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   });
 
   const groupJudge = jevJudge();
+  const swipes = chatDbSwipes();
   const build = (chat: ChatCore): Parts => {
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
@@ -192,6 +194,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
       transcribe: input => transcribe(input), log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
+      swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
     const delivery = new Delivery(chat.store, transport, {
       projectScope, chatGuid: () => chat.info.key,

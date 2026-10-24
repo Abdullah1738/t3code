@@ -122,13 +122,19 @@ def atomic_write(path, data, mode="w"):
 
 
 class trip_lock:
-    """Per-trip exclusive lock (journal dir) shared by the watcher, refresh and send."""
-    def __init__(self, uuid):
+    """Per-trip exclusive lock (journal dir) shared by the watcher, refresh and send.
+    wait=False raises BlockingIOError at once when someone else holds it."""
+    def __init__(self, uuid, wait=True):
         self.path = journal_dir() / f".{check_uuid(uuid)}.lock"
+        self.wait = wait
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB))
+        except OSError:
+            self.f.close()
+            raise
         return self
     def __exit__(self, *a):
         fcntl.flock(self.f, fcntl.LOCK_UN)
@@ -264,7 +270,7 @@ def from_live(trip, prev, rider, booker, now):
     # can't identify) starts over.
     held = plate_key(c.get("plate"))
     was_arrived = c.get("state") == "arrived" and bool(held) and held == plate_key(clean(veh.get("plate"), 16))
-    c.update(rider=rider, booker=booker, terminal=False, note=None,
+    c.update(rider=rider, booker=booker, terminal=False, note=None, ended_at=None,
              rider_name=display(rider, uuid), booker_name=display(booker, uuid))
     status = trip.get("status") or ""
     drv = trip.get("driver") or {}
@@ -303,7 +309,8 @@ def from_live(trip, prev, rider, booker, now):
 def to_terminal(prev, status, now, note=None):
     c = dict(prev)
     state = TERMINAL[status]
-    c.update(state=state, terminal=True, pickup_eta=None, arrival_eta=None, checked_at=iso(now), since=iso(now))
+    c.update(state=state, terminal=True, pickup_eta=None, arrival_eta=None, checked_at=iso(now), since=iso(now),
+             ended_at=iso(now))
     c["step"] = 4 if state == "done" else c.get("step", 0)
     c["note"] = note or ("No driver found" if status == "UNFULFILLED" else None)
     return c
@@ -313,7 +320,8 @@ def to_unknown(prev, now, final=False):
     c = dict(prev)
     if c.get("state") != "unknown":
         c["since"] = iso(now)
-    c.update(state="unknown", pickup_eta=None, arrival_eta=None, checked_at=iso(now), terminal=bool(final))
+    c.update(state="unknown", pickup_eta=None, arrival_eta=None, checked_at=iso(now), terminal=bool(final),
+             ended_at=iso(now) if final else None)
     c["note"] = "Uber never confirmed the end" if final else "Waiting for Uber to confirm"
     return c
 
@@ -382,7 +390,8 @@ def signature(c):
 def public(c):
     """Exactly the fields allowed into the public folder."""
     allowed = ("trip", "v", "state", "step", "terminal", "rider", "booker", "driver", "rating", "car",
-               "plate", "pickup", "dropoff", "pickup_eta", "arrival_eta", "note", "driver_changed", "checked_at", "since")
+               "plate", "pickup", "dropoff", "pickup_eta", "arrival_eta", "note", "driver_changed", "checked_at", "since",
+               "ended_at")
     out = {k: c.get(k) for k in allowed}
     out["rider"] = c.get("rider_name") or NAMES.get(c.get("rider")) or None
     out["booker"] = c.get("booker_name") or NAMES.get(c.get("booker")) or None
@@ -725,6 +734,120 @@ def bridge(*args, timeout=60):
     return data
 
 
+UNSHARE_AFTER_S = 3600  # an ended ride's page stays up this long, then its public link goes
+
+
+def unshared_path(uuid):
+    return journal_dir() / f".{check_uuid(uuid)}.unshared"
+
+
+def public_link(uuid):
+    """True once someone other than the owner got this trip's public share link. The owner's card
+    is a tailnet page (publish), not a share, so it never counts against the bridge's share cap."""
+    j = read_json(journal_path(uuid), {}) or {}
+    return any(who != "abdullah" and (r.get("payload") or {}).get("url")
+               for who, r in (j.get("recipients") or {}).items())
+
+
+UNCONFIRMED_UNSHARE_AFTER_S = 12 * 3600  # frozen as "never confirmed": the trip might come back
+
+
+def ended_at(card):
+    """When a frozen card froze; None while the card is live. Cards frozen before `ended_at` was
+    written fall back to checked_at, the frozen write itself. `since` only stands in for an end Uber
+    confirmed: on a card frozen as "never confirmed" it is when "Checking" began, hours earlier."""
+    if not card or not card.get("terminal"):
+        return None
+    unknown = card.get("state") == "unknown"
+    for field in ("ended_at", "checked_at") if unknown else ("ended_at", "checked_at", "since"):
+        try:
+            return datetime.fromisoformat(str(card.get(field)).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def link_done(card, now, grace=UNSHARE_AFTER_S):
+    """True when a frozen card's public link can go: `grace` after the end Uber confirmed (the share
+    cap passes 0), or UNCONFIRMED_UNSHARE_AFTER_S after a card froze as "never confirmed" either way.
+    That ride may still be going (its card reopens if Uber shows it again), and a quick tunnel's
+    link can't be given back once it's gone."""
+    end = ended_at(card)
+    if end is None:
+        return False
+    return now - end >= (UNCONFIRMED_UNSHARE_AFTER_S if card.get("state") == "unknown" else grace)
+
+
+def unshare(uuid):
+    """Take a trip's public link down. Idempotent: the bridge answers removed:false once it's gone."""
+    res = bridge("unshare", "--app", slug(uuid), timeout=10)
+    atomic_write(unshared_path(uuid), json.dumps({"at": iso(time.time()), "removed": res.get("removed")}))
+    return res
+
+
+def free_ended_shares(exclude=None):
+    """The bridge's live-share cap is hit: every trip Uber confirmed ended loses its public link now,
+    without the hour's grace. The trip Uber shows right now keeps its link whatever its card says,
+    and when Uber can't be read nothing goes: a card frozen as "never confirmed" may be that trip.
+    Returns how many the bridge really removed."""
+    try:
+        d = uber_status()
+    except Exception:
+        return 0
+    if not isinstance(d, dict) or not d.get("ok"):
+        return 0
+    live = str(((d.get("result") or {}).get("trip") or {}).get("uuid") or "").lower()
+    freed, now = 0, time.time()
+    for p in sorted(journal_dir().glob("*.json")):
+        uuid = p.stem
+        if uuid in (exclude, live) or not UUID_RE.match(uuid):
+            continue
+        try:
+            # Under the trip's own lock, so a send re-sharing it can't race the unshare. A trip
+            # someone else holds is skipped, not waited on.
+            with trip_lock(uuid, wait=False):
+                if (unshared_path(uuid).exists() or not link_done(load_card(uuid), now, grace=0)
+                        or not public_link(uuid)):
+                    continue
+                freed += bool(unshare(uuid).get("removed"))
+        except Exception:
+            continue
+    return freed
+
+
+def share_card(uuid):
+    try:
+        pub = bridge("share", "--app", slug(uuid), "--days", "2")
+    except RuntimeError as ex:
+        # At most 10 live shares: ended rides' links are past use, so they go first, then one retry.
+        if "live shares" not in str(ex) or not free_ended_shares(exclude=uuid):
+            raise
+        pub = bridge("share", "--app", slug(uuid), "--days", "2")
+    unshared_path(uuid).unlink(missing_ok=True)  # shared again: the watcher takes it down again later
+    return pub
+
+
+def relink(uuid):
+    """A ride whose public link was taken down shows up live again. That link is gone for good (a
+    quick tunnel's URL can't be given back), so everyone who got it needs a new one: their records
+    move to `retired` and restart on a key family of their own, and the next `send` shares the card
+    again and sends the new link. The caller holds trip_lock. Returns who needs it."""
+    j = load_journal(uuid)
+    recips = j.setdefault("recipients", {})
+    n = int(j.get("relinks") or 0) + 1
+    moved = []
+    for who, r in list(recips.items()):
+        if who == "abdullah" or not (r.get("payload") or {}).get("url"):
+            continue  # the owner's card is a tailnet page, not a share
+        j.setdefault("retired", []).append({**r, "who": who, "retired_at": iso(time.time())})
+        recips[who] = {"relink": n, "mode": r["payload"].get("mode")}
+        moved.append(who)
+    if moved:
+        j["relinks"] = n
+        _save_journal(uuid, j)
+    return moved
+
+
 def bridge_app_to():
     """True only once `app --to` is deployed AND the bridge server was restarted onto it.
     The CLI alone isn't enough: an old server would ignore `to` and post Moni's card in the
@@ -957,12 +1080,15 @@ def standing(uuid, who, r, planned):
     is settled, a dead op lets any route go again on a key it never used."""
     keys, ids, route, states = _ops(who, r)
     sent = r.get("status") == "sent"
+    # A relinked recipient's old keys are retired with the dead link: a new key family, so the
+    # bridge can't answer "already had it" for the new one.
+    base = f"uber:{uuid}:card:{who}" + (f":relink{r['relink']}" if r.get("relink") else "")
     fresh = lambda: (keys[-1] if ids.get((keys[-1], planned)) not in (states or {})
-                     else f"uber:{uuid}:card:{who}:{len(keys) + 1}")
+                     else f"{base}:{len(keys) + 1}")
     if not ids:
         if sent:
             return ("sent", "already sent"), None
-        return None, (keys[-1] if keys else f"uber:{uuid}:card:{who}")
+        return None, (keys[-1] if keys else base)
     if states is None:
         if sent:
             return ("sent", "already sent"), None
@@ -1077,7 +1203,7 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
         _add_extras(uuid, [who for who, _ in plan if who != "abdullah" and who not in everyone])
     for who, to in plan:
         r = recips.setdefault(who, {})
-        mode = (r.get("payload") or {}).get("mode") or modes.get(who) or (
+        mode = (r.get("payload") or {}).get("mode") or r.get("mode") or modes.get(who) or (
             "card" if who == "abdullah" else "card" if who == "moni" and moni_has_cards() else "link")
         if who == "abdullah" and r.get("via") == "self" and r.get("no_to"):
             to = None  # this bridge refused `--to owner` before: the owner session reaches itself
@@ -1105,7 +1231,7 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 if who == "abdullah":
                     pub = bridge("publish", "--app", slug(uuid))
                 else:
-                    pub = bridge("share", "--app", slug(uuid), "--days", "2")
+                    pub = share_card(uuid)
                 url = pub.get("publicURL") or pub.get("url")
                 warn = pub.get("metadataWarnings") or []
                 if warn:

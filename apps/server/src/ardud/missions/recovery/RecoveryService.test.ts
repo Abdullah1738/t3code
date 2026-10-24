@@ -573,6 +573,46 @@ it.effect("a busy master's queued note still gets its lead before lanes start", 
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a turn that got going again before its note goes out needs none", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    yield* cutRun(webThread, 1, "vp test run");
+    yield* boot;
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* recovery.setSettings(ownerApp, {
+      missionId,
+      resumePerMinute: 4,
+      masterLeadSeconds: 300,
+    });
+    // Planned while both were idle; by delivery the API lane has a new turn going.
+    yield* runRow({ threadId: laneThread, ordinal: 2, status: "running", completedAt: null });
+    fake.busy.add(laneThread);
+    fake.busy.add(webThread);
+    assert.strictEqual(yield* recovery.tick, 1);
+    yield* TestClock.adjust("5 minutes");
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => [sent.threadId, sent.queue]),
+      [
+        [masterThread, false],
+        [webThread, true],
+      ],
+    );
+    const [incident] = yield* recovery.incidents(missionId);
+    const api = incident?.threads.find((thread) => thread.threadId === laneThread);
+    assert.strictEqual(api?.state, "skipped");
+    assert.strictEqual(api?.stateReason, "turn already continued, nothing lost");
+    // The web lane's note waits behind its turn, so it says how old its facts are.
+    assert.include(
+      fake.sent[1]?.text ?? "",
+      "As of 09:00, queued at 09:05 behind your running turn: work and children started after 09:00 aren't covered here",
+    );
+    assert.notInclude(fake.sent[0]?.text ?? "", "queued behind your running turn");
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("the master and the owner steer the plan; nobody else can", () => {
   const { fake, layer } = harness();
   return Effect.gen(function* () {
@@ -1033,7 +1073,9 @@ it.effect("a notice whose send was never confirmed is held for a human, not sent
       [masterThread, laneThread],
     );
 
-    // Whether it arrived is unknown: the next round holds it instead of guessing.
+    // Whether it arrived is unknown, and the turn that started since may be the
+    // note's own: the next round holds it instead of guessing.
+    yield* runRow({ threadId: laneThread, ordinal: 2, status: "running", completedAt: null });
     assert.strictEqual(yield* recovery.tick, 0);
     const held = yield* laneState;
     assert.strictEqual(held?.state, "held");

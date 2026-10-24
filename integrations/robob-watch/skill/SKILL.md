@@ -24,7 +24,7 @@ robob-watch add --id nik-macbook --title "Nik replied on WhatsApp (MacBook order
   --context-file /path/to/context.txt     # or --context "..."
 ```
 
-Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
+Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, quiet, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
 
 `add` runs the check once to **prime** it: baseline helpers record what's already there, so old items never fire. Read the `prime` line in the output. If it says "printed (NOT delivered)", your check fires on existing data and needs fixing.
 
@@ -36,6 +36,7 @@ Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode,
   - WhatsApp: nothing to add. A check using `whatsapp-new-message` gets `~/.wacli/wacli.db-wal` + `wacli.db` as triggers automatically (and an old `whatscli/session.db` trigger is swapped out).
   - Your own scripts: touch a file in `$WATCH_DIR` and trigger on it.
   - Remote things (email, web, CI) have no local file. Poll them, or push via a daemon, the way otp-idle does IMAP IDLE for OTPs (agent-mail skill).
+- **quiet** (watcher.json only, since 24 Oct 2026): `{"start": 23, "end": 8, "time_zone": "Asia/Dubai"}` holds every event, new or retried, until the window ends (same key, sent once). The check still runs. Use it for nags and reminders that must not land at night.
 - **expires**: always set one that fits (hours for a deploy, 1-2 weeks for a human reply). The default is 14d. On expiry the owner gets a short "expired without firing" note.
 - **max-fires**: default 1 (fire once, then done). Use `0` (unlimited) or N for ongoing feeds.
 - **serial**: set automatically only for checks that drive the legacy whatscli TUI (`wa read/send/...`, `wa tui`). `whatsapp-new-message` and `wa-db` read a database and need no lock.

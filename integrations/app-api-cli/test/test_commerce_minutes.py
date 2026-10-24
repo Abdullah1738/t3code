@@ -233,9 +233,13 @@ class PaymentAwaitTests(unittest.TestCase):
         self.assertEqual(command[command.index('--severity')+1],'attention')
         env=run.call_args.kwargs['env']
         self.assertNotIn('BUN_INSPECT',env)
-        with patch.object(c.subprocess,'run',side_effect=OSError), \
-                self.assertRaisesRegex(c.j.JournalError,'MINUTES_3DS_NOTIFY_FAILED'):
-            c.telegram_3ds_notify('IAEGA123',1725)
+        # Sent after the card went out: a failed alert is reported, never raised.
+        failed={'notified':False,'key':'minutes-cli-3ds-IAEGA123','error':'MINUTES_3DS_NOTIFY_FAILED'}
+        with patch.object(c.subprocess,'run',side_effect=OSError):
+            self.assertEqual(c.telegram_3ds_notify('IAEGA123',1725),failed)
+        with patch.object(c.subprocess,'run') as run:
+            run.return_value.returncode=1
+            self.assertEqual(c.telegram_3ds_notify('IAEGA123',1725),failed)
 
 
 class ResumeActiveTests(unittest.TestCase):

@@ -122,11 +122,14 @@ def telegram_3ds_notify(order,total_minor):
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[*TELEGRAM_CLI,'--source','Minutes CLI build','--severity','attention',
              '--text',text,'--key',f'minutes-cli-3ds-{order}']
+    # The card is already sent: a lost alert is reported, never a reason to stop watching it.
     try:
-        result=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+        sent=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            timeout=60).returncode==0
     except (OSError,subprocess.TimeoutExpired):
-        j.fail('MINUTES_3DS_NOTIFY_FAILED')
-    if result.returncode:j.fail('MINUTES_3DS_NOTIFY_FAILED')
+        sent=False
+    if not sent:
+        return {'notified':False,'key':f'minutes-cli-3ds-{order}','error':'MINUTES_3DS_NOTIFY_FAILED'}
     return {'notified':True,'key':f'minutes-cli-3ds-{order}'}
 
 
@@ -521,6 +524,7 @@ class MinutesFlow:
         deadline=clock()+wait_seconds
         polls=0
         last=None
+        latest=None
         while True:
             try:
                 snap=self.client.payment_intent_status(order=order,client_secret=secret,
@@ -549,10 +553,13 @@ class MinutesFlow:
                 if p['state']=='payment_failed':
                     self._payment_receipt('PAYMENT_UNKNOWN',p)
                     return {**p,'polls':polls,'timed_out':False}
+                latest=p
             if clock()>=deadline:
-                if p is not None:self._payment_receipt('PAYMENT_PENDING',p)
-                return {**(p or {}),'polls':polls,'timed_out':True,
-                        'state':'payment_window_elapsed'}
+                if latest is not None:self._payment_receipt('PAYMENT_PENDING',latest)
+                # The last read that answered (a bank approval seen before a lost final read
+                # still counts); with none the caller still gets the full unpaid shape.
+                return {'paid':False,'payment_status':None,'transaction_status':None,**(latest or {}),
+                        'polls':polls,'timed_out':True,'state':'payment_window_elapsed'}
             sleep(poll_seconds)
 
     def _payment_receipt(self,state,p):

@@ -51,6 +51,8 @@ import * as RecoveryService from "../../../ardud/missions/recovery/RecoveryServi
 import * as ViewService from "../../../ardud/missions/views/ViewService.ts";
 // ardud missions: reports
 import * as ScribeService from "../../../ardud/missions/scribe/ScribeService.ts";
+// ardud schedules: blocked-run retry tool
+import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -91,6 +93,8 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(ViewService.ViewService)({}),
   // ardud missions: reports
   Layer.mock(ScribeService.ScribeService)({}),
+  // ardud schedules: blocked-run retry tool
+  SqlitePersistence.layerMemory,
 );
 
 const ToolsListPayload = Schema.fromJsonString(

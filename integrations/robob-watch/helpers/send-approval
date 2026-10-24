@@ -1,0 +1,790 @@
+#!/usr/bin/python3
+"""send-approval: did Abdullah OK this exact outgoing message after he saw it? Used by `wa send --approved`
+and `mailsend send --approved`; read-only.
+
+  send-approval check (--inbound ID | --app) --preview TEXT --drafted-at EPOCH [--file SHA256 NAME]...
+  send-approval visible TEXT     exit 2 if the chat would hide part of TEXT (drafts are refused at write time)
+
+--preview is the block `wa draft` / `mailsend draft` printed: recipient, text, files and "(draft <id>)";
+--drafted-at the draft's created_at (a preview shown before that is an older draft's).
+Exit 0 and one "approved: ..." line, or exit 2 and "Refused: ..." on stderr.
+
+  preview Nothing in it may be something the iMessage bridge drops (model-internal or DCP text, checked with
+          the bridge's own formatter) and it can't hold ``` (the app shows it in a code block).
+  shown   The whole preview, line for line, in one message he got in the 24h before his reply:
+          iMessage: an outbox message of the chat he replied in, with the preview lines in it as pasted (only
+          spacing and one "> " quote level may differ) and still there after the bridge drops what it never
+          delivers. Sendblue has to confirm every bubble of it delivered before he replied, one message per
+          bubble, each with the text the bridge sent (accepted isn't enough).
+          Robob thread: a finished reply of yours with the preview as a plain ``` code block (no language),
+          exactly. Nothing before that block may open something that could hide it (a fence, raw HTML, math
+          with $ or a backslash, :: directives, a [reference] line).
+          Files: the bridge also delivered that exact file (sha256) to the chat around the preview. A Robob
+          thread can't show that, so drafts with files are refused with --app.
+  reply   --inbound ID: the bridge id of a message he typed in the last 24h after the preview ("Current
+          incoming message ID"), ordered by the time he sent it. Wakes, voice notes, Moni and guests don't count.
+          --app: the first message he typed in this Robob thread (web or mobile) after the preview finished.
+  judge   Jev reads the preview, everything said between it and his reply, the reply and everything after it
+          (his voice notes by their transcript), and has to agree he OKed this draft and didn't take it back.
+          Anything of his it can't read (a photo, an untranscribed voice note) refuses. So does too much text
+          or Jev being down, except a plain OK ("yes send it") right after a message that was only the preview
+          (plus at most an "OK to send?" line), with nothing else said. Before approving, his messages are read
+          again: anything new from him while Jev was thinking refuses.
+"""
+import argparse, hashlib, json, math, os, re, shutil, sqlite3, subprocess, sys, time, unicodedata, urllib.parse, urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+BRIDGE = os.environ.get("SEND_APPROVAL_BRIDGE_DIR") or os.path.join(HOME, ".config/spectrum-bridge")
+STATE_DB = os.environ.get("SEND_APPROVAL_STATE_DB") or os.path.join(HOME, ".robob/userdata/statev2.sqlite")
+LOG = os.environ.get("SEND_APPROVAL_LOG") or os.path.join(HOME, ".local/state/send-approval/decisions.jsonl")
+# The bridge's own formatter decides what the chat shows (deployed copy of spectrum-bridge/src/formatting.ts).
+FORMATTER = os.environ.get("SEND_APPROVAL_FORMATTER") or os.path.join(HOME, ".local/share/spectrum-bridge/src/formatting.ts")
+BUN = os.environ.get("SEND_APPROVAL_BUN") or shutil.which("bun") or os.path.join(HOME, ".bun/bin/bun")
+# Test seams: a shell command that reads the judge state as JSON on stdin and prints a probability, and one that
+# reads a JSON list of Sendblue message handles and prints {handle: {"status": ..., "service": ...}}.
+JUDGE = os.environ.get("SEND_APPROVAL_JUDGE")
+DELIVERY = os.environ.get("SEND_APPROVAL_DELIVERY")
+KEY_FILE = os.path.join(HOME, ".config/opencode/openrouter-key")
+JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+JEV_MODEL = "typesafe/jev-1.13"
+SENDBLUE = "https://api.sendblue.com/api/v2/messages/"
+THRESHOLD = 0.6
+WINDOW_MS = 24 * 3600 * 1000
+# A file has to reach his chat at most this long before the preview (send-file usually goes first).
+FILE_LEAD_MS = 15 * 60 * 1000
+# Bridge-made inbound rows: never his reply, and not something he said.
+SYNTHETIC = ("wake:", "secret:", "reset:", "poll-vote:")
+NOT_SAID = ("wake:", "secret:", "reset:")
+APP_SOURCES = ("web", "mobile")
+# The judge gets everything said after the preview or nothing: past these limits we refuse instead of clipping.
+MAX_ITEMS = 40
+MAX_OWNER_CHARS = 4000
+MAX_STATE_CHARS = 60000
+DRAFT_LINE = re.compile(r"\(draft [0-9a-f]{10}\)")
+# In a Robob thread, lines before the preview's code block can't have anything that opens a block the app
+# could hide it in: a fence, raw HTML (an unclosed comment or <details>), math ($, $$, \[ or \( when the
+# client turns math on), :: directives, or a reference definition (its title can run over several lines).
+UNSAFE_BEFORE = re.compile(r"[`<$\\]|~~~|::|^ {0,3}\[")
+# Markdown only treats spaces and tabs as a fence line's trailing blanks; any other "whitespace" (\v, \f,
+# NBSP, U+2028...) makes it a different line, so lines are compared after stripping just those two.
+BLANKS = " \t"
+# Sendblue sends straight quotes as curly ones; nothing else differs from what the bridge asked for.
+QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+# Runs formatting.ts: strip = the text once internal/DCP text is dropped, tidy = the input with only the same
+# whitespace tidy, text = the characters the chat shows (strip with **, * and ~~ pairs turned into styling),
+# chunks = the bubbles delivery.ts sends for it (one Sendblue message each).
+RENDER_JS = ("const m = await import(process.argv.at(-1));"
+             "if (typeof m.BUBBLE_CHARS !== 'number') throw new Error('formatting.ts has no BUBBLE_CHARS');"
+             "const tidy = s => s.replace(/[^\\S\\n]+/g, ' ').replace(/ ?\\n ?/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();"
+             "const xs = JSON.parse(await Bun.stdin.text());"
+             "console.log(JSON.stringify(xs.map(x => ({strip: m.stripInternalText(x), tidy: tidy(x), "
+             "text: m.formatText(x).text, "
+             "chunks: m.splitFormatted(m.formatText(x.trim() ? x : ''), m.BUBBLE_CHARS).map(c => c.text)}))));")
+PUNCT = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+                       "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2033": '"', "\u00ab": '"', "\u00bb": '"',
+                       "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u00a0": " "})
+YES = {"yes", "yeah", "yep", "yup", "ya", "ok", "okay", "sure", "approved", "approve", "send", "go", "perfect",
+       "good", "fine", "great"}
+YES_FILLER = YES | {"it", "ahead", "do", "please", "pls", "now", "them", "both", "all", "thanks", "thank", "you",
+                    "looks", "that", "this", "one", "that's", "its", "it's"}
+
+
+def refuse(msg):
+    log({"decision": "refused", "why": msg})
+    print(f"Refused: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+class NotOk(Exception):
+    """One preview/reply pair didn't hold up; --app tries the next pair before refusing."""
+
+
+ARGS_FOR_LOG = {}
+
+
+def log(entry):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        entry = {"at": int(time.time()), **ARGS_FOR_LOG, **entry}
+        with open(LOG, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def render(texts):
+    """formatting.ts on each text (see RENDER_JS). No formatter, no check: we can't know what he saw."""
+    if not texts:
+        return []
+    env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
+    try:
+        r = subprocess.run([BUN, "-e", RENDER_JS, FORMATTER], input=json.dumps(texts), capture_output=True,
+                           text=True, timeout=30, env=env, cwd="/")
+        out = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        out = None
+    if not isinstance(out, list) or len(out) != len(texts) or not all(
+            isinstance(x, dict) and isinstance(x.get("chunks"), list) for x in out):
+        refuse(f"couldn't run the bridge formatter ({FORMATTER}) to see what the chat shows him.")
+    return out
+
+
+def lf(text):
+    """Markdown's line endings (CRLF, CR, LF) as LF."""
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def lines_of(text):
+    """Non-empty lines, spacing collapsed; every other character counts."""
+    return [y for y in (re.sub(r"\s+", " ", x).strip() for x in (text or "").splitlines()) if y]
+
+
+def unquote(line):
+    return line[2:] if line.startswith("> ") else line[1:]
+
+
+def find_block(lines, block):
+    """(start, end) of the preview's lines in `lines`, in order and next to each other, or None. Unchanged lines
+    first; then the whole block quoted once (a blank line inside a quote comes through as a bare ">")."""
+    n = len(block)
+    for i in range(len(lines) - n + 1):
+        if lines[i:i + n] == block:
+            return i, i + n
+    alt = [(k, x) for k, x in enumerate(lines) if x != ">"]
+    for i in range(len(alt) - n + 1):
+        win = [x for _, x in alt[i:i + n]]
+        if all(x.startswith(">") for x in win) and [unquote(x) for x in win] == block:
+            return alt[i][0], alt[i + n - 1][0] + 1
+    return None
+
+
+def only_preview(lines, block):
+    """The message was just the preview, plus at most a fixed "OK to send?" line."""
+    at = find_block(lines, block)
+    if at is None:
+        return False
+    extra = [x for x in lines[:at[0]] + lines[at[1]:] if x != ">"]
+    return len(extra) <= 1 and all(x.lower() in SEND_PROMPTS for x in extra)
+
+
+def hidden_part(r):
+    """What the bridge would drop from a text (one render() result), or None. Styling isn't dropping."""
+    if r["strip"] != r["tidy"]:
+        a, b = r["tidy"], r["strip"]
+        i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+        return a[i:i + 40] or "text"
+    return None
+
+
+def visible_or_refuse(text, what):
+    if "```" in text:
+        refuse(f"{what} has ``` in it; the app shows the preview in a code block, so write it without that.")
+    if "\r" in text.replace("\r\n", "\n"):
+        refuse(f"{what} has a bare carriage return (shown as a line break in some places, not in others). "
+               "Write it without that.")
+    r = render([text])[0]
+    h = hidden_part(r)
+    if h:
+        refuse(f"{what} has text the chat would hide from him ({clip(h, 40)}). Write it without that.")
+    return r
+
+
+def ro(path):
+    if not os.path.isfile(path):
+        refuse(f"can't read {path}")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    con.execute("pragma busy_timeout=5000")
+    return con
+
+
+def address(a):
+    return str(a or "").strip().lower()
+
+
+def stamp(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%d %b %H:%M:%S")
+
+
+def clip(s, n=160):
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def clip_mid(s, n):
+    """Context only (never his words): keep both ends of a long message."""
+    s = s or ""
+    return s if len(s) <= n else s[: n // 2] + "\n[...]\n" + s[-(n // 2):]
+
+
+def int_ms(v):
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------- bridge (--inbound)
+
+def bridge_stores():
+    out = [("owner", os.path.join(BRIDGE, "state.sqlite"))]
+    chats = os.path.join(BRIDGE, "chats")
+    if os.path.isdir(chats):
+        for name in sorted(os.listdir(chats)):
+            p = os.path.join(chats, name, "state.sqlite")
+            if os.path.isfile(p):
+                out.append((name, p))
+    return out
+
+
+def bridge_config():
+    try:
+        with open(os.path.join(BRIDGE, "config.json")) as fh:
+            c = json.load(fh)
+            return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def his(chat, p, owner):
+    """Written by him: his number, or no sender in his own chat (photon-era rows and poll votes)."""
+    sender = p.get("sender")
+    if chat == "owner":
+        return sender is None or bool(owner and address(sender) == owner)
+    return bool(owner) and address(sender) == owner
+
+
+def owner_typed(chat, p, owner):
+    """Same rule as the missions inbound check, minus Moni: only he OKs sends in his name."""
+    if p.get("source") != "typed" or p.get("isAudioMessage") or p.get("attachments") \
+            or not str(p.get("text") or "").strip():
+        return False
+    return his(chat, p, owner)
+
+
+def said_by_him(con, p):
+    """(label, text) the judge reads for one of his messages, or None when part of it can't be read."""
+    text = str(p.get("text") or "")
+    files = [a for a in p.get("attachments") or [] if isinstance(a, dict)]
+    if not files:
+        return ("Abdullah", text)
+    if not p.get("isAudioMessage") or len(files) != 1 or not files[0].get("guid"):
+        return None  # a photo or file: the judge can't see what it says
+    key = "transcript:" + hashlib.sha256(str(files[0]["guid"]).encode()).hexdigest()
+    row = con.execute("select value from kv where key = ?", (key,)).fetchone()
+    try:
+        heard = json.loads(row[0]) if row else None
+    except ValueError:
+        heard = None
+    if not isinstance(heard, str) or not heard.strip():
+        return None
+    return "Abdullah (voice note, transcribed)", (text + "\n" + heard).strip()
+
+
+def owner_rows(con, chat, owner, t_s, skip):
+    """Everything he sent to this chat after t_s except the reply: [(t, id, payload)]."""
+    out = []
+    for rid, payload in con.execute("select id, payload from inbound order by id"):
+        if rid == skip or rid.startswith(NOT_SAID):
+            continue
+        try:
+            p = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(p, dict):
+            continue
+        t = int_ms(p.get("sentAt")) or int_ms(p.get("receivedAt"))
+        if t is not None and t > t_s and his(chat, p, owner):
+            out.append((t, rid, p))
+    return sorted(out, key=lambda x: (x[0], x[1]))
+
+
+def bubbles(con, oid):
+    """Sendblue handles of every bubble the bridge sent for an outbox row (kv chunk:<id>:<n>), or None."""
+    prefix = f"chunk:{oid}:"
+    got = {}
+    for key, value in con.execute("select key, value from kv where substr(key, 1, ?) = ?", (len(prefix), prefix)):
+        n = key[len(prefix):]
+        try:
+            v = json.loads(value)
+        except ValueError:
+            return None
+        if not n.isdigit() or str(int(n)) != n or not isinstance(v, dict) or v.get("accepted") is not True \
+                or not isinstance(v.get("providerId"), str) or not v["providerId"]:
+            return None
+        got[int(n)] = v["providerId"]
+    if not got or sorted(got) != list(range(len(got))):
+        return None
+    return [got[i] for i in range(len(got))]
+
+
+def iso_ms(s):
+    """Sendblue's ISO time ("2026-10-24T06:01:18.448Z") in ms, or None."""
+    m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:?\d\d)", s) \
+        if isinstance(s, str) else None
+    if not m:
+        return None
+    y, mo, d, h, mi, sec, frac, tz = m.groups()
+    try:
+        t = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec), tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+    off = 0 if tz == "Z" else (1 if tz[0] == "+" else -1) * (int(tz[1:3]) * 60 + int(tz[-2:])) * 60
+    return int(t - off) * 1000 + int(((frac or "") + "000")[:3])
+
+
+def bubble_of(m, h):
+    """What Sendblue says about one outbound message: status, service, when it last changed (for DELIVERED, or
+    SENT over SMS, that is when it reached him), its text and whether it carries a file. None if it isn't ours."""
+    if not isinstance(m, dict) or m.get("is_outbound") is not True or m.get("message_handle", h) != h:
+        return None
+    return {"status": m.get("status"), "service": m.get("service"), "at": iso_ms(m.get("date_updated")),
+            "content": m.get("content") if isinstance(m.get("content"), str) else None,
+            "media": bool(m.get("media_url"))}
+
+
+DELIVERY_CACHE = {}
+
+
+def credentials():
+    out = {}
+    try:
+        with open(os.path.join(BRIDGE, "credentials.env")) as fh:
+            for line in fh:
+                k, sep, v = line.strip().partition("=")
+                if sep:
+                    out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def statuses(handles):
+    """{handle: bubble_of(...) or None} from Sendblue; None on any error."""
+    todo = [h for h in handles if h not in DELIVERY_CACHE]
+    if todo and DELIVERY:
+        try:
+            r = subprocess.run(DELIVERY, shell=True, input=json.dumps(todo), capture_output=True, text=True, timeout=30)
+            got = json.loads(r.stdout) if r.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            got = {}
+        for h in todo:
+            DELIVERY_CACHE[h] = bubble_of(got.get(h) if isinstance(got, dict) else None, h)
+    elif todo:
+        creds = credentials()
+        kid, secret = creds.get("SENDBLUE_API_KEY_ID"), creds.get("SENDBLUE_API_SECRET")
+        for h in todo:
+            DELIVERY_CACHE[h] = None
+            if not (kid and secret):
+                continue
+            req = urllib.request.Request(SENDBLUE + urllib.parse.quote(h, safe=""), headers={
+                "sb-api-key-id": kid, "sb-api-secret-key": secret, "Accept": "application/json",
+                "User-Agent": "send-approval/1"})  # Cloudflare refuses urllib's default agent
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = json.load(resp)
+                DELIVERY_CACHE[h] = bubble_of(body.get("data") if isinstance(body.get("data"), dict) else body, h)
+            except Exception:  # network, HTTP or shape errors: unknown, so not delivered
+                pass
+    return {h: DELIVERY_CACHE[h] for h in handles}
+
+
+def delivered(status, service):
+    # DELIVERED is final for iMessage and RCS; an SMS stops at SENT (Sendblue's status docs).
+    return status == "DELIVERED" or (status == "SENT" and service == "SMS")
+
+
+def undelivered(con, oid, p, chunks, before):
+    """None when Sendblue confirms that every bubble of this outbox row reached him before `before` (ms) with the
+    text the bridge sent, else why not. `chunks` is the bridge's split of the row's text (render()["chunks"]); a
+    file, poll or card is one more bubble. A retry the bridge matched by text alone can point two bubbles at one
+    message, so every bubble needs its own."""
+    hs = bubbles(con, oid)
+    if not hs:
+        return "no record of its bubbles"
+    want = len(chunks) + (1 if p.get("attachment") or p.get("poll") or p.get("app") else 0)
+    if len(hs) != want:
+        return f"{len(hs)} bubbles on record for {want}"
+    if len(set(hs)) != len(hs):
+        return "one Sendblue message on record for two bubbles"
+    got = statuses(hs)
+    for i, h in enumerate(hs):
+        b = got[h]
+        if not b or not delivered(b["status"], b["service"]):
+            return f"Sendblue status {(b or {}).get('status') or 'unknown'}"
+        if b["at"] is None:
+            return "no delivery time at Sendblue"
+        if b["at"] >= before:
+            return f"delivered at {stamp(b['at'])}, after his reply"
+        if i < len(chunks):
+            if b["content"] is None or b["content"].translate(QUOTES) != chunks[i].translate(QUOTES):
+                return "a bubble reads differently at Sendblue"
+        elif p.get("attachment") and not b["media"]:
+            return "the file bubble has no file at Sendblue"
+    return None
+
+
+def outbox_text(p):
+    text = p.get("text") or ""
+    att = p.get("attachment") or {}
+    if att.get("name"):
+        text = f"[file {att.get('name')}] {text}".strip()
+    return text
+
+
+def check_bridge(iid, block, seen, files, drafted):
+    if not iid or iid.startswith(SYNTHETIC):
+        refuse(f"{iid or 'empty id'} is not a message Abdullah typed. Use the incoming message ID of his reply.")
+    config = bridge_config()
+    owner = address(config.get("owner"))
+    if config.get("transport") != "sendblue":
+        refuse(f"the bridge runs on {config.get('transport') or 'photon'}, where delivery to him can't be confirmed. "
+               "Get his OK in the Robob app (--app) instead.")
+    for chat, path in bridge_stores():
+        con = ro(path)
+        row = con.execute("select payload from inbound where id = ?", (iid,)).fetchone()
+        if row:
+            break
+        con.close()
+    else:
+        refuse(f"no incoming message {iid} in the bridge. Use the incoming message ID of his reply.")
+    try:
+        reply = json.loads(row[0])
+    except ValueError:
+        refuse(f"incoming message {iid} is unreadable")
+    if not isinstance(reply, dict) or not owner_typed(chat, reply, owner):
+        refuse(f"incoming message {iid} wasn't typed by Abdullah (wake, voice note, attachment or someone else).")
+    # receivedAt can be a late arrival (backfill); sentAt is when he sent it.
+    ta = int_ms(reply.get("sentAt"))
+    if ta is None:
+        refuse(f"incoming message {iid} has no send time. Ask him again and use the id of that reply.")
+    if ta < now_ms() - WINDOW_MS:
+        refuse(f"his reply {iid} ({stamp(ta)}) is older than 24h. Show the preview again and use his fresh OK.")
+
+    sent = []
+    for oid, payload, t in con.execute(
+            "select o.id, o.payload, cast(k.value as integer) from outbox o join kv k on k.key = 'sent-at:' || o.id "
+            "where o.state = 'sent' and cast(k.value as integer) >= ? order by 3, 1", (ta - WINDOW_MS,)):
+        try:
+            p = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(p, dict):
+            sent.append((t, oid, p))
+    shown_r = dict(zip([x[1] for x in sent], render([x[2].get("text") or "" for x in sent])))
+    # The preview pasted as is (lossless, raw lines), and still all there in what the chat showed him: the bridge's
+    # formatting of the whole message (it can drop text around and inside the block) contains the formatted block.
+    with_block = [x for x in sent if drafted <= x[0] < ta and find_block(lines_of(x[2].get("text")), block) is not None
+                  and find_block(lines_of(shown_r[x[1]]["text"]), seen) is not None]
+    if not with_block:
+        refuse(f"Abdullah wasn't shown this draft's preview before his reply {iid} ({stamp(ta)}). Paste the "
+               "preview block as is in his chat, wait for his OK, then use the id of that reply.")
+    why = None
+    for cand in reversed(with_block):
+        why = undelivered(con, cand[1], cand[2], shown_r[cand[1]]["chunks"], ta)
+        if not why:
+            t_s, shown_id, shown_p = cand
+            break
+    else:
+        refuse(f"the preview before his reply {iid} isn't confirmed delivered to him before he replied ({why}). "
+               "If Sendblue is still delivering it, wait a minute and try again; otherwise show the preview again "
+               "and use his next OK.")
+    for sha, name in files:
+        if not any((x[2].get("attachment") or {}).get("sha256") == sha and t_s - FILE_LEAD_MS <= x[0] < ta
+                   and not undelivered(con, x[1], x[2], shown_r[x[1]]["chunks"], ta) for x in sent):
+            refuse(f"the file {name} itself didn't reach Abdullah's chat with the preview (or isn't confirmed "
+                   "delivered). send-file it there right before the preview, then use the id of his OK.")
+
+    def gather():
+        rows = owner_rows(con, chat, owner, t_s, iid)
+        items = []
+        for t, rid, p in rows:
+            if not str(p.get("text") or "").strip() and not p.get("attachments"):
+                continue  # nothing in it
+            s = said_by_him(con, p)
+            if s is None:
+                raise NotOk(f"he sent something after the preview that can't be read as text ({rid}: a photo, file "
+                            "or untranscribed voice note). Ask him in words and use that reply.")
+            items.append((t, s[0], s[1]))
+        return rows, items
+
+    try:
+        rows, owners = gather()
+        bare = only_preview(lines_of(shown_r[shown_id]["text"]), seen)
+        said = sorted(owners + [(t, "assistant", outbox_text({**p, "text": shown_r[oid]["text"]}))
+                                for t, oid, p in sent if t > t_s and oid != shown_id], key=lambda x: x[0])
+        verdict = decide(block, shown_r[shown_id]["text"], [x for x in said if x[0] < ta], reply.get("text") or "",
+                         [x for x in said if x[0] >= ta], f"his reply {iid} ({stamp(ta)})", t_s, bare)
+        # He may have written again while the judge was thinking.
+        if [r[1] for r in owner_rows(con, chat, owner, t_s, iid)] != [r[1] for r in rows]:
+            raise NotOk("he wrote again while his OK was being checked. Read it, then run the send again.")
+    except NotOk as e:
+        refuse(str(e))
+    con.close()
+    log({"decision": "approved", **verdict[1]})
+    print(verdict[0])
+
+
+# ---------------------------------------------------------------- Robob thread (--app)
+
+def iso(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def ms_of(iso_s):
+    return int(datetime.strptime(iso_s[:23], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def app_shown(text, want):
+    """Where the app shows `want` (the preview's lines) exactly: (lines before, lines after) of the first plain
+    ``` code block holding just those lines, or None. Code blocks render literally, so only what comes before
+    the block could hide it (an open fence, HTML block, math, :: directive or multi-line reference
+    definition); any of those before it means no. Line endings as markdown reads them (CR and CRLF too)."""
+    lines = lf(text).split("\n")
+    n = len(want)
+    for i, line in enumerate(lines):
+        if line.rstrip(BLANKS) != "```" or i + n + 1 >= len(lines):
+            continue
+        if [x.rstrip(BLANKS) for x in lines[i + 1:i + n + 1]] == want and lines[i + n + 1].rstrip(BLANKS) == "```":
+            before = lines[:i]
+            if any(UNSAFE_BEFORE.search(x) for x in before):
+                return None
+            return before, lines[i + n + 2:]
+    return None
+
+
+def trimmed(lines):
+    lines = [x.rstrip(BLANKS) for x in lines]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def app_messages(thread):
+    con = ro(STATE_DB)
+    msgs = []
+    for role, streaming, created, updated, payload in con.execute(
+            "select role, streaming, created_at, updated_at, payload_json from orchestration_v2_projection_messages "
+            "where thread_id = ? and created_at >= ? order by created_at, message_id",
+            (thread, iso(now_ms() - 2 * WINDOW_MS))):
+        try:
+            p = json.loads(payload)
+        except ValueError:
+            continue
+        text = p.get("text") or ""
+        if role == "assistant" and text:
+            # Assistant text is updated in place while it streams: it counts as shown once finished.
+            done = not streaming and not p.get("streaming")
+            msgs.append({"who": "assistant", "t": ms_of(created), "done_t": ms_of(updated or created),
+                         "done": done, "text": text})
+        elif role == "user" and p.get("createdBy") == "user" and p.get("creationSource") in APP_SOURCES \
+                and (text.strip() or p.get("attachments")):
+            msgs.append({"who": "Abdullah", "t": ms_of(created), "text": text, "files": bool(p.get("attachments"))})
+    con.close()
+    return msgs
+
+
+def check_app(raw, drafted):
+    sid = os.environ.get("OPENCODE_SESSION_ID", "")
+    if not sid:
+        refuse("--app needs a Robob thread session (OPENCODE_SESSION_ID). From iMessage use --inbound ID.")
+    con = ro(STATE_DB)
+    row = con.execute("select thread_id from orchestration_v2_projection_provider_threads "
+                      "where json_extract(payload_json, '$.nativeThreadRef.nativeId') = ? "
+                      "order by updated_at desc limit 1", (sid,)).fetchone()
+    con.close()
+    if not row:
+        refuse("this session isn't a Robob thread Abdullah types in (subagents return drafts to their parent).")
+    want = trimmed(lf(raw).split("\n"))
+    block = lines_of(raw)
+    msgs = app_messages(row[0])
+    cands, loose = [], False
+    for i, m in enumerate(msgs):
+        if m["who"] != "assistant" or not m["done"] or m["done_t"] < drafted:
+            continue
+        if app_shown(m["text"], want) is not None:
+            cands.append(i)
+        elif find_block(lines_of(m["text"]), block) is not None:
+            loose = True
+    if not cands:
+        if loose:
+            refuse("the preview is in your reply, but not as a plain ``` code block (no language), or something before "
+                   "the block can hide it (a fence, raw HTML, $ or a backslash, ::, a [reference] line). The app renders markdown, "
+                   "so only a code block shows it exactly. Paste it again that way and wait for his OK.")
+        refuse("this draft's preview isn't in any finished reply of yours in this thread. Paste the preview block "
+               "in a plain ``` code block, end your turn, wait for his OK, then send.")
+    # Each preview pairs with the first thing he typed after it finished. Newest pair first; a preview the
+    # agent repeated after his OK pairs with a later message, fails the judge, and the earlier pair is tried.
+    pairs = {}
+    for s in cands:
+        done_t = msgs[s]["done_t"]
+        r = next((j for j in range(s + 1, len(msgs)) if msgs[j]["who"] == "Abdullah" and msgs[j]["t"] > done_t), None)
+        if r is not None and msgs[r]["t"] - done_t <= WINDOW_MS and msgs[r]["t"] >= now_ms() - WINDOW_MS:
+            pairs[r] = s  # several previews before one reply: the newest one
+    if not pairs:
+        refuse("Abdullah hasn't typed anything in this thread since the preview (within 24h). End your turn and "
+               "wait for his OK.")
+
+    def said(ms):
+        out = []
+        for m in ms:
+            if m["who"] == "Abdullah" and m.get("files"):
+                raise NotOk("he attached something after the preview, and that can't be read as text. Ask him in "
+                            "words and use that reply.")
+            out.append((m["t"], m["who"], m["text"]))
+        return out
+
+    why = None
+    for r in sorted(pairs, reverse=True)[:3]:
+        s = pairs[r]
+        try:
+            if msgs[r].get("files"):
+                raise NotOk("his reply has an attachment, so it isn't a plain OK. Ask him for a typed OK.")
+            before_block, after_block = app_shown(msgs[s]["text"], want)
+            outside = lines_of("\n".join(before_block + after_block))
+            bare = len(outside) <= 1 and all(x.lower() in SEND_PROMPTS for x in outside)
+            before = [(m["t"], m["text"]) for m in msgs if m["who"] == "Abdullah" and m["t"] > msgs[s]["done_t"]]
+            verdict = decide(block, msgs[s]["text"], said(msgs[s + 1:r]), msgs[r]["text"], said(msgs[r + 1:]),
+                             f"his message at {stamp(msgs[r]['t'])}", msgs[s]["done_t"], bare)
+            after = [(m["t"], m["text"]) for m in app_messages(row[0])
+                     if m["who"] == "Abdullah" and m["t"] > msgs[s]["done_t"]]
+            if after != before:
+                raise NotOk("he wrote again while his OK was being checked. Read it, then run the send again.")
+            log({"decision": "approved", **verdict[1]})
+            print(verdict[0])
+            return
+        except NotOk as e:
+            why = why or str(e)
+    refuse(why)
+
+
+# ---------------------------------------------------------------- judge
+
+# The plain-OK fallback only trusts a message that was the preview and nothing else, give or take one of these.
+SEND_PROMPTS = {"ok to send?", "okay to send?", "ok to send it?", "ok to send this?", "send it?", "send this?",
+                "good to send?", "shall i send it?", "reply ok to send."}
+
+
+def plain_ok(text):
+    t = unicodedata.normalize("NFKC", text or "").translate(PUNCT).strip().lower()
+    if not re.fullmatch(r"[a-z' ,.!]+", t):
+        return False
+    words = re.findall(r"[a-z']+", t)
+    return 0 < len(words) <= 6 and all(w in YES_FILLER for w in words) and any(w in YES for w in words)
+
+
+def probability(v):
+    p = float(v)
+    if not math.isfinite(p) or not 0 <= p <= 1:
+        raise ValueError(f"judge answered {v!r}, not a probability")
+    return p
+
+
+def jev(state):
+    if JUDGE:
+        r = subprocess.run(JUDGE, shell=True, input=json.dumps(state), capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(f"judge exit {r.returncode}")
+        return probability(r.stdout.strip())
+    with open(KEY_FILE) as fh:
+        key = fh.read().strip()
+    body = {"model": JEV_MODEL, "state": {"s": state}, "questions": {"s": {
+        "type": "noul",
+        "instructions": "Abdullah was shown `s.shown`, which contains the preview `s.draft` of an outgoing "
+                        "message an assistant wants to send in his name. `s.between` lists what was said after "
+                        "that, oldest first. Then he typed `s.reply`. `s.later` lists everything said after his "
+                        "reply. Decide whether he approved sending exactly this draft.",
+        "criteria": {
+            "true": "`s.reply` clearly OKs sending this draft as shown (yes, send it, go ahead, approved, looks "
+                    "good), or OKs a set of drafts that includes it, and nothing he says in `s.between` or "
+                    "`s.later` changes, holds or takes it back.",
+            "false": "He asks for changes, asks a question, declines, approves something else or another version, "
+                     "holds or takes it back later, or it is unclear."}}}}
+    req = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json", "X-OpenRouter-Title": "send-approval"})
+    last = None
+    for timeout in (15, 25):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return probability(json.load(resp)["answers"]["s"]["noul"])
+        except Exception as e:  # network, HTTP or shape errors: retry once, then give up
+            last = e
+    raise RuntimeError(str(last))
+
+
+def decide(block, shown, between, reply, later, where, t_s, bare):
+    """(approved line, log fields), or NotOk. `bare`: the showing message was only the preview (+ a send prompt)."""
+    if len(between) + len(later) > MAX_ITEMS:
+        raise NotOk(f"too much was said since the preview ({len(between) + len(later)} messages) to check his OK. "
+                    "Show the preview again and use his fresh OK.")
+
+    def item(who, text):
+        if who.startswith("Abdullah") and len(text) > MAX_OWNER_CHARS:
+            raise NotOk("one of his messages since the preview is too long to check. Show the preview again.")
+        return {"from": who, "text": text if who.startswith("Abdullah") else clip_mid(text, 1500)}
+
+    if len(reply) > MAX_OWNER_CHARS:
+        raise NotOk("his reply is too long to check as an OK. Ask him for a plain OK after the preview.")
+    state = {"draft": clip_mid("\n".join(block), 6000), "shown": clip_mid(shown, 8000),
+             "between": [item(w, t) for _, w, t in between], "reply": reply,
+             "later": [item(w, t) for _, w, t in later]}
+    if len(json.dumps(state)) > MAX_STATE_CHARS:
+        raise NotOk("too much was said since the preview to check his OK. Show the preview again.")
+    try:
+        p = jev(state)
+    except Exception as e:
+        if plain_ok(reply) and not between and not later and bare:
+            return (f"approved: {where} \"{clip(reply, 80)}\" right after the preview shown {stamp(t_s)}",
+                    {"how": "plain-ok", "judge_error": str(e)[:200], "reply": clip(reply)})
+        raise NotOk(f"couldn't confirm his OK (judge unavailable: {clip(str(e), 120)}). Send him the preview again on "
+                    "its own (at most an \"OK to send?\" line with it), ask for a plain OK and use that reply.")
+    if p < THRESHOLD:
+        log({"decision": "not-ok", "how": "judge", "p": p, "reply": clip(reply)})
+        raise NotOk(f"{where} \"{clip(reply, 80)}\" doesn't read as an OK to send this draft (p={p:.2f}). "
+                    "Ask him, and if he changes anything write a new draft and show its preview.")
+    return (f"approved: {where} \"{clip(reply, 80)}\" after the preview shown {stamp(t_s)} (p={p:.2f})",
+            {"how": "judge", "p": p, "reply": clip(reply)})
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="send-approval", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    c = sub.add_parser("check")
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("--inbound")
+    g.add_argument("--app", action="store_true")
+    c.add_argument("--preview", required=True)
+    c.add_argument("--drafted-at", type=int, required=True)
+    c.add_argument("--file", nargs=2, action="append", default=[], metavar=("SHA256", "NAME"))
+    v = sub.add_parser("visible")
+    v.add_argument("text")
+    a = ap.parse_args()
+    if a.cmd == "visible":
+        visible_or_refuse(a.text, "the draft")
+        return
+    if a.cmd != "check":
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    block = lines_of(a.preview)
+    if len(block) < 2 or not DRAFT_LINE.fullmatch(block[-1]):
+        refuse("--preview must be the whole block the draft command printed, ending with (draft <id>)")
+    ARGS_FOR_LOG.update({"via": "app" if a.app else f"inbound:{a.inbound}", "draft": block[-1][7:17],
+                         "what": clip(" / ".join(block[:-1]), 200)})
+    seen = lines_of(visible_or_refuse(a.preview, "the preview")["text"])
+    try:
+        if a.app:
+            if a.file:
+                refuse("a draft with files needs the files themselves delivered to him, and a Robob thread can't show "
+                       "that. Approve it from iMessage: send-file each file, then the preview, then use --inbound.")
+            check_app(a.preview, a.drafted_at * 1000)
+        else:
+            check_bridge(a.inbound.strip(), block, seen, a.file, a.drafted_at * 1000)
+    except sqlite3.Error as e:
+        refuse(f"sqlite error: {e}")
+
+
+if __name__ == "__main__":
+    main()

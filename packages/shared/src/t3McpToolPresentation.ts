@@ -166,6 +166,10 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
   t3_worktree_status: tool(["Get", "Getting", "Got", "thread worktree status"], "worktree-status"),
   // ardud fork
   t3_context_reset: tool(["Reset", "Resetting", "Reset", "this thread's context"], "context-reset"),
+  t3_scheduled_task_block_retry: tool(
+    ["Set", "Setting", "Set", "a scheduled task's blocked-run retry"],
+    "schedule-update",
+  ),
   preview_status: tool(["Get", "Getting", "Got", "preview browser status"], "browser", "browser"),
   preview_open: tool(
     ["Open", "Opening", "Opened", "a page in the preview browser"],
