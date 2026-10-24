@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { RoleId, type Lane, type RecoveryIncident } from "@t3tools/contracts";
+import { MissionError, RoleId, type Lane, type RecoveryIncident } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -1021,6 +1021,178 @@ it.effect("a lane the owner stopped is under Skipped in the master's summary", (
     assert.deepStrictEqual(
       fake.sent.map((sent) => sent.threadId),
       [masterThread, webThread],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+/** A run an OpenCode restart cut mid command, reported by the restart watch. */
+const restartCut = (ordinal: number, at: number) =>
+  Effect.gen(function* () {
+    const recovery = yield* RecoveryService.RecoveryService;
+    const runId = `${laneThread}-run-${ordinal}`;
+    yield* runRow({
+      threadId: laneThread,
+      ordinal,
+      status: "cancelled",
+      completedAt: plus(at),
+      startedAt: plus(at - 40),
+    });
+    yield* itemRow(runId, laneThread, 1, "command_execution", "running", { input: "vp test run" });
+    yield* TestClock.setTime(T0 + (at + 10) * 1000);
+    return yield* recovery.report(test, {
+      reportId: `rs-${runId}`,
+      cause: "opencode-restart",
+      startAt: plus(at - 5),
+      endAt: plus(at + 5),
+      threads: [{ threadId: laneThread, runIds: [runId], childIds: [] }],
+    });
+  });
+
+it.effect("notices the router refused fold into one limit notice that waits for the reset", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    fake.refuse.set(laneThread, new MissionError({ code: "conflict", detail: "Room is busy." }));
+    // Two restarts, and the router turns both lane notices away.
+    const first = yield* restartCut(1, UP + 300);
+    assert.isNotNull(first.incidentId);
+    yield* recovery.tick;
+    yield* TestClock.adjust("61 seconds");
+    yield* recovery.tick;
+    const second = yield* restartCut(3, UP + 400);
+    assert.isNotNull(second.incidentId);
+    assert.notStrictEqual(second.incidentId, first.incidentId);
+    yield* recovery.tick;
+    yield* TestClock.adjust("61 seconds");
+    yield* recovery.tick;
+    // Then it fails on the limit before either went out.
+    yield* limitFailure(laneThread, 5, UP + 600);
+    yield* at(UP + 901);
+    assert.isNull(yield* recovery.scan);
+    fake.refuse.delete(laneThread);
+    const laneEntries = Effect.map(recovery.incidents(missionId), (open) =>
+      open.flatMap((incident) =>
+        incident.threads
+          .filter((thread) => thread.threadId === laneThread)
+          .map((thread) => [incident.id, thread.state, thread.usageLimit ?? null]),
+      ),
+    );
+    assert.deepStrictEqual(yield* laneEntries, [
+      [second.incidentId, "skipped", null],
+      [first.incidentId, "pending", "first"],
+    ]);
+    yield* at(UP + 1302);
+    yield* recovery.tick;
+    assert.notInclude(
+      fake.sent.map((sent) => sent.threadId),
+      laneThread,
+    );
+    yield* at(UP + 1303);
+    yield* recovery.tick;
+    yield* TestClock.adjust("1 hour");
+    yield* recovery.tick;
+    assert.strictEqual(fake.sent.filter((sent) => sent.threadId === laneThread).length, 1);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "a newer limit still settling holds the notice even after an older cut is replanned",
+  () => {
+    const { fake, layer } = harness();
+    return Effect.gen(function* () {
+      yield* limitWorld([lane]);
+      const recovery = yield* RecoveryService.RecoveryService;
+      yield* limitFailure(laneThread, 1, UP + 600);
+      yield* at(UP + 901);
+      assert.strictEqual((yield* recovery.scan)?.threads[0]?.notBefore, plus(UP + 1303));
+      // Poked by hand: one failure on something else, then the limit again at 09:20:50.
+      yield* runRow({
+        threadId: laneThread,
+        ordinal: 3,
+        status: "failed",
+        completedAt: plus(UP + 950),
+        startedAt: plus(UP + 920),
+      });
+      yield* itemRow(`${laneThread}-run-3`, laneThread, 1, "error", "failed", {
+        failure: {
+          class: "provider",
+          code: "provider.internal",
+          message: "OAuth token expired",
+          retryable: null,
+        },
+      });
+      yield* limitFailure(laneThread, 4, UP + 1250, {
+        message: '[claude/claude-opus-5-5] [429]: {"type":"rate_limit_error"} (reset after 20m)',
+      });
+      // At the first reset the older cut has settled and the newer one hasn't.
+      yield* at(UP + 1303);
+      assert.strictEqual(yield* recovery.tick, 0);
+      yield* at(UP + 1551);
+      assert.isNull(yield* recovery.scan);
+      yield* at(UP + 2509);
+      assert.strictEqual(yield* recovery.tick, 0);
+      yield* at(UP + 2510);
+      assert.strictEqual(yield* recovery.tick, 1);
+      yield* TestClock.adjust("1 hour");
+      yield* recovery.tick;
+      assert.deepStrictEqual(
+        fake.sent.map((sent) => sent.threadId),
+        [laneThread],
+      );
+      assert.include(fake.sent[0]?.text ?? "", "failed at 09:20");
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("a held limit notice stays the one notice through a restart and another limit", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* at(UP + 901);
+    const waiting = yield* recovery.scan;
+    assert.isNotNull(waiting);
+    yield* recovery.resume(agent(masterThread), { missionId, mode: "hold", threadId: laneThread });
+    // Poked by hand, an OpenCode restart cuts it, then it fails on the limit again.
+    const report = yield* restartCut(3, UP + 1000);
+    assert.strictEqual(report.incidentId, waiting?.id);
+    yield* limitFailure(laneThread, 5, UP + 1020);
+    yield* at(UP + 1330);
+    assert.isNull(yield* recovery.scan);
+    assert.deepStrictEqual(
+      (yield* recovery.incidents(missionId)).map((incident) => [incident.id, view(incident)]),
+      [
+        [
+          waiting?.id,
+          [
+            {
+              threadId: laneThread,
+              action: "resume",
+              state: "held",
+              usageLimit: "first",
+              notBefore: plus(UP + 1020 + 703),
+            },
+          ],
+        ],
+      ],
+    );
+    yield* TestClock.adjust("1 hour");
+    yield* recovery.tick;
+    assert.deepStrictEqual(fake.sent, []);
+    // Released, it goes once.
+    yield* recovery.resume(agent(masterThread), {
+      missionId,
+      mode: "release",
+      threadId: laneThread,
+    });
+    yield* recovery.tick;
+    yield* TestClock.adjust("1 hour");
+    yield* recovery.tick;
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [laneThread],
     );
   }).pipe(Effect.provide(layer));
 });

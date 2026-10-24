@@ -267,7 +267,12 @@ const mergeCut = (
   const freshHolds = new Set(fresh.holds.map((hold) => hold.holdId));
   const keepReconcile = waiting.action === "reconcile-first" && fresh.action === "resume";
   // A newer cut on something else means the provider answered again: no more wait.
-  const usageLimit = fresh.usageLimit;
+  // A held one stays a limit notice though, so the next limit failure still finds
+  // it instead of opening a fresh resume past the hold.
+  const usageLimit =
+    waiting.state === "held" && waiting.usageLimit === "first" && fresh.usageLimit === undefined
+      ? waiting.usageLimit
+      : fresh.usageLimit;
   const notBefore =
     usageLimit === "first" ? laterOf(waiting.notBefore, fresh.notBefore) : fresh.notBefore;
   return {
@@ -1003,13 +1008,14 @@ export const make = Effect.gen(function* () {
         });
         // A notice the router already took counts as sent, so the newer cut
         // gets its own; one stopped mid-send stays held for a human and takes
-        // the newer facts with it.
+        // the newer facts with it. One the router refused never went out, so
+        // it folds like any other.
         const matches: typeof found = [];
         const claimed = new Set<string>();
         for (const match of found) {
           const claim = yield* recovery.noticeClaim(noticeKey(match.incident, match.waiting));
           if (claim?.state === "sent") continue;
-          if (claim !== null) claimed.add(match.incident.id);
+          if (claim?.state === "sending") claimed.add(match.incident.id);
           matches.push(match);
         }
         // A notice that may already be on its way, or one a human holds, keeps the thread.
@@ -1520,15 +1526,19 @@ export const make = Effect.gen(function* () {
           now,
         );
         incident = (yield* recovery.incident(start.id)) ?? incident;
-        continue;
       }
+      // The newest cut may still be settling behind the ones just replanned.
       const settled = settledAt(latest);
       if (settled <= now) continue;
+      const current = incident.threads.find(
+        (entry) => entry.missionId === thread.missionId && entry.threadId === thread.threadId,
+      );
+      if (current === undefined || current.noticeAt !== null || !sendable(current)) continue;
       const reset = Model.limitResetOf(latest) ?? undefined;
-      const notBefore = laterOf(laterOf(thread.notBefore, reset), settled) ?? settled;
-      if (notBefore === thread.notBefore) continue;
+      const notBefore = laterOf(laterOf(current.notBefore, reset), settled) ?? settled;
+      if (notBefore === current.notBefore) continue;
       const clock = Model.clockLabel(notBefore, delivery.timeZone);
-      incident = patchThread(incident, thread, {
+      incident = patchThread(incident, current, {
         notBefore,
         stateReason:
           reset === undefined
