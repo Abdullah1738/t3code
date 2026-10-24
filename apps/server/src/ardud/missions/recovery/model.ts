@@ -379,6 +379,13 @@ export const clockLabel = (iso: string, timeZone: string) => {
   }).format(date);
 };
 
+/**
+ * Closes a note queued behind a running turn. It lands when that turn ends,
+ * maybe hours later, and only knows what recovery saw when it looked.
+ */
+export const queuedNoteStamp = (seenAt: string, queuedAt: string) =>
+  `As of ${seenAt}${queuedAt === seenAt ? ", queued" : `, queued at ${queuedAt}`} behind your running turn: work and children started after ${seenAt} aren't covered here, so check the current state before acting on this.`;
+
 const CAUSE_LABEL: Record<RecoveryCause, string> = {
   "server-restart": "restart",
   "opencode-restart": "OpenCode restart",
