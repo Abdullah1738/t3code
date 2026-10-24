@@ -1,6 +1,6 @@
 #!/bin/zsh
 # wa — WhatsApp CLI for agents, backed by wacli (durable SQLite store kept live by LaunchAgent com.ardud.wacli-sync).
-# Same interface as the old whatscli/tmux wrapper (still available as `wa tui ...` = ~/.local/bin/wa.bak-20261001-tui).
+# Same interface as the old whatscli/tmux wrapper (retired; it sent without approval, so `wa tui` is gone).
 # Usage:
 #   wa status                 "online pid N" if the sync daemon is up (exit 1 otherwise)
 #   wa find <name|number>     search contacts -> jid | name | push name (lists phone JID and LID)
@@ -9,23 +9,27 @@
 #   wa chats [N]              recent chats: name (unread) | jid
 #   wa read <jid> [--more N]  last 40 messages "(dd-mm-yy HH:MM:SS) Me|Name: text" (phone JID + LID merged);
 #                             --more N shows N*40 more and asks the phone for older history when the store runs out
-#   wa draft <jid> <text...>  store a single-line text draft (sends nothing); prints the id to show Abdullah
-#   wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]   same for a file
-#   wa send --approved <id>   send a text draft after Abdullah OKs its exact text (once, within 24h)
-#   wa sendfile --approved <id>   send a file draft after he OKs it (once, within 24h)
+#   wa draft <jid> <text...>  store a single-line text draft (sends nothing); prints the preview lines to show Abdullah
+#   wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]   same for a file (bound to its bytes)
+#   wa send --approved <id> (--inbound <id> | --app)   send a text draft once Abdullah OKed its preview (once, within 24h).
+#                             --inbound: the incoming message ID of his OK (iMessage), --app: his reply in this Robob
+#                             thread. send-approval checks he got the preview lines before that reply and that it is an OK.
+#   wa sendfile --approved <id> (--inbound <id> | --app)   same for a file draft
 #   wa send <jid> <text...>   blocked for everyone but the owner's own number (draft first, see above)
 #   wa sendfile <jid> <path> [image|video|audio|doc]   blocked the same way; owner's own number only
 #   wa download <jid> [N]     download the Nth-newest media message (default 1) -> prints the file path
 #   wa ids <jid> [N]          last N messages with message ids (for download/reply-to)
 #   wa start                  (re)start the sync daemon
-#   wa tui <args>             run the legacy whatscli wrapper (fallback while it stays linked)
-# Drafts live in $WA_DRAFT_DIR (default ~/.local/state/wa-drafts). A used draft is renamed
-# <id>.sent.json or <id>.failed.json, never deleted; a claimed draft is briefly <id>.sending.json.
+# Drafts live in $WA_DRAFT_DIR (default ~/.local/state/wa-drafts). A pending draft is never rewritten; drafting it
+# again once it is over 24h old (or its file changed) renames it <id>.expired.json and makes a new id, so an old OK
+# can't send it. A claimed draft is briefly <id>.sending.json; a used one is renamed
+# <id>.sent.json or <id>.failed.json, never deleted.
 set -u
 W=${WA_WACLI:-$HOME/.local/bin/wacli}
 D=${WA_DRAFT_DIR:-$HOME/.local/state/wa-drafts}
 H="$HOME/.local/share/robob-watch/helpers/wa-db"
-TUI="$HOME/.local/bin/wa.bak-20261001-tui"
+# Checks Abdullah's OK on a draft (lives next to this script; ~/.local/bin/wa is a symlink).
+SA=${WA_SEND_APPROVAL:-${0:A:h}/send-approval}
 DL="$HOME/Downloads/whatsapp"
 norm() { local j=$1; [[ $j == *@* ]] || j="${j//[^0-9]/}@s.whatsapp.net"; print -r -- $j; }
 SVC="gui/$(id -u)/com.ardud.wacli-sync"
@@ -36,7 +40,7 @@ LCTL=${WA_LAUNCHCTL:-launchctl}
 OWNER=971585134795
 re_id='^[0-9a-f]{10}$'
 die() { print -r -- "$1" >&2; exit 2; }
-# Read one field of a draft file (fields are single-line by construction).
+# Read one field of a draft file (only the preview has several lines).
 jget() { /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2"; }
 # Write a draft file atomically from key=value pairs.
 jput() {
@@ -52,17 +56,106 @@ with open(tmp, "w") as fh:
     json.dump(out, fh)
 os.replace(tmp, sys.argv[1])' "$f" "$@"
 }
-# A draft already sent or in flight cannot be re-drafted; a failed one can be written again.
+# A draft already sent or in flight cannot be written again.
 draft_free() {
   [[ -e $D/$1.sent.json ]] && die "Refused: this exact draft $1 was already sent."
   [[ -e $D/$1.sending.json ]] && die "Refused: draft $1 is already being sent."
   return 0
 }
-# Claim an approved draft of the given kind (text|file) by renaming it to <id>.sending.json.
+# Draft id from its content (stdin). After a failed send or an expired draft the same content gets a new id,
+# so the old OK (on the old id's preview) can't send it again.
+draft_id() {
+  local base n=0 id
+  base=$(cat)
+  id=$(print -rn -- "$base" | /usr/bin/shasum -a 256 | cut -c1-10)
+  while [[ -e $D/$id.failed.json || -e $D/$id.expired.json ]]; do
+    (( n++ )); id=$(print -rn -- "$base"$'\n'"retry $n" | /usr/bin/shasum -a 256 | cut -c1-10)
+  done
+  print -r -- $id
+}
+# One chat, one draft id: a privacy id (LID) becomes the phone JID when wacli knows it.
+canon() {
+  local j=$1 pj
+  if [[ $j == *@lid ]]; then
+    pj=(${(M)${(f)"$("$H" resolve "$j" 2>/dev/null)"}:#*@s.whatsapp.net})
+    (( ${#pj} )) && j=$pj[1]
+  fi
+  print -r -- $j
+}
+# The recipient line of a preview, with the chat's stable id: "Name (+number)", "group Name (id@g.us)". Sets TO.
+recipient() {
+  local jid=$1 name
+  name=$("$H" name "$jid" 2>/dev/null)
+  if [[ $jid == *@g.us ]]; then TO="group ${name:+$name }($jid)"
+  elif [[ $jid == *@s.whatsapp.net ]]; then TO="${name:+$name (}+${jid%%@*}${name:+)}"
+  else TO="${name:+$name }($jid)"; fi
+}
+# Approval evidence from `send --approved <id> (--inbound <id> | --app)`; fills VIA.
+approval_args() {
+  VIA=()
+  case ${1:-} in
+    --inbound) [[ -n ${2:-} ]] && VIA=(--inbound "$2") ;;
+    --app) VIA=(--app) ;;
+  esac
+  (( ${#VIA} )) || die "Refused: --approved <id> alone isn't Abdullah's OK. Add --inbound <incoming message ID of his reply> (iMessage) or --app (his reply in this Robob thread), after he saw the preview."
+}
+# Abdullah's OK on exactly this draft's preview, given after he got it (send-approval). Exits 2 when refused.
+check_ok() {
+  local f=$1 pv files=()
+  [[ ${$(jget "$f" jid)%%@*} == $OWNER ]] && return 0
+  pv=$(jget "$f" preview)
+  [[ -n $pv ]] || die "Refused: draft ${${f:t}%.json} predates preview binding. Write it again and show the new preview."
+  [[ $(jget "$f" kind) == file ]] && files=(--file "$(jget "$f" sha256)" "${$(jget "$f" path):t}")
+  "$SA" check "${VIA[@]}" --preview "$pv" --drafted-at "$(jget "$f" created_at)" "${files[@]}" || exit 2
+}
+# Print the preview lines the agent pastes to Abdullah before asking for his OK.
+show_preview() {
+  print -r -- "Show Abdullah these lines as is (in a Robob thread: alone in a plain \`\`\` code block), then wait for his OK:"
+  print -r -- "$3"
+  print -r -- "After his OK: wa $2 --approved $1 --inbound <incoming message ID of his reply> (in a Robob thread: --app)"
+}
+# A pending draft with this id is kept as is while it is fresh (same preview, same clock). Over 24h old, or its
+# file gone or changed: it becomes <id>.expired.json and this prints nothing (the caller takes a new id).
+# Prints the stored preview and exits when it is still fresh.
+reuse_pending() {
+  local id=$1 cmd=$2 f=$D/$1.json created fp
+  [[ -f $f ]] || return 0
+  created=$(jget "$f" created_at)
+  if [[ $created == <-> ]] && (( $(date +%s) - created <= 86400 )) && [[ -n $(jget "$f" preview) ]]; then
+    fp=$(jget "$f" path)
+    if [[ $(jget "$f" kind) != file ]] || [[ -f $fp && $(/usr/bin/shasum -a 256 "$fp" | cut -c1-64) == $(jget "$f" sha256) ]]; then
+      print -r -- "DRAFT $id (already pending, unchanged)"
+      show_preview $id $cmd "$(jget "$f" preview)"
+      exit 0
+    fi
+  fi
+  mv "$f" "$D/$id.expired.json"
+}
+# The id for a draft's content (stdin of draft_id), locked: a pending fresh one is printed and the script exits
+# (reuse_pending); one retired while we waited for its lock (failed or expired by another wa) moves on to the
+# next id. Sets ID.
+pick_id() {
+  local base=$1 cmd=$2
+  while true; do
+    ID=$(print -rn -- "$base" | draft_id)
+    lock_draft "$ID"
+    [[ -e $D/$ID.failed.json || -e $D/$ID.expired.json ]] && continue
+    draft_free "$ID"
+    reuse_pending "$ID" $cmd
+    [[ -e $D/$ID.expired.json ]] || return 0
+  done
+}
+# One drafter or sender per draft id at a time; held until this process exits.
+lock_draft() {
+  mkdir -p "$D/locks" && zmodload zsh/system && : >> "$D/locks/$1" && zsystem flock -t 60 "$D/locks/$1" \
+    || die "Refused: draft $1 is busy (another wa is writing or sending it). Try again in a minute."
+}
+# Claim an approved draft of the given kind (text|file): hard-link it to <id>.sending.json (fails if that exists).
 claim_draft() {
-  local id=$1 kind=$2 f=$D/$1.json k created s
+  local id=$1 kind=$2 f=$D/$1.json k created s fp sha
   [[ $id =~ $re_id ]] || die "error: bad draft id: $id"
-  for s in sent sending failed; do
+  lock_draft "$id"
+  for s in sent sending failed uncertain expired; do
     [[ -e $D/$id.$s.json ]] && die "Refused: draft $id already used ($s). Write a new draft."
   done
   [[ -f $f ]] || die "Refused: no draft $id. Write one with wa draft or wa draftfile."
@@ -71,7 +164,14 @@ claim_draft() {
   created=$(jget "$f" created_at)
   [[ $created == <-> ]] || die "Refused: draft $id has no valid timestamp."
   (( $(date +%s) - created > 86400 )) && die "Refused: draft $id is older than 24h. Write a new draft."
-  mv "$f" "$D/$id.sending.json" 2>/dev/null || die "Refused: draft $id already used."
+  if [[ $kind == file ]]; then
+    fp=$(jget "$f" path); sha=$(jget "$f" sha256)
+    [[ -n $sha ]] || die "Refused: draft $id predates file binding. Write a new draft with wa draftfile."
+    [[ -f $fp ]] || die "Refused: file is gone: $fp"
+    [[ $(/usr/bin/shasum -a 256 "$fp" | cut -c1-64) == $sha ]] || die "Refused: $fp changed since draft $id. Write a new draft and show it again."
+  fi
+  check_ok "$f"
+  { ln "$f" "$D/$id.sending.json" 2>/dev/null && rm -f "$f"; } || die "Refused: draft $id already used."
   CLAIMED=$D/$id.sending.json
 }
 settle() { mv "$CLAIMED" "${CLAIMED%.sending.json}.$1.json"; }
@@ -216,18 +316,20 @@ if not ok:
     sqlite3 -readonly -separator ' | ' "file:$HOME/.wacli/wacli.db?mode=ro" \
       "select msg_id, chat_jid, datetime(ts,'unixepoch','localtime'), case from_me when 1 then 'Me' else coalesce(nullif(sender_name,''),sender_jid) end, coalesce(media_type,''), substr(replace(coalesce(text,display_text,''),char(10),' / '),1,80) from messages where chat_jid in ($q) and deleted_at is null order by ts desc limit $n" ;;
   draft)
-    jid=$(norm ${1:?usage: wa draft <jid> <text...>}); shift
+    jid=$(canon "$(norm ${1:?usage: wa draft <jid> <text...>})"); shift
     text="${*}"
     [[ $text == *$'\n'* ]] && die "error: single-line text only"
     [[ -n $text ]] || die "error: empty text"
-    id=$(printf '%s\n%s\n%s' text "$jid" "$text" | /usr/bin/shasum -a 256 | cut -c1-10)
-    draft_free "$id"
-    mkdir -p "$D"
-    jput "$D/$id.json" kind=text jid="$jid" text="$text" created_at=$(date +%s)
+    base=$(printf '%s\n%s\n%s' text "$jid" "$text")
+    pick_id "$base" send; id=$ID
+    recipient "$jid"
+    pv=$(print -rl -- "WhatsApp to $TO:" "$text" "(draft $id)")
+    "$SA" visible "$pv" || exit 2
+    jput "$D/$id.json" kind=text jid="$jid" text="$text" preview="$pv" created_at=$(date +%s)
     print -r -- "DRAFT $id to $jid: $text"
-    print -r -- "Show Abdullah this exact text. Send only after he OKs it: wa send --approved $id" ;;
+    show_preview $id send "$pv" ;;
   draftfile)
-    jid=$(norm ${1:?usage: wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]}); file=${2:?file}; shift 2
+    jid=$(canon "$(norm ${1:?usage: wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]})"); file=${2:?file}; shift 2
     as=auto
     if [[ ${1:-} == --as ]]; then as=${2:?--as needs a kind}; shift 2; fi
     case $as in
@@ -239,15 +341,21 @@ if not ok:
     abs=${file:a}
     caption="${*}"
     [[ $caption == *$'\n'* ]] && die "error: single-line caption only"
-    id=$(printf '%s\n%s\n%s\n%s\n%s' file "$jid" "$abs" "$as" "$caption" | /usr/bin/shasum -a 256 | cut -c1-10)
-    draft_free "$id"
-    mkdir -p "$D"
-    jput "$D/$id.json" kind=file jid="$jid" path="$abs" as="$as" caption="$caption" created_at=$(date +%s)
+    sha=$(/usr/bin/shasum -a 256 "$abs" | cut -c1-64)
+    # The file's bytes, not its path, make the draft: a copy elsewhere is the same draft.
+    base=$(printf '%s\n%s\n%s\n%s\n%s' file "$jid" "$as" "$caption" "$sha")
+    pick_id "$base" sendfile; id=$ID
+    recipient "$jid"
+    pv=$(print -rl -- "WhatsApp to $TO: file $abs [$as] (sha256 ${sha[1,12]})" ${caption:+"Caption: $caption"} "(draft $id)")
+    "$SA" visible "$pv" || exit 2
+    jput "$D/$id.json" kind=file jid="$jid" path="$abs" as="$as" caption="$caption" sha256="$sha" preview="$pv" created_at=$(date +%s)
     print -r -- "DRAFT $id to $jid: file ${abs:t} [$as]${caption:+ caption: $caption}"
-    print -r -- "Show Abdullah this exact file and caption. Send only after he OKs it: wa sendfile --approved $id" ;;
+    show_preview $id sendfile "$pv"
+    print -r -- "In iMessage, send-file him $abs in the same chat right before the preview (the file has to reach him too)." ;;
   send)
     if [[ ${1:-} == --approved ]]; then
-      claim_draft "${2:?usage: wa send --approved <id>}" text
+      approval_args "${@:3}"
+      claim_draft "${2:?usage: wa send --approved <id> (--inbound <id> | --app)}" text
       jid=$(jget "$CLAIMED" jid); text=$(jget "$CLAIMED" text)
       self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
       out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
@@ -268,9 +376,12 @@ if not ok:
     if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: $text"; else print -r -- "$out" >&2; exit 1; fi ;;
   sendfile)
     if [[ ${1:-} == --approved ]]; then
-      claim_draft "${2:?usage: wa sendfile --approved <id>}" file
+      approval_args "${@:3}"
+      claim_draft "${2:?usage: wa sendfile --approved <id> (--inbound <id> | --app)}" file
       jid=$(jget "$CLAIMED" jid); fp=$(jget "$CLAIMED" path); as=$(jget "$CLAIMED" as); caption=$(jget "$CLAIMED" caption)
-      if [[ ! -f $fp ]]; then settle failed; die "Refused: file is gone: $fp"; fi
+      if [[ ! -f $fp || $(/usr/bin/shasum -a 256 "$fp" | cut -c1-64) != $(jget "$CLAIMED" sha256) ]]; then
+        settle failed; die "Refused: $fp is gone or changed. Write a new draft."
+      fi
       self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
       cap=(); [[ -n $caption ]] && cap=(--caption "$caption")
       out=$("$W" --json send file --to "$jid" --file "$fp" --as "$as" $self "${cap[@]}" 2>&1); rc=$?
@@ -301,6 +412,6 @@ d=json.load(sys.stdin); x=d.get("data") or {}
 print(x.get("path") or x.get("Path") or x.get("local_path") or x.get("LocalPath") or "")' 2>/dev/null)
     [[ -n $p && -f $p ]] || { print -r -- "$out" >&2; exit 1; }
     print -r -- "$p" ;;
-  screen|tui) exec "$TUI" "$@" ;;
-  *) sed -n '2,23p' "$0" ;;
+  screen|tui) die "wa tui is retired: the old whatscli wrapper sent without Abdullah's OK. Use wa draft / wa send --approved." ;;
+  *) sed -n '2,26p' "$0" ;;
 esac

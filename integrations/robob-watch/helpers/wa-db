@@ -8,6 +8,7 @@
   wa-db check NUMBER...           "+N | on WhatsApp (known locally) | <jid> | name" or "+N | unknown locally"
                                   (contacts + LID map only, no network; exit 2 on a bad number)
   wa-db chats [N]                 recent chats
+  wa-db name JID|NUMBER           display name of a person or group (empty line if unknown)
   wa-db health                    exit 0 if the sync daemon is live (lock held + heartbeat/DB fresh), else 1 + reason
 
 Times print in the Mac's local zone (Asia/Dubai). Never writes wacli.db.
@@ -253,6 +254,16 @@ def cmd_chats(args):
         print(f"{nm or jid.split('@')[0]}{f' ({unread})' if unread else ''} | {jid}")
 
 
+def cmd_name(args):
+    con = connect()
+    jid = norm(args[0])
+    if jid.endswith("@g.us"):
+        row = con.execute("select coalesce(name,'') from chats where jid=?", (jid,)).fetchone()
+        print(row[0] if row and "@" not in row[0] else "")
+    else:
+        print(name_of(con, jid))
+
+
 def daemon_status():
     """(ok, reason). Live = the sync process holds the store lock and the DB or heartbeat moved recently,
     or the process is up (quiet chats legitimately leave both untouched)."""
@@ -433,7 +444,7 @@ def main():
         die(__doc__, 2)
     cmd, args = sys.argv[1], sys.argv[2:]
     fn = {"read": cmd_read, "resolve": cmd_resolve, "find": cmd_find, "check": cmd_check, "chats": cmd_chats, "health": cmd_health,
-          "new": cmd_new}.get(cmd)
+          "new": cmd_new, "name": cmd_name}.get(cmd)
     if not fn:
         die(__doc__, 2)
     try:
