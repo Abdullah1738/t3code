@@ -725,6 +725,69 @@ def bridge(*args, timeout=60):
     return data
 
 
+UNSHARE_AFTER_S = 3600  # an ended ride's page stays up this long, then its public link goes
+
+
+def unshared_path(uuid):
+    return journal_dir() / f".{check_uuid(uuid)}.unshared"
+
+
+def public_link(uuid):
+    """True once someone other than the owner got this trip's public share link. The owner's card
+    is a tailnet page (publish), not a share, so it never counts against the bridge's share cap."""
+    j = read_json(journal_path(uuid), {}) or {}
+    return any(who != "abdullah" and (r.get("payload") or {}).get("url")
+               for who, r in (j.get("recipients") or {}).items())
+
+
+def ended_at(card):
+    """When a frozen card's trip ended (its last state change); None while the card is live."""
+    if not card or not card.get("terminal"):
+        return None
+    for field in ("since", "checked_at"):
+        try:
+            return datetime.fromisoformat(str(card.get(field)).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def unshare(uuid):
+    """Take a trip's public link down. Idempotent: the bridge answers removed:false once it's gone."""
+    res = bridge("unshare", "--app", slug(uuid), timeout=10)
+    atomic_write(unshared_path(uuid), json.dumps({"at": iso(time.time()), "removed": res.get("removed")}))
+    return res
+
+
+def free_ended_shares(exclude=None):
+    """The bridge's live-share cap is hit: every ended trip's public link goes now, grace or not.
+    Returns how many the bridge really removed."""
+    freed = 0
+    for p in sorted(journal_dir().glob("*.json")):
+        uuid = p.stem
+        if uuid == exclude or not UUID_RE.match(uuid) or unshared_path(uuid).exists():
+            continue
+        if ended_at(load_card(uuid)) is None or not public_link(uuid):
+            continue
+        try:
+            freed += bool(unshare(uuid).get("removed"))
+        except Exception:
+            continue
+    return freed
+
+
+def share_card(uuid):
+    try:
+        pub = bridge("share", "--app", slug(uuid), "--days", "2")
+    except RuntimeError as ex:
+        # At most 10 live shares: ended rides' links are past use, so they go first, then one retry.
+        if "live shares" not in str(ex) or not free_ended_shares(exclude=uuid):
+            raise
+        pub = bridge("share", "--app", slug(uuid), "--days", "2")
+    unshared_path(uuid).unlink(missing_ok=True)  # shared again: the watcher takes it down again later
+    return pub
+
+
 def bridge_app_to():
     """True only once `app --to` is deployed AND the bridge server was restarted onto it.
     The CLI alone isn't enough: an old server would ignore `to` and post Moni's card in the
@@ -1105,7 +1168,7 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 if who == "abdullah":
                     pub = bridge("publish", "--app", slug(uuid))
                 else:
-                    pub = bridge("share", "--app", slug(uuid), "--days", "2")
+                    pub = share_card(uuid)
                 url = pub.get("publicURL") or pub.get("url")
                 warn = pub.get("metadataWarnings") or []
                 if warn:

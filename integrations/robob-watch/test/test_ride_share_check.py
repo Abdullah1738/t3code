@@ -87,8 +87,15 @@ if fail and os.environ.get("FAKE_BRIDGE_QUEUED"):
     queue(os.environ["FAKE_BRIDGE_QUEUED"])  # accepted, but the reply never came back
 if fail:
     print(os.environ.get("FAKE_BRIDGE_ERR") or "boom", file=sys.stderr); sys.exit(1)
+if args[0] == "share" and os.environ.get("FAKE_BRIDGE_CAP"):
+    with open(log) as f:  # all 10 shares are live until something is unshared
+        if not any(json.loads(x)[0] == "unshare" for x in f):
+            print('{"error":"Bridge request failed (HTTP 409): At most 10 live shares; unshare one first"}',
+                  file=sys.stderr); sys.exit(1)
 if args[0] in ("send", "app"):
     print(json.dumps(queue(os.environ.get("FAKE_BRIDGE_ACK_STATE") or "sent")))
+elif args[0] == "unshare":
+    print(json.dumps({"app": args[2], "removed": True}))
 elif args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -700,6 +707,90 @@ class RecipientTest(Base):
         p = self.meta("--rider", "moni", "--recipient", "lina")
         self.assertEqual(json.loads(p.stdout)["booker"], "moni")
         self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "omar", "lina"])
+
+
+class UnshareTest(Base):
+    def unshares(self):
+        return [c[2] for c in self.bridge_calls() if c[0] == "unshare"]
+
+    def ended(self, uuid, status="COMPLETED", at=30):
+        self.mark_sent(uuid)
+        self.run_check(0)
+        self.set_state(None, {uuid: {"status": status}})
+        self.run_check(at)
+        self.assertTrue(self.card(uuid)["terminal"])
+
+    def test_ended_ride_link_goes_an_hour_after_the_end_once(self):
+        self.ended(A)
+        self.assertEqual(self.run_check(30 + 3599), [])
+        self.assertEqual(self.unshares(), [], "the page stays up for an hour after the ride")
+        self.assertEqual(self.run_check(30 + 3600), [])
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "taken down once")
+
+    def test_cancelled_and_unconfirmed_rides_are_unshared_too(self):
+        self.ended(A, status="CANCELED")
+        self.run_check(30 + 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        self.set_state(trip(B, "OnTrip"), {})
+        self.card_cli("send", "--trip", B, "--session", "thread-1@3")
+        self.run_check(4000)
+        self.set_state(None, {})
+        for t in (4030, 4060, 4060 + 3 * 3600):
+            self.run_check(t)
+        self.assertEqual((self.card(B)["state"], self.card(B)["terminal"]), ("unknown", True))
+        self.run_check(4060 + 3 * 3600 + 30)
+        self.assertEqual(self.unshares(), [f"ride-{A}", f"ride-{B}"])
+
+    def test_live_ride_and_owner_only_card_keep_their_pages(self):
+        self.set_state(trip(A, "OnTrip"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.run_check(10 * 3600)
+        self.assertEqual(self.unshares(), [], "a ride still going keeps its link")
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("send", "--trip", B, "--session", "thread-1@3", "--chat", "abdullah")
+        self.run_check(10 * 3600 + 30)
+        self.set_state(None, {A: {"status": "COMPLETED"}, B: {"status": "COMPLETED"}})
+        self.run_check(10 * 3600 + 60)
+        self.run_check(20 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "the owner's tailnet card is no share")
+
+    def test_failed_unshare_is_tried_again_next_run(self):
+        self.ended(A)
+        p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(30 + 3600), FAKE_BRIDGE_FAIL="unshare"))
+        self.assertEqual(p.returncode, 0, "a bridge hiccup must not fail the watcher")
+        self.assertIn(f"unshare {A} failed", p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{A}", f"ride-{A}"])
+        self.assertTrue(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+
+    def test_share_cap_frees_ended_rides_then_shares(self):
+        # All 10 live shares in use (trip e44d36f9): an ended ride's link goes and the share is retried.
+        self.ended(A)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "sent", "moni": "sent"})
+        calls = [c[:3] for c in self.bridge_calls() if c[0] in ("share", "unshare")]
+        self.assertEqual(calls[-3:], [["share", "--app", f"ride-{B}"], ["unshare", "--app", f"ride-{A}"],
+                                      ["share", "--app", f"ride-{B}"]])
+
+    def test_a_backlog_goes_a_few_per_run(self):
+        uuids = [f"cccccccc-0000-4000-8000-00000000000{i}" for i in range(4)]
+        for u in uuids:
+            self.ended(u)
+        self.run_check(30 + 3600)
+        self.assertEqual(len(self.unshares()), 3)
+        self.run_check(30 + 3630)
+        self.assertEqual(sorted(self.unshares()), sorted(f"ride-{u}" for u in uuids))
+
+    def test_share_cap_with_nothing_ended_still_fails_plainly(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
 
 
 class PreviewRetryTest(Base):

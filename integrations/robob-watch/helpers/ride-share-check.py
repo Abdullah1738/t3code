@@ -11,7 +11,8 @@ the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at
 
 Completion is quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
 a trip that disappears without a terminal history status shows "Checking" and is retried for
-UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself.
+UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself; the only bridge call
+it makes is `unshare`, an hour after a ride ended, for that ride's public share link.
 
 Env overrides (all optional):
   WATCH_DIR          directory for rides.json and polls.jsonl (one line per poll: raw Uber status,
@@ -49,6 +50,7 @@ UNKNOWN_GIVE_UP_S = 3 * 3600
 CARD_RETRY_S = 600          # one more CARD_READY if someone still lacks the card 10 min later
 MISSES_BEFORE_UNKNOWN = 2   # a single empty poll doesn't flip a live card to "Checking"
 PREVIEW_RETRIES = 10        # checks spent re-rendering a frozen card's failed preview
+UNSHARES_PER_RUN = 3        # ended rides' links taken down per check
 
 
 def now_ts():
@@ -129,6 +131,31 @@ def q(v):
 def recently_requested(trips, rider, now, exclude):
     return any(u != exclude and t.get("rider") == rider and t.get("card_requested")
                and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
+
+
+def unshare_ended(now):
+    """An hour after a ride ends, its public share link goes: the bridge caps live shares at 10 and
+    old ride links used them all up (trip e44d36f9). Reads the share journal, so rides this state
+    file no longer tracks are covered too. A bridge that fails is tried again next run."""
+    if not os.environ.get("RIDE_CARD_BRIDGE") and Path(WD).resolve() != LIVE_DIR.resolve():
+        return  # a scratch run's journal isn't the real one: never touch real shares from it
+    done = 0
+    for p in sorted(rc.journal_dir().glob("*.json")):
+        if done >= UNSHARES_PER_RUN:
+            return  # the rest go next run; the check has a 60s budget
+        uuid = p.stem
+        if not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() or not rc.public_link(uuid):
+            continue
+        with rc.trip_lock(uuid):
+            end = rc.ended_at(rc.load_card(uuid))
+            if end is None or now - end < rc.UNSHARE_AFTER_S or rc.unshared_path(uuid).exists():
+                continue
+            try:
+                rc.unshare(uuid)
+                done += 1
+            except Exception as e:
+                print(f"ride-share: unshare {uuid} failed: {e}"[:300], file=sys.stderr)
+                return  # the bridge is down or busy: no point trying the rest this run
 
 
 def main():
@@ -261,6 +288,8 @@ def main():
             s["preview_retry"].pop(uuid, None)
         else:
             s["preview_retry"][uuid] = n + 1
+
+    unshare_ended(now)
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:
