@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -37,6 +38,9 @@ interface SubagentFixture {
   readonly title?: string | null;
   readonly nativeId?: string | null;
   readonly childThreadId?: string | null;
+  readonly providerThreadId?: string | null;
+  readonly startedAt?: string;
+  readonly driver?: string;
 }
 
 interface RosterFixture {
@@ -60,12 +64,15 @@ const subagentRecord = (fixture: SubagentFixture, index: number) => ({
   id: fixture.id ?? `node:subagent-${index}`,
   status: fixture.status,
   origin: fixture.origin ?? "provider_native",
+  driver: fixture.driver ?? "opencode",
   title: fixture.title === undefined ? `Subagent ${index}` : fixture.title,
   nativeTaskRef:
     fixture.nativeId === null
       ? null
       : { driver: "opencode", nativeId: fixture.nativeId ?? `toolu_${index}`, strength: "strong" },
   childThreadId: fixture.childThreadId ?? null,
+  providerThreadId: fixture.providerThreadId ?? null,
+  startedAt: fixture.startedAt === undefined ? null : DateTime.makeUnsafe(fixture.startedAt),
 });
 
 const makeHarness = (options: HarnessOptions = {}) => {
@@ -218,6 +225,79 @@ describe("ContextResetService", () => {
       expect(error.message).toContain("1 running background task:");
       expect(error.message).toContain('subagent "CRP-13347 facts + packet" (toolu_live)');
       expect(error.message).toContain("cancelBackgroundWork: true");
+      expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("says where each running child lives and since when, so it doesn't look lost", () => {
+    const harness = makeHarness({
+      subagents: [
+        {
+          status: "running",
+          title: "Sol r2",
+          nativeId: "toolu_sol",
+          providerThreadId:
+            "provider-thread:provider:opencode:provider-instance:opencode:native-thread:ses_e9b3d2a8fffe0SsrulM4Wva4Yn",
+          childThreadId:
+            "thread:provider:opencode:provider-instance:opencode:native-thread:ses_e9b3d2a8fffe0SsrulM4Wva4Yn",
+          startedAt: "2026-10-22T17:57:30.876Z",
+        },
+        {
+          id: "node:delegated",
+          status: "running",
+          origin: "app_owned",
+          title: "Astra final",
+          nativeId: null,
+          childThreadId: "thread:delegated-task:astra",
+        },
+        {
+          status: "running",
+          driver: "muse",
+          title: "Muse helper",
+          nativeId: "muse_sub",
+          // Muse puts the parent's provider thread here, not the child's.
+          providerThreadId:
+            "provider-thread:provider:muse:provider-instance:muse:native-thread:ses_parent",
+          childThreadId: "thread:muse-child",
+        },
+        {
+          status: "running",
+          driver: "claudeAgent",
+          title: "Claude task",
+          nativeId: "toolu_claude",
+          providerThreadId: "provider-thread:provider:claudeAgent:native-thread:toolu_claude",
+          childThreadId: "thread:provider:claudeAgent:native-thread:toolu_claude",
+        },
+        {
+          status: "running",
+          driver: "cursor",
+          title: "Cursor task",
+          nativeId: "task_cursor",
+          childThreadId: "thread:provider:cursor:native-thread:task_cursor",
+        },
+      ],
+      roster: [{ taskId: "bash-1", kind: "command", description: "offbox run make test" }],
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(reset(makeScope({})));
+      expect(error.message).toContain(
+        'subagent "Sol r2" (toolu_sol), in session ses_e9b3d2a8fffe0SsrulM4Wva4Yn, running since 2026-10-22T17:57:30Z',
+      );
+      expect(error.message).toContain(
+        'delegated task "Astra final" (node:delegated), in thread thread:delegated-task:astra, still running',
+      );
+      expect(error.message).toContain(
+        'subagent "Muse helper" (muse_sub), in thread thread:muse-child, still running',
+      );
+      expect(error.message).toContain(
+        'subagent "Claude task" (toolu_claude), in thread thread:provider:claudeAgent:native-thread:toolu_claude, still running',
+      );
+      expect(error.message).toContain(
+        'subagent "Cursor task" (task_cursor), in thread thread:provider:cursor:native-thread:task_cursor, still running',
+      );
+      expect(error.message).not.toContain("ses_parent");
+      expect(error.message).toContain('command "offbox run make test" (bash-1), still running');
+      expect(error.message).toContain("They are alive, not lost.");
       expect(harness.calls).toEqual([]);
     }).pipe(Effect.provide(harness.layer));
   });

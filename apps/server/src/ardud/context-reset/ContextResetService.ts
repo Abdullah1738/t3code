@@ -17,6 +17,7 @@ import type {
 } from "../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import {
+  describeRunningWork,
   describeWork,
   type RunningBackgroundWork,
   runningBackgroundWork,
@@ -122,7 +123,7 @@ const make = Effect.gen(function* () {
       const count = running.length;
       return yield* failure(
         "invalid_request",
-        `This thread still has ${count} running background task${count === 1 ? "" : "s"}: ${running.map(describeWork).join("; ")}. Wait for them to finish, or call t3_context_reset again with cancelBackgroundWork: true to stop them and reset (the stopped items are listed in the resume note).`,
+        `This thread still has ${count} running background task${count === 1 ? "" : "s"}: ${running.map(describeRunningWork).join("; ")}. ${count === 1 ? "It is" : "They are"} alive, not lost. Wait for them to finish, or call t3_context_reset again with cancelBackgroundWork: true to stop them and reset (the stopped items are listed in the resume note).`,
       );
     }
 
