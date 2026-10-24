@@ -114,12 +114,15 @@ class MarketplacePayment:
             print(json.dumps({'phase': phase, 'notify': result}), flush=True)
 
         last = None
-        declined = False  # the payment itself reported failed; the order can lag behind it
+        # The payment itself reported failed (the order can lag behind it). A resumed wait
+        # (await-payment) keeps what the run before the restart already saw.
+        declined = getattr(self, '_recovery_only', False) and journal.payment_declined(self.flow_id)
+        confirmed = False  # the bank approved it; only the order confirmation is outstanding
 
         def stalled():
             # Neither confirmed nor failed for 5 minutes: he hears it, with the safe fallback.
             # Checked after each read, so a read that settles the payment never alerts.
-            if not declined and clock() - start >= STALL_SECONDS:
+            if not declined and not confirmed and clock() - start >= STALL_SECONDS:
                 alert('payment_stalled', stall_notify)
 
         for _ in range(attempts):
@@ -189,9 +192,11 @@ class MarketplacePayment:
                     self._payment_observation('PAYMENT_FAILED', payment)
                     # Order cancellation/refund propagation can lag payment status.
                     declined = True
-                if not declined and (state in ('pending', 'challenge_required') or summary['has_redirect']):
+                confirmed = confirmed or state == 'payment_confirmed'
+                if not (declined or confirmed) and (state in ('pending', 'challenge_required')
+                                                    or summary['has_redirect']):
                     alert('owner_3ds_notified', notify)
-            elif (not declined and status == 'pending' and not secret
+            elif (not declined and not confirmed and status == 'pending' and not secret
                   and (self._financial_operation() != 'place'
                        or data.get('statusMessage') == 'Payment pending'
                        or data.get('redirect_url'))):
@@ -202,7 +207,8 @@ class MarketplacePayment:
         journal.observe(self.flow_id, self._financial_operation(), outcome='UNKNOWN',
                         evidence_hash=journal.digest({'order': self.order, 'payment_wait_elapsed': True}),
                         order_id=self.order)
-        self._payment_fail('_PAYMENT_WINDOW_ELAPSED_NO_RETRY', waiting=not declined)
+        self._payment_fail('_PAYMENT_WINDOW_ELAPSED_NO_RETRY',
+                           outcome='declined' if declined else 'confirming' if confirmed else 'waiting')
 
     def confirm_paid(self):
         if not journal.payment_reported(self.flow_id):

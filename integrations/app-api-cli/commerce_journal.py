@@ -111,7 +111,9 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
     a lost status read can still show up as a charge (a 3DS approval that lands late, a hold
     the bank keeps), so the person isn't told otherwise."""
     amount = f'AED {amount_minor / 100:.2f}' if isinstance(amount_minor, int) else 'the order'
-    status = f'commerce await-payment {flow_id} (status only, never resends)'
+    # Without an order number (the place answer was lost) only the order readback can find it.
+    status = (f'commerce await-payment {flow_id} (status only, never resends)' if order
+              else f'commerce order-status {flow_id} (reads the store\'s orders, never resends)')
     reconcile = f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)'
     unknown = 'I can\'t say yet whether the card was charged'
     if outcome == 'not_charged':
@@ -123,6 +125,10 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
     elif outcome == 'unconfirmed':
         tell = f'The payment for {amount} went out but I lost its status before it confirmed. {unknown}.'
         steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+    elif outcome == 'confirming':
+        tell = (f'The bank approved the payment for {amount}, but the store hasn\'t confirmed the order yet. '
+                'Treat the card as charged until the order shows up or is refunded.')
+        steps = ['check the store\'s Orders page for this order', status, reconcile]
     else:
         tell = f'The payment for {amount} didn\'t go through. {unknown}; checking.'
         steps = ['check ENBD X / the bank SMS for a charge or a hold', reconcile]
@@ -131,22 +137,26 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
             'next': steps + ['never re-place or resend this payment']}
 
 
-def payment_fail(code, *, flow_id, order, amount_minor, proven=False, waiting=False):
+def payment_fail(code, *, flow_id, order, amount_minor, proven=False, waiting=False, outcome=None):
     """Stop on an unconfirmed payment, with what may be said about it."""
-    outcome = 'not_charged' if proven else 'waiting' if waiting else 'declined'
+    outcome = outcome or ('not_charged' if proven else 'waiting' if waiting else 'declined')
     raise PaymentError(code, payment_details(flow_id=flow_id, order=order,
                                              amount_minor=amount_minor, outcome=outcome))
 
 
 class after_payment_send:
-    """Any stop between a payment send and its confirmation (a lost status read, a bad
-    readback, a crash in the wait) still says the charge is unknown and what is safe next.
+    """Any stop between a payment send and its confirmation (a send whose answer was lost,
+    a lost status read, a bad readback, a crash in the wait) still says the charge is
+    unknown and what is safe next.
 
     A class, not @contextmanager: PaymentError is a RuntimeError, and contextlib would take
     it for PEP 479 wrapping of a StopIteration and re-raise the bare original instead."""
 
-    def __init__(self, fallback, *, flow_id, order, amount_minor):
-        self.fallback, self.where = fallback, {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor}
+    def __init__(self, *, flow_id, order, amount_minor, sending=False):
+        # sending: around the send itself, where only an error that may have reached the
+        # store (may_have_sent) means a charge is possible; anything else stopped before it.
+        self.where = {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor}
+        self.sending = sending
 
     def __enter__(self):
         return self
@@ -154,7 +164,11 @@ class after_payment_send:
     def __exit__(self, kind, exc, tb):
         if exc is None or isinstance(exc, PaymentError) or not isinstance(exc, Exception):
             return False
-        code = str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', str(exc)) else self.fallback
+        if self.sending and (getattr(exc, 'may_have_sent', False) is not True
+                             or getattr(exc, 'code', None) in ('AUTH_EXPIRED', 'AUTH_FORBIDDEN')):
+            return False  # stopped before the store took it, or refused at auth: the lane's own error
+        # The error code stays what the CLI would have printed anyway; only the guidance is added.
+        code = str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', str(exc)) else 'COMMERCE_OPERATION_FAILED'
         raise PaymentError(code, payment_details(**self.where, outcome='unconfirmed')) from exc
 
 
@@ -681,6 +695,14 @@ def release_orderless(flow_id, *, evidence_hash):
     return {'state': 'RELEASED', 'reservation_minor_retained': True, 'retry_allowed': False}
 
 
+def payment_declined(flow_id):
+    """True once the payment itself was journalled as failed (a restart keeps that)."""
+    with _db() as db:
+        _get(db, flow_id)
+        return bool(db.execute("SELECT 1 FROM observations WHERE flow_id=? "
+                               "AND outcome='PAYMENT_FAILED'", (flow_id,)).fetchone())
+
+
 def payment_reported(flow_id):
     """True once a financial observation claimed PAYMENT_REPORTED_SUCCESS."""
     with _db() as db:
@@ -828,6 +850,35 @@ def completed_order_binding(*, app, vertical, account_hash, order_id):
         return {'flow_id': row['id'], 'scope_hash': row['scope_hash']} if row is not None else None
 
 
+def _snapshot(path, tries=20):
+    """The journal's bytes at one committed state, read without any sqlite lock.
+
+    This is read exactly while a payment waits on the bank. Any sqlite reader holds a
+    SHARED lock that the live payment's next commit has to wait out, so a slow or stopped
+    reader would make that payment's own journal write fail. A writer here (rollback
+    journal mode, see _db) keeps a -journal file the whole time it changes the database
+    and every commit moves the file's mtime, so a copy taken with no -journal around and
+    the same identity, size and mtime before and after is one committed state."""
+    hot = path.with_name(path.name + '-journal')
+    for _ in range(tries):
+        try:
+            before = os.stat(path)
+            if hot.exists():
+                time.sleep(0.05)
+                continue
+            with open(path, 'rb') as f:
+                data = f.read()
+            after = os.stat(path)
+        except OSError:
+            fail('JOURNAL_BUSY_OR_UNAVAILABLE')
+        same = all(getattr(before, k) == getattr(after, k)
+                   for k in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns'))
+        if same and not hot.exists() and len(data) == after.st_size and data[:16] == b'SQLite format 3\x00':
+            return data
+        time.sleep(0.05)
+    fail('JOURNAL_BUSY_OR_UNAVAILABLE')
+
+
 def open_payments(*, since_seconds=1800, now=None):
     """Flows with a payment send in the window that haven't closed, newest first. Read only.
 
@@ -836,10 +887,9 @@ def open_payments(*, since_seconds=1800, now=None):
     path = ROOT / 'journal.sqlite'
     if not path.is_file():
         return []
-    # Not _db(): its BEGIN IMMEDIATE would make the live payment's own journal calls (timeout=0)
-    # fail while this runs, and this is read exactly while a payment waits on the bank.
-    db = sqlite3.connect(f'{path.absolute().as_uri()}?mode=ro', uri=True, timeout=5)
+    db = sqlite3.connect(':memory:')
     try:
+        db.deserialize(_snapshot(path))
         db.row_factory = sqlite3.Row
         # An empty answer is read as "that bank prompt isn't ours", so only a journal this
         # code fully understands may give it.

@@ -292,7 +292,8 @@ def order_minutes(args):
         cvv=cvv_from_keychain() if args.cvv_from_keychain else None
         placed=flow.place()
         print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
-        payment=flow.complete(cvv=cvv)
+        with minutes_after_send(flow,sending=True):
+            payment=flow.complete(cvv=cvv)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_submitted','payment':payment}),flush=True)
     except minutes_transport.MinutesError as exc:
         if exc.code in ('AUTH_EXPIRED','AUTH_FORBIDDEN'):
@@ -305,7 +306,9 @@ def order_minutes(args):
         # not an error; the status readback below still proves the terminal triple.
         notify={'notified':False,'reason':'payment_confirmed_without_challenge'}
     else:
-        journal.fail('MINUTES_PAYMENT_NOT_PENDING')
+        # The card was sent; a refused answer still isn't proof nothing was charged.
+        journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
+                             amount_minor=flow.review.get('amount'))
     print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
     with minutes_after_send(flow):
         paid=flow.await_payment()
@@ -402,13 +405,14 @@ def order_main(args):
         return verified
     flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
     try:
-        placed=flow.place()
+        with marketplace_after_send(flow,sending=True):
+            placed=flow.place()
     except market_transport.MarketplaceError as exc:
         if exc.code in ('AUTH_EXPIRED','AUTH_FORBIDDEN'):
             journal.fail('MAIN_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
-    with marketplace_after_send(flow,'main'):
+    with marketplace_after_send(flow):
         paid=flow.await_success()
         flow.confirm_paid()
     tracking=flow.verify_tracking()
@@ -456,13 +460,14 @@ def order_supermall(args):
         return verified
     flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
     try:
-        placed = flow.place()
+        with marketplace_after_send(flow, sending=True):
+            placed = flow.place()
     except market_transport.MarketplaceError as exc:
         if exc.code in ('AUTH_EXPIRED', 'AUTH_FORBIDDEN'):
             journal.fail('SUPERMALL_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id': flow.flow_id, 'phase': 'placed', 'order': placed['order']}), flush=True)
-    with marketplace_after_send(flow, 'supermall'):
+    with marketplace_after_send(flow):
         paid = flow.await_success()
         flow.confirm_paid()
     tracking = flow.verify_tracking()
@@ -478,23 +483,24 @@ def order_supermall(args):
             'financial_retry': False}
 
 
-def marketplace_after_send(flow,lane):
-    return journal.after_payment_send(lane.upper()+'_PAYMENT_UNCONFIRMED_NO_RETRY',
-                                      flow_id=flow.flow_id,order=flow.order,
-                                      amount_minor=flow.review['payable_minor'])
+def marketplace_after_send(flow,sending=False):
+    return journal.after_payment_send(flow_id=flow.flow_id,order=getattr(flow,'order',None),
+                                      amount_minor=flow.review['payable_minor'],sending=sending)
 
 
-def minutes_after_send(flow):
-    return journal.after_payment_send('MINUTES_PAYMENT_UNCONFIRMED_NO_RETRY',flow_id=flow.flow_id,
-                                      order=flow.review.get('order'),amount_minor=flow.review.get('amount'))
+def minutes_after_send(flow,sending=False):
+    return journal.after_payment_send(flow_id=flow.flow_id,order=flow.review.get('order'),
+                                      amount_minor=flow.review.get('amount'),sending=sending)
 
 
 def minutes_payment_fail(flow,paid):
     # No Minutes read proves a no-capture, so a failed or unconfirmed payment is never "not charged".
+    outcome=('declined' if not paid['timed_out'] else
+             'confirming' if paid.get('payment_status')=='payment_confirmed' else 'waiting')
     journal.payment_fail('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY' if paid['timed_out']
                          else 'MINUTES_PAYMENT_FAILED_NO_RETRY',flow_id=flow.flow_id,
                          order=flow.review.get('order'),amount_minor=flow.review.get('amount'),
-                         waiting=bool(paid['timed_out']))
+                         outcome=outcome)
 
 
 def await_payment_flow(args):
@@ -517,7 +523,7 @@ def await_payment_flow(args):
                     evidence_hash=journal.digest({'order': flow.order, 'retained_paid_evidence': True}))
             paid = {'paid': True, 'already_observed': True}
         else:
-            with marketplace_after_send(flow, binding['vertical']):
+            with marketplace_after_send(flow):
                 paid = flow.await_success(wait_seconds=args.minutes * 60,
                                           notify=None if args.no_notify else telegram_3ds_notify)
         tracking = flow.verify_tracking()
