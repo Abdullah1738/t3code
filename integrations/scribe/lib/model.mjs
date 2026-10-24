@@ -8,14 +8,20 @@ export const ROUTER_URL = (process.env.SCRIBE_ROUTER_URL || 'http://127.0.0.1:20
 export const SCRIBE_MODEL = process.env.SCRIBE_MODEL || 'cc/claude-haiku-5-5';
 export const EDITOR_MODEL = process.env.SCRIBE_EDITOR_MODEL || 'cc/claude-opus-5-5';
 
-export async function chat({ model, system, user, maxTokens = 8000, timeoutMs = 240_000, fetchImpl = fetch }) {
+/**
+ * One chat completion. `stream` reads the reply as server-sent events: long
+ * replies (the report writer's) outlast fetch's five-minute wait for response
+ * headers when the router only answers once the whole reply is done.
+ */
+export async function chat({ model, system, user, maxTokens = 8000, timeoutMs = 240_000, stream = false, fetchImpl = fetch }) {
   const res = await fetchImpl(`${ROUTER_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model,
       max_tokens: maxTokens,
-      stream: false,
+      stream,
+      ...(stream ? { stream_options: { include_usage: true } } : {}),
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user },
@@ -23,17 +29,52 @@ export async function chat({ model, system, user, maxTokens = 8000, timeoutMs = 
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`9router ${res.status}: ${text.slice(0, 300)}`);
-  const data = JSON.parse(text);
-  const content = String(data.choices?.[0]?.message?.content ?? '')
+  if (!res.ok) throw new Error(`9router ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  const data = stream ? await readStream(res) : JSON.parse(await res.text());
+  const content = String(data.content ?? data.choices?.[0]?.message?.content ?? '')
     .replace(/<think>[\s\S]*?<\/think>/g, '')
     .trim();
   const usage = data.usage ?? {};
+  const finish = data.finish ?? data.choices?.[0]?.finish_reason ?? null;
   return {
     content,
     usage: { input: Number(usage.prompt_tokens ?? 0), output: Number(usage.completion_tokens ?? 0) },
+    finish,
   };
+}
+
+// The pieces of a streamed completion, joined; an error event fails the call.
+async function readStream(res) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let usage = null;
+  let finish = null;
+  let done = false;
+  const take = (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (payload === '[DONE]') done = true;
+    if (!payload || payload === '[DONE]') return;
+    const event = JSON.parse(payload);
+    if (event.error) throw new Error(`9router stream: ${JSON.stringify(event.error).slice(0, 300)}`);
+    const choice = event.choices?.[0];
+    if (typeof choice?.delta?.content === 'string') content += choice.delta.content;
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    if (event.usage) usage = event.usage;
+  };
+  for await (const chunk of res.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let at;
+    while ((at = buffer.indexOf('\n')) >= 0) {
+      take(buffer.slice(0, at).trim());
+      buffer = buffer.slice(at + 1);
+    }
+  }
+  take((buffer + decoder.decode()).trim());
+  // A stream that just stops (a dropped connection) is not a whole reply.
+  if (!finish && !done) throw new Error('9router stream: the reply ended without finishing');
+  return { content, usage, finish };
 }
 
 /**

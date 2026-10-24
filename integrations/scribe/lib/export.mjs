@@ -5,8 +5,9 @@
 // is never touched. The export is a copy of what the mission already holds;
 // the default target is scratch, and the live Crpko file takes an explicit
 // `live` (the cutover's report jobs).
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
+import { unpin } from './writer/lines.mjs';
 
 export const MARKER =
   '<!-- UPDATES-INSERT-BELOW: routine updates add a new "### <date> <time> UTC" section directly below this line. -->';
@@ -29,28 +30,94 @@ const header = (title) =>
     '',
   ].join('\n');
 
-const real = (path) => {
-  const abs = resolve(path);
-  try {
-    return realpathSync.native(abs);
-  } catch {
-    try {
-      return resolve(realpathSync.native(dirname(abs)), abs.split('/').pop());
-    } catch {
-      return abs;
+/**
+ * Where `path` really is, read the way the filesystem reads it: each part in
+ * turn, a symlink resolved before a later `..` steps out of it, and parts
+ * that don't exist yet kept as given. So `alias/../x.md`, with `alias` a
+ * link into another folder, names that folder's parent, as a write would.
+ */
+export const canonicalPath = (path) => {
+  const raw = isAbsolute(path) ? path : `${process.cwd()}/${path}`;
+  let at = '/';
+  for (const part of raw.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      at = dirname(at);
+      continue;
     }
+    const next = join(at, part);
+    try {
+      lstatSync(next);
+      at = realpathSync.native(next);
+    } catch {
+      at = next;
+    }
+  }
+  return at;
+};
+
+// Case folded broadly (upper then lower, so final sigma and sigma, or the
+// Kelvin sign and k, meet), whatever the volume does with case: two names a
+// case-blind volume might take for one count as one. Too broad only refuses
+// a pair of outputs, never merges them.
+// Repeated to a fixed point, with full mappings: capital sharp S, sharp S
+// and SS all end as "ss", the way a lower-upper-lower pass alone does not.
+const fold = (text) => {
+  let out = text.normalize('NFKD');
+  for (let prev = null; prev !== out; ) {
+    prev = out;
+    out = out.toLowerCase().toUpperCase().toLowerCase().normalize('NFKD');
+  }
+  return out.normalize('NFC');
+};
+
+// A path as a case-blind volume compares names.
+const comparable = (path) => fold(canonicalPath(path).normalize('NFC'));
+
+/**
+ * Whether two paths are one file: the same place once links are resolved
+ * and case is folded (so two names for a file that doesn't exist yet count
+ * too, on any volume), or the same inode (hard links).
+ */
+export const sameFile = (a, b) => {
+  if (comparable(a) === comparable(b)) return true;
+  try {
+    const one = statSync(a);
+    const two = statSync(b);
+    return one.dev === two.dev && one.ino === two.ino;
+  } catch {
+    return false;
   }
 };
 
-export const isLiveReport = (path) => LIVE.some((pattern) => pattern.test(real(path)));
+export const isLiveReport = (path) => LIVE.some((pattern) => pattern.test(canonicalPath(path)));
+
+/**
+ * Writes a file by replacing it (a new file renamed into place, at the
+ * file's real location), so a hard link to it elsewhere, a published report
+ * say, keeps its old text and a symlink stays a symlink. Keeps the old mode.
+ */
+export const replaceFile = (path, text) => {
+  const real = canonicalPath(path);
+  mkdirSync(dirname(real), { recursive: true });
+  const temp = join(dirname(real), `.${basename(real)}.${process.pid}.${Date.now()}.tmp`);
+  writeFileSync(temp, text);
+  try {
+    chmodSync(temp, statSync(real).mode & 0o7777);
+  } catch {}
+  renameSync(temp, real);
+};
 
 /** Inserts `section` below the marker; returns the new file text. Pure. */
 export const insertUpdate = (file, section) => {
   const lines = file.split('\n');
   const at = lines.findIndex((line) => line.startsWith(MARKER_PREFIX));
   if (at === -1) throw new Error('no UPDATES-INSERT-BELOW marker in the target file');
-  const heading = section.split('\n', 1)[0].trim();
-  if (heading.startsWith('### ') && lines.some((line) => line.trim() === heading)) {
+  // The heading names the window; the code's [record: ...] pins after a name
+  // in it can change between two writes of the same window.
+  const bare = (line) => unpin(line).trim();
+  const heading = bare(section.split('\n', 1)[0]);
+  if (heading.startsWith('### ') && lines.some((line) => bare(line) === heading)) {
     return { text: file, inserted: false };
   }
   const before = lines.slice(0, at + 1);
@@ -77,9 +144,11 @@ const refuseLive = (path, live) => {
  * checks this before asking the server, so a saved report is never one the file missed.
  */
 export const assertWritable = (path, { kind, live = false }) => {
-  refuseLive(path, live);
-  if (!existsSync(path)) return;
-  const current = readFileSync(path, 'utf8');
+  // The real place, as replaceFile will write it: `missing/../x` is x.
+  const real = canonicalPath(path);
+  refuseLive(real, live);
+  if (!existsSync(real)) return;
+  const current = readFileSync(real, 'utf8');
   if (kind === 'daily' && !current.startsWith(DAILY_STAMP)) {
     throw new Error(`refusing to overwrite ${path}: it was not written by scribe`);
   }
@@ -90,11 +159,13 @@ export const assertWritable = (path, { kind, live = false }) => {
 
 /** Writes the update into `path` (created with a header when missing). */
 export const exportUpdate = (path, section, { title = 'Mission', live = false } = {}) => {
-  assertWritable(path, { kind: 'update', live });
-  mkdirSync(dirname(resolve(path)), { recursive: true });
-  const current = existsSync(path) ? readFileSync(path, 'utf8') : header(title);
+  // Resolved once: what is checked, read and replaced is the same file.
+  const real = canonicalPath(path);
+  assertWritable(real, { kind: 'update', live });
+  const current = existsSync(real) ? readFileSync(real, 'utf8') : header(title);
   const { text, inserted } = insertUpdate(current, section);
-  if (inserted || !existsSync(path)) writeFileSync(path, text);
+  // Replaced, not rewritten in place: a hard link elsewhere keeps its text.
+  if (inserted || !existsSync(real)) replaceFile(real, text);
   return { path, inserted };
 };
 
@@ -103,8 +174,8 @@ export const exportUpdate = (path, section, { title = 'Mission', live = false } 
  * only overwrites a file this exporter wrote before (it starts with a stamp line).
  */
 export const exportDaily = (path, text, { live = false } = {}) => {
-  assertWritable(path, { kind: 'daily', live });
-  mkdirSync(dirname(resolve(path)), { recursive: true });
-  writeFileSync(path, `${DAILY_STAMP}\n${text.endsWith('\n') ? text : `${text}\n`}`);
+  const real = canonicalPath(path);
+  assertWritable(real, { kind: 'daily', live });
+  replaceFile(real, `${DAILY_STAMP}\n${text.endsWith('\n') ? text : `${text}\n`}`);
   return { path, inserted: true };
 };

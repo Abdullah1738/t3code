@@ -50,6 +50,8 @@ export function serverClient({ url, token, fetchImpl = fetch, timeoutMs = 30_000
     editorInput: async (missionId) => (await call('GET', `/editor/input${q({ missionId })}`)).input,
     postEditor: async (output) => (await call('POST', '/editor', output)).result,
     report: async (request) => (await call('POST', '/reports', request)).report,
+    /** Saves a written report ({missionId, kind, from, to, text, open, facts}); returns what the server kept. */
+    putReport: async (request) => (await call('POST', '/reports', request)).saved,
   };
 }
 

@@ -35,6 +35,8 @@ node cli.mjs run [--mission ID] [--slices 10]       # every mission lane, via th
 node cli.mjs dry-run --thread THREAD_ID [--from EVENT | --since ISO] [--slices 3] [--out DIR]
 node cli.mjs editor --mission ID [--out FILE]      # one Opus editor pass, by hand
 node cli.mjs report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--live] [--out FILE]
+node cli.mjs write --mission ID --kind daily|update [--day YYYY-MM-DD | --from ISO --to ISO] [--previous FILE]
+                   [--out FILE] [--pack FILE] [--export FILE [--live]] [--save] [--no-model] [--config FILE]
 node cli.mjs watch --mission ID [--sweep-minutes 15]  # a pass whenever a lane's run settles
 ```
 
@@ -57,8 +59,36 @@ section goes below the `UPDATES-INSERT-BELOW` marker of the target file
 the file is not written twice. The default target is scratch. The live Crpko
 status files take `--live`, which only the report jobs pass.
 
+`write` is the written version of the same reports. It gathers a facts pack
+for the window (merged PRs from `gh search`, or commits on a branch; review
+decisions and deploy records from the review workflow's DB; release runs with
+the PRs each tag carried; Linear tickets and triage moves; docs commits; the
+mission's own records), has the editor model write the report in one call, and
+checks it in code: every merged PR or commit exactly once, the team's PRs
+marked, every cited ref in the pack, the previous daily's follow-ups each closed,
+dropped, carried or still open, no banned words, within the size limit. The
+release, deploy and review sections aren't the editor's: the code writes one
+line per release run, deploy record and reviewed PR straight from the records
+(what a run carried, whether it is proven, a deploy's status and read back, a
+PR's verdicts) and the checks require exactly those lines there. A text
+whose only fault is a few left-out PRs keeps its writing and gets them added as
+plain lines. Any other failed check gets one retry with the problems listed;
+after that the plain render (the pack as lists under the same headings,
+shortened until it fits) comes out with a line saying so. A report that fails
+its checks even then stays in `--out` and is never exported or saved; `--out`,
+`--pack` and `--export` must be different files and only `--export` may be a
+live status file. A daily covers a whole day in the
+mission's zone (`--day`, default the last one); an update runs from the last
+saved update and lists only the left-open items that changed. `--save` stores
+the text, the open items and the pack with the mission (scribe credential);
+`--pack` writes the pack and the writer's record to a file; `--no-model`
+skips the editor. Sources a mission uses are set per mission in a local file,
+`$SCRIBE_WRITER_CONFIG` or `~/.config/scribe/writer.json`, since they name
+people and repos; `writer.example.json` shows the shape. `gh`, `git` and
+`linctl` are found on PATH or in `/opt/homebrew/bin`.
+
 Environment: `SCRIBE_DB`, `SCRIBE_ROUTER_URL`, `SCRIBE_MODEL`,
-`SCRIBE_EDITOR_MODEL`, `SCRIBE_OUT`, `SCRIBE_CONTROL_FILE` (defaults to
+`SCRIBE_EDITOR_MODEL`, `SCRIBE_OUT`, `SCRIBE_WRITER_CONFIG`, `SCRIBE_CONTROL_FILE` (defaults to
 `~/.robob/components/scribe.json`), `T3_CONTROL_URL`, `T3_CONTROL_TOKEN`.
 
 `watch` follows the control API's run events and runs one `run` pass when a

@@ -11,6 +11,14 @@
 //   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE] [--live]
 //                                                   build a report from mission data; export it (scratch by default;
 //                                                   the live Crpko status files only with --live)
+//   scribe write --mission ID --kind daily|update [--day YYYY-MM-DD | --from ISO --to ISO] [--previous FILE]
+//                [--out FILE] [--pack FILE] [--export FILE [--live]] [--save] [--no-model] [--config FILE]
+//                                                   gather the facts pack (merged PRs or commits, reviews, releases,
+//                                                   mission records), have the editor write the report, check it,
+//                                                   retry once, else the plain render; to a file, with --save to
+//                                                   the mission. Daily windows are whole days in the mission's zone
+//                                                   (default: the last one); updates run from the last update.
+//                                                   Per-mission sources: ~/.config/scribe/writer.json
 //   scribe watch --mission ID [--sweep-minutes 15] [--slices N] [--min-severity S]
 //                                                   a run pass whenever a lane's run settles, plus a sweep;
 //                                                   runs until stopped
@@ -166,6 +174,105 @@ async function report(opts) {
   return { ...written, coversFrom: built.coversFrom, coversTo: built.coversTo, open: built.open.length };
 }
 
+const HOUR_MS = 3_600_000;
+
+/** The window, and the report it follows, for `write`. */
+async function writeWindow(opts, config, db) {
+  const { previousReport } = await import('./lib/writer/mission.mjs');
+  const { dayWindow, lastWholeDay } = await import('./lib/writer/time.mjs');
+  const kind = opts.kind;
+  let from = typeof opts.from === 'string' ? new Date(opts.from).toISOString() : null;
+  let to = typeof opts.to === 'string' ? new Date(opts.to).toISOString() : null;
+  let label;
+  if (kind === 'daily') {
+    if (!from || !to) {
+      const day = typeof opts.day === 'string' ? dayWindow(opts.day, config.zone) : lastWholeDay(new Date().toISOString(), config.zone);
+      ({ from, to } = day);
+      label = day.day;
+    }
+  } else {
+    to ??= new Date().toISOString();
+  }
+  let previous = null;
+  if (typeof opts.previous === 'string') {
+    previous = { coversFrom: null, coversTo: from ?? to, text: readFileSync(opts.previous, 'utf8'), open: [], facts: null };
+  } else {
+    // A rerun of a saved window follows the report before it, not itself.
+    previous = previousReport(db, { missionId: config.id, kind, to: from ?? to, strict: !from });
+  }
+  if (!from) from = previous?.coversTo && previous.coversTo < to ? previous.coversTo : new Date(Date.parse(to) - 4 * HOUR_MS).toISOString();
+  if (!(from < to)) throw new Error(`empty window ${from} to ${to}`);
+  return { from, to, previous, label: label ?? to.replace(/[:.]/g, '-') };
+}
+
+async function writeCommand(opts) {
+  if (!opts.mission || !['update', 'daily'].includes(opts.kind)) {
+    throw new Error('write needs --mission and --kind update|daily');
+  }
+  const { loadConfig } = await import('./lib/writer/config.mjs');
+  const { exec } = await import('./lib/writer/sh.mjs');
+  const { writeReport } = await import('./lib/writer/writer.mjs');
+  const { assertWritable, exportDaily, exportUpdate, isLiveReport, replaceFile, sameFile } = await import('./lib/export.mjs');
+  const config = loadConfig(opts.mission, typeof opts.config === 'string' ? opts.config : undefined);
+  const live = Boolean(opts.live);
+  const db = openDb();
+  try {
+    const { from, to, previous, label } = await writeWindow(opts, config, db);
+    const out = typeof opts.out === 'string' ? opts.out : join(SCRATCH, `write-${opts.mission}-${opts.kind}-${label}.md`);
+    const target = typeof opts.export === 'string' ? opts.export : null;
+    const packOut = typeof opts.pack === 'string' ? opts.pack : null;
+    // `out` and `pack` get every version, a failing one too, so neither is ever a
+    // published file: those take --export, which only gets a version that passed
+    // its checks. All three are checked before anything is written (symlinks,
+    // hard links and folders that don't exist yet included), and scratch files
+    // are replaced rather than written through, so a link elsewhere keeps its text.
+    const scratch = [['--out', out], ...(packOut ? [['--pack', packOut]] : [])];
+    for (const [flag, path] of scratch) {
+      if (isLiveReport(path)) throw new Error(`refusing to write the live report file ${path} with ${flag}; publish with --export ${path} --live`);
+    }
+    const named = [...scratch, ...(target ? [['--export', target]] : [])];
+    for (let i = 0; i < named.length; i++) {
+      for (let j = i + 1; j < named.length; j++) {
+        if (sameFile(named[i][1], named[j][1])) throw new Error(`${named[i][0]} and ${named[j][0]} are the same file (${named[i][1]}); give each its own`);
+      }
+    }
+    // Before any work the file would refuse.
+    if (target) assertWritable(target, { kind: opts.kind, live });
+    const client = opts.save ? serverClient() : null;
+    log(`write ${opts.mission} ${opts.kind} ${from} to ${to}${previous ? ` after ${previous.coversTo}` : ''}`);
+    const result = await writeReport({ config, kind: opts.kind, from, to, db, exec, previous, useModel: !opts['no-model'], log });
+    replaceFile(out, result.text);
+    if (packOut) replaceFile(packOut, `${JSON.stringify(result.facts, null, 2)}\n`);
+    const summary = {
+      mission: opts.mission,
+      kind: opts.kind,
+      from,
+      to,
+      status: result.status,
+      chars: result.text.length,
+      merged: result.facts.pack.counts.merged,
+      failedSources: result.facts.pack.errors.map((error) => error.source),
+      out,
+    };
+    if (!result.passed) {
+      // Kept in `out` to look at; never published or stored.
+      throw new Error(`the report fails its checks even in plain form, so it was not exported or saved (see ${out}): ${result.facts.writer.fallbackErrors.join(' | ').slice(0, 600)}`);
+    }
+    if (target) {
+      summary.exported =
+        opts.kind === 'update'
+          ? exportUpdate(target, result.text, { title: opts.title || config.title, live })
+          : exportDaily(target, result.text, { live });
+    }
+    if (client) {
+      summary.saved = await client.putReport({ missionId: opts.mission, kind: opts.kind, from, to, text: result.text, open: result.open, facts: result.facts });
+    }
+    return summary;
+  } finally {
+    db.close();
+  }
+}
+
 async function watch(opts) {
   if (!opts.mission) throw new Error('watch needs --mission');
   severityFloor(opts['min-severity']);
@@ -204,13 +311,13 @@ const write = (path, text) => {
   writeFileSync(path, text);
 };
 
-const COMMANDS = { 'dry-run': dryRun, run: (opts) => run(opts), editor, report, watch };
+const COMMANDS = { 'dry-run': dryRun, run: (opts) => run(opts), editor, report, write: writeCommand, watch };
 
 const { cmd, opts } = parseArgs(process.argv.slice(2));
 const handler = COMMANDS[cmd];
 if (!handler) {
   process.stdout.write(
-    'usage: scribe run|dry-run|editor|report|watch (see the header of cli.mjs or README.md)\n',
+    'usage: scribe run|dry-run|editor|report|write|watch (see the header of cli.mjs or README.md)\n',
   );
   process.exit(cmd === 'help' ? 0 : 2);
 }
