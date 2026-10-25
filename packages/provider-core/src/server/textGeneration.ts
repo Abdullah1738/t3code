@@ -6,6 +6,7 @@ import type {
   TextGenerationError,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
+import type * as Schema from "effect/Schema";
 
 import type { TextGenerationPolicy } from "./textGenerationPolicy.ts";
 
@@ -93,6 +94,14 @@ export type ReviewGuideGenerationResult = Omit<
   "headSha" | "generatedAt" | "modelSelection"
 >;
 
+/** A free-form prompt answered as JSON matching `outputSchema` (fork: Missions board writer). */
+export interface JsonGenerationInput<S extends Schema.Top> {
+  cwd: string;
+  prompt: string;
+  outputSchema: S;
+  modelSelection: ModelSelection;
+}
+
 export interface ProviderTextGeneration {
   readonly generateCommitMessage: (
     input: CommitMessageGenerationInput,
@@ -113,4 +122,9 @@ export interface ProviderTextGeneration {
   readonly generateReviewGuide: (
     input: ReviewGuideGenerationInput,
   ) => Effect.Effect<ReviewGuideGenerationResult, TextGenerationError>;
+
+  /** Optional: providers built on a JSON runner support it. */
+  readonly generateJson?: <S extends Schema.Top>(
+    input: JsonGenerationInput<S>,
+  ) => Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]>;
 }

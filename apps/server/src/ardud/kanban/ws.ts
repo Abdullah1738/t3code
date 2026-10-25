@@ -1,0 +1,92 @@
+import {
+  KANBAN_WS_METHODS as M,
+  type KanbanBoardUpdateInput,
+  type KanbanCardPatchInput,
+} from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+
+import type { BoardPatch, KanbanServiceShape } from "./engine/KanbanService.ts";
+
+const OWNER = { _tag: "owner" } as const;
+
+const definedOnly = <T extends object>(value: T) =>
+  Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as {
+    [K in keyof T]: Exclude<T[K], undefined>;
+  };
+
+/** WS handlers for the board UI. Every write runs as the owner (the operate scope gates it). */
+export const makeKanbanWsHandlers = (service: KanbanServiceShape) => {
+  const patchCard = Effect.fn("KanbanWs.patchCard")(function* (input: KanbanCardPatchInput) {
+    const { cardId, stage, stalled, comment, ...fields } = input;
+    let card = (yield* service.card(cardId)).card;
+    const edits = definedOnly(fields);
+    if (Object.keys(edits).length > 0 || comment) {
+      card = yield* service.editCard(cardId, { ...edits, ...(comment ? { comment } : {}) }, OWNER);
+    }
+    if (stalled === false && card.stalled) card = yield* service.flagCard(cardId, null, OWNER);
+    if (stage && stage !== card.stage)
+      card = yield* service.moveCard(cardId, stage, "owner", OWNER);
+    return card;
+  });
+
+  const updateBoard = (input: KanbanBoardUpdateInput) => {
+    const { boardId, ...patch } = input;
+    return service.updateBoard(boardId, definedOnly(patch) as BoardPatch);
+  };
+
+  return {
+    [M.boards]: () => service.boards,
+    [M.subscribe]: (input: { readonly boardId: Parameters<KanbanServiceShape["watch"]>[0] }) =>
+      service.watch(input.boardId),
+    [M.card]: (input: { readonly cardId: Parameters<KanbanServiceShape["card"]>[0] }) =>
+      service.card(input.cardId),
+    [M.discussions]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["discussions"]>[0];
+    }) => service.discussions(input.boardId),
+    [M.messages]: (input: {
+      readonly discussionId: Parameters<KanbanServiceShape["messages"]>[0];
+      readonly afterSeq?: number | undefined;
+      readonly limit?: number | undefined;
+    }) =>
+      service.messages(
+        input.discussionId,
+        definedOnly({ afterSeq: input.afterSeq, limit: input.limit }),
+      ),
+    [M.wiki]: (input: { readonly boardId: Parameters<KanbanServiceShape["wiki"]>[0] }) =>
+      service.wiki(input.boardId),
+    [M.boardCreate]: (input: Parameters<KanbanServiceShape["ensureBoard"]>[0]) =>
+      service.ensureBoard(input),
+    [M.boardUpdate]: updateBoard,
+    [M.cardPatch]: patchCard,
+    [M.cardSettle]: (input: { readonly cardId: Parameters<KanbanServiceShape["settleCard"]>[0] }) =>
+      service.settleCard(input.cardId),
+    [M.cardStop]: (input: { readonly cardId: Parameters<KanbanServiceShape["cardThread"]>[0] }) =>
+      service.cardThread(input.cardId, "stop", "Stopped by the owner.", OWNER),
+    [M.cardDiscussion]: (input: {
+      readonly cardId: Parameters<KanbanServiceShape["cardDiscussion"]>[0];
+    }) => service.cardDiscussion(input.cardId),
+    [M.poolSet]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["setPool"]>[0];
+      readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
+      readonly slots: number;
+    }) => service.setPool(input.boardId, input.model, input.slots),
+    [M.discussionCreate]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
+      readonly title: string;
+    }) => service.createDiscussion(input.boardId, input.title, OWNER),
+    [M.discussionRead]: (input: {
+      readonly discussionId: Parameters<KanbanServiceShape["markRead"]>[0];
+      readonly seq: number;
+    }) => service.markRead(input.discussionId, OWNER, input.seq).pipe(Effect.as({})),
+    [M.messagePost]: (input: {
+      readonly discussionId: Parameters<KanbanServiceShape["post"]>[0];
+      readonly blocks: Parameters<KanbanServiceShape["post"]>[2];
+    }) => service.post(input.discussionId, OWNER, input.blocks),
+    [M.answer]: (input: {
+      readonly discussionId: Parameters<KanbanServiceShape["answer"]>[0];
+      readonly seq: number;
+      readonly blockId: string;
+      readonly choice: ReadonlyArray<string>;
+    }) => service.answer(input.discussionId, input.seq, input.blockId, input.choice, OWNER),
+  } as const;
+};

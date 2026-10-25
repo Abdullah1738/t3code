@@ -168,11 +168,15 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
     });
   });
 
+  const generateJson: NonNullable<ProviderTextGeneration["generateJson"]> = (input) =>
+    run({ operation: "generateJson", ...input }).pipe(Effect.withSpan(`${name}.generateJson`));
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
     generateReviewGuide,
+    generateJson,
   } satisfies ProviderTextGeneration;
 }

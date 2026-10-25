@@ -34,6 +34,8 @@ import {
   MISSIONS_RECOVERY_READ_SCOPES,
   // ardud missions: views
   MISSIONS_VIEWS_READ_SCOPES,
+  // ardud: missions board
+  KANBAN_READ_SCOPES,
   RpcScopeAuthorization,
   WS_METHODS,
   WsRpcGroup,
@@ -228,6 +230,8 @@ export const RPC_REQUIRED_SCOPES = {
   ...MISSIONS_RECOVERY_READ_SCOPES,
   // ardud missions: views
   ...MISSIONS_VIEWS_READ_SCOPES,
+  // ardud: missions board
+  ...KANBAN_READ_SCOPES,
   // ardud missions: router
   [WS_METHODS.missionsRooms]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsRoomPage]: AuthOrchestrationReadScope,

@@ -106,6 +106,8 @@ import {
   WsMissionsRecoveryRpcGroup,
   // ardud missions: views
   WsMissionsViewsRpcGroup,
+  // ardud: missions board
+  WsKanbanRpcGroup,
 } from "@t3tools/contracts";
 import {
   HttpRouter,
@@ -145,6 +147,9 @@ import { guardRequestImageUrl } from "./ardud/missions/views/requestImageAccess.
 // ardud missions: recovery
 import { RecoveryService } from "./ardud/missions/recovery/RecoveryService.ts";
 import { makeRecoveryWsHandlers } from "./ardud/missions/recovery/ws.ts";
+// ardud: missions board
+import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { makeKanbanWsHandlers } from "./ardud/kanban/ws.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -578,6 +583,8 @@ const ServerWsMissionsAsksRpcGroup = WsMissionsAsksRpcGroup.middleware(RpcInstru
 const ServerWsMissionsRecoveryRpcGroup = WsMissionsRecoveryRpcGroup.middleware(RpcInstrumentation);
 // ardud missions: views
 const ServerWsMissionsViewsRpcGroup = WsMissionsViewsRpcGroup.middleware(RpcInstrumentation);
+// ardud: missions board
+const ServerWsKanbanRpcGroup = WsKanbanRpcGroup.middleware(RpcInstrumentation);
 // Replaying each intervening event costs a shell refetch; past this gap a
 // single O(active-threads) snapshot is cheaper and bounded.
 const SHELL_RESUME_MAX_GAP = 1_000;
@@ -1258,6 +1265,11 @@ const layerWsMissionsRecoveryRpc = (
       ),
     ),
   );
+
+// ardud: missions board
+const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
+  Effect.map(KanbanService, (service) => ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service))),
+);
 
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -3347,6 +3359,8 @@ export const layer = Layer.unwrap(
               Layer.merge(layerWsMissionsRecoveryRpc(session, clientOrigin)),
               // ardud missions: views
               Layer.merge(layerWsMissionsViewsRpc(session, clientOrigin)),
+              // ardud: missions board
+              Layer.merge(layerWsKanbanRpc),
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.

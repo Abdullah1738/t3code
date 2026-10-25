@@ -83,6 +83,8 @@ import * as MissionsRecoveryTools from "../ardud/missions/tools/recovery.ts";
 import * as MissionsViewsTools from "../ardud/missions/views/tools.ts";
 // ardud missions: reports
 import * as MissionsReportTools from "../ardud/missions/scribe/tools.ts";
+import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
+import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -1064,6 +1066,8 @@ const layerMissionsReportToolkitRegistration = toolkitRegistration(
   MissionsReportTools.ReportsToolkit,
   MissionsReportTools.layer,
 );
+// ardud: missions board (KanbanService comes from ArdudKanbanLive in server.ts)
+const layerKanbanToolkitRegistration = toolkitRegistration(KanbanToolkit, KanbanHandlers.layer);
 const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
@@ -1141,6 +1145,8 @@ export const layer = Layer.mergeAll(
   layerMissionsViewsToolkitRegistration,
   // ardud missions: reports
   layerMissionsReportToolkitRegistration,
+  // ardud: missions board
+  layerKanbanToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,

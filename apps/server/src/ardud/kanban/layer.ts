@@ -1,0 +1,52 @@
+import * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schedule from "effect/Schedule";
+import * as Stream from "effect/Stream";
+
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import { forkParked } from "../../serverActivation.ts";
+import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
+import { KanbanService, layer as KanbanServiceLayer } from "./engine/KanbanService.ts";
+import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
+import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
+
+/** Typing heartbeat, review completion and the dispatcher's safety net. */
+const TICK = "30 seconds";
+
+const warnUnlessInterrupted = (what: string) => (cause: Cause.Cause<unknown>) =>
+  Cause.hasInterruptsOnly(cause)
+    ? Effect.void
+    : Effect.logWarning(what, { cause: Cause.pretty(cause) });
+
+/**
+ * The Missions board: its service, the worker that runs dispatch and turn
+ * ends one at a time, the run-update follower and the periodic tick.
+ */
+export const ArdudKanbanLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const service = yield* KanbanService;
+    const engine = yield* Orchestrator.OrchestratorV2;
+    yield* forkParked(service.worker);
+    yield* forkParked(
+      Stream.runForEach(engine.streamDomainEvents, (event) =>
+        event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status)
+          ? service.notifyTurnEnded(event.threadId)
+          : Effect.void,
+      ).pipe(
+        Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
+      ),
+    );
+    yield* forkParked(
+      service.tick.pipe(
+        Effect.catchCause(warnUnlessInterrupted("missions board tick failed")),
+        Effect.repeat(Schedule.spaced(TICK)),
+        Effect.asVoid,
+      ),
+    );
+  }),
+).pipe(
+  Layer.provideMerge(KanbanServiceLayer),
+  Layer.provide(KanbanThreadsLayer),
+  Layer.provideMerge(KanbanStoreLayer),
+);

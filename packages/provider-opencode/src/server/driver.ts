@@ -1,4 +1,4 @@
-import { ProviderDriverKind } from "@t3tools/contracts";
+import { ProviderDriverKind, TextGenerationError } from "@t3tools/contracts";
 import { OpenCodeSettings } from "../settings.ts";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -19,7 +19,10 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as OpenCodeAdapterV2 from "./adapter.ts";
 import * as OpenCode2AdapterV2 from "./v2/adapter.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
-import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
+import type {
+  JsonGenerationInput,
+  ProviderTextGeneration,
+} from "@t3tools/provider-core/server/textGeneration";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { openCodeUsageReader, type OpenCodeUsageReaderEnv } from "./usage.ts";
 import { readOpenCodeGoUsageLimits } from "./usageLimits.ts";
@@ -139,6 +142,19 @@ function selectOpenCodeRuntimeAdapter(input: {
   };
 }
 
+const jsonOrUnsupported = <S extends Schema.Top>(
+  generation: ProviderTextGeneration,
+  input: JsonGenerationInput<S>,
+) =>
+  generation.generateJson
+    ? generation.generateJson(input)
+    : Effect.fail(
+        new TextGenerationError({
+          operation: "generateJson",
+          detail: "OpenCode text generation has no JSON operation.",
+        }),
+      );
+
 function selectOpenCodeRuntimeTextGeneration(
   probe: OpenCodeRuntimeProbe,
   v1: ProviderTextGeneration,
@@ -169,6 +185,11 @@ function selectOpenCodeRuntimeTextGeneration(
       byOpenCodeRuntime(probe.get, {
         v1: v1.generateReviewGuide(input),
         v2: v2.generateReviewGuide(input),
+      }),
+    generateJson: (input) =>
+      byOpenCodeRuntime(probe.get, {
+        v1: jsonOrUnsupported(v1, input),
+        v2: jsonOrUnsupported(v2, input),
       }),
   };
 }

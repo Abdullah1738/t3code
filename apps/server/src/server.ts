@@ -193,6 +193,8 @@ import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud missions: core
 import { ArdudMissionsLive, ArdudMissionsRoutesLive } from "./ardud/missions/layer.ts";
+import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
@@ -606,6 +608,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ArdudOpenCodeImportLive,
   // ardud missions: core
   ArdudMissionsLive,
+  // ardud: missions board
+  ArdudKanbanLive,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
@@ -719,6 +723,8 @@ const layerMakeRoutes = Layer.mergeAll(
     openCodeImportRouteLayer,
     // ardud missions: core
     ArdudMissionsRoutesLive,
+    // ardud: missions board
+    kanbanRouteLayer,
     ServerHttp.layerStaticAndDevRoute,
     Ws.layer,
   ),

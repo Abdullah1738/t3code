@@ -7,6 +7,8 @@ import {
   MISSIONS_RECOVERY_AGGREGATES,
   // ardud missions: views
   MISSIONS_VIEWS_AGGREGATES,
+  // ardud: missions board
+  KANBAN_AGGREGATES,
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   type WsRpcGroup,
@@ -240,6 +242,8 @@ const RPC_AGGREGATES = {
   ...MISSIONS_RECOVERY_AGGREGATES,
   // ardud missions: views
   ...MISSIONS_VIEWS_AGGREGATES,
+  // ardud: missions board
+  ...KANBAN_AGGREGATES,
   [WS_METHODS.missionsUpsertSubMission]: "missions",
   [WS_METHODS.missionsMergeSubMissions]: "missions",
   [WS_METHODS.missionsUpsertLane]: "missions",

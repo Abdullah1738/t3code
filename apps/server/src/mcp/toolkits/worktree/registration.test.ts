@@ -37,6 +37,7 @@ import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
 // ardud missions: asks
 import * as AsksService from "../../../ardud/missions/asks/AsksService.ts";
 import * as MissionService from "../../../ardud/missions/MissionService.ts";
+import { KanbanService } from "../../../ardud/kanban/engine/KanbanService.ts";
 // ardud missions: policy
 import * as PolicyService from "../../../ardud/missions/policy/PolicyService.ts";
 // ardud missions: core
@@ -93,6 +94,8 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(ViewService.ViewService)({}),
   // ardud missions: reports
   Layer.mock(ScribeService.ScribeService)({}),
+  // ardud: missions board
+  Layer.mock(KanbanService)({}),
   // ardud schedules: blocked-run retry tool
   SqlitePersistence.layerMemory,
 );
