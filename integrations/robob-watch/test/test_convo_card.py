@@ -262,6 +262,26 @@ class BuildTest(Base):
         self.assertNotIn("image", m)
         # Nobody has seen what it shows, so it can't count as done.
         self.assertEqual(out["pending"], [{"id": "P9", "type": "image", "reason": "not downloaded"}])
+        p = self.run_card("translate", "--slug", "lydia-chat", "--id", "P9", "--none", code=3)
+        self.assertIn("isn't downloaded", p.stderr)
+        self.assertEqual(json.loads(self.build().stdout)["pending"][0]["id"], "P9")
+        # Once the photo can be fetched, a dry run says a real build would change the card.
+        self.set_photos({"P9": "nine"})
+        out = json.loads(self.build("--dry-run").stdout)
+        self.assertFalse(out["same"])
+        self.assertEqual(out["photos_not_downloaded"], ["P9"])
+
+    def test_identity_mapped_after_the_first_build_is_read(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        con = sqlite3.connect(os.path.join(self.store, "session.db"))
+        con.execute("delete from whatsmeow_lid_map")
+        con.execute("insert into whatsmeow_lid_map values ('2222', '971500000001')")
+        con.commit()
+        con.close()
+        self.msg("2222@lid", "T2", T0 + 5, from_me=1, text="hello")
+        self.run_card("build", "--slug", "lydia-chat")
+        self.assertEqual([m["id"] for m in self.data()["messages"]], ["T1", "T2"])
 
     def test_help_says_use_the_defaults(self):
         p = self.run_card("--help")
@@ -410,11 +430,12 @@ class SendTest(Base):
         self.send("--to", "moni", code=3, env=env)
         self.assertEqual([c[0] for c in self.log("bridge")], ["share"])
 
-    def test_subcaption_with_a_time_is_refused(self):
+    def test_card_text_cannot_be_overridden(self):
         self.msg(PHONE, "T1", T0, text="hi")
         self.build()
-        for sub in ("Lydia replied at 15:29", "Meet at noon", "See you May 5", "Due 24/10", "Back on Sat"):
-            self.send("--to", "moni", "--subcaption", sub, code=2)
+        # Caption and subcaption are fixed phrases: free text could carry a time that goes stale in the chat.
+        self.send("--to", "moni", "--subcaption", "Back in an hour", code=2)
+        self.send("--to", "moni", "--caption", "Lydia at 5", code=2)
         self.assertEqual(self.log("bridge"), [])
 
     def test_bad_session_and_chat_are_refused(self):
@@ -504,6 +525,74 @@ class WatchTest(Base):
         with open(os.path.join(self.wdir, "cursor.json")) as f:
             self.assertGreater(json.load(f)["rowid"], cursor)
 
+    def test_edits_and_deletes_update_the_card(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.msg(PHONE, "T2", T0 + 1, text="see you")
+        self.build()
+        self.watch("--now", "1000")
+        self.edit("T1", "hi there")
+        out = self.watch("--now", "1000", "--force").stdout
+        self.assertIn("1 edited or deleted message(s) in the Lydia chat", out)
+        self.assertIn("- Lydia (edited): hi there (msgid T1)", out)
+        self.assertEqual(self.watch("--now", "1001", "--force").stdout, "")
+        con = sqlite3.connect(os.path.join(self.store, "wacli.db"))
+        con.execute("update messages set revoked=1 where msg_id='T2'")
+        con.commit()
+        con.close()
+        out = self.watch("--now", "1002", "--force").stdout
+        self.assertIn("- Lydia: message deleted (msgid T2)", out)
+
+    def test_message_deleted_for_me_is_not_reported(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.msg(PHONE, "T2", T0 + 1, text="gone", deleted_for_me=1)
+        self.assertEqual(self.watch("--now", "1000", "--force").stdout, "")
+
+    def test_identity_mapped_later_is_watched(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        con = sqlite3.connect(os.path.join(self.store, "session.db"))
+        con.execute("delete from whatsmeow_lid_map")
+        con.execute("insert into whatsmeow_lid_map values ('2222', '971500000001')")
+        con.commit()
+        con.close()
+        self.msg("2222@lid", "T2", T0 + 5, from_me=1, text="hello")
+        self.assertIn("- Moni: hello (msgid T2)", self.watch("--now", "1000", "--force").stdout)
+
+    def test_new_event_gets_its_own_replay_budget(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        with open(os.path.join(self.wdir, ".convo-outbox.json"), "w") as f:
+            json.dump({"run": "r0", "lines": ["CONVO_CARD_UPDATE old"], "at": 900, "replays": 3}, f)
+        run = lambda rid: self.watch("--now", "1000", "--force", env=dict(self.env, WATCH_RUN=rid)).stdout
+        self.msg(PHONE, "T2", T0 + 1, text="a")
+        first = run("r1")
+        self.assertIn("msgid T2", first)
+        self.assertNotIn("old", first)
+        # r1 was never recorded: the new event is printed again, whatever the old one used up.
+        self.assertIn("msgid T2", run("r2"))
+
+    def test_crash_between_outbox_and_cursor_is_not_reported_twice(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        cursor = os.path.join(self.wdir, "cursor.json")
+        with open(cursor) as f:
+            before = f.read()
+        self.msg(PHONE, "T2", T0 + 1, text="a")
+        run = lambda rid: self.watch("--now", "1000", "--force", env=dict(self.env, WATCH_RUN=rid)).stdout
+        first = run("r1")
+        with open(cursor, "w") as f:
+            f.write(before)            # the run died after its outbox write, before the cursor write
+        again = run("r2")
+        self.assertEqual(again.count("msgid T2"), 1)
+        self.assertEqual(again, first)
+        with open(os.path.join(self.wdir, ".run-ok"), "w") as f:
+            f.write("r2\n")
+        self.assertEqual(run("r3"), "")
 
 if __name__ == "__main__":
     unittest.main()

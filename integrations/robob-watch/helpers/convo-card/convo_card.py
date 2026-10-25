@@ -11,17 +11,20 @@ Use the defaults. Every option has one; don't stop to ask which to pick.
         Store the English for one message, bound to that exact message (its id + sha256 of its exact text,
         caption or photo bytes). If the message changes, the translation stops showing and send refuses again.
         Every photo and every message that isn't plainly English waits for this. Look at each one first
-        (`show` prints the photo path); --none = nothing in it to translate (English already).
+        (`show` prints the photo path); --none = nothing in it to translate (English already). A photo
+        that hasn't downloaded can't be marked: build again to retry the download.
     convo-card send --slug SLUG --session S [--to CHAT] [--days N] [--dry-run]
         Rebuilds, refuses while any translation is pending or stale, runs `card-check page`, then shares
         the page and sends ONE live app card (`app --to CHAT`), keyed per last message + page URL, so
         a repeat is a no-op. CHAT defaults to owner (Abdullah); S = the CURRENT session id of the chat
-        you are in. It never sends WhatsApp and never sends a picture of the chat.
+        you are in. Caption '<title> chat' and subcaption ('Lydia replied', 'Moni sent a photo') are
+        fixed phrases: the card's text never updates, so it never carries message text, times or dates.
+        It never sends WhatsApp and never sends a picture of the chat.
     convo-card show --slug SLUG       config, pending items (with photo paths), send journal
     convo-card watch --slug SLUG      watcher check (state in $WATCH_DIR): prints CONVO_CARD_UPDATE once
-        a burst of new messages has been quiet for 2 min, CONVO_CARD_SHARE_DOWN when a shared link
-        fails twice in a row. Exits 1 while the wacli sync daemon is down. Under robob-watch ($WATCH_RUN) an
-        event the runner never recorded is printed again (.convo-outbox.json in the state dir).
+        new, edited or deleted messages have been quiet for 2 min, CONVO_CARD_SHARE_DOWN when a shared
+        link fails twice in a row. Exits 1 while the wacli sync daemon is down. Under robob-watch
+        ($WATCH_RUN) an event the runner never recorded is printed again (.convo-outbox.json in the state dir).
 
 Card folder ~/.local/share/imessage-apps/<slug>/ (served): index.html, data.json, preview.png, media/.
 The page re-reads data.json every 25s, so a rebuild shows up on the open card by itself.
@@ -52,12 +55,6 @@ OUTBOX_MAX_REPLAYS = 3    # at most this many times (same rule as wa-db's whatsa
 LABELS = {"audio": "Voice message", "ptt": "Voice message", "video": "Video", "gif": "GIF",
           "sticker": "Sticker", "document": "Document", "location": "Location",
           "live_location": "Live location"}
-# A card's subcaption is frozen in the chat while the page keeps changing, so it never carries a time or date.
-# The default is a fixed phrase; an override with a digit or one of these words is refused.
-NO_TIME = re.compile(r"\d|\b(today|tonight|tomorrow|yesterday|now|ago|noon|midnight|morning|evening|afternoon|"
-                     r"night|week(end)?|month|(mon|tue|tues|wed|wednes|thu|thur|thurs|fri|sat|satur|sun)(day)?|"
-                     r"jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sept?(ember)?|"
-                     r"oct(ober)?|nov(ember)?|dec(ember)?)\b", re.I)
 WORDS_FILE = "/usr/share/dict/words"
 CHAT_WORDS = {"ok", "okay", "thx", "pls", "plz", "lol", "yeah", "yep", "nope", "hi", "hey", "bye", "omg", "btw"}
 STEMS = (("ies", "y"), ("ied", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ed", "e"), ("ing", ""), ("ing", "e"),
@@ -306,11 +303,35 @@ def download(chat, msg_id, media_dir, dry_run):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def chat_jids(w, con, cfg):
+    """Every JID the chat is stored under now. A phone-LID mapping can appear after the first build, so the
+    saved list is only a starting point."""
+    return list(dict.fromkeys([*cfg.get("jids", []), *w.resolve(con, cfg["chat"])]))
+
+
+def body_of(media, text, display, caption):
+    """The source text the card shows for a row (and binds a translation to)."""
+    if media:
+        return caption or text
+    return text if text.strip() else display
+
+
+def sender_who(w, con, cfg, from_me, sender, sender_name):
+    if from_me:
+        return cfg["me"]
+    if not cfg["chat"].endswith("@g.us"):
+        return cfg["them"]
+    num = sender.split("@")[0]
+    return clean(w.name_of(con, sender) or sender_name or ("+" + num if sender.endswith("@s.whatsapp.net")
+                                                         else "Someone"), 40)
+
+
 def fetch(cfg, d, dry_run=False):
-    """The chat since cfg.since as private message records, oldest first."""
+    """The chat since cfg.since as private message records, oldest first. Refreshes cfg['jids']."""
     w = wadb()
     con = w.connect()
     group = cfg["chat"].endswith("@g.us")
+    cfg["jids"] = chat_jids(w, con, cfg)
     q = ",".join("?" * len(cfg["jids"]))
     rows = con.execute(
         f"select rowid, chat_jid, msg_id, coalesce(sender_jid,''), coalesce(sender_name,''), from_me, ts,"
@@ -323,20 +344,14 @@ def fetch(cfg, d, dry_run=False):
          reaction, revoked, deleted) in rows:
         if reaction or revoked or deleted or not msg_id:
             continue
-        if from_me:
-            side, who, frm = "out", cfg["me"], "me"
-        elif group:
-            num = sender.split("@")[0]
-            who = clean(w.name_of(con, sender) or sender_name or ("+" + num if sender.endswith("@s.whatsapp.net")
-                                                                 else "Someone"), 40)
-            side, frm = "in", sha(sender)[:8]
-        else:
-            side, who, frm = "in", cfg["them"], "them"
+        who = sender_who(w, con, cfg, from_me, sender, sender_name)
+        side = "out" if from_me else "in"
+        frm = "me" if from_me else (sha(sender)[:8] if group else "them")
         m = {"rowid": rowid, "id": msg_id, "side": side, "who": who, "from": frm, "ts": int(ts)}
         # A translation is bound to the message id and the exact source (raw text, caption, photo bytes): any
         # change, or a translation copied from another message, no longer matches.
+        raw = body_of(media, text, display, caption)
         if media == "image":
-            raw = caption or text
             path = download(chat_jid, msg_id, d / "media", dry_run)
             m.update(type="image", caption=raw.strip())
             if path:
@@ -344,16 +359,16 @@ def fetch(cfg, d, dry_run=False):
                 m["sha"] = sha("image", msg_id, path.read_bytes(), raw)
             else:
                 m["sha"] = sha("image-missing", msg_id, raw)
+                if dry_run:
+                    m["unchecked"] = True    # a real build would try to download it
             m["needs"] = True    # a photo can carry text in any language, so someone always has to look at it
         elif media:
             label = LABELS.get(media, "Attachment")
             if media == "document" and filename:
                 label += ": " + clean(filename, 60)
-            raw = caption or text
             m.update(type="other", label=label, caption=raw.strip(), sha=sha("other", msg_id, label, raw),
                      needs=needs_review(raw, names))
         else:
-            raw = text if text.strip() else display
             if not raw.strip():
                 continue
             m.update(type="text", text=raw.strip(), sha=sha("text", msg_id, raw), needs=needs_review(raw, names))
@@ -367,7 +382,8 @@ def compose(cfg, msgs, translations, now=None):
     items, pending = [], []
     for m in msgs:
         e = translations.get(m["id"])
-        ok = bool(e) and e.get("sha") == m["sha"]
+        unseen = m["type"] == "image" and not m.get("image")   # nobody can have looked at it: never done
+        ok = bool(e) and e.get("sha") == m["sha"] and not unseen
         t = local(m["ts"])
         it = {"id": m["id"], "side": m["side"], "who": m["who"], "from": m.get("from") or m["side"],
               "time": t.strftime("%H:%M"), "day": t.strftime("%a %d %b"), "ts": m["ts"], "type": m["type"]}
@@ -381,7 +397,7 @@ def compose(cfg, msgs, translations, now=None):
             it["translation_by"] = e.get("by") or "agent"
         if (m["needs"] or e) and not ok:
             it["translation_pending"] = True
-            reason = "changed" if e else ("not downloaded" if m["type"] == "image" and not m.get("image") else "missing")
+            reason = "not downloaded" if unseen else ("changed" if e else "missing")
             pending.append({"id": m["id"], "type": m["type"], "reason": reason})
         items.append(it)
     last = items[-1] if items else None
@@ -530,8 +546,11 @@ def cmd_build(a):
         for k in sorted((set(data) | set(cur)) - {"messages", *VOLATILE}):
             if (cur.get(k) or None) != (data.get(k) or None):
                 diffs.append({"field": k, "now": cur.get(k), "would_be": data.get(k)})
+        # A photo not on disk yet may download in a real build, so the result can't be called the same.
+        unchecked = [m["id"] for m in msgs if m.get("unchecked")]
         print(json.dumps({"dry_run": True, "slug": slug, "dir": str(d), "messages": len(data["messages"]),
-                          "pending": pending, "same": not diffs, "diffs": diffs}, ensure_ascii=False, indent=1))
+                          "pending": pending, "same": not diffs and not unchecked, "diffs": diffs,
+                          "photos_not_downloaded": unchecked}, ensure_ascii=False, indent=1))
         return
     with Lock(d):
         msgs, (data, pending) = build(d, cfg)
@@ -558,6 +577,9 @@ def cmd_translate(a):
         m = next((x for x in msgs if x["id"] == a.id), None)
         if not m:
             die(f"message {a.id} is not on the card (build first; ids come from `convo-card show`)")
+        if m["type"] == "image" and not m.get("image"):
+            die(f"photo {a.id} isn't downloaded, so nobody can have looked at it: run `convo-card build "
+                f"--slug {a.slug}` to retry the download, then look at it and translate", 3)
         tr = read_json(d / ".translations.json", {})
         tr[a.id] = {"sha": m["sha"], "text": None if a.none else clean(a.text, 2000), "by": clean(a.by, 40),
                     "at": datetime.now(DXB).isoformat(timespec="seconds")}
@@ -609,11 +631,8 @@ def cmd_send(a):
                            stdin=subprocess.DEVNULL)
         if p.returncode != 0:
             die(f"card-check failed ({p.returncode}), not sending:\n" + (p.stdout + p.stderr).strip()[-1500:], 3)
-        caption = a.caption or f"{cfg['title']} chat"
-        if a.subcaption and NO_TIME.search(a.subcaption):
-            die(f"--subcaption must not carry a number, time, day or date (the card's text never updates); "
-                f"leave it out for the default: {a.subcaption!r}")
-        sub = clean(a.subcaption, 200) if a.subcaption else subcaption(data)
+        caption = clean(f"{cfg['title']} chat", 200)
+        sub = subcaption(data)
         if a.dry_run:
             print(json.dumps({"dry_run": True, "to": a.to, "caption": caption, "subcaption": sub,
                               "publish": ["publish", "--app", a.slug] if a.to == "owner"
@@ -670,6 +689,50 @@ def probe(url):
         return False
 
 
+def watch_rows(w, con, cfg):
+    """Every message in the card's window by id (rowid order), with a fingerprint of what the card shows for it,
+    plus the chat's newest rowid."""
+    jids = chat_jids(w, con, cfg)
+    q = ",".join("?" * len(jids))
+    rows = con.execute(
+        f"select rowid, msg_id, from_me, coalesce(sender_jid,''), coalesce(sender_name,''), coalesce(text,''),"
+        f" coalesce(display_text,''), lower(coalesce(media_type,'')), coalesce(media_caption,''),"
+        f" coalesce(revoked,0), coalesce(deleted_for_me,0) from messages where chat_jid in ({q}) and ts >= ?"
+        f" and coalesce(reaction_to_id,'') = '' and coalesce(msg_id,'') != '' order by rowid",
+        (*jids, cfg["since"])).fetchall()
+    top = con.execute(f"select coalesce(max(rowid),0) from messages where chat_jid in ({q})", jids).fetchone()[0]
+    out = {}
+    for rowid, mid, from_me, sender, sender_name, text, display, media, caption, revoked, deleted in rows:
+        body = body_of(media, text, display, caption)
+        gone = bool(revoked or deleted or not (media or body.strip()))   # not on the card
+        out[mid] = {"rowid": rowid, "fp": ("-" if gone else "") + sha(media, body, gone)[:16], "gone": gone,
+                    "who": sender_who(w, con, cfg, from_me, sender, sender_name),
+                    "body": (f"[{media.upper()}] " if media else "") + body}
+    return top, out
+
+
+def watch_changes(cur, rows):
+    """[(kind, msg_id)] for what changed on the card since the cursor: new, edited, deleted or dropped messages."""
+    fps = cur.get("fps")
+    changes = []
+    for mid, r in rows.items():
+        if fps is None:   # cursor from before fingerprints: everything up to its rowid was seen
+            kind = "new" if r["rowid"] > cur.get("rowid", 0) and not r["gone"] else None
+        elif mid not in fps:
+            kind = None if r["gone"] else "new"
+        elif fps[mid] != r["fp"]:
+            # "-" marks a row the card didn't show (revoked, empty): one that fills in later is new to the card.
+            was_shown = not fps[mid].startswith("-")
+            kind = ("deleted" if was_shown else None) if r["gone"] else ("edited" if was_shown else "new")
+        else:
+            kind = None
+        if kind:
+            changes.append((kind, mid))
+    # Shown before, now gone from the store or out of the card's window (--since moved): off the card too.
+    changes += [("dropped", mid) for mid, fp in (fps or {}).items() if mid not in rows and not fp.startswith("-")]
+    return changes
+
+
 def cmd_watch(a):
     d, cfg = load(a.slug)
     state = Path(a.state_dir or os.environ.get("WATCH_DIR") or die("watch needs --state-dir or $WATCH_DIR"))
@@ -677,49 +740,73 @@ def cmd_watch(a):
     ok, why = w.daemon_status()
     if not ok:
         die(why, 1)
-    con = w.connect()
-    q = ",".join("?" * len(cfg["jids"]))
-    top = con.execute(f"select coalesce(max(rowid),0) from messages where chat_jid in ({q})", cfg["jids"]).fetchone()[0]
     now = a.now or time.time()
-    cur = read_json(state / "cursor.json")
-    if not cur:
-        if not a.dry_run:
-            write_json(state / "cursor.json", {"rowid": top})
-        return
-    rows = con.execute(
-        f"select rowid, msg_id, from_me, coalesce(text,''), coalesce(display_text,''), lower(coalesce(media_type,'')),"
-        f" coalesce(media_caption,''), coalesce(sender_jid,'') from messages where chat_jid in ({q}) and rowid > ?"
-        f" and coalesce(reaction_to_id,'') = '' and coalesce(revoked,0) = 0 order by rowid", (*cfg["jids"], cur["rowid"])).fetchall()
-    # Lines this run prints, and the state writes that consume them. The writes happen only after the lines are
-    # in the outbox, so a run killed before the runner records its output prints them again next time.
-    out, writes, carry, replays = [], [], [], 0
     run = os.environ.get("WATCH_RUN", "")
     outbox = state / ".convo-outbox.json"
-    ob = read_json(outbox) if run else None
-    if ob:
+    ob = read_json(outbox) or {}
+    if "lines" in ob:   # single-batch outbox from before 25 Oct
+        ob = {"run": ob.get("run"), "batches": [{"lines": ob["lines"], "at": ob.get("at", 0),
+                                                 "replays": ob.get("replays", 0)}]}
+    con = w.connect()
+    top, rows = watch_rows(w, con, cfg)
+    con.close()
+    fps = {mid: r["fp"] for mid, r in rows.items()}
+    cur = read_json(state / "cursor.json")
+    # State writes run in order, and only after this run's lines are in the outbox, so a run killed before the
+    # runner records its output prints them again next time instead of losing them.
+    pre, writes = [], []
+    oc = ob.get("cursor")
+    if oc and cur is not None and oc.get("seq", 0) > cur.get("seq", 0):
+        # The run that printed the outbox died before its cursor write. Commit that cursor now, or the same
+        # changes would be reported again on top of the replay.
+        cur = oc
+        pre.append(lambda: write_json(state / "cursor.json", oc))
+    if cur is None:
+        if not a.dry_run:
+            write_json(state / "cursor.json", {"rowid": top, "seq": 0, "fps": fps})
+        return
+    carry = []
+    if run and ob.get("batches"):
         okid = (state / ".run-ok").read_text().strip() if (state / ".run-ok").exists() else ""
-        if ob.get("run") != okid and now - ob.get("at", 0) < OUTBOX_TTL and ob.get("replays", 0) < OUTBOX_MAX_REPLAYS:
-            carry, replays = ob.get("lines", []), ob.get("replays", 0) + 1
-        elif not a.dry_run:
-            outbox.unlink()
-    if rows:
-        pend = read_json(state / "pending.json") or {}
-        if pend.get("max_rowid") != rows[-1][0]:
-            pend = {"max_rowid": rows[-1][0], "first_seen": pend.get("first_seen") or now, "last_change": now}
+        if ob.get("run") != okid:
+            # Each batch keeps its own replay budget, so a new event never inherits an older one's.
+            carry = [dict(b, replays=b.get("replays", 0) + 1) for b in ob["batches"]
+                     if now - b.get("at", 0) < OUTBOX_TTL and b.get("replays", 0) < OUTBOX_MAX_REPLAYS]
+    out, nc = [], None
+    changes = watch_changes(cur, rows)
+    pend = read_json(state / "pending.json") or {}
+    if changes:
+        sig = sha(*[f"{k}:{m}:{fps.get(m)}" for k, m in changes])
+        if pend.get("sig") != sig:
+            pend = {"sig": sig, "first_seen": pend.get("first_seen") or now, "last_change": now}
             writes.append(lambda p=pend: write_json(state / "pending.json", p))
         if a.force or now - pend["last_change"] >= QUIET_S:
+            new = [m for k, m in changes if k == "new"]
+            changed = len(changes) - len(new)
+            what = " and ".join(x for x in (f"{len(new)} new message(s)" if new else "",
+                                            f"{changed} edited or deleted message(s)" if changed else "") if x)
+            last = (new or [m for k, m in changes])[-1]
             sent = sorted(read_json(d / ".sent.json", {}) or {})
-            out.append(f"CONVO_CARD_UPDATE {a.slug}: {len(rows)} new message(s) in the {cfg['title']} chat, last msgid="
-                       f"{rows[-1][1]} rowid={rows[-1][0]}. Card sent before to: {', '.join(sent) or 'nobody'}.")
-            for rowid, mid, from_me, text, display, media, caption, sender in rows[-8:]:
-                who = cfg["me"] if from_me else (w.name_of(con, sender) or cfg["them"]
-                                                 if cfg["chat"].endswith("@g.us") else cfg["them"])
-                body = (f"[{media.upper()}] " if media else "") + (caption or text or ("" if media else display))
-                out.append(f"- {who}: {clean(body, 160)} (msgid {mid})")
-            top_row = rows[-1][0]
-            writes.append(lambda: write_json(state / "cursor.json", {"rowid": top_row}))
+            out.append(f"CONVO_CARD_UPDATE {a.slug}: {what} in the {cfg['title']} chat, last msgid={last}. "
+                       f"Card sent before to: {', '.join(sent) or 'nobody'}.")
+            for kind, mid in changes[-8:]:
+                r = rows.get(mid)
+                if kind == "dropped":
+                    out.append(f"- message no longer in the chat (msgid {mid})")
+                elif kind == "deleted":
+                    out.append(f"- {r['who']}: message deleted (msgid {mid})")
+                else:
+                    tag = " (edited)" if kind == "edited" else ""
+                    out.append(f"- {r['who']}{tag}: {clean(r['body'], 160)} (msgid {mid})")
+            nc = {"rowid": top, "seq": cur.get("seq", 0) + 1, "fps": fps}
+            writes.append(lambda: write_json(state / "cursor.json", nc))
             writes.append(lambda: (state / "pending.json").unlink() if (state / "pending.json").exists() else None)
-    con.close()
+    else:
+        if pend:
+            writes.append(lambda: (state / "pending.json").unlink() if (state / "pending.json").exists() else None)
+        if cur.get("fps") != fps:   # only silent differences (a message deleted before it was ever reported)
+            quiet = {"rowid": top, "seq": cur.get("seq", 0), "fps": fps}
+            writes.append(lambda: write_json(state / "cursor.json", quiet))
     share = read_json(state / "share.json") or {}
     urls = sorted({v["url"] for k, v in (read_json(d / ".sent.json", {}) or {}).items() if k != "owner" and v.get("url")})
     if urls and now - share.get("last_probe", 0) >= PROBE_S:
@@ -733,15 +820,17 @@ def cmd_watch(a):
         if not bad:
             share.pop("alerted_url", None)
         writes.append(lambda: write_json(state / "share.json", share))
-    lines = carry + out
+    batches = carry + ([{"lines": out, "at": now, "replays": 0}] if out else [])
     if not a.dry_run:
-        if run and out:
-            write_json(outbox, {"run": run, "lines": lines, "at": now if not carry else ob.get("at", now),
-                                "replays": replays})
-        elif run and carry:
-            write_json(outbox, dict(ob, run=run, replays=replays))
+        for f in pre:
+            f()
+        if run and (batches or nc):
+            write_json(outbox, {"run": run, "batches": batches, "cursor": nc})
+        elif run and outbox.exists():
+            outbox.unlink()
         for f in writes:
             f()
+    lines = [x for b in batches for x in b["lines"]]
     if lines:
         print("\n".join(lines))
 
@@ -773,8 +862,6 @@ def main(argv=None):
     s.add_argument("--session", required=True)
     s.add_argument("--to", default="owner", help="bridge chat slug (default owner)")
     s.add_argument("--days", type=int, default=30, help="public link lifetime for non-owner chats (default 30)")
-    s.add_argument("--caption", help="default '<title> chat'")
-    s.add_argument("--subcaption", help="default: last message, without times")
     s.add_argument("--dry-run", action="store_true")
     sh = sub.add_parser("show", help="config, pending translations, send journal")
     sh.add_argument("--slug", required=True)
