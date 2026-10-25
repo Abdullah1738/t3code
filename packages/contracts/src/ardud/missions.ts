@@ -674,6 +674,11 @@ export const MissionMessage = Schema.Struct({
   receipt: Schema.NullOr(BroadcastReceipt),
   /** Owner post marked "correct the master": the scribe offers it as a rule. */
   isCorrection: Schema.Boolean,
+  /**
+   * Set when `to` is the audience the router filled in for an unaddressed
+   * control, not actors its author named. A parked lane in it is not addressed.
+   */
+  broadcast: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
   // --- coord additions ---
   /** Set when the message mirrors a coord event (import or forward shim). */

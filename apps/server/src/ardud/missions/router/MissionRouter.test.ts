@@ -1557,6 +1557,31 @@ describe("parked lanes", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("a broadcast queued while the lane was busy doesn't wake it once it parks", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      h.activity.set(laneThread, "running");
+      // No subscribers, so the router fills in the audience, the lane among it.
+      const posted = yield* router.post(
+        { ...request("freeze merges"), kind: "control" },
+        agent(masterThread),
+      );
+      assert.deepStrictEqual(posted.receipt?.pending, ["API", "role-writer"]);
+      yield* parkLane;
+      h.activity.set(laneThread, "idle");
+      yield* router.settled(laneThread);
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+
+      yield* router.markRead({ roomId: control, seq: 1 }, agent(writerThread));
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 0);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.deepStrictEqual(page.messages[0]?.receipt?.pending, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("a parked lane is reminded only of what names it", () => {
     const h = harness();
     return Effect.gen(function* () {

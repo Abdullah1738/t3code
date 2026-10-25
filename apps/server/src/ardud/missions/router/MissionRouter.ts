@@ -534,8 +534,8 @@ const make = Effect.gen(function* () {
   /**
    * The unread deliveries that may still wake a thread. Where the thread's
    * lanes are parked it wakes only for messages that name it or come from the
-   * owner; ambient traffic that reached it before it parked waits until the
-   * lane works again.
+   * owner; ambient traffic that reached it before it parked, a filled-in
+   * broadcast audience included, waits until the lane works again.
    */
   const wakingDeliveries = Effect.fn("MissionRouter.wakingDeliveries")(function* (
     threadId: ThreadId,
@@ -561,7 +561,8 @@ const make = Effect.gen(function* () {
       if (
         message !== null &&
         (message.author._tag === "owner" ||
-          message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId)))
+          (message.broadcast !== true &&
+            message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId))))
       ) {
         out.push(row);
       }
@@ -908,16 +909,14 @@ const make = Effect.gen(function* () {
           if (masterRole === null) return yield* fail("not-found", "This mission has no master.");
           to = [{ _tag: "role", roleId: masterRole.id }];
         }
-        if (
+        const broadcast =
           to.length === 0 &&
           input.kind === "control" &&
-          !subscriptions.some((sub) => sub.mode !== "mute")
-        ) {
-          to = broadcastAudience(cast, { fromOwner: author._tag === "owner" });
-        }
+          !subscriptions.some((sub) => sub.mode !== "mute");
+        if (broadcast) to = broadcastAudience(cast, { fromOwner: author._tag === "owner" });
         const seq = (yield* rooms.lastMessageSeq(input.missionId)) + 1;
         const at = yield* nowIso;
-        const shaped = { kind: input.kind, to: [...to], author };
+        const shaped = { kind: input.kind, to: [...to], author, broadcast };
         const recipients = receiptRecipients(shaped, subscriptions, unwokenBy(cast, author)).map(
           (actor) => ({
             actor,
@@ -940,6 +939,7 @@ const make = Effect.gen(function* () {
           links: [...(input.links ?? [])],
           receipt: input.kind === "control" ? receiptFor(seq, recipients, () => 0) : null,
           isCorrection,
+          ...(broadcast ? { broadcast } : {}),
           createdAt: at,
           ...(coord === undefined ? {} : { coord }),
         };
