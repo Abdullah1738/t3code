@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
-  saveState, type State, type Stop, stopFor, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
+  saveState, type State, type Stop, stopFor, unscopedSender, heldCheck, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
 const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob) when something happens.
@@ -24,6 +24,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch relay-ok ID --to JID [--eta ISO]   may this fire message JID now? "ok" (exit 0) counts it; "no" exits 3
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
                                          watcher sharing ID's trip
+  robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (owner-only)
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -64,6 +65,9 @@ const ago = (value?: string) => {
 };
 
 async function scratchRun(watcher: Watcher) {
+  if (heldCheck(watcher)) {
+    throw new Error(`${watcher.id} is held: its check runs wa draft/send and it may message nobody. Add it again with a check that doesn't draft or send (or with relays, the owner's words for each) first.`);
+  }
   const scratch = mkdtempSync(join(tmpdir(), `robob-watch-${watcher.id}-`));
   try {
     cpSync(watcherDir(watcher.id), scratch, { recursive: true });
@@ -242,6 +246,16 @@ async function main(argv: string[]): Promise<void> {
       const target = join(ARCHIVE, `${w.id}-${Date.now()}`);
       renameSync(watcherDir(w.id), target);
       console.log(JSON.stringify({ removed: w.id, archived: target }));
+      return;
+    }
+    case "unscoped": {
+      const found = listIds().map(id => loadWatcher(id)).filter((w): w is Watcher => !!w && (unscopedSender(w) || heldCheck(w)));
+      if (!found.length) { console.log("No watchers mention wa draft/send without relays."); return; }
+      for (const w of found) {
+        const s = loadState(w.id);
+        console.log(`${w.id}  [${w.paused ? "paused" : s.status}${heldCheck(w) ? ", held: its check sends" : ""}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
+      }
+      console.log("These fire owner-only; held ones don't run their check at all (add them again with a check that doesn't draft or send). To let one message someone, add it again with relays (the owner's words for each).");
       return;
     }
     case "runner": {

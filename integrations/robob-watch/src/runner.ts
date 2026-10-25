@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, escalate, hash, heldCheck, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
@@ -115,6 +115,16 @@ async function tickOne(id: string): Promise<void> {
   const state = loadState(id);
   await headsUps(watcher, state);
   if (state.status !== "active" || watcher.paused) return;
+  if (heldCheck(watcher)) {
+    if (!state.held_alerted) {
+      log(id, "held: its check runs wa draft/send and it may message nobody; the check doesn't run until it is added again with a check that doesn't draft or send");
+      const sent = await alert(watcher, `Watcher "${watcher.title}" is from before watchers had to name who they may message, and its check drafts or sends WhatsApp. It is held and its check doesn't run. To keep it, have it added again with a check that only spots the change (it then tells only you), or with relays for the people you allow.`,
+        `robob-watch:${id}:held`, "attention");
+      log(id, `held notice ok=${sent.ok} via=${sent.via}`);
+      if (sent.ok) { const fresh = loadState(id); fresh.held_alerted = true; saveState(id, fresh); }
+    }
+    return;
+  }
   const t = now();
   if (watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending) {
     finish(watcher, state, "expired");

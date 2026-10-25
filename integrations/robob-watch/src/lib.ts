@@ -105,6 +105,8 @@ export type State = {
   wakes?: TrackedWake[];
   /** Trigger-file signature seen at the start of the last run. */
   trigger_sig?: string;
+  /** The owner was told this watcher is held (see heldCheck). */
+  held_alerted?: boolean;
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
 
@@ -221,8 +223,11 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     errors.push("relays must be up to 8 distinct {to, name, quote, at}: to a phone number or phone/group jid (not an @lid), quote the owner's own words allowing it, at the ISO time he said it (not in the future)");
   }
   // 23 Oct: an ETA watcher's standing OK in its context let it text a group 5-7 times; who may hear from a fire is now a field.
-  if (relays === undefined && /\bwa\s+(draft|send|sendfile)\b/.test(`${input.check ?? ""}\n${input.context ?? ""}`)) {
+  if (relays === undefined && mentionsWhatsAppSend(input)) {
     errors.push("this watcher may send WhatsApp messages: list who it may message in relays (with the owner's words allowing each), or pass --owner-only (relays: []) so it tells only the owner");
+  } else if (Array.isArray(relays) && relays.length === 0 && WA_SENDS.test(String(input.check ?? ""))) {
+    // Sol r2 (25 Oct): owner-only can't stop a draft the check itself makes; the fire wakes the agent, which tells him.
+    errors.push("an owner-only watcher's check can't run wa draft/send/sendfile: make the check only detect the change, and the fire tells the owner");
   }
   if (errors.length) throw new Error(errors.join("; "));
   return {
@@ -372,8 +377,27 @@ export function telegram(source: string, text: string, key: string, severity = "
   return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
 }
 
+const WA_SENDS = /\bwa\s+(draft|send|sendfile)\b/;
+export const mentionsWhatsAppSend = (watcher: { check?: unknown; context?: unknown }) =>
+  WA_SENDS.test(`${watcher.check ?? ""}\n${watcher.context ?? ""}`);
+
+/**
+ * A watcher that may message nobody (no relays field, from before they existed, or owner-only) whose check
+ * command itself drafts or sends WhatsApp: the check never runs, since a draft it makes can't be taken back by
+ * an owner-only wake. Re-adding it with a check that only detects the change releases it (or with relays the
+ * owner named).
+ */
+export const heldCheck = (watcher: Watcher) => (watcher.relays ?? []).length === 0 && WA_SENDS.test(watcher.check);
+
+/**
+ * Set up before relays existed (11c84e10d9) and its text talks about WhatsApp sends: nobody besides the owner
+ * was ever listed, so it is owner-only. The add-time guard only sees new input; this covers the old ones.
+ */
+export const unscopedSender = (watcher: Watcher) => watcher.relays === undefined && mentionsWhatsAppSend(watcher);
+
 function relayLines(watcher: Watcher): string[] {
-  if (watcher.relays === undefined && watcher.trip === undefined) return [];
+  const legacy = unscopedSender(watcher);
+  if (watcher.relays === undefined && watcher.trip === undefined && !legacy) return [];
   const stops = readStops();
   const relays = (watcher.relays ?? []).map(relay => ({ relay, stop: stopFor(stops, watcher, relay) }));
   const live = relays.filter(entry => !entry.stop).map(entry => entry.relay);
@@ -382,6 +406,7 @@ function relayLines(watcher: Watcher): string[] {
     live.length
       ? `People besides the owner this may update (he allowed each one; nobody else hears from this watcher). Before each message run \`robob-watch relay-ok ${watcher.id} --to <to>\` (add --eta ISO for an ETA change) and send only on "ok":`
       : "No third-party relays: tell only the owner.",
+    ...(legacy ? ["This watcher was set up before it had to name who it may message, and it names nobody: whatever its context says about messaging other people (drafts, sends, standing OKs) no longer applies. Tell only the owner."] : []),
     ...live.map(relay => `- ${relay.name} (${relay.to}), allowed ${relay.at.slice(0, 10)}: ${JSON.stringify(relay.quote)}`),
     ...relays.flatMap(({ relay, stop }) => stop
       ? [`- ${relay.name} (${relay.to}): the owner stopped these on ${stop.at.slice(0, 10)} (${JSON.stringify(stop.quote)}). Don't message them.`]
@@ -506,6 +531,7 @@ export type Delivery = { ok: boolean; via: string; detail: string };
 /** Delivers one event; each channel is idempotent under the same key. */
 export async function deliver(watcher: Watcher, event: string, key: string, state: State, test = false): Promise<Delivery> {
   const tried: string[] = [];
+  if (watcher.mode === "wake" && unscopedSender(watcher)) log(watcher.id, "mentions wa draft/send but lists no relays: told the agent owner-only");
   const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
   if (watcher.mode === "wake") {
     const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);

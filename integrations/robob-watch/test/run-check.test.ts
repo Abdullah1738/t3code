@@ -55,6 +55,15 @@ test("a watcher that can send WhatsApp says who it may message, in the owner's w
   expect(live).toContain("robob-watch relay-ok eta --to <to>");
   expect(wakeText(normalize({ ...base, relays: [] }), "ETA 21:40", state)).toContain("No third-party relays: tell only the owner.");
   expect(wakeText(normalize({ ...base, context: "Tell the owner." }), "x", state)).not.toContain("third-party");
+  // Set up before relays existed: the add-time guard never saw it, so the fire tells the agent owner-only.
+  const legacy = { ...normalize({ ...base, relays: [] }), relays: undefined };
+  const old = wakeText(legacy, "ETA 21:40", state);
+  expect(old).toContain("No third-party relays: tell only the owner.");
+  expect(old).toContain("no longer applies");
+  expect(old.indexOf("tell only the owner")).toBeLessThan(old.indexOf(base.context));
+  expect(clip(wakeText({ ...legacy, context: `${base.context} ${"x".repeat(5_900)}` }, "e".repeat(6_000), state), MAX_WAKE))
+    .toContain("no longer applies");
+  expect(wakeText({ ...legacy, context: "Tell the owner when it lands." }, "x", state)).not.toContain("third-party");
   // The longest wake there can be is still clipped, but never the owner-only line.
   const longest = wakeText(normalize({ ...base, context: `${base.context} ${"x".repeat(5_900)}`, relays: [] }), "e".repeat(6_000), state);
   expect(longest.length).toBeGreaterThan(MAX_WAKE);

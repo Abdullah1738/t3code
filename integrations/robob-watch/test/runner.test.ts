@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,8 +21,12 @@ Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, v
 const env = { ...process.env, ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
+// Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
+const waCalls = join(sandbox, "wa-calls.log");
+mkdirSync(join(sandbox, "root/helpers"), { recursive: true });
+writeFileSync(join(sandbox, "root/helpers/wa"), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(waCalls)}\n`, { mode: 0o755 });
 const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], { env });
-const readCalls = () => readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { cli: string; args: string[] });
+const readCalls = () => (existsSync(calls) ? readFileSync(calls, "utf8") : "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { cli: string; args: string[] });
 const optIn = (id: string) => { const f = join(sandbox, "root/watchers", id, "watcher.json"); writeFileSync(f, JSON.stringify({ ...JSON.parse(readFileSync(f, "utf8")), headsup: true })); };
 const state = (id: string) => JSON.parse(readFileSync(join(sandbox, "root/watchers", id, "state.json"), "utf8"));
 
@@ -362,6 +366,75 @@ test("relays: one stop reaches every watcher of the trip, and ETA updates to a p
   expect(cli("add", "--id", "gate", ...flags).stderr.toString()).toContain("--owner-only");
   expect(cli("add", "--id", "gate", ...flags, "--owner-only").exitCode).toBe(0);
 });
+
+test("watchers from before relays that mention wa sends are listed and fire owner-only, with a log line", async () => {
+  // EK58 (24 Oct) was set up before 11c84e10d9: its context still had the relay rules the owner had stopped.
+  const dir = join(sandbox, "root/watchers/old-ek");
+  mkdirSync(dir, { recursive: true });
+  const flag = join(sandbox, "old-ek-event");
+  writeFileSync(join(dir, "watcher.json"), JSON.stringify({ id: "old-ek", title: "Old EK ETA", check: `[[ -f ${flag} ]] && cat ${flag}; true`,
+    interval_s: 10, mode: "wake", context: "Pre-authorised: on a new ETA, wa draft 120363@g.us then wa send --approved <id>.",
+    expires_at: null, max_fires: 1, serial: false, created_at: "2026-10-19T08:00:00.000Z", created_by_session: null }));
+  const fine = join(sandbox, "root/watchers/old-plain");
+  mkdirSync(fine, { recursive: true });
+  writeFileSync(join(fine, "watcher.json"), JSON.stringify({ id: "old-plain", title: "Old plain", check: "true", interval_s: 60, mode: "wake",
+    context: "Tell the owner.", expires_at: null, max_fires: 1, serial: false, created_at: "2026-10-19T08:00:00.000Z", created_by_session: null }));
+  const listed = cli("unscoped").stdout.toString();
+  expect(listed).toContain("old-ek");
+  expect(listed).toContain("Old EK ETA");
+  expect(listed).not.toContain("old-plain");
+  expect(listed).toContain("owner-only");
+  writeFileSync(flag, "ETA 21:40");
+  await runnerFor(2_500);
+  const wake = readCalls().filter(call => call.args[0] === "wake" && call.args.includes("robob-watch old-ek")).at(-1)!;
+  const text = wake.args[wake.args.indexOf("--text") + 1]!;
+  expect(text).toContain("No third-party relays: tell only the owner.");
+  expect(text).toContain("no longer applies");
+  expect(cli("logs", "old-ek").stdout.toString()).toContain("lists no relays: told the agent owner-only");
+  // Once it names its relays (here: nobody), it drops off the list.
+  writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(dir, "watcher.json"), "utf8")), relays: [] }));
+  expect(cli("unscoped").stdout.toString()).toContain("No watchers mention");
+  for (const id of ["old-ek", "old-plain"]) cli("remove", id);
+}, 20_000);
+
+test("an old watcher whose check itself runs wa draft is held: the check never runs and the owner hears once", async () => {
+  // Sol r1: an owner-only wake can't take back a draft the check already made, so the check must not run.
+  const dir = join(sandbox, "root/watchers/old-sender");
+  mkdirSync(dir, { recursive: true });
+  const ran = join(sandbox, "old-sender-ran");
+  const old = { id: "old-sender", title: "Old sender", check: `print -r -- ran >> ${ran}; wa draft 120363@g.us "New ETA"; print ETA`,
+    interval_s: 1, mode: "wake", context: "Tell the owner.", expires_at: null, max_fires: 0, serial: false,
+    created_at: "2026-10-19T08:00:00.000Z", created_by_session: null };
+  writeFileSync(join(dir, "watcher.json"), JSON.stringify(old));
+  expect(cli("unscoped").stdout.toString()).toContain("held: its check sends");
+  const test = cli("test", "old-sender");
+  expect(test.exitCode).toBe(1);
+  expect(test.stderr.toString()).toContain("is held");
+  const before = readCalls().length;
+  await runnerFor(3_500);
+  expect(existsSync(ran)).toBe(false);
+  const notices = readCalls().slice(before).filter(call => call.args.some(arg => arg.includes("robob-watch:old-sender:held")));
+  expect(notices).toHaveLength(1);
+  expect(readCalls().slice(before).some(call => call.args[0] === "wake" && call.args.includes("robob-watch old-sender"))).toBe(false);
+  expect(state("old-sender").held_alerted).toBe(true);
+  // Sol r2: owner-only doesn't release it; its check would still draft. add refuses it, and a hand-made one stays held.
+  const def = join(sandbox, "old-sender.json");
+  writeFileSync(def, JSON.stringify(old));
+  const replaced = cli("add", "--json", def, "--replace", "--owner-only");
+  expect(replaced.exitCode).toBe(1);
+  expect(replaced.stderr.toString()).toContain("can't run wa draft");
+  writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...old, relays: [] }));
+  expect(cli("unscoped").stdout.toString()).toContain("held: its check sends");
+  await runnerFor(2_500);
+  expect(existsSync(ran)).toBe(false);
+  // A check that only spots the change releases it.
+  writeFileSync(def, JSON.stringify({ ...old, interval_s: 5, check: `print -r -- ran >> ${ran}; true` }));
+  expect(cli("add", "--json", def, "--replace", "--owner-only", "--no-prime").exitCode).toBe(0);
+  await runnerFor(2_500);
+  expect(existsSync(ran)).toBe(true);
+  expect(existsSync(waCalls)).toBe(false);
+  cli("remove", "old-sender");
+}, 25_000);
 
 test("relays: a person's @lid and phone jid are one contact, and concurrent checks take one ETA slot", async () => {
   mkdirSync(join(sandbox, "wacli"), { recursive: true });
