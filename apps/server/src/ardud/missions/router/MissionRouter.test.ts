@@ -1427,6 +1427,92 @@ describe("reminders", () => {
   });
 });
 
+describe("parked lanes", () => {
+  const parkLane = Effect.gen(function* () {
+    const store = yield* MissionStore.MissionStore;
+    yield* store.commit({
+      event: {
+        missionId,
+        kind: "lane.parked",
+        actor: { _tag: "system", component: "test" },
+        provenance: { _tag: "system", component: "test" },
+        summary: "Queue empty",
+        subject: null,
+      },
+      upserts: [
+        { _tag: "lane", record: { ...lane, status: "parked", statusReason: "Queue empty" } },
+      ],
+    });
+  });
+  const remindersFor = (sent: ReadonlyArray<Sent>, threadId: ThreadId) =>
+    sent.filter((each) => each.threadId === threadId && each.key.startsWith("mission-remind:"));
+
+  it.effect("a parked lane wakes only for what names it or comes from the owner", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.subscribe(
+        { roomId: control, subscriber: { _tag: "lane", laneId: lane.id }, mode: "wake" },
+        ownerApp,
+      );
+      yield* parkLane;
+
+      yield* router.post(request("anyone free?"), agent(writerThread));
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+      yield* router.post(
+        request("API, rebase please", { to: [{ _tag: "lane", laneId: lane.id }] }),
+        agent(writerThread),
+      );
+      assert.strictEqual(wakesFor(h.sent, laneThread).length, 1);
+      yield* router.markRead({ roomId: control, seq: 2 }, agent(laneThread));
+      yield* router.post(request("everyone, a word"), ownerApp);
+      assert.strictEqual(wakesFor(h.sent, laneThread).length, 2);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("control broadcasts skip parked lanes and do not wait on their read", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* parkLane;
+      const router = yield* MissionRouter.MissionRouter;
+      const posted = yield* router.post(
+        { ...request("freeze merges"), kind: "control" },
+        agent(masterThread),
+      );
+      assert.deepStrictEqual(posted.receipt?.pending, ["role-writer"]);
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a parked lane is reminded only of what names it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.subscribe(
+        { roomId: control, subscriber: { _tag: "lane", laneId: lane.id }, mode: "wake" },
+        ownerApp,
+      );
+      // Delivered while the lane still worked, then the lane parked with it unread.
+      yield* router.post(request("anyone free?"), agent(writerThread));
+      yield* parkLane;
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 0);
+
+      yield* router.post(
+        request("API, rebase please", { to: [{ _tag: "lane", laneId: lane.id }] }),
+        agent(writerThread),
+      );
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 1);
+      assert.strictEqual(remindersFor(h.sent, laneThread).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
 // --- router additions: r3 ---
 describe("system delivery", () => {
   it.effect("readiness reads idle, busy and gone without failing", () => {

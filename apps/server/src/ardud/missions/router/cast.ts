@@ -202,13 +202,28 @@ export const itemWatchers = (
 };
 
 /**
+ * A thread whose lanes in this mission are all parked. It wakes only for
+ * messages that name it or come from the owner: a lane parks when its queue
+ * is empty, and broadcasts, subscriptions and reminders would only burn turns.
+ */
+export const isParkedThread = (cast: RouterCast, threadId: ThreadId): boolean => {
+  if (masterThreadsOf(cast).includes(threadId)) return false;
+  const lanes = cast.lanes.filter(
+    (lane) => lane.threadId === threadId && lane.status !== "retired",
+  );
+  return lanes.length > 0 && lanes.every((lane) => lane.status === "parked");
+};
+
+/**
  * Who a broadcast control reaches when the room has no subscribers and it
- * names nobody: every lane with a thread and every non-master bound role.
+ * names nobody: every lane with a thread that isn't parked, and every
+ * non-master bound role that doesn't run a lane.
  */
 export const broadcastAudience = (cast: RouterCast): ReadonlyArray<MissionActor> => {
   const master = masterRoleOf(cast);
-  const lanes = cast.lanes.filter((lane) => lane.threadId !== null && lane.status !== "retired");
-  const laneThreads = new Set(lanes.map((lane) => lane.threadId));
+  const live = cast.lanes.filter((lane) => lane.threadId !== null && lane.status !== "retired");
+  const laneThreads = new Set(live.map((lane) => lane.threadId));
+  const lanes = live.filter((lane) => lane.status !== "parked");
   // One recipient per thread, so a receipt counts threads, not titles.
   return [
     ...lanes.map((lane): MissionActor => ({ _tag: "lane", laneId: lane.id })),

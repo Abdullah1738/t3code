@@ -6,6 +6,7 @@ import {
   OPEN_WORK_STAGES,
   pullRequestReviews,
   reviewPolicyView,
+  reviewRoundsView,
   workBoard,
   workFacts,
   type PullRequestReviews,
@@ -258,6 +259,7 @@ function WorkRowItem(props: {
           {row.reason}
         </span>
       ) : null}
+      <ReviewRoundsLine item={row.item} className="col-start-2 col-end-4" />
       {reviews ? <PullRequestRounds reviews={reviews} /> : null}
     </li>
   );
@@ -317,7 +319,22 @@ function DoneRow(props: { item: WorkItem; nowMs: number }) {
       {fact ? (
         <span className="col-span-2 min-w-0 truncate text-xs text-(--m-muted)">{fact}</span>
       ) : null}
+      <ReviewRoundsLine item={props.item} className="col-span-2" />
     </li>
+  );
+}
+
+/** Review rounds a lane recorded on an item; past the budget it reads as a warning. */
+function ReviewRoundsLine(props: { item: WorkItem; className: string }) {
+  const rounds = reviewRoundsView(props.item);
+  if (rounds === null) return null;
+  return (
+    <span className={cn("min-w-0 truncate text-xs text-(--m-muted)", props.className)}>
+      <span className={rounds.over ? "font-medium text-(--m-warning)" : undefined}>
+        {rounds.label}
+      </span>
+      {` · ${rounds.detail}`}
+    </span>
   );
 }
 

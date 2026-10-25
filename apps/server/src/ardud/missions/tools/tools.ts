@@ -27,6 +27,7 @@ import {
   OrchestratorMcpFailure,
   PostMessageInput,
   RecordDraftSentInput,
+  RecordReviewRoundInput,
   RecordRuleUseInput,
   RecordView,
   ReopenDraftInput,
@@ -40,6 +41,7 @@ import {
   SetApprovalRoutingInput,
   SetMissionFocusInput,
   SetMissionStatusInput,
+  SetOwnLaneStatusInput,
   SetThreadAttachmentInput,
   SplitLaneInput,
   SubMissionId,
@@ -542,6 +544,18 @@ const MissionLaneNudgeTool = Tool.make("mission_lane_nudge", {
   dependencies: [...planDependencies, MissionStore.MissionStore, MissionRouter],
 });
 
+const MissionReviewRoundTool = missionWriteTool(
+  "mission_review_round",
+  "As the lead of a work item's lane (or the master), record one review round you ran on it: round number (next after the recorded ones), verdict clear or findings, how many findings and how many of them are P0/P1 (wrong behaviour, data loss, security, money paths), the head reviewed and the reviewer. The board shows rounds per item. Three rounds is the budget: after that only P0/P1 findings justify another round, nits go to a follow-up, and from round 4 the master is told. Recording the same round again is a no-op.",
+  RecordReviewRoundInput,
+);
+
+const MissionLaneStatusTool = missionWriteTool(
+  "mission_lane_status",
+  "As a lane's lead, park your own lane when its queue is empty (status parked, with a short reason), or put it back to work (status working) when you pick up new work. A parked lane wakes only for messages addressed to it or from the owner: broadcasts, room subscriptions and unread reminders stop. Pass laneId only if you lead more than one lane. An open ask holding the lane keeps it waiting; parking it is still allowed.",
+  SetOwnLaneStatusInput,
+);
+
 // ardud missions: core - the master revises a call on the owner's condition
 const MissionCallReviseTool = missionWriteTool(
   "mission_call_revise",
@@ -741,6 +755,8 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionCallReviseTool, "Revise a call on the owner's condition"),
   writeTool(MissionPortfolioReorderTool, "Set the portfolio order"),
   writeTool(MissionLaneNudgeTool, "Nudge a lane"),
+  writeTool(MissionReviewRoundTool, "Record a review round"),
+  writeTool(MissionLaneStatusTool, "Park or resume your lane"),
   writeTool(MissionApprovalOpenTool, "Open an approval"),
   writeTool(MissionApprovalWithdrawTool, "Withdraw an approval"),
   writeTool(MissionApprovalRouteTool, "Route one approval"),

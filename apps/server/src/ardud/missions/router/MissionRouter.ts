@@ -70,6 +70,7 @@ import {
   actorsOfThread,
   broadcastAudience,
   heldBy,
+  isParkedThread,
   itemWatchers,
   labelOf,
   leadTiersOf,
@@ -953,8 +954,9 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Threads a message wakes. The master's thread wakes only for what is
-   * addressed to it or comes from the owner; the author never wakes itself.
+   * Threads a message wakes. The master's thread, and a thread whose lanes
+   * are all parked, wake only for what is addressed to them or comes from
+   * the owner; the author never wakes itself.
    * Only the mission's own members get a delivery, so a stale subscription
    * or a thread that has left cannot carry a message out of the mission.
    */
@@ -977,7 +979,13 @@ const make = Effect.gen(function* () {
         const addressed = message.to.some((each) => sameActor(each, actor));
         for (const threadId of threadsOfActor(cast, actor)) {
           if (threadId === authorThread || out.has(threadId)) continue;
-          if (masters.has(threadId) && !fromOwner && !addressed) continue;
+          if (
+            !fromOwner &&
+            !addressed &&
+            (masters.has(threadId) || isParkedThread(cast, threadId))
+          ) {
+            continue;
+          }
           const member = yield* membershipIn(within(cast), threadId).pipe(
             Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
           );
@@ -2528,7 +2536,36 @@ const make = Effect.gen(function* () {
       byThread.set(delivery.threadId, list);
     }
     let reminded = 0;
-    for (const [threadId, rows] of byThread) {
+    const casts = new Map<MissionId, RouterCast | null>();
+    const castFor = (missionId: MissionId) =>
+      Effect.gen(function* () {
+        if (!casts.has(missionId)) {
+          casts.set(
+            missionId,
+            yield* loadCast(missionId).pipe(
+              Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
+            ),
+          );
+        }
+        return casts.get(missionId) ?? null;
+      });
+    // A parked lane is reminded only of what was addressed to it or came from
+    // the owner: anything it got before parking would just burn a turn.
+    const worthReminding = (threadId: ThreadId, row: DeliveryRow) =>
+      Effect.gen(function* () {
+        const cast = yield* castFor(row.missionId);
+        if (cast === null || !isParkedThread(cast, threadId)) return true;
+        const message = yield* rooms.messageById(row.messageId);
+        if (message === null) return false;
+        return (
+          message.author._tag === "owner" ||
+          message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId))
+        );
+      });
+    for (const [threadId, all] of byThread) {
+      const rows: DeliveryRow[] = [];
+      for (const row of all) if (yield* worthReminding(threadId, row)) rows.push(row);
+      if (rows.length === 0) continue;
       const sent = yield* bellLock
         .withPermit(remindThread(threadId, rows, ago(REMIND_GAP_MS)))
         .pipe(

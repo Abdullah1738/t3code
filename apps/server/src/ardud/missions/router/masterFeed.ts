@@ -1,8 +1,9 @@
 /**
  * What reaches the master besides messages addressed to it: one digest per
  * editor pass, the approvals and drafts routed to the master, the notes
- * the owner leaves when deciding an approval, and every owner decision on an
- * approval the master opened itself. Each one
+ * the owner leaves when deciding an approval, every owner decision on an
+ * approval the master opened itself, and a lane's review round past the
+ * budget. Each one
  * is a message in the mission's control room addressed to the master role,
  * so it rings the doorbell like every other delivery. Keys come from the
  * event id, so a replayed event posts nothing new.
@@ -85,11 +86,48 @@ const ownerDecidedMasterAsk = (event: MissionEvent) =>
   "masterAsked" in event.payload &&
   event.payload.masterAsked === true;
 
+/** Review round fields as `work-item.reviewed` records them. */
+interface ReviewedPayload {
+  readonly round: number;
+  readonly severe: number;
+  readonly findings: number;
+  readonly budget: number;
+  readonly previousSevere: number | null;
+}
+
+const reviewedPayload = (event: MissionEvent): ReviewedPayload | null => {
+  if (event.kind !== "work-item.reviewed") return null;
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null) return null;
+  const read = (key: string) =>
+    key in payload ? (payload as Record<string, unknown>)[key] : undefined;
+  const round = read("round");
+  const budget = read("budget");
+  const severe = read("severe");
+  const findings = read("findings");
+  const previousSevere = read("previousSevere");
+  if (typeof round !== "number" || typeof budget !== "number") return null;
+  return {
+    round,
+    budget,
+    severe: typeof severe === "number" ? severe : 0,
+    findings: typeof findings === "number" ? findings : 0,
+    previousSevere: typeof previousSevere === "number" ? previousSevere : null,
+  };
+};
+
+/** A lane recorded a review round past the budget: the master decides whether the item goes on. */
+const overReviewBudget = (event: MissionEvent) => {
+  const payload = reviewedPayload(event);
+  return payload !== null && payload.round > payload.budget;
+};
+
 const feedRelevant = (event: MissionEvent) =>
   event.kind === "editor.updated" ||
   ROUTED_KINDS.has(event.kind) ||
   ownerCommented(event) ||
-  ownerDecidedMasterAsk(event);
+  ownerDecidedMasterAsk(event) ||
+  overReviewBudget(event);
 
 interface Notice {
   readonly kind: MissionMessageKind;
@@ -168,6 +206,24 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
         return notice;
       }
       if (ROUTED_KINDS.has(event.kind)) return yield* routedNotice(event);
+      const reviewed = reviewedPayload(event);
+      if (reviewed !== null && reviewed.round > reviewed.budget) {
+        const title = event.subject?.label ?? event.subject?.id ?? "A work item";
+        const severeBefore = reviewed.previousSevere !== null && reviewed.previousSevere > 0;
+        const notice: Notice = {
+          kind: "request",
+          summary: `Review round ${reviewed.round} on ${title}`,
+          body: [
+            `${title} just had review round ${reviewed.round}; the budget is ${reviewed.budget}.`,
+            `This round: ${reviewed.findings} finding${reviewed.findings === 1 ? "" : "s"}, ${reviewed.severe} P0/P1.`,
+            severeBefore
+              ? `The round before found ${reviewed.previousSevere} P0/P1, so another round can be right.`
+              : "The round before found no P0/P1, so this round was past the rule: after three rounds only P0/P1 findings reopen work.",
+            "Decide: land it with the nits as a follow-up, cut scope, or stop the lane on it.",
+          ].join("\n"),
+        };
+        return notice;
+      }
       if (ownerDecidedMasterAsk(event) && event.subject?.kind === "approval") {
         const subject = { kind: "approval" as const, id: event.subject.id };
         const approval = Option.getOrNull(yield* store.get("approval", subject.id));

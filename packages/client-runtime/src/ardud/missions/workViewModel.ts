@@ -1,4 +1,9 @@
-import type { MissionActor, WorkItem, WorkStage } from "@t3tools/contracts";
+import {
+  WORK_ITEM_REVIEW_BUDGET,
+  type MissionActor,
+  type WorkItem,
+  type WorkStage,
+} from "@t3tools/contracts";
 
 import { actorLabel, refLabel } from "./viewModel.ts";
 
@@ -69,6 +74,31 @@ export function workFacts(item: WorkItem): string[] {
     item.facts.deployedReadback ? `deployed: ${item.facts.deployedReadback}` : null,
     item.facts.exercised ? `exercised: ${item.facts.exercised}` : null,
   ].filter((part): part is string => part !== null);
+}
+
+export interface ReviewRoundsView {
+  /** "2 rounds", "5 rounds". */
+  readonly label: string;
+  /** "Round 3 clear", "Round 5: 2 findings, 1 P0/P1". */
+  readonly detail: string;
+  /** Past the review budget: the master was told. */
+  readonly over: boolean;
+}
+
+/** The review rounds a lane recorded on an item, or null before the first. */
+export function reviewRoundsView(item: WorkItem): ReviewRoundsView | null {
+  const rounds = item.reviewRounds ?? [];
+  const last = rounds.at(-1);
+  if (last === undefined) return null;
+  const findings = `${last.findings} finding${last.findings === 1 ? "" : "s"}`;
+  return {
+    label: `${rounds.length} round${rounds.length === 1 ? "" : "s"}`,
+    detail:
+      last.verdict === "clear"
+        ? `Round ${last.round} clear`
+        : `Round ${last.round}: ${findings}${last.severe > 0 ? `, ${last.severe} P0/P1` : ""}`,
+    over: rounds.length > WORK_ITEM_REVIEW_BUDGET,
+  };
 }
 
 // --- Desk board ---

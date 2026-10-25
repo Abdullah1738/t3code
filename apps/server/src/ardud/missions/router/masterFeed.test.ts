@@ -12,7 +12,15 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
-import { agent, at, masterThread, missionId, seed } from "../asks/AsksService.testkit.ts";
+import {
+  agent,
+  at,
+  lane,
+  laneThread,
+  masterThread,
+  missionId,
+  seed,
+} from "../asks/AsksService.testkit.ts";
 import { withComment } from "../asks/inboxMarks.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
@@ -376,6 +384,52 @@ describe("master inbox feed", () => {
       const after = yield* controlMessages;
       assert.strictEqual(after.length, 3);
       assert.include((yield* rooms.messageBody(after[2]!.id)) ?? "", "Robob release 4");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a review round past the budget asks the master whether the item goes on", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const rooms = yield* RouterStore.RouterStore;
+      const feed = yield* feedOf(null);
+      const reviewed = (
+        round: number,
+        severe: number,
+        previousSevere: number | null,
+        provenance: MissionProvenance = agent(laneThread),
+      ) =>
+        store.appendEvent({
+          missionId,
+          kind: "work-item.reviewed",
+          actor: { _tag: "lane", laneId: lane.id },
+          provenance,
+          summary: `"Item wi-free" review round ${round}`,
+          subject: { kind: "work-item", id: "wi-free", label: "Item wi-free" },
+          payload: { round, verdict: "findings", findings: 3, severe, budget: 3, previousSevere },
+        });
+
+      // Within the budget the lane carries on by itself.
+      for (const round of [1, 2, 3]) yield* feed.handle(yield* reviewed(round, 1, 1));
+      assert.strictEqual((yield* controlMessages).length, 0);
+
+      yield* feed.handle(yield* reviewed(4, 0, 0));
+      const [notice] = yield* controlMessages;
+      assert.strictEqual(notice?.kind, "request");
+      assert.deepStrictEqual(notice?.to, [masterRole]);
+      assert.include(notice?.summary ?? "", "Review round 4 on Item wi-free");
+      const body = (yield* rooms.messageBody(notice!.id)) ?? "";
+      assert.include(body, "The round before found no P0/P1");
+      assert.include(body, "land it with the nits as a follow-up");
+      assert.deepStrictEqual(wakesFor(h.threads.sent), [masterThread]);
+
+      // A round after real defects says so; the master's own record is filed, not a wake.
+      yield* feed.handle(yield* reviewed(5, 1, 2, agent(masterThread)));
+      const after = yield* controlMessages;
+      assert.strictEqual(after.length, 2);
+      assert.include((yield* rooms.messageBody(after[1]!.id)) ?? "", "found 2 P0/P1");
+      assert.deepStrictEqual(wakesFor(h.threads.sent), [masterThread]);
     }).pipe(Effect.provide(h.layer));
   });
 
