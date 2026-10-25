@@ -311,16 +311,24 @@ export const wakeTargets = (
   );
 };
 
-/** Named recipients a control's receipt counts: its addressees, or the non-muted room. */
+/**
+ * Named recipients a control's receipt counts: its addressees, or the
+ * non-muted room. `unwoken` drops subscribers an unaddressed control does not
+ * wake (parked lanes), so the receipt never waits on them.
+ */
 export const receiptRecipients = (
   message: Pick<MissionMessage, "kind" | "to" | "author">,
   subscriptions: ReadonlyArray<Subscription>,
+  unwoken?: (actor: MissionActor) => boolean,
 ): MissionActor[] => {
   if (message.kind !== "control") return [];
   const named =
     message.to.length > 0
       ? message.to
-      : subscriptions.filter((sub) => sub.mode !== "mute").map((sub) => sub.subscriber);
+      : subscriptions
+          .filter((sub) => sub.mode !== "mute")
+          .map((sub) => sub.subscriber)
+          .filter((actor) => unwoken === undefined || !unwoken(actor));
   return uniqueActors(named).filter(
     (actor) => actor._tag !== "owner" && !sameActor(actor, message.author),
   );

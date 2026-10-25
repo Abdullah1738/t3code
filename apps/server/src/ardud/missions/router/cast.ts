@@ -214,16 +214,25 @@ export const isParkedThread = (cast: RouterCast, threadId: ThreadId): boolean =>
   return lanes.length > 0 && lanes.every((lane) => lane.status === "parked");
 };
 
+/** An actor whose threads are all parked lanes: ambient broadcasts neither wake it nor wait on its read. */
+export const isParkedActor = (cast: RouterCast, actor: MissionActor): boolean => {
+  const threads = threadsOfActor(cast, actor);
+  return threads.length > 0 && threads.every((threadId) => isParkedThread(cast, threadId));
+};
+
 /**
  * Who a broadcast control reaches when the room has no subscribers and it
- * names nobody: every lane with a thread that isn't parked, and every
- * non-master bound role that doesn't run a lane.
+ * names nobody: every lane with a thread, and every non-master bound role
+ * that doesn't run a lane. Parked lanes only hear the owner's broadcasts.
  */
-export const broadcastAudience = (cast: RouterCast): ReadonlyArray<MissionActor> => {
+export const broadcastAudience = (
+  cast: RouterCast,
+  options: { readonly fromOwner: boolean },
+): ReadonlyArray<MissionActor> => {
   const master = masterRoleOf(cast);
   const live = cast.lanes.filter((lane) => lane.threadId !== null && lane.status !== "retired");
   const laneThreads = new Set(live.map((lane) => lane.threadId));
-  const lanes = live.filter((lane) => lane.status !== "parked");
+  const lanes = options.fromOwner ? live : live.filter((lane) => lane.status !== "parked");
   // One recipient per thread, so a receipt counts threads, not titles.
   return [
     ...lanes.map((lane): MissionActor => ({ _tag: "lane", laneId: lane.id })),

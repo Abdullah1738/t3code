@@ -1487,6 +1487,76 @@ describe("parked lanes", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("the owner's control broadcast still reaches a parked lane", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* parkLane;
+      const router = yield* MissionRouter.MissionRouter;
+      const posted = yield* router.post(
+        { ...request("Everyone stop. Owner instruction."), kind: "control" },
+        ownerApp,
+      );
+      assert.deepStrictEqual(posted.receipt?.pending, ["API", "role-writer"]);
+      assert.strictEqual(wakesFor(h.sent, laneThread).length, 1);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a subscribed parked lane is not waited on by a broadcast it doesn't get", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.subscribe(
+        { roomId: control, subscriber: { _tag: "lane", laneId: lane.id }, mode: "wake" },
+        ownerApp,
+      );
+      yield* parkLane;
+      const posted = yield* router.post(
+        { ...request("freeze merges"), kind: "control" },
+        agent(masterThread),
+      );
+      assert.deepStrictEqual([posted.receipt?.reached, posted.receipt?.total], [0, 0]);
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.deepStrictEqual(page.messages[0]?.receipt?.pending, []);
+
+      // The owner's broadcast in the same room still counts the lane.
+      const owner = yield* router.post({ ...request("Everyone stop."), kind: "control" }, ownerApp);
+      assert.deepStrictEqual(owner.receipt?.pending, ["API"]);
+      assert.strictEqual(wakesFor(h.sent, laneThread).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("traffic queued while the lane was busy doesn't wake it once it parks", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.subscribe(
+        { roomId: control, subscriber: { _tag: "lane", laneId: lane.id }, mode: "wake" },
+        ownerApp,
+      );
+      h.activity.set(laneThread, "running");
+      yield* router.post(request("Anyone free?"), agent(masterThread));
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+      yield* parkLane;
+      h.activity.set(laneThread, "idle");
+      yield* router.settled(laneThread);
+      assert.deepStrictEqual(wakesFor(h.sent, laneThread), []);
+
+      // Something that names the lane still rings.
+      yield* router.post(
+        request("API, rebase please", { to: [{ _tag: "lane", laneId: lane.id }] }),
+        agent(masterThread),
+      );
+      const wakes = wakesFor(h.sent, laneThread);
+      assert.strictEqual(wakes.length, 1);
+      assert.strictEqual(wakes[0]!.key, `mission-wake:${missionId}:${laneThread}:2`);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("a parked lane is reminded only of what names it", () => {
     const h = harness();
     return Effect.gen(function* () {

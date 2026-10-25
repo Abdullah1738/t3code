@@ -70,6 +70,7 @@ import {
   actorsOfThread,
   broadcastAudience,
   heldBy,
+  isParkedActor,
   isParkedThread,
   itemWatchers,
   labelOf,
@@ -522,6 +523,52 @@ const make = Effect.gen(function* () {
   const loadCast = (missionId: MissionId): Effect.Effect<RouterCast, MissionError> =>
     readCast(store, missionId);
 
+  /**
+   * Subscribers an unaddressed control from this author neither wakes nor
+   * waits on: parked lanes, unless the owner speaks. Receipts read the lanes
+   * as they are now, like they read the room's subscriptions.
+   */
+  const unwokenBy = (cast: RouterCast, author: MissionActor) =>
+    author._tag === "owner" ? undefined : (actor: MissionActor) => isParkedActor(cast, actor);
+
+  /**
+   * The unread deliveries that may still wake a thread. Where the thread's
+   * lanes are parked it wakes only for messages that name it or come from the
+   * owner; ambient traffic that reached it before it parked waits until the
+   * lane works again.
+   */
+  const wakingDeliveries = Effect.fn("MissionRouter.wakingDeliveries")(function* (
+    threadId: ThreadId,
+    rows: ReadonlyArray<DeliveryRow>,
+  ) {
+    const casts = new Map<MissionId, RouterCast | null>();
+    const out: DeliveryRow[] = [];
+    for (const row of rows) {
+      if (!casts.has(row.missionId)) {
+        casts.set(
+          row.missionId,
+          yield* loadCast(row.missionId).pipe(
+            Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
+          ),
+        );
+      }
+      const cast = casts.get(row.missionId) ?? null;
+      if (cast === null || !isParkedThread(cast, threadId)) {
+        out.push(row);
+        continue;
+      }
+      const message = yield* rooms.messageById(row.messageId);
+      if (
+        message !== null &&
+        (message.author._tag === "owner" ||
+          message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId)))
+      ) {
+        out.push(row);
+      }
+    }
+    return out;
+  });
+
   const loadRoom = (roomId: RoomId) =>
     Effect.gen(function* () {
       const room = yield* rooms.room(roomId);
@@ -866,15 +913,17 @@ const make = Effect.gen(function* () {
           input.kind === "control" &&
           !subscriptions.some((sub) => sub.mode !== "mute")
         ) {
-          to = broadcastAudience(cast);
+          to = broadcastAudience(cast, { fromOwner: author._tag === "owner" });
         }
         const seq = (yield* rooms.lastMessageSeq(input.missionId)) + 1;
         const at = yield* nowIso;
         const shaped = { kind: input.kind, to: [...to], author };
-        const recipients = receiptRecipients(shaped, subscriptions).map((actor) => ({
-          actor,
-          label: labelOf(cast, actor),
-        }));
+        const recipients = receiptRecipients(shaped, subscriptions, unwokenBy(cast, author)).map(
+          (actor) => ({
+            actor,
+            label: labelOf(cast, actor),
+          }),
+        );
         const message: MissionMessage = {
           id: MissionMessageId.make(`${input.missionId}:msg:${seq}`),
           missionId: input.missionId,
@@ -1104,7 +1153,9 @@ const make = Effect.gen(function* () {
       const receiptsTo = new Map(
         page.messages.map((message) => [
           message.id,
-          message.kind === "control" ? receiptRecipients(message, subscriptions) : [],
+          message.kind === "control"
+            ? receiptRecipients(message, subscriptions, unwokenBy(cast, message.author))
+            : [],
         ]),
       );
       const { names, members } = yield* whoIsIn(cast, room.id, subscriptions, [
@@ -2065,7 +2116,7 @@ const make = Effect.gen(function* () {
         heldPokes.add(threadId);
         return;
       }
-      const unread = yield* rooms.unreadDeliveries(threadId);
+      const unread = yield* wakingDeliveries(threadId, yield* rooms.unreadDeliveries(threadId));
       if (unread.length === 0) return;
       let bell = yield* rooms.doorbell(threadId);
       const facts = yield* threads.facts(threadId);
@@ -2536,35 +2587,9 @@ const make = Effect.gen(function* () {
       byThread.set(delivery.threadId, list);
     }
     let reminded = 0;
-    const casts = new Map<MissionId, RouterCast | null>();
-    const castFor = (missionId: MissionId) =>
-      Effect.gen(function* () {
-        if (!casts.has(missionId)) {
-          casts.set(
-            missionId,
-            yield* loadCast(missionId).pipe(
-              Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
-            ),
-          );
-        }
-        return casts.get(missionId) ?? null;
-      });
-    // A parked lane is reminded only of what was addressed to it or came from
-    // the owner: anything it got before parking would just burn a turn.
-    const worthReminding = (threadId: ThreadId, row: DeliveryRow) =>
-      Effect.gen(function* () {
-        const cast = yield* castFor(row.missionId);
-        if (cast === null || !isParkedThread(cast, threadId)) return true;
-        const message = yield* rooms.messageById(row.messageId);
-        if (message === null) return false;
-        return (
-          message.author._tag === "owner" ||
-          message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId))
-        );
-      });
     for (const [threadId, all] of byThread) {
-      const rows: DeliveryRow[] = [];
-      for (const row of all) if (yield* worthReminding(threadId, row)) rows.push(row);
+      // A parked lane is reminded only of what names it or came from the owner.
+      const rows = yield* wakingDeliveries(threadId, all);
       if (rows.length === 0) continue;
       const sent = yield* bellLock
         .withPermit(remindThread(threadId, rows, ago(REMIND_GAP_MS)))
