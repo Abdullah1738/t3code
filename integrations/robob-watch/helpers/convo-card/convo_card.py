@@ -32,8 +32,8 @@ Private dotfiles in the same folder (the bridge never serves dot paths): .convo.
 .messages.json, .translations.json, .sent.json, .preview-key, .lock.
 
 Env overrides: CONVO_CARD_ROOT, CONVO_CARD_BRIDGE (bridge CLI command, space separated),
-CONVO_CARD_WACLI, CONVO_CARD_CHECK, CONVO_CARD_PREVIEW_LIB, CONVO_CARD_NO_IMAGE=1 (skip Chrome, tests),
-WACLI_STORE_DIR.
+CONVO_CARD_WACLI, CONVO_CARD_CHECK, CONVO_CARD_LANGID (language check, default english.js = Apple's
+on-device recognizer), CONVO_CARD_PREVIEW_LIB, CONVO_CARD_NO_IMAGE=1 (skip Chrome, tests), WACLI_STORE_DIR.
 """
 import argparse, fcntl, hashlib, html, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 import importlib.util, unicodedata, urllib.request
@@ -85,6 +85,10 @@ def bridge_cmd():
 
 def check_cmd():
     return _cmd("CONVO_CARD_CHECK", [str(HOME / ".local/bin/card-check")])
+
+
+def langid_cmd():
+    return _cmd("CONVO_CARD_LANGID", ["/usr/bin/osascript", "-l", "JavaScript", str(HERE / "english.js")])
 
 
 def wadb():
@@ -169,15 +173,43 @@ def known_word(w, names):
     return False
 
 
-def needs_review(s, names=()):
-    """True unless the text is confidently English: only ASCII letters, and every word is in the system word
-    list (simple suffixes stripped) or is a chat name. Emoji, digits and punctuation alone need nothing.
-    A false alarm costs one `translate --none`; a miss shows an untranslated message as done."""
+def _words_check(s, names):
+    """'review', 'plain' (no words, or only chat words and names) or 'ask' (dictionary words: the language
+    recognizer decides, since 'Sin embargo' and 'Ich bin in Berlin' are all in the word list too)."""
     s = (s or "").replace("\u2019", "'")
     if any(ch.isalpha() and ord(ch) > 127 for ch in s):
-        return True
-    s = re.sub(r"'(s|t|re|ll|ve|d|m)\b", "", s.lower())
-    return not all(known_word(w, names) for w in re.findall(r"[a-z]+", s))
+        return "review"
+    words = re.findall(r"[a-z]+", re.sub(r"'(s|t|re|ll|ve|d|m)\b", "", s.lower()))
+    if not all(known_word(w, names) for w in words):
+        return "review"
+    return "ask" if any(w not in names and w not in CHAT_WORDS for w in words) else "plain"
+
+
+def english(texts):
+    """Apple's on-device recognizer says English for each text. Can't run -> all False (reviewed)."""
+    if not texts:
+        return []
+    try:
+        p = subprocess.run(langid_cmd(), input=json.dumps(texts), capture_output=True, text=True, timeout=60)
+        res = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        res = None
+    if not isinstance(res, list) or len(res) != len(texts):
+        print("convo-card: language check didn't run; every message with words waits for translate",
+              file=sys.stderr)
+        return [False] * len(texts)
+    return [isinstance(r, dict) and r.get("top") == "en" for r in res]
+
+
+def needs_review(texts, names=()):
+    """One flag per text: True unless it is confidently English, meaning ASCII letters only, every word in
+    the system word list (simple suffixes stripped) or a chat name, and the recognizer calls it English.
+    Emoji, digits and punctuation alone need nothing. A false alarm costs one `translate --none`; a miss
+    shows an untranslated message as done."""
+    verdicts = [_words_check(s, names) for s in texts]
+    asks = [s for s, v in zip(texts, verdicts) if v == "ask"]
+    en = iter(english(asks))
+    return [v == "review" or (v == "ask" and not next(en)) for v in verdicts]
 
 
 def chat_names(cfg):
@@ -243,9 +275,10 @@ def resolve_config(a, d, ident=None):
     cfg = read_json(d / ".convo.json", {})
     if a.chat:
         main, jids, name = ident or identify(a.chat)
-        if cfg.get("chat") not in (None, main):
+        mine = {cfg["chat"], *cfg.get("jids", [])} if cfg.get("chat") else set()
+        if mine and not mine & {main, *jids}:
             die(f"{d.name} already belongs to {cfg['chat']}; pick another --slug for {main}")
-        cfg["chat"], cfg["jids"] = main, jids
+        cfg["chat"], cfg["jids"] = main, list(dict.fromkeys([*jids, *cfg.get("jids", [])]))
         cfg.setdefault("them", name)
     if not cfg.get("chat"):
         die("first build needs --chat NUMBER|JID")
@@ -304,9 +337,16 @@ def download(chat, msg_id, media_dir, dry_run):
 
 
 def chat_jids(w, con, cfg):
-    """Every JID the chat is stored under now. A phone-LID mapping can appear after the first build, so the
-    saved list is only a starting point."""
-    return list(dict.fromkeys([*cfg.get("jids", []), *w.resolve(con, cfg["chat"])]))
+    """Every JID the chat is stored under now. A phone-LID mapping can appear or change after the first
+    build, so every saved identity is resolved again, not just the one the card was made from."""
+    known = list(dict.fromkeys([cfg["chat"], *cfg.get("jids", [])]))
+    return list(dict.fromkeys(j for k in known for j in (k, *w.resolve(con, k))))
+
+
+def canonical(cfg):
+    """A card made from an unmapped LID switches to the phone JID once it is known (it stays stable)."""
+    if cfg["chat"].endswith("@lid"):
+        cfg["chat"] = next((j for j in cfg["jids"] if j.endswith("@s.whatsapp.net")), cfg["chat"])
 
 
 def body_of(media, text, display, caption):
@@ -332,6 +372,7 @@ def fetch(cfg, d, dry_run=False):
     con = w.connect()
     group = cfg["chat"].endswith("@g.us")
     cfg["jids"] = chat_jids(w, con, cfg)
+    canonical(cfg)
     q = ",".join("?" * len(cfg["jids"]))
     rows = con.execute(
         f"select rowid, chat_jid, msg_id, coalesce(sender_jid,''), coalesce(sender_name,''), from_me, ts,"
@@ -339,7 +380,7 @@ def fetch(cfg, d, dry_run=False):
         f" coalesce(filename,''), coalesce(reaction_to_id,''), coalesce(revoked,0), coalesce(deleted_for_me,0)"
         f" from messages where chat_jid in ({q}) and ts >= ? order by ts, rowid", (*cfg["jids"], cfg["since"])).fetchall()
     names = chat_names(cfg)
-    out = {}
+    out, check = {}, {}
     for (rowid, chat_jid, msg_id, sender, sender_name, from_me, ts, text, display, media, caption, filename,
          reaction, revoked, deleted) in rows:
         if reaction or revoked or deleted or not msg_id:
@@ -366,14 +407,18 @@ def fetch(cfg, d, dry_run=False):
             label = LABELS.get(media, "Attachment")
             if media == "document" and filename:
                 label += ": " + clean(filename, 60)
-            m.update(type="other", label=label, caption=raw.strip(), sha=sha("other", msg_id, label, raw),
-                     needs=needs_review(raw, names))
+            m.update(type="other", label=label, caption=raw.strip(), sha=sha("other", msg_id, label, raw))
+            check[msg_id] = raw
         else:
             if not raw.strip():
                 continue
-            m.update(type="text", text=raw.strip(), sha=sha("text", msg_id, raw), needs=needs_review(raw, names))
+            m.update(type="text", text=raw.strip(), sha=sha("text", msg_id, raw))
+            check[msg_id] = raw
         out[msg_id] = m
     con.close()
+    for msg_id, needs in zip(check, needs_review(list(check.values()), names)):
+        if msg_id in out:
+            out[msg_id]["needs"] = needs
     return sorted(out.values(), key=lambda m: (m["ts"], m["rowid"]))
 
 
@@ -434,15 +479,14 @@ def compose(cfg, msgs, translations, now=None):
 def page_html(data):
     t = (HERE / "page.html").read_text()
     e = lambda s: html.escape(str(s), quote=True)
-    for k, v in (("{{OG_TITLE}}", e(data["title"] + " chat")), ("{{OG_DESC}}", e(data["status"])),
-                 ("{{V}}", e(data["v"])), ("{{INITIAL}}", e(data["initial"])), ("{{NAME}}", e(data["title"])),
-                 ("{{SUBTITLE}}", e(data["subtitle"]))):
-        t = t.replace(k, v)
     # Inline copy of data.json for the first paint; escaped so no message text can close the script tag.
     seed = json.dumps(data, ensure_ascii=False)
     for c, u in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
         seed = seed.replace(c, u)
-    return t.replace("{{DATA}}", seed)
+    fill = {"OG_TITLE": e(data["title"] + " chat"), "OG_DESC": e(data["status"]), "V": e(data["v"]),
+            "INITIAL": e(data["initial"]), "NAME": e(data["title"]), "SUBTITLE": e(data["subtitle"]), "DATA": seed}
+    # One pass over the template, so a name or message that looks like a placeholder is never filled in.
+    return re.sub(r"\{\{([A-Z_]+)\}\}", lambda mo: fill.get(mo.group(1), mo.group(0)), t)
 
 
 def preview_doc(d, data):
@@ -814,8 +858,11 @@ def cmd_watch(a):
         share["last_probe"] = now
         share["fails"] = share.get("fails", 0) + 1 if bad else 0
         if share["fails"] >= 2 and share.get("alerted_url") != bad[0]:
-            out.append(f"CONVO_CARD_SHARE_DOWN {a.slug}: {bad[0]} failed {share['fails']} probes in a row; run "
-                       f"`convo-card send --slug {a.slug} --to <chat> --session <yours>` to re-share and resend.")
+            head = f"CONVO_CARD_SHARE_DOWN {a.slug}: {bad[0]} "
+            # A run that died after its outbox write but before share.json is being replayed with this alert.
+            if not any(x.startswith(head) for b in carry for x in b["lines"]):
+                out.append(f"{head}failed {share['fails']} probes in a row; run `convo-card send --slug {a.slug} "
+                           f"--to <chat> --session <yours>` to re-share and resend.")
             share["alerted_url"] = bad[0]
         if not bad:
             share.pop("alerted_url", None)

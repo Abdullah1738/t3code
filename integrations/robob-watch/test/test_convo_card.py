@@ -52,6 +52,14 @@ print("PASS" if code == 0 else "FAIL bubble: text cut")
 sys.exit(code)
 """
 
+# Language check: English unless FAKE_LANG maps the text to another language.
+FAKE_LANGID = """#!/usr/bin/python3
+import json, os, sys
+langs = json.loads(os.environ.get("FAKE_LANG") or "{}")
+print(json.dumps([{"top": langs.get(t, "en")} for t in json.load(sys.stdin)]))
+"""
+REAL_LANGID = os.path.join(HERE, "..", "helpers", "convo-card", "english.js")
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -93,7 +101,8 @@ class Base(unittest.TestCase):
         self.env = dict(
             os.environ, WACLI_STORE_DIR=self.store, CONVO_CARD_ROOT=self.cards, CONVO_CARD_NO_IMAGE="1",
             CONVO_CARD_WACLI=self._exe("wacli", FAKE_WACLI), CONVO_CARD_BRIDGE=self._exe("bridge", FAKE_BRIDGE),
-            CONVO_CARD_CHECK=self._exe("card-check", FAKE_CHECK), FAKE_WACLI_LOG=self.logs["wacli"],
+            CONVO_CARD_CHECK=self._exe("card-check", FAKE_CHECK), CONVO_CARD_LANGID=self._exe("langid", FAKE_LANGID),
+            FAKE_WACLI_LOG=self.logs["wacli"],
             FAKE_WACLI_PHOTOS=self.photos, FAKE_BRIDGE_LOG=self.logs["bridge"], FAKE_CHECK_LOG=self.logs["check"],
         )
         self.env.pop("WATCH_DIR", None)
@@ -195,6 +204,13 @@ class BuildTest(Base):
         start = page.index('<script id="seed" type="application/json">') + len('<script id="seed" type="application/json">')
         seed = json.loads(page[start:page.index("</script>", start)])
         self.assertEqual(seed["messages"][0]["text"], '</script><script>alert(1)</script> & "q"')
+        # A name or message that looks like a placeholder is never filled in.
+        self.msg(PHONE, "T2", T0 + 1, text='" id=thread x="')
+        self.run_card("build", "--slug", "lydia-chat", "--them", "{{DATA}}", "--title", "{{DATA}}")
+        with open(os.path.join(self.card(), "index.html")) as f:
+            page = f.read()
+        self.assertEqual(page.count('id="thread"'), 1)
+        self.assertIn("<title>{{DATA}} chat</title>", page)
         for word in ("Moni", "Abdullah's", "Lydia"):
             with open(os.path.join(HERE, "..", "helpers", "convo-card", "page.html")) as f:
                 self.assertNotIn(word, f.read())
@@ -207,8 +223,33 @@ class BuildTest(Base):
         self.msg(PHONE, "DE", T0 + 4, text="Guten Tag")
         self.msg(PHONE, "EN", T0 + 5, text="Lydia walked the dogs and they're eating, thanks")
         self.msg(PHONE, "VI", T0 + 6, media="video", caption="ምግብ")
-        out = json.loads(self.build().stdout)
-        self.assertEqual([p["id"] for p in out["pending"]], ["AM", "FR", "ES", "DE", "VI"])
+        # Every word is in the English word list, so only the language check catches these.
+        self.msg(PHONE, "ES2", T0 + 7, text="Sin embargo")
+        self.msg(PHONE, "DE2", T0 + 8, text="Ich bin in Berlin")
+        env = dict(self.env, FAKE_LANG=json.dumps({"Sin embargo": "es", "Ich bin in Berlin": "de"}))
+        out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
+                                       "--me", "Moni", "--since", SINCE, env=env).stdout)
+        self.assertEqual([p["id"] for p in out["pending"]], ["AM", "FR", "ES", "DE", "VI", "ES2", "DE2"])
+
+    def test_language_check_that_cannot_run_reviews_every_worded_message(self):
+        self.msg(PHONE, "EN", T0, text="Lydia walked the dogs")
+        self.msg(PHONE, "OK", T0 + 1, text="ok 👍")
+        env = dict(self.env, CONVO_CARD_LANGID="/usr/bin/false")
+        out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
+                                       "--me", "Moni", "--since", SINCE, env=env).stdout)
+        self.assertEqual([p["id"] for p in out["pending"]], ["EN"])
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/osascript"), "needs macOS")
+    def test_real_recognizer_tells_english_from_dictionary_words(self):
+        # Apple's on-device recognizer (no network).
+        self.msg(PHONE, "ES", T0, text="Sin embargo")
+        self.msg(PHONE, "DE", T0 + 1, text="Ich bin in Berlin")
+        self.msg(PHONE, "EN", T0 + 2, text="Booby is vomiting, should I call the vet?")
+        self.msg(PHONE, "EN2", T0 + 3, text="on my way")
+        env = dict(self.env, CONVO_CARD_LANGID=f"/usr/bin/osascript -l JavaScript {REAL_LANGID}")
+        out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
+                                       "--me", "Moni", "--since", SINCE, env=env).stdout)
+        self.assertEqual([p["id"] for p in out["pending"]], ["ES", "DE"])
 
     def test_group_senders_are_told_apart(self):
         group = "120363000000000001@g.us"
@@ -282,6 +323,25 @@ class BuildTest(Base):
         self.msg("2222@lid", "T2", T0 + 5, from_me=1, text="hello")
         self.run_card("build", "--slug", "lydia-chat")
         self.assertEqual([m["id"] for m in self.data()["messages"]], ["T1", "T2"])
+
+    def test_card_made_from_an_unmapped_lid_follows_the_phone(self):
+        self.msg("3333@lid", "L1", T0, text="hi")
+        self.run_card("build", "--chat", "3333@lid", "--slug", "lid-chat", "--them", "Sam", "--since", SINCE)
+        con = sqlite3.connect(os.path.join(self.store, "session.db"))
+        con.execute("insert into whatsmeow_lid_map values ('3333', '971500000009')")
+        con.commit()
+        self.msg("971500000009@s.whatsapp.net", "L2", T0 + 1, text="hello")
+        self.run_card("build", "--slug", "lid-chat")
+        with open(os.path.join(self.card("lid-chat"), ".convo.json")) as f:
+            self.assertEqual(json.load(f)["chat"], "971500000009@s.whatsapp.net")
+        # The phone moves to a new LID: still the same chat.
+        con.execute("delete from whatsmeow_lid_map where pn='971500000009'")
+        con.execute("insert into whatsmeow_lid_map values ('4444', '971500000009')")
+        con.commit()
+        con.close()
+        self.msg("4444@lid", "L3", T0 + 2, from_me=1, text="see you")
+        self.run_card("build", "--slug", "lid-chat")
+        self.assertEqual([m["id"] for m in self.data("lid-chat")["messages"]], ["L1", "L2", "L3"])
 
     def test_help_says_use_the_defaults(self):
         p = self.run_card("--help")
@@ -593,6 +653,23 @@ class WatchTest(Base):
         with open(os.path.join(self.wdir, ".run-ok"), "w") as f:
             f.write("r2\n")
         self.assertEqual(run("r3"), "")
+
+    def test_share_down_alert_is_not_doubled_after_a_crash(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        with open(os.path.join(self.card(), ".sent.json"), "w") as f:   # a file:// link never answers 200
+            json.dump({"moni": {"url": "file:///nonexistent/convo-card-share", "key": "k"}}, f)
+        share = os.path.join(self.wdir, "share.json")
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        run = lambda rid, now: self.watch("--now", now, env=dict(self.env, WATCH_RUN=rid)).stdout
+        first = run("r1", "1000")
+        self.assertEqual(first.count("CONVO_CARD_SHARE_DOWN"), 1)
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)   # died after the outbox write, before share.json
+        self.assertEqual(run("r2", "2000").count("CONVO_CARD_SHARE_DOWN"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
