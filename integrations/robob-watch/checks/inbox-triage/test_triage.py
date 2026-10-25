@@ -3,7 +3,9 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -183,6 +185,88 @@ class TriageTests(unittest.TestCase):
             self.assertEqual(state['queue'], [])
             self.assertIn('outbox', state)
             self.assertEqual(t.read_json(Path(state['outbox']['batch']))['hits'][0]['id'], 'mail:a:1:1')
+
+    def test_a_slow_collection_leaves_the_classifier_only_what_fits_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': [self.item()]})
+            args = types.SimpleNamespace(dry_run_hours=None, report=None)
+            # Collection took 43.5 s, so the call would have to answer by second 44: no whole second left.
+            ticks = [1000.0, 1043.5]
+            def clock():
+                return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+            with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
+                 patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                 patch.object(t, 'collect', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'handled', return_value=({}, {})), patch.object(t.time, 'time', side_effect=clock), \
+                 patch.object(t, 'classify', side_effect=AssertionError('no time left to call it')) as model, patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+            model.assert_not_called()
+            state = t.read_json(wd / 'cursor.json')
+            self.assertEqual(t.read_json(Path(state['outbox']['batch']))['hits'][0]['reason'], 'Classifier unavailable; manually review')
+        # With 6 s left the call gets a 6 s timer, not the usual 20, re-firing each second after.
+        with patch.object(t, 'classify', return_value=([], {})), patch.object(t.signal, 'setitimer') as timer:
+            t.classify_batch([self.item()], {}, 6)
+        self.assertEqual(timer.call_args_list[0].args, (t.signal.ITIMER_REAL, 6, 1))
+        self.assertEqual(timer.call_args_list[-1].args, (t.signal.ITIMER_REAL, 0))
+
+    def test_the_deadline_survives_code_that_swallows_timeouts(self):
+        # socket.create_connection catches OSError (TimeoutError is one) and tries the next
+        # address; the deadline must still end the call within the budget.
+        def stubborn(items, context):
+            started = time.monotonic()
+            while time.monotonic() - started < 10:
+                try:
+                    time.sleep(0.05)
+                except OSError:
+                    pass
+                except Exception:
+                    pass
+            raise AssertionError('the deadline never stopped the call')
+        started = time.monotonic()
+        with patch.object(t, 'classify', side_effect=stubborn):
+            hits, meta = t.classify_batch([self.item()], {}, 1)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(meta['classifier_error'], 'TimeoutError')
+        self.assertEqual(hits[0]['reason'], 'Classifier unavailable; manually review')
+        self.assertEqual(t.signal.getitimer(t.signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_a_deadline_firing_right_after_the_timer_is_set_is_still_caught(self):
+        real = t.signal.setitimer
+        calls = []
+        def slow_to_return(which, seconds, interval=0.0):
+            calls.append(seconds)
+            real(which, seconds, interval)
+            if len(calls) == 1:
+                time.sleep(1.05)  # descheduled between arming and the call
+        with patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
+             patch.object(t, 'classify', side_effect=AssertionError('the deadline came first')):
+            hits, meta = t.classify_batch([self.item()], {}, 1)
+        self.assertEqual(meta['classifier_error'], 'TimeoutError')
+        self.assertEqual(hits[0]['reason'], 'Classifier unavailable; manually review')
+        self.assertEqual(t.signal.getitimer(t.signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertIs(t.signal.getsignal(t.signal.SIGALRM), t.signal.SIG_DFL)
+
+    def test_the_classifier_sees_which_payments_each_message_came_after(self):
+        sent = {}
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+        def urlopen(req, timeout):
+            sent.update(json.loads(json.loads(req.data)['messages'][1]['content']))
+            return Response()
+        # A prompt 60 s old and a payment 40 s old both round to "1 min ago"; only exact times
+        # can tell the prompt came first.
+        work = {'live_work': {'open_payments': [{'ref': 'p1', 'sent_at': 2000.0}, {'ref': 'p2', 'sent_at': 900.0},
+                                                {'ref': 'p3'}], 'phone_task': {'running': False}}}
+        items = [self.item(id='before', ts=1980), self.item(id='after', ts=2010), self.item(id='none', ts=None)]
+        with patch.object(t.urllib.request, 'urlopen', side_effect=urlopen), \
+             patch.object(t.json, 'load', return_value={'choices': [{'message': {'content': '{"hits":[]}'}}]}), \
+             patch.object(Path, 'read_text', return_value='key'):
+            t.classify(items, work)
+            self.assertEqual([i['after_payments'] for i in sent['items']], [['p2'], ['p1', 'p2'], []])
+            t.classify(items, {'live_work': {'open_payments': 'unavailable: RuntimeError: busy'}})
+            self.assertEqual([i['after_payments'] for i in sent['items']], [[], [], []])
 
     def test_answered_chats_are_dropped_before_and_after_classifying(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,6 +477,67 @@ class ChatFollowUpTests(unittest.TestCase):
         self.assertIsNone(t.replay_outbox(state, wd, 'third'))
         self.assertNotIn('outbox', t.read_json(wd / 'cursor.json'))
 
+    def test_a_slow_replay_that_clears_its_batch_leaves_collection_to_the_next_run(self):
+        wd = self.home / 'watch'
+        batch = self.home / 'batch.json'
+        hits = [{**self.imsg(1, 1000), 'urgency': 'today', 'sender': 's', 'subject': '', 'preview': 'p', 'reason': 'r'}]
+        t.atomic(batch, {'hits': hits, 'source_errors': {}})
+        args = types.SimpleNamespace(dry_run_hours=None, report=None)
+        for took, collects in ((40.0, False), (1.0, True)):
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': [],
+                                          'outbox': {'run': 'old', 'event': 'e', 'batch': str(batch)}})
+            ticks = [5000.0, 5000.0 + took]
+            def clock():
+                return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+            with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'new'}), \
+                 patch.object(t, 'handled', return_value=({'imsg:1': 'answered'}, {})), \
+                 patch.object(t.time, 'time', side_effect=clock), \
+                 patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                 patch.object(t, 'collect', return_value=({}, {})) as collect, patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+            self.assertEqual(collect.called, collects)
+            self.assertNotIn('outbox', t.read_json(wd / 'cursor.json'))
+        logged = [json.loads(line) for line in (wd / 'diagnostics/runs.jsonl').read_text().splitlines()]
+        self.assertTrue(logged[0]['collect_deferred'])
+
+    def test_follow_up_checks_stop_at_their_deadline_and_keep_the_rest(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db',
+                [(1, 10, MONI, now - 300, 0), (2, 20, BOB, now - 300, 0), (3, 30, ROBOB, now - 300, 0)],
+                {10: [MONI, ROBOB], 20: [BOB], 30: [MONI]})
+        items = [self.imsg(n, now - 300) for n in (1, 2, 3)]
+        # A slow store takes its time per item; past the deadline nothing more is checked or dropped.
+        ticks = iter([0, 0, 100, 100, 100, 100])
+        with patch.object(t.time, 'time', side_effect=lambda: next(ticks, 100)):
+            reasons, errors = t.handled(items, 50)
+        self.assertEqual(reasons, {'imsg:1': 'robob_chat'})
+        self.assertEqual(errors, {'imessage': t.UNCHECKED})
+        wa = [{'id': 'wa:1', 'source': 'whatsapp', 'ts': now, 'chat_jid': 'x@s.whatsapp.net'}]
+        lookups = types.SimpleNamespace(resolve=lambda *_: self.fail('no store read after the deadline'))
+        with patch.object(t, 'load_module', return_value=lookups), \
+             patch.object(t, 'db', return_value=sqlite3.connect(':memory:')), patch.object(t.time, 'time', return_value=100):
+            self.assertEqual(t.answered(wa, 50), (set(), {'whatsapp': t.UNCHECKED}))
+
+    def test_a_run_stops_its_follow_up_checks_in_time_for_the_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': [TriageTests.item(None)]})
+            args = types.SimpleNamespace(dry_run_hours=None, report=None)
+            calls = []
+            def handled(items, deadline=None):
+                calls.append(deadline)
+                return {}, {}
+            with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
+                 patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                 patch.object(t, 'collect', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'handled', side_effect=handled), patch.object(t.time, 'time', return_value=1000.0), \
+                 patch.object(t, 'classify', return_value=([], {})), patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+        self.assertEqual(calls, [1000 + t.EARLY_BY, 1000 + t.LATE_BY])
+        # Slowest case: the last item starts just before LATE_BY and waits out a locked store.
+        self.assertLess(t.LATE_BY + 7 + 3, 60)
+        self.assertLess(t.EARLY_BY, t.CLASSIFY_BY)
+
     def test_candidates_queued_or_waiting_to_wake_are_dropped_once_their_chat_has_robob(self):
         now = 1_800_000_000
         # Robob joined Moni's group after her message was queued; Bob's chat stays without him.
@@ -494,6 +639,207 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(out['candidate_count'], t.MAX_BATCH + 1)
             self.assertEqual([h['id'] for h in out['hits']], [f'wa:{t.MAX_BATCH - 1}', f'wa:{t.MAX_BATCH}'])
             self.assertEqual((out['usage']['input_tokens'], out['usage']['cost_usd']), (2, 1.0))
+
+
+class LiveWorkTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lock = Path(self.tmp.name)
+        patcher = patch.object(t, 'PHONE_LOCK', self.lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def commerce(self, stdout, code=0):
+        return patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(stdout=stdout, stderr='', returncode=code))
+
+    def test_open_payments_and_a_running_phone_task_reach_the_classifier(self):
+        flow = {'flow_id': 'f1', 'app': 'noon', 'vertical': 'supermall', 'state': 'PLACED', 'order_id': None,
+                'amount_minor': 12345, 'sent_seconds_ago': 1140}
+        (self.lock / 'priority-hold').write_text('owner')
+        now = (self.lock / 'priority-hold').stat().st_mtime + 600
+        with self.commerce(json.dumps({'ok': True, 'open': [flow], 'financial_send': False})) as run, \
+             patch.object(t.time, 'time', return_value=5000.0):
+            work = t.live_work(now)
+        self.assertEqual(run.call_args.args[0][1:], ['open-flows', '--minutes', '60'])
+        # sent_at errs late by the second commerce rounds away.
+        self.assertEqual(work, {'open_payments': [{'ref': 'p1', 'app': 'noon', 'vertical': 'supermall', 'state': 'PLACED',
+                                                   'amount_aed': 123.45, 'minutes_ago': 19, 'sent_at': 3861.0}],
+                                'phone_task': {'running': True, 'minutes': 10}})
+        self.assertEqual(t.work_line(work), 'In flight: noon supermall payment AED 123.45 (19 min ago); a phone task has run for 10 min.')
+
+    def test_nothing_in_flight_adds_no_line(self):
+        with self.commerce(json.dumps({'ok': True, 'open': []})):
+            work = t.live_work(1000)
+        self.assertEqual(work, {'open_payments': [], 'phone_task': {'running': False}})
+        self.assertIsNone(t.work_line(work))
+        self.assertEqual(t.event_text('b.json', [], {}, work), 'Inbox triage: 0 candidate(s). Read full batch: b.json')
+
+    def test_an_unreadable_journal_says_so_instead_of_looking_empty(self):
+        cases = [(self.commerce(json.dumps({'ok': False, 'error': 'JOURNAL_BUSY_OR_UNAVAILABLE'}), 1), 'JOURNAL_BUSY_OR_UNAVAILABLE'),
+                 (patch.object(t.subprocess, 'run', side_effect=t.subprocess.TimeoutExpired('commerce', 3)), 'TimeoutExpired'),
+                 (self.commerce('not json', 1), 'JSONDecodeError')]
+        for side, reason in cases:
+            with side:
+                work = t.live_work(1000)
+            self.assertTrue(work['open_payments'].startswith('unavailable: '), work)
+            self.assertIn(reason, work['open_payments'])
+            self.assertIn('check order work before saying a bank prompt is not ours', t.work_line(work))
+
+    def test_the_wake_and_batch_carry_live_work_and_a_replay_keeps_it(self):
+        work = {'open_payments': [{'app': 'talabat', 'vertical': 'mart', 'state': 'PLACED', 'amount_aed': None, 'minutes_ago': 3}],
+                'phone_task': {'running': False}}
+        item = TriageTests.item(None, subject='A payment on your card needs your confirmation')
+        wd = Path(self.tmp.name) / 'watch'
+        t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': []})
+        result = {'icloud': {'cursor': {'validity': 1, 'uid': 2}, 'items': [item], 'drops': {}, 'scanned': 1}}
+        args = types.SimpleNamespace(dry_run_hours=None, report=None)
+        with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'first'}), \
+             patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+             patch.object(t, 'collect', return_value=(result, {})), patch.object(t, 'handled', return_value=({}, {})), \
+             patch.object(t, 'build_context', return_value={'live_work': work}), \
+             patch.object(t, 'classify', return_value=([{'id': item['id'], 'reason': 'ours', 'urgency': 'now'}], {})), \
+             patch('builtins.print') as printed:
+            self.assertEqual(t.run(args), 0)
+        event = printed.call_args.args[0]
+        self.assertIn('In flight: talabat mart payment (3 min ago).', event)
+        state = t.read_json(wd / 'cursor.json')
+        self.assertEqual(t.read_json(Path(state['outbox']['batch']))['live_work'], work)
+        with patch.object(t, 'handled', return_value=({}, {})):
+            self.assertEqual(t.replay_outbox(state, wd, 'second'), event)
+
+
+class SourceHealthTests(unittest.TestCase):
+    def runs(self, errors_per_run, start=10_000, step=300):
+        state, due = {}, []
+        for n, errors in enumerate(errors_per_run):
+            due.append(t.track_health(state, errors, start + n * step))
+        return state, due
+
+    def test_three_failed_runs_in_a_row_are_due_once(self):
+        state, due = self.runs([{'outlook': 'RuntimeError: timeout'}] * 3 + [{'outlook': 'x'}])
+        self.assertEqual(due[:3], [[], [], ['outlook']])
+        self.assertEqual(state['source_health']['outlook']['streak'], 4)
+        # Until it is marked sent it stays due, so a lost alert is retried next run.
+        self.assertEqual(due[3], ['outlook'])
+
+    def test_a_flapping_source_is_due_at_five_failures_in_an_hour(self):
+        ok, bad = {}, {'gmail': 'TimeoutExpired: worker'}
+        state, due = self.runs([bad, ok, bad, ok, bad, ok, bad, ok, bad])
+        self.assertEqual([d for d in due if d], [['gmail']])
+        self.assertEqual(due[-1], ['gmail'])
+        # Spread over more than an hour it never adds up.
+        _, due = self.runs([bad, ok, ok, ok] * 6)
+        self.assertFalse(any(due))
+
+    def test_after_an_alert_it_waits_six_hours_and_a_recovered_source_starts_over(self):
+        state, bad = {}, {'outlook': 'x'}
+        now = 50_000
+        for n in range(3):
+            due = t.track_health(state, bad, now + n * 300)
+        self.assertEqual(due, ['outlook'])
+        state['source_health']['outlook'].update(alerted_at=now + 600, alerts=1)
+        self.assertEqual(t.track_health(state, bad, now + 900), [])
+        self.assertEqual(t.track_health(state, bad, now + 600 + t.HEALTH_REALERT), ['outlook'])
+        # It recovers; once the hour and the quiet period pass its entry goes.
+        later = now + 600 + t.HEALTH_REALERT
+        state['source_health']['outlook']['alerted_at'] = later
+        t.track_health(state, {}, later + 300)
+        self.assertIn('outlook', state['source_health'])
+        t.track_health(state, {}, later + t.HEALTH_REALERT)
+        self.assertNotIn('outlook', state['source_health'])
+
+    def tick(self, state, wd, errors, now):
+        due = t.track_health(state, errors, now)
+        t.health_alert(state, due, now)
+        return t.send_health(state, due, wd, now)
+
+    def test_a_live_run_sends_one_alert_and_retries_exactly_that_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            bad = {'outlook': 'IMAP auth failed', 'gmail': 'timeout'}
+            state, _ = self.runs([bad] * 2)
+            # The first send may have reached the bridge before it timed out.
+            lost = t.subprocess.TimeoutExpired('bun', 4)
+            sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
+            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
+                self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
+                self.assertNotIn('alerted_at', state['source_health']['gmail'])
+                # The next run counts another failure, but resends the same text under the same key.
+                self.assertEqual(self.tick(state, wd, bad, 10_900), {'health_alerts': ['gmail', 'outlook']})
+                self.assertEqual(self.tick(state, wd, bad, 11_200), {})
+            first, second = (c.args[0] for c in run.call_args_list)
+            self.assertEqual(first, second)
+            self.assertEqual(first[2:4], ['notify', '--source'])
+            self.assertEqual(first[first.index('--severity') + 1], 'attention')
+            text = first[first.index('--text') + 1]
+            self.assertIn('- outlook: 3 run(s) in a row, 3 in the last hour. Last error: IMAP auth failed', text)
+            self.assertIn('- gmail:', text)
+            self.assertEqual(state['source_health']['outlook']['alerted_at'], 10_900)
+            self.assertEqual(state['source_health']['outlook']['streak'], 5)
+            self.assertNotIn('health_pending', state)
+            self.assertNotIn('BUN_INSPECT', run.call_args.kwargs['env'])
+
+    def test_a_source_falling_due_during_a_retry_waits_for_its_own_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            state, _ = self.runs([{'outlook': 'x'}] * 2)
+            down = types.SimpleNamespace(returncode=1, stdout='', stderr='bridge down')
+            sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
+            both = {'outlook': 'x', 'gmail': 'y'}
+            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[down, down, sent, sent]) as run:
+                self.assertIn('health_alert_error', self.tick(state, wd, both, 10_600))
+                self.assertIn('health_alert_error', self.tick(state, wd, both, 10_900))
+                # gmail is due now too, but the pending outlook alert goes out unchanged.
+                self.assertEqual(self.tick(state, wd, both, 11_200), {'health_alerts': ['outlook']})
+                self.assertEqual(self.tick(state, wd, both, 11_500), {'health_alerts': ['gmail']})
+                self.assertEqual(self.tick(state, wd, both, 11_800), {})
+            keys = [c.args[0][c.args[0].index('--key') + 1] for c in run.call_args_list]
+            self.assertEqual(len(set(keys[:3])), 1)
+            self.assertNotEqual(keys[2], keys[3])
+            self.assertNotIn('gmail', run.call_args_list[2].args[0][run.call_args_list[2].args[0].index('--text') + 1])
+
+    def test_an_alert_the_bridge_never_takes_is_dropped_after_six_hours(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            state, _ = self.runs([{'outlook': 'x'}] * 2)
+            down = types.SimpleNamespace(returncode=1, stdout='', stderr='409')
+            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=down) as run:
+                self.tick(state, wd, {'outlook': 'x'}, 10_600)
+                first = state['health_pending']['key']
+                self.tick(state, wd, {'outlook': 'x'}, 10_600 + t.HEALTH_REALERT)
+            self.assertNotEqual(state['health_pending']['key'], first)
+            self.assertEqual(run.call_count, 2)
+
+    def test_scratch_runs_never_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _ = self.runs([{'outlook': 'x'}] * 2)
+            with patch.object(t.subprocess, 'run') as run:
+                self.assertEqual(self.tick(state, Path(tmp), {'outlook': 'x'}, 20_000), {'health_alerts_skipped': ['outlook']})
+            run.assert_not_called()
+
+    def test_runs_that_wake_on_other_sources_still_count_the_failing_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': []})
+            args = types.SimpleNamespace(dry_run_hours=None, report=None)
+            for n in range(3):
+                item = TriageTests.item(None, id=f'mail:a:1:{n}')
+                result = {'icloud': {'cursor': {'validity': 1, 'uid': n}, 'items': [item], 'drops': {}, 'scanned': 1}}
+                with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': f'run-{n}'}), \
+                     patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                     patch.object(t, 'collect', return_value=(result, {'outlook': 'RuntimeError: timeout'})), \
+                     patch.object(t, 'handled', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                     patch.object(t, 'classify', return_value=([{'id': item['id'], 'reason': 'r', 'urgency': 'today'}], {})), \
+                     patch('builtins.print'):
+                    self.assertEqual(t.run(args), 0)
+                t.atomic(wd / '.run-ok', {})
+                state = t.read_json(wd / 'cursor.json')
+                state.pop('outbox', None)
+                t.atomic(wd / 'cursor.json', state)
+            logs = [json.loads(line) for line in (wd / 'diagnostics/runs.jsonl').read_text().splitlines()]
+            self.assertEqual([log.get('health_alerts_skipped') for log in logs], [None, None, ['outlook']])
+            self.assertEqual(t.read_json(wd / 'cursor.json')['source_health']['outlook']['streak'], 3)
 
 
 if __name__ == '__main__':
