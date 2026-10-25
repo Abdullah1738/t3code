@@ -7,6 +7,7 @@ import {
   chainHeads,
   isBlocked,
   openDependencies,
+  reviewRoundsView,
   workBoard,
   workFacts,
   workFactsLine,
@@ -133,5 +134,50 @@ describe("work facts", () => {
     expect(workFactsLine(byId.get("CRP-13361")!)).toBeNull();
     expect(workFacts(byId.get("CRP-13298")!)[0]).toMatch(/^merged /);
     expect(workFacts(byId.get("CRP-13361")!)).toEqual([]);
+  });
+});
+
+describe("review rounds", () => {
+  const withRounds = (
+    rounds: ReadonlyArray<[verdict: "clear" | "findings", findings: number, severe: number]>,
+  ) => ({
+    ...fixtureItems()[0]!,
+    reviewRounds: rounds.map(([verdict, findings, severe], index) => ({
+      round: index + 1,
+      verdict,
+      findings,
+      severe,
+      headSha: null,
+      reviewer: "Sol",
+      at: FIXTURE_NOW,
+    })),
+  });
+
+  it("counts an item's rounds and flags the ones past the budget", () => {
+    expect(reviewRoundsView(fixtureItems()[0]!)).toBeNull();
+    expect(reviewRoundsView(withRounds([["findings", 2, 1]]))).toEqual({
+      label: "1 round",
+      detail: "Round 1: 2 findings, 1 P0/P1",
+      over: false,
+    });
+    expect(
+      reviewRoundsView(
+        withRounds([
+          ["findings", 2, 1],
+          ["findings", 1, 0],
+          ["clear", 0, 0],
+        ]),
+      ),
+    ).toEqual({ label: "3 rounds", detail: "Round 3 clear", over: false });
+    expect(
+      reviewRoundsView(
+        withRounds([
+          ["findings", 2, 1],
+          ["findings", 1, 1],
+          ["findings", 3, 1],
+          ["findings", 1, 0],
+        ]),
+      ),
+    ).toEqual({ label: "4 rounds", detail: "Round 4: 1 finding", over: true });
   });
 });

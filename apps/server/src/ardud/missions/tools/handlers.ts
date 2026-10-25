@@ -15,6 +15,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import { keepWorkItemHolds, laneHoldConflict } from "../asks/holds.ts";
+import type { Standing } from "../asks/standing.ts";
 import * as MasterControls from "../core/MasterControls.ts";
 import { nudgeLane } from "../core/nudge.ts";
 import * as RuleService from "../core/RuleService.ts";
@@ -95,6 +96,27 @@ const asMaster = <A>(
       }
       const missions = yield* MissionService.MissionService;
       return yield* run(missions, asks, standing.caller.provenance);
+    }),
+  );
+
+/**
+ * Lane-owned writes: core checks the caller leads the record's lane (or is
+ * the master). The write is recorded under the caller's resolved role.
+ */
+const asMember = <A>(
+  missionId: MissionId,
+  run: (
+    missions: MissionService.MissionService["Service"],
+    asks: AsksService.AsksService["Service"],
+    provenance: MissionProvenance,
+    standing: Standing,
+  ) => Effect.Effect<A, MissionError>,
+) =>
+  withCaller((asks, provenance) =>
+    Effect.gen(function* () {
+      const standing = yield* asks.standing(missionId, provenance);
+      const missions = yield* MissionService.MissionService;
+      return yield* run(missions, asks, standing.caller.provenance, standing);
     }),
   );
 
@@ -456,6 +478,28 @@ const handlers = {
       actingFor,
       "Only the owner or a mission's master sets the portfolio order.",
       (missions, provenance) => missions.setPortfolioOrder(provenance, { order }),
+    ),
+  ),
+  mission_review_round: McpToolAccess.actsAsCaller((input) =>
+    asMember(input.missionId, (missions, _asks, provenance) =>
+      missions.recordReviewRound(provenance, input),
+    ),
+  ),
+  mission_lane_status: McpToolAccess.actsAsCaller((input) =>
+    asMember(input.missionId, (missions, asks, provenance, standing) =>
+      Effect.gen(function* () {
+        const own = standing.lanes.filter((lane) => lane.status !== "retired");
+        const laneId = input.laneId ?? (own.length === 1 ? own[0]?.id : undefined);
+        const conflict = laneHoldConflict(
+          laneId,
+          { status: input.status, statusReason: input.reason },
+          yield* openAsks(asks, input.missionId),
+        );
+        if (conflict !== null) {
+          return yield* new MissionError({ code: "conflict", detail: conflict });
+        }
+        return yield* missions.setOwnLaneStatus(provenance, input);
+      }),
     ),
   ),
   mission_lane_nudge: McpToolAccess.actsAsCaller(({ missionId, laneId, note }) =>

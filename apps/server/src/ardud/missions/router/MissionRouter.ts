@@ -70,6 +70,8 @@ import {
   actorsOfThread,
   broadcastAudience,
   heldBy,
+  isParkedActor,
+  isParkedThread,
   itemWatchers,
   labelOf,
   leadTiersOf,
@@ -521,6 +523,53 @@ const make = Effect.gen(function* () {
   const loadCast = (missionId: MissionId): Effect.Effect<RouterCast, MissionError> =>
     readCast(store, missionId);
 
+  /**
+   * Subscribers an unaddressed control from this author neither wakes nor
+   * waits on: parked lanes, unless the owner speaks. Receipts read the lanes
+   * as they are now, like they read the room's subscriptions.
+   */
+  const unwokenBy = (cast: RouterCast, author: MissionActor) =>
+    author._tag === "owner" ? undefined : (actor: MissionActor) => isParkedActor(cast, actor);
+
+  /**
+   * The unread deliveries that may still wake a thread. Where the thread's
+   * lanes are parked it wakes only for messages that name it or come from the
+   * owner; ambient traffic that reached it before it parked, a filled-in
+   * broadcast audience included, waits until the lane works again.
+   */
+  const wakingDeliveries = Effect.fn("MissionRouter.wakingDeliveries")(function* (
+    threadId: ThreadId,
+    rows: ReadonlyArray<DeliveryRow>,
+  ) {
+    const casts = new Map<MissionId, RouterCast | null>();
+    const out: DeliveryRow[] = [];
+    for (const row of rows) {
+      if (!casts.has(row.missionId)) {
+        casts.set(
+          row.missionId,
+          yield* loadCast(row.missionId).pipe(
+            Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
+          ),
+        );
+      }
+      const cast = casts.get(row.missionId) ?? null;
+      if (cast === null || !isParkedThread(cast, threadId)) {
+        out.push(row);
+        continue;
+      }
+      const message = yield* rooms.messageById(row.messageId);
+      if (
+        message !== null &&
+        (message.author._tag === "owner" ||
+          (message.broadcast !== true &&
+            message.to.some((actor) => threadsOfActor(cast, actor).includes(threadId))))
+      ) {
+        out.push(row);
+      }
+    }
+    return out;
+  });
+
   const loadRoom = (roomId: RoomId) =>
     Effect.gen(function* () {
       const room = yield* rooms.room(roomId);
@@ -860,20 +909,20 @@ const make = Effect.gen(function* () {
           if (masterRole === null) return yield* fail("not-found", "This mission has no master.");
           to = [{ _tag: "role", roleId: masterRole.id }];
         }
-        if (
+        const broadcast =
           to.length === 0 &&
           input.kind === "control" &&
-          !subscriptions.some((sub) => sub.mode !== "mute")
-        ) {
-          to = broadcastAudience(cast);
-        }
+          !subscriptions.some((sub) => sub.mode !== "mute");
+        if (broadcast) to = broadcastAudience(cast, { fromOwner: author._tag === "owner" });
         const seq = (yield* rooms.lastMessageSeq(input.missionId)) + 1;
         const at = yield* nowIso;
-        const shaped = { kind: input.kind, to: [...to], author };
-        const recipients = receiptRecipients(shaped, subscriptions).map((actor) => ({
-          actor,
-          label: labelOf(cast, actor),
-        }));
+        const shaped = { kind: input.kind, to: [...to], author, broadcast };
+        const recipients = receiptRecipients(shaped, subscriptions, unwokenBy(cast, author)).map(
+          (actor) => ({
+            actor,
+            label: labelOf(cast, actor),
+          }),
+        );
         const message: MissionMessage = {
           id: MissionMessageId.make(`${input.missionId}:msg:${seq}`),
           missionId: input.missionId,
@@ -890,6 +939,7 @@ const make = Effect.gen(function* () {
           links: [...(input.links ?? [])],
           receipt: input.kind === "control" ? receiptFor(seq, recipients, () => 0) : null,
           isCorrection,
+          ...(broadcast ? { broadcast } : {}),
           createdAt: at,
           ...(coord === undefined ? {} : { coord }),
         };
@@ -953,8 +1003,9 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Threads a message wakes. The master's thread wakes only for what is
-   * addressed to it or comes from the owner; the author never wakes itself.
+   * Threads a message wakes. The master's thread, and a thread whose lanes
+   * are all parked, wake only for what is addressed to them or comes from
+   * the owner; the author never wakes itself.
    * Only the mission's own members get a delivery, so a stale subscription
    * or a thread that has left cannot carry a message out of the mission.
    */
@@ -977,7 +1028,13 @@ const make = Effect.gen(function* () {
         const addressed = message.to.some((each) => sameActor(each, actor));
         for (const threadId of threadsOfActor(cast, actor)) {
           if (threadId === authorThread || out.has(threadId)) continue;
-          if (masters.has(threadId) && !fromOwner && !addressed) continue;
+          if (
+            !fromOwner &&
+            !addressed &&
+            (masters.has(threadId) || isParkedThread(cast, threadId))
+          ) {
+            continue;
+          }
           const member = yield* membershipIn(within(cast), threadId).pipe(
             Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
           );
@@ -1096,7 +1153,9 @@ const make = Effect.gen(function* () {
       const receiptsTo = new Map(
         page.messages.map((message) => [
           message.id,
-          message.kind === "control" ? receiptRecipients(message, subscriptions) : [],
+          message.kind === "control"
+            ? receiptRecipients(message, subscriptions, unwokenBy(cast, message.author))
+            : [],
         ]),
       );
       const { names, members } = yield* whoIsIn(cast, room.id, subscriptions, [
@@ -2057,7 +2116,7 @@ const make = Effect.gen(function* () {
         heldPokes.add(threadId);
         return;
       }
-      const unread = yield* rooms.unreadDeliveries(threadId);
+      const unread = yield* wakingDeliveries(threadId, yield* rooms.unreadDeliveries(threadId));
       if (unread.length === 0) return;
       let bell = yield* rooms.doorbell(threadId);
       const facts = yield* threads.facts(threadId);
@@ -2528,7 +2587,10 @@ const make = Effect.gen(function* () {
       byThread.set(delivery.threadId, list);
     }
     let reminded = 0;
-    for (const [threadId, rows] of byThread) {
+    for (const [threadId, all] of byThread) {
+      // A parked lane is reminded only of what names it or came from the owner.
+      const rows = yield* wakingDeliveries(threadId, all);
+      if (rows.length === 0) continue;
       const sent = yield* bellLock
         .withPermit(remindThread(threadId, rows, ago(REMIND_GAP_MS)))
         .pipe(

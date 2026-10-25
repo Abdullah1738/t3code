@@ -40,6 +40,7 @@ import { makeApprovalWrites } from "./approvals.ts";
 import { makeAttachmentWrites } from "./attachments.ts";
 import { makeCallWrites } from "./calls.ts";
 import { makePortfolioWrites } from "./portfolio.ts";
+import { makeReviewRoundWrites } from "./reviewRounds.ts";
 import { attachTargets } from "./attachTargets.ts";
 import { ownerConditions } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
@@ -660,6 +661,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       ...makeApprovalWrites(kit),
       ...makeCallWrites(kit),
       ...makePortfolioWrites(kit),
+      ...makeReviewRoundWrites(kit),
       // ardud missions: crw-threads
       ...makeAttachmentWrites(kit, targets),
     };

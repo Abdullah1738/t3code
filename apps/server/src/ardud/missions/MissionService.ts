@@ -41,6 +41,8 @@ import {
   type UpsertMilestoneInput,
   type UpsertSubMissionInput,
   type UpsertWorkItemInput,
+  type RecordReviewRoundInput,
+  type SetOwnLaneStatusInput,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -216,6 +218,10 @@ export class MissionService extends Context.Service<
     readonly upsertMilestone: Write<UpsertMilestoneInput>;
     readonly upsertLane: Write<UpsertLaneInput>;
     readonly upsertWorkItem: Write<UpsertWorkItemInput>;
+    /** A lane lead (or the master) records the next review round on a work item. */
+    readonly recordReviewRound: Write<RecordReviewRoundInput>;
+    /** A lane lead parks its own lane when its queue is empty, or puts it back to work. */
+    readonly setOwnLaneStatus: Write<SetOwnLaneStatusInput>;
     readonly markSeen: Write<MarkMissionSeenInput>;
     readonly splitLane: Write<SplitLaneInput>;
     readonly mergeLanes: Write<MergeLanesInput>;

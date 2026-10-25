@@ -674,6 +674,11 @@ export const MissionMessage = Schema.Struct({
   receipt: Schema.NullOr(BroadcastReceipt),
   /** Owner post marked "correct the master": the scribe offers it as a rule. */
   isCorrection: Schema.Boolean,
+  /**
+   * Set when `to` is the audience the router filled in for an unaddressed
+   * control, not actors its author named. A parked lane in it is not addressed.
+   */
+  broadcast: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
   // --- coord additions ---
   /** Set when the message mirrors a coord event (import or forward shim). */
@@ -1799,6 +1804,27 @@ export const WorkItemDeferral = Schema.Struct({
 export type WorkItemDeferral = typeof WorkItemDeferral.Type;
 // --- end coord additions ---
 
+/**
+ * One review round a lane ran on a work item that has no PR review records
+ * (lanes that push straight to a branch). Three rounds is the budget; after
+ * that only P0/P1 findings justify another round.
+ */
+export const WorkItemReviewRound = Schema.Struct({
+  round: PositiveInt,
+  verdict: Schema.Literals(["clear", "findings"]),
+  findings: NonNegativeInt,
+  /** P0/P1 findings: wrong behaviour, data loss, security, money paths. */
+  severe: NonNegativeInt,
+  headSha: Schema.NullOr(Schema.String),
+  /** The reviewer model or role, e.g. `opus/cx/gpt-6.1-sol`. */
+  reviewer: TrimmedNonEmptyString,
+  at: IsoDateTime,
+});
+export type WorkItemReviewRound = typeof WorkItemReviewRound.Type;
+
+/** Review rounds a work item gets before the master hears about it. */
+export const WORK_ITEM_REVIEW_BUDGET = 3;
+
 /** Done is three facts: merged at the exact head, deployed and read back, behaviour exercised. */
 export const WorkItem = Schema.Struct({
   id: WorkItemId,
@@ -1833,6 +1859,8 @@ export const WorkItem = Schema.Struct({
   /** Generative views: the card template that draws it and its field values. */
   view: Schema.optional(RecordView),
   // --- end asks additions ---
+  /** Rounds recorded with `mission_review_round`, oldest first. */
+  reviewRounds: Schema.optional(Schema.Array(WorkItemReviewRound)),
 });
 export type WorkItem = typeof WorkItem.Type;
 
@@ -1921,6 +1949,7 @@ export const MissionEventKind = Schema.Literals([
   "lane.updated",
   "work-item.created",
   "work-item.updated",
+  "work-item.reviewed",
   "role.created",
   "role.model-changed",
   "role.bound",
@@ -3239,6 +3268,35 @@ export const UpsertWorkItemInput = Schema.Struct({
   // --- end asks additions ---
 });
 export type UpsertWorkItemInput = typeof UpsertWorkItemInput.Type;
+
+/**
+ * The item's lane lead (or the master) records the next review round. The
+ * same round with the same result again is a no-op.
+ */
+export const RecordReviewRoundInput = Schema.Struct({
+  missionId: MissionId,
+  workItemId: WorkItemId,
+  round: PositiveInt,
+  verdict: WorkItemReviewRound.fields.verdict,
+  findings: NonNegativeInt,
+  severe: NonNegativeInt,
+  headSha: Schema.optional(Schema.NullOr(Schema.String)),
+  reviewer: TrimmedNonEmptyString,
+});
+export type RecordReviewRoundInput = typeof RecordReviewRoundInput.Type;
+
+/**
+ * A lane lead parks its own lane when its queue is empty, or puts it back to
+ * work. A parked lane wakes only for messages addressed to it.
+ */
+export const SetOwnLaneStatusInput = Schema.Struct({
+  missionId: MissionId,
+  /** Needed only when the caller leads more than one lane. */
+  laneId: Schema.optional(LaneId),
+  status: Schema.Literals(["parked", "working"]),
+  reason: Schema.optional(Schema.NullOr(Schema.String)),
+});
+export type SetOwnLaneStatusInput = typeof SetOwnLaneStatusInput.Type;
 
 /** What a mutation committed: its timeline seq and the record it wrote. */
 export const MissionMutationResult = Schema.Struct({

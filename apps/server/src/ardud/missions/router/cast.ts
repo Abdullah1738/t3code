@@ -202,13 +202,37 @@ export const itemWatchers = (
 };
 
 /**
- * Who a broadcast control reaches when the room has no subscribers and it
- * names nobody: every lane with a thread and every non-master bound role.
+ * A thread whose lanes in this mission are all parked. It wakes only for
+ * messages that name it or come from the owner: a lane parks when its queue
+ * is empty, and broadcasts, subscriptions and reminders would only burn turns.
  */
-export const broadcastAudience = (cast: RouterCast): ReadonlyArray<MissionActor> => {
+export const isParkedThread = (cast: RouterCast, threadId: ThreadId): boolean => {
+  if (masterThreadsOf(cast).includes(threadId)) return false;
+  const lanes = cast.lanes.filter(
+    (lane) => lane.threadId === threadId && lane.status !== "retired",
+  );
+  return lanes.length > 0 && lanes.every((lane) => lane.status === "parked");
+};
+
+/** An actor whose threads are all parked lanes: ambient broadcasts neither wake it nor wait on its read. */
+export const isParkedActor = (cast: RouterCast, actor: MissionActor): boolean => {
+  const threads = threadsOfActor(cast, actor);
+  return threads.length > 0 && threads.every((threadId) => isParkedThread(cast, threadId));
+};
+
+/**
+ * Who a broadcast control reaches when the room has no subscribers and it
+ * names nobody: every lane with a thread, and every non-master bound role
+ * that doesn't run a lane. Parked lanes only hear the owner's broadcasts.
+ */
+export const broadcastAudience = (
+  cast: RouterCast,
+  options: { readonly fromOwner: boolean },
+): ReadonlyArray<MissionActor> => {
   const master = masterRoleOf(cast);
-  const lanes = cast.lanes.filter((lane) => lane.threadId !== null && lane.status !== "retired");
-  const laneThreads = new Set(lanes.map((lane) => lane.threadId));
+  const live = cast.lanes.filter((lane) => lane.threadId !== null && lane.status !== "retired");
+  const laneThreads = new Set(live.map((lane) => lane.threadId));
+  const lanes = options.fromOwner ? live : live.filter((lane) => lane.status !== "parked");
   // One recipient per thread, so a receipt counts threads, not titles.
   return [
     ...lanes.map((lane): MissionActor => ({ _tag: "lane", laneId: lane.id })),

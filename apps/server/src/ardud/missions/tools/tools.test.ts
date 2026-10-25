@@ -945,6 +945,112 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("lets a lane count its own review rounds, one after another", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const lane = threadCaller(laneThread);
+      const round = (round: number, extra: Record<string, unknown> = {}) => ({
+        missionId,
+        workItemId: "wi-free",
+        round,
+        verdict: "findings",
+        findings: 2,
+        severe: 1,
+        headSha: "abc123",
+        reviewer: "Sol",
+        ...extra,
+      });
+
+      const first = yield* call("mission_review_round", lane, round(1));
+      expect(first.isError, first.text).toBe(false);
+      const [event] = yield* store.recentEvents(missionId, 1);
+      expect(event?.kind).toBe("work-item.reviewed");
+      expect(event?.payload).toMatchObject({ round: 1, severe: 1, previousSevere: null });
+
+      // A retry of the same round is a no-op; a different round 1 or a skipped round is refused.
+      const retry = yield* call("mission_review_round", lane, round(1));
+      expect(retry.isError, retry.text).toBe(false);
+      expect((yield* store.recentEvents(missionId, 1))[0]?.id).toBe(event?.id);
+      const rewritten = yield* call("mission_review_round", lane, round(1, { findings: 5 }));
+      expect(rewritten.text).toContain("record round 2 next");
+      const skipped = yield* call("mission_review_round", lane, round(3));
+      expect(skipped.text).toContain("the next is round 2");
+      const clearWithSevere = yield* call(
+        "mission_review_round",
+        lane,
+        round(2, { verdict: "clear" }),
+      );
+      expect(clearWithSevere.text).toContain("no P0/P1");
+
+      // Only the item's lane lead or the master counts its rounds.
+      const writer = yield* call("mission_review_round", threadCaller(writerThread), round(2));
+      expect(writer.text).toContain("forbidden");
+      const master = yield* call(
+        "mission_review_round",
+        threadCaller(masterThread),
+        round(2, { verdict: "clear", findings: 0, severe: 0, headSha: null }),
+      );
+      expect(master.isError, master.text).toBe(false);
+      const item = Option.getOrThrow(yield* store.get("work-item", WorkItemId.make("wi-free")));
+      expect(item.reviewRounds?.map((each) => [each.round, each.verdict, each.severe])).toEqual([
+        [1, "findings", 1],
+        [2, "clear", 0],
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("lets a lane park itself when its queue is empty and pick work up again", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const lane = threadCaller(laneThread);
+      const laneRecord = () =>
+        store.get("lane", "lane-api" as never).pipe(Effect.map(Option.getOrThrow));
+
+      const parked = yield* call("mission_lane_status", lane, {
+        missionId,
+        status: "parked",
+        reason: "Queue empty",
+      });
+      expect(parked.isError, parked.text).toBe(false);
+      expect((yield* store.recentEvents(missionId, 1))[0]?.kind).toBe("lane.parked");
+      expect(yield* laneRecord()).toMatchObject({ status: "parked", statusReason: "Queue empty" });
+      const again = yield* call("mission_lane_status", lane, {
+        missionId,
+        status: "parked",
+        reason: "Queue empty",
+      });
+      expect(again.isError, again.text).toBe(false);
+
+      // Threads that lead no lane can't park one.
+      const writer = yield* call("mission_lane_status", threadCaller(writerThread), {
+        missionId,
+        status: "parked",
+      });
+      expect(writer.text).toContain("leads no lane");
+      const named = yield* call("mission_lane_status", threadCaller(writerThread), {
+        missionId,
+        laneId: "lane-api",
+        status: "working",
+      });
+      expect(named.text).toContain("forbidden");
+
+      const resumed = yield* call("mission_lane_status", lane, { missionId, status: "working" });
+      expect(resumed.isError, resumed.text).toBe(false);
+      expect((yield* store.recentEvents(missionId, 1))[0]?.kind).toBe("lane.resumed");
+      expect(yield* laneRecord()).toMatchObject({ status: "working", statusReason: null });
+
+      // An open ask holding the lane keeps it waiting; parking is still allowed.
+      yield* call("mission_ask", threadCaller(masterThread), askInput("Online or offline?"));
+      yield* call("mission_lane_status", lane, { missionId, status: "parked" });
+      const held = yield* call("mission_lane_status", lane, { missionId, status: "working" });
+      expect(held.text).toContain("waiting on ask");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("builds a watch check for a mission", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {
