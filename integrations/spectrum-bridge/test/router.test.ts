@@ -10,7 +10,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped, wakeGuidance } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import type { SttInput } from "../src/stt.ts";
 
@@ -1407,6 +1407,26 @@ test("a watcher wake runs as its own turn and its reply is not a quoted reply", 
   expect(forwarded.text).toBe("Nik says he is ordering today");
   expect("replyTo" in forwarded).toBe(false);
   expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi", "[Watcher event from watch, not typed by the owner.]\nNik replied", "Also this"]);
+  // Only the wake gets the short guidance; typed turns on either side keep the full text.
+  const [typed, woken, after] = h.backend.prompts.map(p => p.system!);
+  expect(typed!.startsWith(`${imessageGuidance()}\n`)).toBe(true);
+  expect(after!.startsWith(`${imessageGuidance()}\n`)).toBe(true);
+  expect(woken!.startsWith(`${wakeGuidance()}\n`)).toBe(true);
+  expect(woken!.length).toBeLessThan(typed!.length / 2);
+  for (const rule of ["reply only if the owner needs to know or act now", "~/Documents/assistant/activity-log.md", "end your reply with exactly NO_REPLY",
+    "Never use the question tool", "never retry a charge you are unsure about", "Never mention sessions", "send-file --file PATH", "CURRENT_SESSION_ID for bridge commands"]) {
+    expect(woken).toContain(rule);
+  }
+});
+
+test("a configured imessage prompt also replaces the wake guidance", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "spectrum-router-config-"));
+  directories.push(configRoot);
+  writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "prompt": "Custom texting guidance: KEEP IT SHORT." } }`);
+  const h = setup(":memory:", { openCodeConfigRoot: configRoot });
+  h.input(`wake:${"d".repeat(64)}`, "[Watcher event from watch, not typed by the owner.]\nNik replied");
+  await h.router.tick();
+  expect(h.backend.prompts[0]!.system!.startsWith("Custom texting guidance: KEEP IT SHORT.\n")).toBe(true);
 });
 
 test("a watcher turn that ends without text closes quietly", async () => {

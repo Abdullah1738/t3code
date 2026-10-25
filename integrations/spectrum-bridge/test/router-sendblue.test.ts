@@ -178,6 +178,18 @@ test("only the owner's prompt sends Robob fixes to the mission as his request", 
   for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [])).not.toContain("mission request");
 });
 
+test("a wake's chat prompt drops what only typed messages need and keeps who reads it", () => {
+  const owner = sendblueContextPrompt(context("owner"), false, [], true);
+  for (const line of ["Files:", "Polls are not available", "mission request open robob", "guest-allow --address"]) expect(owner).not.toContain(line);
+  for (const line of ["send --to <slug>", "wake --chat <slug>", "location --session", "publish --app SLUG", "the `mission` CLI", "never answered by you directly"]) expect(owner).toContain(line);
+  expect(owner.length).toBeLessThan(sendblueContextPrompt(context("owner"), false, []).length / 2);
+  const moni = sendblueContextPrompt(context("dm"), false, ["+971585933213"], true);
+  expect(moni).toContain("Moni (admin)");
+  expect(moni).toContain("including your reply after a watcher event");
+  expect(moni).not.toContain("the `mission` CLI");
+  expect(sendblueContextPrompt(context("group"), false, [], true)).toContain("silent observer");
+});
+
 test("every chat's prompt says which link kind to create and to fill preview metadata", () => {
   for (const kind of ["owner", "dm", "group"] as const) {
     const prompt = sendblueContextPrompt(context(kind), false, []);
