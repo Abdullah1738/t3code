@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>{{OG_TITLE}}</title>
+<meta property="og:title" content="{{OG_TITLE}}">
+<meta property="og:description" content="{{OG_DESC}}">
+<meta property="og:image" content="preview.png?v={{V}}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+:root{
+  --wall:#efeae2;
+  --bar:#f0f2f5;
+  --bar-ink:#111b21;
+  --sub:#54656f;
+  --in:#ffffff;
+  --in-ink:#111b21;
+  --out:#d9fdd3;
+  --out-ink:#111b21;
+  --tick:#53bdeb;
+  --day:#ffffffcc;
+  --day-ink:#54656f;
+  --tr:#54656f;
+  --tr-line:#8696a0;
+  --accent:#00a884;
+  --avatar:#00a884;
+  --sep:#d1d7db;
+  --shadow:0 1px .5px rgba(11,20,26,.13);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --wall:#0b141a;
+    --bar:#202c33;
+    --bar-ink:#e9edef;
+    --sub:#8696a0;
+    --in:#202c33;
+    --in-ink:#e9edef;
+    --out:#005c4b;
+    --out-ink:#e9edef;
+    --tick:#53bdeb;
+    --day:#182229cc;
+    --day-ink:#8696a0;
+    --tr:#aebac1;
+    --tr-line:#8696a0;
+    --accent:#00a884;
+    --avatar:#2a7d6b;
+    --sep:#222d34;
+    --shadow:0 1px .5px rgba(0,0,0,.4);
+  }
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  font:16px/1.35 -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
+  color:var(--in-ink);background:var(--wall);
+  -webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%;
+  display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top);
+  padding-left:env(safe-area-inset-left);
+  padding-right:env(safe-area-inset-right);
+}
+/* header */
+.bar{
+  flex:none;display:flex;align-items:center;gap:12px;
+  padding:10px 16px;background:var(--bar);
+  border-bottom:.5px solid var(--sep);
+  position:sticky;top:0;z-index:2;
+}
+.av{
+  width:40px;height:40px;border-radius:50%;flex:none;
+  background:var(--avatar);color:#fff;font-weight:650;font-size:18px;
+  display:flex;align-items:center;justify-content:center;letter-spacing:-.01em;
+}
+.who{min-width:0;flex:1}
+.who .nm{margin:0;font-size:18px;font-weight:600;color:var(--bar-ink);line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.who .sub{font-size:13px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.live{
+  flex:none;font-size:12px;color:var(--sub);text-align:right;line-height:1.25;
+}
+.live i{font-style:normal;display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:5px;vertical-align:1px}
+.live.stale i{background:#e9a23b}
+/* thread */
+.wallpaper{
+  flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;
+  background-color:var(--wall);
+  padding:12px 10px calc(16px + env(safe-area-inset-bottom));
+  scroll-behavior:auto;
+}
+.day{
+  display:flex;justify-content:center;margin:14px 0 10px;
+}
+.day span{
+  background:var(--day);color:var(--day-ink);font-size:12.5px;font-weight:500;
+  padding:5px 12px;border-radius:8px;box-shadow:var(--shadow);
+}
+.row{display:flex;margin:2px 0}
+.row.out{justify-content:flex-end}
+.row.in{justify-content:flex-start}
+.row + .row{margin-top:2px}
+.row.gap{margin-top:10px}
+.bub{
+  position:relative;max-width:82%;min-width:0;
+  padding:6px 9px 5px;border-radius:9px;
+  box-shadow:var(--shadow);
+  word-wrap:break-word;overflow-wrap:anywhere;
+}
+.row.in .bub{background:var(--in);color:var(--in-ink);border-top-left-radius:2px}
+.row.out .bub{background:var(--out);color:var(--out-ink);border-top-right-radius:2px}
+.row.in.tail .bub::before,.row.out.tail .bub::before{
+  content:"";position:absolute;top:0;width:8px;height:13px;
+}
+.row.in.tail .bub::before{left:-7px;background:var(--in);clip-path:polygon(0 0,100% 0,100% 100%)}
+.row.out.tail .bub::before{right:-7px;background:var(--out);clip-path:polygon(0 0,100% 0,0 100%)}
+.who-line{
+  font-size:12.5px;font-weight:600;margin:0 0 2px;color:#06846c;
+}
+.row.out .who-line{color:#00705b;text-align:right}
+@media (prefers-color-scheme: dark){ .who-line{color:#53bdeb} }
+.text{font-size:15.5px;line-height:1.38;white-space:pre-wrap}
+.meta{
+  float:right;display:flex;align-items:center;gap:3px;margin:6px 0 -2px 10px;
+  font-size:11px;color:var(--sub);line-height:1;transform:translateY(2px);
+}
+.tick{color:var(--tick);width:16px;height:11px;margin-left:2px;flex:none}
+.tick.single{color:var(--sub)}
+/* image bubble */
+.pic{
+  display:block;position:relative;width:min(248px,70vw);aspect-ratio:4/3;
+  border-radius:7px;overflow:hidden;background:#c9d1d9;padding:0;border:0;cursor:zoom-in;
+  -webkit-tap-highlight-color:transparent;
+}
+.pic img{width:100%;height:100%;object-fit:cover;object-position:top center;display:block;transition:transform .2s}
+.pic:active img{transform:scale(1.02)}
+.pic::after{
+  content:"Tap to view";position:absolute;right:6px;bottom:6px;
+  font-size:11px;font-weight:600;color:#fff;background:rgba(0,0,0,.45);
+  padding:3px 7px;border-radius:999px;
+}
+.cap{font-size:14.5px;margin:6px 2px 0;line-height:1.35}
+.tr{
+  margin:6px 2px 2px;padding:4px 0 0 9px;border-left:2px solid var(--tr-line);
+  color:var(--tr);font-style:italic;font-size:13.5px;line-height:1.35;
+}
+.tr b{font-style:normal;font-weight:600;font-size:11px;letter-spacing:.02em;opacity:.8;text-transform:none}
+.tr.pending{opacity:.7}
+.pendingtag{font-size:11.5px;color:var(--sub);margin:4px 2px 0}
+.other{font-size:14px;color:var(--sub);font-style:italic}
+/* lightbox */
+.lb{
+  position:fixed;inset:0;z-index:50;display:none;background:rgba(0,0,0,.94);
+  flex-direction:column;
+  padding:calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 12px);
+}
+.lb.on{display:flex}
+.lb .top{display:flex;align-items:center;justify-content:space-between;color:#fff;font-size:14px;flex:none;padding:4px 4px 10px}
+.lb .x{
+  background:rgba(255,255,255,.14);border:0;color:#fff;font-size:16px;font-weight:600;
+  padding:8px 14px;border-radius:999px;cursor:pointer;
+}
+.lb .scroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;border-radius:12px}
+.lb img{display:block;width:100%;height:auto;border-radius:12px}
+/* footer */
+.foot{
+  flex:none;text-align:center;font-size:12px;color:var(--sub);
+  padding:4px 12px calc(10px + env(safe-area-inset-bottom));
+  background:var(--wall);
+}
+.empty{text-align:center;color:var(--sub);padding:40px 0;font-size:14px}
+.err{
+  margin:8px auto;max-width:300px;text-align:center;color:#c0392b;font-size:12.5px;
+}
+@media (max-width:340px){
+  .live .lbl{display:none}
+  .who .sub{font-size:12px}
+  .av{width:36px;height:36px;font-size:16px}
+}
+/* In the Messages bubble the app icon sits over the top-left corner: the header starts past it. */
+/* The bubble can't scroll: it shows the newest messages, long ones at 3 lines, smaller photos, and
+   the script hides any line of text the header would cut in half (a photo may peek in under it). */
+@media (max-height:480px) and (max-width:480px){
+  .bar{padding-left:44px}
+  .text,.tr{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+  .cap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pic{width:min(200px,64vw);aspect-ratio:16/9}
+  .pic::after{display:none}
+  .foot{display:none}
+}
+@media (min-width:600px){
+  .wallpaper{padding-left:max(10px,calc(50% - 300px));padding-right:max(10px,calc(50% - 300px))}
+}
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="av" id="avatar" aria-hidden="true">{{INITIAL}}</div>
+  <div class="who">
+    <h1 class="nm" id="name">{{NAME}}</h1>
+    <div class="sub" id="subtitle">{{SUBTITLE}}</div>
+  </div>
+  <div class="live" id="live" aria-live="polite"><i></i><span class="lbl">Updated </span><span id="updated">Loading…</span></div>
+</header>
+
+<main class="wallpaper" id="thread" aria-live="polite"></main>
+
+<div class="foot" id="foot"></div>
+
+<div class="lb" id="lb" role="dialog" aria-modal="true" aria-label="Photo">
+  <div class="top"><span id="lbTitle">Photo</span><button class="x" id="lbClose">Done</button></div>
+  <div class="scroll"><img id="lbImg" alt=""></div>
+</div>
+
+<script id="seed" type="application/json">{{DATA}}</script>
+<script>
+(function(){
+  "use strict";
+  var DATA_URL = "data.json";
+  var POLL_MS = 25000;
+  var lastKey = "";
+  var lastUpdated = "";
+  var thread = document.getElementById("thread");
+  var updated = document.getElementById("updated");
+  var live = document.getElementById("live");
+  var foot = document.getElementById("foot");
+  var avatar = document.getElementById("avatar");
+  var lb = document.getElementById("lb");
+  var lbImg = document.getElementById("lbImg");
+  var lbTitle = document.getElementById("lbTitle");
+
+  function esc(s){
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+      return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+    });
+  }
+
+  function nodeFor(m, prev){
+    var side = m.side === "out" ? "out" : "in";
+    var grouped = prev && prev.side === m.side && prev.day === m.day;
+    var h = [];
+    h.push('<div class="row ' + side + (grouped ? "" : " tail gap") + '">');
+    h.push('<div class="bub">');
+    if (!grouped) h.push('<div class="who-line">' + esc(m.who) + '</div>');
+
+    if (m.type === "image") {
+      if (m.image) {
+        h.push('<button class="pic" data-full="' + esc(m.image) + '" data-label="' + esc(m.caption || "Photo") + '" aria-label="View full size">' +
+               '<img src="' + esc(m.image) + '" alt="' + esc(m.caption || "Photo") + '" loading="lazy"></button>');
+      } else {
+        h.push('<div class="other">Photo not available</div>');
+      }
+      if (m.caption) h.push('<div class="cap">' + esc(m.caption) + '</div>');
+      if (m.translation) {
+        h.push('<div class="tr"><b>English translation</b><br>' + esc(m.translation) + '</div>');
+      } else if (m.translation_pending) {
+        h.push('<div class="pendingtag">Translation pending</div>');
+      }
+    } else if (m.type === "other") {
+      h.push('<div class="other">' + esc(m.label || "Attachment") + '</div>');
+    } else {
+      h.push('<div class="text">' + esc(m.text) + '</div>');
+      if (m.translation) h.push('<div class="tr"><b>English translation</b><br>' + esc(m.translation) + '</div>');
+      else if (m.translation_pending) h.push('<div class="pendingtag">Translation pending</div>');
+    }
+
+    var tick = m.side === "out" ? '<svg class="tick" viewBox="0 0 16 11" role="img" aria-label="Sent"><path fill="currentColor" d="M11.07.65 10.4.1a.37.37 0 0 0-.52.06L4.68 6.62 2.13 4.2a.37.37 0 0 0-.52.02l-.55.6a.37.37 0 0 0 .02.52l3.15 2.99c.15.15.4.13.53-.03l5.92-7.13a.37.37 0 0 0-.06-.52ZM15.07.65 14.4.1a.37.37 0 0 0-.52.06L8.68 6.62l-.6-.57-.98 1.18 1.33 1.27c.15.15.4.13.53-.03l5.92-7.13a.37.37 0 0 0-.06-.52Z"/></svg>' : '';
+    h.push('<div class="meta">' + esc(m.time) + tick + '</div>');
+    h.push('</div></div>');
+    return h.join("");
+  }
+
+  // Opened at the newest message, the oldest one on screen sits half under the header. In the
+  // bubble, where nothing scrolls, hide the lines the header cuts (a photo may peek in). On the
+  // page, hide that whole message until the reader scrolls.
+  var inBubble = window.matchMedia("(max-height:480px) and (max-width:480px)");
+  var touched = false;
+  var LINES = ".day,.who-line,.text,.cap,.tr,.pendingtag,.other,.meta,.empty";
+  function trim(){
+    var top = thread.getBoundingClientRect().top - 0.5;
+    var sel = inBubble.matches ? LINES : touched ? "" : ".day,.row";
+    Array.prototype.forEach.call(thread.querySelectorAll(LINES + ",.row"), function(el){
+      el.style.visibility = sel && el.matches(sel) && el.getBoundingClientRect().top < top ? "hidden" : "";
+    });
+  }
+  function reveal(){
+    if (touched || inBubble.matches) return;
+    touched = true;
+    trim();
+  }
+  ["wheel", "touchstart", "pointerdown"].forEach(function(t){
+    thread.addEventListener(t, reveal, { passive: true });
+  });
+  window.addEventListener("keydown", reveal);
+  window.addEventListener("resize", function(){ thread.scrollTop = thread.scrollHeight; trim(); });
+
+  function render(data){
+    var msgs = data.messages || [];
+    var html = [];
+    var prevDay = null, prev = null;
+    msgs.forEach(function(m){
+      if (m.day !== prevDay) {
+        html.push('<div class="day"><span>' + esc(m.day) + '</span></div>');
+        prevDay = m.day; prev = null;
+      }
+      html.push(nodeFor(m, prev));
+      prev = m;
+    });
+    if (!msgs.length) html.push('<div class="empty">No messages yet</div>');
+    var atBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+    var firstPaint = !thread.dataset.ready;
+    thread.innerHTML = html.join("");
+    thread.dataset.ready = "1";
+    if (firstPaint || atBottom) thread.scrollTop = thread.scrollHeight;
+    trim();
+
+    if (data.title) {
+      document.getElementById("name").textContent = data.title;
+      avatar.textContent = data.initial || data.title.trim().charAt(0).toUpperCase();
+    }
+    document.getElementById("subtitle").textContent = data.subtitle || "";
+    var n = data.pending_translations || 0;
+    foot.textContent = (data.foot || "") + (n ? " · " + n + (n === 1 ? " translation" : " translations") + " pending" : "");
+  }
+
+  function setStatus(ok, when){
+    updated.textContent = ok ? when : "Offline · " + when;
+    live.classList.toggle("stale", !ok);
+  }
+
+  function load(){
+    fetch(DATA_URL + "?t=" + Date.now(), {cache: "no-store"})
+      .then(function(r){ if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function(data){
+        var key = JSON.stringify(data);
+        if (key !== lastKey) {
+          lastKey = key;
+          render(data);
+        }
+        lastUpdated = data.updated || lastUpdated;
+        setStatus(true, lastUpdated);
+      })
+      .catch(function(){
+        setStatus(false, lastUpdated || "–");
+      });
+  }
+
+  thread.addEventListener("click", function(e){
+    var btn = e.target.closest ? e.target.closest(".pic") : null;
+    if (!btn) return;
+    lbImg.src = btn.getAttribute("data-full");
+    lbImg.alt = btn.getAttribute("data-label") || "";
+    lbTitle.textContent = btn.getAttribute("data-label") || "Photo";
+    lb.classList.add("on");
+    lb.querySelector(".scroll").scrollTop = 0;
+  });
+  document.getElementById("lbClose").addEventListener("click", function(){ lb.classList.remove("on"); });
+  lb.addEventListener("click", function(e){ if (e.target === lb) lb.classList.remove("on"); });
+  document.addEventListener("keydown", function(e){ if (e.key === "Escape") lb.classList.remove("on"); });
+
+  // The build inlines the same data.json, so the first paint never waits on the network
+  // (and a copy opened from disk, which can't fetch, still shows the chat).
+  try {
+    var seed = JSON.parse(document.getElementById("seed").textContent);
+    lastKey = JSON.stringify(seed);
+    render(seed);
+    lastUpdated = seed.updated || "";
+    setStatus(true, lastUpdated);
+  } catch (e) {}
+  if (location.protocol !== "file:") {
+    load();
+    setInterval(load, POLL_MS);
+    document.addEventListener("visibilitychange", function(){ if (!document.hidden) load(); });
+  }
+})();
+</script>
+</body>
+</html>
