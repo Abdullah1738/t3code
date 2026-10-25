@@ -199,12 +199,25 @@ class BuildTest(Base):
             with open(os.path.join(HERE, "..", "helpers", "convo-card", "page.html")) as f:
                 self.assertNotIn(word, f.read())
 
-    def test_foreign_text_is_pending_and_emoji_is_not(self):
+    def test_text_that_is_not_plainly_english_is_pending(self):
         self.msg(PHONE, "AM", T0, text="እሺ")
         self.msg(PHONE, "EM", T0 + 1, text="ok 👍")
         self.msg(PHONE, "FR", T0 + 2, text="très bien")
+        self.msg(PHONE, "ES", T0 + 3, text="Necesito ayuda con el perro")
+        self.msg(PHONE, "DE", T0 + 4, text="Guten Tag")
+        self.msg(PHONE, "EN", T0 + 5, text="Lydia walked the dogs and they're eating, thanks")
+        self.msg(PHONE, "VI", T0 + 6, media="video", caption="ምግብ")
         out = json.loads(self.build().stdout)
-        self.assertEqual([p["id"] for p in out["pending"]], ["AM"])
+        self.assertEqual([p["id"] for p in out["pending"]], ["AM", "FR", "ES", "DE", "VI"])
+
+    def test_group_senders_are_told_apart(self):
+        group = "120363000000000001@g.us"
+        self.msg(group, "G1", T0, text="hi", sender="971500000005@s.whatsapp.net")
+        self.msg(group, "G2", T0 + 1, text="hello", sender="971500000006@s.whatsapp.net")
+        self.run_card("build", "--chat", group, "--slug", "dog-group", "--since", SINCE)
+        a, b = self.data("dog-group")["messages"]
+        self.assertEqual((a["who"], b["who"]), ("+971500000005", "+971500000006"))
+        self.assertNotEqual(a["from"], b["from"])
 
     def test_defaults_without_flags(self):
         self.msg(PHONE, "T1", int(datetime.now(DXB).timestamp()) - 60, text="hi")
@@ -235,14 +248,20 @@ class BuildTest(Base):
         self.assertTrue(out["same"], out["diffs"])
         self.assertEqual(out["pending"], [])
         self.assertEqual(sorted(os.listdir(self.card())), before)
+        # Anything a real build would change counts, e.g. the footer after a different --me.
+        out = json.loads(self.build("--dry-run", "--me", "Abdullah").stdout)
+        self.assertFalse(out["same"])
+        self.assertIn("foot", [x.get("field") for x in out["diffs"]])
+        self.assertEqual(sorted(os.listdir(self.card())), before)
 
-    def test_photo_that_cannot_download_shows_as_missing(self):
+    def test_photo_that_cannot_download_stays_pending(self):
         self.msg(LID, "P9", T0, from_me=1, media="image", caption="Card 9")
         out = json.loads(self.build().stdout)
         m = self.data()["messages"][0]
         self.assertEqual(m["type"], "image")
         self.assertNotIn("image", m)
-        self.assertEqual(out["pending"], [])  # an English caption alone needs no translation
+        # Nobody has seen what it shows, so it can't count as done.
+        self.assertEqual(out["pending"], [{"id": "P9", "type": "image", "reason": "not downloaded"}])
 
     def test_help_says_use_the_defaults(self):
         p = self.run_card("--help")
@@ -279,9 +298,18 @@ class TranslateTest(Base):
         self.assertEqual(out["pending"][0]["reason"], "changed")
         self.assertNotIn("translation", self.data()["messages"][0])
 
+    def test_whitespace_change_in_the_source_drops_its_translation(self):
+        self.msg(PHONE, "AM", T0, text="እሺ")
+        self.build()
+        self.run_card("translate", "--slug", "lydia-chat", "--id", "AM", "--text", "OK")
+        self.edit("AM", " እሺ ")
+        out = json.loads(self.build().stdout)
+        self.assertEqual(out["pending"], [{"id": "AM", "type": "text", "reason": "changed"}])
+
     def test_translation_moved_to_another_message_does_not_show(self):
+        # Same text in both, so only the message id tells them apart.
         self.msg(PHONE, "A1", T0, text="እሺ")
-        self.msg(PHONE, "A2", T0 + 1, text="አይ")
+        self.msg(PHONE, "A2", T0 + 1, text="እሺ")
         self.build()
         self.run_card("translate", "--slug", "lydia-chat", "--id", "A1", "--text", "OK")
         tr_path = os.path.join(self.card(), ".translations.json")
@@ -348,7 +376,7 @@ class SendTest(Base):
         self.assertEqual(opt("--to"), "moni")
         self.assertEqual(opt("--session"), self.SESSION)
         self.assertEqual(opt("--caption"), "Lydia chat")
-        self.assertEqual(opt("--subcaption"), "Lydia: ok")
+        self.assertEqual(opt("--subcaption"), "Lydia replied")
         self.assertTrue(opt("--key").startswith("convo-lydia-chat-moni-R1-"))
         self.assertEqual(self.log("check"), [["page", self.card()]])
         # Same last message, same link: nothing new goes out.
@@ -356,12 +384,13 @@ class SendTest(Base):
         self.assertFalse(out["sent"])
         self.assertEqual([c[0] for c in self.log("bridge")], ["share", "app", "share"])
         # A new message makes a new card.
-        self.msg(PHONE, "R2", T0 + 200, text="Done at 3:30 today, thanks")
+        self.msg(PHONE, "R2", T0 + 200, text="Meet at noon on Sat 24 Oct, 24/10/2026")
         self.build()
+        self.run_card("translate", "--slug", "lydia-chat", "--id", "R2", "--none")
         self.send("--to", "moni")
         app = self.log("bridge")[-1]
         self.assertEqual(app[0], "app")
-        self.assertEqual(app[app.index("--subcaption") + 1], "Lydia: Done at , thanks")
+        self.assertEqual(app[app.index("--subcaption") + 1], "Lydia replied")   # never the message text
         self.assertIn("-R2-", app[app.index("--key") + 1])
         # Never a picture of the chat, never WhatsApp.
         self.assertFalse(any(c[0] in ("send-file", "send") for c in self.log("bridge")))
@@ -384,7 +413,8 @@ class SendTest(Base):
     def test_subcaption_with_a_time_is_refused(self):
         self.msg(PHONE, "T1", T0, text="hi")
         self.build()
-        self.send("--to", "moni", "--subcaption", "Lydia replied at 15:29", code=2)
+        for sub in ("Lydia replied at 15:29", "Meet at noon", "See you May 5", "Due 24/10", "Back on Sat"):
+            self.send("--to", "moni", "--subcaption", sub, code=2)
         self.assertEqual(self.log("bridge"), [])
 
     def test_bad_session_and_chat_are_refused(self):
@@ -426,6 +456,31 @@ class WatchTest(Base):
         self.assertEqual(self.watch("--now", "2100").stdout, "")
         self.assertEqual(self.watch("--now", "2200").stdout, "")
         self.assertIn("2 new message(s)", self.watch("--now", "2221").stdout)
+
+    def test_event_the_runner_never_recorded_is_printed_again(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.msg(PHONE, "T2", T0 + 10, text="a")
+        run = lambda rid, now: self.watch("--now", now, env=dict(self.env, WATCH_RUN=rid)).stdout
+        self.assertEqual(run("r1", "1100"), "")
+        first = run("r2", "1300")   # the runner gets killed before it records r2's output
+        self.assertIn("msgid T2", first)
+        again = run("r3", "1400")
+        self.assertEqual(again, first)
+        with open(os.path.join(self.wdir, ".run-ok"), "w") as f:
+            f.write("r3\n")         # r3 was recorded: nothing to repeat
+        self.assertEqual(run("r4", "1500"), "")
+        # A new burst after an unrecorded one carries both.
+        self.msg(PHONE, "T3", T0 + 20, text="b")
+        run("r5", "1600")
+        lost = run("r6", "1800")
+        self.assertIn("msgid T3", lost)
+        self.msg(PHONE, "T4", T0 + 30, text="c")
+        run("r7", "1900")
+        both = run("r8", "2100")
+        self.assertIn("msgid T3", both)
+        self.assertIn("msgid T4", both)
 
     def test_daemon_down_fails_the_check(self):
         self.msg(PHONE, "T1", T0, text="hi")

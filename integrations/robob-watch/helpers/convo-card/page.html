@@ -239,7 +239,7 @@ body{
 
   function nodeFor(m, prev){
     var side = m.side === "out" ? "out" : "in";
-    var grouped = prev && prev.side === m.side && prev.day === m.day;
+    var grouped = prev && prev.side === m.side && prev.day === m.day && (prev.from || prev.who) === (m.from || m.who);
     var h = [];
     h.push('<div class="row ' + side + (grouped ? "" : " tail gap") + '">');
     h.push('<div class="bub">');
@@ -260,6 +260,9 @@ body{
       }
     } else if (m.type === "other") {
       h.push('<div class="other">' + esc(m.label || "Attachment") + '</div>');
+      if (m.caption) h.push('<div class="cap">' + esc(m.caption) + '</div>');
+      if (m.translation) h.push('<div class="tr"><b>English translation</b><br>' + esc(m.translation) + '</div>');
+      else if (m.translation_pending) h.push('<div class="pendingtag">Translation pending</div>');
     } else {
       h.push('<div class="text">' + esc(m.text) + '</div>');
       if (m.translation) h.push('<div class="tr"><b>English translation</b><br>' + esc(m.translation) + '</div>');
