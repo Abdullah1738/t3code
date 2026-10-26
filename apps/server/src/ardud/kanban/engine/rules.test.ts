@@ -10,7 +10,16 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
-import { applyReviewResult, checkMove, planDispatch, poolKey, prsLanded } from "./rules.ts";
+import {
+  applyReviewResult,
+  checkClaim,
+  checkMove,
+  MAX_BATCH,
+  planDispatch,
+  poolKey,
+  prsLanded,
+  relatedCandidates,
+} from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
   instanceId: ProviderInstanceId.make("opencode"),
@@ -199,5 +208,125 @@ describe("planDispatch", () => {
     );
     expect(plan.map((d) => d.pool)).toEqual([poolKey(sol), poolKey(astra)]);
     expect(planDispatch(board, [critical], pools([[astra, 1]]))).toEqual([]);
+  });
+});
+
+describe("thread batching", () => {
+  const t1 = ThreadId.make("t1");
+  const working = (patch: Partial<KanbanCard> = {}) =>
+    card({
+      stage: "working",
+      activeThreadId: t1,
+      activeRole: "work",
+      activePool: poolKey(opus),
+      workThreadId: t1,
+      ...patch,
+    });
+
+  it("counts a slot per thread, not per card", () => {
+    const a = working();
+    const b = working();
+    const waiting = card();
+    expect(planDispatch(board, [a, b, waiting], pools([[opus, 2]])).length).toBe(1);
+    expect(planDispatch(board, [a, b, waiting], pools([[opus, 1]]))).toEqual([]);
+  });
+
+  it("sends a todo card back to its thread without a new slot, up to the cap", () => {
+    const a = working();
+    const back = card({ workThreadId: t1 });
+    const plan = planDispatch(board, [a, back], pools([[opus, 1]]));
+    expect(plan).toMatchObject([{ cardId: back.id, role: "work", joins: true }]);
+    const full = Array.from({ length: MAX_BATCH }, () => working());
+    expect(planDispatch(board, [...full, back], pools([[opus, 1]]))).toEqual([]);
+  });
+
+  it("keeps a held slot for a thread between cards", () => {
+    const waiting = card();
+    const holds = new Map([["t1", poolKey(opus)]]);
+    expect(planDispatch(board, [waiting], pools([[opus, 1]]), holds)).toEqual([]);
+    const mine = card({ workThreadId: t1 });
+    expect(planDispatch(board, [mine], pools([[opus, 1]]), holds)).toMatchObject([
+      { cardId: mine.id, joins: true },
+    ]);
+  });
+
+  it("claims only todo cards on the same pool and project, unblocked outside the thread", () => {
+    const a = working();
+    const blocker = card();
+    const byId = new Map([a, blocker].map((c) => [c.id as string, c]));
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(opus),
+      projectId: null,
+      mine: new Set<string>([a.id]),
+      byId,
+      carrying: 1,
+      slots: 1,
+    };
+    expect(checkClaim(board, card(), ctx).ok).toBe(true);
+    expect(checkClaim(board, card({ model: haiku }), ctx).ok).toBe(false);
+    expect(checkClaim(board, card({ stage: "needs_review" }), ctx).ok).toBe(false);
+    expect(checkClaim(board, card({ blockedBy: [blocker.id] }), ctx).ok).toBe(false);
+    expect(checkClaim(board, card({ blockedBy: [a.id] }), ctx).ok).toBe(true);
+    expect(checkClaim(board, card(), { ...ctx, carrying: MAX_BATCH }).ok).toBe(false);
+    expect(checkClaim(board, card({ projectId: "p2" as KanbanCard["projectId"] }), ctx).ok).toBe(
+      false,
+    );
+    // Kept for another work thread, or the pool is paused.
+    expect(checkClaim(board, card({ workThreadId: ThreadId.make("t2") }), ctx).ok).toBe(false);
+    expect(checkClaim(board, card({ workThreadId: t1 }), ctx).ok).toBe(true);
+    expect(checkClaim(board, card(), { ...ctx, slots: 0 }).ok).toBe(false);
+  });
+
+  it("starts a card fresh when its old thread is busy in another pool", () => {
+    const elsewhere = working({ model: haiku, activePool: poolKey(haiku) });
+    const back = card({ workThreadId: t1 });
+    expect(
+      planDispatch(
+        board,
+        [elsewhere, back],
+        pools([
+          [opus, 1],
+          [haiku, 1],
+        ]),
+      ),
+    ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
+  });
+
+  it("takes nothing from a pool at 0, not even a rejoin", () => {
+    const a = working();
+    const back = card({ workThreadId: t1 });
+    expect(planDispatch(board, [a, back], pools([[opus, 0]]))).toEqual([]);
+  });
+
+  it("offers related todo cards with a reason, most urgent first", () => {
+    const pr = { kind: "pr" as const, url: "pr-1", label: null, state: null, checkedAt: null };
+    const seed = working({ links: [pr] });
+    const samePr = card({ links: [pr], priority: 3 });
+    const waitsOnSeed = card({ blockedBy: [seed.id], priority: 1 });
+    const grouped = card({ priority: 2 });
+    const otherModel = card({ links: [pr], model: haiku });
+    const unrelated = card();
+    const candidates = relatedCandidates({
+      board,
+      cards: [seed, samePr, waitsOnSeed, grouped, otherModel, unrelated],
+      groups: [
+        {
+          id: "g",
+          name: "Fees",
+          summary: "",
+          cardIds: [seed.id, grouped.id],
+          updatedAt: "2026-10-25T00:00:00Z",
+        },
+      ],
+      seeds: [seed],
+      threadId: "t1",
+      pool: poolKey(opus),
+      projectId: null,
+      carrying: 1,
+      slots: 1,
+    });
+    expect(candidates.map((c) => c.card.id)).toEqual([waitsOnSeed.id, grouped.id, samePr.id]);
+    expect(candidates[0]?.why).toContain(`#${seed.number}`);
   });
 });

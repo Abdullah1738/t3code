@@ -121,6 +121,18 @@ export interface CardDetail {
   readonly threads: ReadonlyArray<KanbanThreadLink>;
 }
 
+export interface ClaimResult {
+  readonly card: KanbanCard;
+  /** What the thread should do for the card: its task, facts and any waiting note. */
+  readonly brief: string;
+}
+
+export interface NextCards {
+  readonly carrying: ReadonlyArray<KanbanCard>;
+  readonly candidates: ReadonlyArray<Rules.Candidate>;
+  readonly holdsSlot: boolean;
+}
+
 export type KanbanWatchEvent =
   | { readonly _tag: "snapshot"; readonly snapshot: KanbanBoardSnapshot }
   | { readonly _tag: "change"; readonly change: KanbanChange };
@@ -245,6 +257,20 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<ThreadId, KanbanError>;
   /** The board link of a calling thread, or null for threads the board did not start. */
   readonly caller: (threadId: string) => Effect.Effect<KanbanThreadLink | null, KanbanError>;
+  /** Cards a work thread is working on right now. */
+  readonly carried: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
+  /** A work thread takes a todo card into its own run (same pool and project). */
+  readonly claimCard: (
+    threadId: ThreadId,
+    cardId: KanbanCard["id"],
+  ) => Effect.Effect<ClaimResult, KanbanError>;
+  /** A work thread creates a card and takes it straight away. */
+  readonly createForThread: (
+    threadId: ThreadId,
+    input: NewCard,
+  ) => Effect.Effect<ClaimResult, KanbanError>;
+  /** Related todo cards a work thread could take next, with why. */
+  readonly nextCards: (threadId: ThreadId) => Effect.Effect<NextCards, KanbanError>;
 
   /** Runs dispatch for every board now. */
   readonly dispatchNow: Effect.Effect<void, KanbanError>;
@@ -263,6 +289,17 @@ export class KanbanService extends Context.Service<KanbanService, KanbanServiceS
 ) {}
 
 type Job = { readonly _tag: "kick" } | { readonly _tag: "turnEnd"; readonly threadId: ThreadId };
+
+/** A slot a work thread keeps between cards (see `holds`). */
+interface Hold {
+  readonly boardId: string;
+  readonly pool: string;
+  readonly at: number;
+}
+
+// A held slot is meant to last to the end of the thread's turn; past this a
+// stuck thread gives it back.
+const HOLD_MAX_MS = 30 * 60_000;
 
 const WriterOutput = Schema.Struct({ title: Schema.String, description: Schema.String });
 
@@ -364,6 +401,38 @@ const make = Effect.gen(function* () {
   }>();
   const jobs = yield* Queue.unbounded<Job>();
   const kickPending = yield* Ref.make(false);
+  /**
+   * Work threads whose last card moved on mid-turn keep their slot until the
+   * turn ends, so they can take a related card while they have the context.
+   * Lost on restart, which only frees slots; tick drops one whose turn ended
+   * or that outlived HOLD_MAX_MS.
+   */
+  const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
+  const hold = (threadId: ThreadId, boardId: string, pool: string) =>
+    Effect.flatMap(nowMillis, (at) =>
+      Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
+    );
+  /** One board's held slots, thread id to pool, as the rules take them. */
+  const boardHolds = (boardId: string) =>
+    Effect.map(
+      Ref.get(holds),
+      (all) =>
+        new Map(
+          [...all].flatMap(([threadId, held]) =>
+            held.boardId === boardId ? [[threadId as string, held.pool] as const] : [],
+          ),
+        ),
+    );
+  // Threads a card was running on that were missing at the last tick. `view`
+  // also answers null on a read error, so a card is let go on the second miss.
+  const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  const dropHold = (threadId: ThreadId) =>
+    Ref.update(holds, (all) => {
+      if (!all.has(threadId)) return all;
+      const next = new Map(all);
+      next.delete(threadId);
+      return next;
+    });
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
@@ -451,7 +520,9 @@ const make = Effect.gen(function* () {
   const snapshotOf = Effect.fn("KanbanService.snapshotOf")(function* (boardId: KanbanBoard["id"]) {
     const board = yield* boardOf(boardId);
     const cards = yield* store.cards(boardId);
-    const live = cards.flatMap((card) => (card.activeThreadId ? [card.activeThreadId] : []));
+    const live = [
+      ...new Set(cards.flatMap((card) => (card.activeThreadId ? [card.activeThreadId] : []))),
+    ];
     const states = yield* Effect.forEach(live, threadState, { concurrency: 8 });
     const discussions = yield* store.discussions(boardId);
     const unread = discussions.flatMap((discussion) => {
@@ -504,6 +575,40 @@ const make = Effect.gen(function* () {
   const release = (card: KanbanCard) =>
     ({ ...card, activeThreadId: null, activeRole: null, activePool: null }) satisfies KanbanCard;
 
+  /**
+   * A card leaves its live thread. The thread's own move happens mid-turn, so
+   * the turn finishes by itself; a work thread with no card left keeps its
+   * slot until then. Anyone else stops the thread, or, when it still carries
+   * other cards, tells it to drop this one. True when the thread goes on
+   * with other cards.
+   */
+  const letGo = Effect.fn("KanbanService.letGo")(function* (
+    card: KanbanCard,
+    bySelf: boolean,
+    what: string,
+  ) {
+    const threadId = card.activeThreadId;
+    if (threadId === null) return false;
+    const others =
+      card.activeRole === "work"
+        ? (yield* store.cardsByThread(threadId)).filter((other) => other.id !== card.id)
+        : [];
+    if (bySelf) {
+      if (card.activeRole === "work" && others.length === 0 && card.activePool !== null) {
+        yield* hold(threadId, card.boardId, card.activePool);
+      }
+      return others.length > 0;
+    }
+    if (others.length === 0) {
+      yield* threads.interrupt(threadId, `Card #${card.number} ${what}`);
+      return false;
+    }
+    yield* threads
+      .send({ threadId, text: Briefs.dropCardText(card, what, others) })
+      .pipe(Effect.ignore);
+    return true;
+  });
+
   const moveUnlocked = Effect.fn("KanbanService.moveUnlocked")(function* (
     card: KanbanCard,
     to: KanbanStage,
@@ -518,11 +623,16 @@ const make = Effect.gen(function* () {
     if (!check.ok) return yield* failWith("denied", check.reason);
     const at = yield* nowIso;
     const leaving = card.activeThreadId !== null && !KANBAN_THREAD_STAGES.includes(to);
-    // A thread moving its own card is mid-turn and finishes on its own.
-    if (leaving && role !== "cardThread" && card.activeThreadId) {
-      yield* threads.interrupt(card.activeThreadId, `Card #${card.number} moved to ${to}`);
-    }
-    const base = leaving ? release(card) : card;
+    const bySelf = role === "cardThread";
+    const kept = leaving ? yield* letGo(card, bySelf, `moved to ${to}`) : false;
+    // Pulled back to todo while its thread goes on with other cards: the
+    // thread was told to drop it, so it starts fresh instead of rejoining.
+    const base = leaving
+      ? {
+          ...release(card),
+          workThreadId: kept && !bySelf && to === "todo" ? null : card.workThreadId,
+        }
+      : card;
     const next: KanbanCard = {
       ...base,
       stage: to,
@@ -541,17 +651,22 @@ const make = Effect.gen(function* () {
     return next;
   });
 
-  /** Copies the work thread's tracked PRs (same source as the sidebar) onto the card. */
+  /**
+   * Copies the work thread's tracked PRs (same source as the sidebar) onto the
+   * card. A thread that carried several cards attaches PRs per card itself, so
+   * then only the states of PRs already on the card are refreshed.
+   */
   const syncPrs = Effect.fn("KanbanService.syncPrs")(function* (card: KanbanCard) {
     if (card.workThreadId === null) return card;
     const view = yield* threads.view(card.workThreadId);
     if (!view || view.prs.length === 0) return card;
     const at = yield* nowIso;
+    const solo = (yield* store.threadCards(card.workThreadId)).every((id) => id === card.id);
     let changed = false;
     let links = mergeLinks(
       card.links,
       view.prs
-        .filter((pr) => !card.links.some((link) => link.url === pr.url))
+        .filter((pr) => solo && !card.links.some((link) => link.url === pr.url))
         .map((pr) => ({ url: pr.url, label: pr.title, kind: "pr" as const })),
     );
     if (links.length !== card.links.length) changed = true;
@@ -899,7 +1014,7 @@ const make = Effect.gen(function* () {
       if (card.activeThreadId !== null && card.activeThreadId !== author.threadId) {
         yield* threads.send({
           threadId: card.activeThreadId,
-          text: `Evaluator in the card discussion (${posted.id}):\n\n${text}`,
+          text: `Evaluator in the discussion of card #${card.number} (${posted.id}):\n\n${text}`,
         });
       }
     }
@@ -958,13 +1073,27 @@ const make = Effect.gen(function* () {
       return;
     }
     const goal = yield* goalOf(card);
-    const existing = dispatch.role === "work" ? card.workThreadId : card.reviewThreadId;
+    // A fresh start leaves the old work thread to its cards in another pool.
+    const existing = dispatch.fresh
+      ? null
+      : dispatch.role === "work"
+        ? card.workThreadId
+        : card.reviewThreadId;
     let threadId: ThreadId | null = null;
     if (existing !== null) {
       const view = yield* threads.view(existing);
+      if (dispatch.joins && !view) {
+        // The thread holding the slot is gone: the card stops pointing at it,
+        // so the next pass gives it a slot of its own instead of joining again.
+        yield* dropHold(existing);
+        yield* saveCard({ ...card, workThreadId: null, updatedAt: at });
+        yield* kick;
+        return;
+      }
       // A turn still finishing (for example the one that called card_move) gets
-      // the next message only after it ends; the next pass retries.
-      if (view && view.state !== "idle") return;
+      // the next message only after it ends; the next pass retries. A thread
+      // that holds the slot for other cards is steered right away.
+      if (view && view.state !== "idle" && !dispatch.joins) return;
       if (view) threadId = existing;
     }
     const synced = dispatch.role === "review" ? yield* syncPrs(card) : card;
@@ -1004,6 +1133,10 @@ const make = Effect.gen(function* () {
       });
       yield* logEvent(card, system, "thread", { body: `${dispatch.role} thread ${threadId}` });
     }
+    if (dispatch.role === "work") {
+      yield* store.addThreadCard(threadId, card.id, at);
+      yield* dropHold(threadId);
+    }
     const to: KanbanStage = dispatch.role === "work" ? "working" : "in_review";
     const next: KanbanCard = {
       ...synced,
@@ -1030,6 +1163,7 @@ const make = Effect.gen(function* () {
         board,
         yield* store.cards(board.id),
         yield* store.pools(board.id),
+        yield* boardHolds(board.id),
       );
       for (const dispatch of plan) {
         yield* startCard(board, dispatch).pipe(
@@ -1048,10 +1182,15 @@ const make = Effect.gen(function* () {
     if (!link) return;
     const at = yield* nowIso;
     const card = link.cardId ? yield* store.card(link.cardId) : null;
+    const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
     const discussionIds = new Set<string>();
     if (link.discussionId) discussionIds.add(link.discussionId);
     if (card?.discussionId) discussionIds.add(card.discussionId);
+    for (const id of carriedIds) {
+      const other = id === card?.id ? card : yield* store.card(id);
+      if (other?.discussionId) discussionIds.add(other.discussionId);
+    }
     for (const id of discussionIds) {
       const discussion = yield* store.discussion(KanbanDiscussionId.make(id));
       if (discussion) yield* settleParticipant(discussion, threadId);
@@ -1063,31 +1202,40 @@ const make = Effect.gen(function* () {
       }
       return;
     }
+    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    if (link.role === "work") {
+      // The turn is over, so a slot held for a next card is free again.
+      if ((yield* Ref.get(holds)).has(threadId)) {
+        yield* dropHold(threadId);
+        yield* kick;
+      }
+      const carried = yield* Effect.forEach(yield* store.cardsByThread(threadId), syncPrs);
+      if (carried.length === 0) {
+        yield* kick;
+        return;
+      }
+      // A worker may be waiting on CI or a deploy, so it keeps its slot; the
+      // stalled sweep looks at idle Working cards. It hears once per card.
+      const unnudged = carried.filter((entry) => entry.nudgedAt === null);
+      if (unnudged.length === 0) return;
+      yield* threads.send({ threadId, text: Briefs.nudgeWorkText(unnudged) }).pipe(Effect.ignore);
+      for (const entry of unnudged) yield* saveCard({ ...entry, nudgedAt: at, updatedAt: at });
+      return;
+    }
     if (!card) return;
-    const synced = link.role === "work" ? yield* syncPrs(card) : card;
-    if (synced.activeThreadId !== threadId) {
+    if (card.activeThreadId !== threadId) {
       yield* kick;
       return;
     }
-    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
-    if (synced.nudgedAt === null) {
-      yield* threads
-        .send({
-          threadId,
-          text:
-            link.role === "work" ? Briefs.nudgeWorkText(synced) : Briefs.nudgeReviewText(synced),
-        })
-        .pipe(Effect.ignore);
-      yield* saveCard({ ...synced, nudgedAt: at, updatedAt: at });
+    if (card.nudgedAt === null) {
+      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
+      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
       return;
     }
-    // A worker may be waiting on CI or a deploy, so it keeps its slot; the
-    // stalled sweep looks at idle Working cards. A reviewer that still has no
-    // verdict after the nudge frees its slot and is flagged.
-    if (link.role === "work") return;
+    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
     const reason = "Reviewer stopped without a verdict";
     const next: KanbanCard = {
-      ...release(synced),
+      ...release(card),
       stage: "needs_review",
       stalled: { reason, by: system, at },
       nudgedAt: null,
@@ -1095,7 +1243,7 @@ const make = Effect.gen(function* () {
       updatedAt: at,
     };
     yield* logEvent(next, system, "flagged", {
-      fromStage: synced.stage,
+      fromStage: card.stage,
       toStage: next.stage,
       body: reason,
     });
@@ -1105,8 +1253,42 @@ const make = Effect.gen(function* () {
 
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
     const now = yield* nowMillis;
+    // A hold lasts for the turn; a missed turn end or a thread stuck waiting
+    // on something must not keep the slot.
+    for (const [threadId, held] of yield* Ref.get(holds)) {
+      const view = yield* threads.view(threadId);
+      if (!view || view.state !== "running" || now - held.at > HOLD_MAX_MS) {
+        yield* dropHold(threadId);
+        yield* kick;
+      }
+    }
+    const missed = new Set<ThreadId>();
+    const before = yield* Ref.get(missing);
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
+      // A card whose thread was deleted goes back to its queue for a new one.
+      for (const card of yield* store.cards(board.id)) {
+        const threadId = card.activeThreadId;
+        if (threadId === null || (yield* threads.view(threadId))) continue;
+        missed.add(threadId);
+        if (!before.has(threadId)) continue;
+        const at = yield* nowIso;
+        const review = card.activeRole === "review";
+        const next: KanbanCard = {
+          ...release(card),
+          stage: review ? "needs_review" : "todo",
+          workThreadId: review ? card.workThreadId : null,
+          reviewThreadId: review ? null : card.reviewThreadId,
+          movedAt: at,
+          updatedAt: at,
+        };
+        yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
+          fromStage: card.stage,
+          toStage: next.stage,
+          body: "Its thread is gone",
+        });
+        yield* saveCard(next);
+      }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {
         let next = discussion;
@@ -1145,6 +1327,7 @@ const make = Effect.gen(function* () {
         }
       }
     }
+    yield* Ref.set(missing, missed);
     yield* dispatchUnlocked();
   });
 
@@ -1198,59 +1381,280 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /** A new card as it would be saved; nothing is written yet. */
+  const draftCard = Effect.fn("KanbanService.draftCard")(function* (
+    boardId: KanbanBoard["id"],
+    input: NewCard,
+    actor: KanbanActor,
+  ) {
+    const board = yield* boardOf(boardId);
+    const prompt = input.prompt.trim();
+    if (prompt.length === 0 && !input.title?.trim()) {
+      return yield* failWith("invalid", "a card needs a prompt or a title");
+    }
+    const at = yield* nowIso;
+    const stage = input.stage ?? "todo";
+    return {
+      id: KanbanCardId.make(`card-${uuid()}`),
+      boardId,
+      number: yield* store.nextCardNumber(boardId),
+      title: input.title?.trim() || fallbackTitle(prompt),
+      description: input.description?.trim() ?? "",
+      prompt,
+      stage,
+      priority: clampPriority(input.priority, 3),
+      goalId: input.goalId ?? null,
+      projects: input.projects ?? [],
+      model: input.model ? yield* poolModel(boardId, input.model) : board.defaultCardModel,
+      projectId: input.projectId ?? null,
+      links: mergeLinks([], input.links ?? []),
+      blockedBy: input.blockedBy ?? [],
+      stalled: null,
+      question: stage === "needs_owner" ? (input.question ?? null) : null,
+      reviewChain: input.reviewChain ?? null,
+      reviewStep: 0,
+      reviewRound: 0,
+      activeThreadId: null,
+      activeRole: null,
+      activePool: null,
+      workThreadId: null,
+      reviewThreadId: null,
+      discussionId: null,
+      wakeNote: null,
+      nudgedAt: null,
+      settledAt: null,
+      createdBy: actor,
+      createdAt: at,
+      updatedAt: at,
+      movedAt: at,
+    } satisfies KanbanCard;
+  });
+
+  /** Saves a drafted card; the writer fills in a missing title or description. */
+  const insertCard = Effect.fn("KanbanService.insertCard")(function* (
+    card: KanbanCard,
+    input: NewCard,
+  ) {
+    yield* logEvent(card, card.createdBy, "created", { toStage: card.stage });
+    yield* saveCard(card);
+    const needTitle = !input.title?.trim();
+    const needDescription = !input.description?.trim();
+    if (card.prompt.length > 0 && (needTitle || needDescription)) {
+      yield* forkWriter(card.id, { title: needTitle, description: needDescription });
+    }
+    yield* kick;
+    return card;
+  });
+
+  const createCardUnlocked = Effect.fn("KanbanService.createCardUnlocked")(function* (
+    boardId: KanbanBoard["id"],
+    input: NewCard,
+    actor: KanbanActor,
+  ) {
+    return yield* insertCard(yield* draftCard(boardId, input, actor), input);
+  });
+
   const createCard: KanbanServiceShape["createCard"] = (boardId, input, actor) =>
+    guard(createCardUnlocked(boardId, input, actor));
+
+  /**
+   * Where a work thread stands: its board, pool, project, the cards it carries
+   * and the card it started on, whose review chain and goal new cards inherit.
+   */
+  const workThreadOf = Effect.fn("KanbanService.workThreadOf")(function* (threadId: ThreadId) {
+    const link = yield* store.threadLink(threadId);
+    if (!link || link.role !== "work") {
+      return yield* failWith("denied", "only a card's work thread takes cards");
+    }
+    const board = yield* boardOf(link.boardId);
+    const view = yield* threads.view(threadId);
+    if (!view) return yield* failWith("not-found", `thread ${threadId}`);
+    const carried = yield* store.cardsByThread(threadId);
+    const held = (yield* Ref.get(holds)).get(threadId);
+    const pool =
+      carried[0]?.activePool ?? held?.pool ?? Rules.poolKey(link.model ?? board.defaultCardModel);
+    const origin = carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null);
+    return {
+      link,
+      board,
+      projectId: view.projectId,
+      carried,
+      origin,
+      pool,
+      holdsSlot: carried.length > 0 || held !== undefined,
+    };
+  });
+
+  /**
+   * Cards this thread carried that are still its own: one that moved to
+   * another thread no longer counts as this thread's work.
+   */
+  const ownCards = Effect.fn("KanbanService.ownCards")(function* (
+    threadId: ThreadId,
+    cards: ReadonlyArray<KanbanCard>,
+  ) {
+    const carried = new Set<string>(yield* store.threadCards(threadId));
+    return new Set<string>(
+      cards
+        .filter((card) => carried.has(card.id) && card.workThreadId === threadId)
+        .map((card) => card.id),
+    );
+  });
+
+  /** Fails unless the work thread may take `card` now (see `Rules.checkClaim`). */
+  const checkTake = Effect.fn("KanbanService.checkTake")(function* (
+    thread: {
+      readonly board: KanbanBoard;
+      readonly pool: string;
+      readonly projectId: ProjectId;
+      readonly carried: ReadonlyArray<KanbanCard>;
+      readonly holdsSlot: boolean;
+    },
+    threadId: ThreadId,
+    card: KanbanCard,
+  ) {
+    if (card.boardId !== thread.board.id) {
+      return yield* failWith("denied", `card #${card.number} is on another board`);
+    }
+    const cards = yield* store.cards(card.boardId);
+    const slots =
+      (yield* store.pools(card.boardId)).find((pool) => pool.key === thread.pool)?.slots ?? 0;
+    const check = Rules.checkClaim(thread.board, card, {
+      threadId,
+      pool: thread.pool,
+      projectId: thread.projectId,
+      mine: yield* ownCards(threadId, cards),
+      byId: new Map(cards.map((entry) => [entry.id as string, entry])),
+      carrying: thread.carried.length,
+      slots,
+    });
+    if (!check.ok) return yield* failWith("denied", check.reason);
+    if (!thread.holdsSlot) {
+      const used =
+        Rules.poolThreads(cards, yield* boardHolds(card.boardId)).get(thread.pool)?.size ?? 0;
+      if (used >= slots) {
+        return yield* failWith("denied", `no free slot on ${thread.pool}; leave it in todo`);
+      }
+    }
+  });
+
+  /** Puts a checked todo card on its new work thread. */
+  const takeCard = Effect.fn("KanbanService.takeCard")(function* (
+    threadId: ThreadId,
+    pool: string,
+    card: KanbanCard,
+    how: string,
+  ) {
+    const at = yield* nowIso;
+    const actor: KanbanActor = { _tag: "thread", threadId };
+    const next: KanbanCard = {
+      ...card,
+      stage: "working",
+      activeThreadId: threadId,
+      activeRole: "work",
+      activePool: pool,
+      workThreadId: threadId,
+      wakeNote: null,
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    // Threads started before batching never recorded their first card; without
+    // it the board would take this thread for a one-card thread and copy all
+    // its PRs onto the new card.
+    const link = yield* store.threadLink(threadId);
+    if (link?.cardId) yield* store.addThreadCard(threadId, link.cardId, link.startedAt);
+    yield* store.addThreadCard(threadId, card.id, at);
+    yield* dropHold(threadId);
+    if (card.workThreadId !== threadId) {
+      yield* logEvent(next, actor, "thread", { body: `work thread ${threadId}` });
+    }
+    yield* logEvent(next, actor, "moved", { fromStage: card.stage, toStage: "working", body: how });
+    yield* saveCard(next);
+    return {
+      card: next,
+      brief: Briefs.claimBrief(next, yield* goalOf(next), card.wakeNote),
+    } satisfies ClaimResult;
+  });
+
+  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
     guard(
       Effect.gen(function* () {
-        const board = yield* boardOf(boardId);
-        const prompt = input.prompt.trim();
-        if (prompt.length === 0 && !input.title?.trim()) {
-          return yield* failWith("invalid", "a card needs a prompt or a title");
+        const thread = yield* workThreadOf(threadId);
+        const card = yield* cardOf(cardId);
+        yield* checkTake(thread, threadId, card);
+        return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
+      }),
+    );
+
+  // The card is checked as a draft first, so a refused take leaves nothing
+  // behind for the dispatcher to start twice.
+  const createForThread: KanbanServiceShape["createForThread"] = (threadId, input) =>
+    guard(
+      Effect.gen(function* () {
+        const thread = yield* workThreadOf(threadId);
+        const model = input.model
+          ? yield* poolModel(thread.board.id, input.model)
+          : (thread.carried[0]?.model ??
+            thread.link.model ??
+            (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.model ??
+            thread.board.defaultCardModel);
+        if (Rules.poolKey(model) !== thread.pool) {
+          return yield* failWith(
+            "denied",
+            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolKey(model)}`,
+          );
         }
-        const at = yield* nowIso;
-        const stage = input.stage ?? "todo";
-        const card: KanbanCard = {
-          id: KanbanCardId.make(`card-${uuid()}`),
-          boardId,
-          number: yield* store.nextCardNumber(boardId),
-          title: input.title?.trim() || fallbackTitle(prompt),
-          description: input.description?.trim() ?? "",
-          prompt,
-          stage,
-          priority: clampPriority(input.priority, 3),
-          goalId: input.goalId ?? null,
-          projects: input.projects ?? [],
-          model: input.model ? yield* poolModel(boardId, input.model) : board.defaultCardModel,
-          projectId: input.projectId ?? null,
-          links: mergeLinks([], input.links ?? []),
-          blockedBy: input.blockedBy ?? [],
-          stalled: null,
-          question: stage === "needs_owner" ? (input.question ?? null) : null,
-          reviewChain: input.reviewChain ?? null,
-          reviewStep: 0,
-          reviewRound: 0,
-          activeThreadId: null,
-          activeRole: null,
-          activePool: null,
-          workThreadId: null,
-          reviewThreadId: null,
-          discussionId: null,
-          wakeNote: null,
-          nudgedAt: null,
-          settledAt: null,
-          createdBy: actor,
-          createdAt: at,
-          updatedAt: at,
-          movedAt: at,
+        const fields: NewCard = {
+          ...input,
+          model,
+          stage: "todo",
+          question: null,
+          projectId:
+            input.projectId ??
+            (thread.projectId === thread.board.defaultProjectId ? null : thread.projectId),
+          // Follow-up work keeps the scrutiny of the card it came from.
+          reviewChain: thread.origin ? thread.origin.reviewChain : (input.reviewChain ?? null),
+          goalId: input.goalId ?? thread.origin?.goalId ?? null,
         };
-        yield* logEvent(card, actor, "created", { toStage: stage });
-        yield* saveCard(card);
-        const needTitle = !input.title?.trim();
-        const needDescription = !input.description?.trim();
-        if (prompt.length > 0 && (needTitle || needDescription)) {
-          yield* forkWriter(card.id, { title: needTitle, description: needDescription });
-        }
-        yield* kick;
-        return card;
+        const draft = yield* draftCard(thread.board.id, fields, { _tag: "thread", threadId });
+        yield* checkTake(thread, threadId, draft);
+        const card = yield* insertCard(draft, fields);
+        return yield* takeCard(threadId, thread.pool, card, "Created and taken by its work thread");
+      }),
+    );
+
+  const nextCards: KanbanServiceShape["nextCards"] = (threadId) =>
+    read(
+      Effect.gen(function* () {
+        const thread = yield* workThreadOf(threadId);
+        const cards = yield* store.cards(thread.board.id);
+        const mine = yield* ownCards(threadId, cards);
+        const slots =
+          (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.slots ??
+          0;
+        // Without a slot of its own the thread can only claim while the pool has room.
+        const full =
+          !thread.holdsSlot &&
+          (Rules.poolThreads(cards, yield* boardHolds(thread.board.id)).get(thread.pool)?.size ??
+            0) >= slots;
+        return {
+          carrying: thread.carried,
+          candidates: full
+            ? []
+            : Rules.relatedCandidates({
+                board: thread.board,
+                cards,
+                groups: yield* store.groups(thread.board.id),
+                seeds: cards.filter((card) => mine.has(card.id)),
+                threadId,
+                pool: thread.pool,
+                projectId: thread.projectId,
+                carrying: thread.carried.length,
+                slots,
+              }),
+          holdsSlot: thread.holdsSlot,
+        } satisfies NextCards;
       }),
     );
 
@@ -1321,6 +1725,19 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
+        // A stop from the owner, an evaluator or another thread is theirs to lift.
+        const by = card.stalled?.by;
+        if (
+          reason === null &&
+          actor._tag === "thread" &&
+          by !== undefined &&
+          !(by._tag === "thread" && by.threadId === actor.threadId)
+        ) {
+          return yield* failWith(
+            "denied",
+            `card #${card.number} was flagged by someone else; only they can clear it`,
+          );
+        }
         const at = yield* nowIso;
         const selfFlag =
           reason !== null && actor._tag === "thread" && card.activeThreadId === actor.threadId;
@@ -1423,10 +1840,15 @@ const make = Effect.gen(function* () {
           return card;
         }
         if (action === "stop") {
-          if (card.activeThreadId !== null)
-            yield* threads.interrupt(card.activeThreadId, text || "Stopped");
+          const kept = yield* letGo(
+            card,
+            false,
+            text.trim() ? `was stopped: ${text.trim()}` : "was stopped",
+          );
           const next: KanbanCard = {
             ...release(card),
+            // A thread that goes on with other cards dropped this one for good.
+            workThreadId: kept ? null : card.workThreadId,
             stage: KANBAN_THREAD_STAGES.includes(card.stage) ? "todo" : card.stage,
             stalled: { reason: text.trim() || "Stopped", by: actor, at },
             movedAt: at,
@@ -1682,6 +2104,10 @@ const make = Effect.gen(function* () {
         }),
       ),
     caller: (threadId) => read(store.threadLink(threadId)),
+    carried: (threadId) => read(store.cardsByThread(threadId)),
+    claimCard,
+    createForThread,
+    nextCards,
     dispatchNow: guard(dispatchUnlocked()),
     turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
     tick: guard(tickUnlocked()),

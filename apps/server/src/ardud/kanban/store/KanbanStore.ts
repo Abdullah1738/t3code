@@ -20,7 +20,7 @@ import {
   KanbanWikiPage,
   type KanbanActor,
   type KanbanBoardId,
-  type KanbanCardId,
+  KanbanCardId,
   type KanbanDiscussionId,
   type KanbanScriptId,
   type KanbanStage,
@@ -113,6 +113,14 @@ const DDL = [
     json TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_threads_card ON ardud_kanban_threads (card_id)`,
+  // Every card a work thread has carried; one thread can serve several cards.
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_thread_cards (
+    thread_id TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, card_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_thread_cards_card ON ardud_kanban_thread_cards (card_id)`,
 ];
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
@@ -168,7 +176,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly card: (cardId: KanbanCardId) => Effect.Effect<KanbanCard | null, KanbanStoreError>;
-  readonly cardByThread: (threadId: string) => Effect.Effect<KanbanCard | null, KanbanStoreError>;
+  /** Cards a thread is running now; one work thread may carry several. */
+  readonly cardsByThread: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly cardsInStage: (
     stage: KanbanStage,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
@@ -257,6 +268,16 @@ export interface KanbanStoreShape {
       | { readonly boardId: KanbanBoardId; readonly open: boolean },
   ) => Effect.Effect<ReadonlyArray<KanbanThreadLink>, KanbanStoreError>;
   readonly putThreadLink: (link: KanbanThreadLink) => Effect.Effect<void, KanbanStoreError>;
+  /** Records that a work thread carries a card (idempotent). */
+  readonly addThreadCard: (
+    threadId: string,
+    cardId: KanbanCardId,
+    at: string,
+  ) => Effect.Effect<void, KanbanStoreError>;
+  /** Cards a work thread has carried, in the order it took them. */
+  readonly threadCards: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardId>, KanbanStoreError>;
 }
 
 export class KanbanStore extends Context.Service<KanbanStore, KanbanStoreShape>()(
@@ -330,12 +351,12 @@ const make = Effect.gen(function* () {
         (rows) => Effect.map(decodeAll(rows, Card.decode), first),
       ),
     );
-  const cardByThread = (threadId: string) =>
+  const cardsByThread = (threadId: string) =>
     run(
-      "read card by thread",
+      "read cards by thread",
       Effect.flatMap(
-        sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} LIMIT 1`,
-        (rows) => Effect.map(decodeAll(rows, Card.decode), first),
+        sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} ORDER BY number`,
+        (rows) => decodeAll(rows, Card.decode),
       ),
     );
   const cardsInStage = (stage: KanbanStage) =>
@@ -667,7 +688,14 @@ const make = Effect.gen(function* () {
       "read thread links",
       Effect.flatMap(
         "cardId" in filter
-          ? sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE card_id = ${filter.cardId} ORDER BY rowid`
+          ? sql<JsonRow>`
+              SELECT json FROM ardud_kanban_threads
+              WHERE card_id = ${filter.cardId}
+                OR thread_id IN (
+                  SELECT thread_id FROM ardud_kanban_thread_cards WHERE card_id = ${filter.cardId}
+                )
+              ORDER BY rowid
+            `
           : filter.open
             ? sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} AND ended = 0 ORDER BY rowid`
             : sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} ORDER BY rowid`,
@@ -689,12 +717,33 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const addThreadCard = (threadId: string, cardId: KanbanCardId, at: string) =>
+    run(
+      "write thread card",
+      sql`
+        INSERT INTO ardud_kanban_thread_cards (thread_id, card_id, joined_at)
+        VALUES (${threadId}, ${cardId}, ${at})
+        ON CONFLICT (thread_id, card_id) DO NOTHING
+      `.pipe(Effect.asVoid),
+    );
+  const threadCards = (threadId: string) =>
+    run(
+      "read thread cards",
+      Effect.map(
+        sql<{ readonly card_id: string }>`
+          SELECT card_id FROM ardud_kanban_thread_cards WHERE thread_id = ${threadId}
+          ORDER BY joined_at, rowid
+        `,
+        (rows) => rows.map((row) => KanbanCardId.make(row.card_id)),
+      ),
+    );
+
   return KanbanStore.of({
     boards,
     putBoard,
     cards,
     card,
-    cardByThread,
+    cardsByThread,
     cardsInStage,
     nextCardNumber,
     putCard,
@@ -728,6 +777,8 @@ const make = Effect.gen(function* () {
     threadLink,
     threadLinks,
     putThreadLink,
+    addThreadCard,
+    threadCards,
   });
 });
 

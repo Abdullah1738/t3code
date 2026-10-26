@@ -85,11 +85,14 @@ it.layer(TestLayer)("kanban store", (it) => {
       yield* store.putCard(card(2, "working"));
       assert.equal(yield* store.nextCardNumber(boardId), 3);
       assert.equal((yield* store.cards(boardId)).length, 2);
-      assert.equal((yield* store.cardByThread("thread-2"))?.number, 2);
+      assert.deepStrictEqual(
+        (yield* store.cardsByThread("thread-2")).map((entry) => entry.number),
+        [2],
+      );
       assert.equal((yield* store.cardsInStage("todo")).length, 1);
 
       yield* store.putCard({ ...card(2, "needs_review"), activeThreadId: null });
-      assert.equal(yield* store.cardByThread("thread-2"), null);
+      assert.equal((yield* store.cardsByThread("thread-2")).length, 0);
 
       const event = yield* store.addCardEvent({
         cardId: KanbanCardId.make("card-1"),

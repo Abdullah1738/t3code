@@ -1,5 +1,7 @@
 import type { KanbanBoard, KanbanCard, KanbanGoal, KanbanReviewChain } from "@t3tools/contracts";
 
+import { MAX_BATCH } from "./rules.ts";
+
 const lines = (...parts: ReadonlyArray<string | null | false | undefined>) =>
   parts.filter((part): part is string => typeof part === "string").join("\n");
 
@@ -23,6 +25,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "",
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
+    card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
     "",
     "How the board works:",
     "- Your card tools: card_get, card_update, card_move, card_flag, discussion_post, wiki_read.",
@@ -31,7 +34,32 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "- If you can't continue (missing access, broken env), call card_flag with the reason.",
     "- Messages from the card discussion arrive here. Answer them with discussion_post; plain replies in this thread are not seen there.",
     "- Read the board wiki (wiki_read) for lessons that apply to this work.",
+    "",
+    "Taking more cards (reuse your context instead of handing it back):",
+    `- One thread can carry up to ${MAX_BATCH} cards at once. Each card still moves to needs_review on its own and gets its own review.`,
+    "- card_next lists related todo cards (same group, blocking or blocked, same PR or Linear issue). card_claim takes one into this thread.",
+    "- Found more work while doing this? card_create with assignToSelf true makes a card and gives it to you right away; without it the card waits in todo for another thread.",
+    "- After a card moves on, check card_next before you stop: take a related card if you have the context for it, otherwise just end.",
+    "- With more than one card, name the card (#number) in every card tool call, and attach each card's own PRs with card_update (links): the board stops attaching this thread's PRs for you once it carries several cards.",
   );
+
+/** What a work thread gets for a card it took into its run (claimed or created). */
+export const claimBrief = (card: KanbanCard, goal: KanbanGoal | null, note: string | null) =>
+  lines(
+    `Card #${card.number} is now yours too, in this thread.`,
+    "",
+    cardFacts(card, goal),
+    "",
+    "Task:",
+    card.prompt.trim() || card.description.trim() || card.title,
+    note?.trim() ? `\nWaiting for this card:\n${note.trim()}` : null,
+    "",
+    `Pass card "#${card.number}" to card_update, card_move and card_flag for this card. Attach its PRs yourself with card_update (links) before moving it to needs_review: with several cards on this thread the board can't tell which PR is whose.`,
+  );
+
+/** Sent when a card is taken off a thread that keeps working on other cards. */
+export const dropCardText = (card: KanbanCard, what: string, others: ReadonlyArray<KanbanCard>) =>
+  `Card #${card.number} ${what}, so it is no longer yours: stop working on it. Carry on with ${others.map((other) => `#${other.number}`).join(", ")}.`;
 
 /** Sent when the dispatcher wakes an existing work thread. */
 export const wakeText = (card: KanbanCard) =>
@@ -163,14 +191,16 @@ export const ownerMessageText = (discussionTitle: string, discussionId: string, 
     "",
     text,
     "",
-    "Reply with discussion_post.",
+    `Reply with discussion_post (discussionId ${discussionId}).`,
   );
 
 export const nudgeDiscussionText = (discussionId: string) =>
   `The owner is waiting for your reply in discussion ${discussionId}. Post it with discussion_post.`;
 
-export const nudgeWorkText = (card: KanbanCard) =>
-  `Card #${card.number} is still in Working. If the work is done, card_move to needs_review. If you need the owner, card_move to needs_owner with the question. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
+export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
+  const names = cards.map((card) => `#${card.number}`).join(", ");
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, card_move to needs_owner with the question. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
+};
 
 export const nudgeReviewText = (card: KanbanCard) =>
   `Card #${card.number}: record your verdict with card_review_result (clear or findings).`;

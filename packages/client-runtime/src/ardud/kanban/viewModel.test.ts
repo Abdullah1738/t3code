@@ -19,6 +19,7 @@ import {
   goalProgress,
   groupCards,
   mergeMessages,
+  poolViews,
   stageBoard,
 } from "./viewModel.ts";
 
@@ -154,6 +155,25 @@ describe("stageBoard", () => {
     expect(view.owner.cards[0]!.flag).toEqual({ kind: "ask", label: "Window?" });
     expect(view.shipped.flatMap((column) => column.cards.map((c) => c.number))).toEqual([6]);
     expect(view.total).toBe(5);
+  });
+});
+
+describe("poolViews", () => {
+  it("counts a busy slot per thread, not per card", () => {
+    const base = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "working", activeThreadId: "t-a" as never, activePool: "opencode/opus" }),
+        card(2, { stage: "working", activeThreadId: "t-a" as never, activePool: "opencode/opus" }),
+        card(3, {
+          stage: "in_review",
+          activeThreadId: "t-b" as never,
+          activePool: "opencode/opus",
+        }),
+        card(4, { stage: "todo", workThreadId: "t-c" as never }),
+      ]),
+    );
+    const state = { ...base, pools: [{ key: "opencode/opus", model, slots: 3 }] };
+    expect(poolViews(state).map((pool) => [pool.busy, pool.slots])).toEqual([[2, 3]]);
   });
 });
 

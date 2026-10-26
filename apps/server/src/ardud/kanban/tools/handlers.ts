@@ -95,6 +95,27 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   return yield* invalid("Pass boardId: this thread is not on a board.");
 });
 
+/**
+ * The caller's own card when it names none: a review thread's card, or the
+ * one card a work thread carries. A work thread carrying several must say.
+ */
+const defaultCard = Effect.fn("KanbanTools.defaultCard")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+) {
+  if (caller.link?.role === "work") {
+    const carried = yield* service.carried(caller.threadId);
+    if (carried.length === 1 && carried[0]) return carried[0];
+    if (carried.length > 1) {
+      return yield* invalid(
+        `Pass card: this thread carries ${carried.map((card) => `#${card.number}`).join(", ")}.`,
+      );
+    }
+  }
+  if (caller.link?.cardId) return (yield* service.card(caller.link.cardId)).card;
+  return yield* invalid("Pass card: this thread has no card of its own.");
+});
+
 /** A card id ("card-...") or number ("#12"/"12"); defaults to the caller's own card. */
 const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   service: KanbanService["Service"],
@@ -102,10 +123,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   ref: string | undefined,
 ) {
   const trimmed = ref?.trim();
-  if (!trimmed) {
-    if (caller.link?.cardId) return (yield* service.card(caller.link.cardId)).card;
-    return yield* invalid("Pass card: this thread has no card of its own.");
-  }
+  if (!trimmed) return yield* defaultCard(service, caller);
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
     const board = yield* boardFor(service, caller);
@@ -117,11 +135,28 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   return (yield* service.card(KanbanCardId.make(trimmed))).card;
 });
 
-/** Card threads may only act on their own card. */
+/**
+ * Card threads act only on their own cards: a review thread on its card, a
+ * work thread on the cards it still works on (one moved to another thread is
+ * no longer its own, even the one it started with).
+ */
 const ownCard = (caller: Caller, card: KanbanCard) =>
-  isCardThread(caller) && caller.link?.cardId !== card.id
-    ? refuse(`This thread works on another card; it can't change card #${card.number}.`)
-    : Effect.void;
+  !isCardThread(caller) ||
+  (caller.link?.role === "work"
+    ? card.workThreadId === caller.threadId
+    : caller.link?.cardId === card.id)
+    ? Effect.void
+    : refuse(`This thread works on other cards; it can't change card #${card.number}.`);
+
+/** The card a work thread's new cards follow on from: one it carries, else the one it started with. */
+const workOrigin = Effect.fn("KanbanTools.workOrigin")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+) {
+  const [carried] = yield* service.carried(caller.threadId);
+  if (carried) return carried;
+  return caller.link?.cardId ? (yield* service.card(caller.link.cardId)).card : null;
+});
 
 const modelOf = (input: ModelInput): ModelSelection => modelSelectionOf(input);
 
@@ -140,7 +175,13 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
 ) {
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
-  if (caller.link?.cardId) return yield* service.cardDiscussion(caller.link.cardId);
+  if (isCardThread(caller)) {
+    if (caller.link?.role === "work" && (yield* service.carried(caller.threadId)).length > 1) {
+      return yield* invalid("Pass discussionId: this thread carries several cards.");
+    }
+    const card = yield* defaultCard(service, caller);
+    return yield* service.cardDiscussion(card.id);
+  }
   return yield* invalid("Pass discussionId: this thread has no discussion of its own.");
 });
 
@@ -280,30 +321,83 @@ const handlers = {
   ),
 
   card_create: McpToolAccess.actsAsCaller((input) =>
-    asEvaluator((service, caller) =>
+    withCaller((service, caller) =>
       Effect.gen(function* () {
+        if (caller.link?.role === "review") {
+          return yield* refuse("Review threads report findings; they don't create cards.");
+        }
+        const isWorker = caller.link?.role === "work";
+        if (input.assignToSelf && !isWorker) {
+          return yield* refuse("Only a card's work thread can take a card with assignToSelf.");
+        }
         const board = yield* boardFor(service, caller);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy);
+        // Follow-up work keeps the review chain and goal of the card it came from.
+        const origin = isWorker ? yield* workOrigin(service, caller) : null;
+        const fields = {
+          prompt: input.prompt,
+          title: input.title,
+          description: input.description,
+          priority: input.priority,
+          goalId: input.goalId ? KanbanGoalId.make(input.goalId) : (origin?.goalId ?? null),
+          projects: input.projects,
+          model: input.model ? modelOf(input.model) : undefined,
+          projectId: input.projectId ? ProjectId.make(input.projectId) : null,
+          links: input.links,
+          blockedBy,
+          reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
+        };
+        if (input.assignToSelf) {
+          return yield* service.createForThread(caller.threadId, fields);
+        }
+        if (isWorker && input.stage === "needs_owner") {
+          return yield* refuse(
+            "Work threads ask the owner by moving their own card to needs_owner.",
+          );
+        }
         const card = yield* service.createCard(
           board.id,
-          {
-            prompt: input.prompt,
-            title: input.title,
-            description: input.description,
-            priority: input.priority,
-            goalId: input.goalId ? KanbanGoalId.make(input.goalId) : null,
-            projects: input.projects,
-            model: input.model ? modelOf(input.model) : undefined,
-            projectId: input.projectId ? ProjectId.make(input.projectId) : null,
-            links: input.links,
-            blockedBy,
-            stage: input.stage,
-            question: input.question ?? null,
-            reviewChain: input.reviewChain ?? null,
-          },
+          { ...fields, stage: input.stage, question: input.question ?? null },
           caller.actor,
         );
         return { card };
+      }),
+    ),
+  ),
+
+  card_claim: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "work") {
+          return yield* refuse("Only a card's work thread takes cards into its run.");
+        }
+        const card = yield* cardFor(service, caller, input.card);
+        return yield* service.claimCard(caller.threadId, card.id);
+      }),
+    ),
+  ),
+
+  card_next: McpToolAccess.readsAsCaller(() =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "work") {
+          return yield* refuse("Only a card's work thread asks for its next card.");
+        }
+        const next = yield* service.nextCards(caller.threadId);
+        return {
+          carrying: next.carrying.map((card) => ({
+            card: `#${card.number}`,
+            title: card.title,
+            stage: card.stage,
+          })),
+          candidates: next.candidates.map(({ card, why }) => ({
+            card: `#${card.number}`,
+            title: card.title,
+            priority: card.priority,
+            why,
+          })),
+          holdsSlot: next.holdsSlot,
+        };
       }),
     ),
   ),

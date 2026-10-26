@@ -514,16 +514,19 @@ export interface PoolView {
 
 export function poolViews(state: KanbanBoardState): PoolView[] {
   return state.pools.map((pool) => {
-    let busy = 0;
+    // A slot belongs to a thread, and one thread can carry several cards.
+    const threads = new Set<string>();
     for (const card of state.cards.values()) {
-      if (card.activePool === pool.key && card.activeThreadId !== null) busy += 1;
+      if (card.activePool === pool.key && card.activeThreadId !== null) {
+        threads.add(card.activeThreadId);
+      }
     }
     return {
       key: pool.key,
       name: modelName(pool.model),
       variant: modelVariant(pool.model),
       slots: pool.slots,
-      busy,
+      busy: threads.size,
       model: pool.model,
     };
   });

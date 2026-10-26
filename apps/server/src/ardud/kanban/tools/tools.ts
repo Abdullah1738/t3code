@@ -16,6 +16,7 @@ import * as Schema from "effect/Schema";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
+import { MAX_BATCH } from "../engine/rules.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -31,7 +32,7 @@ const describe = <S extends Schema.Top>(schema: S, description: string) =>
 
 const CardRef = describe(
   TrimmedNonEmptyString,
-  'Card id or number ("#12" or "12"). Defaults to your own card when you are a card thread.',
+  'Card id or number ("#12" or "12"). Defaults to your own card when you are a card thread carrying one card.',
 );
 
 export const ModelInput = Schema.Struct({
@@ -195,9 +196,15 @@ const WikiRead = tool(
 const CardCreate = tool(
   "card_create",
   "Create a card",
-  "Evaluators: create a card in todo (the dispatcher starts it when a slot is free) or needs_owner (with the question). The prompt is what the work thread gets; title and description are written for you when left out.",
+  "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; title and description are written for you when left out.",
   {
     prompt: Schema.String,
+    assignToSelf: Schema.optional(
+      describe(
+        Schema.Boolean,
+        "Work threads: take the card yourself now. It runs on your model and project.",
+      ),
+    ),
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     priority: Schema.optional(describe(Schema.Int, "1 (urgent) to 4; default 3.")),
@@ -215,8 +222,26 @@ const CardCreate = tool(
       describe(Schema.String, "Review chain name; default the board's."),
     ),
   },
-  { card: Record },
+  { card: Record, brief: Schema.optional(Schema.String) },
   { readonly: false },
+);
+
+const CardClaim = tool(
+  "card_claim",
+  "Take a todo card",
+  `Work threads: take a todo card into this thread to reuse your context. It must run on your model and project, not be blocked by work outside this thread or kept for another work thread, and you can carry at most ${MAX_BATCH} cards. The card moves to working on this thread; you get its task back.`,
+  { card: CardRef },
+  { card: Record, brief: Schema.String },
+  { readonly: false },
+);
+
+const CardNext = tool(
+  "card_next",
+  "Related cards to take next",
+  "Work threads: the cards you carry, and related todo cards you could take (same group, blocking or blocked, same PR or Linear issue), each with why. Use after a card moves on, before you stop; take one with card_claim or just end.",
+  {},
+  { carrying: Records, candidates: Records, holdsSlot: Schema.Boolean },
+  { readonly: true },
 );
 
 const CardEdit = tool(
@@ -352,6 +377,8 @@ export const KanbanToolkit = Toolkit.make(
   DiscussionRead,
   WikiRead,
   CardCreate,
+  CardClaim,
+  CardNext,
   CardEdit,
   CardThread,
   PoolSet,
