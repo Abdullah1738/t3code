@@ -183,7 +183,7 @@ body{
    the script hides any line of text the header would cut in half (a photo may peek in under it). */
 @media (max-height:480px) and (max-width:480px){
   .bar{padding-left:44px}
-  .text,.tr{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+  .text,.tr{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;text-overflow:ellipsis}
   .cap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pic{width:min(200px,64vw);aspect-ratio:16/9}
   .pic::after{display:none}
