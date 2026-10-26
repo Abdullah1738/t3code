@@ -39,6 +39,7 @@ import { Route as ChatMissionsInboxRouteImport } from './routes/_chat.missions.i
 import { Route as ChatMissionsMissionIdRouteImport } from './routes/_chat.missions.$missionId'
 import { Route as ChatImessageChatSlugRouteImport } from './routes/_chat.imessage.$chatSlug'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
+import { Route as ChatBoardsBoardIdRouteImport } from './routes/_chat.boards.$boardId'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
 
 const WelcomeRoute = WelcomeRouteImport.update({
@@ -191,6 +192,11 @@ const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   path: '/draft/$draftId',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatBoardsBoardIdRoute = ChatBoardsBoardIdRouteImport.update({
+  id: '/boards/$boardId',
+  path: '/boards/$boardId',
+  getParentRoute: () => ChatRoute,
+} as any)
 const ChatEnvironmentIdThreadIdRoute =
   ChatEnvironmentIdThreadIdRouteImport.update({
     id: '/$environmentId/$threadId',
@@ -224,6 +230,7 @@ export interface FileRoutesByFullPath {
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
+  '/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
   '/missions/$missionId': typeof ChatMissionsMissionIdRoute
@@ -256,6 +263,7 @@ export interface FileRoutesByTo {
   '/settings/storage': typeof SettingsStorageRoute
   '/': typeof ChatIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
+  '/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
   '/missions/$missionId': typeof ChatMissionsMissionIdRoute
@@ -290,6 +298,7 @@ export interface FileRoutesById {
   '/settings/storage': typeof SettingsStorageRoute
   '/_chat/': typeof ChatIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
+  '/_chat/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/_chat/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
   '/_chat/missions/$missionId': typeof ChatMissionsMissionIdRoute
@@ -324,6 +333,7 @@ export interface FileRouteTypes {
     | '/settings/source-control'
     | '/settings/storage'
     | '/$environmentId/$threadId'
+    | '/boards/$boardId'
     | '/draft/$draftId'
     | '/imessage/$chatSlug'
     | '/missions/$missionId'
@@ -356,6 +366,7 @@ export interface FileRouteTypes {
     | '/settings/storage'
     | '/'
     | '/$environmentId/$threadId'
+    | '/boards/$boardId'
     | '/draft/$draftId'
     | '/imessage/$chatSlug'
     | '/missions/$missionId'
@@ -389,6 +400,7 @@ export interface FileRouteTypes {
     | '/settings/storage'
     | '/_chat/'
     | '/_chat/$environmentId/$threadId'
+    | '/_chat/boards/$boardId'
     | '/_chat/draft/$draftId'
     | '/_chat/imessage/$chatSlug'
     | '/_chat/missions/$missionId'
@@ -619,6 +631,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatDraftDraftIdRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/boards/$boardId': {
+      id: '/_chat/boards/$boardId'
+      path: '/boards/$boardId'
+      fullPath: '/boards/$boardId'
+      preLoaderRoute: typeof ChatBoardsBoardIdRouteImport
+      parentRoute: typeof ChatRoute
+    }
     '/_chat/$environmentId/$threadId': {
       id: '/_chat/$environmentId/$threadId'
       path: '/$environmentId/$threadId'
@@ -634,6 +653,7 @@ interface ChatRouteChildren {
   ChatPullRequestsRoute: typeof ChatPullRequestsRoute
   ChatIndexRoute: typeof ChatIndexRoute
   ChatEnvironmentIdThreadIdRoute: typeof ChatEnvironmentIdThreadIdRoute
+  ChatBoardsBoardIdRoute: typeof ChatBoardsBoardIdRoute
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
   ChatImessageChatSlugRoute: typeof ChatImessageChatSlugRoute
   ChatMissionsMissionIdRoute: typeof ChatMissionsMissionIdRoute
@@ -646,6 +666,7 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatPullRequestsRoute: ChatPullRequestsRoute,
   ChatIndexRoute: ChatIndexRoute,
   ChatEnvironmentIdThreadIdRoute: ChatEnvironmentIdThreadIdRoute,
+  ChatBoardsBoardIdRoute: ChatBoardsBoardIdRoute,
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
   ChatImessageChatSlugRoute: ChatImessageChatSlugRoute,
   ChatMissionsMissionIdRoute: ChatMissionsMissionIdRoute,

@@ -1,0 +1,15 @@
+/*
+ * Board tokens on top of the Missions `--m-*` set. The warm band marks the
+ * Needs Owner column; under Desk it takes the exact design value.
+ */
+:root {
+  --m-warnband: color-mix(in oklab, var(--warning-foreground) 9%, var(--background));
+}
+
+html[data-theme-id="desk"] {
+  --m-warnband: #fbf4ea;
+}
+
+html[data-theme-id="desk"].dark {
+  --m-warnband: #2a2217;
+}

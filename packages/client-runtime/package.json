@@ -71,6 +71,10 @@
       "types": "./src/ardud/missions/mobile/index.ts",
       "default": "./src/ardud/missions/mobile/index.ts"
     },
+    "./ardud/kanban": {
+      "types": "./src/ardud/kanban/index.ts",
+      "default": "./src/ardud/kanban/index.ts"
+    },
     "./connection": {
       "types": "./src/connection/index.ts",
       "default": "./src/connection/index.ts"

@@ -472,7 +472,8 @@ const make = Effect.gen(function* () {
     } satisfies KanbanBoardSnapshot;
   });
 
-  // Callers hold the lock.
+  // Callers hold the lock, and log a card's event before saving it: clients
+  // re-read the card's history when its change is published.
 
   const saveCard = Effect.fn("KanbanService.saveCard")(function* (card: KanbanCard) {
     yield* store.putCard(card);
@@ -530,12 +531,12 @@ const make = Effect.gen(function* () {
       question: to === "needs_owner" ? (options.question ?? card.question) : null,
       reviewStep: card.stage === "working" && to === "needs_review" ? 0 : card.reviewStep,
     };
-    yield* saveCard(next);
     yield* logEvent(next, actor, "moved", {
       fromStage: card.stage,
       toStage: to,
       body: options.note ?? null,
     });
+    yield* saveCard(next);
     yield* kick;
     return next;
   });
@@ -814,12 +815,12 @@ const make = Effect.gen(function* () {
           movedAt: at,
           updatedAt: at,
         };
-        yield* saveCard(next);
         yield* logEvent(next, { _tag: "owner" }, "moved", {
           fromStage: card.stage,
           toStage: "todo",
           body: "Owner replied",
         });
+        yield* saveCard(next);
         yield* saveDiscussion(
           withParticipant(discussion, { _tag: "thread", threadId: card.workThreadId }, "Worker", {
             lastReadSeq: discussion.lastSeq,
@@ -952,8 +953,8 @@ const make = Effect.gen(function* () {
         stalled: { reason: "No project set for this card", by: system, at },
         updatedAt: at,
       };
-      yield* saveCard(next);
       yield* logEvent(next, system, "flagged", { body: "No project set for this card" });
+      yield* saveCard(next);
       return;
     }
     const goal = yield* goalOf(card);
@@ -1017,8 +1018,8 @@ const make = Effect.gen(function* () {
       movedAt: at,
       updatedAt: at,
     };
-    yield* saveCard(next);
     yield* logEvent(next, system, "moved", { fromStage: card.stage, toStage: to });
+    yield* saveCard(next);
   });
 
   const dispatchUnlocked = Effect.fn("KanbanService.dispatchUnlocked")(function* () {
@@ -1093,12 +1094,12 @@ const make = Effect.gen(function* () {
       movedAt: at,
       updatedAt: at,
     };
-    yield* saveCard(next);
     yield* logEvent(next, system, "flagged", {
       fromStage: synced.stage,
       toStage: next.stage,
       body: reason,
     });
+    yield* saveCard(next);
     yield* kick;
   });
 
@@ -1241,8 +1242,8 @@ const make = Effect.gen(function* () {
           updatedAt: at,
           movedAt: at,
         };
-        yield* saveCard(card);
         yield* logEvent(card, actor, "created", { toStage: stage });
+        yield* saveCard(card);
         const needTitle = !input.title?.trim();
         const needDescription = !input.description?.trim();
         if (prompt.length > 0 && (needTitle || needDescription)) {
@@ -1273,7 +1274,6 @@ const make = Effect.gen(function* () {
           reviewChain: patch.reviewChain === undefined ? card.reviewChain : patch.reviewChain,
           updatedAt: at,
         };
-        yield* saveCard(next);
         const changed = Object.entries(patch)
           .filter(([key, value]) => key !== "comment" && value !== undefined)
           .map(([key]) => key);
@@ -1283,6 +1283,7 @@ const make = Effect.gen(function* () {
           });
         if (patch.comment?.trim())
           yield* logEvent(next, actor, "comment", { body: patch.comment.trim() });
+        yield* saveCard(next);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });
         }
@@ -1336,12 +1337,12 @@ const make = Effect.gen(function* () {
               movedAt: at,
             }
           : flagged;
-        yield* saveCard(next);
         yield* logEvent(next, actor, "flagged", {
           fromStage: card.stage,
           toStage: next.stage,
           body: reason ?? "Cleared",
         });
+        yield* saveCard(next);
         yield* kick;
         return next;
       }),
@@ -1355,8 +1356,8 @@ const make = Effect.gen(function* () {
           return yield* failWith("denied", "only verified cards can be settled");
         const at = yield* nowIso;
         const next = { ...card, settledAt: at, updatedAt: at };
-        yield* saveCard(next);
         yield* logEvent(next, { _tag: "owner" }, "edited", { body: "Settled" });
+        yield* saveCard(next);
         return next;
       }),
     );
@@ -1397,12 +1398,12 @@ const make = Effect.gen(function* () {
           movedAt: at,
           updatedAt: at,
         };
-        yield* saveCard(next);
         yield* logEvent(next, { _tag: "thread", threadId }, "review", {
           fromStage: card.stage,
           toStage: next.stage,
           body,
         });
+        yield* saveCard(next);
         yield* kick;
         return next;
       }),
@@ -1431,12 +1432,12 @@ const make = Effect.gen(function* () {
             movedAt: at,
             updatedAt: at,
           };
-          yield* saveCard(next);
           yield* logEvent(next, actor, "flagged", {
             fromStage: card.stage,
             toStage: next.stage,
             body: next.stalled?.reason ?? null,
           });
+          yield* saveCard(next);
           return next;
         }
         if (card.activeThreadId !== null) {
@@ -1453,12 +1454,12 @@ const make = Effect.gen(function* () {
           movedAt: at,
           updatedAt: at,
         };
-        yield* saveCard(next);
         yield* logEvent(next, actor, "moved", {
           fromStage: card.stage,
           toStage: next.stage,
           body: "Woken",
         });
+        yield* saveCard(next);
         yield* kick;
         return next;
       }),

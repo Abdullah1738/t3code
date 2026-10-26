@@ -285,6 +285,8 @@ import { useMissionList } from "../ardud/missions/missionsStore";
 import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
 import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
 import { IMessageSidebarGroup } from "../ardud/imessage/IMessageSidebarGroup";
+// ardud kanban: ui-web
+import { BoardsSidebarGroup } from "../ardud/kanban/BoardsSidebarGroup";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -4725,6 +4727,8 @@ export default function Sidebar() {
         }
       >
         {/* ardud missions: ui-web */}
+        {/* ardud kanban: ui-web */}
+        {!isSearchingThreads ? <BoardsSidebarGroup /> : null}
         {!isSearchingThreads ? <MissionsSidebarGroup /> : null}
         {/* ardud imessage: ui-web */}
         {!isSearchingThreads ? <IMessageSidebarGroup /> : null}
