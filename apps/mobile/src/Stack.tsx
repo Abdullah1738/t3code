@@ -132,6 +132,10 @@ import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 import { MissionRecordRouteScreen } from "./ardud/missions/MissionRecordRouteScreen";
 import { MissionsRouteScreen } from "./ardud/missions/MissionsRouteScreen";
 // end ardud missions: ui-mobile
+// ardud kanban: ui-mobile
+import { KanbanBoardRouteScreen } from "./ardud/kanban/KanbanBoardRouteScreen";
+import { KanbanRecordRouteScreen } from "./ardud/kanban/KanbanRecordRouteScreen";
+// end ardud kanban: ui-mobile
 // ardud imessage: mobile
 import { IMessageChatRouteScreen } from "./ardud/imessage/IMessageChatRouteScreen";
 // end ardud imessage: mobile
@@ -796,6 +800,18 @@ const RootStackConfig = createWorkspaceStackNavigator({
       options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
     }),
     // end ardud missions: ui-mobile
+    // ardud kanban: ui-mobile
+    KanbanBoard: createNativeStackScreen({
+      screen: KanbanBoardRouteScreen,
+      linking: "boards/:boardId",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Board" },
+    }),
+    KanbanRecord: createNativeStackScreen({
+      screen: KanbanRecordRouteScreen,
+      linking: "boards/:boardId/:kind/:id?",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Board" },
+    }),
+    // end ardud kanban: ui-mobile
     // ardud imessage: mobile
     IMessageChat: createNativeStackScreen({
       screen: IMessageChatRouteScreen,

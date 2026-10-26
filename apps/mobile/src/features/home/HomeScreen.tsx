@@ -91,6 +91,9 @@ import { ThreadListFilters } from "./ThreadListFilters";
 // ardud missions: mobile
 import { MissionsThreadGroup } from "../../ardud/missions/MissionsThreadGroup";
 // end ardud missions: mobile
+// ardud kanban: ui-mobile
+import { KanbanBoardsGroup } from "../../ardud/kanban/KanbanBoardsGroup";
+// end ardud kanban: ui-mobile
 // ardud imessage: mobile
 import { IMessageThreadGroup } from "../../ardud/imessage/IMessageThreadGroup";
 // end ardud imessage: mobile
@@ -801,6 +804,9 @@ export function HomeScreen(props: HomeScreenProps) {
       {/* ardud missions: mobile */}
       {hasSearchQuery ? null : <MissionsThreadGroup />}
       {/* end ardud missions: mobile */}
+      {/* ardud kanban: ui-mobile */}
+      {hasSearchQuery ? null : <KanbanBoardsGroup />}
+      {/* end ardud kanban: ui-mobile */}
       {/* ardud imessage: mobile */}
       {hasSearchQuery ? null : <IMessageThreadGroup />}
       {/* end ardud imessage: mobile */}
