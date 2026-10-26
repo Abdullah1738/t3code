@@ -302,8 +302,18 @@ export function measure(opts) {
       if (size < 1) continue;
       const odd = oddIn(el);
       const fixed = fixedOf(el);
+      // Rects made only of white space (a space pre-wrap hangs past the line end) carry
+      // no ink, so they can't be sliced; drop them by matching each whitespace run's rects.
+      const blank = new Set();
+      for (const w of n.data.matchAll(/\s+/g)) {
+        const wr = document.createRange();
+        wr.setStart(n, w.index);
+        wr.setEnd(n, w.index + w[0].length);
+        for (const r of wr.getClientRects()) blank.add([r.left, r.top, r.right, r.bottom].join());
+      }
       for (const r of range.getClientRects()) {
         if (r.width < 0.5 || r.height < 0.5) continue;
+        if (blank.has([r.left, r.top, r.right, r.bottom].join())) continue;
         const b = box(r);
         out.push({ ...b, vis: meet(b, clip), ell: ellipsisOf(el), clamp: clampOf(el), blk: blockOf(el), sel: path(el), text, node, size, ...(odd && { odd }), ...(fixed && { fixed }) });
       }
