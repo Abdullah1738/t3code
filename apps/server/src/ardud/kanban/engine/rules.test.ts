@@ -393,11 +393,13 @@ describe("thread batching", () => {
       workThreadId: ThreadId.make("t2"),
     });
     const heldInTurn = card({ workThreadId: t1, blockedBy: [other.id] });
+    const asking = card({ workThreadId: t1, stage: "needs_owner", question: "Which fee?" });
     const fine = card({ workThreadId: t1 });
-    const all = [paused, stalled, other, heldInTurn, fine];
+    const all = [paused, stalled, other, heldInTurn, asking, fine];
     const waiters = all.map((blocker) => card({ workThreadId: t1, blockedBy: [blocker.id] }));
     const byId = new Map([...all, ...waiters].map((c) => [c.id as string, c]));
     expect(waiters.map((waiter) => isBlocked(waiter, byId))).toEqual([
+      true,
       true,
       true,
       true,

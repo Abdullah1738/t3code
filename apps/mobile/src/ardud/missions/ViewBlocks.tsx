@@ -36,6 +36,8 @@ import {
   viewMarkdownPreview,
 } from "@t3tools/client-runtime/ardud/missions";
 import { missionErrorMessage } from "@t3tools/client-runtime/ardud/missions/mobile";
+import { useNavigation } from "@react-navigation/native";
+import { parseThreadLinkHref } from "@t3tools/shared/threadLinks";
 import { Image } from "expo-image";
 import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { FlatList, Modal, Pressable, ScrollView, View } from "react-native";
@@ -263,13 +265,25 @@ function CollapsibleRows(
   );
 }
 
-const openMarkdownLink = (href: string) => void tryOpenExternalUrl(href, "markdown-link");
+/** Thread links open the thread's screen (after `before`, e.g. closing a reader); others open outside. */
+function useOpenMarkdownLink(before?: () => void) {
+  const navigation = useNavigation();
+  const environmentId = useMissionsEnvironmentId();
+  return (href: string) => {
+    const threadId = parseThreadLinkHref(href);
+    if (threadId === null) return void tryOpenExternalUrl(href, "markdown-link");
+    if (environmentId === null) return;
+    before?.();
+    navigation.navigate("Thread", { environmentId, threadId });
+  };
+}
 
 /** Markdown folded to `maxLines`; long text opens in a full-screen reader. */
 export function MarkdownText(props: { readonly text: string; readonly maxLines: number | null }) {
   const styles = useMarkdownPreviewStyles();
   const [unfolded, setUnfolded] = useState(false);
   const [reading, setReading] = useState(false);
+  const openMarkdownLink = useOpenMarkdownLink();
   const [height, setHeight] = useState<number | null>(null);
   const preview = useMemo(
     () =>
@@ -343,6 +357,7 @@ function MarkdownReader(props: { readonly text: string; readonly onClose: () => 
 
 function MarkdownReaderBody(props: { readonly text: string; readonly onClose: () => void }) {
   const styles = useMarkdownPreviewStyles();
+  const openMarkdownLink = useOpenMarkdownLink(props.onClose);
   const insets = useSafeAreaInsets();
   const chunks = useMemo(() => viewMarkdownChunks(props.text), [props.text]);
   return (

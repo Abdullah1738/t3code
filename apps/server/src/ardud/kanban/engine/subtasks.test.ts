@@ -1,7 +1,15 @@
 import { kanbanEvaluatorStep, kanbanOpenStep, kanbanStepSubtasks } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { checkMark, markSubtask, passReview, planSubtasks, subtaskLines } from "./subtasks.ts";
+import {
+  checkMark,
+  markSubtask,
+  PACKET_SUBTASK,
+  passReview,
+  planSubtasks,
+  subtaskLines,
+  withPacketStep,
+} from "./subtasks.ts";
 
 const owner = { _tag: "owner" } as const;
 const at = "2026-10-26T12:00:00.000Z";
@@ -99,5 +107,27 @@ describe("marking subtasks", () => {
     card = { subtasks: markSubtask(card.subtasks, "s5", "skipped", "no tickets", owner, at) };
     expect(kanbanOpenStep(card)).toBe(4);
     expect(subtaskLines(card)).toContain("s5 step 4, evaluator (skipped: no tickets)");
+  });
+});
+
+describe("withPacketStep", () => {
+  it("puts the evaluator's packet first and moves the given steps one later", () => {
+    const plan = planSubtasks(
+      [],
+      withPacketStep([
+        { text: "Fix it", owner: "work" },
+        { text: "Tell QA", owner: "evaluator", step: 2 },
+        { text: "Ping the owner", owner: "evaluator", step: 2 },
+      ]),
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.subtasks.map((subtask) => [subtask.step, subtask.owner])).toEqual([
+      [1, "evaluator"],
+      [2, "work"],
+      [3, "evaluator"],
+      [3, "evaluator"],
+    ]);
+    expect(plan.subtasks[0]?.text).toBe(PACKET_SUBTASK);
   });
 });

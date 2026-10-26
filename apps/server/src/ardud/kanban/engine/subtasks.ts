@@ -22,6 +22,22 @@ export interface SubtaskInput {
   readonly owner: KanbanSubtask["owner"];
 }
 
+/**
+ * What an evaluator does first on a card a thread or a script made: the prompt
+ * it came with is a note, and the work thread (maybe the cheapest model) only
+ * gets the prompt.
+ */
+export const PACKET_SUBTASK =
+  "Write the packet: read what the card points at (sessions, PRs, the code, the architecture) and rewrite its prompt with card_edit so the cheapest model can do it: scope, files, steps, tests, and when it's done. Add the rest of the plan.";
+
+/** Puts the packet first; every step the inputs set moves one later. */
+export const withPacketStep = (
+  inputs: ReadonlyArray<SubtaskInput>,
+): ReadonlyArray<SubtaskInput> => [
+  { step: 1, text: PACKET_SUBTASK, owner: "evaluator" },
+  ...inputs.map((input) => (input.step === undefined ? input : { ...input, step: input.step + 1 })),
+];
+
 export type SubtaskPlan =
   | { readonly ok: true; readonly subtasks: ReadonlyArray<KanbanSubtask> }
   | { readonly ok: false; readonly reason: string };
@@ -158,11 +174,13 @@ export function passReview(
 
 /**
  * Stages a card goes back to work from once its plan's next step is the
- * worker's. Todo is already there; working and in_review have a live thread;
- * needs_owner waits on the owner's answer.
+ * worker's, when no thread is on it. Todo is already there; working always has
+ * a live thread; in_review has none once its review passed and it waits for
+ * its PRs; needs_owner waits on the owner's answer.
  */
 export const BACK_TO_WORK_FROM: ReadonlySet<KanbanCard["stage"]> = new Set([
   "needs_review",
+  "in_review",
   "completed",
   "deployed",
   "verified",
@@ -196,6 +214,10 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
   });
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }
+
+/** The wake note that sends a card's worker to its next step. */
+export const nextStepNote = (card: Pick<KanbanCard, "subtasks">, lead = "") =>
+  `${lead}Next on the plan:\n${subtaskLines(card)}\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
 
 /** Ids of open subtasks, for refusals: "s1, s3". */
 export const subtaskIds = (subtasks: ReadonlyArray<KanbanSubtask>) =>

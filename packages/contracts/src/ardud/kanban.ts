@@ -238,8 +238,8 @@ const isOpenCard = (card: KanbanCard) =>
 /**
  * The first unfinished card holding `card` up, or undefined. A blocker on the
  * same work thread is no block, since that thread does both in order, unless
- * it can't go on itself: stalled, in the backlog, waiting on the evaluator,
- * or held up in turn.
+ * it can't go on itself: stalled, in the backlog, waiting on the owner or the
+ * evaluator, or held up in turn.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -255,6 +255,7 @@ export function kanbanHeldUpBy(
       if (
         blocker.stalled !== null ||
         blocker.priority === KANBAN_BACKLOG ||
+        blocker.stage === "needs_owner" ||
         kanbanWaitsOnEvaluator(blocker) ||
         path.has(blocker.id)
       ) {

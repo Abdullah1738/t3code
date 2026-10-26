@@ -877,20 +877,27 @@ const make = Effect.gen(function* () {
     Effect.map((now) => DateTime.formatIso(DateTime.add(now, { milliseconds: TYPING_MS }))),
   );
 
-  /** Delivers text to an agent on behalf of a discussion and marks it as owing a reply. */
+  /**
+   * Delivers text to an agent on behalf of a discussion and marks it as owing a
+   * reply. A `note` (the board telling an evaluator its step came) owes none.
+   */
   const deliver = Effect.fn("KanbanService.deliver")(function* (
     discussion: KanbanDiscussion,
     actor: KanbanActor,
     name: string,
     threadId: ThreadId,
     text: string,
+    note = false,
   ) {
     yield* threads.send({ threadId, text });
-    const next = withParticipant(discussion, actor, name, {
-      lastReadSeq: discussion.lastSeq,
-      typingUntil: yield* typingUntil,
-      owes: "asked",
-    });
+    const next = withParticipant(
+      discussion,
+      actor,
+      name,
+      note
+        ? {}
+        : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
+    );
     yield* saveDiscussion(next);
     return next;
   });
@@ -927,10 +934,14 @@ const make = Effect.gen(function* () {
     return threadId;
   });
 
-  /** The discussion's evaluator gets the text: an existing one is steered, otherwise one starts. */
+  /**
+   * The discussion's evaluator gets the text: an existing one is steered,
+   * otherwise one starts. A `note` owes no reply in the discussion.
+   */
   const toEvaluator = Effect.fn("KanbanService.toEvaluator")(function* (
     discussion: KanbanDiscussion,
     text: string,
+    note = false,
   ) {
     const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
     if (discussion.evaluatorThreadId !== null) {
@@ -942,6 +953,7 @@ const make = Effect.gen(function* () {
           "Evaluator",
           discussion.evaluatorThreadId,
           text,
+          note,
         );
       }
     }
@@ -961,11 +973,9 @@ const make = Effect.gen(function* () {
       { ...discussion, evaluatorThreadId: threadId },
       actorOf(threadId),
       "Evaluator",
-      {
-        lastReadSeq: discussion.lastSeq,
-        typingUntil: yield* typingUntil,
-        owes: "asked",
-      },
+      note
+        ? { lastReadSeq: discussion.lastSeq }
+        : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
     );
     yield* saveDiscussion(next);
     return next;
@@ -977,35 +987,39 @@ const make = Effect.gen(function* () {
     return events.findLast((event) => event.kind === "moved" && event.toStage === "needs_owner");
   });
 
-  const isWorkThread = (card: KanbanCard, actor: KanbanActor) =>
-    actor._tag === "thread" && actor.threadId === card.workThreadId;
-
   /**
-   * A card whose step became the evaluator's (after a review, an owner's move
-   * or a worker's last subtask) tells the card discussion's evaluator, which
+   * A card whose step became the evaluator's (a new card waiting on its packet,
+   * a review, an owner's move or a worker's last subtask) tells the card
+   * discussion's evaluator, which
    * would otherwise never hear of it. An evaluator's own change needs no note.
+   * The wake is keyed on the step's subtasks alone, so a card moving between
+   * waiting stages (in_review to completed when its PRs land) isn't told twice.
    */
-  const evaluatorTurn = Effect.fn("KanbanService.evaluatorTurn")(function* (
-    before: KanbanCard,
-    after: KanbanCard,
-    actor: KanbanActor,
-  ) {
-    const turn = (card: KanbanCard) =>
-      kanbanEvaluatorStep(card) &&
-      card.activeThreadId === null &&
-      card.settledAt === null &&
-      ((card.stage === "todo" && card.wakeNote === null) || KANBAN_DONE_STAGES.has(card.stage))
-        ? `${card.stage}:${Subtasks.subtaskIds(kanbanStepSubtasks(card))}`
-        : null;
-    const now = turn(after);
-    if (actor._tag === "evaluator" || now === null || now === turn(before)) return;
-    const discussion = yield* cardDiscussionUnlocked(after.id);
-    yield* toEvaluator(discussion, Briefs.evaluatorStepText(after)).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("kanban evaluator step note failed", { cardId: after.id, cause }),
+  const evaluatorTurn = Effect.fn("KanbanService.evaluatorTurn")(
+    function* (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) {
+      // in_review with no thread: its review passed and it waits for its PRs.
+      const turn = (card: KanbanCard) =>
+        kanbanEvaluatorStep(card) &&
+        card.activeThreadId === null &&
+        card.settledAt === null &&
+        ((card.stage === "todo" && card.wakeNote === null) ||
+          card.stage === "in_review" ||
+          (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
+          ? Subtasks.subtaskIds(kanbanStepSubtasks(card))
+          : null;
+      const now = turn(after);
+      if (actor._tag === "evaluator" || now === null) return;
+      if (before !== null && now === turn(before)) return;
+      const discussion = yield* cardDiscussionUnlocked(after.id);
+      yield* toEvaluator(discussion, Briefs.evaluatorStepText(after), true);
+    },
+    (effect, _before, after) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator step note failed", { cardId: after.id, cause }),
+        ),
       ),
-    );
-  });
+  );
 
   /**
    * Owner (or script) text in a discussion reaches whoever owns it: the card's
@@ -1022,13 +1036,20 @@ const make = Effect.gen(function* () {
       const card = yield* cardOf(discussion.cardId);
       const asked =
         from === "owner" && card.stage === "needs_owner" ? yield* askedBy(card) : undefined;
-      if (asked !== undefined && !isWorkThread(card, asked.actor)) {
+      if (asked !== undefined && asked.actor._tag === "evaluator") {
         // An evaluator's question, often an approval: the card goes back where
         // it was and the answer goes to the evaluator, not to the worker.
         const at = yield* nowIso;
         const back = asked.fromStage ?? "todo";
         const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
-        const next: KanbanCard = { ...card, stage, question: null, movedAt: at, updatedAt: at };
+        const next: KanbanCard = {
+          ...card,
+          stage,
+          question: null,
+          stalled: null,
+          movedAt: at,
+          updatedAt: at,
+        };
         yield* logEvent(next, { _tag: "owner" }, "moved", {
           fromStage: card.stage,
           toStage: stage,
@@ -1084,10 +1105,12 @@ const make = Effect.gen(function* () {
     yield* toEvaluator(discussion, text);
   });
 
+  /** `route` false posts without passing it on: an owner's own question on his move. */
   const postUnlocked = Effect.fn("KanbanService.postUnlocked")(function* (
     discussionId: KanbanDiscussion["id"],
     author: KanbanActor,
     blocks: ReadonlyArray<KanbanBlock>,
+    route = true,
   ) {
     if (blocks.length === 0)
       return yield* failWith("invalid", "a message needs at least one block");
@@ -1126,6 +1149,7 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(blocks);
+    if (!route) return message;
     if (author._tag === "owner") {
       yield* routeToOwnerAgent(posted, Briefs.ownerMessageText(posted.title, posted.id, text));
     } else if (author._tag === "script") {
@@ -1459,17 +1483,37 @@ const make = Effect.gen(function* () {
         const chain = Rules.chainFor({ ...board, reviewChains: chains }, card);
         if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) continue;
         const synced = yield* syncPrs(card);
-        if (Rules.prsLanded(synced)) {
-          yield* moveUnlocked(
-            synced,
-            "completed",
-            "system",
-            { _tag: "system", component: "dispatcher" },
-            {
-              note: "PRs landed",
-            },
-          );
-        }
+        if (!Rules.prsLanded(synced)) continue;
+        // The plan's next step decides where it goes: the worker's sends it
+        // back to work, a review-only one to review, else it's completed.
+        const to: KanbanStage =
+          kanbanStepSubtasks(synced, "work").length > 0
+            ? "todo"
+            : kanbanStepSubtasks(synced, "review").length > 0
+              ? "needs_review"
+              : "completed";
+        const at = yield* nowIso;
+        const dispatcher: KanbanActor = { _tag: "system", component: "dispatcher" };
+        const landed: KanbanCard = {
+          ...synced,
+          stage: to,
+          reviewStep: to === "completed" ? synced.reviewStep : 0,
+          wakeNote:
+            to === "todo"
+              ? [synced.wakeNote, Subtasks.nextStepNote(synced, "The PRs landed. ")]
+                  .filter((part) => part !== null)
+                  .join("\n\n")
+              : synced.wakeNote,
+          movedAt: at,
+          updatedAt: at,
+        };
+        yield* logEvent(landed, dispatcher, "moved", {
+          fromStage: synced.stage,
+          toStage: to,
+          body: "PRs landed",
+        });
+        yield* saveCard(landed);
+        yield* evaluatorTurn(synced, landed, dispatcher);
       }
     }
     yield* Ref.set(missing, missed);
@@ -1604,7 +1648,15 @@ const make = Effect.gen(function* () {
     input: NewCard,
     actor: KanbanActor,
   ) {
-    return yield* insertCard(yield* draftCard(boardId, input, actor), input);
+    // A thread's or a script's card waits for an evaluator to write its packet;
+    // the owner's and the evaluators' own come written.
+    const packet = actor._tag === "thread" || actor._tag === "script";
+    const fields = packet
+      ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
+      : input;
+    const card = yield* insertCard(yield* draftCard(boardId, fields, actor), fields);
+    if (packet) yield* evaluatorTurn(null, card, actor);
+    return card;
   });
 
   const createCard: KanbanServiceShape["createCard"] = (boardId, input, actor) =>
@@ -1950,9 +2002,12 @@ const make = Effect.gen(function* () {
         if (to === "needs_review") return yield* syncPrs(moved);
         if (to === "needs_owner" && options?.question?.trim()) {
           const discussion = yield* cardDiscussionUnlocked(moved.id);
-          yield* postUnlocked(discussion.id, actor, [
-            { _tag: "md", text: options.question.trim() },
-          ]);
+          yield* postUnlocked(
+            discussion.id,
+            actor,
+            [{ _tag: "md", text: options.question.trim() }],
+            actor._tag !== "owner",
+          );
           return yield* cardOf(moved.id);
         }
         return moved;
@@ -2063,7 +2118,7 @@ const make = Effect.gen(function* () {
                 marked.stage !== "needs_review"
               ? "needs_review"
               : null;
-        const plan = `Next on the plan:\n${Subtasks.subtaskLines(marked)}\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
+        const plan = Subtasks.nextStepNote(marked);
         const next: KanbanCard =
           to === null
             ? marked
@@ -2132,7 +2187,7 @@ const make = Effect.gen(function* () {
             verdict === "findings"
               ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
               : moreWork
-                ? `The review passed. Next on the plan:\n${Subtasks.subtaskLines({ subtasks })}\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`
+                ? Subtasks.nextStepNote({ subtasks }, "The review passed. ")
                 : card.wakeNote,
           nudgedAt: null,
           movedAt: at,
@@ -2306,8 +2361,11 @@ const make = Effect.gen(function* () {
         yield* publish(discussion.boardId, { _tag: "message", message: next });
         if (by._tag !== "owner") return next;
         const text = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${picked.map((option) => option.label).join(", ")}`;
+        // A pick on a card waiting on the owner answers it like a reply does.
+        const waiting =
+          discussion.cardId !== null && (yield* cardOf(discussion.cardId)).stage === "needs_owner";
         const author = message.author;
-        if (author._tag === "thread" || author._tag === "evaluator") {
+        if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
           const view = yield* threads.view(author.threadId);
           if (view) {
             yield* deliver(discussion, author, message.authorName, author.threadId, text);

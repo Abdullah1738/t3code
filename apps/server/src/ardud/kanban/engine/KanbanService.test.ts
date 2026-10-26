@@ -11,7 +11,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
-import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
 
 interface FakeThread {
   readonly title: string;
@@ -23,6 +23,7 @@ interface FakeThread {
 const makeFake = Effect.gen(function* () {
   const threads = yield* Ref.make(new Map<string, FakeThread>());
   const interrupted: Array<string> = [];
+  const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   let next = 0;
   const layer = Layer.succeed(
     KanbanThreads,
@@ -38,7 +39,7 @@ const makeFake = Effect.gen(function* () {
               title: thread.title,
               state: thread.running ? "running" : "idle",
               updatedAt: "2026-10-25T13:00:00.000Z",
-              prs: [],
+              prs: prs.get(threadId) ?? [],
             };
           }),
         ),
@@ -64,7 +65,7 @@ const makeFake = Effect.gen(function* () {
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
-  return { threads, layer, interrupted };
+  return { threads, layer, interrupted, prs };
 });
 
 const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
@@ -1017,6 +1018,167 @@ it.effect("a passed review hands the card back to its worker when the next step 
       assert.include(back.wakeNote ?? "", "Part two");
       yield* kanban.dispatchNow;
       assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, workThread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a thread's new card waits for an evaluator's packet; the owner's goes straight on", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const thread: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker-1") };
+      const noted = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Retry the fee job",
+          title: "Retry",
+          subtasks: [
+            { text: "Fix it", owner: "work" },
+            { text: "Tell QA", owner: "evaluator", step: 2 },
+          ],
+        },
+        thread,
+      );
+      assert.deepStrictEqual(
+        noted.subtasks.map((subtask) => [subtask.id, subtask.step, subtask.owner]),
+        [
+          ["s1", 1, "evaluator"],
+          ["s2", 2, "work"],
+          ["s3", 3, "evaluator"],
+        ],
+      );
+      const told = [...(yield* Ref.get(fake.threads)).values()].filter((view) =>
+        view.messages.some((text) => text.includes("waiting on your subtasks: s1")),
+      );
+      assert.strictEqual(told.length, 1);
+
+      const owners = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      assert.deepStrictEqual(owners.subtasks, []);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(owners.id)).card.stage, "working");
+      assert.strictEqual((yield* kanban.card(noted.id)).card.stage, "todo");
+      assert.isNull((yield* kanban.card(noted.id)).card.activeThreadId);
+
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.editCard(
+        noted.id,
+        { prompt: "Packet: retry with backoff in fees.ts" },
+        evaluator,
+      );
+      yield* kanban.markSubtask(noted.id, "s1", "done", null, evaluator, "evaluator");
+      yield* kanban.dispatchNow;
+      const started = (yield* kanban.card(noted.id)).card;
+      assert.strictEqual(started.stage, "working");
+      const messages = (yield* Ref.get(fake.threads)).get(started.activeThreadId!)!.messages;
+      assert.include(messages[0] ?? "", "retry with backoff");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an evaluator hears once when a reviewed card waits on it for its PRs", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const plan = [
+        { text: "Write the PR", owner: "work" as const },
+        { text: "Review", owner: "review" as const },
+        { text: "Merge it", owner: "evaluator" as const },
+        { text: "Follow-up", owner: "work" as const },
+      ];
+      const reviewed = Effect.fn(function* (title: string) {
+        const card = yield* kanban.createCard(
+          board.id,
+          { prompt: title, title, subtasks: plan },
+          evaluator,
+        );
+        yield* kanban.dispatchNow;
+        const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const pr = `https://github.com/o/r/pull/${card.number}`;
+        fake.prs.set(workThread, [{ url: pr, title, state: "open" }]);
+        const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+        yield* kanban.dispatchNow;
+        yield* kanban.reviewResult((yield* kanban.card(card.id)).card.activeThreadId!, "clear", []);
+        return { card: (yield* kanban.card(card.id)).card, workThread, pr };
+      });
+      const toldAbout = Effect.fn(function* (number: number) {
+        const texts = [...(yield* Ref.get(fake.threads)).values()].flatMap(
+          (thread) => thread.messages,
+        );
+        return texts.filter((text) => text.includes(`Card #${number} (`)).length;
+      });
+
+      // Merged by the evaluator while it waits in review: back to its worker.
+      const first = yield* reviewed("First");
+      assert.strictEqual(first.card.stage, "in_review");
+      assert.isNull(first.card.activeThreadId);
+      assert.strictEqual(yield* toldAbout(first.card.number), 1);
+      const discussion = yield* kanban.cardDiscussion(first.card.id);
+      assert.isTrue(
+        discussion.participants.every((participant) => participant.owes === null),
+        "a step note owes no reply",
+      );
+      yield* kanban.markSubtask(first.card.id, "s3", "done", "merged", evaluator, "evaluator");
+      const back = (yield* kanban.card(first.card.id)).card;
+      assert.strictEqual(back.stage, "todo");
+      assert.include(back.wakeNote ?? "", "Follow-up");
+
+      // Its PR lands on its own: completed, and the evaluator isn't told twice.
+      const second = yield* reviewed("Second");
+      fake.prs.set(second.workThread, [{ url: second.pr, title: "Second", state: "merged" }]);
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.card(second.card.id)).card.stage, "completed");
+      assert.strictEqual(yield* toldAbout(second.card.number), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the owner's own question and a pick on an evaluator's go where they belong", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      // The owner parks a working card with a question; his reply wakes its worker.
+      const mine = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      yield* kanban.moveCard(mine.id, "needs_owner", "owner", owner, { question: "Hold on" });
+      const mineTalk = yield* kanban.cardDiscussion(mine.id);
+      yield* kanban.post(mineTalk.id, owner, [{ _tag: "md", text: "Use 3%" }]);
+      const woken = (yield* kanban.card(mine.id)).card;
+      assert.strictEqual(woken.stage, "todo");
+      assert.include(woken.wakeNote ?? "", "Use 3%");
+
+      // An evaluator's approval as a pick: the card goes back where it was.
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const theirs = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      yield* kanban.moveCard(theirs.id, "completed", "evaluator", evaluator);
+      yield* kanban.moveCard(theirs.id, "needs_owner", "evaluator", evaluator, {
+        question: "Post it?",
+      });
+      const talk = yield* kanban.cardDiscussion(theirs.id);
+      const asked = yield* kanban.post(talk.id, evaluator, [
+        {
+          _tag: "choice",
+          id: "c1",
+          style: "pick",
+          question: "Post it?",
+          options: [
+            { id: "yes", label: "Yes" },
+            { id: "no", label: "No" },
+          ],
+          multi: false,
+        },
+      ]);
+      yield* kanban.answer(talk.id, asked.seq, "c1", ["yes"], owner);
+      const answered = (yield* kanban.card(theirs.id)).card;
+      assert.strictEqual(answered.stage, "completed");
+      assert.isNull(answered.question);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
