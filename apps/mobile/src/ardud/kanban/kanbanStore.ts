@@ -1,4 +1,4 @@
-import type { KanbanBoard, KanbanCardDetail, KanbanMessage } from "@t3tools/contracts";
+import type { KanbanBoardSummary, KanbanCardDetail, KanbanMessage } from "@t3tools/contracts";
 import {
   createAtomKanbanTransport,
   createKanbanClient,
@@ -47,13 +47,12 @@ function useFeed(store: SnapshotStore<unknown>): FeedState {
 }
 
 /**
- * Boards on the paired server, archived ones left out. The client keeps the
- * list fresh: it retries until the server answers and reads it again on board
- * snapshots and every few minutes.
+ * Boards on the paired server with their list counts, archived ones left out.
+ * The server streams the list, so it stays current without board feeds.
  */
-export function useKanbanBoards(): ReadonlyArray<KanbanBoard> | undefined {
+export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
   const boards = useStore(kanbanClient().boards);
-  return useMemo(() => boards?.filter((board) => board.archivedAt === null), [boards]);
+  return useMemo(() => boards?.filter((summary) => summary.board.archivedAt === null), [boards]);
 }
 
 export function useKanbanBoard(boardId: string): KanbanBoardState | undefined {

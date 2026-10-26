@@ -397,6 +397,18 @@ export const KanbanBoardSnapshot = Schema.Struct({
 });
 export type KanbanBoardSnapshot = typeof KanbanBoardSnapshot.Type;
 
+/** A board with the counts a board list shows, so the list needs no board feeds. */
+export const KanbanBoardSummary = Schema.Struct({
+  board: KanbanBoard,
+  /** Unsettled cards waiting on the owner. */
+  needsOwner: NonNegativeInt,
+  /** Unsettled cards a thread is working on. */
+  running: NonNegativeInt,
+  /** Unread owner messages across the board's discussions. */
+  unread: NonNegativeInt,
+});
+export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
+
 export const KanbanChange = Schema.Union([
   Schema.TaggedStruct("card", { card: KanbanCard }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),

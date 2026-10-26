@@ -2,14 +2,13 @@ import { Link, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import { memo } from "react";
 
-import { totalUnread } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanBoard } from "@t3tools/contracts";
+import type { KanbanBoardSummary } from "@t3tools/contracts";
 
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
-import { useBoards, useBoardState } from "./kanbanStore";
+import { useBoards } from "./kanbanStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
 import "../missions/missions.css";
@@ -39,7 +38,7 @@ export function BoardsSidebarGroup() {
     if (isMobile) setOpenMobile(false);
   };
 
-  const live = (boards ?? []).filter((board) => board.archivedAt === null);
+  const live = (boards ?? []).filter((summary) => summary.board.archivedAt === null);
   if (live.length === 0) return null;
   const expanded = !state.collapsed;
 
@@ -55,11 +54,11 @@ export function BoardsSidebarGroup() {
       </div>
       {expanded ? (
         <ul className="flex flex-col gap-0.5 pb-3.5">
-          {live.map((board) => (
+          {live.map((summary) => (
             <BoardRow
-              key={board.id}
-              board={board}
-              open={board.id === activeBoardId}
+              key={summary.board.id}
+              summary={summary}
+              open={summary.board.id === activeBoardId}
               onNavigate={onNavigate}
             />
           ))}
@@ -70,23 +69,16 @@ export function BoardsSidebarGroup() {
 }
 
 const BoardRow = memo(function BoardRow(props: {
-  board: KanbanBoard;
+  summary: KanbanBoardSummary;
   open: boolean;
   onNavigate: () => void;
 }) {
-  const { board, open } = props;
-  // Each row keeps its board's feed open for the counts: one subscription and
-  // one discussion list per board, no message reads.
-  const state = useBoardState(board.id);
+  const { open } = props;
+  const { board, needsOwner, unread } = props.summary;
   const view = useSearch({
     strict: false,
     select: (search) => (typeof search.view === "string" ? (search.view as BoardView) : "board"),
   });
-  const needsOwner = state
-    ? [...state.cards.values()].filter((card) => card.stage === "needs_owner" && !card.settledAt)
-        .length
-    : 0;
-  const unread = state ? totalUnread(state) : 0;
 
   return (
     <li className="flex flex-col gap-0.5">

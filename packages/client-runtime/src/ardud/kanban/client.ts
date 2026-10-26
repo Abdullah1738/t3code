@@ -1,7 +1,7 @@
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
-  type KanbanBoard,
+  type KanbanBoardSummary,
   type KanbanBoardUpdateInput,
   type KanbanCardDetail,
   type KanbanCardPatchInput,
@@ -45,7 +45,8 @@ interface BoardFeed {
 }
 
 export interface KanbanClient {
-  readonly boards: SnapshotStore<ReadonlyArray<KanbanBoard>>;
+  /** Every board with its list counts, kept current by the server. */
+  readonly boards: SnapshotStore<ReadonlyArray<KanbanBoardSummary>>;
   board(boardId: string): SnapshotStore<KanbanBoardState>;
   messages(boardId: string, discussionId: string): SnapshotStore<ReadonlyArray<KanbanMessage>>;
   card(boardId: string, cardId: string): SnapshotStore<KanbanCardDetail>;
@@ -81,7 +82,6 @@ const PREVIEW_FETCH_LIMIT = 40;
 const MESSAGE_PAGE = 200;
 const RETRY_MIN_MS = 5_000;
 const RETRY_MAX_MS = 60_000;
-const BOARDS_REFRESH_MS = 2 * 60_000;
 
 /**
  * Runs `load` one at a time. A call while it runs asks for one more run after
@@ -154,10 +154,6 @@ export function createKanbanClient(
   // store re-emits whenever either changes it.
   const stateListeners = new Map<string, Set<() => void>>();
 
-  // Set while the boards store is open; a board snapshot (first load or a
-  // reconnect) is a good moment to read the list again.
-  let refreshBoards: (() => void) | null = null;
-
   const notifyState = (boardId: string) => {
     for (const listener of Array.from(stateListeners.get(boardId) ?? [])) listener();
   };
@@ -225,10 +221,7 @@ export function createKanbanClient(
           const next = applyKanbanWatchEvent(created.state, event);
           created.state = next === undefined ? next : withPendingReads(boardId, next);
           for (const listener of Array.from(created.events)) listener(event);
-          if (event._tag === "snapshot") {
-            refreshBoards?.();
-            resendReads(boardId);
-          }
+          if (event._tag === "snapshot") resendReads(boardId);
         },
         (error) => {
           // A failed feed is finished: the next listener opens a new one
@@ -506,21 +499,42 @@ export function createKanbanClient(
     };
   }, options);
 
-  // Never fails: a read made before the server connects retries until it
-  // lands, and the list is read again on board snapshots and now and then, so
-  // new boards appear.
-  const boards = createSnapshotStore<ReadonlyArray<KanbanBoard>>((emit) => {
-    const reads = serialLoader(async () => {
-      emit(await transport.request(M.boards, {}));
-    });
-    refreshBoards = reads.run;
-    // @effect-diagnostics-next-line globalTimers:off - Plain callback store shared by web and mobile.
-    const refresh = setInterval(reads.run, BOARDS_REFRESH_MS);
-    reads.run();
+  // Never fails: the stream follows reconnects, and after a server error it
+  // opens again after a growing pause.
+  const boards = createSnapshotStore<ReadonlyArray<KanbanBoardSummary>>((emit) => {
+    let close: Unsubscribe | null = null;
+    let closed = false;
+    let pause = RETRY_MIN_MS;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const open = () => {
+      timer = null;
+      let failed = false;
+      const stop = transport.stream(
+        M.boards,
+        {},
+        (list) => {
+          pause = RETRY_MIN_MS;
+          emit(list);
+        },
+        () => {
+          if (failed || closed) return;
+          failed = true;
+          close?.();
+          close = null;
+          // @effect-diagnostics-next-line globalTimers:off - Plain callback store shared by web and mobile.
+          timer = setTimeout(open, pause);
+          pause = Math.min(pause * 2, RETRY_MAX_MS);
+        },
+      );
+      // The stream may fail while it opens.
+      if (failed) stop();
+      else close = stop;
+    };
+    open();
     return () => {
-      clearInterval(refresh);
-      reads.close();
-      if (refreshBoards === reads.run) refreshBoards = null;
+      closed = true;
+      if (timer !== null) clearTimeout(timer);
+      close?.();
     };
   }, options);
 

@@ -19,7 +19,7 @@ import {
 import type { Unsubscribe } from "../missions/source.ts";
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
-export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe;
+export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe | typeof KANBAN_WS_METHODS.boards;
 export type KanbanRequestTag = Exclude<KanbanMethod, KanbanStreamTag>;
 export type KanbanRpcInput<TTag extends KanbanMethod> = Parameters<WsRpcProtocolClient[TTag]>[0];
 export type KanbanStreamValue<TTag extends KanbanStreamTag> = WsRpcProtocolClient[TTag] extends (

@@ -35,7 +35,7 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape) => {
   };
 
   return {
-    [M.boards]: () => service.boards,
+    [M.boards]: () => service.boardSummaries,
     [M.subscribe]: (input: { readonly boardId: Parameters<KanbanServiceShape["watch"]>[0] }) =>
       service.watch(input.boardId),
     [M.card]: (input: { readonly cardId: Parameters<KanbanServiceShape["card"]>[0] }) =>

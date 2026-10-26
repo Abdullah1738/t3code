@@ -19,6 +19,7 @@ import {
   KanbanBoard,
   KanbanBoardId,
   KanbanBoardSnapshot,
+  KanbanBoardSummary,
   KanbanCard,
   KanbanCardEvent,
   KanbanCardId,
@@ -111,7 +112,13 @@ const BoardRef = Schema.Struct({ boardId: KanbanBoardId });
 const CardRef = Schema.Struct({ cardId: KanbanCardId });
 
 export const KanbanRpcs = RpcGroup.make(
-  call(M.boards, Schema.Struct({}), Schema.Array(KanbanBoard)),
+  /** Every board with its counts, again whenever a count or a board changes. */
+  Rpc.make(M.boards, {
+    payload: Schema.Struct({}),
+    success: Schema.Array(KanbanBoardSummary),
+    error: KanbanRpcError,
+    stream: true,
+  }),
   Rpc.make(M.subscribe, {
     payload: BoardRef,
     success: KanbanWatchEvent,

@@ -1,5 +1,10 @@
-import type { KanbanDiscussion, KanbanMessage, KanbanWatchEvent } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import type {
+  KanbanBoardSummary,
+  KanbanDiscussion,
+  KanbanMessage,
+  KanbanWatchEvent,
+} from "@t3tools/contracts";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import { createKanbanClient } from "./client.ts";
 import { KanbanOfflineError, type KanbanTransport } from "./transport.ts";
@@ -17,9 +22,16 @@ function fakeTransport() {
   let push: ((event: KanbanWatchEvent) => void) | null = null;
   let fail: ((error: unknown) => void) | null = null;
   let streams = 0;
+  const lists: Array<(list: ReadonlyArray<KanbanBoardSummary>) => void> = [];
+  const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
-    stream(_tag, _input, onValue, onError) {
+    stream(tag, _input, onValue, onError) {
       streams += 1;
+      if (tag === "kanban.boards") {
+        lists.push(onValue as never);
+        listFailures.push(onError ?? (() => {}));
+        return () => {};
+      }
       push = onValue as (event: KanbanWatchEvent) => void;
       fail = onError ?? null;
       return () => {
@@ -44,6 +56,8 @@ function fakeTransport() {
     push: (event: KanbanWatchEvent) => push?.(event),
     fail: (error: unknown) => fail?.(error),
     streams: () => streams,
+    pushList: (list: ReadonlyArray<KanbanBoardSummary>) => lists.at(-1)?.(list),
+    failList: (error: unknown) => listFailures.at(-1)?.(error),
   };
 }
 
@@ -224,6 +238,29 @@ describe("createKanbanClient", () => {
     expect(store.get()?.[0]?.answers).toHaveLength(1);
     stop();
     stopBoard();
+  });
+
+  it("keeps the board list from its stream and opens it again after a server error", () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeTransport();
+      const client = createKanbanClient(fake.transport);
+      const stop = client.boards.subscribe(() => {});
+      const list = [{ board: { id: "board-toy" }, needsOwner: 1, running: 0, unread: 2 }] as never;
+      fake.pushList(list);
+      expect(client.boards.get()).toBe(list);
+
+      fake.failList(new Error("denied"));
+      expect(client.boards.failure()).toBeUndefined();
+      expect(fake.streams()).toBe(1);
+      vi.advanceTimersByTime(5_000);
+      expect(fake.streams()).toBe(2);
+      // The list stays until the new stream answers.
+      expect(client.boards.get()).toBe(list);
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits out a missing connection instead of failing a chat", async () => {

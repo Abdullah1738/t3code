@@ -1,12 +1,11 @@
 import { useNavigation } from "@react-navigation/native";
-import type { KanbanBoard } from "@t3tools/contracts";
-import { totalUnread } from "@t3tools/client-runtime/ardud/kanban";
+import type { KanbanBoardSummary } from "@t3tools/contracts";
 import { Fragment } from "react";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Group, NewCount, Row, SectionHead, Separator, Title } from "../missions/parts";
-import { useKanbanBoard, useKanbanBoards } from "./kanbanStore";
+import { useKanbanBoards } from "./kanbanStore";
 import { Glyph } from "./parts";
 
 /**
@@ -21,12 +20,12 @@ export function KanbanBoardsGroup() {
     <View className="gap-1.5 px-4 pb-1 pt-3">
       <SectionHead title="Boards" />
       <Group>
-        {boards.map((board, index) => (
-          <Fragment key={board.id}>
+        {boards.map((summary, index) => (
+          <Fragment key={summary.board.id}>
             {index > 0 ? <Separator /> : null}
             <BoardRow
-              board={board}
-              onOpen={() => navigation.navigate("KanbanBoard", { boardId: board.id })}
+              summary={summary}
+              onOpen={() => navigation.navigate("KanbanBoard", { boardId: summary.board.id })}
             />
           </Fragment>
         ))}
@@ -35,17 +34,9 @@ export function KanbanBoardsGroup() {
   );
 }
 
-function BoardRow(props: { readonly board: KanbanBoard; readonly onOpen: () => void }) {
-  const state = useKanbanBoard(props.board.id);
-  let owner = 0;
-  let running = 0;
-  for (const card of state?.cards.values() ?? []) {
-    if (card.settledAt !== null) continue;
-    if (card.stage === "needs_owner") owner += 1;
-    else if (card.activeThreadId !== null) running += 1;
-  }
-  const unread = state ? totalUnread(state) : 0;
-  const name = state?.board.name ?? props.board.name;
+function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen: () => void }) {
+  const { board, needsOwner: owner, running, unread } = props.summary;
+  const name = board.name;
   return (
     <Row
       accessibilityLabel={owner > 0 ? `${name}, ${owner} need you` : name}

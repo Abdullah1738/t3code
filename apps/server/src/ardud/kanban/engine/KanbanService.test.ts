@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
 
 import { ProjectId, ThreadId, type KanbanActor, type ModelSelection } from "@t3tools/contracts";
 
@@ -620,5 +621,43 @@ it.effect("a card that moved to another thread no longer counts as this thread's
         waiting.id as string,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("board summaries count running, waiting and unread as they change", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const pull = yield* Stream.toPull(kanban.boardSummaries);
+      // Each pull takes what is queued, one list per batch; the last is the list now.
+      const latest = Effect.map(pull, (chunk) => {
+        const { board: summarized, ...counts } = chunk.at(-1)![0]!;
+        assert.strictEqual(summarized.id, board.id);
+        return counts;
+      });
+      assert.deepStrictEqual(yield* latest, { needsOwner: 0, running: 0, unread: 0 });
+
+      yield* kanban.dispatchNow;
+      assert.deepStrictEqual(yield* latest, { needsOwner: 0, running: 1, unread: 0 });
+
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* kanban.moveCard(
+        card.id,
+        "needs_owner",
+        "cardThread",
+        { _tag: "thread", threadId: thread },
+        { question: "Which fee?" },
+      );
+      const waiting = yield* latest;
+      assert.strictEqual(waiting.needsOwner, 1);
+      assert.strictEqual(waiting.running, 0);
+      assert.isAbove(waiting.unread, 0);
+
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.markRead(discussion.id, owner, discussion.lastSeq);
+      assert.deepStrictEqual(yield* latest, { needsOwner: 1, running: 0, unread: 0 });
+    }).pipe(Effect.scoped, Effect.provide(testLayer(fake.layer)));
   }),
 );

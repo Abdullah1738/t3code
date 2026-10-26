@@ -12,6 +12,7 @@ import {
   type KanbanBlock,
   type KanbanBoard,
   type KanbanBoardSnapshot,
+  type KanbanBoardSummary,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanChange,
@@ -48,6 +49,7 @@ import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
 import * as Briefs from "./briefs.ts";
 import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import * as Summaries from "./summaries.ts";
 import { KanbanThreads } from "./threads.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
@@ -152,6 +154,8 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
   ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
   readonly watch: (boardId: KanbanBoard["id"]) => Stream.Stream<KanbanWatchEvent, KanbanError>;
+  /** Every board with its list counts, again whenever one changes. */
+  readonly boardSummaries: Stream.Stream<ReadonlyArray<KanbanBoardSummary>, KanbanError>;
 
   readonly card: (cardId: KanbanCard["id"]) => Effect.Effect<CardDetail, KanbanError>;
   readonly createCard: (
@@ -2050,6 +2054,25 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // Subscribed before the read, so no change falls between the two.
+  const boardSummaries: KanbanServiceShape["boardSummaries"] = Stream.unwrap(
+    Effect.gen(function* () {
+      const subscription = yield* PubSub.subscribe(changes);
+      const boards = yield* read(
+        Effect.flatMap(store.boards, (all) =>
+          Effect.forEach(all, (board) =>
+            Effect.all({
+              board: Effect.succeed(board),
+              cards: store.cards(board.id),
+              discussions: store.discussions(board.id),
+            }),
+          ),
+        ),
+      );
+      return Summaries.follow(Summaries.tallyBoards(boards), Stream.fromSubscription(subscription));
+    }),
+  );
+
   const runJob = (job: Job) =>
     lock
       .withPermits(1)(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId))
@@ -2065,6 +2088,7 @@ const make = Effect.gen(function* () {
     updateBoard,
     snapshot: (boardId) => read(snapshotOf(boardId)),
     watch,
+    boardSummaries,
     card: (cardId) =>
       read(
         Effect.gen(function* () {

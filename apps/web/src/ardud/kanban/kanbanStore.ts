@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 
 import type {
-  KanbanBoard,
+  KanbanBoardSummary,
   KanbanCardDetail,
   KanbanMessage,
   KanbanWikiPage,
@@ -31,7 +31,8 @@ function useStore<T>(store: SnapshotStore<T>): T | undefined {
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
-export function useBoards(): ReadonlyArray<KanbanBoard> | undefined {
+/** Every board with its list counts; no board feed opens for them. */
+export function useBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
   return useStore(kanban.boards);
 }
 
