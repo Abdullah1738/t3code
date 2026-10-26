@@ -33,6 +33,9 @@ import {
   KanbanPool,
   KanbanPriority,
   KanbanReviewChain,
+  KanbanScript,
+  KanbanScriptId,
+  KanbanScriptRun,
   KanbanStage,
   KanbanThreadLink,
   KanbanWikiPage,
@@ -56,6 +59,10 @@ export const KANBAN_WS_METHODS = {
   discussionRead: "kanban.discussion.read",
   messagePost: "kanban.message.post",
   answer: "kanban.answer",
+  scripts: "kanban.scripts",
+  scriptRuns: "kanban.script.runs",
+  scriptEnable: "kanban.script.enable",
+  scriptRun: "kanban.script.run",
 } as const;
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
@@ -110,6 +117,7 @@ const call = <const Tag extends KanbanMethod, P extends Schema.Top, S extends Sc
 const M = KANBAN_WS_METHODS;
 const BoardRef = Schema.Struct({ boardId: KanbanBoardId });
 const CardRef = Schema.Struct({ cardId: KanbanCardId });
+const ScriptRef = Schema.Struct({ scriptId: KanbanScriptId });
 
 export const KanbanRpcs = RpcGroup.make(
   /** Every board with its counts, again whenever a count or a board changes. */
@@ -182,6 +190,20 @@ export const KanbanRpcs = RpcGroup.make(
     }),
     KanbanMessage,
   ),
+  call(M.scripts, BoardRef, Schema.Array(KanbanScript)),
+  /** Newest first. */
+  call(
+    M.scriptRuns,
+    Schema.Struct({ scriptId: KanbanScriptId, limit: Schema.optional(NonNegativeInt) }),
+    Schema.Array(KanbanScriptRun),
+  ),
+  call(
+    M.scriptEnable,
+    Schema.Struct({ scriptId: KanbanScriptId, enabled: Schema.Boolean }),
+    KanbanScript,
+  ),
+  /** Starts a run now and answers with it open; it finishes in the background. */
+  call(M.scriptRun, ScriptRef, KanbanScriptRun),
 );
 
 export const KANBAN_READ_SCOPES = {
@@ -191,6 +213,8 @@ export const KANBAN_READ_SCOPES = {
   [M.discussions]: AuthOrchestrationReadScope,
   [M.messages]: AuthOrchestrationReadScope,
   [M.wiki]: AuthOrchestrationReadScope,
+  [M.scripts]: AuthOrchestrationReadScope,
+  [M.scriptRuns]: AuthOrchestrationReadScope,
 } as const;
 
 /** Owner changes: guarded on the client too (see `CLIENT_GUARDED_RPC_SCOPES`). */
@@ -206,6 +230,8 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.discussionRead]: AuthOrchestrationOperateScope,
   [M.messagePost]: AuthOrchestrationOperateScope,
   [M.answer]: AuthOrchestrationOperateScope,
+  [M.scriptEnable]: AuthOrchestrationOperateScope,
+  [M.scriptRun]: AuthOrchestrationOperateScope,
 } as const;
 
 export const KANBAN_AGGREGATES = Object.fromEntries(

@@ -2,6 +2,7 @@ import type {
   KanbanBoardSummary,
   KanbanDiscussion,
   KanbanMessage,
+  KanbanScriptRun,
   KanbanWatchEvent,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -115,6 +116,18 @@ const snapshotEvent = (unread: number): KanbanWatchEvent =>
       unread: [{ discussionId: "disc-1", count: unread }],
     },
   }) as never;
+
+function scriptRun(id: number, endedAt: string | null = null): KanbanScriptRun {
+  return {
+    id,
+    scriptId: "script-1",
+    startedAt: "2026-10-26T10:00:00.000Z",
+    endedAt,
+    exitCode: endedAt === null ? null : 0,
+    output: "",
+    trigger: "manual",
+  } as never;
+}
 
 const vote = {
   blockId: "b1",
@@ -236,6 +249,62 @@ describe("createKanbanClient", () => {
     read.resolve([message(1)]);
     await settle();
     expect(store.get()?.[0]?.answers).toHaveLength(1);
+    stop();
+    stopBoard();
+  });
+
+  it("puts a run that opens while the runs are read on top, and ends it in place", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const board = client.board("board-toy");
+    const stopBoard = board.subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.scriptRuns("board-toy", "script-1");
+    const stop = store.subscribe(() => {});
+    const read = fake.take("kanban.script.runs");
+    expect(read.input).toEqual({ scriptId: "script-1", limit: 20 });
+    fake.push({ _tag: "change", change: { _tag: "scriptRun", run: scriptRun(3) } } as never);
+    read.resolve([
+      scriptRun(2, "2026-10-26T09:00:05.000Z"),
+      scriptRun(1, "2026-10-26T08:00:05.000Z"),
+    ]);
+    await settle();
+    expect(store.get()?.map((run) => run.id)).toEqual([3, 2, 1]);
+
+    fake.push({
+      _tag: "change",
+      change: { _tag: "scriptRun", run: scriptRun(3, "2026-10-26T10:00:04.000Z") },
+    } as never);
+    expect(store.get()?.map((run) => run.id)).toEqual([3, 2, 1]);
+    expect(store.get()?.[0]?.endedAt).toBe("2026-10-26T10:00:04.000Z");
+
+    // Another script's run stays out; a reconnect reads the list again.
+    fake.push({
+      _tag: "change",
+      change: { _tag: "scriptRun", run: { ...scriptRun(9), scriptId: "script-2" } },
+    } as never);
+    expect(store.get()).toHaveLength(3);
+    fake.push(snapshotEvent(0));
+    await settle();
+    fake.take("kanban.script.runs").resolve([scriptRun(3, "2026-10-26T10:00:04.000Z")]);
+    await settle();
+    expect(store.get()?.map((run) => run.id)).toEqual([3]);
+    stop();
+    stopBoard();
+  });
+
+  it("keeps a run the read has ended over the open copy that came in meanwhile", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stopBoard = client.board("board-toy").subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.scriptRuns("board-toy", "script-1");
+    const stop = store.subscribe(() => {});
+    const read = fake.take("kanban.script.runs");
+    fake.push({ _tag: "change", change: { _tag: "scriptRun", run: scriptRun(3) } } as never);
+    read.resolve([scriptRun(3, "2026-10-26T10:00:04.000Z")]);
+    await settle();
+    expect(store.get()?.[0]?.endedAt).toBe("2026-10-26T10:00:04.000Z");
     stop();
     stopBoard();
   });

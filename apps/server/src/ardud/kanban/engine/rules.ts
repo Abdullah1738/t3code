@@ -1,5 +1,11 @@
 import {
+  KANBAN_BACKLOG,
+  KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
+  kanbanCardModels,
+  kanbanHeldUpBy,
+  kanbanPickOrder,
+  kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
   type KanbanGroup,
@@ -13,11 +19,9 @@ export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "sy
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
-const DONE_STAGES: ReadonlySet<KanbanStage> = new Set(["completed", "deployed", "verified"]);
-
 export const poolKey = (model: ModelSelection): string => `${model.instanceId}/${model.model}`;
 
-export const isDone = (stage: KanbanStage) => DONE_STAGES.has(stage);
+export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);
 
 const ok: MoveCheck = { ok: true };
 const no = (reason: string): MoveCheck => ({ ok: false, reason });
@@ -115,12 +119,12 @@ export function prsLanded(card: KanbanCard): boolean {
     .every((link) => link.state === "merged" || link.state === "closed");
 }
 
-export function isBlocked(card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>): boolean {
-  return card.blockedBy.some((id) => {
-    const blocker = byId.get(id);
-    return blocker !== undefined && !isDone(blocker.stage);
-  });
-}
+/** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
+export const isBlocked = (
+  card: KanbanCard,
+  byId: ReadonlyMap<string, KanbanCard>,
+  thread: string | null = card.workThreadId,
+): boolean => kanbanHeldUpBy(card, byId, thread) !== undefined;
 
 export function chainFor(board: KanbanBoard, card: KanbanCard) {
   const name = card.reviewChain ?? board.defaultReviewChain;
@@ -136,6 +140,29 @@ export function nextModel(board: KanbanBoard, card: KanbanCard): ModelSelection 
     return board.evaluatorModel;
   }
   return card.model;
+}
+
+/** The model of a card's that runs on `pool`, if any. */
+export function modelOnPool(card: KanbanCard, pool: string): ModelSelection | null {
+  if (poolKey(card.model) === pool) return card.model;
+  return kanbanCardModels(card).find((entry) => poolKey(entry.model) === pool)?.model ?? null;
+}
+
+/**
+ * The model a card's new work thread starts on: of the models whose pool has
+ * a free slot, the highest weight; `pick` chooses among a tie.
+ */
+function weightedModel(
+  card: KanbanCard,
+  free: ReadonlyMap<string, number>,
+  pick: (count: number) => number,
+): ModelSelection | null {
+  const open = kanbanCardModels(card).filter((entry) => (free.get(poolKey(entry.model)) ?? 0) > 0);
+  if (open.length === 0) return null;
+  const top = Math.max(...open.map((entry) => entry.weight));
+  const tied = open.filter((entry) => entry.weight === top);
+  const index = Math.min(tied.length - 1, Math.max(0, Math.floor(pick(tied.length))));
+  return tied[index]?.model ?? null;
 }
 
 export interface Dispatch {
@@ -178,17 +205,20 @@ export function poolThreads(
 }
 
 /**
- * Fill free pool slots: reviews first (oldest first), then todo by priority
- * and age, skipping blocked and settled cards. Lowering a pool below what is
+ * Fill free pool slots: reviews first (oldest first), then todo in pick
+ * order, skipping blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
+ * A card with no work thread yet starts on its highest-weight model with a
+ * free slot; `pick(n)` returns an index below n to break a tie.
  */
 export function planDispatch(
   board: KanbanBoard,
   cards: ReadonlyArray<KanbanCard>,
   pools: ReadonlyArray<KanbanPool>,
   holds: ReadonlyMap<string, string> = new Map(),
+  pick: (count: number) => number = () => 0,
 ): ReadonlyArray<Dispatch> {
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
@@ -202,14 +232,21 @@ export function planDispatch(
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const waiting = cards.filter(
-    (card) => card.settledAt === null && card.activeThreadId === null && card.stalled === null,
+    (card) =>
+      card.settledAt === null &&
+      card.activeThreadId === null &&
+      card.stalled === null &&
+      card.priority !== KANBAN_BACKLOG &&
+      // A step that's only the evaluator's is done by an evaluator, not a new thread.
+      // Reviews still go: a review never waits on the evaluator's step.
+      !kanbanWaitsOnEvaluator(card),
   );
   const reviews = waiting
     .filter((card) => card.stage === "needs_review")
     .toSorted((a, b) => a.movedAt.localeCompare(b.movedAt));
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .toSorted((a, b) => a.priority - b.priority || a.movedAt.localeCompare(b.movedAt));
+    .toSorted(kanbanPickOrder(cards));
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 
@@ -219,11 +256,18 @@ export function planDispatch(
     ["work", todos],
   ] as const) {
     for (const card of list) {
-      const model = nextModel(board, card);
+      // Once a card has a work thread it stays on that thread's model.
+      const model =
+        role === "work" && card.workThreadId === null
+          ? weightedModel(card, free, pick)
+          : nextModel(board, card);
+      if (model === null) continue;
       const key = poolKey(model);
       if ((slots.get(key) ?? 0) <= 0) continue;
       let thread = role === "work" ? card.workThreadId : null;
       const fresh = thread !== null && busyElsewhere(thread, key);
+      // A new thread can't take a card its old thread's own work still holds up.
+      if (fresh && isBlocked(card, byId, null)) continue;
       if (fresh) thread = null;
       const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
       if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
@@ -249,8 +293,6 @@ export interface ClaimContext {
   readonly threadId: string | null;
   readonly pool: string;
   readonly projectId: string | null;
-  /** Cards this thread carried that are still its own; a block by one of them doesn't stop a claim. */
-  readonly mine: ReadonlySet<string>;
   readonly byId: ReadonlyMap<string, KanbanCard>;
   /** Cards working on the thread right now. */
   readonly carrying: number;
@@ -273,21 +315,22 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   if (card.stalled !== null) {
     return no(`card #${card.number} is flagged stalled: ${card.stalled.reason}`);
   }
-  const pool = poolKey(card.model);
-  if (pool !== ctx.pool)
-    return no(`card #${card.number} runs on ${pool}; this thread runs ${ctx.pool}`);
+  if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
+  if (kanbanWaitsOnEvaluator(card)) {
+    return no(`card #${card.number} waits on an evaluator's subtask first`);
+  }
+  const runsOn =
+    card.workThreadId === null
+      ? kanbanCardModels(card).map((entry) => poolKey(entry.model))
+      : [poolKey(card.model)];
+  if (!runsOn.includes(ctx.pool)) {
+    return no(`card #${card.number} runs on ${runsOn.join(" or ")}; this thread runs ${ctx.pool}`);
+  }
   if ((card.projectId ?? board.defaultProjectId) !== ctx.projectId) {
     return no(`card #${card.number} runs in another project`);
   }
-  const blocker = card.blockedBy
-    .map((id) => ctx.byId.get(id))
-    .find(
-      (other) =>
-        other !== undefined &&
-        !isDone(other.stage) &&
-        !ctx.mine.has(other.id) &&
-        (ctx.threadId === null || other.activeThreadId !== ctx.threadId),
-    );
+  // The claim makes the card this thread's, so a block by the thread's own work doesn't count.
+  const blocker = kanbanHeldUpBy(card, ctx.byId, ctx.threadId);
   if (blocker) return no(`card #${card.number} waits on #${blocker.number}`);
   if (ctx.slots <= 0) return no(`the ${ctx.pool} pool is paused`);
   if (ctx.carrying >= MAX_BATCH) {
@@ -304,7 +347,7 @@ export interface Candidate {
 /**
  * Todo cards worth taking into a thread that worked on `seeds`: same similar
  * group, a block either way, or the same PR or Linear issue. Only cards the
- * thread could claim, most urgent first.
+ * thread could claim, in pick order.
  */
 export function relatedCandidates(input: {
   readonly board: KanbanBoard;
@@ -319,10 +362,10 @@ export function relatedCandidates(input: {
   readonly limit?: number;
 }): ReadonlyArray<Candidate> {
   const byId = new Map(input.cards.map((card) => [card.id as string, card]));
-  const mine = new Set<string>(input.seeds.map((seed) => seed.id));
+  const seeds = new Set<string>(input.seeds.map((seed) => seed.id));
   const reasons = new Map<string, string>();
   const note = (id: string, why: string) => {
-    if (!mine.has(id) && !reasons.has(id)) reasons.set(id, why);
+    if (!seeds.has(id) && !reasons.has(id)) reasons.set(id, why);
   };
   for (const seed of input.seeds) {
     for (const group of input.groups) {
@@ -345,18 +388,16 @@ export function relatedCandidates(input: {
     threadId: input.threadId,
     pool: input.pool,
     projectId: input.projectId,
-    mine,
     byId,
     carrying: input.carrying,
     slots: input.slots,
   };
+  const order = kanbanPickOrder(input.cards);
   return [...reasons]
     .flatMap(([id, why]) => {
       const card = byId.get(id);
       return card && checkClaim(input.board, card, ctx).ok ? [{ card, why }] : [];
     })
-    .toSorted(
-      (a, b) => a.card.priority - b.card.priority || a.card.movedAt.localeCompare(b.card.movedAt),
-    )
+    .toSorted((a, b) => order(a.card, b.card))
     .slice(0, input.limit ?? MAX_BATCH);
 }

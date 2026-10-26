@@ -7,6 +7,8 @@ import {
   modelName,
   modelVariant,
   STAGE_LABELS,
+  SUBTASK_OWNER_LABELS,
+  subtaskSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/missions";
@@ -26,6 +28,7 @@ import { useNowMs } from "../missions/useNowMs";
 import { PrGlyph } from "./CardTile";
 import { Chat, Composer } from "./Chat";
 import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from "./kanbanStore";
+import { CopyLinkButton, KanbanMarkdown } from "./links";
 import { Chip, Glyph, LinkChip, Pri, priorityLabel, stageGlyph, Tabs } from "./parts";
 
 type DrawerTab = "discussion" | "details" | "threads" | "comments";
@@ -144,6 +147,7 @@ export function CardDrawer(props: {
           <Pri priority={card.priority} />
           <span className="tabular-nums">#{card.number}</span>
           <span className="flex-1" />
+          <CopyLinkButton kind="kanban-card" id={card.id} label={`#${card.number} ${card.title}`} />
           {card.activeThreadId ? (
             <ThreadLink threadId={card.activeThreadId}>Open</ThreadLink>
           ) : null}
@@ -350,7 +354,7 @@ function Details(props: {
                 value={String(card.priority)}
                 onValueChange={(value) => patch({ priority: Number(value) })}
               >
-                {[1, 2, 3, 4].map((priority) => (
+                {[1, 2, 3, 4, 5].map((priority) => (
                   <MenuRadioItem key={priority} value={String(priority)}>
                     {priorityLabel(priority)}
                   </MenuRadioItem>
@@ -388,14 +392,28 @@ function Details(props: {
             </span>
           </Fact>
         ) : null}
-        <Fact label="Model">
-          <Chip>
-            {modelName(card.model)}
-            {modelVariant(card.model) ? (
-              <span className="text-(--m-muted)">{modelVariant(card.model)}</span>
-            ) : null}
-          </Chip>
-        </Fact>
+        {card.models.length > 1 && card.workThreadId === null ? (
+          // Not started yet: it goes to the highest weight with room.
+          <Fact label="Models">
+            <span className="flex flex-wrap items-center gap-1.5">
+              {card.models.map((entry) => (
+                <Chip key={`${entry.model.instanceId}/${entry.model.model}`}>
+                  {modelName(entry.model)}
+                  <span className="text-(--m-muted) tabular-nums">{entry.weight}</span>
+                </Chip>
+              ))}
+            </span>
+          </Fact>
+        ) : (
+          <Fact label="Model">
+            <Chip>
+              {modelName(card.model)}
+              {modelVariant(card.model) ? (
+                <span className="text-(--m-muted)">{modelVariant(card.model)}</span>
+              ) : null}
+            </Chip>
+          </Fact>
+        )}
         {card.links.length > 0 ? (
           <Fact label="Links">
             <span className="flex flex-wrap gap-1.5">
@@ -445,6 +463,7 @@ function Details(props: {
           </Fact>
         ) : null}
       </dl>
+      <Subtasks card={card} />
       {moves.length > 0 ? (
         <ol className="mt-6 flex flex-col gap-2 text-sm">
           {moves.map((event) => (
@@ -461,6 +480,61 @@ function Details(props: {
         </ol>
       ) : null}
     </div>
+  );
+}
+
+const SUBTASK_GLYPH = { open: "idle", done: "done", skipped: "idle" } as const;
+
+/** The card's plan, step by step. The evaluator and the card's threads mark it; the owner reads it. */
+function Subtasks(props: { card: KanbanCard }) {
+  const steps = subtaskSteps(props.card);
+  if (steps.length === 0) return null;
+  return (
+    <section aria-label="Subtasks" className="mt-6">
+      <h3 className="mb-2 text-sm font-medium">Subtasks</h3>
+      <ol className="flex flex-col gap-3">
+        {steps.map((step) => (
+          <li key={step.step} className="grid grid-cols-[24px_1fr] gap-x-2">
+            <span
+              className={cn(
+                "pt-0.5 text-xs tabular-nums",
+                step.when === "now" ? "font-semibold text-(--m-text)" : "text-(--m-muted)",
+              )}
+            >
+              {step.step}
+            </span>
+            <ul className="flex flex-col gap-1.5">
+              {step.subtasks.map((subtask) => (
+                <li key={subtask.id} className="flex min-w-0 items-start gap-2 text-sm">
+                  <Glyph
+                    kind={
+                      subtask.state === "open" && step.when === "now"
+                        ? "ok"
+                        : SUBTASK_GLYPH[subtask.state]
+                    }
+                    className="mt-1.25"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className={cn(
+                        subtask.state === "skipped" && "text-(--m-muted) line-through",
+                        step.when === "later" && "text-(--m-muted)",
+                      )}
+                    >
+                      {subtask.text}
+                    </span>
+                    <span className="block text-xs text-(--m-muted)">
+                      {SUBTASK_OWNER_LABELS[subtask.owner]}
+                      {subtask.note ? ` · ${subtask.note}` : ""}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -534,10 +608,10 @@ function ThreadList(props: {
         const live = props.state.threads.get(thread.threadId);
         const running = live?.running ?? false;
         return (
-          <li key={thread.threadId}>
+          <li key={thread.threadId} className="flex items-center gap-1">
             <ThreadLink
               threadId={thread.threadId}
-              className="-mx-2 flex h-11 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
+              className="-ms-2 flex h-11 min-w-0 flex-1 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
             >
               <Glyph kind={running ? "ok" : thread.endedAt ? "done" : "idle"} />
               <span className="min-w-0 flex-1 truncate">
@@ -551,6 +625,11 @@ function ThreadList(props: {
                 {ageView(thread.startedAt, props.nowMs)?.label ?? ""}
               </span>
             </ThreadLink>
+            <CopyLinkButton
+              kind="thread"
+              id={thread.threadId}
+              label={live?.title || ROLE_LABELS[thread.role]}
+            />
           </li>
         );
       })}
@@ -570,7 +649,9 @@ function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEve
             <span className="text-xs text-(--m-muted) tabular-nums">
               {actorName(event.actor)} · {formatDayLabel(event.at)} {formatTimeOfDay(event.at)}
             </span>
-            <span className="whitespace-pre-wrap">{event.body}</span>
+            <div className="min-w-0">
+              <KanbanMarkdown text={event.body ?? ""} />
+            </div>
           </li>
         ))}
       </ol>

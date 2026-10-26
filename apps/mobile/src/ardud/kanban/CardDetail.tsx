@@ -4,6 +4,8 @@ import {
   modelName,
   modelVariant,
   STAGE_LABELS,
+  SUBTASK_OWNER_LABELS,
+  subtaskSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
@@ -237,7 +239,9 @@ function CardFacts(props: {
       </DetailRow>
       <DetailRow label="Priority">
         <PriorityBars priority={card.priority} />
-        <Text className="text-[14px] text-foreground">P{card.priority}</Text>
+        <Text className="text-[14px] text-foreground">
+          {card.priority === 5 ? "Backlog" : `P${card.priority}`}
+        </Text>
       </DetailRow>
       <DetailRow label="Goal">
         {goal ? <ChipLink label={goal.name} onPress={() => props.onOpenGoal(goal.id)} /> : <Dash />}
@@ -249,10 +253,22 @@ function CardFacts(props: {
           <Dash />
         )}
       </DetailRow>
-      <DetailRow label="Model">
-        <KChip label={modelName(card.model)} />
-        {variant ? <KChip label={variant} /> : null}
-      </DetailRow>
+      {card.models.length > 1 && card.workThreadId === null ? (
+        // Not started yet: it goes to the highest weight with room.
+        <DetailRow label="Models">
+          {card.models.map((entry) => (
+            <KChip
+              key={`${entry.model.instanceId}/${entry.model.model}`}
+              label={`${modelName(entry.model)} ${entry.weight}`}
+            />
+          ))}
+        </DetailRow>
+      ) : (
+        <DetailRow label="Model">
+          <KChip label={modelName(card.model)} />
+          {variant ? <KChip label={variant} /> : null}
+        </DetailRow>
+      )}
       <DetailRow label="Links">
         {card.links.length > 0 ? (
           card.links.map((link) => (
@@ -304,6 +320,65 @@ function CardFacts(props: {
           <Dash />
         )}
       </DetailRow>
+      <CardSubtasks card={card} />
+    </View>
+  );
+}
+
+/** The card's plan, step by step. Agents mark it; the owner reads it here. */
+function CardSubtasks(props: { readonly card: KanbanCard }) {
+  const steps = subtaskSteps(props.card);
+  if (steps.length === 0) return null;
+  return (
+    <View className="gap-3 pt-3">
+      <Text className="text-[13px] text-foreground-muted">Subtasks</Text>
+      {steps.map((step) => (
+        <View key={step.step} className="flex-row gap-2">
+          <Text
+            className={
+              step.when === "now"
+                ? "w-5 text-[13px] font-semibold text-foreground"
+                : "w-5 text-[13px] text-foreground-muted"
+            }
+          >
+            {step.step}
+          </Text>
+          <View className="min-w-0 flex-1 gap-2">
+            {step.subtasks.map((subtask) => (
+              <View key={subtask.id} className="flex-row items-start gap-2">
+                <View className="pt-[5px]">
+                  <Glyph
+                    kind={
+                      subtask.state === "done"
+                        ? "done"
+                        : subtask.state === "open" && step.when === "now"
+                          ? "ok"
+                          : "idle"
+                    }
+                  />
+                </View>
+                <View className="min-w-0 flex-1">
+                  <Text
+                    className={
+                      subtask.state === "skipped"
+                        ? "text-[14px] text-foreground-muted line-through"
+                        : step.when === "later"
+                          ? "text-[14px] text-foreground-muted"
+                          : "text-[14px] text-foreground"
+                    }
+                  >
+                    {subtask.text}
+                  </Text>
+                  <Text className="text-[12px] text-foreground-muted">
+                    {SUBTASK_OWNER_LABELS[subtask.owner]}
+                    {subtask.note ? ` · ${subtask.note}` : ""}
+                  </Text>
+                </View>
+              </View>
+            ))}
+          </View>
+        </View>
+      ))}
     </View>
   );
 }

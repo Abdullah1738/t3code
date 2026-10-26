@@ -149,6 +149,7 @@ import { RecoveryService } from "./ardud/missions/recovery/RecoveryService.ts";
 import { makeRecoveryWsHandlers } from "./ardud/missions/recovery/ws.ts";
 // ardud: missions board
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { KanbanScripts } from "./ardud/kanban/engine/ScriptService.ts";
 import { makeKanbanWsHandlers } from "./ardud/kanban/ws.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import {
@@ -1268,7 +1269,11 @@ const layerWsMissionsRecoveryRpc = (
 
 // ardud: missions board
 const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
-  Effect.map(KanbanService, (service) => ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service))),
+  Effect.gen(function* () {
+    const service = yield* KanbanService;
+    const scripts = yield* KanbanScripts;
+    return ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service, scripts));
+  }),
 );
 
 export const layerWsRpc = (

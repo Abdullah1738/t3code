@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - source scripts run as owner-written child processes in their own scratch dirs.
+// @effect-diagnostics nodeBuiltinImport:off - owner-written scripts (view sources, board scripts) run as child processes.
 // @effect-diagnostics globalTimersInEffect:off - the child's deadline lives in the Node callback that owns the child.
 // @effect-diagnostics globalDate:off - wall-clock duration of a child process, measured in its callbacks.
 // @effect-diagnostics globalDateInEffect:off - same duration, started where the child is spawned.
@@ -87,10 +87,24 @@ const killGroup = (child: NodeChildProcess.ChildProcess) => {
   }
 };
 
-const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
+export interface ProcessSpec {
+  /** Program and arguments; the run starts them under `nice`. */
+  readonly argv: readonly [string, ...Array<string>];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly timeoutMs: number;
+  /** stdout past this many bytes stops the run (`overflow`). */
+  readonly outputBytes: number;
+}
+
+/**
+ * Runs one program with stdin closed in its own process group, and kills
+ * the whole group on timeout, on too much output, or when the run is
+ * interrupted.
+ */
+export const runProcess = (spec: ProcessSpec) =>
   Effect.callback<ScriptResult>((resume, signal) => {
     const started = Date.now();
-    const runtime = RUNTIMES[spec.runtime];
     const stdout: Array<Buffer> = [];
     let stdoutBytes = 0;
     let stderr = "";
@@ -113,9 +127,9 @@ const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
         }),
       );
     };
-    const child = NodeChildProcess.spawn("nice", ["-n", "10", runtime.binary, scriptPath], {
-      cwd,
-      env: scriptEnv(process.env),
+    const child = NodeChildProcess.spawn("nice", ["-n", "10", ...spec.argv], {
+      cwd: spec.cwd,
+      env: spec.env,
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
@@ -137,7 +151,7 @@ const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
     child.stdout?.on("data", (chunk: Buffer) => {
       if (overflow || settled) return;
       stdoutBytes += chunk.length;
-      if (stdoutBytes > VIEW_SOURCE_LIMITS.outputBytes) {
+      if (stdoutBytes > spec.outputBytes) {
         overflow = true;
         stop();
         finish(null, null);
@@ -166,11 +180,7 @@ const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
     return Effect.sync(abort);
   });
 
-/**
- * Runs one script: written to the source's scratch dir, started under
- * `nice` with stdin closed, killed with its whole process group on timeout,
- * on too much output, or when the run is interrupted.
- */
+/** Runs one source script, written to the source's scratch dir (see `runProcess`). */
 export const runScript = Effect.fn("SourceRunner.run")(function* (spec: ScriptSpec) {
   const runtime = RUNTIMES[spec.runtime];
   const cwd = NodePath.join(spec.dir, "work");
@@ -194,7 +204,13 @@ export const runScript = Effect.fn("SourceRunner.run")(function* (spec: ScriptSp
     };
     return failed;
   }
-  return yield* spawnScript(spec, scriptPath, cwd);
+  return yield* runProcess({
+    argv: [runtime.binary, scriptPath],
+    cwd,
+    env: scriptEnv(process.env),
+    timeoutMs: spec.timeoutMs,
+    outputBytes: VIEW_SOURCE_LIMITS.outputBytes,
+  });
 });
 
 export class SourceRunner extends Context.Service<

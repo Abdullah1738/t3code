@@ -6,6 +6,7 @@ import {
   avatarOf,
   discussionRows,
   type KanbanBoardState,
+  linkLabels,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/missions";
 
@@ -13,6 +14,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { Chat, Composer } from "./Chat";
 import { kanban, runAction } from "./kanbanStore";
+import { CopyLinkButton } from "./links";
 import { Avatar, UnreadDot } from "./parts";
 
 /** Search value that opens an empty room for a new request. */
@@ -51,7 +53,7 @@ function DraftRoom(props: {
 
 function requestTitle(text: string) {
   const line =
-    text
+    linkLabels(text)
       .split("\n")
       .find((entry) => entry.trim().length > 0)
       ?.trim() ?? "Request";
@@ -139,6 +141,7 @@ export function DiscussionsView(props: {
                 </button>
               ) : null}
               <h3 className="min-w-0 flex-1 truncate text-base font-medium">{selected.title}</h3>
+              <CopyLinkButton kind="kanban-discussion" id={selected.id} label={selected.title} />
               <span className="flex -space-x-1">
                 {selected.participants.map((entry) => {
                   const face = avatarOf(entry.actor, entry.name);

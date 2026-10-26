@@ -6,6 +6,7 @@ import ChatMarkdown from "../../components/ChatMarkdown";
 import { cn } from "../../lib/utils";
 import { useWiki } from "./kanbanStore";
 import { Tabs } from "./parts";
+import { ScriptsView } from "./ScriptsView";
 
 export function WikiView(props: { boardId: string; nowMs: number }) {
   const pages = useWiki(props.boardId);
@@ -51,13 +52,15 @@ export function WikiView(props: { boardId: string; nowMs: number }) {
   );
 }
 
-/** Automations and Scripts share one page; the engine behind them lands later. */
+/** Automations and Scripts share one page; automations land later. */
 export function AutomationsView(props: {
+  boardId: string;
+  nowMs: number;
   tab: "automations" | "scripts";
   onTab: (tab: "automations" | "scripts") => void;
 }) {
   return (
-    <div className="flex max-w-xl flex-col gap-4">
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
       <Tabs
         label="Automations"
         value={props.tab}
@@ -67,9 +70,11 @@ export function AutomationsView(props: {
           { value: "scripts", label: "Scripts" },
         ]}
       />
-      <p className="text-(--m-muted)">
-        {props.tab === "automations" ? "No automations yet." : "No scripts yet."}
-      </p>
+      {props.tab === "automations" ? (
+        <p className="text-(--m-muted)">No automations yet.</p>
+      ) : (
+        <ScriptsView boardId={props.boardId} nowMs={props.nowMs} />
+      )}
     </div>
   );
 }

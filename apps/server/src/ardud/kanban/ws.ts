@@ -6,6 +6,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import type { BoardPatch, KanbanServiceShape } from "./engine/KanbanService.ts";
+import type { KanbanScriptsShape } from "./engine/ScriptService.ts";
 
 const OWNER = { _tag: "owner" } as const;
 
@@ -14,8 +15,12 @@ const definedOnly = <T extends object>(value: T) =>
     [K in keyof T]: Exclude<T[K], undefined>;
   };
 
+const SCRIPT_RUNS_PAGE = 20;
+
+type ScriptId = Parameters<KanbanScriptsShape["runs"]>[0];
+
 /** WS handlers for the board UI. Every write runs as the owner (the operate scope gates it). */
-export const makeKanbanWsHandlers = (service: KanbanServiceShape) => {
+export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: KanbanScriptsShape) => {
   const patchCard = Effect.fn("KanbanWs.patchCard")(function* (input: KanbanCardPatchInput) {
     const { cardId, stage, stalled, comment, ...fields } = input;
     let card = (yield* service.card(cardId)).card;
@@ -88,5 +93,13 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape) => {
       readonly blockId: string;
       readonly choice: ReadonlyArray<string>;
     }) => service.answer(input.discussionId, input.seq, input.blockId, input.choice, OWNER),
+    [M.scripts]: (input: { readonly boardId: Parameters<KanbanScriptsShape["scripts"]>[0] }) =>
+      scripts.scripts(input.boardId),
+    [M.scriptRuns]: (input: { readonly scriptId: ScriptId; readonly limit?: number | undefined }) =>
+      scripts.runs(input.scriptId, input.limit || SCRIPT_RUNS_PAGE),
+    [M.scriptEnable]: (input: { readonly scriptId: ScriptId; readonly enabled: boolean }) =>
+      scripts.setEnabled(input.scriptId, input.enabled),
+    [M.scriptRun]: (input: { readonly scriptId: ScriptId }) =>
+      scripts.run(input.scriptId, "manual"),
   } as const;
 };

@@ -1,5 +1,5 @@
 import { ArrowUpIcon } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type ClipboardEvent } from "react";
 
 import {
   avatarOf,
@@ -8,12 +8,31 @@ import {
   type PresenceFace,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { formatTimeOfDay } from "@t3tools/client-runtime/ardud/missions";
-import type { KanbanBlock, KanbanDiscussion, KanbanMessage } from "@t3tools/contracts";
+import type {
+  KanbanBlock,
+  KanbanDiscussion,
+  KanbanMessage,
+  ServerProviderSkill,
+} from "@t3tools/contracts";
+import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
+import { formatThreadLink, parseThreadLinkHref } from "@t3tools/shared/threadLinks";
 
-import ChatMarkdown from "../../components/ChatMarkdown";
+import {
+  ComposerPromptEditor,
+  type ComposerPromptEditorHandle,
+} from "../../components/ComposerPromptEditor";
+import {
+  EMPTY_COMPOSER_CONTEXT_RECORDS,
+  type ComposerDraftContextRecords,
+} from "../../components/composerContextPresentation";
+import { collapseExpandedComposerCursor } from "../../composer-logic";
+import { threadContextRecord, threadContextReference } from "../../lib/composerContextRecords";
+import { formatInlineContextReference } from "../../lib/composerContextReferences";
 import { cn } from "../../lib/utils";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "../missions/useNowMs";
 import { kanban, kanbanErrorMessage, runAction, useFeed, useMessages } from "./kanbanStore";
+import { KanbanMarkdown } from "./links";
 import { Avatar, Chip, Glyph, stageGlyph } from "./parts";
 
 /** One discussion: messages, read receipts, typing and the composer. */
@@ -170,7 +189,7 @@ function Block(props: {
     case "md":
       return (
         <div className="min-w-0 text-sm leading-normal">
-          <ChatMarkdown text={block.text} cwd={undefined} headingLevelOffset={2} />
+          <KanbanMarkdown text={block.text} />
         </div>
       );
     case "collapse":
@@ -184,7 +203,7 @@ function Block(props: {
             {block.title}
           </summary>
           <div className="px-3 pb-2.5 text-sm">
-            <ChatMarkdown text={block.text} cwd={undefined} headingLevelOffset={2} />
+            <KanbanMarkdown text={block.text} />
           </div>
         </details>
       );
@@ -364,23 +383,75 @@ function ChoiceBlock(props: {
   );
 }
 
-/** Message box: Enter sends, Shift+Enter breaks the line. */
+const NO_SKILLS: ReadonlyArray<ServerProviderSkill> = [];
+const THREAD_LINK = /\[([^\]\n]*)\]\((t3-thread:\/\/v1\/[^\s)]+)\)/g;
+
+/**
+ * Message box: Enter sends, Shift+Enter breaks the line. A pasted board link
+ * turns into a chip, the same way thread links do in the thread composer.
+ */
 export function Composer(props: {
   placeholder: string;
   onSend: (text: string) => Promise<unknown>;
 }) {
+  const environmentId = usePrimaryEnvironmentId();
   const [text, setText] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const [records, setRecords] = useState<ComposerDraftContextRecords>(
+    EMPTY_COMPOSER_CONTEXT_RECORDS,
+  );
   const [sending, setSending] = useState(false);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<ComposerPromptEditorHandle | null>(null);
+
+  // Thread chips go out as plain thread links, which messages show as live
+  // links and agents can read.
+  const outgoing = (value: string) =>
+    replaceComposerContextReferences(value, (reference) => {
+      const entry = records.get(reference.contextId);
+      return entry?.kind === "thread"
+        ? formatThreadLink(entry.record.threadId, entry.record.title)
+        : reference.source;
+    });
 
   const send = async () => {
-    const body = text.trim();
+    const body = outgoing(text).trim();
     if (body.length === 0 || sending) return;
     setSending(true);
     const ok = await runAction("Couldn't send", () => props.onSend(body));
     setSending(false);
-    if (ok) setText("");
-    inputRef.current?.focus();
+    if (ok) {
+      setText("");
+      setCursor(0);
+      setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
+    }
+    editorRef.current?.focus();
+  };
+
+  // A pasted thread link becomes a thread chip, like in a thread's composer.
+  const onPaste = (event: ClipboardEvent<HTMLElement>) => {
+    const pasted = event.clipboardData.getData("text/plain");
+    if (environmentId === null || !pasted.includes("](t3-thread://v1/")) return;
+    const added = new Map(records);
+    const converted = pasted.replace(THREAD_LINK, (source, label: string, href: string) => {
+      const threadId = parseThreadLinkHref(href);
+      if (threadId === null) return source;
+      const record = threadContextRecord({ environmentId, threadId }, label || threadId);
+      added.set(record.contextId, { kind: "thread", record });
+      return formatInlineContextReference(threadContextReference(record));
+    });
+    if (converted === pasted) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const range = editorRef.current?.readSelectionRange() ?? {
+      start: text.length,
+      end: text.length,
+    };
+    const next = `${text.slice(0, range.start)}${converted}${text.slice(range.end)}`;
+    const nextCursor = collapseExpandedComposerCursor(next, range.start + converted.length);
+    setRecords(added);
+    setText(next);
+    setCursor(nextCursor);
+    window.requestAnimationFrame(() => editorRef.current?.focusAt(nextCursor));
   };
 
   return (
@@ -391,21 +462,30 @@ export function Composer(props: {
         void send();
       }}
     >
-      <textarea
-        ref={inputRef}
-        rows={1}
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
+      <div className="min-w-0 flex-1 py-1.5">
+        <ComposerPromptEditor
+          value={text}
+          cursor={cursor}
+          contextRecords={records}
+          skills={NO_SKILLS}
+          disabled={false}
+          placeholder={props.placeholder}
+          ariaLabel={props.placeholder}
+          className="max-h-40 min-h-5 text-sm leading-5 text-(--m-text)"
+          placeholderClassName="leading-5 text-(--m-muted)"
+          editorRef={editorRef}
+          onPaste={onPaste}
+          onChange={(value, nextCursor) => {
+            setText(value);
+            setCursor(nextCursor);
+          }}
+          onCommandKeyDown={(key, event) => {
+            if (key !== "Enter" || event.shiftKey) return false;
             void send();
-          }
-        }}
-        placeholder={props.placeholder}
-        aria-label={props.placeholder}
-        className="max-h-40 min-h-8 flex-1 resize-none bg-transparent py-1.5 text-sm leading-5 text-(--m-text) outline-none [field-sizing:content] placeholder:text-(--m-muted)"
-      />
+            return true;
+          }}
+        />
+      </div>
       <button
         type="submit"
         disabled={text.trim().length === 0 || sending}

@@ -16,11 +16,13 @@ import {
 import {
   discussionPresence,
   discussionRows,
+  goalPage,
   goalProgress,
   groupCards,
   mergeMessages,
   poolViews,
   stageBoard,
+  subtaskSteps,
 } from "./viewModel.ts";
 
 const NOW = Date.parse("2026-10-25T12:00:00.000Z");
@@ -39,6 +41,8 @@ function card(number: number, patch: Partial<KanbanCard> = {}): KanbanCard {
     goalId: null,
     projects: [],
     model,
+    models: [],
+    subtasks: [],
     projectId: null,
     links: [],
     blockedBy: [],
@@ -155,6 +159,94 @@ describe("stageBoard", () => {
     expect(view.owner.cards[0]!.flag).toEqual({ kind: "ask", label: "Window?" });
     expect(view.shipped.flatMap((column) => column.cards.map((c) => c.number))).toEqual([6]);
     expect(view.total).toBe(5);
+  });
+
+  it("orders todo the way the dispatcher picks: priority, then most blocking, then oldest", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { movedAt: "2026-10-25T09:00:00.000Z" }),
+        card(2),
+        card(3, { priority: 1, movedAt: "2026-10-25T11:00:00.000Z" }),
+        card(4, { stage: "working", blockedBy: ["card-2" as never] }),
+      ]),
+    );
+    const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!;
+    expect(todo.cards.map((c) => c.number)).toEqual([3, 2, 1]);
+  });
+
+  it("puts to-do cards the dispatcher skips below the ones it can start, and reviews oldest first", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { priority: 1, blockedBy: ["card-4" as never] }),
+        card(2, {
+          priority: 1,
+          stalled: { reason: "x", by: { _tag: "owner" }, at: "2026-10-25T09:00:00.000Z" },
+        }),
+        card(3, { priority: 3 }),
+        card(4, { stage: "working" }),
+        card(5, { stage: "needs_review", priority: 1, movedAt: "2026-10-25T11:00:00.000Z" }),
+        card(6, { stage: "needs_review", priority: 4, movedAt: "2026-10-25T09:00:00.000Z" }),
+        card(7, { priority: 5, movedAt: "2026-10-25T08:00:00.000Z" }),
+      ]),
+    );
+    const columns = stageBoard(state, NOW).active;
+    const numbers = (stage: string) =>
+      columns.find((column) => column.stage === stage)!.cards.map((c) => c.number);
+    expect(numbers("todo")).toEqual([3, 1, 2, 7]);
+    const backlog = columns.find((column) => column.stage === "todo")!.cards.at(-1)!;
+    expect(backlog.flag).toEqual({ kind: "blocked", label: "In the backlog" });
+    expect(numbers("needs_review")).toEqual([6, 5]);
+  });
+
+  it("counts a card's subtasks, and flags one waiting on the evaluator's step", () => {
+    const subtask = (
+      id: string,
+      step: number,
+      owner: "work" | "evaluator",
+      state: "open" | "done" = "open",
+    ) => ({ id, step, text: id, owner, state, note: null, doneBy: null, doneAt: null });
+    const waiting = card(1, {
+      subtasks: [subtask("s1", 1, "work", "done"), subtask("s2", 2, "evaluator")],
+    });
+    const state = boardStateFromSnapshot(snapshot([waiting, card(2)]));
+    const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!.cards;
+    expect(todo.map((c) => c.number)).toEqual([2, 1]);
+    expect(todo[1]!.flag).toEqual({ kind: "blocked", label: "Waits on the evaluator" });
+    expect(todo[1]!.subtasks).toEqual({ done: 1, total: 2 });
+    expect(todo[0]!.subtasks).toBeNull();
+    expect(subtaskSteps(waiting).map((step) => [step.step, step.when])).toEqual([
+      [1, "past"],
+      [2, "now"],
+    ]);
+  });
+
+  it("orders a goal's stages and the goal grouping the same way", () => {
+    const goal = { goalId: "goal-a" as never };
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { ...goal, priority: 1, blockedBy: ["card-4" as never] }),
+        card(3, { ...goal, priority: 3 }),
+        card(4, { ...goal, stage: "working" }),
+        card(5, {
+          ...goal,
+          stage: "needs_review",
+          priority: 1,
+          movedAt: "2026-10-25T11:00:00.000Z",
+        }),
+        card(6, {
+          ...goal,
+          stage: "needs_review",
+          priority: 4,
+          movedAt: "2026-10-25T09:00:00.000Z",
+        }),
+      ]),
+    );
+    const page = goalPage(state, "goal-a", NOW)!;
+    const stage = (name: string) =>
+      page.stages.find((column) => column.stage === name)!.cards.map((c) => c.number);
+    expect(stage("todo")).toEqual([3, 1]);
+    expect(stage("needs_review")).toEqual([6, 5]);
+    expect(groupCards(state, "goal", NOW)[0]!.cards.map((c) => c.number)).toEqual([4, 6, 5, 3, 1]);
   });
 });
 

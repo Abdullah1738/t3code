@@ -7,6 +7,8 @@ import {
   type KanbanCardPatchInput,
   type KanbanDiscussion,
   type KanbanMessage,
+  type KanbanScript,
+  type KanbanScriptRun,
   type KanbanWatchEvent,
   type KanbanWikiPage,
   type ModelSelection,
@@ -51,6 +53,10 @@ export interface KanbanClient {
   messages(boardId: string, discussionId: string): SnapshotStore<ReadonlyArray<KanbanMessage>>;
   card(boardId: string, cardId: string): SnapshotStore<KanbanCardDetail>;
   wiki(boardId: string): SnapshotStore<ReadonlyArray<KanbanWikiPage>>;
+  /** The board's scripts, kept current by the board feed. */
+  scripts(boardId: string): SnapshotStore<ReadonlyArray<KanbanScript>>;
+  /** A script's recent runs, newest first, kept current by the board feed. */
+  scriptRuns(boardId: string, scriptId: string): SnapshotStore<ReadonlyArray<KanbanScriptRun>>;
 
   patchCard(input: KanbanCardPatchInput): Promise<void>;
   settleCard(cardId: string): Promise<void>;
@@ -70,6 +76,9 @@ export interface KanbanClient {
     blockId: string,
     choice: ReadonlyArray<string>,
   ): Promise<void>;
+  setScriptEnabled(scriptId: string, enabled: boolean): Promise<void>;
+  /** Starts a run now; it shows up in the runs store as it opens and ends. */
+  runScript(scriptId: string): Promise<void>;
   /**
    * While watched, the newest message of recent discussions is read whenever
    * a preview falls behind. Screens that list discussions watch; the board
@@ -82,6 +91,25 @@ const PREVIEW_FETCH_LIMIT = 40;
 const MESSAGE_PAGE = 200;
 const RETRY_MIN_MS = 5_000;
 const RETRY_MAX_MS = 60_000;
+const SCRIPT_RUNS_PAGE = 20;
+
+/**
+ * Puts `item` in place of the entry with its id, or where `insert` says.
+ * `keep` says when the entry there is newer and stays.
+ */
+function upsert<T extends { readonly id: unknown }>(
+  list: ReadonlyArray<T>,
+  item: T,
+  insert: (list: ReadonlyArray<T>, item: T) => ReadonlyArray<T>,
+  keep?: (current: T, item: T) => boolean,
+): ReadonlyArray<T> {
+  const index = list.findIndex((entry) => entry.id === item.id);
+  if (index === -1) return insert(list, item);
+  if (keep?.(list[index]!, item)) return list;
+  const next = [...list];
+  next[index] = item;
+  return next;
+}
 
 /**
  * Runs `load` one at a time. A call while it runs asks for one more run after
@@ -551,6 +579,97 @@ export function createKanbanClient(
     options,
   );
 
+  // A list read from the server, then kept current by the board feed's
+  // changes. Every snapshot (a reconnect included) reads it again; changes
+  // that land while a read is out are newer than the read and win.
+  function followedList<T extends { readonly id: unknown }>(config: {
+    readonly boardId: string;
+    readonly read: () => Promise<ReadonlyArray<T>>;
+    readonly pick: (change: Extract<KanbanWatchEvent, { _tag: "change" }>["change"]) => T | null;
+    readonly insert: (list: ReadonlyArray<T>, item: T) => ReadonlyArray<T>;
+    readonly keep?: (current: T, item: T) => boolean;
+    readonly emit: (list: ReadonlyArray<T>) => void;
+    readonly fail: (error: unknown) => void;
+  }): Unsubscribe {
+    let list: ReadonlyArray<T> = [];
+    let loaded = false;
+    let live: Array<T> | null = null;
+    const reads = serialLoader(async () => {
+      const during: Array<T> = [];
+      live = during;
+      let read: ReadonlyArray<T>;
+      try {
+        read = await config.read();
+      } catch (error) {
+        if (loaded || !isKanbanServerError(error)) throw error;
+        config.fail(error);
+        return;
+      } finally {
+        if (live === during) live = null;
+      }
+      list = during.reduce((next, item) => upsert(next, item, config.insert, config.keep), read);
+      loaded = true;
+      config.emit(list);
+    });
+    const off = follow(
+      config.boardId,
+      (event) => {
+        if (event._tag === "snapshot") {
+          if (loaded) reads.run();
+          else reads.nudge();
+          return;
+        }
+        const item = config.pick(event.change);
+        if (item === null) return;
+        live?.push(item);
+        list = upsert(list, item, config.insert, config.keep);
+        if (loaded) config.emit(list);
+      },
+      reads.run,
+    );
+    reads.run();
+    return () => {
+      reads.close();
+      off();
+    };
+  }
+
+  const scripts = createKeyedSnapshotStores<string, ReadonlyArray<KanbanScript>>(
+    (boardId, emit, fail) =>
+      followedList({
+        boardId,
+        read: () => transport.request(M.scripts, { boardId: boardId as never }),
+        pick: (change) =>
+          change._tag === "script" && change.script.boardId === boardId ? change.script : null,
+        insert: (list, script) => [...list, script],
+        emit,
+        fail,
+      }),
+    options,
+  );
+
+  const scriptRuns = createKeyedSnapshotStores<string, ReadonlyArray<KanbanScriptRun>>(
+    (key, emit, fail) => {
+      const [boardId = "", scriptId = ""] = key.split("\n");
+      return followedList({
+        boardId,
+        read: () =>
+          transport.request(M.scriptRuns, {
+            scriptId: scriptId as never,
+            limit: SCRIPT_RUNS_PAGE,
+          }),
+        pick: (change) =>
+          change._tag === "scriptRun" && change.run.scriptId === scriptId ? change.run : null,
+        insert: (list, run) => [run, ...list].slice(0, SCRIPT_RUNS_PAGE),
+        // A run that opened during a read can arrive after the read that has it ended.
+        keep: (current, run) => current.endedAt !== null && run.endedAt === null,
+        emit,
+        fail,
+      });
+    },
+    options,
+  );
+
   const withDiscussion = (boardId: string, discussion: KanbanDiscussion) =>
     update(boardId, (state) => withDiscussions(state, [discussion], []));
 
@@ -560,6 +679,8 @@ export function createKanbanClient(
     messages: (boardId, discussionId) => messages(`${boardId}\n${discussionId}`),
     card: (boardId, cardId) => card(`${boardId}\n${cardId}`),
     wiki,
+    scripts,
+    scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
 
     async patchCard(input) {
       await transport.request(M.cardPatch, input);
@@ -606,6 +727,12 @@ export function createKanbanClient(
         blockId,
         choice,
       });
+    },
+    async setScriptEnabled(scriptId, enabled) {
+      await transport.request(M.scriptEnable, { scriptId: scriptId as never, enabled });
+    },
+    async runScript(scriptId) {
+      await transport.request(M.scriptRun, { scriptId: scriptId as never });
     },
     watchPreviews(boardId) {
       previewWatchers.set(boardId, (previewWatchers.get(boardId) ?? 0) + 1);

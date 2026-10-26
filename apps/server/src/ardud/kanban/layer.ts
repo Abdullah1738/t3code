@@ -8,6 +8,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
 import { KanbanService, layer as KanbanServiceLayer } from "./engine/KanbanService.ts";
+import { KanbanScripts, layer as KanbanScriptsLayer } from "./engine/ScriptService.ts";
 import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
 import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
 
@@ -21,13 +22,22 @@ const warnUnlessInterrupted = (what: string) => (cause: Cause.Cause<unknown>) =>
 
 /**
  * The Missions board: its service, the worker that runs dispatch and turn
- * ends one at a time, the run-update follower and the periodic tick.
+ * ends one at a time, the run-update follower, board scripts and the
+ * periodic tick.
  */
 export const ArdudKanbanLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const service = yield* KanbanService;
+    const scripts = yield* KanbanScripts;
     const engine = yield* Orchestrator.OrchestratorV2;
     yield* forkParked(service.worker);
+    yield* forkParked(
+      scripts.recover.pipe(
+        Effect.catchCause(warnUnlessInterrupted("board scripts could not close old runs")),
+        Effect.andThen(scripts.listen),
+        Effect.catchCause(warnUnlessInterrupted("board scripts stopped following the board")),
+      ),
+    );
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) =>
         event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status)
@@ -40,12 +50,16 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     yield* forkParked(
       service.tick.pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board tick failed")),
+        Effect.andThen(
+          scripts.tick.pipe(Effect.catchCause(warnUnlessInterrupted("board scripts tick failed"))),
+        ),
         Effect.repeat(Schedule.spaced(TICK)),
         Effect.asVoid,
       ),
     );
   }),
 ).pipe(
+  Layer.provideMerge(KanbanScriptsLayer),
   Layer.provideMerge(KanbanServiceLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),

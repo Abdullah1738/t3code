@@ -61,20 +61,20 @@ export function flagGlyph(flag: CardFlag): GlyphKind {
   return flag.kind === "stalled" ? "stuck" : flag.kind === "ask" ? "wait" : "idle";
 }
 
-const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low"] as const;
+const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low", "Backlog"] as const;
 
 export function priorityLabel(priority: number): string {
   return PRIORITY_LABELS[priority - 1] ?? "Normal";
 }
 
-/** Three rising bars; priority 1 fills all three, 4 fills none. */
+/** Three rising bars; priority 1 fills all three, 4 and backlog fill none. */
 export function Pri(props: { priority: number }) {
   const filled = Math.max(0, 4 - props.priority);
   return (
     <span
       className="inline-flex h-2.75 shrink-0 items-end gap-0.5"
       role="img"
-      aria-label={`${priorityLabel(props.priority)} priority`}
+      aria-label={props.priority === 5 ? "Backlog" : `${priorityLabel(props.priority)} priority`}
     >
       {[5, 8, 11].map((height, index) => (
         <i

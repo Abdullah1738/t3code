@@ -451,12 +451,20 @@ const composerContextPresentationRegistry = createContextPresentationRegistry<
   fallback: (_kind, _entry, context) => <UnresolvedContextChip label={context.label} />,
 });
 
+// Lets a surface draw chips for context kinds of its own, which have no draft
+// record; it answers null for kinds it doesn't know.
+export const ComposerContextChipRendererContext = createContext<
+  ((reference: { kind: string; contextId: string; label: string }) => ReactElement | null) | null
+>(null);
+
 export function ComposerContextReferenceChip(props: {
   kind: string;
   contextId: string;
   label: string;
 }): ReactElement {
   const records = use(ComposerContextRecordsContext);
+  const own = use(ComposerContextChipRendererContext)?.(props);
+  if (own) return own;
   return composerContextPresentationRegistry.render(props.kind, records.get(props.contextId), {
     label: props.label,
   });

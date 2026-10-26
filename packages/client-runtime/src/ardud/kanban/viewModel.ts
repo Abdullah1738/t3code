@@ -1,16 +1,23 @@
-import type {
-  KanbanActor,
-  KanbanBlock,
-  KanbanCard,
-  KanbanDiscussion,
-  KanbanGoal,
-  KanbanMessage,
-  KanbanStage,
-  ModelSelection,
+import {
+  KANBAN_BACKLOG,
+  KANBAN_DONE_STAGES,
+  kanbanHeldUpBy,
+  kanbanOpenStep,
+  kanbanPickOrder,
+  kanbanWaitsOnEvaluator,
+  type KanbanActor,
+  type KanbanBlock,
+  type KanbanCard,
+  type KanbanDiscussion,
+  type KanbanGoal,
+  type KanbanMessage,
+  type KanbanStage,
+  type ModelSelection,
 } from "@t3tools/contracts";
 
 import { ageView } from "../missions/viewModel.ts";
 import type { KanbanBoardState } from "./boardState.ts";
+import { linkLabels } from "./links.ts";
 
 export const STAGE_LABELS: Record<KanbanStage, string> = {
   todo: "To-Do",
@@ -25,9 +32,8 @@ export const STAGE_LABELS: Record<KanbanStage, string> = {
 
 export const ACTIVE_STAGES = ["todo", "working", "needs_review", "in_review"] as const;
 export const SHIPPED_STAGES = ["completed", "deployed", "verified"] as const;
-const DONE = new Set<KanbanStage>(SHIPPED_STAGES);
 
-export const isDoneStage = (stage: KanbanStage) => DONE.has(stage);
+export const isDoneStage = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);
 
 /** "Opus", "Haiku", "Sol", "Astra", or the bare model id. */
 export function modelName(model: ModelSelection | null): string {
@@ -77,6 +83,8 @@ export interface CardView {
   readonly model: { readonly name: string; readonly letter: string };
   readonly running: boolean;
   readonly unread: number;
+  /** Subtasks done or skipped out of all, or null for a card with no plan. */
+  readonly subtasks: { readonly done: number; readonly total: number } | null;
   readonly card: KanbanCard;
 }
 
@@ -95,15 +103,19 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
     flag = { kind: "stalled", label: since && since !== "now" ? `Stalled ${since}` : "Stalled" };
   } else if (card.stage === "needs_owner" && card.question) {
     flag = { kind: "ask", label: card.question };
+  } else if (card.priority === KANBAN_BACKLOG && !isDoneStage(card.stage)) {
+    // Shown like a block: the card waits, here on the owner taking it out.
+    flag = { kind: "blocked", label: "In the backlog" };
   } else {
-    const waiting = card.blockedBy
-      .map((id) => state.cards.get(id))
-      .filter((blocker) => blocker !== undefined && !isDoneStage(blocker.stage));
-    if (waiting.length > 0) {
-      flag = { kind: "blocked", label: `After ${waiting.map((b) => `#${b!.number}`).join(", ")}` };
+    const blocker = isDoneStage(card.stage) ? undefined : kanbanHeldUpBy(card, state.cards);
+    if (blocker !== undefined) {
+      flag = { kind: "blocked", label: `After #${blocker.number}` };
+    } else if (kanbanWaitsOnEvaluator(card)) {
+      flag = { kind: "blocked", label: "Waits on the evaluator" };
     }
   }
   const thread = card.activeThreadId === null ? undefined : state.threads.get(card.activeThreadId);
+  const finished = card.subtasks.filter((subtask) => subtask.state !== "open").length;
   return {
     id: card.id,
     number: card.number,
@@ -118,8 +130,40 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
     model: { name: modelName(card.model), letter: modelLetter(card.model) },
     running: thread?.running ?? false,
     unread: card.discussionId === null ? 0 : (state.unread.get(card.discussionId) ?? 0),
+    subtasks: card.subtasks.length === 0 ? null : { done: finished, total: card.subtasks.length },
     card,
   };
+}
+
+export const SUBTASK_OWNER_LABELS = {
+  work: "Worker",
+  review: "Reviewer",
+  evaluator: "Evaluator",
+} as const;
+
+export interface SubtaskStepView {
+  readonly step: number;
+  /** Done or skipped steps are past; the open step is now; later steps wait. */
+  readonly when: "past" | "now" | "later";
+  readonly subtasks: KanbanCard["subtasks"];
+}
+
+/** A card's subtasks grouped by step, in order, with where the card is. */
+export function subtaskSteps(card: Pick<KanbanCard, "subtasks">): ReadonlyArray<SubtaskStepView> {
+  const current = kanbanOpenStep(card);
+  const steps = new Map<number, Array<KanbanCard["subtasks"][number]>>();
+  for (const subtask of card.subtasks) {
+    const list = steps.get(subtask.step) ?? [];
+    list.push(subtask);
+    steps.set(subtask.step, list);
+  }
+  return [...steps]
+    .sort(([a], [b]) => a - b)
+    .map(([step, subtasks]) => ({
+      step,
+      when: current === null || step < current ? "past" : step === current ? "now" : "later",
+      subtasks,
+    }));
 }
 
 export interface BoardFilter {
@@ -146,8 +190,36 @@ export function visibleCards(state: KanbanBoardState, filter: BoardFilter = {}):
   return cards;
 }
 
-const byPriorityThenWait = (a: KanbanCard, b: KanbanCard) =>
-  a.priority - b.priority || a.movedAt.localeCompare(b.movedAt) || a.number - b.number;
+type CardOrder = (a: KanbanCard, b: KanbanCard) => number;
+
+const oldestFirst: CardOrder = (a, b) => a.movedAt.localeCompare(b.movedAt) || a.number - b.number;
+// Like the dispatcher: backlog and the evaluator's steps never start, and a
+// blocker on the card's own work thread doesn't count while that thread can go on.
+const waitsToStart = (card: KanbanCard, state: KanbanBoardState) =>
+  card.stalled !== null ||
+  card.priority === KANBAN_BACKLOG ||
+  kanbanWaitsOnEvaluator(card) ||
+  kanbanHeldUpBy(card, state.cards) !== undefined;
+/**
+ * How each stage lists its cards, built once per board. To-Do goes the way the
+ * dispatcher takes it: cards it can start, in pick order, then the blocked and
+ * stalled ones it skips, so the top card goes next. Reviews start oldest first.
+ */
+const stageOrders = (state: KanbanBoardState) => {
+  const byPick = kanbanPickOrder([...state.cards.values()]);
+  const waits = new Map<string, boolean>();
+  const waiting = (card: KanbanCard) => {
+    let known = waits.get(card.id);
+    if (known === undefined) {
+      known = waitsToStart(card, state);
+      waits.set(card.id, known);
+    }
+    return known;
+  };
+  const todo: CardOrder = (a, b) => Number(waiting(a)) - Number(waiting(b)) || byPick(a, b);
+  return (stage: KanbanStage): CardOrder =>
+    stage === "todo" ? todo : stage === "needs_review" ? oldestFirst : byPick;
+};
 const newestFirst = (a: KanbanCard, b: KanbanCard) =>
   b.movedAt.localeCompare(a.movedAt) || b.number - a.number;
 
@@ -171,7 +243,8 @@ export function stageBoard(
   filter: BoardFilter = {},
 ): StageBoard {
   const cards = visibleCards(state, filter);
-  const column = (stage: KanbanStage, order = byPriorityThenWait): StageColumn => ({
+  const orderFor = stageOrders(state);
+  const column = (stage: KanbanStage, order = orderFor(stage)): StageColumn => ({
     stage,
     label: STAGE_LABELS[stage],
     cards: cards
@@ -210,8 +283,11 @@ const STAGE_ORDER = new Map<KanbanStage, number>(
     ] as const
   ).map((stage, index) => [stage, index]),
 );
-const byStageThenPriority = (a: KanbanCard, b: KanbanCard) =>
-  (STAGE_ORDER.get(a.stage) ?? 0) - (STAGE_ORDER.get(b.stage) ?? 0) || byPriorityThenWait(a, b);
+const byStageThenPick = (state: KanbanBoardState): CardOrder => {
+  const orderFor = stageOrders(state);
+  return (a, b) =>
+    (STAGE_ORDER.get(a.stage) ?? 0) - (STAGE_ORDER.get(b.stage) ?? 0) || orderFor(a.stage)(a, b);
+};
 
 /** Columns for every grouping but Stage. A card in several projects shows in each. */
 export function groupCards(
@@ -222,8 +298,8 @@ export function groupCards(
 ): CardGroup[] {
   const cards = visibleCards(state, filter);
   const visible = new Map(cards.map((card) => [card.id, card]));
-  const view = (list: KanbanCard[]) =>
-    list.sort(byStageThenPriority).map((card) => cardView(card, state, nowMs));
+  const order = byStageThenPick(state);
+  const view = (list: KanbanCard[]) => list.sort(order).map((card) => cardView(card, state, nowMs));
 
   if (by === "similar") {
     const placed = new Set<string>();
@@ -337,6 +413,7 @@ export function goalPage(state: KanbanBoardState, goalId: string, nowMs: number)
   if (goal === undefined) return null;
   const cards = [...state.cards.values()].filter((card) => card.goalId === goalId);
   const projects = [...new Set(cards.flatMap((card) => card.projects))].sort();
+  const orderFor = stageOrders(state);
   const order: KanbanStage[] = [
     "needs_owner",
     "working",
@@ -359,7 +436,7 @@ export function goalPage(state: KanbanBoardState, goalId: string, nowMs: number)
         label: STAGE_LABELS[stage],
         cards: cards
           .filter((card) => card.stage === stage)
-          .sort(byPriorityThenWait)
+          .sort(orderFor(stage))
           .map((card) => cardView(card, state, nowMs)),
       }))
       .filter((column) => column.cards.length > 0),
@@ -370,7 +447,7 @@ export function goalPage(state: KanbanBoardState, goalId: string, nowMs: number)
 export function blockText(block: KanbanBlock): string {
   switch (block._tag) {
     case "md":
-      return block.text;
+      return linkLabels(block.text);
     case "collapse":
       return block.title;
     case "html":

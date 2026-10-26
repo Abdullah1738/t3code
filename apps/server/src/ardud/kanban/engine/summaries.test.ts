@@ -44,6 +44,8 @@ const card = (id: string, patch: Partial<KanbanCard> = {}): KanbanCard => ({
   goalId: null,
   projects: [],
   model: opus,
+  models: [],
+  subtasks: [],
   projectId: null,
   links: [],
   blockedBy: [],

@@ -31,6 +31,7 @@ import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
 import { kanban, kanbanErrorMessage, useBoardState, useFeed } from "./kanbanStore";
+import { KanbanLinksProvider } from "./links";
 import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
 import { SettingsView } from "./SettingsView";
@@ -119,61 +120,65 @@ export function BoardPage(props: {
           </button>
         </WorkspacePageHeader>
         <main className="relative mx-2 mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl bg-(--m-ground) ps-5 pt-4.5 ring-1 ring-(--m-rule)">
-          {state === undefined ? (
-            feed.failure ? (
-              <div className="flex flex-col items-start gap-3 pe-5">
-                <p className="font-medium">Couldn't load the board.</p>
-                <p className="text-sm text-(--m-muted)">{kanbanErrorMessage(feed.failure.error)}</p>
-                <button
-                  type="button"
-                  onClick={feed.retry}
-                  className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
-                >
-                  Retry
-                </button>
-              </div>
-            ) : null
-          ) : (
-            <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
-              {feed.failure ? (
-                <div
-                  role="status"
-                  className="me-5 mb-3 flex items-center gap-3 rounded-xl bg-(--m-warnband) px-3.5 py-2 text-sm"
-                >
-                  <span className="min-w-0 flex-1 truncate">
-                    Not live. {kanbanErrorMessage(feed.failure.error)}
-                  </span>
+          <KanbanLinksProvider boardId={boardId}>
+            {state === undefined ? (
+              feed.failure ? (
+                <div className="flex flex-col items-start gap-3 pe-5">
+                  <p className="font-medium">Couldn't load the board.</p>
+                  <p className="text-sm text-(--m-muted)">
+                    {kanbanErrorMessage(feed.failure.error)}
+                  </p>
                   <button
                     type="button"
                     onClick={feed.retry}
-                    className="h-7 shrink-0 rounded-full bg-(--m-chip) px-3 font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
                   >
                     Retry
                   </button>
                 </div>
-              ) : null}
-              <BoardBody
+              ) : null
+            ) : (
+              <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
+                {feed.failure ? (
+                  <div
+                    role="status"
+                    className="me-5 mb-3 flex items-center gap-3 rounded-xl bg-(--m-warnband) px-3.5 py-2 text-sm"
+                  >
+                    <span className="min-w-0 flex-1 truncate">
+                      Not live. {kanbanErrorMessage(feed.failure.error)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={feed.retry}
+                      className="h-7 shrink-0 rounded-full bg-(--m-chip) px-3 font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                ) : null}
+                <BoardBody
+                  boardId={boardId}
+                  state={state}
+                  search={search}
+                  query={query}
+                  nowMs={nowMs}
+                  go={go}
+                  openCard={openCard}
+                  openGoal={openGoal}
+                />
+              </div>
+            )}
+            {state && search.card ? (
+              <CardDrawer
+                key={search.card}
                 boardId={boardId}
+                cardId={search.card}
                 state={state}
-                search={search}
-                query={query}
-                nowMs={nowMs}
-                go={go}
-                openCard={openCard}
-                openGoal={openGoal}
+                onClose={closeCard}
+                onOpenCard={openCard}
               />
-            </div>
-          )}
-          {state && search.card ? (
-            <CardDrawer
-              key={search.card}
-              boardId={boardId}
-              cardId={search.card}
-              state={state}
-              onClose={closeCard}
-              onOpenCard={openCard}
-            />
-          ) : null}
+            ) : null}
+          </KanbanLinksProvider>
         </main>
       </div>
     </SidebarInset>
@@ -240,8 +245,10 @@ function BoardBody(props: {
     case "automations":
     case "scripts":
       return (
-        <div className="pe-5">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pe-5">
           <AutomationsView
+            boardId={props.boardId}
+            nowMs={nowMs}
             tab={search.view === "scripts" ? "scripts" : "automations"}
             onTab={(view) => go({ view })}
           />

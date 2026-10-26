@@ -1,4 +1,5 @@
 import {
+  KANBAN_BACKLOG,
   KanbanBoardId,
   KanbanCardId,
   ThreadId,
@@ -14,7 +15,9 @@ import {
   applyReviewResult,
   checkClaim,
   checkMove,
+  isBlocked,
   MAX_BATCH,
+  modelOnPool,
   planDispatch,
   poolKey,
   prsLanded,
@@ -63,6 +66,8 @@ const card = (patch: Partial<KanbanCard> = {}): KanbanCard => {
     goalId: null,
     projects: [],
     model: opus,
+    models: [],
+    subtasks: [],
     projectId: null,
     links: [],
     blockedBy: [],
@@ -168,6 +173,46 @@ describe("planDispatch", () => {
     ]);
   });
 
+  it("at the same priority takes the card holding up the most work first", () => {
+    const loose = card();
+    const holdsOne = card();
+    const holdsChain = card();
+    const waiter = card({ priority: 3, blockedBy: [holdsOne.id] });
+    const middle = card({ priority: 4, blockedBy: [holdsChain.id] });
+    const end = card({ priority: 4, blockedBy: [middle.id] });
+    const urgent = card({ priority: 1 });
+    const plan = planDispatch(
+      board,
+      [loose, holdsOne, holdsChain, waiter, middle, end, urgent],
+      pools([[opus, 4]]),
+    );
+    expect(plan.map((d) => d.cardId)).toEqual([urgent.id, holdsChain.id, holdsOne.id, loose.id]);
+  });
+
+  it("takes a card holding up an urgent one as if it were that urgent", () => {
+    const routine = card({ priority: 2 });
+    const blocker = card({ priority: 4 });
+    const urgent = card({ priority: 1, blockedBy: [blocker.id] });
+    const plan = planDispatch(board, [routine, blocker, urgent], pools([[opus, 1]]));
+    expect(plan.map((d) => d.cardId)).toEqual([blocker.id]);
+  });
+
+  it("doesn't count done or settled cards as held up, and survives a loop of blocks", () => {
+    const b = card();
+    const a = card();
+    const doneWaiter = card({ stage: "completed", blockedBy: [a.id] });
+    const settledWaiter = card({ blockedBy: [a.id], settledAt: "2026-10-25T01:00:00Z" });
+    const loopX: KanbanCard = card();
+    const loopY = card({ blockedBy: [loopX.id] });
+    const x = { ...loopX, blockedBy: [loopY.id] };
+    const plan = planDispatch(
+      board,
+      [a, b, doneWaiter, settledWaiter, x, loopY],
+      pools([[opus, 2]]),
+    );
+    expect(plan.map((d) => d.cardId)).toEqual([b.id, a.id]);
+  });
+
   it("counts running cards against their pool and never goes negative", () => {
     const running = card({
       stage: "working",
@@ -258,7 +303,6 @@ describe("thread batching", () => {
       threadId: "t1",
       pool: poolKey(opus),
       projectId: null,
-      mine: new Set<string>([a.id]),
       byId,
       carrying: 1,
       slots: 1,
@@ -276,6 +320,7 @@ describe("thread batching", () => {
     expect(checkClaim(board, card({ workThreadId: ThreadId.make("t2") }), ctx).ok).toBe(false);
     expect(checkClaim(board, card({ workThreadId: t1 }), ctx).ok).toBe(true);
     expect(checkClaim(board, card(), { ...ctx, slots: 0 }).ok).toBe(false);
+    expect(checkClaim(board, card({ priority: KANBAN_BACKLOG }), ctx).ok).toBe(false);
   });
 
   it("starts a card fresh when its old thread is busy in another pool", () => {
@@ -293,13 +338,113 @@ describe("thread batching", () => {
     ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
   });
 
+  it("never picks up a backlog card, not even back to its own thread", () => {
+    const parked = card({ priority: KANBAN_BACKLOG });
+    const paused = card({ priority: KANBAN_BACKLOG, workThreadId: t1 });
+    const review = card({ priority: KANBAN_BACKLOG, stage: "needs_review" });
+    const next = card({ priority: 4 });
+    expect(planDispatch(board, [parked, paused, review, next], pools([[opus, 3]]))).toMatchObject([
+      { cardId: next.id },
+    ]);
+  });
+
   it("takes nothing from a pool at 0, not even a rejoin", () => {
     const a = working();
     const back = card({ workThreadId: t1 });
     expect(planDispatch(board, [a, back], pools([[opus, 0]]))).toEqual([]);
   });
 
-  it("offers related todo cards with a reason, most urgent first", () => {
+  it("sends a card back to its thread when only that thread's own work holds it up", () => {
+    const blocker = working();
+    const back = card({ workThreadId: t1, blockedBy: [blocker.id] });
+    expect(planDispatch(board, [blocker, back], pools([[opus, 1]]))).toMatchObject([
+      { cardId: back.id, joins: true },
+    ]);
+    // Someone else's work still blocks it, and so does its old thread's work
+    // when a new thread would have to take it.
+    const other = working({
+      activeThreadId: ThreadId.make("t2"),
+      workThreadId: ThreadId.make("t2"),
+    });
+    const waits = card({ workThreadId: t1, blockedBy: [other.id] });
+    expect(planDispatch(board, [blocker, other, waits], pools([[opus, 2]]))).toEqual([]);
+    const elsewhere = working({ model: haiku, activePool: poolKey(haiku) });
+    const parked = card({ workThreadId: t1, stage: "todo", blockedBy: [] });
+    const held = card({ workThreadId: t1, blockedBy: [parked.id] });
+    expect(
+      planDispatch(
+        board,
+        [elsewhere, parked, held],
+        pools([
+          [opus, 2],
+          [haiku, 1],
+        ]),
+      ).map((entry) => entry.cardId),
+    ).toEqual([parked.id]);
+  });
+
+  it("counts a same-thread blocker that can't go on itself", () => {
+    const by = "2026-10-25T12:00:00.000Z";
+    const owner = { _tag: "owner" } as const;
+    const paused = card({ workThreadId: t1, priority: KANBAN_BACKLOG });
+    const stalled = card({ workThreadId: t1, stalled: { reason: "no access", by: owner, at: by } });
+    const other = working({
+      activeThreadId: ThreadId.make("t2"),
+      workThreadId: ThreadId.make("t2"),
+    });
+    const heldInTurn = card({ workThreadId: t1, blockedBy: [other.id] });
+    const fine = card({ workThreadId: t1 });
+    const all = [paused, stalled, other, heldInTurn, fine];
+    const waiters = all.map((blocker) => card({ workThreadId: t1, blockedBy: [blocker.id] }));
+    const byId = new Map([...all, ...waiters].map((c) => [c.id as string, c]));
+    expect(waiters.map((waiter) => isBlocked(waiter, byId))).toEqual([
+      true,
+      true,
+      true,
+      true,
+      false,
+    ]);
+    // A loop of blocks on one thread never goes.
+    const a = card({ workThreadId: t1 });
+    const b = card({ workThreadId: t1, blockedBy: [a.id] });
+    const looped = { ...a, blockedBy: [b.id] };
+    expect(
+      isBlocked(
+        looped,
+        new Map([
+          [a.id as string, looped],
+          [b.id as string, b],
+        ]),
+      ),
+    ).toBe(true);
+  });
+
+  it("still reviews a card whose next step is the evaluator's, and leaves its todo alone", () => {
+    const subtask = (id: string, step: number, owner: "work" | "evaluator") => ({
+      id,
+      step,
+      text: id,
+      owner,
+      state: "open" as const,
+      note: null,
+      doneBy: null,
+      doneAt: null,
+    });
+    const evaluatorStep = [
+      { ...subtask("s1", 1, "work"), state: "done" as const },
+      subtask("s2", 2, "evaluator"),
+    ];
+    const review = card({ stage: "needs_review", subtasks: evaluatorStep });
+    const todo = card({ subtasks: evaluatorStep });
+    const findings = card({ subtasks: evaluatorStep, wakeNote: "Review findings: fix it" });
+    expect(
+      planDispatch(board, [review, todo, findings], pools([[opus, 3]])).map(
+        (entry) => entry.cardId,
+      ),
+    ).toEqual([review.id, findings.id]);
+  });
+
+  it("offers related todo cards with a reason, in pick order", () => {
     const pr = { kind: "pr" as const, url: "pr-1", label: null, state: null, checkedAt: null };
     const seed = working({ links: [pr] });
     const samePr = card({ links: [pr], priority: 3 });
@@ -328,5 +473,105 @@ describe("thread batching", () => {
     });
     expect(candidates.map((c) => c.card.id)).toEqual([waitsOnSeed.id, grouped.id, samePr.id]);
     expect(candidates[0]?.why).toContain(`#${seed.number}`);
+  });
+});
+
+describe("model weights", () => {
+  const t1 = ThreadId.make("t1");
+  const all = pools([
+    [opus, 1],
+    [haiku, 1],
+    [sol, 1],
+  ]);
+  const weighted = (weights: ReadonlyArray<[ModelSelection, number]>, patch = {}) =>
+    card({ models: weights.map(([m, weight]) => ({ model: m, weight })), ...patch });
+  const busy = (m: ModelSelection) =>
+    card({
+      stage: "working",
+      model: m,
+      activeThreadId: ThreadId.make(`busy-${m.model}`),
+      activeRole: "work",
+      activePool: poolKey(m),
+    });
+
+  it("starts on the highest weight with room, then the next weight down", () => {
+    const c = weighted([
+      [opus, 60],
+      [haiku, 20],
+      [sol, 10],
+    ]);
+    expect(planDispatch(board, [c], all)).toMatchObject([{ model: opus, pool: poolKey(opus) }]);
+    expect(planDispatch(board, [busy(opus), c], all)).toMatchObject([
+      { cardId: c.id, model: haiku },
+    ]);
+    expect(planDispatch(board, [busy(opus), busy(haiku), c], all)).toMatchObject([
+      { cardId: c.id, model: sol },
+    ]);
+    expect(planDispatch(board, [busy(opus), busy(haiku), busy(sol), c], all)).toEqual([]);
+  });
+
+  it("treats a paused pool as full, and splits equal weights with pick", () => {
+    const c = weighted([
+      [opus, 60],
+      [haiku, 20],
+      [sol, 20],
+    ]);
+    const paused = pools([
+      [opus, 0],
+      [haiku, 1],
+      [sol, 1],
+    ]);
+    expect(planDispatch(board, [c], paused, new Map(), () => 0)).toMatchObject([{ model: haiku }]);
+    expect(planDispatch(board, [c], paused, new Map(), (count) => count - 1)).toMatchObject([
+      { model: sol },
+    ]);
+  });
+
+  it("gives the room to the next card once one takes it", () => {
+    const first = weighted([
+      [opus, 2],
+      [haiku, 1],
+    ]);
+    const second = weighted([
+      [opus, 2],
+      [haiku, 1],
+    ]);
+    expect(planDispatch(board, [first, second], all)).toMatchObject([
+      { cardId: first.id, model: opus },
+      { cardId: second.id, model: haiku },
+    ]);
+  });
+
+  it("keeps a card on its thread's model once it has one", () => {
+    const back = weighted(
+      [
+        [opus, 2],
+        [haiku, 1],
+      ],
+      { model: haiku, workThreadId: t1 },
+    );
+    expect(planDispatch(board, [back], all)).toMatchObject([{ cardId: back.id, model: haiku }]);
+  });
+
+  it("lets a thread claim a weighted card on any of its pools", () => {
+    const c = weighted([
+      [opus, 2],
+      [haiku, 1],
+    ]);
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(haiku),
+      projectId: null,
+      byId: new Map<string, KanbanCard>(),
+      carrying: 1,
+      slots: 1,
+    };
+    expect(checkClaim(board, c, ctx).ok).toBe(true);
+    expect(checkClaim(board, c, { ...ctx, pool: poolKey(sol) }).ok).toBe(false);
+    expect(modelOnPool(c, poolKey(haiku))).toEqual(haiku);
+    expect(modelOnPool(c, poolKey(sol))).toBeNull();
+    // Once its thread has it, the card runs only on that thread's model.
+    const kept = { ...c, model: opus, workThreadId: t1 };
+    expect(checkClaim(board, kept, ctx).ok).toBe(false);
   });
 });

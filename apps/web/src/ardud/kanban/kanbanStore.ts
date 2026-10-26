@@ -4,6 +4,8 @@ import type {
   KanbanBoardSummary,
   KanbanCardDetail,
   KanbanMessage,
+  KanbanScript,
+  KanbanScriptRun,
   KanbanWikiPage,
 } from "@t3tools/contracts";
 import {
@@ -53,6 +55,17 @@ export function useCardDetail(boardId: string, cardId: string): KanbanCardDetail
 
 export function useWiki(boardId: string): ReadonlyArray<KanbanWikiPage> | undefined {
   return useStore(kanban.wiki(boardId));
+}
+
+export function useScripts(boardId: string): ReadonlyArray<KanbanScript> | undefined {
+  return useStore(kanban.scripts(boardId));
+}
+
+export function useScriptRuns(
+  boardId: string,
+  scriptId: string,
+): ReadonlyArray<KanbanScriptRun> | undefined {
+  return useStore(kanban.scriptRuns(boardId, scriptId));
 }
 
 export interface FeedState {

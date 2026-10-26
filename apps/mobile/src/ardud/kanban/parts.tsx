@@ -37,7 +37,7 @@ export function PriorityBars(props: { readonly priority: number }) {
   return (
     <View
       accessible
-      accessibilityLabel={`P${props.priority}`}
+      accessibilityLabel={props.priority === 5 ? "Backlog" : `P${props.priority}`}
       className="h-[11px] flex-row items-end gap-[2px]"
     >
       {BAR_HEIGHTS.map((height, index) => (

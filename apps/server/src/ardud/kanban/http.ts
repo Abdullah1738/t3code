@@ -12,6 +12,9 @@ import {
   KanbanCardId,
   KanbanDiscussionId,
   KanbanError,
+  KanbanPriority,
+  KanbanScriptId,
+  KanbanScriptTrigger,
   KanbanStage,
   ProjectId,
 } from "@t3tools/contracts";
@@ -23,6 +26,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { modelSelectionOf } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
+import { KanbanScripts } from "./engine/ScriptService.ts";
 
 export const KANBAN_ROUTE_PREFIX = "/api/ardud/kanban";
 
@@ -90,7 +94,7 @@ const CreateCardBody = Schema.Struct({
   model: Schema.optional(ModelBody),
   title: Text,
   description: Text,
-  priority: Schema.optional(Schema.Number),
+  priority: Schema.optional(KanbanPriority),
   projects: Schema.optional(Schema.Array(Schema.String)),
   links: Schema.optional(Schema.Array(Schema.Struct({ url: Schema.String, label: Text }))),
   stage: Schema.optional(Schema.Literals(["todo", "needs_owner"])),
@@ -124,6 +128,18 @@ const BoardBody = Schema.Struct({
 
 const PoolBody = Schema.Struct({ model: ModelBody, slots: Schema.Number });
 
+const ScriptBody = Schema.Struct({
+  name: Schema.String,
+  path: Schema.String,
+  trigger: KanbanScriptTrigger,
+  enabled: Schema.optional(Schema.Boolean),
+});
+
+const ScriptPatchBody = Schema.Struct({ enabled: Schema.Boolean });
+
+/** A webhook sender calls the run route with `trigger: "webhook"`. */
+const RunBody = Schema.Struct({ trigger: Schema.optional(Schema.Literals(["manual", "webhook"])) });
+
 const EvaluatorBody = Schema.Struct({
   kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
   text: Text,
@@ -133,6 +149,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
     const service = yield* KanbanService;
+    const scripts = yield* KanbanScripts;
 
     const authenticate = Effect.fn("KanbanHttp.authenticate")(function* (
       scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
@@ -365,6 +382,48 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const listScripts = read(
+      Effect.gen(function* () {
+        const board = yield* boardOf(yield* param("board"));
+        return yield* scripts.scripts(board.id);
+      }),
+    );
+
+    const registerScript = write(
+      Effect.gen(function* () {
+        const board = yield* boardOf(yield* param("board"));
+        const input = yield* body(ScriptBody);
+        return yield* scripts.register({ ...input, boardId: board.id }, OWNER);
+      }),
+    );
+
+    const scriptId = Effect.map(param("script"), (id) => KanbanScriptId.make(id));
+
+    const patchScript = write(
+      Effect.gen(function* () {
+        const id = yield* scriptId;
+        const input = yield* body(ScriptPatchBody);
+        return yield* scripts.setEnabled(id, input.enabled);
+      }),
+    );
+
+    const runScript = write(
+      Effect.gen(function* () {
+        const id = yield* scriptId;
+        const input = yield* body(RunBody);
+        // The app runs scripts over the socket, so a bare HTTP call is a webhook.
+        return yield* scripts.run(id, input.trigger ?? "webhook");
+      }),
+    );
+
+    const listRuns = read(
+      Effect.gen(function* () {
+        const id = yield* scriptId;
+        const limit = Number(yield* query("limit"));
+        return yield* scripts.runs(id, Number.isInteger(limit) && limit > 0 ? limit : 20);
+      }),
+    );
+
     const p = KANBAN_ROUTE_PREFIX;
     return [
       HttpRouter.route("GET", `${p}/boards`, handle(listBoards)),
@@ -376,6 +435,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("GET", `${p}/boards/:board/discussions`, handle(listDiscussions)),
       HttpRouter.route("POST", `${p}/boards/:board/discussions`, handle(createDiscussion)),
       HttpRouter.route("POST", `${p}/boards/:board/evaluators`, handle(startEvaluator)),
+      HttpRouter.route("GET", `${p}/boards/:board/scripts`, handle(listScripts)),
+      HttpRouter.route("POST", `${p}/boards/:board/scripts`, handle(registerScript)),
+      HttpRouter.route("PATCH", `${p}/scripts/:script`, handle(patchScript)),
+      HttpRouter.route("POST", `${p}/scripts/:script/run`, handle(runScript)),
+      HttpRouter.route("GET", `${p}/scripts/:script/runs`, handle(listRuns)),
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),

@@ -4,6 +4,7 @@
  * evaluators steer the work. Discussions are a chat store shared by owner,
  * card threads, evaluators and scripts.
  */
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
@@ -58,9 +59,12 @@ export const KanbanActor = Schema.Union([
 ]);
 export type KanbanActor = typeof KanbanActor.Type;
 
-/** Priority 1 is the most urgent. */
-export const KanbanPriority = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 4 }));
+/** Priority 1 is the most urgent, 4 the least; 5 is backlog. */
+export const KanbanPriority = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 5 }));
 export type KanbanPriority = typeof KanbanPriority.Type;
+
+/** A backlog card is never picked up; one with a thread is paused until it leaves. */
+export const KANBAN_BACKLOG = 5;
 
 export const KanbanLinkKind = Schema.Literals(["pr", "linear", "url"]);
 export type KanbanLinkKind = typeof KanbanLinkKind.Type;
@@ -97,6 +101,35 @@ export const KanbanThreadLink = Schema.Struct({
 });
 export type KanbanThreadLink = typeof KanbanThreadLink.Type;
 
+/** One model a card's work may start on; the highest weight with room wins. */
+export const KanbanCardModel = Schema.Struct({
+  model: ModelSelection,
+  weight: PositiveInt,
+});
+export type KanbanCardModel = typeof KanbanCardModel.Type;
+
+/** Who does a subtask: the card's worker, its reviewer, or an evaluator. */
+export const KanbanSubtaskOwner = Schema.Literals(["work", "review", "evaluator"]);
+export type KanbanSubtaskOwner = typeof KanbanSubtaskOwner.Type;
+
+/**
+ * One piece of a card's plan. Subtasks with the same step go in any order; a
+ * step opens once every subtask in an earlier step is done or skipped.
+ */
+export const KanbanSubtask = Schema.Struct({
+  /** `s1`, `s2`, ... in the order they were added. */
+  id: TrimmedNonEmptyString,
+  step: PositiveInt,
+  text: Schema.String,
+  owner: KanbanSubtaskOwner,
+  state: Schema.Literals(["open", "done", "skipped"]),
+  /** What was done, or why it was skipped. */
+  note: Schema.NullOr(Schema.String),
+  doneBy: Schema.NullOr(KanbanActor),
+  doneAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanSubtask = typeof KanbanSubtask.Type;
+
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
   boardId: KanbanBoardId,
@@ -105,12 +138,19 @@ export const KanbanCard = Schema.Struct({
   title: Schema.String,
   description: Schema.String,
   prompt: Schema.String,
+  /** The card's flow, step by step: the work, its review and what comes after. */
+  subtasks: Schema.Array(KanbanSubtask).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   stage: KanbanStage,
   priority: KanbanPriority,
   goalId: Schema.NullOr(KanbanGoalId),
   projects: Schema.Array(TrimmedNonEmptyString),
   /** Model the work thread runs on. */
   model: ModelSelection,
+  /**
+   * Models the work may start on, highest weight first. A pool with room at
+   * the top weight wins, ties at random. Empty means just `model`.
+   */
+  models: Schema.Array(KanbanCardModel).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   /** T3 project the card's threads run in; null uses the board default. */
   projectId: Schema.NullOr(ProjectId),
   links: Schema.Array(KanbanLink),
@@ -144,6 +184,159 @@ export const KanbanCard = Schema.Struct({
 });
 export type KanbanCard = typeof KanbanCard.Type;
 
+/** The models a card's work may start on, highest weight first. */
+export const kanbanCardModels = (card: KanbanCard): ReadonlyArray<KanbanCardModel> =>
+  card.models.length > 0 ? card.models : [{ model: card.model, weight: 1 }];
+
+/** The step the card is on: the first with an open subtask, or null when none is open. */
+export const kanbanOpenStep = (card: Pick<KanbanCard, "subtasks">): number | null =>
+  card.subtasks.reduce<number | null>(
+    (step, subtask) =>
+      subtask.state === "open" && (step === null || subtask.step < step) ? subtask.step : step,
+    null,
+  );
+
+/** Open subtasks of the step the card is on, for one owner or all. */
+export const kanbanStepSubtasks = (
+  card: Pick<KanbanCard, "subtasks">,
+  owner?: KanbanSubtask["owner"],
+): ReadonlyArray<KanbanSubtask> => {
+  const step = kanbanOpenStep(card);
+  return card.subtasks.filter(
+    (subtask) =>
+      subtask.state === "open" &&
+      subtask.step === step &&
+      (owner === undefined || subtask.owner === owner),
+  );
+};
+
+/** True when the step a card is on is only the evaluator's: no worker or reviewer has anything in it. */
+export const kanbanEvaluatorStep = (card: Pick<KanbanCard, "subtasks">): boolean => {
+  const open = kanbanStepSubtasks(card);
+  return open.length > 0 && open.every((subtask) => subtask.owner === "evaluator");
+};
+
+/**
+ * A todo card the dispatcher leaves alone because its step is the
+ * evaluator's. One with a wake note still goes back to its worker: review
+ * findings and the owner's words have to reach it.
+ */
+export const kanbanWaitsOnEvaluator = (
+  card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks">,
+): boolean => card.stage === "todo" && card.wakeNote === null && kanbanEvaluatorStep(card);
+
+/** Stages past the work: a card here no longer blocks anything or waits on anything. */
+export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
+  "completed",
+  "deployed",
+  "verified",
+]);
+
+const isOpenCard = (card: KanbanCard) =>
+  !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
+
+/**
+ * The first unfinished card holding `card` up, or undefined. A blocker on the
+ * same work thread is no block, since that thread does both in order, unless
+ * it can't go on itself: stalled, in the backlog, waiting on the evaluator,
+ * or held up in turn.
+ */
+export function kanbanHeldUpBy(
+  card: KanbanCard,
+  byId: ReadonlyMap<string, KanbanCard>,
+  thread: string | null = card.workThreadId,
+): KanbanCard | undefined {
+  // `path` is the chain being walked; meeting a card on it again is a loop, and nothing in a loop goes.
+  const heldUp = (waiter: KanbanCard, path: Set<string>): KanbanCard | undefined => {
+    for (const id of waiter.blockedBy) {
+      const blocker = byId.get(id);
+      if (blocker === undefined || KANBAN_DONE_STAGES.has(blocker.stage)) continue;
+      if (thread === null || blocker.workThreadId !== thread) return blocker;
+      if (
+        blocker.stalled !== null ||
+        blocker.priority === KANBAN_BACKLOG ||
+        kanbanWaitsOnEvaluator(blocker) ||
+        path.has(blocker.id)
+      ) {
+        return blocker;
+      }
+      path.add(blocker.id);
+      const deeper = heldUp(blocker, path);
+      path.delete(blocker.id);
+      if (deeper !== undefined) return blocker;
+    }
+    return undefined;
+  };
+  return heldUp(card, new Set([card.id]));
+}
+
+export interface KanbanBlocking {
+  /** Open cards it holds up, the whole chain: if C waits on B and B waits on A, A holds up two. */
+  readonly holds: number;
+  /** The most urgent priority among the card and every open card it holds up. */
+  readonly urgency: number;
+}
+
+/**
+ * What each open card holds up. Done and settled cards are left out, and a
+ * backlog card waiting on another doesn't count: nobody is going to do it.
+ */
+export function kanbanBlocking(cards: ReadonlyArray<KanbanCard>): Map<string, KanbanBlocking> {
+  const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const waiters = new Map<string, Array<string>>();
+  for (const card of cards) {
+    if (!isOpenCard(card) || card.priority === KANBAN_BACKLOG) continue;
+    for (const id of card.blockedBy) {
+      const list = waiters.get(id) ?? [];
+      list.push(card.id);
+      waiters.set(id, list);
+    }
+  }
+  const result = new Map<string, KanbanBlocking>();
+  for (const card of cards) {
+    if (!isOpenCard(card)) continue;
+    // Breadth-first over the waiters; `seen` also ends a loop of blocks.
+    const seen = new Set<string>([card.id]);
+    const queue: Array<string> = [card.id];
+    let urgency = card.priority;
+    for (let i = 0; i < queue.length; i += 1) {
+      for (const id of waiters.get(queue[i] ?? "") ?? []) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        queue.push(id);
+        urgency = Math.min(urgency, byId.get(id)?.priority ?? urgency);
+      }
+    }
+    // A backlog card stays at the bottom whatever waits on it; only the owner takes it out.
+    result.set(card.id, {
+      holds: seen.size - 1,
+      urgency: card.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : urgency,
+    });
+  }
+  return result;
+}
+
+/**
+ * The order todo cards get picked up in: most urgent first, where a card
+ * holding up an urgent card is as urgent as that card; then the one holding
+ * up the most other cards; then the one waiting longest. The dispatcher uses
+ * it and the board's To-Do column shows it.
+ */
+export function kanbanPickOrder(cards: ReadonlyArray<KanbanCard>) {
+  const blocking = kanbanBlocking(cards);
+  const of = (card: KanbanCard) => blocking.get(card.id) ?? { holds: 0, urgency: card.priority };
+  return (a: KanbanCard, b: KanbanCard) => {
+    const x = of(a);
+    const y = of(b);
+    return (
+      x.urgency - y.urgency ||
+      y.holds - x.holds ||
+      a.movedAt.localeCompare(b.movedAt) ||
+      a.number - b.number
+    );
+  };
+}
+
 export const KanbanCardEvent = Schema.Struct({
   id: NonNegativeInt,
   cardId: KanbanCardId,
@@ -158,6 +351,7 @@ export const KanbanCardEvent = Schema.Struct({
     "comment",
     "thread",
     "review",
+    "subtask",
   ]),
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
@@ -309,7 +503,7 @@ export const KanbanScript = Schema.Struct({
   id: KanbanScriptId,
   boardId: KanbanBoardId,
   name: TrimmedNonEmptyString,
-  /** Absolute path; run by extension (.ts/.js with bun, .py with python3, .sh/.zsh with zsh). */
+  /** Absolute path; run by extension (.ts/.js with bun, .py with python3, .sh with bash, .zsh with zsh). */
   path: TrimmedNonEmptyString,
   trigger: KanbanScriptTrigger,
   enabled: Schema.Boolean,

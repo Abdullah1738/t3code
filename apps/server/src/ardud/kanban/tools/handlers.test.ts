@@ -22,13 +22,14 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanHandlers from "./handlers.ts";
 import { KanbanToolkit } from "./tools.ts";
 
+// Writes check the caller is the thread's live provider; liveThreadsLayer runs on codex.
 const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
   environmentId: EnvironmentId.make("environment"),
   requestNamespace: `provider:${threadId}`,
   thread: {
     threadId,
     providerSessionId: `provider:${threadId}`,
-    providerInstanceId: ProviderInstanceId.make("opencode"),
+    providerInstanceId: ProviderInstanceId.make("codex"),
   },
   client: undefined,
   capabilities: new Set(["orchestration"]),
@@ -61,41 +62,44 @@ const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =
   );
 
 // Threads launch idle; `running` keeps a work thread's slot between cards.
-const running = new Set<string>();
-let launched = 0;
-const threads = Layer.succeed(
-  KanbanThreads,
-  KanbanThreads.of({
-    view: (threadId) =>
-      Effect.succeed({
-        threadId,
-        projectId: ProjectId.make("project-1"),
-        title: "thread",
-        state: running.has(threadId) ? "running" : "idle",
-        updatedAt: "2026-10-26T08:00:00.000Z",
-        prs: [],
-      }),
-    launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
-    send: () => Effect.void,
-    interrupt: () => Effect.void,
-  }),
-);
-
-const testLayer = McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
-  Layer.provideMerge(McpServer.McpServer.layer),
-  Layer.provideMerge(liveThreadsLayer),
-  Layer.provideMerge(KanbanService.layer),
-  Layer.provideMerge(threads),
-  Layer.provideMerge(KanbanStore.layer),
-  Layer.provideMerge(Sqlite.layerMemory),
-  Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
-  Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
-);
+const fakeThreads = () => {
+  const running = new Set<string>();
+  let launched = 0;
+  const threads = Layer.succeed(
+    KanbanThreads,
+    KanbanThreads.of({
+      view: (threadId) =>
+        Effect.succeed({
+          threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "thread",
+          state: running.has(threadId) ? "running" : "idle",
+          updatedAt: "2026-10-26T08:00:00.000Z",
+          prs: [],
+        }),
+      launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
+      send: () => Effect.void,
+      interrupt: () => Effect.void,
+    }),
+  );
+  const layer = McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(liveThreadsLayer),
+    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(threads),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+  );
+  return { running, layer };
+};
 
 const owner: KanbanActor = { _tag: "owner" };
 
-it.effect("a work thread with nothing active defaults to the cards still its own", () =>
-  Effect.gen(function* () {
+it.effect("a work thread with nothing active defaults to the cards still its own", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
     const board = yield* kanban.ensureBoard({
       slug: "toy",
@@ -132,5 +136,47 @@ it.effect("a work thread with nothing active defaults to the cards still its own
     assert.isFalse(read.isError, read.text);
     const discussion = yield* kanban.cardDiscussion(second.id);
     assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
-  }).pipe(Effect.provide(testLayer)),
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "a thread with several cards picks a card's discussion, but only of its own cards",
+  () => {
+    const { running, layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const other = yield* kanban.createCard(board.id, { prompt: "C", title: "C" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      running.add(thread);
+      const second = (yield* kanban.createForThread(thread, { prompt: "B", title: "B" })).card;
+
+      const unnamed = yield* call(thread, "discussion_post", { text: "hi" });
+      assert.isTrue(unnamed.isError);
+      assert.include(unnamed.text, "Pass card or discussionId");
+
+      const posted = yield* call(thread, "discussion_post", {
+        card: `#${second.number}`,
+        text: "Done with B",
+      });
+      assert.isFalse(posted.isError, posted.text);
+      const discussion = yield* kanban.cardDiscussion(second.id);
+      const read = yield* call(thread, "discussion_read", { card: String(second.number) });
+      assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
+
+      const theirs = yield* call(thread, "discussion_post", {
+        card: `#${other.number}`,
+        text: "Not mine",
+      });
+      assert.isTrue(theirs.isError);
+      assert.include(theirs.text, `can't change card #${other.number}`);
+    }).pipe(Effect.provide(layer));
+  },
 );

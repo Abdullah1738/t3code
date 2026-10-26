@@ -5,9 +5,11 @@
  */
 import {
   KanbanBlock,
+  KanbanPriority,
   KanbanStage,
   NonNegativeInt,
   OrchestratorMcpFailure,
+  PositiveInt,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
@@ -49,6 +51,41 @@ export const ModelInput = Schema.Struct({
 });
 export type ModelInput = typeof ModelInput.Type;
 
+const WeightedModels = describe(
+  Schema.Array(
+    Schema.Struct({
+      ...ModelInput.fields,
+      weight: describe(
+        PositiveInt,
+        "Higher wins when its pool has room; equal weights split at random.",
+      ),
+    }),
+  ),
+  "Several models to start on, by weight: the card starts on the highest-weight model whose pool has room, and its thread keeps that model. Wins over model.",
+);
+
+const SubtasksInput = describe(
+  Schema.Array(
+    Schema.Struct({
+      id: Schema.optional(
+        describe(TrimmedNonEmptyString, "An existing subtask's id (s1, s2...) to keep it."),
+      ),
+      step: Schema.optional(
+        describe(
+          PositiveInt,
+          "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
+        ),
+      ),
+      text: TrimmedNonEmptyString,
+      owner: describe(
+        Schema.Literals(["work", "review", "evaluator"]),
+        "Who does it: the worker, the reviewer (ticked when the review passes) or an evaluator.",
+      ),
+    }),
+  ),
+  "The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: listed ids keep their state, open ones left out go, done ones stay.",
+);
+
 const LinkInput = Schema.Struct({
   url: TrimmedNonEmptyString,
   label: Schema.optional(Schema.String),
@@ -78,8 +115,8 @@ const tool = <
 ) =>
   Tool.make(name, {
     description,
-    // An empty Schema.Struct encodes to `anyOf: [object, array]`, which MCP
-    // refuses, taking every board tool down with it.
+    // An empty Schema.Struct has no `type: object` root, so McpServer refuses
+    // to register it and the whole MCP layer fails.
     parameters: Object.keys(parameters).length === 0 ? Tool.EmptyParams : Schema.Struct(parameters),
     success: Schema.Struct(success),
     failure: OrchestratorMcpFailure,
@@ -168,8 +205,12 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies.",
-  { discussionId: Schema.optional(TrimmedNonEmptyString), ...BlocksInput },
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies.",
+  {
+    discussionId: Schema.optional(TrimmedNonEmptyString),
+    card: Schema.optional(CardRef),
+    ...BlocksInput,
+  },
   { message: Record },
   { readonly: false },
 );
@@ -180,6 +221,7 @@ const DiscussionRead = tool(
   "Messages of a discussion (latest 200, or those after afterSeq), with answers to polls and picks. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
+    card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
   },
   { discussion: Record, messages: Records },
@@ -209,10 +251,13 @@ const CardCreate = tool(
     ),
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
-    priority: Schema.optional(describe(Schema.Int, "1 (urgent) to 4; default 3.")),
+    priority: Schema.optional(
+      describe(KanbanPriority, "1 (urgent) to 4 (low); default 3. 5 is the backlog."),
+    ),
     goalId: Schema.optional(TrimmedNonEmptyString),
     projects: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
     model: Schema.optional(ModelInput),
+    models: Schema.optional(WeightedModels),
     projectId: Schema.optional(
       describe(TrimmedNonEmptyString, "T3 project the card threads run in; default the board's."),
     ),
@@ -223,6 +268,7 @@ const CardCreate = tool(
     reviewChain: Schema.optional(
       describe(Schema.String, "Review chain name; default the board's."),
     ),
+    subtasks: Schema.optional(SubtasksInput),
   },
   { card: Record, brief: Schema.optional(Schema.String) },
   { readonly: false },
@@ -240,7 +286,7 @@ const CardClaim = tool(
 const CardNext = tool(
   "card_next",
   "Related cards to take next",
-  "Work threads: the cards you carry, and related todo cards you could take (same group, blocking or blocked, same PR or Linear issue), each with why. Use after a card moves on, before you stop; take one with card_claim or just end.",
+  "Work threads: the cards you carry, and related todo cards you could take (same group, blocking or blocked, same PR or Linear issue), each with why, the one to take first on top. Use after a card moves on, before you stop; take one with card_claim or just end.",
   {},
   { carrying: Records, candidates: Records, holdsSlot: Schema.Boolean },
   { readonly: true },
@@ -255,15 +301,36 @@ const CardEdit = tool(
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
-    priority: Schema.optional(Schema.Int),
+    priority: Schema.optional(
+      describe(
+        KanbanPriority,
+        "1 (urgent) to 4 (low). 5 is the backlog: never picked up, and a card with a thread is paused. Only when the owner asks.",
+      ),
+    ),
     goalId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     projects: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
     model: Schema.optional(ModelInput),
+    models: Schema.optional(WeightedModels),
     projectId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     links: Schema.optional(Schema.Array(LinkInput)),
     blockedBy: Schema.optional(Schema.Array(CardRef)),
     reviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+    subtasks: Schema.optional(SubtasksInput),
     comment: Schema.optional(Schema.String),
+  },
+  { card: Record },
+  { readonly: false },
+);
+
+const SubtaskDone = tool(
+  "subtask_done",
+  "Mark a subtask",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent.",
+  {
+    card: Schema.optional(CardRef),
+    subtask: describe(TrimmedNonEmptyString, "Subtask id, e.g. s2."),
+    state: Schema.Literals(["done", "skipped", "open"]),
+    note: Schema.optional(Schema.String),
   },
   { card: Record },
   { readonly: false },
@@ -382,6 +449,7 @@ export const KanbanToolkit = Toolkit.make(
   CardClaim,
   CardNext,
   CardEdit,
+  SubtaskDone,
   CardThread,
   PoolSet,
   GoalSet,

@@ -1,4 +1,5 @@
 import {
+  KANBAN_BACKLOG,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
@@ -8,6 +9,7 @@ import {
   type KanbanActor,
   type KanbanBlock,
   type KanbanCard,
+  type KanbanCardModel,
   type KanbanError,
   type KanbanThreadLink,
   type ModelSelection,
@@ -172,6 +174,11 @@ const workOrigin = Effect.fn("KanbanTools.workOrigin")(function* (
 
 const modelOf = (input: ModelInput): ModelSelection => modelSelectionOf(input);
 
+const modelsOf = (
+  input: ReadonlyArray<ModelInput & { readonly weight: number }> | undefined,
+): ReadonlyArray<KanbanCardModel> | undefined =>
+  input?.map((entry) => ({ model: modelOf(entry), weight: entry.weight }));
+
 const blocksOf = (input: {
   readonly text?: string | undefined;
   readonly blocks?: ReadonlyArray<KanbanBlock> | undefined;
@@ -184,16 +191,24 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
   explicit: string | undefined,
+  cardRef?: string | undefined,
 ) {
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
+  if (cardRef?.trim()) {
+    const card = yield* cardFor(service, caller, cardRef);
+    yield* ownCard(caller, card);
+    return yield* service.cardDiscussion(card.id);
+  }
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
-    if (cards.length > 1) {
-      return yield* invalid(
-        `Pass discussionId: this thread has ${numbers(cards)}; each has its own discussion.`,
-      );
-    }
+    const [only] = cards;
+    if (cards.length === 1 && only) return yield* service.cardDiscussion(only.id);
+    return yield* invalid(
+      cards.length > 1
+        ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
+        : "Pass discussionId: this thread has no card of its own.",
+    );
   }
   if (isCardThread(caller)) {
     const card = yield* defaultCard(service, caller);
@@ -306,7 +321,7 @@ const handlers = {
       Effect.gen(function* () {
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
-        const discussion = yield* discussionFor(service, caller, input.discussionId);
+        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
         return { message: yield* service.post(discussion.id, caller.actor, blocks) };
       }),
     ),
@@ -315,7 +330,7 @@ const handlers = {
   discussion_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const discussion = yield* discussionFor(service, caller, input.discussionId);
+        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
         const messages = yield* service.messages(
           discussion.id,
           input.afterSeq !== undefined ? { afterSeq: input.afterSeq } : undefined,
@@ -347,6 +362,9 @@ const handlers = {
         if (input.assignToSelf && !isWorker) {
           return yield* refuse("Only a card's work thread can take a card with assignToSelf.");
         }
+        if (input.assignToSelf && input.priority === KANBAN_BACKLOG) {
+          return yield* refuse("A backlog card isn't picked up; leave out assignToSelf.");
+        }
         const board = yield* boardFor(service, caller);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy);
         // Follow-up work keeps the review chain and goal of the card it came from.
@@ -359,10 +377,12 @@ const handlers = {
           goalId: input.goalId ? KanbanGoalId.make(input.goalId) : (origin?.goalId ?? null),
           projects: input.projects,
           model: input.model ? modelOf(input.model) : undefined,
+          models: modelsOf(input.models),
           projectId: input.projectId ? ProjectId.make(input.projectId) : null,
           links: input.links,
           blockedBy,
           reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
+          subtasks: input.subtasks,
         };
         if (input.assignToSelf) {
           return yield* service.createForThread(caller.threadId, fields);
@@ -436,17 +456,42 @@ const handlers = {
               : {}),
             projects: input.projects,
             model: input.model ? modelOf(input.model) : undefined,
+            models: modelsOf(input.models),
             ...(input.projectId !== undefined
               ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
               : {}),
             links: input.links,
             blockedBy,
             ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
+            subtasks: input.subtasks,
             comment: input.comment,
           },
           caller.actor,
         );
         return { card: edited };
+      }),
+    ),
+  ),
+
+  subtask_done: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const card = yield* cardFor(service, caller, input.card);
+        yield* ownCard(caller, card);
+        const role =
+          caller.link?.role === "work" || caller.link?.role === "review"
+            ? caller.link.role
+            : "evaluator";
+        return {
+          card: yield* service.markSubtask(
+            card.id,
+            input.subtask,
+            input.state,
+            input.note ?? null,
+            caller.actor,
+            role,
+          ),
+        };
       }),
     ),
   ),

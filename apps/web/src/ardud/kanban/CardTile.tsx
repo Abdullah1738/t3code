@@ -73,6 +73,14 @@ export const CardTile = memo(function CardTile(props: {
           </span>
         ) : null}
         <span className="flex-1" />
+        {card.subtasks ? (
+          <span
+            className="shrink-0 px-1 text-xs text-(--m-muted) tabular-nums"
+            aria-label={`${card.subtasks.done} of ${card.subtasks.total} subtasks done`}
+          >
+            {card.subtasks.done}/{card.subtasks.total}
+          </span>
+        ) : null}
         {card.running ? <Glyph kind="ok" label="Running" /> : null}
         <ModelMark name={card.model.name} letter={card.model.letter} />
       </span>
