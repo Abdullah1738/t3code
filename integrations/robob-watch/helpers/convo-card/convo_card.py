@@ -35,7 +35,7 @@ Env overrides: CONVO_CARD_ROOT, CONVO_CARD_BRIDGE (bridge CLI command, space sep
 CONVO_CARD_WACLI, CONVO_CARD_CHECK, CONVO_CARD_LANGID (language check, default english.js = Apple's
 on-device recognizer), CONVO_CARD_PREVIEW_LIB, CONVO_CARD_NO_IMAGE=1 (skip Chrome, tests), WACLI_STORE_DIR.
 """
-import argparse, fcntl, hashlib, html, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
+import argparse, fcntl, hashlib, html, json, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time
 import importlib.util, unicodedata, urllib.request
 from importlib.machinery import SourceFileLoader
 from datetime import datetime, timezone, timedelta
@@ -81,6 +81,33 @@ def wacli_cmd():
 
 def bridge_cmd():
     return _cmd("CONVO_CARD_BRIDGE", ["/Users/ardud/.bun/bin/bun", str(HOME / ".local/share/spectrum-bridge/src/cli.ts")])
+
+
+def bridge_state():
+    return Path(os.environ.get("CONVO_CARD_BRIDGE_STATE") or HOME / ".config/spectrum-bridge")
+
+
+def own_chat(to, session):
+    """True when the session is the recipient chat's own live route: the bridge refuses --to from any chat
+    but the owner's, so a card for the chat you are in goes as a plain reply in it."""
+    db = bridge_state() / ("state.sqlite" if to == "owner" else f"chats/{to}/state.sqlite")
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("select value from kv where key = 'route'").fetchone()
+        finally:
+            con.close()
+        route = json.loads(row[0]) if row and row[0] else None
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+    if not isinstance(route, dict) or not isinstance(route.get("id"), str):
+        return False
+    g = route.get("generation")
+    if not isinstance(g, int) or isinstance(g, bool) or g < 0:
+        return False
+    return session in (route["id"], f"{route['id']}@{g}")
 
 
 def check_cmd():
@@ -694,8 +721,9 @@ def cmd_send(a):
             print(json.dumps({"sent": False, "reason": "already sent for this message and link", "key": key}))
             return
         card_url = url.rstrip("/") + "/?v=" + data["v"]
+        to = [] if own_chat(a.to, a.session) else ["--to", a.to]
         res = bridge("app", "--url", card_url, "--caption", caption, "--subcaption", sub,
-                     "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, "--to", a.to)
+                     "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, *to)
         sent[a.to] = {"key": key, "url": url, "card_url": card_url, "last_id": data["last_id"],
                       "at": datetime.now(DXB).isoformat(timespec="seconds"), "op": res.get("id"),
                       "created": res.get("created")}

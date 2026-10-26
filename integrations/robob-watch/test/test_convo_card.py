@@ -100,6 +100,7 @@ class Base(unittest.TestCase):
         s.close()
         self.env = dict(
             os.environ, WACLI_STORE_DIR=self.store, CONVO_CARD_ROOT=self.cards, CONVO_CARD_NO_IMAGE="1",
+            CONVO_CARD_BRIDGE_STATE=os.path.join(self.dir, "bridge-state"),
             CONVO_CARD_WACLI=self._exe("wacli", FAKE_WACLI), CONVO_CARD_BRIDGE=self._exe("bridge", FAKE_BRIDGE),
             CONVO_CARD_CHECK=self._exe("card-check", FAKE_CHECK), CONVO_CARD_LANGID=self._exe("langid", FAKE_LANGID),
             FAKE_WACLI_LOG=self.logs["wacli"],
@@ -474,6 +475,27 @@ class SendTest(Base):
         self.assertIn("-R2-", app[app.index("--key") + 1])
         # Never a picture of the chat, never WhatsApp.
         self.assertFalse(any(c[0] in ("send-file", "send") for c in self.log("bridge")))
+
+    def test_card_for_the_chat_you_are_in_goes_without_to(self):
+        import sqlite3
+        db = os.path.join(self.dir, "bridge-state", "chats", "moni")
+        os.makedirs(db)
+        con = sqlite3.connect(os.path.join(db, "state.sqlite"))
+        con.execute("create table kv (key text primary key, value text)")
+        con.execute("insert into kv values ('route', ?)", (json.dumps({"id": self.SESSION, "generation": 1}),))
+        con.commit()
+        con.close()
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.run_card("send", "--slug", "lydia-chat", "--session", self.SESSION + "@1", "--to", "moni")
+        app = self.log("bridge")[-1]
+        self.assertEqual(app[0], "app")
+        self.assertNotIn("--to", app)
+        # A stale generation is not this chat's session: it stays an owner relay (--to).
+        self.msg(PHONE, "T2", T0 + 100, text="hello")
+        self.build()
+        self.run_card("send", "--slug", "lydia-chat", "--session", self.SESSION + "@0", "--to", "moni")
+        self.assertIn("--to", self.log("bridge")[-1])
 
     def test_owner_gets_the_tailnet_link(self):
         self.msg(PHONE, "T1", T0, text="hi")
