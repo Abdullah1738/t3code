@@ -78,7 +78,9 @@ const tool = <
 ) =>
   Tool.make(name, {
     description,
-    parameters: Schema.Struct(parameters),
+    // An empty Schema.Struct encodes to `anyOf: [object, array]`, which MCP
+    // refuses, taking every board tool down with it.
+    parameters: Object.keys(parameters).length === 0 ? Tool.EmptyParams : Schema.Struct(parameters),
     success: Schema.Struct(success),
     failure: OrchestratorMcpFailure,
     failureMode: "return",

@@ -661,3 +661,58 @@ it.effect("board summaries count running, waiting and unread as they change", ()
     }).pipe(Effect.scoped, Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("a thread can't reword or replace a flag someone else set", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const self: KanbanActor = { _tag: "thread", threadId: thread };
+      yield* kanban.flagCard(card.id, "Hold on, waiting for the fee table", owner);
+      for (const reason of ["I'm fine now", null]) {
+        const refused = yield* kanban.flagCard(card.id, reason, self).pipe(Effect.flip);
+        assert.strictEqual(refused.code, "denied");
+      }
+      assert.strictEqual(
+        (yield* kanban.card(card.id)).card.stalled?.reason,
+        "Hold on, waiting for the fee table",
+      );
+      // Its own flag stays its own to change.
+      yield* kanban.flagCard(card.id, null, owner);
+      yield* kanban.flagCard(card.id, "Blocked on CI", self);
+      yield* kanban.flagCard(card.id, null, self);
+      assert.isNull((yield* kanban.card(card.id)).card.stalled);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a work thread's own cards are the ones it took and still has", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const self: KanbanActor = { _tag: "thread", threadId: thread };
+      yield* setRunning(fake, thread, true);
+      const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      const ids = (cards: ReadonlyArray<{ readonly id: string }>) => cards.map((c) => c.id);
+
+      // Pulled back to todo while the thread goes on: it starts fresh, no longer this thread's.
+      yield* kanban.moveCard(first.id, "todo", "owner", owner);
+      assert.deepStrictEqual(ids(yield* kanban.ownCards(thread)), [second.card.id]);
+
+      // The other waits on the owner: nothing is active, it is still the thread's own.
+      yield* kanban.moveCard(second.card.id, "needs_owner", "cardThread", self, {
+        question: "Which?",
+      });
+      assert.deepStrictEqual(ids(yield* kanban.carried(thread)), []);
+      assert.deepStrictEqual(ids(yield* kanban.ownCards(thread)), [second.card.id]);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

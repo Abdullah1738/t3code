@@ -249,7 +249,7 @@ export interface ClaimContext {
   readonly threadId: string | null;
   readonly pool: string;
   readonly projectId: string | null;
-  /** Cards on this thread now or before; a block by one of them doesn't stop a claim. */
+  /** Cards this thread carried that are still its own; a block by one of them doesn't stop a claim. */
   readonly mine: ReadonlySet<string>;
   readonly byId: ReadonlyMap<string, KanbanCard>;
   /** Cards working on the thread right now. */

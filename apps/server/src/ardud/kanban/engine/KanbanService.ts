@@ -263,6 +263,8 @@ export interface KanbanServiceShape {
   readonly caller: (threadId: string) => Effect.Effect<KanbanThreadLink | null, KanbanError>;
   /** Cards a work thread is working on right now. */
   readonly carried: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
+  /** Cards a work thread took that are still its own, working or not, in the order it took them. */
+  readonly ownCards: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
   /** A work thread takes a todo card into its own run (same pool and project). */
   readonly claimCard: (
     threadId: ThreadId,
@@ -1729,17 +1731,17 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        // A stop from the owner, an evaluator or another thread is theirs to lift.
+        // A stop from the owner, an evaluator or another thread is theirs to lift
+        // or reword; a thread replacing it with its own flag could then clear it.
         const by = card.stalled?.by;
         if (
-          reason === null &&
           actor._tag === "thread" &&
           by !== undefined &&
           !(by._tag === "thread" && by.threadId === actor.threadId)
         ) {
           return yield* failWith(
             "denied",
-            `card #${card.number} was flagged by someone else; only they can clear it`,
+            `card #${card.number} was flagged by someone else; only they can change or clear it`,
           );
         }
         const at = yield* nowIso;
@@ -2129,6 +2131,19 @@ const make = Effect.gen(function* () {
       ),
     caller: (threadId) => read(store.threadLink(threadId)),
     carried: (threadId) => read(store.cardsByThread(threadId)),
+    ownCards: (threadId) =>
+      read(
+        Effect.gen(function* () {
+          // Threads started before batching only have their first card on the link.
+          const link = yield* store.threadLink(threadId);
+          const ids = new Set<string>(yield* store.threadCards(threadId));
+          if (link?.cardId) ids.add(link.cardId);
+          const cards = yield* Effect.forEach([...ids], (id) => store.card(KanbanCardId.make(id)));
+          return cards.filter(
+            (card): card is KanbanCard => card !== null && card.workThreadId === threadId,
+          );
+        }),
+      ),
     claimCard,
     createForThread,
     nextCards,

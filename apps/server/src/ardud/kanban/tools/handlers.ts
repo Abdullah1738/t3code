@@ -96,21 +96,33 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
 });
 
 /**
+ * A work thread's cards when it names none: what it works on now, else the
+ * cards it took that are still its own. One moved to another thread is not.
+ */
+const workCards = Effect.fn("KanbanTools.workCards")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+) {
+  const carried = yield* service.carried(caller.threadId);
+  return carried.length > 0 ? carried : yield* service.ownCards(caller.threadId);
+});
+
+const numbers = (cards: ReadonlyArray<KanbanCard>) =>
+  cards.map((card) => `#${card.number}`).join(", ");
+
+/**
  * The caller's own card when it names none: a review thread's card, or the
- * one card a work thread carries. A work thread carrying several must say.
+ * one card a work thread has. A work thread with several must say.
  */
 const defaultCard = Effect.fn("KanbanTools.defaultCard")(function* (
   service: KanbanService["Service"],
   caller: Caller,
 ) {
   if (caller.link?.role === "work") {
-    const carried = yield* service.carried(caller.threadId);
-    if (carried.length === 1 && carried[0]) return carried[0];
-    if (carried.length > 1) {
-      return yield* invalid(
-        `Pass card: this thread carries ${carried.map((card) => `#${card.number}`).join(", ")}.`,
-      );
-    }
+    const cards = yield* workCards(service, caller);
+    if (cards.length === 1 && cards[0]) return cards[0];
+    if (cards.length > 1) return yield* invalid(`Pass card: this thread has ${numbers(cards)}.`);
+    return yield* invalid("Pass card: this thread has no card of its own.");
   }
   if (caller.link?.cardId) return (yield* service.card(caller.link.cardId)).card;
   return yield* invalid("Pass card: this thread has no card of its own.");
@@ -175,10 +187,15 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
 ) {
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
-  if (isCardThread(caller)) {
-    if (caller.link?.role === "work" && (yield* service.carried(caller.threadId)).length > 1) {
-      return yield* invalid("Pass discussionId: this thread carries several cards.");
+  if (caller.link?.role === "work") {
+    const cards = yield* workCards(service, caller);
+    if (cards.length > 1) {
+      return yield* invalid(
+        `Pass discussionId: this thread has ${numbers(cards)}; each has its own discussion.`,
+      );
     }
+  }
+  if (isCardThread(caller)) {
     const card = yield* defaultCard(service, caller);
     return yield* service.cardDiscussion(card.id);
   }
