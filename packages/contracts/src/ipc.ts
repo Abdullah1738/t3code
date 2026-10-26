@@ -601,6 +601,8 @@ export interface DesktopPreviewTabState {
    */
   audible: boolean;
   controller: "human" | "agent" | "none";
+  /** A screenshot or stream of the guest is pending, so the client keeps it painting while hidden. */
+  capturing: boolean;
   favicon?: DesktopPreviewFavicon;
   updatedAt: string;
 }
