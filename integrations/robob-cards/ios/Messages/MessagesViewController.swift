@@ -24,6 +24,14 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     // page the web view can't draw never leaves an empty sheet.
     private let bar = UIView()
     private let barSafari = UIButton(type: .system)
+    private let versionLabel = UILabel()
+    // Bundle.main is the extension's own bundle here, so this is the installed build.
+    private static let versionText: String = {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "Robob Cards \(version) (\(build))"
+    }()
     private var loadTimer: Timer?
     private var crashReloads = 0
     private static let loadTimeout: TimeInterval = 15
@@ -77,6 +85,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         barSafari.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
         barSafari.addTarget(self, action: #selector(openInSafari), for: .touchUpInside)
         bar.addSubview(barSafari)
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+        versionLabel.font = .preferredFont(forTextStyle: .caption2)
+        versionLabel.textColor = .secondaryLabel
+        versionLabel.text = Self.versionText
+        versionLabel.accessibilityIdentifier = "robob-cards-version"
+        bar.addSubview(versionLabel)
 
         spinner.translatesAutoresizingMaskIntoConstraints = false
         spinner.hidesWhenStopped = true
@@ -92,7 +106,9 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
             bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             bar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            barSafari.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
+            versionLabel.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
+            versionLabel.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
+            barSafari.topAnchor.constraint(equalTo: versionLabel.bottomAnchor, constant: 2),
             barSafari.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
             barSafari.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -6),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -118,7 +134,6 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     override func willBecomeActive(with conversation: MSConversation) {
         super.willBecomeActive(with: conversation)
         open(conversation.selectedMessage)
-        layout(for: presentationStyle)
     }
 
     override func didSelect(_ message: MSMessage, conversation: MSConversation) {
@@ -132,6 +147,7 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     private func open(_ message: MSMessage?) {
+        defer { layout(for: presentationStyle) }
         guard let message else {
             Self.log.info("opened without a selected message")
             return
@@ -141,7 +157,9 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
             showNote("This card has no secure link to open.", canRetry: false)
             return
         }
-        if url == cardURL, webView.url != nil { return }
+        // Only a page on screen counts as already open. After a timeout or
+        // crash note the web view is hidden, so selecting the card again reloads.
+        if url == cardURL, !webView.isHidden { return }
         cardURL = url
         crashReloads = 0
         load(url)
@@ -166,9 +184,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         let preview = (style == .compact || style == .transcript) && cardURL != nil
         expandOverlay.isHidden = !preview
         webView.scrollView.isScrollEnabled = !preview
-        let showBar = style == .expanded && cardURL != nil
+        // The bar is always shown when expanded, so an empty sheet still shows
+        // which build drew it; only its Safari button waits for a card URL.
+        let showBar = style == .expanded
         bar.isHidden = !showBar
         barShown.isActive = showBar
+        barSafari.isEnabled = cardURL != nil
     }
 
     private func showNote(_ text: String, canRetry: Bool) {
@@ -232,6 +253,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         loadTimer?.invalidate()
         loadTimer = nil
         spinner.stopAnimating()
+        // A page that finishes after the timeout note replaces the note.
+        note.isHidden = true
+        retry.isHidden = true
+        safari.isHidden = true
+        webView.isHidden = false
+        layout(for: presentationStyle)
     }
 
     // The page's web process can be killed (memory pressure in the Messages
