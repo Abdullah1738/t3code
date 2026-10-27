@@ -835,6 +835,8 @@ def basket_arguments(parser, flag):
     parser.add_argument('--moni-go',default=None,metavar='HER_WORDS',
         help="required with --for moni unless --prepare-only: Moni's own go, quoted from her chat (checked against "
              'her messages in the last 45 min; fails closed with MONI_GO_NOT_FOUND)')
+    parser.add_argument('--moni-chat',default=None,metavar='SLUG',
+        help='bridge chat where she gave the go, e.g. group-sb_gro; default: her 1:1 plus every group chat')
 
 
 def require_moni_go(args):
@@ -846,7 +848,8 @@ def require_moni_go(args):
     placing=args.command=='test-talabat-shops' or args.command=='order'
     if not placing or getattr(args,'recipient','owner')!='moni' or getattr(args,'prepare_only',False):return None
     import moni_go
-    return moni_go.verify(getattr(args,'moni_go',None) or '')
+    chat=getattr(args,'moni_chat',None)
+    return moni_go.verify(getattr(args,'moni_go',None) or '', **({'chat':chat} if chat else {}))
 
 
 def card_preflight(args):
