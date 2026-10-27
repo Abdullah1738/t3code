@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import commerce_journal as j
 import commerce_minutes_disposition as d
 import noon_minutes_checkout as m
+from noon_checkout import fingerprint
 
 FLOW = '10000000-0000-4000-8000-0000000000aa'
 ORDER = 'IAEGTEST1482FAILED'
@@ -23,10 +24,20 @@ def order_snap(status='failed', total=Decimal('0.00'), echoed=ORDER, token='PRIV
     return m.Snapshot(wire, m.project_order_get(wire, ORDER), time.time())
 
 
-def intent(status='payment_ready_to_redirect', txn='3DS_ENROLL_INITIATED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
+def intent(status='payment_failed', txn='FAILED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
     wire = {'status': status, 'transaction_status': txn, 'reference': ORDER, 'error_code': None,
             'is_3ds_failure': False, 'authorized_amount': authorized, 'captured_amount': captured}
     return m.Snapshot(wire, m.project_payment_status(wire, ORDER, AMOUNT), time.time())
+
+
+def order_wire(status='failed', total=Decimal('0.00'), token='PRIVATE-INTENT'):
+    return {'orderNr': ORDER, 'statusCode': status, 'orderTotal': total, 'paymentIntentToken': token,
+            'paymentErrorMsg': 'payment failed', 'isPaymentSubscriptionUsed': False, 'success': True}
+
+
+def intent_wire(status='payment_failed', txn='FAILED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
+    return {'status': status, 'transaction_status': txn, 'reference': ORDER, 'error_code': None,
+            'is_3ds_failure': False, 'authorized_amount': authorized, 'captured_amount': captured, 'success': True}
 
 
 def active(*orders):
@@ -99,6 +110,21 @@ class JournalCloseTests(JournalCase):
         with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_TOO_EARLY'):
             j.close_minutes_failed_uncaptured(FLOW, evidence=self.evidence(), expected_local=j.inspect(FLOW))
 
+    def test_old_place_recent_payment_refuses(self):
+        # place is long past the grace, but the payment was sent moments ago: still in its 3DS window.
+        self.placed(payment=False)
+        place_time = time.time() - 3 * j.MINUTES_FAILED_CLOSE_MIN_AGE
+        with j._db() as db:
+            db.execute("UPDATE observations SET observed_at=? WHERE flow_id=? AND operation='place'", (place_time, FLOW))
+        self.pay()
+        j.observe(FLOW, 'payment_complete', outcome='PAYMENT_FAILED', evidence_hash='a' * 64, order_id=ORDER)
+        recent = time.time()
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_TOO_EARLY'):
+            j.minutes_failed_close_precheck(FLOW, now=recent)
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_TOO_EARLY'):
+            j.close_minutes_failed_uncaptured(FLOW, evidence=self.evidence(), expected_local=j.inspect(FLOW), now=recent)
+        self.assertEqual(j.inspect(FLOW)['state'], 'FENCED')
+
     def test_success_observation_vetoes(self):
         self.placed(payment_outcome='PAYMENT_REPORTED_SUCCESS')
         with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_SUCCESS_ALREADY_OBSERVED'):
@@ -159,6 +185,22 @@ class EvidenceGateTests(unittest.TestCase):
             with self.subTest(pay.projection), self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
                 self.gate(pay=pay)
 
+    def test_in_progress_intent_with_zero_amounts_refuses(self):
+        # A live intent can still settle; zero amounts alone must not release the flow.
+        for pay in (intent(status='payment_pending', txn='CREATED'),
+                    intent(status='payment_ready_to_redirect', txn='3DS_ENROLL_INITIATED'),
+                    intent(status='payment_confirmed', txn='NEUTRAL')):
+            with self.subTest(pay.projection), self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+                self.gate(pay=pay)
+
+    def test_payment_confirmed_alone_refuses_with_zero_amounts(self):
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+            self.gate(pay=intent(status='payment_confirmed', txn='NEUTRAL'))
+
+    def test_captured_txn_alone_refuses_with_zero_amounts(self):
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+            self.gate(pay=intent(status='payment_failed', txn='CAPTURED'))
+
     def test_cancelled_passes(self):
         self.assertEqual(self.gate(snap=order_snap(status='cancelled'))['order_status'], 'cancelled')
 
@@ -191,11 +233,24 @@ class CloseFailedFlowTests(JournalCase):
             return d.close_failed(FLOW, client=client)
 
     def client(self, **kw):
-        c = Mock()
-        c.order_status.return_value = kw.get('snap', order_snap())
-        c.active_orders.return_value = SimpleNamespace(projection=kw.get('act', active()))
-        c.payment_intent_status.return_value = kw.get('pay', intent())
-        return c
+        # Real MinutesCheckout over a fake transport; the transport records every route it sees.
+        self.routes = []
+        bodies = {
+            'order_get': kw.get('order_body', order_wire()),
+            'order_get_active': kw.get('active_body', {'activeOrders': [], 'success': True}),
+            'payment_status': kw.get('payment_body', intent_wire()),
+        }
+
+        def transport(route, headers, deadline, payload, *, response_observer):
+            self.routes.append(route)
+            response_observer(m.ResponseObservation('https://' + m.ROUTES[route][1] + m.ROUTES[route][2], 200, ()))
+            return bodies[route]
+        # run_close patches the global clock to the future; the home must share that clock.
+        headers = {'x-addresscode': 'C', 'x-addresskey': 'K'}
+        home = m.AccountHome('minutes', ACCOUNT, fingerprint('C', 'K'), time.time() + j.MINUTES_FAILED_CLOSE_MIN_AGE + 1)
+        return m.MinutesCheckout(headers, home, request=transport,
+                                 receipt=lambda record: True,
+                                 response_cookies=lambda *a, **k: True)
 
     def test_reads_then_closes_without_sends(self):
         self.placed()
@@ -203,12 +258,9 @@ class CloseFailedFlowTests(JournalCase):
         out = self.run_close(c)
         self.assertEqual(out['state'], 'RELEASED')
         self.assertFalse(out['financial_send'] or out['financial_retry'])
-        c.payment_intent_status.assert_called_once_with(order=ORDER, client_secret='PRIVATE-INTENT',
-                                                        total_minor=AMOUNT, timeout=25)
-        for name in ('complete_payment', 'place_order', 'sync'):
-            getattr(c, name).assert_not_called()
-        self.assertEqual({name for name, _, _ in c.method_calls},
-                         {'order_status', 'active_orders', 'payment_intent_status'})
+        # Only the three reads reached the transport; no write route, no send.
+        self.assertEqual(sorted(self.routes), ['order_get', 'order_get_active', 'payment_status'])
+        self.assertFalse(set(self.routes) & m.WRITES)
         self.assertNotIn('PRIVATE-INTENT', str(out))
         self.assertNotIn(ACCOUNT, str(out))
 
@@ -236,12 +288,12 @@ class CloseFailedFlowTests(JournalCase):
                                          state='PAYMENT_REPORTED_SUCCESS')]):
             with self.assertRaisesRegex(j.JournalError, 'EXACT_PLACE_RECEIPT_REQUIRED'):
                 self.run_close(c, receipts_list=rec)
-        c.order_status.assert_not_called()
+        self.assertEqual(self.routes, [])
 
     def test_live_paid_order_keeps_flow(self):
         self.placed()
         with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_ORDER_NOT_FAILED'):
-            self.run_close(self.client(snap=order_snap(status='confirmed')))
+            self.run_close(self.client(order_body=order_wire(status='confirmed')))
         self.assertEqual(j.inspect(FLOW)['state'], 'ACTIVE')
 
 
