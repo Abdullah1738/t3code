@@ -12,6 +12,14 @@ struct RobobCardsApp: App {
 /// The container exists only so iOS will install the Messages extension; this
 /// screen just tells the person it worked and where the cards appear.
 struct InstalledView: View {
+    // Shows which build is installed, so opening the app confirms the version.
+    static let versionText: String = {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "Robob Cards \(version) (\(build))"
+    }()
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -30,6 +38,9 @@ struct InstalledView: View {
                 Text("You can close this app. Nothing else to set up.")
                     .font(.body)
                     .foregroundStyle(.secondary)
+                Text(Self.versionText)
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
             }
             .frame(maxWidth: 560, alignment: .leading)
             .padding(.horizontal, 24)
