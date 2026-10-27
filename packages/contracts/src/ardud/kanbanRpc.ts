@@ -17,6 +17,7 @@ import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlock,
   KanbanBoard,
+  KanbanBoardIcon,
   KanbanBoardId,
   KanbanBoardSnapshot,
   KanbanBoardSummary,
@@ -53,6 +54,7 @@ export const KANBAN_WS_METHODS = {
   cardPatch: "kanban.card.patch",
   cardSettle: "kanban.card.settle",
   cardStop: "kanban.card.stop",
+  cardAsk: "kanban.card.ask",
   cardDiscussion: "kanban.card.discussion",
   poolSet: "kanban.pool.set",
   discussionCreate: "kanban.discussion.create",
@@ -96,6 +98,7 @@ export type KanbanCardPatchInput = typeof KanbanCardPatchInput.Type;
 export const KanbanBoardUpdateInput = Schema.Struct({
   boardId: KanbanBoardId,
   name: Schema.optional(Schema.String),
+  icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   defaultProjectId: Schema.optional(Schema.NullOr(ProjectId)),
   managerModel: Schema.optional(ModelSelection),
   evaluatorModel: Schema.optional(ModelSelection),
@@ -158,6 +161,16 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.cardPatch, KanbanCardPatchInput, KanbanCard),
   call(M.cardSettle, CardRef, KanbanCard),
   call(M.cardStop, CardRef, KanbanCard),
+  /** The owner makes an async ask blocking, or drops an ask. */
+  call(
+    M.cardAsk,
+    Schema.Struct({
+      cardId: KanbanCardId,
+      askId: Schema.String,
+      action: Schema.Literals(["block", "drop"]),
+    }),
+    KanbanCard,
+  ),
   /** The card's discussion, created on first use. */
   call(M.cardDiscussion, CardRef, KanbanDiscussion),
   call(
@@ -224,6 +237,7 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.cardPatch]: AuthOrchestrationOperateScope,
   [M.cardSettle]: AuthOrchestrationOperateScope,
   [M.cardStop]: AuthOrchestrationOperateScope,
+  [M.cardAsk]: AuthOrchestrationOperateScope,
   [M.cardDiscussion]: AuthOrchestrationOperateScope,
   [M.poolSet]: AuthOrchestrationOperateScope,
   [M.discussionCreate]: AuthOrchestrationOperateScope,

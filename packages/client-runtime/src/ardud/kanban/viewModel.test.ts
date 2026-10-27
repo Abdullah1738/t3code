@@ -14,6 +14,7 @@ import {
   withOwnerRead,
 } from "./boardState.ts";
 import {
+  askViews,
   discussionPresence,
   discussionRows,
   goalPage,
@@ -48,6 +49,7 @@ function card(number: number, patch: Partial<KanbanCard> = {}): KanbanCard {
     blockedBy: [],
     stalled: null,
     question: null,
+    asks: [],
     reviewChain: null,
     reviewStep: 0,
     reviewRound: 0,
@@ -156,9 +158,38 @@ describe("stageBoard", () => {
     const todo = view.active.find((column) => column.stage === "todo")!;
     expect(todo.cards[0]!.flag).toEqual({ kind: "blocked", label: "After #1" });
     expect(todo.cards[0]!.goal?.name).toBe("PBV2");
-    expect(view.owner.cards[0]!.flag).toEqual({ kind: "ask", label: "Window?" });
+    expect(view.owner.cards[0]!.flag).toEqual({ kind: "ask", label: "Window?", blocking: true });
     expect(view.shipped.flatMap((column) => column.cards.map((c) => c.number))).toEqual([6]);
     expect(view.total).toBe(5);
+  });
+
+  it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {
+    const ask = (id: string, text: string, blocking: boolean, closedAt: string | null = null) => ({
+      id,
+      text,
+      blocking,
+      by: { _tag: "thread", threadId: "t1" } as never,
+      at: "2026-10-25T10:00:00.000Z",
+      seq: 1,
+      closedAt,
+    });
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "working", asks: [ask("q1", "Logo?", false), ask("q2", "Tone?", false)] }),
+        card(2, { stage: "needs_owner", question: "Window?", asks: [ask("q1", "Window?", true)] }),
+        card(3, { stage: "todo", asks: [ask("q1", "Old", false, "2026-10-25T11:00:00.000Z")] }),
+      ]),
+    );
+    const view = stageBoard(state, NOW);
+    expect(view.owner.cards.map((c) => c.number)).toEqual([2, 1]);
+    expect(view.owner.cards[1]!.flag).toEqual({ kind: "ask", label: "Tone? (+1)", blocking: false });
+    const working = view.active.find((column) => column.stage === "working")!;
+    expect(working.cards.map((c) => c.number)).toEqual([1]);
+    expect(askViews(state.cards.get("card-1")!, NOW).map((a) => [a.id, a.blocking, a.by])).toEqual([
+      ["q1", false, "Worker"],
+      ["q2", false, "Worker"],
+    ]);
+    expect(askViews(state.cards.get("card-3")!, NOW)).toEqual([]);
   });
 
   it("orders todo the way the dispatcher picks: priority, then most blocking, then oldest", () => {

@@ -75,7 +75,7 @@ const asEvaluator = <A, R>(
   withCaller((service, caller) =>
     isCardThread(caller)
       ? refuse(
-          "Only evaluators use this tool. Card threads ask through card_move, card_flag or discussion_post.",
+          "Only evaluators use this tool. Card threads ask through card_ask, card_flag or discussion_post.",
         )
       : run(service, caller),
   );
@@ -290,6 +290,45 @@ const handlers = {
     ),
   ),
 
+  card_ask: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const card = yield* cardFor(service, caller, input.card);
+        yield* ownCard(caller, card);
+        if (caller.link?.role === "review") {
+          return yield* refuse("Review threads put questions in their findings.");
+        }
+        const asked = yield* service.askOwner(
+          card.id,
+          { question: input.question, blocking: input.blocking ?? false, options: input.options },
+          caller.actor,
+          isCardThread(caller) ? "cardThread" : "evaluator",
+        );
+        return { card: asked };
+      }),
+    ),
+  ),
+
+  card_ask_change: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const card = yield* cardFor(service, caller, input.card);
+        yield* ownCard(caller, card);
+        if (caller.link?.role === "review") {
+          return yield* refuse("Review threads put questions in their findings.");
+        }
+        const changed = yield* service.changeAsk(
+          card.id,
+          input.ask.trim(),
+          input.action,
+          caller.actor,
+          isCardThread(caller) ? "cardThread" : "evaluator",
+        );
+        return { card: changed };
+      }),
+    ),
+  ),
+
   card_flag: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
@@ -388,9 +427,7 @@ const handlers = {
           return yield* service.createForThread(caller.threadId, fields);
         }
         if (isWorker && input.stage === "needs_owner") {
-          return yield* refuse(
-            "Work threads ask the owner by moving their own card to needs_owner.",
-          );
+          return yield* refuse("Work threads ask the owner with card_ask on their own card.");
         }
         const card = yield* service.createCard(
           board.id,
@@ -586,14 +623,14 @@ const handlers = {
           name: input.name,
           defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null,
         });
-        if (input.projectId && board.defaultProjectId === null) {
-          return {
-            board: yield* service.updateBoard(board.id, {
-              defaultProjectId: ProjectId.make(input.projectId),
-            }),
-          };
-        }
-        return { board };
+        const patch = {
+          ...(input.projectId && board.defaultProjectId === null
+            ? { defaultProjectId: ProjectId.make(input.projectId) }
+            : {}),
+          ...(input.icon && board.icon === null ? { icon: input.icon } : {}),
+        };
+        if (Object.keys(patch).length === 0) return { board };
+        return { board: yield* service.updateBoard(board.id, patch) };
       }),
     ),
   ),

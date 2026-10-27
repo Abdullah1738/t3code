@@ -43,7 +43,11 @@ export const CardTile = memo(function CardTile(props: {
             "flex gap-1.5 text-xs",
             card.flag.kind === "stalled" && "items-center font-medium text-(--m-negative)",
             card.flag.kind === "blocked" && "items-center text-(--m-muted)",
-            card.flag.kind === "ask" && "items-start leading-snug text-(--m-text)",
+            card.flag.kind === "ask" &&
+              cn(
+                "items-start leading-snug",
+                card.flag.blocking ? "text-(--m-text)" : "text-(--m-muted)",
+              ),
           )}
         >
           <Glyph

@@ -27,6 +27,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { useNowMs } from "../missions/useNowMs";
 import { BoardColumns } from "./BoardColumns";
+import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
@@ -93,7 +94,10 @@ export function BoardPage(props: {
                 onClick={() => onSearch({})}
                 className="max-w-full min-w-0 rounded font-semibold text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               >
-                <WorkspaceBreadcrumbText>{state?.board.name ?? "Board"}</WorkspaceBreadcrumbText>
+                <span className="flex min-w-0 items-center gap-2">
+                  {state ? <BoardIcon board={state.board} className="text-(--m-muted)" /> : null}
+                  <WorkspaceBreadcrumbText>{state?.board.name ?? "Board"}</WorkspaceBreadcrumbText>
+                </span>
               </button>
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator className="max-md:hidden" />

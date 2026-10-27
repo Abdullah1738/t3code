@@ -2,12 +2,13 @@
  * Board list counts, kept from the change feed so a board list never opens
  * board feeds. Only cards and discussions that add to a count are kept.
  */
-import type {
-  KanbanBoard,
-  KanbanBoardSummary,
-  KanbanCard,
-  KanbanChange,
-  KanbanDiscussion,
+import {
+  kanbanNeedsOwner,
+  type KanbanBoard,
+  type KanbanBoardSummary,
+  type KanbanCard,
+  type KanbanChange,
+  type KanbanDiscussion,
 } from "@t3tools/contracts";
 import * as Stream from "effect/Stream";
 
@@ -22,11 +23,11 @@ interface BoardTally {
 /** Mutable on purpose: one per watcher, folded over its own changes. */
 export type BoardTallies = Map<string, BoardTally>;
 
-// A card waiting on the owner counts there even while a thread holds it.
+// A card waiting on the owner, or with an open ask, counts there even while a thread holds it.
 const cardCount = (card: KanbanCard): CardCount =>
   card.settledAt !== null
     ? null
-    : card.stage === "needs_owner"
+    : kanbanNeedsOwner(card)
       ? "owner"
       : card.activeThreadId !== null
         ? "running"

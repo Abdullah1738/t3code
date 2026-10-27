@@ -92,7 +92,7 @@ export const KanbanThreadLink = Schema.Struct({
   boardId: KanbanBoardId,
   cardId: Schema.NullOr(KanbanCardId),
   role: Schema.Literals(["work", "review", "evaluator"]),
-  /** Evaluator purpose: `discussion:<id>`, `stalled`, `completed`, `deployed`, `check`, `setup`. */
+  /** Evaluator purpose: `discussion:<id>`, `stalled`, `completed`, `deployed`, `check`, `packets`, `setup`, `request`. */
   purpose: Schema.NullOr(Schema.String),
   discussionId: Schema.NullOr(KanbanDiscussionId),
   model: Schema.NullOr(ModelSelection),
@@ -130,6 +130,24 @@ export const KanbanSubtask = Schema.Struct({
 });
 export type KanbanSubtask = typeof KanbanSubtask.Type;
 
+/**
+ * A question for the owner. A blocking ask holds the card in Needs Owner; an
+ * async one lets its work go on and can be made blocking later.
+ */
+export const KanbanOwnerAsk = Schema.Struct({
+  /** `q1`, `q2`, ... per card; also the id of its pick block when it has options. */
+  id: TrimmedNonEmptyString,
+  text: Schema.String,
+  blocking: Schema.Boolean,
+  by: KanbanActor,
+  at: IsoDateTime,
+  /** The card discussion message that asked it; null when it wasn't posted. */
+  seq: Schema.NullOr(PositiveInt),
+  /** Set once answered or dropped. */
+  closedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
+
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
   boardId: KanbanBoardId,
@@ -160,6 +178,7 @@ export const KanbanCard = Schema.Struct({
   ),
   /** Set while the card sits in Needs Owner. */
   question: Schema.NullOr(Schema.String),
+  asks: Schema.Array(KanbanOwnerAsk).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   /** Review chain name from the board; null uses the board default. */
   reviewChain: Schema.NullOr(TrimmedNonEmptyString),
   /** Position in the review chain while in review; reset when findings send it back. */
@@ -187,6 +206,13 @@ export type KanbanCard = typeof KanbanCard.Type;
 /** The models a card's work may start on, highest weight first. */
 export const kanbanCardModels = (card: KanbanCard): ReadonlyArray<KanbanCardModel> =>
   card.models.length > 0 ? card.models : [{ model: card.model, weight: 1 }];
+
+export const kanbanOpenAsks = (card: Pick<KanbanCard, "asks">): ReadonlyArray<KanbanOwnerAsk> =>
+  card.asks.filter((ask) => ask.closedAt === null);
+
+/** A card in Needs Owner, or one with an open ask that doesn't block it yet. */
+export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "settledAt">) =>
+  card.settledAt === null && (card.stage === "needs_owner" || kanbanOpenAsks(card).length > 0);
 
 /** The step the card is on: the first with an open subtask, or null when none is open. */
 export const kanbanOpenStep = (card: Pick<KanbanCard, "subtasks">): number | null =>
@@ -398,10 +424,42 @@ export const KanbanInstructions = Schema.Struct({
 });
 export type KanbanInstructions = typeof KanbanInstructions.Type;
 
+/** Icons a board can show; each client draws them from its own icon set. */
+export const KANBAN_BOARD_ICONS = [
+  "briefcase",
+  "rocket",
+  "code",
+  "shield",
+  "chart",
+  "bot",
+  "wallet",
+  "flask",
+  "server",
+  "globe",
+  "users",
+  "wrench",
+  "book",
+  "bolt",
+  "home",
+  "heart",
+  "target",
+  "box",
+  "database",
+  "bug",
+  "brain",
+  "coins",
+  "plane",
+  "leaf",
+] as const;
+export const KanbanBoardIcon = Schema.Literals(KANBAN_BOARD_ICONS);
+export type KanbanBoardIcon = typeof KanbanBoardIcon.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
+  /** A name from KANBAN_BOARD_ICONS; stored as text so a retired name still decodes. */
+  icon: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   defaultProjectId: Schema.NullOr(ProjectId),
   /** Writes titles, descriptions, goal stories and groups. */
   managerModel: ModelSelection,
@@ -414,6 +472,10 @@ export const KanbanBoard = Schema.Struct({
   archivedAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanBoard = typeof KanbanBoard.Type;
+
+/** The board's icon, or null when it has none or one this build doesn't know. */
+export const kanbanBoardIcon = (board: KanbanBoard): KanbanBoardIcon | null =>
+  KANBAN_BOARD_ICONS.find((name) => name === board.icon) ?? null;
 
 const BlockId = TrimmedNonEmptyString;
 const ChoiceOption = Schema.Struct({ id: TrimmedNonEmptyString, label: TrimmedNonEmptyString });

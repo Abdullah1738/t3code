@@ -2,6 +2,8 @@ import {
   KANBAN_BACKLOG,
   KANBAN_DONE_STAGES,
   kanbanHeldUpBy,
+  kanbanNeedsOwner,
+  kanbanOpenAsks,
   kanbanOpenStep,
   kanbanPickOrder,
   kanbanWaitsOnEvaluator,
@@ -63,7 +65,8 @@ export const modelLetter = (model: ModelSelection | null) =>
 export type CardFlag =
   | { readonly kind: "stalled"; readonly label: string }
   | { readonly kind: "blocked"; readonly label: string }
-  | { readonly kind: "ask"; readonly label: string };
+  /** `blocking` false: an async ask; the card's work goes on. */
+  | { readonly kind: "ask"; readonly label: string; readonly blocking: boolean };
 
 export interface CardView {
   readonly id: string;
@@ -97,12 +100,17 @@ function prLabel(url: string, label: string | null): string {
 export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: number): CardView {
   const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
   const pr = card.links.find((link) => link.kind === "pr");
+  const asks = card.settledAt === null ? kanbanOpenAsks(card) : [];
+  const openAsk = asks.at(-1);
   let flag: CardFlag | null = null;
   if (card.stalled !== null) {
     const since = ageView(card.stalled.at, nowMs)?.label;
     flag = { kind: "stalled", label: since && since !== "now" ? `Stalled ${since}` : "Stalled" };
   } else if (card.stage === "needs_owner" && card.question) {
-    flag = { kind: "ask", label: card.question };
+    flag = { kind: "ask", label: card.question, blocking: true };
+  } else if (openAsk !== undefined) {
+    const more = asks.length > 1 ? ` (+${asks.length - 1})` : "";
+    flag = { kind: "ask", label: `${openAsk.text}${more}`, blocking: openAsk.blocking };
   } else if (card.priority === KANBAN_BACKLOG && !isDoneStage(card.stage)) {
     // Shown like a block: the card waits, here on the owner taking it out.
     flag = { kind: "blocked", label: "In the backlog" };
@@ -133,6 +141,36 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
     subtasks: card.subtasks.length === 0 ? null : { done: finished, total: card.subtasks.length },
     card,
   };
+}
+
+export interface AskView {
+  readonly id: string;
+  readonly text: string;
+  readonly blocking: boolean;
+  /** Who asked: Worker, Reviewer, Evaluator, Script, Owner. */
+  readonly by: string;
+  readonly age: string;
+}
+
+/** A card's open asks, oldest first. Blocking ones can't be made blocking again. */
+export function askViews(card: KanbanCard, nowMs: number): ReadonlyArray<AskView> {
+  if (card.settledAt !== null) return [];
+  return kanbanOpenAsks(card).map((ask) => ({
+    id: ask.id,
+    text: ask.text,
+    blocking: ask.blocking,
+    by:
+      ask.by._tag === "thread"
+        ? "Worker"
+        : ask.by._tag === "evaluator"
+          ? "Evaluator"
+          : ask.by._tag === "script"
+            ? "Script"
+            : ask.by._tag === "owner"
+              ? "Owner"
+              : "Board",
+    age: ageView(ask.at, nowMs)?.label ?? "",
+  }));
 }
 
 export const SUBTASK_OWNER_LABELS = {
@@ -220,6 +258,9 @@ const stageOrders = (state: KanbanBoardState) => {
   return (stage: KanbanStage): CardOrder =>
     stage === "todo" ? todo : stage === "needs_review" ? oldestFirst : byPick;
 };
+const firstAskAt = (card: KanbanCard) => kanbanOpenAsks(card)[0]?.at ?? card.movedAt;
+const oldestAskFirst = (a: KanbanCard, b: KanbanCard) =>
+  firstAskAt(a).localeCompare(firstAskAt(b)) || a.number - b.number;
 const newestFirst = (a: KanbanCard, b: KanbanCard) =>
   b.movedAt.localeCompare(a.movedAt) || b.number - a.number;
 
@@ -255,7 +296,18 @@ export function stageBoard(
   return {
     active: ACTIVE_STAGES.map((stage) => column(stage)),
     shipped: SHIPPED_STAGES.map((stage) => column(stage, newestFirst)),
-    owner: column("needs_owner"),
+    // Waiting cards first, then cards whose open asks don't block them.
+    owner: {
+      stage: "needs_owner",
+      label: STAGE_LABELS.needs_owner,
+      cards: [
+        ...column("needs_owner").cards,
+        ...cards
+          .filter((card) => card.stage !== "needs_owner" && kanbanNeedsOwner(card))
+          .sort(oldestAskFirst)
+          .map((card) => cardView(card, state, nowMs)),
+      ],
+    },
     total: cards.length,
   };
 }
@@ -393,7 +445,7 @@ export function activeGoals(state: KanbanBoardState): GoalSummary[] {
       goal,
       progress: goalProgress(state, goal.id),
       needsOwner: [...state.cards.values()].filter(
-        (card) => card.goalId === goal.id && card.stage === "needs_owner" && !card.settledAt,
+        (card) => card.goalId === goal.id && kanbanNeedsOwner(card),
       ).length,
     }))
     .sort((a, b) => a.goal.createdAt.localeCompare(b.goal.createdAt));

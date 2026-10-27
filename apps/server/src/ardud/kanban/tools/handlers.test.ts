@@ -180,3 +180,31 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("board_open gives a board its icon only while it has none", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const evaluator = ThreadId.make("thread-evaluator");
+    const opened = yield* call(evaluator, "board_open", {
+      slug: "toy",
+      name: "Toy",
+      icon: "rocket",
+    });
+    assert.isFalse(opened.isError, opened.text);
+    assert.strictEqual((opened.structured.board as { icon: string }).icon, "rocket");
+
+    const board = (yield* kanban.boards)[0]!;
+    yield* kanban.updateBoard(board.id, { icon: "leaf" });
+    const again = yield* call(evaluator, "board_open", { slug: "toy", name: "Toy", icon: "bug" });
+    assert.strictEqual((again.structured.board as { icon: string }).icon, "leaf");
+
+    // Names outside the list never reach the board.
+    const unknown = yield* call(evaluator, "board_open", {
+      slug: "toy",
+      name: "Toy",
+      icon: "nope",
+    }).pipe(Effect.flip);
+    assert.include(String(unknown), "Invalid parameters");
+  }).pipe(Effect.provide(layer));
+});

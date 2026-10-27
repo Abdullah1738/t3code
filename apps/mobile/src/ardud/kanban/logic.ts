@@ -79,7 +79,7 @@ export function cardPaneWidth(width: number): number {
   return Math.min(460, Math.round(width * 0.46));
 }
 
-export type GlyphKind = "ok" | "done" | "risk" | "stuck" | "wait" | "idle";
+export type GlyphKind = "ok" | "done" | "risk" | "stuck" | "wait" | "ask" | "idle";
 
 export function stageGlyph(stage: KanbanStage): GlyphKind {
   switch (stage) {

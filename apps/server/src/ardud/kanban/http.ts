@@ -8,6 +8,7 @@ import {
   AuthOrchestrationReadScope,
   KanbanBlock,
   type KanbanBoard,
+  KanbanBoardIcon,
   type KanbanCard,
   KanbanCardId,
   KanbanDiscussionId,
@@ -116,6 +117,7 @@ const AnswerBody = Schema.Struct({
 
 const BoardBody = Schema.Struct({
   name: Text,
+  icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   managerModel: Schema.optional(ModelBody),
   evaluatorModel: Schema.optional(ModelBody),
@@ -261,6 +263,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const input = yield* body(BoardBody);
         return yield* service.updateBoard(board.id, {
           ...(input.name ? { name: input.name } : {}),
+          ...(input.icon !== undefined ? { icon: input.icon } : {}),
           ...(input.projectId !== undefined
             ? { defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null }
             : {}),

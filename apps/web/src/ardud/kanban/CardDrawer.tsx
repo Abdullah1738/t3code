@@ -3,6 +3,7 @@ import { XIcon } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
+  askViews,
   cardView,
   modelName,
   modelVariant,
@@ -203,12 +204,7 @@ export function CardDrawer(props: {
           {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
           <Chip>{view.model.name}</Chip>
         </div>
-        {card.question && card.stage === "needs_owner" ? (
-          <p className="mb-3.5 flex items-start gap-2 rounded-xl bg-(--m-warnband) px-3 py-2.5 text-sm leading-snug">
-            <Glyph kind="wait" className="mt-1" />
-            <span>{card.question}</span>
-          </p>
-        ) : null}
+        <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         <Tabs
           label="Card"
           value={tab}
@@ -554,6 +550,59 @@ function FactButton(props: React.ComponentProps<"button">) {
       {...props}
       className="-ms-2 inline-flex h-7.5 items-center gap-2 rounded-full px-2 font-medium text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) data-popup-open:bg-(--m-chip)"
     />
+  );
+}
+
+/** Open questions for the owner. Answers go in the card's discussion. */
+function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => void }) {
+  const { card } = props;
+  const asks = askViews(card, props.nowMs);
+  // Cards from before asks were kept only carry the question.
+  if (asks.length === 0) {
+    return card.question && card.stage === "needs_owner" ? (
+      <p className="mb-3.5 flex items-start gap-2 rounded-xl bg-(--m-warnband) px-3 py-2.5 text-sm leading-snug">
+        <Glyph kind="wait" className="mt-1" />
+        <span>{card.question}</span>
+      </p>
+    ) : null;
+  }
+  return (
+    <ul className="mb-3.5 flex flex-col gap-1 rounded-xl bg-(--m-warnband) py-1.5">
+      {asks.map((ask) => (
+        <li key={ask.id} className="flex items-start gap-2 px-3 py-1 text-sm leading-snug">
+          <Glyph kind={ask.blocking ? "wait" : "ask"} className="mt-1" />
+          <span className="min-w-0 flex-1">
+            <span className="block">{ask.text}</span>
+            <span className="text-xs text-(--m-muted)">
+              {ask.by} · {ask.age} · {ask.blocking ? "Card waits" : "Work goes on"}
+            </span>
+          </span>
+          <span className="-me-1.5 flex shrink-0 items-center">
+            <QuietButton onClick={props.onAnswer}>Answer</QuietButton>
+            {ask.blocking ? null : (
+              <QuietButton
+                onClick={() =>
+                  void runAction("Couldn't make it blocking", () =>
+                    kanban.changeAsk(card.id, ask.id, "block"),
+                  )
+                }
+              >
+                Block
+              </QuietButton>
+            )}
+            <QuietButton
+              onClick={() =>
+                void runAction("Couldn't drop the question", () =>
+                  kanban.changeAsk(card.id, ask.id, "drop"),
+                )
+              }
+            >
+              Drop
+            </QuietButton>
+          </span>
+        </li>
+      ))}
+    </ul>
   );
 }
 

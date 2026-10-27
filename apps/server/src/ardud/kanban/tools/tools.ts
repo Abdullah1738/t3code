@@ -5,6 +5,7 @@
  */
 import {
   KanbanBlock,
+  KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
   NonNegativeInt,
@@ -172,6 +173,35 @@ const CardMove = tool(
     question: Schema.optional(
       describe(Schema.String, "Required for needs_owner: what the owner must decide."),
     ),
+  },
+  { card: Record },
+  { readonly: false },
+);
+
+const CardAsk = tool(
+  "card_ask",
+  "Ask the owner",
+  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick.",
+  {
+    card: Schema.optional(CardRef),
+    question: Schema.String,
+    blocking: Schema.optional(Schema.Boolean),
+    options: Schema.optional(
+      describe(Schema.Array(Schema.String), "Answers to pick from, when they are known."),
+    ),
+  },
+  { card: Record },
+  { readonly: false },
+);
+
+const CardAskChange = tool(
+  "card_ask_change",
+  "Change an open ask",
+  "Make an open async ask (q1, q2... on the card) blocking, or drop one that is no longer needed. A work thread changes only its own card's asks.",
+  {
+    card: Schema.optional(CardRef),
+    ask: Schema.String,
+    action: Schema.Literals(["block", "drop"]),
   },
   { card: Record },
   { readonly: false },
@@ -412,11 +442,12 @@ const WikiWrite = tool(
 const BoardOpen = tool(
   "board_open",
   "Open a Missions board",
-  "Create a board (or return the existing one with this slug). projectId is the T3 project its threads run in.",
+  "Create a board (or return the existing one with this slug). projectId is the T3 project its threads run in. icon is shown beside its name; it is set only while the board has none, so the owner's pick stays.",
   {
     slug: TrimmedNonEmptyString,
     name: TrimmedNonEmptyString,
     projectId: Schema.optional(TrimmedNonEmptyString),
+    icon: Schema.optional(KanbanBoardIcon),
   },
   { board: Record },
   { readonly: false },
@@ -440,6 +471,8 @@ export const KanbanToolkit = Toolkit.make(
   CardGet,
   CardUpdate,
   CardMove,
+  CardAsk,
+  CardAskChange,
   CardFlag,
   CardReviewResult,
   DiscussionPost,

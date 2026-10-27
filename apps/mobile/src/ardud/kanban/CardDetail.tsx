@@ -1,5 +1,6 @@
 import type { KanbanCard, KanbanThreadLink } from "@t3tools/contracts";
 import {
+  askViews,
   cardView,
   modelName,
   modelVariant,
@@ -130,6 +131,7 @@ function CardHeader(props: {
 }) {
   const { card } = props;
   const view = cardView(card, props.state, props.nowMs);
+  const asks = askViews(card, props.nowMs);
   const goal = view.goal;
   return (
     <View className="gap-2.5 pt-2">
@@ -159,13 +161,69 @@ function CardHeader(props: {
         ) : null}
         {view.model.name ? <KChip label={view.model.name} /> : null}
       </View>
-      <FlagLine flag={view.flag} lines={6} />
+      {view.flag?.kind === "ask" && asks.length > 0 ? null : (
+        <FlagLine flag={view.flag} lines={6} />
+      )}
+      <OwnerAsks card={card} asks={asks} />
       {card.description.trim() ? (
         <Text selectable className="text-[15px] leading-[22px] text-foreground">
           {card.description}
         </Text>
       ) : null}
       <CardActions card={card} />
+    </View>
+  );
+}
+
+/** Open questions for the owner; he answers in the discussion below. */
+function OwnerAsks(props: {
+  readonly card: KanbanCard;
+  readonly asks: ReturnType<typeof askViews>;
+}) {
+  const { card } = props;
+  const action = useMissionAction();
+  if (props.asks.length === 0) return null;
+  return (
+    <View className="gap-3 rounded-2xl bg-warning px-3.5 py-3">
+      {props.asks.map((ask) => (
+        <View key={ask.id} className="gap-2">
+          <View className="flex-row items-start gap-2">
+            <View className="pt-[5px]">
+              <Glyph kind={ask.blocking ? "wait" : "ask"} />
+            </View>
+            <View className="flex-1 gap-0.5">
+              <Text selectable className="text-[15px] leading-[21px] text-foreground">
+                {ask.text}
+              </Text>
+              <Text className="text-[13px] text-foreground-muted">
+                {ask.by} · {ask.age} · {ask.blocking ? "Card waits" : "Work goes on"}
+              </Text>
+            </View>
+          </View>
+          <View className="flex-row flex-wrap gap-2 ps-[18px]">
+            {ask.blocking ? null : (
+              <ActionButton
+                label="Make blocking"
+                disabled={action.pending}
+                onPress={() =>
+                  void action.run("Couldn't make it blocking", () =>
+                    kanbanClient().changeAsk(card.id, ask.id, "block"),
+                  )
+                }
+              />
+            )}
+            <ActionButton
+              label="Drop"
+              disabled={action.pending}
+              onPress={() =>
+                void action.run("Couldn't drop the question", () =>
+                  kanbanClient().changeAsk(card.id, ask.id, "drop"),
+                )
+              }
+            />
+          </View>
+        </View>
+      ))}
     </View>
   );
 }

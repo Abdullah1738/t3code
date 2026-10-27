@@ -24,6 +24,8 @@ export function Glyph(props: { readonly kind: GlyphKind }) {
           <View className="absolute inset-y-0 left-0 w-[3.5px] bg-warning-foreground" />
         </View>
       );
+    case "ask":
+      return <View className="size-2.5 rounded-full border-[1.5px] border-warning-foreground" />;
     case "idle":
       return <View className="size-2.5 rounded-full border-[1.5px] border-foreground-muted" />;
   }
@@ -185,7 +187,13 @@ export function FlagLine(props: { readonly flag: CardView["flag"]; readonly line
   const { flag } = props;
   if (flag === null) return null;
   const glyph: GlyphKind =
-    flag.kind === "stalled" ? "stuck" : flag.kind === "ask" ? "wait" : "idle";
+    flag.kind === "stalled"
+      ? "stuck"
+      : flag.kind === "ask"
+        ? flag.blocking
+          ? "wait"
+          : "ask"
+        : "idle";
   return (
     <View className="flex-row items-start gap-1.5">
       <View className="pt-[3px]">
@@ -197,7 +205,7 @@ export function FlagLine(props: { readonly flag: CardView["flag"]; readonly line
           "flex-1 text-[13px] leading-[17px]",
           flag.kind === "stalled" && "font-t3-medium text-danger-foreground",
           flag.kind === "blocked" && "text-foreground-muted",
-          flag.kind === "ask" && "text-foreground",
+          flag.kind === "ask" && (flag.blocking ? "text-foreground" : "text-foreground-muted"),
         )}
       >
         {flag.label}

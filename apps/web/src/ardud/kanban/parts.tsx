@@ -5,7 +5,7 @@ import type { KanbanStage } from "@t3tools/contracts";
 
 import { cn } from "../../lib/utils";
 
-export type GlyphKind = "ok" | "done" | "risk" | "stuck" | "wait" | "idle";
+export type GlyphKind = "ok" | "done" | "risk" | "stuck" | "wait" | "ask" | "idle";
 
 /** 10px state mark: the board's only status vocabulary. */
 export function Glyph(props: {
@@ -34,6 +34,9 @@ export function Glyph(props: {
           <path d="M6 1.4a4.6 4.6 0 0 1 0 9.2z" fill="var(--m-warning)" />
         </>
       ) : null}
+      {kind === "ask" ? (
+        <circle cx="6" cy="6" r="4.4" fill="none" stroke="var(--m-warning)" strokeWidth="1.5" />
+      ) : null}
       {kind === "idle" ? (
         <circle cx="6" cy="6" r="4.4" fill="none" stroke="var(--m-muted)" strokeWidth="1.5" />
       ) : null}
@@ -58,7 +61,9 @@ export function stageGlyph(stage: KanbanStage): GlyphKind {
 }
 
 export function flagGlyph(flag: CardFlag): GlyphKind {
-  return flag.kind === "stalled" ? "stuck" : flag.kind === "ask" ? "wait" : "idle";
+  if (flag.kind === "stalled") return "stuck";
+  if (flag.kind === "ask") return flag.blocking ? "wait" : "ask";
+  return "idle";
 }
 
 const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low", "Backlog"] as const;

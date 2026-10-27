@@ -8,6 +8,7 @@ import { CollapsibleSectionHeader } from "../../components/ui/collapsible-sectio
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
+import { BoardIcon } from "./boardIcon";
 import { useBoards } from "./kanbanStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
@@ -92,6 +93,7 @@ const BoardRow = memo(function BoardRow(props: {
           open ? "font-medium hover:bg-sidebar-row-hover" : rowState(false),
         )}
       >
+        <BoardIcon board={board} className="text-sidebar-muted-foreground" />
         <span className="min-w-0 flex-1 truncate">{board.name}</span>
         <Count count={needsOwner} tone="warn" label={`${needsOwner} need you`} />
       </Link>
@@ -108,7 +110,7 @@ const BoardRow = memo(function BoardRow(props: {
                 aria-current={active ? "page" : undefined}
                 className={cn(
                   rowClassName,
-                  "ps-6.5",
+                  "ps-8.5",
                   active
                     ? rowState(true)
                     : "text-sidebar-muted-foreground hover:bg-sidebar-row-hover",

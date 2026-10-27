@@ -67,6 +67,11 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       service.settleCard(input.cardId),
     [M.cardStop]: (input: { readonly cardId: Parameters<KanbanServiceShape["cardThread"]>[0] }) =>
       service.cardThread(input.cardId, "stop", "Stopped by the owner.", OWNER),
+    [M.cardAsk]: (input: {
+      readonly cardId: Parameters<KanbanServiceShape["changeAsk"]>[0];
+      readonly askId: string;
+      readonly action: "block" | "drop";
+    }) => service.changeAsk(input.cardId, input.askId, input.action, OWNER, "owner"),
     [M.cardDiscussion]: (input: {
       readonly cardId: Parameters<KanbanServiceShape["cardDiscussion"]>[0];
     }) => service.cardDiscussion(input.cardId),

@@ -61,6 +61,8 @@ export interface KanbanClient {
   patchCard(input: KanbanCardPatchInput): Promise<void>;
   settleCard(cardId: string): Promise<void>;
   stopCard(cardId: string): Promise<void>;
+  /** The owner makes an async ask blocking, or drops an ask. */
+  changeAsk(cardId: string, askId: string, action: "block" | "drop"): Promise<void>;
   /** The card's discussion, created on first use. */
   cardDiscussion(boardId: string, cardId: string): Promise<KanbanDiscussion>;
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
@@ -687,6 +689,9 @@ export function createKanbanClient(
     },
     async settleCard(cardId) {
       await transport.request(M.cardSettle, { cardId: cardId as never });
+    },
+    async changeAsk(cardId, askId, action) {
+      await transport.request(M.cardAsk, { cardId: cardId as never, askId, action });
     },
     async stopCard(cardId) {
       await transport.request(M.cardStop, { cardId: cardId as never });

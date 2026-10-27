@@ -40,12 +40,12 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
     "",
     "How the board works:",
-    "- Your card tools: card_get, card_update, card_move, card_flag, subtask_done, discussion_post, wiki_read.",
+    "- Your card tools: card_get, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read.",
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
     "- When the work is done, attach every PR with card_update (links) and call card_move to needs_review with a one-line note. A reviewer picks it up; findings come back to you in this thread.",
-    "- If you need a decision from the owner, call card_move to needs_owner with the question. Don't guess on product or risk calls.",
+    "- If you need a decision from the owner, ask with card_ask. Don't guess on product or risk calls. Ask async and keep working where you can; his answer comes to this thread. Pass blocking only when you can't go on without it: the card then waits in Needs Owner and comes back to you with the answer.",
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,
@@ -80,9 +80,14 @@ export const claimBrief = (card: KanbanCard, goal: KanbanGoal | null, note: stri
 export const dropCardText = (card: KanbanCard, what: string, others: ReadonlyArray<KanbanCard>) =>
   `Card #${card.number} ${what}, so it is no longer yours: stop working on it. Carry on with ${others.map((other) => `#${other.number}`).join(", ")}.`;
 
-/** Sent when a card a thread keeps working beside goes to the backlog. */
-export const pauseCardText = (card: KanbanCard, others: ReadonlyArray<KanbanCard>) =>
-  `Card #${card.number} was moved to the backlog: pause it and leave it as it is. It comes back to you when it leaves the backlog. Carry on with ${others.map((other) => `#${other.number}`).join(", ")}.`;
+/** Sent when a card a thread keeps working beside is paused (the backlog, the owner's answer). */
+export const pauseCardText = (
+  card: KanbanCard,
+  what: string,
+  until: string,
+  others: ReadonlyArray<KanbanCard>,
+) =>
+  `Card #${card.number} ${what}: pause it and leave it as it is. It comes back to you ${until}. Carry on with ${others.map((other) => `#${other.number}`).join(", ")}.`;
 
 /** Sent to a card's live thread when its plan of subtasks changes. */
 export const planChangedText = (card: KanbanCard) =>
@@ -155,6 +160,7 @@ export type EvaluatorPurpose =
   | { readonly kind: "completed" }
   | { readonly kind: "deployed" }
   | { readonly kind: "check" }
+  | { readonly kind: "packets" }
   | { readonly kind: "setup"; readonly text: string }
   | { readonly kind: "request"; readonly text: string };
 
@@ -175,6 +181,8 @@ export const evaluatorTitle = (purpose: EvaluatorPurpose) => {
       return "Evaluator: deployed batch";
     case "check":
       return "Evaluator: board check";
+    case "packets":
+      return "Evaluator: packets";
     case "setup":
       return "Evaluator: board setup";
     case "request":
@@ -196,6 +204,8 @@ const purposeText = (purpose: EvaluatorPurpose) => {
       return "Deployed batch: for each Deployed card, verify the behaviour in the real environment. Move verified ones to verified; send failures back to todo with the evidence.";
     case "check":
       return "Board check: read the board and the live threads. Steer threads that drift, split cards that are too big, create cards for follow-ups, give a plan of subtasks to cards that have none, do the evaluator subtasks cards are waiting on, keep goals' Now and Story current.";
+    case "packets":
+      return "Packets: threads and scripts made new cards that wait on your packet subtask. Each one is sent to you here, and more may follow while you work. For each: read what it points at, write its packet with card_edit, add the plan, then mark the packet subtask done.";
     case "setup":
       return `Board setup:\n${purpose.text}`;
     case "request":
@@ -212,8 +222,9 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     "What you can do:",
     "- Read everything: board_get, card_get, discussions, the wiki, the cards' threads (t3_thread_read), past sessions (recall), the web, Dia for logged-in pages.",
     "- Cards: card_create, card_edit, card_move (any stage except working/in_review, which the dispatcher owns), card_flag, comments and links.",
+    "- Asking the owner: card_ask puts a question on a card; it shows in his Needs Owner list and the card's discussion, and his answer comes back to you. Async by default: the card and its thread go on. Make it blocking (blocking on card_ask, or card_ask_change later) only when nothing can move until he answers; the card then waits in Needs Owner and goes back where it was with his answer. Give options when the answers are known (an approval: Approve, Change, Drop). The owner can make an async ask blocking himself, and drop asks. Drop your own asks with card_ask_change once they no longer matter.",
     "- Packets: a card's prompt is all its work thread gets, and the cheapest model may write the code from it. So every card you create gets a tight packet as its prompt: what to do and why, what you read for it (sessions, PRs, the code, the architecture) boiled down, the files and functions to touch, the steps, the tests to add or run, and when it's done. Detailed enough that the writer never has to guess or go looking. Cards a thread or a script makes start with your packet subtask: read what they point at, rewrite the prompt with card_edit, add the plan, then mark it done.",
-    "- Subtasks: every card you create, on your own or because the owner asked, gets its plan as subtasks (subtasks on card_create), so nobody has to guess what comes next. Lay out the whole flow: the work, its review, and what follows, such as merge and deploy, telling whoever reported it, updating linked tickets or pinging someone, a read-back. Leave out what isn't needed. Same step means any order. Add or change subtasks with card_edit when you learn more or the owner asks; give a plan to any card that has none. Anything outward (a message, a Linear or ticket update, a merge or deploy) is always an evaluator subtask, never the worker's. Do the evaluator's subtasks of the step a card is on and mark them with subtask_done; the dispatcher leaves a card alone while its step is only yours, and you are told when a card's step becomes yours. A subtask follows every other rule: if the board says a message needs the owner's approval, ask him in the card's discussion with card_move to needs_owner and the question; his answer comes back to you, and the card goes back where it was. The subtask stays open until it's sent. A card reaches verified only when every subtask is done or skipped.",
+    "- Subtasks: every card you create, on your own or because the owner asked, gets its plan as subtasks (subtasks on card_create), so nobody has to guess what comes next. Lay out the whole flow: the work, its review, and what follows, such as merge and deploy, telling whoever reported it, updating linked tickets or pinging someone, a read-back. Leave out what isn't needed. Same step means any order. Add or change subtasks with card_edit when you learn more or the owner asks; give a plan to any card that has none. Anything outward (a message, a Linear or ticket update, a merge or deploy) is always an evaluator subtask, never the worker's. Do the evaluator's subtasks of the step a card is on and mark them with subtask_done; the dispatcher leaves a card alone while its step is only yours, and you are told when a card's step becomes yours. A subtask follows every other rule: if the board says a message needs the owner's approval, ask him with card_ask (blocking, with options); his answer comes back to you, and the card goes back where it was. The subtask stays open until it's sent. A card reaches verified only when every subtask is done or skipped.",
     "- Pick order: the dispatcher takes todo cards by priority (a card holding up a more urgent one counts as that urgent), then the one holding up the most other cards, and never a blocked one. Set each card's priority yourself, 1 (urgent) to 4 (low), and blockedBy from what it waits on.",
     "- Backlog: priority 5 is never picked up, and a card with a thread is paused there until it leaves. Move a card into the backlog, or out of it, only when the owner asks.",
     "- Threads: card_thread steer|stop|wake. Every message to a thread is a steer. Threads only talk to each other through you.",
@@ -248,7 +259,7 @@ export const nudgeDiscussionText = (discussionId: string) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, card_move to needs_owner with the question. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, ask with card_ask. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
 };
 
 export const nudgeReviewText = (card: KanbanCard) =>

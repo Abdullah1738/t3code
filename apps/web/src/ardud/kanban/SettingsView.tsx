@@ -7,7 +7,14 @@ import {
   poolViews,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanBoard, KanbanInstructions, ModelSelection } from "@t3tools/contracts";
+import {
+  KANBAN_BOARD_ICONS,
+  kanbanBoardIcon,
+  type KanbanBoard,
+  type KanbanBoardIcon,
+  type KanbanInstructions,
+  type ModelSelection,
+} from "@t3tools/contracts";
 
 import {
   Menu,
@@ -18,6 +25,7 @@ import {
 } from "../../components/ui/menu";
 import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
+import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction } from "./kanbanStore";
 import { Chip } from "./parts";
 
@@ -33,6 +41,9 @@ export function SettingsView(props: { state: KanbanBoardState }) {
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
+      <Section title="Icon">
+        <IconPicker board={board} onChange={(icon) => update({ icon })} />
+      </Section>
       <Section title="Pools">
         {pools.map((pool) => (
           <div
@@ -148,6 +159,45 @@ export function SettingsView(props: { state: KanbanBoardState }) {
       <Section title="Instructions" plain>
         <Instructions board={board} onSave={(instructions) => update({ instructions })} />
       </Section>
+    </div>
+  );
+}
+
+function IconPicker(props: {
+  board: KanbanBoard;
+  onChange: (icon: KanbanBoardIcon | null) => void;
+}) {
+  const current = kanbanBoardIcon(props.board);
+  const option = (icon: KanbanBoardIcon | null, label: string, mark: ReactNode) => (
+    <button
+      key={icon ?? "none"}
+      type="button"
+      aria-label={label}
+      aria-pressed={current === icon}
+      onClick={() => {
+        if (current !== icon) props.onChange(icon);
+      }}
+      className={cn(
+        "grid size-9 place-items-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+        current === icon
+          ? "bg-(--m-band) text-(--m-accent-text)"
+          : "text-(--m-muted) hover:bg-(--m-chip) hover:text-(--m-text)",
+      )}
+    >
+      {mark}
+    </button>
+  );
+  return (
+    <div className="flex flex-wrap gap-1 py-2" role="group" aria-label="Board icon">
+      {option(
+        null,
+        "No icon, show the first letter",
+        <BoardIcon board={{ ...props.board, icon: null }} />,
+      )}
+      {KANBAN_BOARD_ICONS.map((icon) => {
+        const Icon = BOARD_ICONS[icon];
+        return option(icon, icon, <Icon aria-hidden className="size-4.5" />);
+      })}
     </div>
   );
 }

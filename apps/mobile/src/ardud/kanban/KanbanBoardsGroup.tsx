@@ -5,6 +5,7 @@ import { View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Group, NewCount, Row, SectionHead, Separator, Title } from "../missions/parts";
+import { BoardIcon } from "./BoardIcon";
 import { useKanbanBoards } from "./kanbanStore";
 import { Glyph } from "./parts";
 
@@ -43,8 +44,9 @@ function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen
       onPress={props.onOpen}
       className="items-center"
     >
-      <Glyph kind={owner > 0 ? "wait" : running > 0 ? "ok" : "idle"} />
+      <BoardIcon board={board} />
       <Title className="flex-1">{name}</Title>
+      {owner === 0 && running > 0 ? <Glyph kind="ok" /> : null}
       <NewCount count={unread} accessibilityLabel={`${unread} unread`} />
       {owner > 0 ? (
         <View className="h-[22px] min-w-[22px] items-center justify-center rounded-full bg-warning-foreground px-1.5">

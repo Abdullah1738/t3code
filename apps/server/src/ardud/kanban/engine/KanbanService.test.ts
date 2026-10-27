@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
@@ -1179,6 +1180,231 @@ it.effect("the owner's own question and a pick on an evaluator's go where they b
       const answered = (yield* kanban.card(theirs.id)).card;
       assert.strictEqual(answered.stage, "completed");
       assert.isNull(answered.question);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an async ask lets the work go on; the owner's answer reaches the thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Which fee?", blocking: false },
+        worker,
+        "cardThread",
+      );
+      assert.strictEqual(asked.stage, "working");
+      assert.strictEqual(asked.activeThreadId, threadId);
+      assert.deepStrictEqual(
+        asked.asks.map((ask) => [ask.id, ask.blocking, ask.closedAt]),
+        [["q1", false, null]],
+      );
+      assert.isNotNull(asked.asks[0]!.seq);
+      const counted = yield* kanban.boardSummaries.pipe(Stream.runHead);
+      assert.strictEqual(Option.getOrThrow(counted)[0]!.needsOwner, 1);
+
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Use 2%" }]);
+      const answered = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(answered.stage, "working");
+      assert.isNotNull(answered.asks[0]!.closedAt);
+      const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("Use 2%")).length, 1);
+      assert.deepStrictEqual(fake.interrupted, []);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the owner makes an ask blocking: the card waits, then wakes with his pick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Ship tonight?", blocking: false, options: ["Yes", "No"] },
+        worker,
+        "cardThread",
+      );
+
+      const blocked = yield* kanban.changeAsk(card.id, "q1", "block", owner, "owner");
+      assert.strictEqual(blocked.stage, "needs_owner");
+      assert.strictEqual(blocked.question, "Ship tonight?");
+      assert.isNull(blocked.activeThreadId);
+      assert.strictEqual(blocked.workThreadId, threadId);
+      assert.deepStrictEqual(
+        blocked.asks.map((ask) => [ask.id, ask.blocking]),
+        [["q1", true]],
+      );
+      assert.deepStrictEqual(fake.interrupted, [threadId]);
+
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", ["o1"], owner);
+      const woken = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(woken.stage, "todo");
+      assert.include(woken.wakeNote ?? "", "Yes");
+      assert.isNotNull(woken.asks[0]!.closedAt);
+      yield* kanban.dispatchNow;
+      const resumed = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(resumed.activeThreadId, threadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a dropped ask tells its asker; an evaluator's blocking ask goes back where it was", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      yield* kanban.askOwner(card.id, { question: "Logo?", blocking: false }, worker, "cardThread");
+      const dropped = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+      assert.isNotNull(dropped.asks[0]!.closedAt);
+      assert.strictEqual(dropped.stage, "working");
+      const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.isTrue(messages.some((text) => text.includes("was dropped by the owner")));
+      const gone = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner").pipe(Effect.flip);
+      assert.strictEqual(gone.code, "not-found");
+
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      yield* kanban.moveCard(other.id, "completed", "evaluator", evaluator);
+      const waiting = yield* kanban.askOwner(
+        other.id,
+        { question: "Post it?", blocking: true, options: ["Approve", "Drop"] },
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(waiting.stage, "needs_owner");
+      assert.strictEqual(waiting.asks.length, 1);
+      const talk = yield* kanban.cardDiscussion(other.id);
+      yield* kanban.answer(talk.id, waiting.asks[0]!.seq!, "q1", ["o1"], owner);
+      const back = (yield* kanban.card(other.id)).card;
+      assert.strictEqual(back.stage, "completed");
+      assert.isNull(back.question);
+      assert.isNotNull(back.asks[0]!.closedAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the worker's answer survives an evaluator's later blocking ask", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Which fee?", blocking: true },
+        worker,
+        "cardThread",
+      );
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const both = yield* kanban.askOwner(
+        card.id,
+        { question: "Tell QA too?", blocking: true },
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(both.question, "Tell QA too?");
+
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "2%, and yes" }]);
+      const woken = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(woken.stage, "todo");
+      assert.include(woken.wakeNote ?? "", "2%, and yes");
+      assert.isTrue(woken.asks.every((ask) => ask.closedAt !== null));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the owner's answer to his own question frees a card that never ran", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.moveCard(card.id, "needs_owner", "owner", owner, {
+        question: "Do we need this?",
+      });
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Yes, go" }]);
+      const freed = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(freed.stage, "todo");
+      assert.isNull(freed.question);
+      assert.isTrue(freed.asks.every((ask) => ask.closedAt !== null));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a late pick on a closed ask answers nothing else", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const first = yield* kanban.askOwner(
+        card.id,
+        { question: "Color?", blocking: false, options: ["Red", "Blue"] },
+        worker,
+        "cardThread",
+      );
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Red" }]);
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Ship it?", blocking: true },
+        worker,
+        "cardThread",
+      );
+
+      yield* kanban.answer(talk.id, first.asks[0]!.seq!, "q1", ["o2"], owner);
+      const still = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(still.stage, "needs_owner");
+      assert.isNull(still.asks[1]!.closedAt);
+      assert.strictEqual(still.question, "Ship it?");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("new cards from a script share one packets evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const thread: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker-1") };
+      for (const title of ["A", "B", "C"]) {
+        yield* kanban.createCard(board.id, { prompt: title, title }, thread);
+      }
+      const evaluators = [...(yield* Ref.get(fake.threads)).values()].filter(
+        (view) => view.title === "Evaluator: packets",
+      );
+      assert.strictEqual(evaluators.length, 1);
+      const texts = evaluators[0]!.messages;
+      assert.strictEqual(
+        texts.filter((text) => text.includes("waiting on your subtasks")).length,
+        3,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

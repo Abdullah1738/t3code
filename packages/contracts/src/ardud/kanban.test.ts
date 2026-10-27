@@ -1,6 +1,13 @@
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { KANBAN_BACKLOG, kanbanBlocking, type KanbanCard } from "./kanban.ts";
+import {
+  KANBAN_BACKLOG,
+  KanbanBoard,
+  kanbanBlocking,
+  kanbanBoardIcon,
+  type KanbanCard,
+} from "./kanban.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
 
@@ -25,6 +32,7 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
     blockedBy: blockedBy as never,
     stalled: null,
     question: null,
+    asks: [],
     reviewChain: null,
     reviewStep: 0,
     reviewRound: 0,
@@ -70,5 +78,31 @@ describe("kanbanBlocking", () => {
     ]);
     expect(blocking.get("a")).toEqual({ holds: 0, urgency: 3 });
     expect(blocking.get("c")).toEqual({ holds: 1, urgency: KANBAN_BACKLOG });
+  });
+});
+
+const decodeBoard = Schema.decodeUnknownSync(KanbanBoard);
+
+describe("kanbanBoardIcon", () => {
+  const opus = { instanceId: "opencode", model: "opus/claude-opus-5-5" };
+  const stored = {
+    id: "board-toy",
+    slug: "toy",
+    name: "Toy",
+    defaultProjectId: null,
+    managerModel: opus,
+    evaluatorModel: opus,
+    defaultCardModel: opus,
+    reviewChains: [],
+    defaultReviewChain: null,
+    instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+    createdAt: "2026-10-27T00:00:00.000Z",
+    archivedAt: null,
+  };
+
+  it("reads a board saved before icons as having none, and drops names it doesn't know", () => {
+    expect(kanbanBoardIcon(decodeBoard(stored))).toBeNull();
+    expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "rocket" }))).toBe("rocket");
+    expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
   });
 });

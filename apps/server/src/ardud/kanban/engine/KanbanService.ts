@@ -6,6 +6,8 @@ import {
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
   kanbanEvaluatorStep,
+  kanbanNeedsOwner,
+  kanbanOpenAsks,
   kanbanStepSubtasks,
   KanbanBoardId,
   KanbanCardId,
@@ -26,6 +28,7 @@ import {
   type KanbanGroup,
   type KanbanLink,
   type KanbanMessage,
+  type KanbanOwnerAsk,
   type KanbanParticipant,
   type KanbanPool,
   type KanbanStage,
@@ -53,6 +56,7 @@ import * as Stream from "effect/Stream";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
+import * as Asks from "./asks.ts";
 import * as Briefs from "./briefs.ts";
 import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
@@ -123,6 +127,7 @@ export type BoardPatch = Partial<
   Pick<
     KanbanBoard,
     | "name"
+    | "icon"
     | "defaultProjectId"
     | "managerModel"
     | "evaluatorModel"
@@ -208,6 +213,29 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly settleCard: (cardId: KanbanCard["id"]) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * Asks the owner a question on a card. A blocking ask holds the card in
+   * Needs Owner (a card thread's own card must be in Working); an async one
+   * leaves it where it is. Options make it a pick.
+   */
+  readonly askOwner: (
+    cardId: KanbanCard["id"],
+    input: {
+      readonly question: string;
+      readonly blocking: boolean;
+      readonly options?: ReadonlyArray<string> | undefined;
+    },
+    actor: KanbanActor,
+    role: Rules.MoveRole,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** Makes an open ask blocking, or drops it (the asker hears it was dropped). */
+  readonly changeAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    action: "block" | "drop",
+    actor: KanbanActor,
+    role: Rules.MoveRole,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
   /** Marks a subtask done, skipped (with why) or, for evaluators and the owner, open again. */
   readonly markSubtask: (
     cardId: KanbanCard["id"],
@@ -645,7 +673,8 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     bySelf: boolean,
     what: string,
-    paused = false,
+    /** Set to pause the card instead of dropping it: when it comes back. */
+    until: string | null = null,
   ) {
     const threadId = card.activeThreadId;
     if (threadId === null) return false;
@@ -666,7 +695,10 @@ const make = Effect.gen(function* () {
     yield* threads
       .send({
         threadId,
-        text: paused ? Briefs.pauseCardText(card, others) : Briefs.dropCardText(card, what, others),
+        text:
+          until !== null
+            ? Briefs.pauseCardText(card, what, until, others)
+            : Briefs.dropCardText(card, what, others),
       })
       .pipe(Effect.ignore);
     return true;
@@ -687,7 +719,12 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const leaving = card.activeThreadId !== null && !KANBAN_THREAD_STAGES.includes(to);
     const bySelf = role === "cardThread";
-    const kept = leaving ? yield* letGo(card, bySelf, `moved to ${to}`) : false;
+    // A card waiting on the owner comes back to its thread with the answer.
+    const kept = !leaving
+      ? false
+      : to === "needs_owner"
+        ? yield* letGo(card, bySelf, "waits on the owner's answer", "with the answer")
+        : yield* letGo(card, bySelf, `moved to ${to}`);
     // Pulled back to todo while its thread goes on with other cards: the
     // thread was told to drop it, so it starts fresh instead of rejoining.
     const base = leaving
@@ -696,20 +733,54 @@ const make = Effect.gen(function* () {
           workThreadId: kept && !bySelf && to === "todo" ? null : card.workThreadId,
         }
       : card;
-    const next: KanbanCard = {
+    const asked = options.question?.trim() || null;
+    let next: KanbanCard = {
       ...base,
       stage: to,
       movedAt: at,
       updatedAt: at,
-      question: to === "needs_owner" ? (options.question ?? card.question) : null,
+      question: to === "needs_owner" ? (asked ?? card.question) : null,
       reviewStep: card.stage === "working" && to === "needs_review" ? 0 : card.reviewStep,
     };
+    // The question becomes a blocking ask, unless it is one already (made blocking).
+    if (
+      to === "needs_owner" &&
+      asked !== null &&
+      !kanbanOpenAsks(card).some((ask) => ask.blocking && ask.text === asked)
+    ) {
+      next = Asks.addAsk(next, asked, true, actor, at);
+    }
+    // Moved out of Needs Owner without an answer: its blocking asks are over,
+    // and their askers hear it (a worker in its wake note when it is next).
+    const dropped =
+      card.stage === "needs_owner" && to !== "needs_owner"
+        ? kanbanOpenAsks(card).filter((ask) => ask.blocking && actorKey(ask.by) !== actorKey(actor))
+        : [];
+    if (card.stage === "needs_owner" && to !== "needs_owner") {
+      next = Asks.closeAsks(next, at, (ask) => ask.blocking);
+    }
+    const workerDropped = dropped.filter(
+      (ask) => ask.by._tag === "thread" && ask.by.threadId === next.workThreadId,
+    );
+    if (to === "todo" && workerDropped.length > 0) {
+      const texts = workerDropped.map((ask) => Asks.droppedText(next, ask, actor._tag === "owner"));
+      next = { ...next, wakeNote: [next.wakeNote, ...texts].filter(Boolean).join("\n\n") };
+    }
     yield* logEvent(next, actor, "moved", {
       fromStage: card.stage,
       toStage: to,
       body: options.note ?? null,
     });
     yield* saveCard(next);
+    for (const ask of dropped) {
+      if (ask.by._tag !== "evaluator" || !(yield* threads.view(ask.by.threadId))) continue;
+      yield* threads
+        .send({
+          threadId: ask.by.threadId,
+          text: Asks.droppedText(next, ask, actor._tag === "owner"),
+        })
+        .pipe(Effect.ignore);
+    }
     yield* kick;
     return next;
   });
@@ -1010,8 +1081,22 @@ const make = Effect.gen(function* () {
       const now = turn(after);
       if (actor._tag === "evaluator" || now === null) return;
       if (before !== null && now === turn(before)) return;
+      const text = Briefs.evaluatorStepText(after);
+      if (before === null) {
+        // New cards share one packets evaluator, so a script making twenty
+        // cards starts one thread, not twenty.
+        const open = yield* store.threadLinks({ boardId: after.boardId, open: true });
+        for (const link of open.toReversed()) {
+          if (link.role !== "evaluator" || link.purpose !== "packets") continue;
+          if (!(yield* threads.view(link.threadId))) continue;
+          yield* threads.send({ threadId: link.threadId, text });
+          return;
+        }
+        yield* startEvaluatorUnlocked(yield* boardOf(after.boardId), { kind: "packets" }, { text });
+        return;
+      }
       const discussion = yield* cardDiscussionUnlocked(after.id);
-      yield* toEvaluator(discussion, Briefs.evaluatorStepText(after), true);
+      yield* toEvaluator(discussion, text, true);
     },
     (effect, _before, after) =>
       effect.pipe(
@@ -1022,87 +1107,157 @@ const make = Effect.gen(function* () {
   );
 
   /**
-   * Owner (or script) text in a discussion reaches whoever owns it: the card's
-   * live thread, the card's work thread when it waits on the owner, else the
-   * discussion's evaluator. Only the owner answers a card's question; a script
-   * post never sends a waiting card back to work.
+   * The owner answers asks on a card (`which` picks them): they close, and
+   * each asker hears the answer once. A card waiting in Needs Owner with no
+   * blocking ask left goes back where it was. Its worker gets the answer as
+   * the wake note when it is back in todo and the question was the worker's,
+   * or anyone's but an evaluator's (often an approval, which goes to the
+   * evaluator instead). A `note` (a dropped ask) owes no reply. Returns the
+   * threads told and the discussion as it is now.
+   */
+  const answerAsks = Effect.fn("KanbanService.answerAsks")(function* (
+    discussion: KanbanDiscussion,
+    card: KanbanCard,
+    text: string,
+    which: (ask: KanbanOwnerAsk) => boolean,
+    /** Who answered when it isn't the owner (an evaluator dropping an ask): not told. */
+    answeredBy: KanbanActor = { _tag: "owner" },
+    note = false,
+  ) {
+    const at = yield* nowIso;
+    const open = kanbanOpenAsks(card);
+    const answered = open.filter(which);
+    let next = Asks.closeAsks(card, at, which);
+    let current = discussion;
+    const told = new Set<string>(
+      answeredBy._tag === "thread" || answeredBy._tag === "evaluator" ? [answeredBy.threadId] : [],
+    );
+    const unblock =
+      card.stage === "needs_owner" &&
+      Asks.openBlockingAsk(next) === undefined &&
+      (answered.some((ask) => ask.blocking) || !open.some((ask) => ask.blocking));
+    if (unblock) {
+      const asked = yield* askedBy(card);
+      const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
+      const back = asked?.fromStage ?? "todo";
+      const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
+      const workThread = card.workThreadId;
+      const wake =
+        workThread !== null &&
+        stage === "todo" &&
+        (asker?._tag !== "evaluator" ||
+          answered.some((ask) => ask.by._tag === "thread" && ask.by.threadId === workThread));
+      next = {
+        ...next,
+        stage,
+        question: null,
+        stalled: null,
+        wakeNote: wake ? text : next.wakeNote,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(next, answeredBy, "moved", {
+        fromStage: card.stage,
+        toStage: stage,
+        body: answeredBy._tag === "owner" ? "Owner replied" : "Question dropped",
+      });
+      if (wake && workThread !== null) {
+        current = withParticipant(
+          current,
+          { _tag: "thread", threadId: workThread },
+          "Worker",
+          note ? { lastReadSeq: current.lastSeq } : { lastReadSeq: current.lastSeq, owes: "asked" },
+        );
+        yield* saveDiscussion(current);
+        told.add(workThread);
+      }
+      if (asker?._tag === "evaluator" && !told.has(asker.threadId)) {
+        if (yield* threads.view(asker.threadId)) {
+          current = yield* deliver(current, asker, "Evaluator", asker.threadId, text, note);
+          told.add(asker.threadId);
+        } else {
+          current = yield* toEvaluator(current, text, note);
+          if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
+        }
+      }
+    } else if (next !== card) {
+      // Still waiting: the question shown is the blocking ask whose asker gets the answer.
+      const blocking = next.stage === "needs_owner" ? Asks.openBlockingAsk(next) : undefined;
+      next = { ...next, question: blocking?.text ?? next.question, updatedAt: at };
+    }
+    if (next !== card) yield* saveCard(next);
+    // The rest hear it where they are: a live asker directly, anyone else
+    // through the card discussion's evaluator.
+    for (const ask of answered) {
+      const by = ask.by;
+      // Whoever answers or drops their own question isn't told about it.
+      if (actorKey(by) === actorKey(answeredBy)) continue;
+      if (by._tag === "thread" || by._tag === "evaluator") {
+        if (told.has(by.threadId)) continue;
+        const role = by._tag === "evaluator" ? "Evaluator" : roleName(next.activeRole ?? "work");
+        const live =
+          by._tag === "thread"
+            ? by.threadId === next.activeThreadId
+            : (yield* threads.view(by.threadId)) !== null;
+        if (live) {
+          current = yield* deliver(current, by, role, by.threadId, text, note);
+          told.add(by.threadId);
+          continue;
+        }
+      } else if (told.size > 0) {
+        // The owner's own note: the card going back already carries the answer.
+        continue;
+      }
+      if (current.evaluatorThreadId !== null && told.has(current.evaluatorThreadId)) continue;
+      current = yield* toEvaluator(
+        current,
+        by._tag === "thread" ? Asks.passOnText(next, ask, text) : text,
+        note,
+      );
+      if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
+    }
+    if (unblock) yield* kick;
+    return { told, discussion: current, card: next };
+  });
+
+  /**
+   * Owner (or script) text in a discussion reaches whoever owns it. On a
+   * card, an owner reply answers its open asks (see `answerAsks`), and the
+   * card's live thread hears it too. Otherwise it goes to the card's live
+   * thread, else the discussion's evaluator. A pick passes `pick`: only those
+   * asks are answered, and the live thread hears it only when nobody did. A
+   * script post never sends a waiting card back to work.
    */
   const routeToOwnerAgent = Effect.fn("KanbanService.routeToOwnerAgent")(function* (
     discussion: KanbanDiscussion,
     text: string,
     from: "owner" | "script" = "owner",
+    pick?: (ask: KanbanOwnerAsk) => boolean,
   ) {
-    if (discussion.cardId !== null) {
-      const card = yield* cardOf(discussion.cardId);
-      const asked =
-        from === "owner" && card.stage === "needs_owner" ? yield* askedBy(card) : undefined;
-      if (asked !== undefined && asked.actor._tag === "evaluator") {
-        // An evaluator's question, often an approval: the card goes back where
-        // it was and the answer goes to the evaluator, not to the worker.
-        const at = yield* nowIso;
-        const back = asked.fromStage ?? "todo";
-        const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
-        const next: KanbanCard = {
-          ...card,
-          stage,
-          question: null,
-          stalled: null,
-          movedAt: at,
-          updatedAt: at,
-        };
-        yield* logEvent(next, { _tag: "owner" }, "moved", {
-          fromStage: card.stage,
-          toStage: stage,
-          body: "Owner replied",
-        });
-        yield* saveCard(next);
-        const asker = asked.actor;
-        if (asker._tag === "evaluator" && (yield* threads.view(asker.threadId))) {
-          yield* deliver(discussion, asker, "Evaluator", asker.threadId, text);
-        } else {
-          yield* toEvaluator(discussion, text);
-        }
-        yield* kick;
-        return;
+    let current = discussion;
+    if (current.cardId !== null) {
+      let card = yield* cardOf(current.cardId);
+      let told = new Set<string>();
+      if (from === "owner" && kanbanNeedsOwner(card)) {
+        const result = yield* answerAsks(current, card, text, pick ?? (() => true));
+        ({ told, discussion: current, card } = result);
       }
-      if (from === "owner" && card.stage === "needs_owner" && card.workThreadId !== null) {
-        const at = yield* nowIso;
-        const next: KanbanCard = {
-          ...card,
-          stage: "todo",
-          question: null,
-          stalled: null,
-          wakeNote: text,
-          movedAt: at,
-          updatedAt: at,
-        };
-        yield* logEvent(next, { _tag: "owner" }, "moved", {
-          fromStage: card.stage,
-          toStage: "todo",
-          body: "Owner replied",
-        });
-        yield* saveCard(next);
-        yield* saveDiscussion(
-          withParticipant(discussion, { _tag: "thread", threadId: card.workThreadId }, "Worker", {
-            lastReadSeq: discussion.lastSeq,
-            owes: "asked",
-          }),
-        );
-        yield* kick;
-        return;
-      }
+      if (pick && told.size > 0) return;
       if (card.activeThreadId !== null && card.activeRole !== null) {
-        yield* deliver(
-          discussion,
-          { _tag: "thread", threadId: card.activeThreadId },
-          roleName(card.activeRole),
-          card.activeThreadId,
-          text,
-        );
+        if (!told.has(card.activeThreadId)) {
+          yield* deliver(
+            current,
+            { _tag: "thread", threadId: card.activeThreadId },
+            roleName(card.activeRole),
+            card.activeThreadId,
+            text,
+          );
+        }
         return;
       }
+      if (told.size > 0) return;
     }
-    yield* toEvaluator(discussion, text);
+    yield* toEvaluator(current, text);
   });
 
   /** `route` false posts without passing it on: an owner's own question on his move. */
@@ -1535,6 +1690,7 @@ const make = Effect.gen(function* () {
           id: KanbanBoardId.make(`board-${slug}`),
           slug,
           name: input.name.trim() || slug,
+          icon: null,
           defaultProjectId: input.defaultProjectId,
           managerModel: Defaults.DEFAULT_MANAGER_MODEL,
           evaluatorModel: Defaults.DEFAULT_EVALUATOR_MODEL,
@@ -1608,6 +1764,20 @@ const make = Effect.gen(function* () {
       blockedBy: input.blockedBy ?? [],
       stalled: null,
       question: stage === "needs_owner" ? (input.question ?? null) : null,
+      asks:
+        stage === "needs_owner" && input.question?.trim()
+          ? [
+              {
+                id: "q1",
+                text: input.question.trim(),
+                blocking: true,
+                by: actor,
+                at,
+                seq: null,
+                closedAt: null,
+              },
+            ]
+          : [],
       reviewChain: input.reviewChain ?? null,
       reviewStep: 0,
       reviewRound: 0,
@@ -1656,7 +1826,8 @@ const make = Effect.gen(function* () {
       : input;
     const card = yield* insertCard(yield* draftCard(boardId, fields, actor), fields);
     if (packet) yield* evaluatorTurn(null, card, actor);
-    return card;
+    const ask = Asks.openBlockingAsk(card);
+    return ask ? yield* postAsk(card, ask, []) : card;
   });
 
   const createCard: KanbanServiceShape["createCard"] = (boardId, input, actor) =>
@@ -1885,7 +2056,7 @@ const make = Effect.gen(function* () {
     at: string,
   ) {
     if (next.priority !== KANBAN_BACKLOG || card.activeThreadId === null) return next;
-    yield* letGo(card, false, "was moved to the backlog", true);
+    yield* letGo(card, false, "was moved to the backlog", "when it leaves the backlog");
     const paused: KanbanCard = {
       ...release(next),
       stage:
@@ -2000,17 +2171,99 @@ const make = Effect.gen(function* () {
         const moved = yield* moveUnlocked(card, to, role, actor, options ?? {});
         yield* evaluatorTurn(card, moved, actor);
         if (to === "needs_review") return yield* syncPrs(moved);
-        if (to === "needs_owner" && options?.question?.trim()) {
-          const discussion = yield* cardDiscussionUnlocked(moved.id);
-          yield* postUnlocked(
-            discussion.id,
-            actor,
-            [{ _tag: "md", text: options.question.trim() }],
-            actor._tag !== "owner",
-          );
-          return yield* cardOf(moved.id);
+        const ask = Asks.openBlockingAsk(moved);
+        if (to === "needs_owner" && ask !== undefined && ask.seq === null) {
+          return yield* postAsk(moved, ask, []);
         }
         return moved;
+      }),
+    );
+
+  /** Posts an ask in the card's discussion (never routed: it's for the owner) and keeps its seq. */
+  const postAsk = Effect.fn("KanbanService.postAsk")(function* (
+    card: KanbanCard,
+    ask: KanbanOwnerAsk,
+    options: ReadonlyArray<string>,
+  ) {
+    const discussion = yield* cardDiscussionUnlocked(card.id);
+    const message = yield* postUnlocked(discussion.id, ask.by, Asks.askBlocks(ask, options), false);
+    const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, { seq: message.seq });
+    yield* saveCard(next);
+    return next;
+  });
+
+  /** A card thread acts only on the card it is running. */
+  const checkCardThread = (card: KanbanCard, actor: KanbanActor, role: Rules.MoveRole) =>
+    role === "cardThread" && (actor._tag !== "thread" || card.activeThreadId !== actor.threadId)
+      ? failWith("denied", `card #${card.number} is not assigned to this thread`)
+      : Effect.void;
+
+  const askOwner: KanbanServiceShape["askOwner"] = (cardId, input, actor, role) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        yield* checkCardThread(card, actor, role);
+        const question = input.question.trim();
+        if (!question) return yield* failWith("invalid", "an ask needs the question");
+        if (card.settledAt !== null) return yield* failWith("denied", "card is settled");
+        const at = yield* nowIso;
+        let next: KanbanCard;
+        if (!input.blocking) {
+          next = { ...Asks.addAsk(card, question, false, actor, at), updatedAt: at };
+          yield* logEvent(next, actor, "comment", { body: `Asked the owner: ${question}` });
+          yield* saveCard(next);
+        } else if (card.stage === "needs_owner") {
+          // Already waiting on the owner: one more question to answer.
+          next = { ...Asks.addAsk(card, question, true, actor, at), question, updatedAt: at };
+          yield* logEvent(next, actor, "comment", { body: `Asked the owner: ${question}` });
+          yield* saveCard(next);
+        } else {
+          next = yield* moveUnlocked(card, "needs_owner", role, actor, { question });
+          yield* evaluatorTurn(card, next, actor);
+        }
+        const ask = next.asks.at(-1);
+        return ask ? yield* postAsk(next, ask, input.options ?? []) : next;
+      }),
+    );
+
+  const changeAsk: KanbanServiceShape["changeAsk"] = (cardId, askId, action, actor, role) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        yield* checkCardThread(card, actor, role);
+        const ask = Asks.findOpenAsk(card, askId);
+        if (!ask) return yield* failWith("not-found", `open ask ${askId} on card #${card.number}`);
+        const at = yield* nowIso;
+        if (action === "drop") {
+          const discussion = yield* cardDiscussionUnlocked(card.id);
+          const fresh = yield* cardOf(card.id);
+          // Logged first: answerAsks saves the card, which tells the clients to re-read.
+          yield* logEvent(fresh, actor, "comment", { body: `Dropped ${ask.id}: ${ask.text}` });
+          const result = yield* answerAsks(
+            discussion,
+            fresh,
+            Asks.droppedText(fresh, ask, actor._tag === "owner"),
+            (open) => open.id === ask.id,
+            actor,
+            true,
+          );
+          return result.card;
+        }
+        if (ask.blocking) return yield* failWith("invalid", `${ask.id} already blocks the card`);
+        const blocking = Asks.updateAsk(card, ask.id, { blocking: true });
+        if (card.stage === "needs_owner") {
+          const question = Asks.openBlockingAsk(blocking)?.text ?? ask.text;
+          const next = { ...blocking, question, updatedAt: at };
+          yield* logEvent(next, actor, "comment", { body: `Made ${ask.id} blocking` });
+          yield* saveCard(next);
+          return next;
+        }
+        const next = yield* moveUnlocked(blocking, "needs_owner", role, actor, {
+          question: ask.text,
+          note: `Made ${ask.id} blocking`,
+        });
+        yield* evaluatorTurn(card, next, actor);
+        return next;
       }),
     );
 
@@ -2246,7 +2499,8 @@ const make = Effect.gen(function* () {
           return card;
         }
         const next: KanbanCard = {
-          ...card,
+          // Woken out of Needs Owner: the wake text stands in for the answer.
+          ...Asks.closeAsks(card, at, (ask) => ask.blocking && card.stage === "needs_owner"),
           stage: card.stage === "needs_review" ? "needs_review" : "todo",
           stalled: null,
           question: null,
@@ -2361,9 +2615,30 @@ const make = Effect.gen(function* () {
         yield* publish(discussion.boardId, { _tag: "message", message: next });
         if (by._tag !== "owner") return next;
         const text = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${picked.map((option) => option.label).join(", ")}`;
+        const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
+        // A pick on an ask answers that ask alone.
+        const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
+        if (card !== null && ask !== undefined && ask.closedAt === null) {
+          yield* routeToOwnerAgent(discussion, text, "owner", (open) => open.id === ask.id);
+          return next;
+        }
+        if (card !== null && ask !== undefined) {
+          // Already answered or dropped: its asker hears the late pick, and nothing else closes.
+          const by = ask.by;
+          if (by._tag === "thread" && by.threadId === card.activeThreadId) {
+            yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, text);
+          } else if (by._tag === "evaluator" && (yield* threads.view(by.threadId))) {
+            yield* deliver(discussion, by, "Evaluator", by.threadId, text);
+          } else {
+            yield* toEvaluator(
+              discussion,
+              by._tag === "thread" ? Asks.passOnText(card, ask, text) : text,
+            );
+          }
+          return next;
+        }
         // A pick on a card waiting on the owner answers it like a reply does.
-        const waiting =
-          discussion.cardId !== null && (yield* cardOf(discussion.cardId)).stage === "needs_owner";
+        const waiting = card !== null && card.stage === "needs_owner";
         const author = message.author;
         if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
           const view = yield* threads.view(author.threadId);
@@ -2487,6 +2762,8 @@ const make = Effect.gen(function* () {
     flagCard,
     settleCard,
     markSubtask,
+    askOwner,
+    changeAsk,
     reviewResult,
     cardThread,
     setPool,
