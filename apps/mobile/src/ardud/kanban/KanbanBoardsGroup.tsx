@@ -71,9 +71,14 @@ function BoardBadge(props: {
 function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen: () => void }) {
   const { board, needsOwner: owner, running, unread } = props.summary;
   const name = board.name;
+  const parts = [
+    name,
+    ...(unread > 0 ? [`${unread} unread messages`] : []),
+    ...(owner > 0 ? [`${owner} questions for you`] : []),
+  ];
   return (
     <Row
-      accessibilityLabel={owner > 0 ? `${name}, ${owner} need you` : name}
+      accessibilityLabel={parts.join(", ")}
       onPress={props.onOpen}
       className="items-center"
     >
