@@ -47,6 +47,9 @@ commerce order minutes --sku SKU --quantity 1 --cvv-from-keychain --label "minut
 commerce order main --sku-config SKU_CONFIG --quantity 2 --label "main <item> x2"
 commerce order nownow --product-code P --store-code S --quantity 1 --label "nownow <item> x1"
 commerce order supermall --sku-config SKU_CONFIG --quantity 1 --label "supermall <item> x1"
+commerce cart minutes show
+commerce cart minutes set --items-file basket.json --expect-hash HASH
+commerce order minutes --items-file basket.json --use-current-cart --prepare-only
 commerce order minutes --items-file basket.json --prepare-only
 commerce order minutes --items-file basket.json --resume-flow FLOW_UUID --cvv-from-keychain
 commerce order talabat --vertical restaurants --branch BRANCH_ID --items-file basket.json \
