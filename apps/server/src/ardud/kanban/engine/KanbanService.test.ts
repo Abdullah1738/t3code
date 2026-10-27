@@ -1426,3 +1426,39 @@ it.effect("new cards from a script share one packets evaluator", () =>
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("the owner's reply in an evaluator's discussion goes to that evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, {
+        kind: "setup",
+        text: "Set the board up",
+      });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+
+      const opened = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+      assert.strictEqual(opened.evaluatorThreadId, setup);
+      yield* kanban.post(opened.id, evaluator, [{ _tag: "md", text: "Here is the plan" }]);
+      yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Sounds good" }]);
+
+      const current = yield* kanban.discussion(opened.id);
+      assert.strictEqual(current.evaluatorThreadId, setup);
+      const all = [...(yield* Ref.get(fake.threads)).entries()];
+      assert.strictEqual(all.filter(([, view]) => view.title.startsWith("Evaluator")).length, 1);
+      assert.include(all.find(([id]) => id === setup)![1].messages.at(-1) ?? "", "Sounds good");
+
+      // An owner's discussion with no evaluator yet belongs to the first one that speaks.
+      const channel = yield* kanban.createDiscussion(board.id, "Later", owner);
+      yield* kanban.post(channel.id, evaluator, [{ _tag: "md", text: "Picking this up" }]);
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, setup);
+
+      // A card's discussion keeps its own evaluator, which knows the card.
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const cardTalk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(cardTalk.id, evaluator, [{ _tag: "md", text: "A note on #1" }]);
+      assert.isNull((yield* kanban.discussion(cardTalk.id)).evaluatorThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

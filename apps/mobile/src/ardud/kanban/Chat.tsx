@@ -222,7 +222,8 @@ function MessageView(props: {
   if (message.author._tag === "owner") {
     return (
       <View className="max-w-[86%] gap-1 self-end">
-        <View className="gap-2 rounded-[18px] rounded-br-[6px] bg-card px-3.5 py-2.5">
+        {/* user-bubble, as in a thread: card is the screen colour in some themes. */}
+        <View className="gap-2 rounded-[18px] rounded-br-[6px] bg-user-bubble px-3.5 py-2.5">
           {blocks}
         </View>
         <Text className="self-end px-1 text-[12px] text-foreground-muted">{time}</Text>
@@ -276,7 +277,13 @@ function BlockView(props: {
   const { block } = props;
   switch (block._tag) {
     case "md":
-      return <MarkdownText text={block.text} maxLines={MESSAGE_LINES} />;
+      return (
+        <MarkdownText
+          text={block.text}
+          maxLines={MESSAGE_LINES}
+          tone={props.message.author._tag === "owner" ? "user" : "screen"}
+        />
+      );
     case "collapse":
       return <Collapse title={block.title} text={block.text} />;
     case "html":
@@ -464,6 +471,11 @@ function ChoiceBlock(props: {
           );
         })}
       </View>
+      {locked ? (
+        <Text className="text-[12px] text-foreground-muted">
+          {view.mine.length > 0 ? "Answer sent" : "Sending…"}
+        </Text>
+      ) : null}
       {multiPick && !locked ? (
         <Pressable
           accessibilityRole="button"

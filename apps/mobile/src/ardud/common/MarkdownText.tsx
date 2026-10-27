@@ -11,6 +11,7 @@ import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-cont
 
 import { useMarkdownPreviewStyles } from "../../features/files/FileMarkdownPreview";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { markdownGapBefore } from "../../native/markdownSpacing";
 import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { usePairedEnvironmentId } from "./environment";
@@ -29,9 +30,36 @@ function useOpenMarkdownLink(before?: () => void) {
   };
 }
 
-/** Markdown folded to `maxLines`; long text opens in a full-screen reader. */
-export function MarkdownText(props: { readonly text: string; readonly maxLines: number | null }) {
+/** The preview colours sit on the screen; the owner's bubble has its own, as in a thread. */
+function useTextStyle(tone: "screen" | "user") {
   const styles = useMarkdownPreviewStyles();
+  const theme = useUniwindTheme();
+  if (tone === "screen") return styles.nativeTextStyle;
+  const body = theme["--color-user-bubble-foreground"];
+  return {
+    ...styles.nativeTextStyle,
+    color: body,
+    strongColor: body,
+    mutedColor: body,
+    linkColor: body,
+    inlineCodeColor: theme["--color-user-bubble-foreground-muted"],
+    codeColor: theme["--color-md-user-code-text"],
+    codeBackgroundColor: theme["--color-md-user-code-bg"],
+    codeBlockBackgroundColor: theme["--color-md-user-fence-bg"],
+    fileTextColor: body,
+    skillTextColor: body,
+    quoteMarkerColor: body,
+    dividerColor: body,
+  };
+}
+
+/** Markdown folded to `maxLines`; long text opens in a full-screen reader. */
+export function MarkdownText(props: {
+  readonly text: string;
+  readonly maxLines: number | null;
+  readonly tone?: "screen" | "user";
+}) {
+  const textStyle = useTextStyle(props.tone ?? "screen");
   const [unfolded, setUnfolded] = useState(false);
   const [reading, setReading] = useState(false);
   const openMarkdownLink = useOpenMarkdownLink();
@@ -45,7 +73,7 @@ export function MarkdownText(props: { readonly text: string; readonly maxLines: 
   );
   if (props.text.trim() === "") return null;
   // The native markdown view can't clamp lines, so a capped block clips its height.
-  const cap = props.maxLines === null ? null : props.maxLines * styles.nativeTextStyle.lineHeight;
+  const cap = props.maxLines === null ? null : props.maxLines * textStyle.lineHeight;
   const fold = viewMarkdownFold({
     chars: props.text.length,
     cut: preview.cut,
@@ -56,17 +84,18 @@ export function MarkdownText(props: { readonly text: string; readonly maxLines: 
   return (
     <View>
       {/* Clips even when open: a document pulls its leading heading's margin
-          up, and the native view must not catch touches above the block. */}
-      <View
-        className="overflow-hidden"
-        style={{ maxHeight: cap === null || open ? undefined : cap }}
-      >
+          up, and the native view must not catch touches above the block.
+          "scroll", not "hidden": Yoga hands a non-scrolling parent's
+          maxHeight down as the child's measure limit, so the text below
+          would measure no taller than the cap and Show all never shows.
+          It still clips, and nothing here scrolls. */}
+      <View style={{ overflow: "scroll", maxHeight: cap === null || open ? undefined : cap }}>
         {/* Lays out at full height inside the clip, which is how overflow
             shows. Measured open too, so a width or text change refolds. */}
         <View onLayout={(event) => setHeight(event.nativeEvent.layout.height)}>
           <SelectableMarkdownText
             markdown={open ? props.text : preview.text}
-            textStyle={styles.nativeTextStyle}
+            textStyle={textStyle}
             spacing="document"
             onLinkPress={openMarkdownLink}
           />
@@ -76,6 +105,7 @@ export function MarkdownText(props: { readonly text: string; readonly maxLines: 
         <View className="items-start">
           <LinkButton
             label={open ? "Show less" : "Show all"}
+            tone={props.tone}
             onPress={() => (fold === "reader" ? setReading(true) : setUnfolded(!open))}
           />
         </View>

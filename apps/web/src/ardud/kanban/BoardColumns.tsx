@@ -13,6 +13,7 @@ import {
 import type { KanbanStage } from "@t3tools/contracts";
 
 import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
 import { CardTile } from "./CardTile";
 import { GoalBar, Glyph, stageGlyph } from "./parts";
@@ -26,7 +27,15 @@ export function BoardColumns(props: {
   onOpenCard: (cardId: string) => void;
   onOpenGoal: (goalId: string) => void;
 }) {
-  const narrow = useMediaQuery("max-md");
+  // The board's own width decides, not the screen's: an iPad with the sidebar open
+  // is a wide screen with a narrow board.
+  const [width, setWidth] = useState<number | null>(null);
+  const narrowScreen = useMediaQuery("max-md");
+  const narrow = width === null ? narrowScreen : width < STAGE_GRID_MIN_WIDTH;
+  const measure = (element: HTMLDivElement) =>
+    observeResize(element, ([entry]) => {
+      if (entry) setWidth(entry.contentRect.width);
+    });
   const { state, filter } = props;
   const goals = activeGoals(state);
   const shownGoals = filter.goalId
@@ -34,7 +43,7 @@ export function BoardColumns(props: {
     : goals;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3.5">
+    <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
       {shownGoals.length > 0 ? (
         <div className="flex shrink-0 gap-2.5 overflow-x-auto pe-5 [scrollbar-width:none]">
           {shownGoals.map((entry) => (
@@ -68,6 +77,9 @@ export function BoardColumns(props: {
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
 
+// Four stage columns at their narrowest, the shipped column, Needs Owner and the gaps.
+const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 5 * 10;
+
 function StageGrid(props: ColumnsProps) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
   return (
@@ -75,7 +87,7 @@ function StageGrid(props: ColumnsProps) {
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
       <div className="flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto">
         {board.active.map((column) => (
-          <Column key={column.stage} column={column} className="min-w-44 flex-1">
+          <Column key={column.stage} column={column} className="min-w-32 flex-1">
             {column.cards.map((card) => (
               <CardTile
                 key={card.id}
@@ -152,7 +164,7 @@ function ShippedColumn(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   return (
-    <section aria-label="Shipped" className="flex min-h-0 w-44 shrink-0 flex-col">
+    <section aria-label="Shipped" className="flex min-h-0 w-40 shrink-0 flex-col xl:w-44">
       <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pb-3">
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">

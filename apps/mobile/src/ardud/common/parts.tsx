@@ -60,6 +60,8 @@ export function LinkButton(props: {
   readonly accessibilityLabel?: string;
   /** For a show/hide toggle. */
   readonly expanded?: boolean;
+  /** "user" inside the owner's bubble, whose fill can be the primary colour. */
+  readonly tone?: "screen" | "user";
 }) {
   return (
     <Pressable
@@ -76,7 +78,11 @@ export function LinkButton(props: {
       <Text
         className={cn(
           "text-[13px] font-t3-semibold",
-          props.disabled ? "text-foreground-muted" : "text-primary-text",
+          props.disabled
+            ? "text-foreground-muted"
+            : props.tone === "user"
+              ? "text-user-bubble-foreground"
+              : "text-primary-text",
         )}
       >
         {props.label}

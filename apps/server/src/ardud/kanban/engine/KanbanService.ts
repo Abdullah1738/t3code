@@ -897,6 +897,19 @@ const make = Effect.gen(function* () {
     return { ...discussion, participants };
   };
 
+  const adoptEvaluator = (
+    discussion: KanbanDiscussion,
+    evaluator: Extract<KanbanActor, { _tag: "evaluator" }>,
+  ): KanbanDiscussion =>
+    discussion.evaluatorThreadId !== null
+      ? discussion
+      : withParticipant(
+          { ...discussion, evaluatorThreadId: evaluator.threadId },
+          evaluator,
+          "Evaluator",
+          {},
+        );
+
   const saveDiscussion = Effect.fn("KanbanService.saveDiscussion")(function* (
     discussion: KanbanDiscussion,
   ) {
@@ -911,7 +924,7 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
   ) {
     const at = yield* nowIso;
-    const discussion: KanbanDiscussion = {
+    const opened: KanbanDiscussion = {
       id: KanbanDiscussionId.make(`disc-${uuid()}`),
       boardId,
       cardId,
@@ -932,6 +945,8 @@ const make = Effect.gen(function* () {
       createdAt: at,
       archivedAt: null,
     };
+    // The evaluator that opens a discussion is the one the owner's replies go to.
+    const discussion = actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
     yield* saveDiscussion(discussion);
     return discussion;
   });
@@ -1307,8 +1322,14 @@ const make = Effect.gen(function* () {
       createdAt: at,
     };
     yield* store.putMessage(message);
+    // A board discussion with no evaluator yet belongs to the first one that
+    // speaks in it. Card discussions keep starting their own, which knows the card.
+    const owned =
+      author._tag === "evaluator" && discussion.cardId === null
+        ? adoptEvaluator(discussion, author)
+        : discussion;
     const posted = withParticipant(
-      { ...discussion, lastSeq: message.seq, lastMessageAt: at },
+      { ...owned, lastSeq: message.seq, lastMessageAt: at },
       author,
       authorName,
       {
