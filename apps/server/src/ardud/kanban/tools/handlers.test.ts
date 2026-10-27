@@ -13,6 +13,9 @@ import { McpSchema, McpServer } from "effect/ai";
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadsLayer } from "../../../mcp/McpToolAccess.testkit.ts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ServerConfig from "../../../config.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
@@ -82,6 +85,9 @@ const fakeThreads = () => {
       interrupt: () => Effect.void,
     }),
   );
+  const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
+    prefix: "t3-kanban-tools-test-",
+  }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
   const layer = McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(liveThreadsLayer),
@@ -91,6 +97,7 @@ const fakeThreads = () => {
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(boardFilesLayer),
   );
   return { running, layer };
 };

@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -8,6 +9,8 @@ import * as TestClock from "effect/testing/TestClock";
 
 import { ProjectId, ThreadId, type KanbanActor, type ModelSelection } from "@t3tools/contracts";
 
+import * as ServerConfig from "../../../config.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
@@ -70,6 +73,11 @@ const makeFake = Effect.gen(function* () {
   return { threads, layer, interrupted, prs };
 });
 
+/** Board file storage (ServerConfig + FileSystem) that KanbanService now needs when built. */
+const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3-kanban-test-",
+}).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
+
 const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
@@ -77,6 +85,7 @@ const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(boardFilesLayer),
   );
 
 const owner: KanbanActor = { _tag: "owner" };
@@ -1611,6 +1620,7 @@ const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
         getById: () => Effect.succeed(Option.some({ workspaceRoot: "/repo" } as never)),
       }),
     ),
+    Layer.provideMerge(boardFilesLayer),
   );
 
 it.effect("an owner's channel gets a title from his first message, unless he named it", () =>

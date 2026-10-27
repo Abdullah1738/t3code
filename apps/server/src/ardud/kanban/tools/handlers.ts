@@ -437,7 +437,16 @@ const handlers = {
         );
         if (discussion.lastSeq > 0)
           yield* service.markRead(discussion.id, caller.actor, discussion.lastSeq);
-        return { discussion, messages };
+        // Agents open attachments by path; the id alone is not enough to read the file.
+        const withPaths = messages.map((message) => ({
+          ...message,
+          blocks: message.blocks.map((block) =>
+            block._tag === "attachment"
+              ? { ...block, path: service.attachmentPath(block.attachment) }
+              : block,
+          ),
+        }));
+        return { discussion, messages: withPaths };
       }),
     ),
   ),

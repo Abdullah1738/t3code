@@ -378,6 +378,9 @@ function BlockView(props: {
       );
     case "image":
       return <ImageBlock url={block.url} alt={block.alt} />;
+    // Composer and rendering for uploads come in the follow-up cards; until then, the name only.
+    case "attachment":
+      return <Text className="text-[14px] text-foreground-muted">{block.attachment.name}</Text>;
   }
 }
 

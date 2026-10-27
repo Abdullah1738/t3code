@@ -16,6 +16,7 @@ import {
   KanbanGoalId,
   type KanbanActor,
   type KanbanBlock,
+  type ChatAttachment,
   type KanbanBoard,
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
@@ -58,6 +59,9 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
 import * as Asks from "./asks.ts";
 import * as Briefs from "./briefs.ts";
+import { makeBoardAttachments } from "./attachments.ts";
+import * as ServerConfig from "../../../config.ts";
+import * as FileSystem from "effect/FileSystem";
 import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as Subtasks from "./subtasks.ts";
@@ -301,6 +305,8 @@ export interface KanbanServiceShape {
     id: KanbanDiscussion["id"],
     options?: { readonly afterSeq?: number; readonly limit?: number },
   ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanError>;
+  /** Absolute path an agent can open for a board attachment, or null. */
+  readonly attachmentPath: (attachment: ChatAttachment) => string | null;
   readonly post: (
     discussionId: KanbanDiscussion["id"],
     author: KanbanActor,
@@ -449,8 +455,18 @@ const fallbackTitle = (prompt: string) => {
   return first.length > 60 ? `${first.slice(0, 57).trimEnd()}...` : first || "Untitled";
 };
 
-/** Plain text of a message for agents. */
-export const blocksText = (blocks: ReadonlyArray<KanbanBlock>) =>
+const formatFileSize = (bytes: number) =>
+  bytes < 1024
+    ? `${bytes} B`
+    : bytes < 1024 * 1024
+      ? `${(bytes / 1024).toFixed(1)} KB`
+      : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+
+/** Plain text of a message for agents; `pathOf` gives an attachment's absolute path. */
+export const blocksText = (
+  blocks: ReadonlyArray<KanbanBlock>,
+  pathOf: (attachment: ChatAttachment) => string | null,
+) =>
   blocks
     .map((block) => {
       switch (block._tag) {
@@ -466,6 +482,13 @@ export const blocksText = (blocks: ReadonlyArray<KanbanBlock>) =>
           return `[card ${block.cardId}]`;
         case "image":
           return `[image${block.alt ? `: ${block.alt}` : ""}]`;
+        case "attachment": {
+          const { attachment } = block;
+          const path = pathOf(attachment) ?? "unavailable";
+          return attachment.type === "image"
+            ? `[image ${attachment.name}: ${path}]`
+            : `[file ${attachment.name}, ${formatFileSize(attachment.sizeBytes)}: ${path}]`;
+        }
       }
     })
     .join("\n\n");
@@ -478,6 +501,10 @@ const make = Effect.gen(function* () {
   const threads = yield* KanbanThreads;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const projects = yield* ProjectService.ProjectService;
+  const attachments = makeBoardAttachments(
+    yield* ServerConfig.ServerConfig,
+    yield* FileSystem.FileSystem,
+  );
   const scope = yield* Effect.scope;
 
   const lock = yield* Semaphore.make(1);
@@ -1421,16 +1448,22 @@ const make = Effect.gen(function* () {
     } else if (author._tag === "system") {
       authorName = "Board";
     }
+    // Board files are kept on purpose: nothing deletes them yet. Claimed paths
+    // are released if the message never gets stored.
+    const claim = yield* attachments.claim(discussion.boardId, blocks);
+    const storedBlocks = [...claim.blocks];
     const message: KanbanMessage = {
       discussionId,
       seq: discussion.lastSeq + 1,
       author,
       authorName,
-      blocks,
+      blocks: storedBlocks,
       answers: [],
       createdAt: at,
     };
-    yield* store.putMessage(message);
+    yield* store.putMessage(message).pipe(
+      Effect.onError(() => attachments.release(claim.claimedPaths)),
+    );
     // A board discussion with no evaluator yet belongs to the first one that
     // speaks in it. Card discussions keep starting their own, which knows the card.
     const owned =
@@ -1453,7 +1486,7 @@ const make = Effect.gen(function* () {
     yield* saveDiscussion(posted);
     yield* publish(discussion.boardId, { _tag: "message", message });
 
-    const text = blocksText(blocks);
+    const text = blocksText(storedBlocks, attachments.pathOf);
     if (author._tag === "owner" && (yield* wantsWrittenTitle(discussion))) {
       yield* forkDiscussionTitle(discussion.id, text);
     }
@@ -3046,6 +3079,7 @@ const make = Effect.gen(function* () {
     cardDiscussion: (cardId) => guard(cardDiscussionUnlocked(cardId)),
     messages: (id, options) => read(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
+    attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
     wiki: (boardId) => read(store.wiki(boardId)),

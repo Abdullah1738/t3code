@@ -227,6 +227,9 @@ function Block(props: {
           className="max-h-80 w-auto max-w-full rounded-xl object-contain"
         />
       );
+    // Composer and rendering for uploads come in the follow-up cards; until then, the name only.
+    case "attachment":
+      return <p className="text-sm text-(--m-muted)">{block.attachment.name}</p>;
     case "card": {
       const card = props.cards.get(block.cardId);
       if (!card) return <span className="text-(--m-muted)">Card</span>;

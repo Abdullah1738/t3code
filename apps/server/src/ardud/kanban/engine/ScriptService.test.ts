@@ -16,6 +16,9 @@ import {
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ServerConfig from "../../../config.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
@@ -35,6 +38,10 @@ const threads = Layer.succeed(
   }),
 );
 
+const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3-kanban-scripts-test-",
+}).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
+
 const testLayer = ScriptService.layer.pipe(
   Layer.provideMerge(KanbanService.layer),
   Layer.provideMerge(threads),
@@ -42,6 +49,7 @@ const testLayer = ScriptService.layer.pipe(
   Layer.provideMerge(Sqlite.layerMemory),
   Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
   Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+  Layer.provideMerge(boardFilesLayer),
 );
 
 const owner: KanbanActor = { _tag: "owner" };

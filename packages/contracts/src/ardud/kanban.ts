@@ -15,6 +15,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "../baseSchemas.ts";
+import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
 import { ModelSelection } from "../modelSelection.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
@@ -507,6 +508,10 @@ export const KanbanBlock = Schema.Union([
   }),
   Schema.TaggedStruct("card", { cardId: KanbanCardId }),
   Schema.TaggedStruct("image", { url: TrimmedNonEmptyString, alt: Schema.NullOr(Schema.String) }),
+  /** A file uploaded through the attachment store; the board keeps it under its own id. */
+  Schema.TaggedStruct("attachment", {
+    attachment: Schema.Union([ChatImageAttachment, ChatFileAttachment]),
+  }),
 ]);
 export type KanbanBlock = typeof KanbanBlock.Type;
 

@@ -533,6 +533,8 @@ export function blockText(block: KanbanBlock): string {
       return "Card";
     case "image":
       return block.alt ?? "Image";
+    case "attachment":
+      return block.attachment.name || (block.attachment.type === "image" ? "Image" : "File");
   }
 }
 
