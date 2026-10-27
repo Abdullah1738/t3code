@@ -46,6 +46,10 @@ class CardsTunnelTest(unittest.TestCase):
                            timeout=30)
         return r.returncode, r.stderr
 
+    def fails(self):
+        with open(os.path.join(self.home, ".local", "state", "cards-health", "fails")) as fh:
+            return fh.read().strip()
+
     def calls(self):
         if not os.path.exists(self.log):
             return []
@@ -72,6 +76,18 @@ class CardsTunnelTest(unittest.TestCase):
         self.set_up_tunnel()
         self.assertEqual(self.script("cards-health")[0], 0)
         self.assertEqual(self.calls(), ["curl https://cards.abdullah.fund/healthz"])
+
+    def test_broken_card_page_is_not_reported_healthy(self):
+        # spectrum-bridge's /healthz returns 503 when a live share's page is gone. curl -f turns that into a failure,
+        # so the failure counter must climb and the tunnel is restarted, instead of resetting to zero as healthy.
+        self.set_up_tunnel()
+        self.script("cards-health", public=22)
+        self.assertEqual(self.fails(), "1")
+        self.script("cards-health", public=22)
+        calls = self.calls()
+        self.assertIn("kickstart", " ".join(calls))
+        self.assertTrue(any(c.startswith("notify") and "Card links are down" in c for c in calls))
+        self.assertEqual(self.fails(), "2")
 
     def test_down_link_restarts_the_tunnel_alerts_once_then_says_its_back(self):
         self.set_up_tunnel()
