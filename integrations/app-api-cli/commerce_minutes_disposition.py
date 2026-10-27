@@ -20,6 +20,11 @@ DEAD_STATUSES = ('failed', 'cancelled')
 # Any of these in the intent's transaction status means money may have moved.
 MONEY_MOVED = re.compile(r'CAPTUR|AUTHORI[SZ]|SETTL|REFUND|CHARGE')
 TERMINAL_PAYMENT_STATUSES = ('payment_failed', 'payment_error')
+# A failure label alone is not finality: noon's fixtures show failed-looking intents still
+# carrying CREATED / 3DS_ENROLL_INITIATED transactions. Only transaction statuses noon
+# has been observed to finalise as a non-capture may close a flow. None observed yet, so
+# the fence holds by default until a real terminal failure fixture is captured.
+TERMINAL_NO_CAPTURE_TXNS = ()
 
 
 def _wire_hash(value):
@@ -49,7 +54,9 @@ def failed_uncaptured_evidence(order_snap, active, intent, *, order, reserved_mi
     # CREATED, 3DS enrol, ready-to-redirect) can still settle, so it keeps the flow fenced.
     require(pay.get('paid') is False and pay.get('state') == 'payment_failed'
             and pay.get('payment_status') in TERMINAL_PAYMENT_STATUSES
-            and pay.get('payment_status') != 'payment_confirmed'
+            and txn in TERMINAL_NO_CAPTURE_TXNS
+            and not pay.get('redirect_required')
+            and pay.get('error_code') in (None, '0')
             and not MONEY_MOVED.search(txn)
             and pay.get('authorized_minor') == 0 and pay.get('captured_minor') == 0,
             'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED')

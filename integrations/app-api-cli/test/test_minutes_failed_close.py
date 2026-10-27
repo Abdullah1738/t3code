@@ -24,7 +24,7 @@ def order_snap(status='failed', total=Decimal('0.00'), echoed=ORDER, token='PRIV
     return m.Snapshot(wire, m.project_order_get(wire, ORDER), time.time())
 
 
-def intent(status='payment_failed', txn='FAILED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
+def intent(status='payment_failed', txn='VOIDED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
     wire = {'status': status, 'transaction_status': txn, 'reference': ORDER, 'error_code': None,
             'is_3ds_failure': False, 'authorized_amount': authorized, 'captured_amount': captured}
     return m.Snapshot(wire, m.project_payment_status(wire, ORDER, AMOUNT), time.time())
@@ -35,7 +35,7 @@ def order_wire(status='failed', total=Decimal('0.00'), token='PRIVATE-INTENT'):
             'paymentErrorMsg': 'payment failed', 'isPaymentSubscriptionUsed': False, 'success': True}
 
 
-def intent_wire(status='payment_failed', txn='FAILED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
+def intent_wire(status='payment_failed', txn='VOIDED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
     return {'status': status, 'transaction_status': txn, 'reference': ORDER, 'error_code': None,
             'is_3ds_failure': False, 'authorized_amount': authorized, 'captured_amount': captured, 'success': True}
 
@@ -45,11 +45,23 @@ def active(*orders):
             'count': len(orders), 'resend_allowed': False}
 
 
+STAND_IN_TERMINAL_TXN = 'VOIDED'  # test-only: production allowlist is empty until noon is observed
+
+
 class JournalCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         p = patch.object(j, 'ROOT', Path(temp.name).resolve() / 'commerce'); p.start(); self.addCleanup(p.stop)
+        # Positive-path tests need one terminal non-capture transaction; production has none yet.
+        for mod in (j, d):
+            names = 'MINUTES_TERMINAL_NO_CAPTURE_TXNS' if mod is j else 'TERMINAL_NO_CAPTURE_TXNS'
+            q = patch.object(mod, names, (STAND_IN_TERMINAL_TXN,)); q.start(); self.addCleanup(q.stop)
         j.open_flow(flow_id=FLOW, app='noon', vertical='minutes', account_hash=ACCOUNT, scope_hash='2' * 64)
+
+    def gate(self, snap=None, act=None, pay='default'):
+        return d.failed_uncaptured_evidence(snap or order_snap(), act or active(),
+                                            intent(txn=STAND_IN_TERMINAL_TXN) if pay == 'default' else pay,
+                                            order=ORDER, reserved_minor=AMOUNT)
 
     def placed(self, *, payment=True, payment_outcome='RESPONSE_RECEIVED'):
         j.consume(FLOW, 'sync', kind='cart', request_hash='3' * 64, cart_hash='4' * 64)
@@ -96,12 +108,38 @@ class JournalCloseTests(JournalCase):
         with self.assertRaises(j.JournalError):
             self.pay()
 
-    def test_fenced_payment_failed_flow_also_closes(self):
+    def test_fenced_payment_failed_flow_refuses_without_terminal_transaction(self):
+        # A failure label on the intent is not finality; with no terminal transaction the fence holds.
         self.placed(payment_outcome='PAYMENT_FAILED')
         local = j.inspect(FLOW)
         self.assertEqual(local['state'], 'FENCED')
-        self.assertEqual(j.close_minutes_failed_uncaptured(FLOW, evidence=self.evidence(),
-                         expected_local=local, now=self.later())['state'], 'RELEASED')
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+            d.failed_uncaptured_evidence(order_snap(), active(), intent(txn='CREATED'), order=ORDER, reserved_minor=AMOUNT)
+        self.assertEqual(j.inspect(FLOW)['state'], 'FENCED')
+
+    def test_failure_label_with_live_or_missing_transaction_refuses(self):
+        cases = [intent(status='payment_failed', txn='CREATED'),
+                 intent(status='payment_failed', txn='3DS_ENROLL_INITIATED'),
+                 intent(status='payment_failed', txn=None),
+                 intent(status='payment_error', txn='CREATED')]
+        for pay in cases:
+            with self.subTest(pay.wire), self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+                self.gate(pay=pay)
+
+    def test_live_redirect_refuses_even_with_failure_label(self):
+        wire = {'status': 'payment_failed', 'transaction_status': 'FAILED', 'reference': ORDER, 'error_code': None,
+                'is_3ds_failure': False, 'authorized_amount': Decimal('0.00'), 'captured_amount': Decimal('0.00'),
+                'redirect_url': 'https://3ds.example/redirect'}
+        pay = m.Snapshot(wire, m.project_payment_status(wire, ORDER, AMOUNT), time.time())
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+            self.gate(pay=pay)
+
+    def test_journal_rejects_forged_evidence_without_terminal_transaction(self):
+        self.placed(payment_outcome='PAYMENT_FAILED')
+        forged = self.evidence(intent_transaction_status='CREATED')
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_EVIDENCE_REQUIRED'):
+            j.close_minutes_failed_uncaptured(FLOW, evidence=forged, expected_local=j.inspect(FLOW), now=self.later())
+        self.assertEqual(j.inspect(FLOW)['state'], 'FENCED')
 
     def test_too_early_refuses(self):
         self.placed()
@@ -158,6 +196,9 @@ class JournalCloseTests(JournalCase):
 
 
 class EvidenceGateTests(unittest.TestCase):
+    def setUp(self):
+        q = patch.object(d, 'TERMINAL_NO_CAPTURE_TXNS', (STAND_IN_TERMINAL_TXN,)); q.start(); self.addCleanup(q.stop)
+
     def gate(self, snap=None, act=None, pay='default'):
         return d.failed_uncaptured_evidence(snap or order_snap(), act or active(),
                                             intent() if pay == 'default' else pay, order=ORDER, reserved_minor=AMOUNT)
