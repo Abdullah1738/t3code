@@ -1,6 +1,7 @@
 import Messages
 import UIKit
 import WebKit
+import os
 
 /// Opens the page a Robob card points at. The card's MSMessage.url is the whole
 /// payload, so the extension needs no storage, entitlements or network code of
@@ -17,13 +18,23 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }()
     private let note = UILabel()
     private let retry = UIButton(type: .system)
+    private let safari = UIButton(type: .system)
     private let spinner = UIActivityIndicatorView(style: .medium)
+    // Expanded view only: a bar under the page that always offers Safari, so a
+    // page the web view can't draw never leaves an empty sheet.
+    private let bar = UIView()
+    private let barSafari = UIButton(type: .system)
+    private var loadTimer: Timer?
+    private var crashReloads = 0
+    private static let loadTimeout: TimeInterval = 15
+    private static let log = Logger(subsystem: "com.abdullah.robob.cards", category: "card")
     // Compact (the app drawer) and transcript (the live bubble in the chat) are
     // previews; a tap anywhere asks Messages for the full-height view so the
     // page can be used. From the transcript Messages opens a new expanded
     // instance, which loads the same selected message.
     private let expandOverlay = UIControl()
     private var cardURL: URL?
+    private var barShown: NSLayoutConstraint!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -52,14 +63,38 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         retry.addTarget(self, action: #selector(reload), for: .touchUpInside)
         view.addSubview(retry)
 
+        safari.translatesAutoresizingMaskIntoConstraints = false
+        safari.setTitle("Open in Safari", for: .normal)
+        safari.titleLabel?.font = .preferredFont(forTextStyle: .headline)
+        safari.addTarget(self, action: #selector(openInSafari), for: .touchUpInside)
+        view.addSubview(safari)
+
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.backgroundColor = .secondarySystemBackground
+        view.addSubview(bar)
+        barSafari.translatesAutoresizingMaskIntoConstraints = false
+        barSafari.setTitle("Open in Safari", for: .normal)
+        barSafari.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
+        barSafari.addTarget(self, action: #selector(openInSafari), for: .touchUpInside)
+        bar.addSubview(barSafari)
+
         spinner.translatesAutoresizingMaskIntoConstraints = false
         spinner.hidesWhenStopped = true
         view.addSubview(spinner)
 
         let guide = view.safeAreaLayoutGuide
+        let pageBottom = webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        pageBottom.priority = .defaultLow
+        barShown = webView.bottomAnchor.constraint(equalTo: bar.topAnchor)
         NSLayoutConstraint.activate([
             webView.topAnchor.constraint(equalTo: view.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            pageBottom,
+            bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            barSafari.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
+            barSafari.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
+            barSafari.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -6),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             expandOverlay.topAnchor.constraint(equalTo: view.topAnchor),
@@ -71,9 +106,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
             note.topAnchor.constraint(equalTo: guide.topAnchor, constant: 24),
             retry.leadingAnchor.constraint(equalTo: note.leadingAnchor),
             retry.topAnchor.constraint(equalTo: note.bottomAnchor, constant: 12),
+            safari.leadingAnchor.constraint(equalTo: retry.trailingAnchor, constant: 24),
+            safari.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
             spinner.centerXAnchor.constraint(equalTo: guide.centerXAnchor),
             spinner.centerYAnchor.constraint(equalTo: guide.centerYAnchor),
         ])
+        bar.isHidden = true
         showNote("Tap a Robob card in this chat to open it here.", canRetry: false)
     }
 
@@ -94,7 +132,10 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     private func open(_ message: MSMessage?) {
-        guard let message else { return }
+        guard let message else {
+            Self.log.info("opened without a selected message")
+            return
+        }
         guard let url = message.url, Self.isCardPage(url) else {
             cardURL = nil
             showNote("This card has no secure link to open.", canRetry: false)
@@ -102,30 +143,49 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         }
         if url == cardURL, webView.url != nil { return }
         cardURL = url
+        crashReloads = 0
         load(url)
     }
 
     private func load(_ url: URL) {
+        Self.log.info("loading \(url.host ?? "-", privacy: .public)")
         note.isHidden = true
         retry.isHidden = true
+        safari.isHidden = true
         webView.isHidden = false
         spinner.startAnimating()
-        webView.load(URLRequest(url: url))
+        loadTimer?.invalidate()
+        loadTimer = Timer.scheduledTimer(withTimeInterval: Self.loadTimeout, repeats: false) { [weak self] _ in
+            Self.log.error("load timed out")
+            self?.showNote("This card is taking too long to load.", canRetry: true)
+        }
+        webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.loadTimeout))
     }
 
     private func layout(for style: MSMessagesAppPresentationStyle) {
         let preview = (style == .compact || style == .transcript) && cardURL != nil
         expandOverlay.isHidden = !preview
         webView.scrollView.isScrollEnabled = !preview
+        let showBar = style == .expanded && cardURL != nil
+        bar.isHidden = !showBar
+        barShown.isActive = showBar
     }
 
     private func showNote(_ text: String, canRetry: Bool) {
+        loadTimer?.invalidate()
+        loadTimer = nil
         spinner.stopAnimating()
         webView.isHidden = true
         expandOverlay.isHidden = true
         note.text = text
         note.isHidden = false
         retry.isHidden = !canRetry
+        safari.isHidden = cardURL == nil
+    }
+
+    @objc private func openInSafari() {
+        guard let url = webView.url ?? cardURL, Self.isCardPage(url) else { return }
+        extensionContext?.open(url)
     }
 
     @objc private func expand() {
@@ -133,6 +193,7 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     @objc private func reload() {
+        crashReloads = 0
         if let cardURL { load(cardURL) }
     }
 
@@ -167,7 +228,21 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Self.log.info("loaded")
+        loadTimer?.invalidate()
+        loadTimer = nil
         spinner.stopAnimating()
+    }
+
+    // The page's web process can be killed (memory pressure in the Messages
+    // sheet), which leaves an empty white view and calls no failure method.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Self.log.error("web content process ended")
+        guard let cardURL, crashReloads < 1 else {
+            return showNote("This card stopped loading. Try again or open it in Safari.", canRetry: true)
+        }
+        crashReloads += 1
+        load(cardURL)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -180,7 +255,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
 
     private func failed(_ error: Error) {
         // A cancelled load is a redirect or a link handed to the system, not a failure.
-        if (error as NSError).code == NSURLErrorCancelled { return spinner.stopAnimating() }
+        if (error as NSError).code == NSURLErrorCancelled {
+            loadTimer?.invalidate()
+            loadTimer = nil
+            return spinner.stopAnimating()
+        }
+        Self.log.error("load failed: \((error as NSError).code)")
         showNote("This card didn't load. Check your connection and try again.", canRetry: true)
     }
 }
