@@ -95,38 +95,41 @@ describe("subtask ids stay unique for the life of a card", () => {
     expect(second.subtaskSeq).toBe(7);
   });
 
-  it("keeps the counter across separate saves, so a drop in one save is not reused by the next", () => {
+  it("never reuses the highest id once it is dropped in an earlier save", () => {
     const first = planSubtasks([], flow);
     if (!first.ok) throw new Error(first.reason);
-    // Save 1: drop the open s4 and s5. Saved as its own edit, counter carried.
+    expect(first.subtasks.map((subtask) => subtask.id)).toContain("s6");
+    // Save 1: drop s6, the highest id, with nothing above it still on the card.
     const dropped = planSubtasks(
       first.subtasks,
       [
         { id: "s1", text: "Write the PR", owner: "work" },
         { id: "s2", text: "Review", owner: "review" },
         { id: "s3", text: "Merge and deploy", owner: "evaluator" },
-        { id: "s6", text: "Read back", owner: "evaluator" },
+        { id: "s4", text: "Tell the reporter", owner: "evaluator" },
+        { id: "s5", text: "Update linked tickets", owner: "evaluator" },
       ],
       first.subtaskSeq,
     );
     if (!dropped.ok) throw new Error(dropped.reason);
+    expect(dropped.subtasks.map((subtask) => subtask.id)).not.toContain("s6");
     expect(dropped.subtaskSeq).toBe(6);
-    // Save 2, a later edit: a new step must not take s4 or s5.
+    // Save 2, a later edit: the new step must not take the dropped s6.
     const added = planSubtasks(
       dropped.subtasks,
       [
         { id: "s1", text: "Write the PR", owner: "work" },
         { id: "s2", text: "Review", owner: "review" },
         { id: "s3", text: "Merge and deploy", owner: "evaluator" },
-        { id: "s6", text: "Read back", owner: "evaluator" },
+        { id: "s4", text: "Tell the reporter", owner: "evaluator" },
+        { id: "s5", text: "Update linked tickets", owner: "evaluator" },
         { text: "Ping the frontend owner", owner: "evaluator" },
       ],
       dropped.subtaskSeq,
     );
     if (!added.ok) throw new Error(added.reason);
     expect(added.subtasks.map((subtask) => subtask.id)).toContain("s7");
-    expect(added.subtasks.map((subtask) => subtask.id)).not.toContain("s4");
-    expect(added.subtasks.map((subtask) => subtask.id)).not.toContain("s5");
+    expect(added.subtasks.map((subtask) => subtask.id)).not.toContain("s6");
   });
 
   it("defaults to the highest id still on the card for a card saved without a counter", () => {

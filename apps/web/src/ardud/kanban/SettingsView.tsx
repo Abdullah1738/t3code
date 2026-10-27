@@ -291,6 +291,8 @@ function IconPicker(props: {
       {image ? (
         <button
           type="button"
+          disabled={props.disabled}
+          title={props.disabledReason}
           onClick={() => props.onImage(null)}
           className="h-9 rounded-lg px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
         >
