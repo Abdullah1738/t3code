@@ -259,6 +259,17 @@ def prepared_result(flow, prepared):
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 
+QUIET_NOT_OFFERED_NOTICE=("noon didn't offer leave at door for this cart; don't ring bell is on "
+                          "and the driver note asks to leave it at the door")
+
+
+def quiet_notice(review):
+    """Tell the requester when noon offered no leave-at-door toggle for this cart."""
+    if isinstance(review,dict) and review.get('quiet_codes_not_offered'):
+        return QUIET_NOT_OFFERED_NOTICE
+    return None
+
+
 def order_minutes(args):
     """Full paid Minutes E2E: guard, sync, quiet, review, place, pay, 3DS wait, track.
 
@@ -274,17 +285,23 @@ def order_minutes(args):
         print(json.dumps({'phase':'active_order_blocker',
                           'active_orders':guard.projection['active']}),flush=True)
         journal.fail('MINUTES_ACTIVE_ORDER_PRESENT')
+    extra=getattr(args,'driver_note_extra',None)
     if args.resume_flow:
-        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth)
+        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth,driver_note_extra=extra)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
     else:
-        flow=MinutesFlow(items=items,auth=auth)
+        flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
     try:
         prepared=flow.prepare_only()
         verified=prepared_result(flow,prepared)
         review=prepared['review']
         print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
+        notice=quiet_notice(review)
+        # The final result carries the same notice as the prepare-only result.
+        if notice:
+            verified={**verified,'quiet_notice':notice}
+            print(json.dumps({'flow_id':flow.flow_id,'phase':'quiet_notice','quiet_notice':notice}),flush=True)
         if args.prepare_only:
             return verified
         # Preparation never even loads the saved-card CVV. Read it only on the
@@ -323,6 +340,7 @@ def order_minutes(args):
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':placed['order'],
         'items':items,
+        **({'quiet_notice':notice} if notice else {}),
         'payable_minor':review['payable_minor'],
         'paid':{'payment_status':paid['payment_status'],
                 'transaction_status':paid['transaction_status'],
@@ -959,6 +977,8 @@ def main(argv=None):
     minutes_order.add_argument('--label',default='Noon Minutes order')
     minutes_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE preparation flow (exact cart readback; nothing re-sent)')
+    minutes_order.add_argument('--driver-note-extra',default=None,metavar='TEXT',
+        help='optional extra driver note (1-200 chars, no newlines) added after the quiet note')
     nownow_order=order_commands.add_parser('nownow',
         help='Authorized NowNow paid order E2E: guard, session, validate, saved-card, quiet, place, tracking')
     basket_arguments(nownow_order,'--product-code')
