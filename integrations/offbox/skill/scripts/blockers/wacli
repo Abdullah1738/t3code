@@ -1,7 +1,8 @@
 #!/bin/zsh
-# Agent-only WhatsApp send guard. Agents send through `wa draft` + `wa send --approved`,
-# which checks Abdullah's later OK on the exact text (owner rule 18 Oct 2026, nightly 22 Oct).
-# wa itself calls wacli by absolute path, so only direct agent calls land here.
+# Agent-only WhatsApp send guard. Raw wacli sends are refused so agents go through `wa`, which keeps a sent
+# record (and the stop/Bcc-style guards). Sending on their own is allowed; `wa draft` shows a preview where
+# Abdullah's OK makes sense (27 Oct 2026: tools suggest, they don't block). wa calls wacli by absolute path,
+# so only direct agent calls land here.
 emulate -L zsh
 setopt NO_UNSET
 typeset name=${0:t} shim=${0:A} blockers=${0:A:h} real='' candidate dir a
@@ -33,9 +34,9 @@ if [[ -n "${OPENCODE_SESSION_ID:-}" ]]; then
   if [[ ${words[1]:-} == send || ${words[2]:-} == send || $pair == "poll vote" \
         || $pair == (messages\ forward|messages\ edit|messages\ revoke) \
         || ( $pair == "messages delete" && $for_me == 0 ) ]]; then
-    print -u2 -- "Blocked: agents don't send WhatsApp with wacli directly (wacli $pair)."
-    print -u2 -- 'Draft it with `wa draft <jid> <text>` (or `wa draftfile`), show Abdullah the preview it prints,'
-    print -u2 -- 'and after his OK: `wa send --approved <id> --inbound <incoming message ID of his reply>` (whatsapp skill).'
+    print -u2 -- "Blocked: use wa for WhatsApp sends, not wacli directly (wacli $pair)."
+    print -u2 -- 'Use `wa send <jid> <text>` (or `wa sendfile`): it sends right away and keeps a sent record.'
+    print -u2 -- 'If Abdullah should see it first, `wa draft` prints a preview (whatsapp skill).'
     exit 2
   fi
 fi

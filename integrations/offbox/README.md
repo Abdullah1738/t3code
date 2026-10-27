@@ -17,8 +17,9 @@ backups), gate mode `~/.config/opencode/offbox-gate.json`, boat token under
 
 `skill/scripts/blockers/` goes first on every agent shell's PATH. Besides the
 `docker` guard it holds `wacli`, `himalaya` and `himalaya-heal`, which refuse
-sends so agents go through `wa` and `mailsend` (robob-watch helpers) and
-Abdullah's OK on the exact draft. Reads and drafts pass through.
+raw sends so agents go through `wa` and `mailsend` (robob-watch helpers). Those
+send right away and keep a sent record; they don't wait for Abdullah's OK.
+Reads and drafts pass through.
 
 ## Changing it
 
