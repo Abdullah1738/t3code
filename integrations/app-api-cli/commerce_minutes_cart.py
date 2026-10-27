@@ -63,18 +63,21 @@ class OutcomeUnverified(Exception):
     """Post-send cart failure: the send was consumed, the flow stays ACTIVE until the owner reconciles."""
     code = 'MINUTES_CART_SET_OUTCOME_UNVERIFIED'
 
-    def __init__(self, flow_id, cause):
+    def __init__(self, flow_id, cause, *, items_file=None, basket_hash=None):
         self.flow_id = flow_id
         self.cause = str(cause)[:120]
+        # The exact command for the send that was consumed: same basket file and its hash.
+        target = ('--items-file ' + str(items_file) if items_file else '--items-file BASKET_FILE') + \
+                 ' --expect-hash ' + (basket_hash or 'BASKET_HASH')
         self.details = {'flow_id': flow_id, 'cause': self.cause, 'cart_mutation_sent': True,
                         'financial_send': False,
                         'recovery': "run 'commerce cart minutes show' to read the cart, then "
-                                    "'commerce cart minutes reconcile --flow " + flow_id + " --expect-hash HASH' "
-                                    "with the basket's hash (refuses unless the readback matches)"}
+                                    "'commerce cart minutes reconcile --flow " + flow_id + ' ' + target +
+                                    "' with the same basket file that was set (refuses unless it matches the sent basket and the readback)"}
         super().__init__(self.code)
 
 
-def set_cart(rows, *, expect_hash, auth=None):
+def set_cart(rows, *, expect_hash, auth=None, items_file=None):
     m.require(isinstance(expect_hash, str) and expect_hash, 'MINUTES_CART_EXPECT_HASH_REQUIRED')
     queries = {row.get('sku'): row.get('catalog_query') for row in rows if isinstance(row, dict)}
     new_rows = m._skus(_rows(rows))
@@ -165,7 +168,8 @@ def set_cart(rows, *, expect_hash, auth=None):
                 raise refusal[0] from None
             raise
         # Consumed send, then a transport/receipt/cookie failure: the fence stays and nothing is retried.
-        raise OutcomeUnverified(flow_id, getattr(exc, 'code', None) or type(exc).__name__) from None
+        raise OutcomeUnverified(flow_id, getattr(exc, 'code', None) or type(exc).__name__,
+                                items_file=items_file, basket_hash=new_hash) from None
     try:
         after = readback_session(auth)
         m.require(_special_count(after.projection['lines']) == 0, 'MINUTES_CART_SET_VERIFY_MISMATCH')
@@ -173,7 +177,8 @@ def set_cart(rows, *, expect_hash, auth=None):
         j.abandon(flow_id)
     except Exception as exc:
         # The send was consumed: the fence stays. Fixed code plus recovery fields for the CLI.
-        raise OutcomeUnverified(flow_id, getattr(exc, 'args', ('',))[0]) from None
+        raise OutcomeUnverified(flow_id, getattr(exc, 'args', ('',))[0],
+                                items_file=items_file, basket_hash=new_hash) from None
     return {'ok': True, 'flow_id': flow_id, 'items': new_manifest,
             'cart_hash': new_hash, 'total_minor': result.projection.get('total_minor'),
             'cart_mutation_sent': True, 'financial_send': False}

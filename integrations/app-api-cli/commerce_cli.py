@@ -1062,7 +1062,8 @@ def main(argv=None):
             else:
                 if args.items_file is None or args.expect_hash is None:
                     journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')
-                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon)
+                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon,
+                                items_file=args.items_file)
         elif args.command=='clear-cart':
             if args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart

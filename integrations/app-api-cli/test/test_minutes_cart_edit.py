@@ -486,3 +486,44 @@ class ReceiptFailureRecoveryTests(CartTestBase):
         self.assertEqual(payload['error'], 'MINUTES_CART_RECONCILE_BASKET_NOT_SENT')
         self.assertNotEqual(j.inspect(exc.flow_id)['state'], 'RELEASED')
         self.assertEqual([x[0] for x in harness.calls], ['sync'])
+
+
+class EmittedRecoveryTests(ReceiptFailureRecoveryTests):
+    def test_following_emitted_recovery_command_closes_matching_flow_without_second_send(self):
+        import io, contextlib, json, re, shlex, tempfile as tf
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        after = lines_of([row('SKU_A', 2)])
+        harness = Harness([after])
+        real = m.MinutesCheckout
+        with tf.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump(self.SENT, f)
+        # Send through the CLI so the emitted recovery carries the real basket file path.
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur))]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(cart.j, 'observe', side_effect=j.JournalError('JOURNAL_DOWN')), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = commerce_cli.main(['cart', 'minutes', 'set', '--items-file', f.name, '--expect-hash', expect])
+        self.assertEqual(rc, 1)
+        failure = json.loads(out.getvalue().strip().splitlines()[-1])
+        flow_id = failure['flow_id']
+        self.assertEqual(len(harness.calls), 1)
+        # Follow the emitted instruction literally: the 'commerce cart minutes reconcile ...' text.
+        recovery = failure['recovery']
+        match = re.search(r"commerce (cart minutes reconcile .*?)' ", recovery)
+        self.assertIsNotNone(match, recovery)
+        argv = shlex.split(match.group(1))
+        self.assertEqual(argv[:3], ['cart', 'minutes', 'reconcile'])
+        # Recovery reads the cart after the failure; the readback now shows the sent basket.
+        out2 = io.StringIO()
+        with patch.object(cart, 'readback_session', return_value=snap(after)), \
+                contextlib.redirect_stdout(out2):
+            rc2 = commerce_cli.main(argv)
+        self.assertEqual(rc2, 0, out2.getvalue())
+        payload = json.loads(out2.getvalue().strip().splitlines()[-1])
+        self.assertFalse(payload['cart_mutation_sent'])
+        self.assertEqual(j.inspect(flow_id)['state'], 'RELEASED')
+        self.assertEqual(len(harness.calls), 1)  # reconcile never sends a second time
