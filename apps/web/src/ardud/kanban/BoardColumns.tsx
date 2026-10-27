@@ -18,6 +18,8 @@ import { cn } from "../../lib/utils";
 import { CardTile } from "./CardTile";
 import { GoalBar, Glyph, stageGlyph } from "./parts";
 
+const HIDE_SCROLLBAR = "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden";
+
 export function BoardColumns(props: {
   state: KanbanBoardState;
   nowMs: number;
@@ -45,7 +47,7 @@ export function BoardColumns(props: {
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
       {shownGoals.length > 0 ? (
-        <div className="flex shrink-0 gap-2.5 overflow-x-auto pe-5 [scrollbar-width:none]">
+        <div className={cn("flex shrink-0 gap-2.5 overflow-x-auto pe-5", HIDE_SCROLLBAR)}>
           {shownGoals.map((entry) => (
             <button
               key={entry.goal.id}
@@ -86,7 +88,7 @@ function StageGrid(props: ColumnsProps) {
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
-      <div className="flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto">
+      <div className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
         {board.active.map((column) => (
           <Column key={column.stage} column={column} className="min-w-32 flex-1">
             {column.cards.map((card) => (
@@ -112,7 +114,7 @@ function StageGrid(props: ColumnsProps) {
         className="me-5 mb-4 flex min-h-0 w-56 shrink-0 flex-col gap-2 xl:w-64"
       >
         <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto rounded-xl bg-(--m-warnband) p-2">
+        <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
           {board.owner.cards.length === 0 ? (
             <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
           ) : (
@@ -161,7 +163,7 @@ function Column(props: {
       {props.summary ? (
         <p className="px-1 pb-1 text-xs leading-snug text-(--m-muted)">{props.summary}</p>
       ) : null}
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pb-3">
+      <div className={cn("flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pb-3", HIDE_SCROLLBAR)}>
         {props.children}
       </div>
     </section>
@@ -175,7 +177,7 @@ function ShippedColumn(props: {
 }) {
   return (
     <section aria-label="Shipped" className="flex min-h-0 w-40 shrink-0 flex-col xl:w-44">
-      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pb-3">
+      <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pb-3", HIDE_SCROLLBAR)}>
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">
             <ColumnHeader label={column.label} count={column.cards.length} />
@@ -219,7 +221,7 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const groups = groupCards(props.state, props.group, props.nowMs, props.filter);
   if (groups.length === 0) return <p className="text-(--m-muted)">No cards.</p>;
   return (
-    <div className="flex min-h-0 flex-1 gap-2.5 overflow-x-auto">
+    <div className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
       {groups.map((group) => (
         <Column key={group.key} column={group} summary={group.summary} className="w-64 shrink-0">
           {group.cards.map((card) => (
@@ -247,7 +249,7 @@ function StageList(props: ColumnsProps) {
   const current = columns.find((column) => column.stage === stage) ?? columns[0];
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pe-4 pb-4">
+    <div className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pe-4 pb-4", HIDE_SCROLLBAR)}>
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
@@ -259,7 +261,7 @@ function StageList(props: ColumnsProps) {
       <div
         role="tablist"
         aria-label="Stage"
-        className="flex shrink-0 gap-1 overflow-x-auto [scrollbar-width:none]"
+        className={cn("flex shrink-0 gap-1 overflow-x-auto", HIDE_SCROLLBAR)}
       >
         {columns.map((column) => {
           const selected = column.stage === stage;
