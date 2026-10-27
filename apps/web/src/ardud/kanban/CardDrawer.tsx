@@ -13,7 +13,12 @@ import {
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanCard, KanbanCardEvent, KanbanStage } from "@t3tools/contracts";
+import {
+  KANBAN_WS_METHODS,
+  type KanbanCard,
+  type KanbanCardEvent,
+  type KanbanStage,
+} from "@t3tools/contracts";
 
 import {
   Menu,
@@ -29,7 +34,14 @@ import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
 import { PrGlyph } from "./CardTile";
 import { Chat, Composer } from "./Chat";
-import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from "./kanbanStore";
+import {
+  kanban,
+  kanbanErrorMessage,
+  runAction,
+  useCardDetail,
+  useFeed,
+  useKanbanPermission,
+} from "./kanbanStore";
 import { CopyLinkButton, KanbanMarkdown } from "./links";
 import { Chip, Glyph, LinkChip, Pri, priorityLabel, stageGlyph, Tabs } from "./parts";
 
@@ -75,6 +87,8 @@ export function CardDrawer(props: {
   const panelRef = useRef<HTMLElement>(null);
 
   const onClose = useStableCallback(props.onClose);
+  const canStop = useKanbanPermission(KANBAN_WS_METHODS.cardStop);
+  const canSettle = useKanbanPermission(KANBAN_WS_METHODS.cardSettle);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -161,6 +175,8 @@ export function CardDrawer(props: {
             ) : null}
             {card.activeThreadId ? (
               <QuietButton
+                disabled={!canStop}
+                title={canStop ? undefined : "Your connection can't stop cards"}
                 onClick={() =>
                   void runAction("Couldn't stop the card", () => kanban.stopCard(card.id))
                 }
@@ -171,6 +187,8 @@ export function CardDrawer(props: {
             {card.stage === "verified" && card.settledAt === null ? (
               <button
                 type="button"
+                disabled={!canSettle}
+                title={canSettle ? undefined : "Your connection can't settle cards"}
                 onClick={() =>
                   void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
                     (ok) => ok && props.onClose(),
@@ -268,6 +286,7 @@ function CardDiscussion(props: {
 }) {
   const { boardId, card, state } = props;
   const discussion = card.discussionId ? state.discussions.get(card.discussionId) : undefined;
+  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
 
   useEffect(() => {
     // The id is known but the list hasn't loaded it yet; the call returns the existing room.
@@ -297,6 +316,7 @@ function CardDiscussion(props: {
       <Composer
         placeholder="Message"
         attachments
+        blockedReason={canPost ? null : "Your connection can't post here"}
         onSend={async (blocks) => {
           setFirstPosting(true);
           const room = await kanban.cardDiscussion(boardId, card.id);
@@ -624,12 +644,19 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
   );
 }
 
-function QuietButton(props: { onClick: () => void; children: ReactNode }) {
+function QuietButton(props: {
+  onClick: () => void;
+  children: ReactNode;
+  disabled?: boolean;
+  title?: string | undefined;
+}) {
   return (
     <button
       type="button"
       onClick={props.onClick}
-      className="h-7.5 rounded-full px-2 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      disabled={props.disabled}
+      title={props.title}
+      className="h-7.5 rounded-full px-2 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"
     >
       {props.children}
     </button>
@@ -705,6 +732,7 @@ function ThreadList(props: {
 }
 
 function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEvent> }) {
+  const canComment = useKanbanPermission(KANBAN_WS_METHODS.cardPatch);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <ol className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto py-4">
@@ -724,6 +752,7 @@ function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEve
       </ol>
       <Composer
         placeholder="Comment"
+        blockedReason={canComment ? null : "Your connection can't comment on cards"}
         onSend={(blocks) => {
           const text = blocks.find((block) => block._tag === "md")?.text ?? "";
           return kanban.patchCard({ cardId: props.cardId as never, comment: text });
