@@ -1,5 +1,10 @@
-import { useIsFocused } from "@react-navigation/native";
-import type { KanbanBlock, KanbanMessage, KanbanParticipant } from "@t3tools/contracts";
+import { useIsFocused, useNavigation } from "@react-navigation/native";
+import type {
+  EnvironmentId,
+  KanbanBlock,
+  KanbanMessage,
+  KanbanParticipant,
+} from "@t3tools/contracts";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import {
   avatarOf,
@@ -49,7 +54,12 @@ import {
 } from "./logic";
 import { usePairedEnvironmentId } from "../common/environment";
 import { ComposerAttachmentButton } from "../../features/threads/ComposerAttachmentButton";
-import { pickComposerFiles, pickComposerMedia, type DraftComposerAttachment } from "../../lib/composerImages";
+import {
+  pickComposerFiles,
+  pickComposerMedia,
+  type DraftComposerAttachment,
+} from "../../lib/composerImages";
+import { releaseUnusedComposerAttachmentFiles } from "../../state/use-composer-drafts";
 import {
   prepareTurnAttachments,
   releasePendingAttachmentUploads,
@@ -422,6 +432,7 @@ function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttach
 
 function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) {
   const { attachment } = props;
+  const navigation = useNavigation();
   const environmentId = usePairedEnvironmentId();
   const isImage = attachment.type === "image";
   const resource = {
@@ -464,32 +475,30 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
       </>
     );
   }
+  // Files open on the attachment screen, which previews any type and shares the original.
   return (
-    <>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`Open ${attachment.name}`}
-        accessibilityValue={{ text: formatAttachmentSize(attachment.sizeBytes) }}
-        onPress={() =>
-          setPreview({
-            kind: "document",
-            name: attachment.name,
-            mimeType: attachment.mimeType,
-            environmentId,
-            resource,
-          })
-        }
-        className="min-h-10 max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen px-3 py-2"
-      >
-        <Text numberOfLines={1} className="shrink text-[14px] font-t3-medium text-foreground">
-          {attachment.name}
-        </Text>
-        <Text className="text-[12px] text-foreground-muted">
-          {formatAttachmentSize(attachment.sizeBytes)}
-        </Text>
-      </Pressable>
-      <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
-    </>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${attachment.name}`}
+      accessibilityValue={{ text: formatAttachmentSize(attachment.sizeBytes) }}
+      onPress={() =>
+        navigation.navigate("ThreadAttachment", {
+          environmentId: String(environmentId),
+          attachmentId: attachment.id,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          sizeBytes: String(attachment.sizeBytes),
+        })
+      }
+      className="min-h-10 max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen px-3 py-2"
+    >
+      <Text numberOfLines={1} className="shrink text-[14px] font-t3-medium text-foreground">
+        {attachment.name}
+      </Text>
+      <Text className="text-[12px] text-foreground-muted">
+        {formatAttachmentSize(attachment.sizeBytes)}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -841,11 +850,15 @@ function ImageBlock(props: { readonly url: string; readonly alt: string | null }
   );
 }
 
-/** A picked file on its way to the server. The chip shows it uploading until the server has it. */
+/**
+ * A picked file and its upload. The upload belongs to the chip: removing the chip or unmounting
+ * the composer aborts it, and a server id that comes back afterwards is released again.
+ */
 interface ComposerDraft {
   readonly local: DraftComposerAttachment;
   readonly uploaded: StoredAttachment | null;
   readonly failed: boolean;
+  readonly controller: AbortController;
 }
 
 function Composer(props: {
@@ -867,60 +880,74 @@ function Composer(props: {
   const canAttach = capabilities?.attachmentUploads === true;
   const maxFileBytes = capabilities?.fileAttachments?.maxUploadBytes;
   const uploading = drafts.some((draft) => draft.uploaded === null && !draft.failed);
+  const failing = drafts.some((draft) => draft.failed);
   const empty = text.trim().length === 0 && drafts.length === 0;
-  const blocked = empty || action.pending || uploading;
-  // The latest drafts, for the unmount cleanup, which runs once.
+  // A failed upload must be retried or removed first; sending around it would post a partial set.
+  const blocked = empty || action.pending || uploading || failing;
+
+  // Live drafts, read by the unmount cleanup, which runs once.
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
   const environmentRef = useRef(environmentId);
   environmentRef.current = environmentId;
+  // Set on unmount so a late upload result is released instead of landing in a gone component.
+  const mounted = useRef(true);
   useEffect(
     () => () => {
+      mounted.current = false;
       const id = environmentRef.current;
+      for (const draft of draftsRef.current) draft.controller.abort();
       const uploads = draftsRef.current.flatMap((draft) =>
         draft.uploaded === null ? [] : [draft.uploaded.id],
       );
       if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
+      void releaseUnusedComposerAttachmentFiles(draftsRef.current.map((draft) => draft.local));
     },
     [],
   );
 
+  const patch = (id: string, change: (draft: ComposerDraft) => ComposerDraft) =>
+    setDrafts((current) => current.map((draft) => (draft.local.id === id ? change(draft) : draft)));
+
+  const startUpload = (draft: ComposerDraft, environment: EnvironmentId) => {
+    const { local, controller } = draft;
+    void prepareTurnAttachments({
+      environmentId: environment,
+      attachments: [local],
+      supportsImageUploads: true,
+      signal: controller.signal,
+    })
+      .then((result) => {
+        const stored = result.status === "ready" ? result.attachments[0] : undefined;
+        const storedId = stored !== undefined && "id" in stored ? stored.id : undefined;
+        if (stored === undefined || storedId === undefined) throw new Error("Upload cancelled.");
+        if (controller.signal.aborted || !mounted.current) {
+          // Removed or unmounted while uploading: the server copy has no owner, so drop it.
+          void releasePendingAttachmentUploads(environment, [storedId]);
+          return;
+        }
+        patch(local.id, (current) => ({ ...current, uploaded: stored as StoredAttachment }));
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || !mounted.current) return;
+        patch(local.id, (current) => ({ ...current, failed: true }));
+        Dialog.alert(
+          "Couldn't attach file",
+          error instanceof Error ? error.message : "Try again.",
+        );
+      });
+  };
+
   const addPicked = (picked: ReadonlyArray<DraftComposerAttachment>) => {
     if (picked.length === 0 || environmentId === null) return;
-    setDrafts((current) => [
-      ...current,
-      ...picked.map((local) => ({ local, uploaded: null, failed: false })),
-    ]);
-    // Each file uploads as it is picked, so its chip can show progress and a removed one is released.
-    for (const local of picked) {
-      void prepareTurnAttachments({
-        environmentId,
-        attachments: [local],
-        supportsImageUploads: true,
-      })
-        .then((result) => {
-          const stored = result.status === "ready" ? result.attachments[0] : undefined;
-          if (stored === undefined) throw new Error("Upload cancelled.");
-          setDrafts((current) =>
-            current.map((draft) =>
-              draft.local.id === local.id
-                ? { ...draft, uploaded: stored as StoredAttachment }
-                : draft,
-            ),
-          );
-        })
-        .catch((error: unknown) => {
-          setDrafts((current) =>
-            current.map((draft) =>
-              draft.local.id === local.id ? { ...draft, failed: true } : draft,
-            ),
-          );
-          Dialog.alert(
-            "Couldn't attach file",
-            error instanceof Error ? error.message : "Try again.",
-          );
-        });
-    }
+    const fresh = picked.map((local) => ({
+      local,
+      uploaded: null,
+      failed: false,
+      controller: new AbortController(),
+    }));
+    setDrafts((current) => [...current, ...fresh]);
+    for (const draft of fresh) startUpload(draft, environmentId);
   };
 
   const pick = async (kind: "media" | "files") => {
@@ -932,12 +959,23 @@ function Composer(props: {
     if (result.error) Dialog.alert("Could not attach file", result.error);
   };
 
+  const retry = (id: string) => {
+    const draft = drafts.find((candidate) => candidate.local.id === id);
+    if (draft === undefined || environmentId === null) return;
+    const fresh = { ...draft, failed: false, controller: new AbortController() };
+    setDrafts((current) => current.map((other) => (other.local.id === id ? fresh : other)));
+    startUpload(fresh, environmentId);
+  };
+
   const removeDraft = (id: string) => {
     const removed = drafts.find((draft) => draft.local.id === id);
+    if (removed === undefined) return;
+    removed.controller.abort();
     setDrafts((current) => current.filter((draft) => draft.local.id !== id));
-    if (removed?.uploaded && environmentId !== null) {
+    if (removed.uploaded !== null && environmentId !== null) {
       void releasePendingAttachmentUploads(environmentId, [removed.uploaded.id]);
     }
+    void releaseUnusedComposerAttachmentFiles([removed.local]);
   };
 
   const send = () => {
@@ -956,6 +994,8 @@ function Composer(props: {
       })
       .then((sent) => {
         if (sent) {
+          // Sent: the local copies are kept only while a draft or queued send still needs them.
+          void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
           props.onSent();
           return;
         }
@@ -973,6 +1013,7 @@ function Composer(props: {
             <DraftChip
               key={draft.local.id}
               draft={draft}
+              onRetry={() => retry(draft.local.id)}
               onRemove={() => removeDraft(draft.local.id)}
             />
           ))}
@@ -1022,12 +1063,18 @@ function Composer(props: {
   );
 }
 
-/** A picked file as a removable chip: a thumbnail for pictures, the name and size otherwise. */
-function DraftChip(props: { readonly draft: ComposerDraft; readonly onRemove: () => void }) {
+/**
+ * A picked file as a removable chip: a thumbnail for pictures, the name and size otherwise. A
+ * failed upload stays as a chip that can be retried, so it is never silently dropped.
+ */
+function DraftChip(props: {
+  readonly draft: ComposerDraft;
+  readonly onRetry: () => void;
+  readonly onRemove: () => void;
+}) {
   const { local } = props.draft;
   const uploading = props.draft.uploaded === null && !props.draft.failed;
   const previewUri = "previewUri" in local ? local.previewUri : null;
-  const label = props.draft.failed ? "Failed" : uploading ? "Uploading…" : null;
   return (
     <View className="max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen py-1.5 pl-1.5 pr-1">
       {previewUri ? (
@@ -1043,9 +1090,23 @@ function DraftChip(props: { readonly draft: ComposerDraft; readonly onRemove: ()
           {local.name}
         </Text>
         <Text className="text-[11px] text-foreground-muted">
-          {label ?? formatAttachmentSize(local.sizeBytes)}
+          {props.draft.failed
+            ? "Failed"
+            : uploading
+              ? "Uploading…"
+              : formatAttachmentSize(local.sizeBytes)}
         </Text>
       </View>
+      {props.draft.failed ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Retry ${local.name}`}
+          onPress={props.onRetry}
+          className="h-7 justify-center rounded-full px-2"
+        >
+          <Text className="text-[12px] font-t3-medium text-foreground">Retry</Text>
+        </Pressable>
+      ) : null}
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Remove ${local.name}`}
