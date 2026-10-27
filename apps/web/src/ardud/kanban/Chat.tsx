@@ -6,6 +6,7 @@ import {
   useState,
   type ClipboardEvent,
   type DragEvent,
+  type ReactNode,
 } from "react";
 
 import {
@@ -161,7 +162,7 @@ const Message = memo(function Message(props: {
 }) {
   const { message } = props;
   const time = formatTimeOfDay(message.createdAt);
-  const blocks = message.blocks.map((block, index) => (
+  const renderBlock = (block: KanbanBlock, index: number) => (
     <Block
       key={blockKey(block, index)}
       block={block}
@@ -170,7 +171,28 @@ const Message = memo(function Message(props: {
       cards={props.cards}
       onOpenCard={props.onOpenCard}
     />
-  ));
+  );
+  // A run of attachments lays out as one wrapping row, not one per line.
+  const blocks: ReactNode[] = [];
+  for (let index = 0; index < message.blocks.length; ) {
+    const block = message.blocks[index]!;
+    if (block._tag !== "attachment") {
+      blocks.push(renderBlock(block, index));
+      index += 1;
+      continue;
+    }
+    const end = (() => {
+      let next = index;
+      while (next < message.blocks.length && message.blocks[next]!._tag === "attachment") next += 1;
+      return next;
+    })();
+    blocks.push(
+      <div key={`attachments:${index}`} className="flex flex-wrap items-start gap-2">
+        {message.blocks.slice(index, end).map((item, offset) => renderBlock(item, index + offset))}
+      </div>,
+    );
+    index = end;
+  }
 
   if (message.author._tag === "owner") {
     return (
@@ -547,27 +569,41 @@ export function Composer(props: {
   const [records, setRecords] = useState<ComposerDraftContextRecords>(
     EMPTY_COMPOSER_CONTEXT_RECORDS,
   );
-  const [files, setFiles] = useState<ReadonlyArray<ComposerDraftFile>>([]);
+  const [files, setFilesState] = useState<ReadonlyArray<ComposerDraftFile>>([]);
   const [sending, setSending] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const editorRef = useRef<ComposerPromptEditorHandle | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  // Mirror of `files` for the unmount cleanup, which must see the latest list.
+  // The draft as of the latest write. State lags a render behind, so overlapping
+  // paste/pick calls and the send snapshot read this instead.
   const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>([]);
+  // Slots reserved by addFiles calls that are still preparing their files.
+  const pendingSlotsRef = useRef(0);
+  const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
-  useEffect(() => {
-    filesRef.current = files;
-  }, [files]);
+
+  const setFiles = (
+    update: (current: ReadonlyArray<ComposerDraftFile>) => ReadonlyArray<ComposerDraftFile>,
+  ) => {
+    const next = update(filesRef.current);
+    filesRef.current = next;
+    setFilesState(next);
+  };
 
   // Uploads that were never sent are released when the composer goes away.
+  // A send in flight still owns its snapshot: unmounting mid-send (the card
+  // discussion swaps this composer for the chat once its room exists) must
+  // not delete files the post is about to claim.
+  const sendingDraft = useRef<ReadonlyArray<ComposerDraftFile>>([]);
   useEffect(() => {
     return () => {
       for (const file of filesRef.current) {
+        if (sendingDraft.current.some((entry) => entry.id === file.id)) continue;
         if (!sentIds.current.has(file.id)) releaseAttachmentUpload(file.id);
         revokePreview(file);
       }
     };
-  }, []);
+  }, [filesRef, sentIds, sendingDraft]);
 
   const addFiles = async (picked: File[]) => {
     if (!canAttach || environmentId === null || picked.length === 0) return;
@@ -578,45 +614,21 @@ export function Composer(props: {
     const next: ComposerDraftFile[] = [];
     let error: string | null = null;
     for (const raw of picked) {
-      if (files.length + next.length >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+      // Reserve the slot before any await, so overlapping calls count each other.
+      if (filesRef.current.length + pendingSlotsRef.current >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
         error = composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1);
         break;
       }
-      const file = normalizeComposerImageFileMimeType(raw);
-      const kind = classifyComposerAttachmentFile(file);
-      if (kind === "unsupported-image") {
-        error = `'${file.name}' is not a supported image type.`;
-        continue;
-      }
-      if (file.size > maxBytes) {
-        error = fileAttachmentTooLargeMessage(file.name, maxBytes);
-        continue;
-      }
-      if (kind === "image") {
-        const compressed = await prepareImageForAttachment(file, PROVIDER_SEND_TURN_MAX_IMAGE_BYTES);
-        if (!compressed.ok) {
-          error = `'${file.name}' is too large to attach, even after compression.`;
+      pendingSlotsRef.current += 1;
+      try {
+        const added = await prepareDraftFile(raw, maxBytes);
+        if (typeof added === "string") {
+          error = added;
           continue;
         }
-        const attachmentFile = compressed.file;
-        next.push({
-          type: "image",
-          id: randomUUID(),
-          name: attachmentFile.name || "image",
-          mimeType: attachmentFile.type,
-          sizeBytes: attachmentFile.size,
-          previewUrl: URL.createObjectURL(attachmentFile),
-          file: attachmentFile,
-        });
-      } else {
-        next.push({
-          type: "file",
-          id: randomUUID(),
-          name: file.name,
-          mimeType: file.type || "application/octet-stream",
-          sizeBytes: file.size,
-          file,
-        });
+        next.push(added);
+      } finally {
+        pendingSlotsRef.current -= 1;
       }
     }
     setAttachError(error);
@@ -650,43 +662,51 @@ export function Composer(props: {
 
   const send = async () => {
     const body = outgoing(text).trim();
-    if ((body.length === 0 && files.length === 0) || sending) return;
-    if (files.length > 0 && environmentId !== null) {
-      // Waiting here instead of sending early: the server only claims an upload
-      // that finished, so a half-uploaded file must not reach the message.
-      const ids = files.map((file) => file.id);
-      await awaitAttachmentUploads(ids);
-      const uploaded = getUploadedAttachments({ environmentId, images: files });
-      if (uploaded === null) {
-        setAttachError("Some files did not upload. Retry them or remove them.");
-        return;
+    // A ref, not state: a second Enter or click before the re-render must not
+    // start another send of the same draft.
+    if (sendingRef.current) return;
+    // Snapshot the draft now. Files added while this send is in flight are not
+    // part of this message and must survive it.
+    const draft = filesRef.current;
+    if (body.length === 0 && draft.length === 0) return;
+    sendingRef.current = true;
+    sendingDraft.current = draft;
+    setSending(true);
+    try {
+      let blocks: KanbanBlock[];
+      if (draft.length > 0 && environmentId !== null) {
+        // The server only claims an upload that finished, so a half-uploaded
+        // file must not reach the message.
+        await awaitAttachmentUploads(draft.map((file) => file.id));
+        const uploaded = getUploadedAttachments({ environmentId, images: draft });
+        if (uploaded === null) {
+          setAttachError("Some files did not upload. Retry them or remove them.");
+          return;
+        }
+        // Unknown attachment kinds never come from this composer, so they can't
+        // be posted as a block.
+        blocks = composerBlocks(body, uploaded.filter(isPostableAttachment));
+      } else {
+        blocks = composerBlocks(body, []);
       }
-      setSending(true);
-      // Unknown attachment kinds never come from this composer, so they can't
-      // be posted as a block.
-      const blocks = composerBlocks(
-        body,
-        uploaded.filter(isPostableAttachment),
-      );
       const ok = await runAction("Couldn't send", () => props.onSend(blocks));
-      setSending(false);
       if (!ok) return;
-      for (const file of files) {
+      const sentIdSet = new Set(draft.map((file) => file.id));
+      for (const file of draft) {
         sentIds.current.add(file.id);
         revokePreview(file);
       }
-      setFiles([]);
+      setFiles((current) => current.filter((file) => !sentIdSet.has(file.id)));
       setAttachError(null);
-    } else {
-      setSending(true);
-      const ok = await runAction("Couldn't send", () => props.onSend(composerBlocks(body, [])));
+      setText("");
+      setCursor(0);
+      setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
+      editorRef.current?.focus();
+    } finally {
+      sendingRef.current = false;
+      sendingDraft.current = [];
       setSending(false);
-      if (!ok) return;
     }
-    setText("");
-    setCursor(0);
-    setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
-    editorRef.current?.focus();
   };
 
   const onFilesPicked = (list: FileList | null) => {
@@ -829,6 +849,39 @@ export function Composer(props: {
 /** Unknown attachment kinds never come from this composer, so they can't be posted as a block. */
 function isPostableAttachment(attachment: ChatAttachment): attachment is ChatAttachmentBlock {
   return attachment.type === "image" || attachment.type === "file";
+}
+
+/**
+ * One picked file as a draft: images are compressed to the send limit, other
+ * files are staged as they are. Returns the error text when the file is refused.
+ */
+async function prepareDraftFile(raw: File, maxBytes: number): Promise<ComposerDraftFile | string> {
+  const file = normalizeComposerImageFileMimeType(raw);
+  const kind = classifyComposerAttachmentFile(file);
+  if (kind === "unsupported-image") return `'${file.name}' is not a supported image type.`;
+  if (file.size > maxBytes) return fileAttachmentTooLargeMessage(file.name, maxBytes);
+  if (kind === "image") {
+    const compressed = await prepareImageForAttachment(file, PROVIDER_SEND_TURN_MAX_IMAGE_BYTES);
+    if (!compressed.ok) return `'${file.name}' is too large to attach, even after compression.`;
+    const attachmentFile = compressed.file;
+    return {
+      type: "image",
+      id: randomUUID(),
+      name: attachmentFile.name || "image",
+      mimeType: attachmentFile.type,
+      sizeBytes: attachmentFile.size,
+      previewUrl: URL.createObjectURL(attachmentFile),
+      file: attachmentFile,
+    };
+  }
+  return {
+    type: "file",
+    id: randomUUID(),
+    name: file.name,
+    mimeType: file.type || "application/octet-stream",
+    sizeBytes: file.size,
+    file,
+  };
 }
 
 function revokePreview(file: ComposerDraftFile) {
