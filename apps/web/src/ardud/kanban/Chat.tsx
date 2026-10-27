@@ -547,6 +547,13 @@ const THREAD_LINK = /\[([^\]\n]*)\]\((t3-thread:\/\/v1\/[^\s)]+)\)/g;
 
 type ComposerDraftFile = ComposerImageAttachment | ComposerFileAttachment;
 
+/** One batch of files being prepared; `handed` once they reached the draft. */
+interface PendingPreparation {
+  readonly prep: Promise<void>;
+  readonly selected: number;
+  handed: boolean;
+}
+
 /**
  * Message box: Enter sends, Shift+Enter breaks the line. A pasted board link
  * turns into a chip, the same way thread links do in the thread composer.
@@ -587,9 +594,7 @@ export function Composer(props: {
   const pendingSlotsRef = useRef(0);
   // Preparations still running. A send waits for these before taking its snapshot,
   // so a file being compressed when Send is pressed is part of that message.
-  const pendingPrepsRef = useRef(
-    new Set<{ prep: Promise<void>; staged: ComposerDraftFile[]; selected: number }>(),
-  );
+  const pendingPrepsRef = useRef(new Set<PendingPreparation>());
   const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
   // Set after unmount, so a file still being prepared is released on arrival.
@@ -652,9 +657,9 @@ export function Composer(props: {
         pendingSlotsRef.current -= batch.length;
       }
     })();
-    // Registered with the files it selected: a send that waits on it knows which
-    // selection it depends on, and whether that selection was staged.
-    const entry = { prep, staged: next, selected: batch.length };
+    // Registered with the files it selected. `handed` is set only when these files
+    // reach the draft, so a send can tell a dropped selection from a staged one.
+    const entry: PendingPreparation = { prep, selected: batch.length, handed: false };
     pendingPrepsRef.current.add(entry);
     try {
       await prep;
@@ -662,11 +667,13 @@ export function Composer(props: {
       pendingPrepsRef.current.delete(entry);
     }
     // The composer went away while files were being prepared: nothing will
-    // ever own these, so release their previews now and start no uploads.
+    // ever own these, so release their previews now and start no uploads. The
+    // entry stays unhanded, which a waiting send reads as a lost selection.
     if (!mountedRef.current) {
       for (const file of next) revokePreview(file);
       return;
     }
+    entry.handed = true;
     setAttachError(error);
     if (next.length === 0) return;
     setFiles((current) => [...current, ...next]);
@@ -712,7 +719,7 @@ export function Composer(props: {
       await Promise.allSettled(selections.map((entry) => entry.prep));
       // A selection that did not stage is a file the user asked to send: refuse
       // to post without it, rather than sending the text alone.
-      const lost = selections.some((entry) => entry.staged.length < entry.selected);
+      const lost = selections.some((entry) => !entry.handed && entry.selected > 0);
       if (lost) {
         setAttachError("A selected file did not finish preparing. Attach it again.");
         return;
