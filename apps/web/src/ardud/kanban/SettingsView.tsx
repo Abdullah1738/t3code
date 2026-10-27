@@ -1,5 +1,5 @@
-import { MinusIcon, PlusIcon, RepeatIcon } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon } from "lucide-react";
+import { useRef, useState, type ReactNode } from "react";
 
 import {
   modelName,
@@ -9,6 +9,7 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import {
   KANBAN_BOARD_ICONS,
+  KANBAN_BOARD_IMAGE_MAX,
   kanbanBoardIcon,
   type KanbanBoard,
   type KanbanBoardIcon,
@@ -27,6 +28,7 @@ import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
 import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction } from "./kanbanStore";
+import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
 
 const MAX_SLOTS = 8;
@@ -42,7 +44,11 @@ export function SettingsView(props: { state: KanbanBoardState }) {
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
       <Section title="Icon">
-        <IconPicker board={board} onChange={(icon) => update({ icon })} />
+        <IconPicker
+          board={board}
+          onChange={(icon) => update({ icon, iconImage: null })}
+          onImage={(iconImage) => update({ iconImage })}
+        />
       </Section>
       <Section title="Pools">
         {pools.map((pool) => (
@@ -163,11 +169,49 @@ export function SettingsView(props: { state: KanbanBoardState }) {
   );
 }
 
+const IMAGE_SIZE = 96;
+
+/** Squares and shrinks a picked file so it fits on the board record. */
+async function boardImage(file: File): Promise<string | null> {
+  const bitmap = await createImageBitmap(file).catch(() => null);
+  if (!bitmap) return null;
+  const side = Math.min(bitmap.width, bitmap.height);
+  const canvas = document.createElement("canvas");
+  canvas.width = IMAGE_SIZE;
+  canvas.height = IMAGE_SIZE;
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  context.drawImage(
+    bitmap,
+    (bitmap.width - side) / 2,
+    (bitmap.height - side) / 2,
+    side,
+    side,
+    0,
+    0,
+    IMAGE_SIZE,
+    IMAGE_SIZE,
+  );
+  bitmap.close();
+  for (const [type, quality] of [
+    ["image/webp", 0.9],
+    ["image/png", undefined],
+    ["image/jpeg", 0.85],
+  ] as const) {
+    const url = canvas.toDataURL(type, quality);
+    if (url.startsWith(`data:${type};`) && url.length <= KANBAN_BOARD_IMAGE_MAX) return url;
+  }
+  return null;
+}
+
 function IconPicker(props: {
   board: KanbanBoard;
   onChange: (icon: KanbanBoardIcon | null) => void;
+  onImage: (image: string | null) => void;
 }) {
-  const current = kanbanBoardIcon(props.board);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const image = props.board.iconImage;
+  const current = image ? undefined : kanbanBoardIcon(props.board);
   const option = (icon: KanbanBoardIcon | null, label: string, mark: ReactNode) => (
     <button
       key={icon ?? "none"}
@@ -198,6 +242,46 @@ function IconPicker(props: {
         const Icon = BOARD_ICONS[icon];
         return option(icon, icon, <Icon aria-hidden className="size-4.5" />);
       })}
+      <button
+        type="button"
+        aria-label={image ? "Change the picture" : "Upload a picture"}
+        aria-pressed={image !== null}
+        onClick={() => fileInput.current?.click()}
+        className={cn(
+          "grid size-9 place-items-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+          image ? "bg-(--m-band)" : "text-(--m-muted) hover:bg-(--m-chip) hover:text-(--m-text)",
+        )}
+      >
+        {image ? (
+          <img alt="" src={image} className="size-5.5 rounded-sm object-cover" />
+        ) : (
+          <ImageUpIcon aria-hidden className="size-4.5" />
+        )}
+      </button>
+      {image ? (
+        <button
+          type="button"
+          onClick={() => props.onImage(null)}
+          className="h-9 rounded-lg px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        >
+          Remove picture
+        </button>
+      ) : null}
+      <input
+        ref={fileInput}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        className="hidden"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = "";
+          if (!file) return;
+          void boardImage(file).then((url) => {
+            if (url) props.onImage(url);
+            else toastManager.add({ type: "error", title: "Couldn't use that picture" });
+          });
+        }}
+      />
     </div>
   );
 }

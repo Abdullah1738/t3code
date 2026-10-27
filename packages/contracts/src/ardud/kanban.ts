@@ -454,12 +454,21 @@ export const KANBAN_BOARD_ICONS = [
 export const KanbanBoardIcon = Schema.Literals(KANBAN_BOARD_ICONS);
 export type KanbanBoardIcon = typeof KanbanBoardIcon.Type;
 
+/** Board summaries carry the image to every client, so it stays a small inline picture. */
+export const KANBAN_BOARD_IMAGE_MAX = 40_000;
+export const KanbanBoardIconImage = Schema.String.check(
+  Schema.isMaxLength(KANBAN_BOARD_IMAGE_MAX),
+  Schema.isPattern(/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/),
+);
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
   /** A name from KANBAN_BOARD_ICONS; stored as text so a retired name still decodes. */
   icon: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** An uploaded picture (data URL); shown before the named icon. */
+  iconImage: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   defaultProjectId: Schema.NullOr(ProjectId),
   /** Writes titles, descriptions, goal stories and groups. */
   managerModel: ModelSelection,
@@ -663,6 +672,8 @@ export const KanbanBoardSummary = Schema.Struct({
   running: NonNegativeInt,
   /** Unread owner messages across the board's discussions. */
   unread: NonNegativeInt,
+  /** Every thread the board started; thread lists leave them out, the board shows them. */
+  threadIds: Schema.Array(ThreadId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
 });
 export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
 

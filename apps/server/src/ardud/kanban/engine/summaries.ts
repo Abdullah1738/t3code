@@ -1,6 +1,7 @@
 /**
  * Board list counts, kept from the change feed so a board list never opens
- * board feeds. Only cards and discussions that add to a count are kept.
+ * board feeds. Only cards and discussions that add to a count are kept,
+ * plus the ids of the board's threads so thread lists can leave them out.
  */
 import {
   kanbanNeedsOwner,
@@ -9,6 +10,7 @@ import {
   type KanbanCard,
   type KanbanChange,
   type KanbanDiscussion,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Stream from "effect/Stream";
 
@@ -18,6 +20,7 @@ interface BoardTally {
   board: KanbanBoard;
   readonly cards: Map<string, CardCount>;
   readonly unread: Map<string, number>;
+  readonly threads: Set<ThreadId>;
 }
 
 /** Mutable on purpose: one per watcher, folded over its own changes. */
@@ -44,10 +47,11 @@ export function tallyBoards(
     readonly board: KanbanBoard;
     readonly cards: ReadonlyArray<KanbanCard>;
     readonly discussions: ReadonlyArray<KanbanDiscussion>;
+    readonly threadIds: ReadonlyArray<ThreadId>;
   }>,
 ): BoardTallies {
   return new Map(
-    boards.map(({ board, cards, discussions }) => [
+    boards.map(({ board, cards, discussions, threadIds }) => [
       board.id,
       {
         board,
@@ -63,6 +67,7 @@ export function tallyBoards(
             return count === 0 ? [] : [[discussion.id, count] as const];
           }),
         ),
+        threads: new Set(threadIds),
       },
     ]),
   );
@@ -73,7 +78,13 @@ export function applyChange(tallies: BoardTallies, boardId: string, change: Kanb
   if (change._tag === "board") {
     const tally = tallies.get(boardId);
     if (tally) tally.board = change.board;
-    else tallies.set(boardId, { board: change.board, cards: new Map(), unread: new Map() });
+    else
+      tallies.set(boardId, {
+        board: change.board,
+        cards: new Map(),
+        unread: new Map(),
+        threads: new Set(),
+      });
     return true;
   }
   const tally = tallies.get(boardId);
@@ -85,6 +96,11 @@ export function applyChange(tallies: BoardTallies, boardId: string, change: Kanb
       return setEntry(tally.cards, change.cardId, null, null);
     case "discussion":
       return setEntry(tally.unread, change.discussion.id, unreadOf(change.discussion), 0);
+    case "thread": {
+      if (tally.threads.has(change.thread.threadId)) return false;
+      tally.threads.add(change.thread.threadId);
+      return true;
+    }
     default:
       return false;
   }
@@ -108,7 +124,13 @@ export function summaries(tallies: BoardTallies): ReadonlyArray<KanbanBoardSumma
       else if (count === "running") running += 1;
     }
     for (const count of tally.unread.values()) unread += count;
-    return { board: tally.board, needsOwner, running, unread };
+    return {
+      board: tally.board,
+      needsOwner,
+      running,
+      unread,
+      threadIds: [...tally.threads],
+    };
   });
 }
 

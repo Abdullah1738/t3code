@@ -128,6 +128,7 @@ export type BoardPatch = Partial<
     KanbanBoard,
     | "name"
     | "icon"
+    | "iconImage"
     | "defaultProjectId"
     | "managerModel"
     | "evaluatorModel"
@@ -505,6 +506,18 @@ const make = Effect.gen(function* () {
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
   const publish = (boardId: KanbanBoard["id"], change: KanbanChange) =>
     PubSub.publish(changes, { boardId, change });
+
+  // Announced so thread lists can leave the board's threads out as they start.
+  const linkThread = Effect.fn("KanbanService.linkThread")(function* (
+    link: KanbanThreadLink,
+    title: string,
+  ) {
+    yield* store.putThreadLink(link);
+    yield* publish(link.boardId, {
+      _tag: "thread",
+      thread: { threadId: link.threadId, title, running: true, lastActivityAt: link.startedAt },
+    });
+  });
 
   const kick = Effect.gen(function* () {
     const pending = yield* Ref.getAndSet(kickPending, true);
@@ -983,15 +996,17 @@ const make = Effect.gen(function* () {
     }
     const at = yield* nowIso;
     const brief = Briefs.evaluatorBrief(board, purpose);
+    const title = Briefs.evaluatorTitle(purpose);
     const threadId = yield* threads.launch({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${at}`,
       projectId: board.defaultProjectId,
-      title: Briefs.evaluatorTitle(purpose),
+      title,
       model: board.evaluatorModel,
       text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
-    yield* store.putThreadLink({
-      threadId,
+    yield* linkThread(
+      {
+        threadId,
       boardId: board.id,
       cardId: extra.cardId ?? null,
       role: "evaluator",
@@ -1001,7 +1016,9 @@ const make = Effect.gen(function* () {
       model: board.evaluatorModel,
       startedAt: at,
       endedAt: null,
-    });
+      },
+      title,
+    );
     return threadId;
   });
 
@@ -1429,27 +1446,31 @@ const make = Effect.gen(function* () {
     if (threadId) {
       yield* threads.send({ threadId, text, model: dispatch.model });
     } else {
+      const title =
+        dispatch.role === "work"
+          ? `#${card.number} ${card.title}`
+          : `#${card.number} review: ${card.title}`;
       threadId = yield* threads.launch({
         key: `${card.id}:${dispatch.role}:${at}`,
         projectId,
-        title:
-          dispatch.role === "work"
-            ? `#${card.number} ${card.title}`
-            : `#${card.number} review: ${card.title}`,
+        title,
         model: dispatch.model,
         text,
       });
-      yield* store.putThreadLink({
-        threadId,
-        boardId: board.id,
-        cardId: card.id,
-        role: dispatch.role,
-        purpose: null,
-        discussionId: null,
-        model: dispatch.model,
-        startedAt: at,
-        endedAt: null,
-      });
+      yield* linkThread(
+        {
+          threadId,
+          boardId: board.id,
+          cardId: card.id,
+          role: dispatch.role,
+          purpose: null,
+          discussionId: null,
+          model: dispatch.model,
+          startedAt: at,
+          endedAt: null,
+        },
+        title,
+      );
       yield* logEvent(card, system, "thread", { body: `${dispatch.role} thread ${threadId}` });
     }
     if (dispatch.role === "work") {
@@ -1691,6 +1712,7 @@ const make = Effect.gen(function* () {
           slug,
           name: input.name.trim() || slug,
           icon: null,
+          iconImage: null,
           defaultProjectId: input.defaultProjectId,
           managerModel: Defaults.DEFAULT_MANAGER_MODEL,
           evaluatorModel: Defaults.DEFAULT_EVALUATOR_MODEL,
@@ -2719,6 +2741,10 @@ const make = Effect.gen(function* () {
               board: Effect.succeed(board),
               cards: store.cards(board.id),
               discussions: store.discussions(board.id),
+              threadIds: Effect.map(
+                store.threadLinks({ boardId: board.id, open: false }),
+                (links) => links.map((link) => link.threadId),
+              ),
             }),
           ),
         ),

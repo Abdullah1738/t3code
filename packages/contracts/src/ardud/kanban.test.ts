@@ -6,6 +6,8 @@ import {
   KanbanBoard,
   kanbanBlocking,
   kanbanBoardIcon,
+  KanbanBoardIconImage,
+  KANBAN_BOARD_IMAGE_MAX,
   type KanbanCard,
 } from "./kanban.ts";
 
@@ -104,5 +106,14 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard(stored))).toBeNull();
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "rocket" }))).toBe("rocket");
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
+    expect(decodeBoard(stored).iconImage).toBeNull();
+  });
+
+  it("takes only small inline pictures as a board image", () => {
+    const valid = Schema.is(KanbanBoardIconImage);
+    expect(valid("data:image/webp;base64,UklGRg==")).toBe(true);
+    expect(valid("data:image/svg+xml;base64,PHN2Zz4=")).toBe(false);
+    expect(valid("https://example.com/icon.png")).toBe(false);
+    expect(valid(`data:image/png;base64,${"A".repeat(KANBAN_BOARD_IMAGE_MAX)}`)).toBe(false);
   });
 });

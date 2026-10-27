@@ -57,8 +57,17 @@ export const BOARD_ICONS: Record<KanbanBoardIcon, LucideIcon> = {
   leaf: LeafIcon,
 };
 
-/** The board's icon, or its first letter when it has none. */
+/** The board's picture, else its named icon, else its first letter. */
 export function BoardIcon(props: { board: KanbanBoard; className?: string }) {
+  if (props.board.iconImage) {
+    return (
+      <img
+        alt=""
+        src={props.board.iconImage}
+        className={cn("size-4 shrink-0 rounded-sm object-cover", props.className)}
+      />
+    );
+  }
   const name = kanbanBoardIcon(props.board);
   if (name === null) {
     return (

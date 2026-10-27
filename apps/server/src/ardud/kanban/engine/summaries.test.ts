@@ -22,6 +22,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   slug: id,
   name,
   icon: null,
+  iconImage: null,
   defaultProjectId: null,
   managerModel: opus,
   evaluatorModel: opus,
@@ -109,19 +110,20 @@ describe("board summaries", () => {
           card("idle"),
         ],
         discussions: [discussion("d1", 5, 2), discussion("d2", 4, 4)],
+        threadIds: [thread],
       },
-      { board: board("b2"), cards: [], discussions: [] },
+      { board: board("b2"), cards: [], discussions: [], threadIds: [] },
     ]);
     expect(summaries(tallies).map(({ board, ...counts }) => ({ id: board.id, ...counts }))).toEqual(
       [
-        { id: "b1", needsOwner: 2, running: 1, unread: 3 },
-        { id: "b2", needsOwner: 0, running: 0, unread: 0 },
+        { id: "b1", needsOwner: 2, running: 1, unread: 3, threadIds: [thread] },
+        { id: "b2", needsOwner: 0, running: 0, unread: 0, threadIds: [] },
       ],
     );
   });
 
   it("follows changes and reports only those that move a count", () => {
-    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [] }]);
+    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
     const counts = () => {
       const [summary] = summaries(tallies);
       return summary && [summary.needsOwner, summary.running, summary.unread];
@@ -157,8 +159,19 @@ describe("board summaries", () => {
     expect(applyChange(tallies, "b9", { _tag: "card", card: card("c2") })).toBe(false);
   });
 
+  it("keeps every thread a board starts, once", () => {
+    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+    const started = {
+      _tag: "thread" as const,
+      thread: { threadId: thread, title: "#1 work", running: true, lastActivityAt: at },
+    };
+    expect(applyChange(tallies, "b1", started)).toBe(true);
+    expect(applyChange(tallies, "b1", started)).toBe(false);
+    expect(summaries(tallies)[0]?.threadIds).toEqual([thread]);
+  });
+
   it("adds new boards and renames from board changes", () => {
-    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [] }]);
+    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
     expect(applyChange(tallies, "b1", { _tag: "board", board: board("b1", "Renamed") })).toBe(true);
     expect(applyChange(tallies, "b2", { _tag: "board", board: board("b2") })).toBe(true);
     expect(summaries(tallies).map((summary) => summary.board.name)).toEqual(["Renamed", "b2"]);
@@ -166,7 +179,7 @@ describe("board summaries", () => {
 
   it.effect("streams the list first, then only changes that move a count", () =>
     Effect.gen(function* () {
-      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [] }]);
+      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
       const changes = Stream.fromIterable([
         { boardId: "b1", change: { _tag: "card" as const, card: card("c1") } },
         {
@@ -185,7 +198,7 @@ describe("board summaries", () => {
 
   it.effect("sends one list for a burst of changes that arrive together", () =>
     Effect.gen(function* () {
-      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [] }]);
+      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
       const owner = (id: string) => ({
         boardId: "b1",
         change: { _tag: "card" as const, card: card(id, { stage: "needs_owner" }) },

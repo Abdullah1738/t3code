@@ -9,6 +9,7 @@ import {
   KanbanBlock,
   type KanbanBoard,
   KanbanBoardIcon,
+  KanbanBoardIconImage,
   type KanbanCard,
   KanbanCardId,
   KanbanDiscussionId,
@@ -118,6 +119,7 @@ const AnswerBody = Schema.Struct({
 const BoardBody = Schema.Struct({
   name: Text,
   icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
+  iconImage: Schema.optional(Schema.NullOr(KanbanBoardIconImage)),
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   managerModel: Schema.optional(ModelBody),
   evaluatorModel: Schema.optional(ModelBody),
@@ -264,6 +266,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         return yield* service.updateBoard(board.id, {
           ...(input.name ? { name: input.name } : {}),
           ...(input.icon !== undefined ? { icon: input.icon } : {}),
+          ...(input.iconImage !== undefined ? { iconImage: input.iconImage } : {}),
           ...(input.projectId !== undefined
             ? { defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null }
             : {}),

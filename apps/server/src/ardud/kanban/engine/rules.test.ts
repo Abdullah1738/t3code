@@ -38,6 +38,7 @@ const board: KanbanBoard = {
   slug: "robob",
   name: "Robob",
   icon: null,
+  iconImage: null,
   defaultProjectId: null,
   managerModel: haiku,
   evaluatorModel: opus,

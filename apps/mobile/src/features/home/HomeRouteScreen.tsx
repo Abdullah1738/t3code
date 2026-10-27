@@ -36,6 +36,10 @@ import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
 import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
 import { useMissionList } from "../../ardud/missions/missionsStore";
 // end ardud missions: ui-web
+// ardud kanban: mobile (board threads open from their cards, not the list)
+import { withoutBoardThreads } from "@t3tools/client-runtime/ardud/kanban";
+import { useKanbanBoardThreadIds } from "../../ardud/kanban/kanbanStore";
+// end ardud kanban: mobile
 // ardud imessage: mobile (iMessage threads open from their chat, not the list)
 import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
 // end ardud imessage: mobile
@@ -54,9 +58,12 @@ export function HomeRouteScreen() {
   const visible = useHomeRouteVisible();
   // ardud missions: ui-web (a mission's threads open from the mission, not the list)
   const missionThreads = missionThreadIds(useMissionList());
-  const listThreads = withoutMissionThreads(
-    useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
-    missionThreads,
+  const listThreads = withoutBoardThreads(
+    withoutMissionThreads(
+      useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
+      missionThreads,
+    ),
+    useKanbanBoardThreadIds(),
   );
   // end ardud missions: ui-web
   // ardud imessage: mobile

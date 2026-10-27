@@ -669,7 +669,7 @@ it.effect("a card that moved to another thread no longer counts as this thread's
   }),
 );
 
-it.effect("board summaries count running, waiting and unread as they change", () =>
+it.effect("board summaries count running, waiting and unread, and list the board's threads", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -682,12 +682,22 @@ it.effect("board summaries count running, waiting and unread as they change", ()
         assert.strictEqual(summarized.id, board.id);
         return counts;
       });
-      assert.deepStrictEqual(yield* latest, { needsOwner: 0, running: 0, unread: 0 });
+      assert.deepStrictEqual(yield* latest, {
+        needsOwner: 0,
+        running: 0,
+        unread: 0,
+        threadIds: [],
+      });
 
       yield* kanban.dispatchNow;
-      assert.deepStrictEqual(yield* latest, { needsOwner: 0, running: 1, unread: 0 });
-
       const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.deepStrictEqual(yield* latest, {
+        needsOwner: 0,
+        running: 1,
+        unread: 0,
+        threadIds: [thread],
+      });
+
       yield* kanban.moveCard(
         card.id,
         "needs_owner",
@@ -702,7 +712,11 @@ it.effect("board summaries count running, waiting and unread as they change", ()
 
       const discussion = yield* kanban.cardDiscussion(card.id);
       yield* kanban.markRead(discussion.id, owner, discussion.lastSeq);
-      assert.deepStrictEqual(yield* latest, { needsOwner: 1, running: 0, unread: 0 });
+      const read = yield* latest;
+      assert.deepStrictEqual([read.needsOwner, read.unread], [1, 0]);
+      // A fresh list reads them from the links, not from the feed.
+      const fresh = Option.getOrThrow(yield* kanban.boardSummaries.pipe(Stream.runHead));
+      assert.includeMembers([...fresh[0]!.threadIds], [thread]);
     }).pipe(Effect.scoped, Effect.provide(testLayer(fake.layer)));
   }),
 );

@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -9,6 +9,7 @@ import type {
   KanbanWikiPage,
 } from "@t3tools/contracts";
 import {
+  boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
   type KanbanBoardState,
@@ -36,6 +37,12 @@ function useStore<T>(store: SnapshotStore<T>): T | undefined {
 /** Every board with its list counts; no board feed opens for them. */
 export function useBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
   return useStore(kanban.boards);
+}
+
+/** Threads the boards started, archived boards too, for thread lists to leave out. */
+export function useBoardThreadIds(): ReadonlySet<string> {
+  const boards = useStore(kanban.boards);
+  return useMemo(() => boardThreadIds(boards), [boards]);
 }
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {

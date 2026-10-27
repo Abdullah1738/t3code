@@ -287,6 +287,8 @@ import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
 import { IMessageSidebarGroup } from "../ardud/imessage/IMessageSidebarGroup";
 // ardud kanban: ui-web
 import { BoardsSidebarGroup } from "../ardud/kanban/BoardsSidebarGroup";
+import { useBoardThreadIds } from "../ardud/kanban/kanbanStore";
+import { withoutBoardThreads } from "@t3tools/client-runtime/ardud/kanban";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -465,7 +467,12 @@ function useSidebarThreads(input: {
     input;
   // ardud missions: ui-web (a mission's threads open from the mission, not the list)
   const missionThreads = missionThreadIds(useMissionList());
-  const threads = withoutIMessageThreads(withoutMissionThreads(useThreadShells(), missionThreads));
+  const threads = withoutIMessageThreads(
+    withoutBoardThreads(
+      withoutMissionThreads(useThreadShells(), missionThreads),
+      useBoardThreadIds(),
+    ),
+  );
   const routeRowThreadKey =
     routeThreadRef === null
       ? null

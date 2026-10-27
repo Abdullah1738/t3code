@@ -1,4 +1,5 @@
 import type { Icon } from "@tabler/icons-react-native/types";
+import { Image } from "expo-image";
 /* Per-icon imports: the package root registers the whole Tabler set in Metro. */
 import IconBolt from "@tabler/icons-react-native/IconBolt";
 import IconBook from "@tabler/icons-react-native/IconBook";
@@ -64,6 +65,15 @@ const THEMED = Object.fromEntries(
 /** The board's icon, or its first letter when it has none. */
 export function BoardIcon(props: { readonly board: KanbanBoard; readonly size?: number }) {
   const size = props.size ?? 18;
+  if (props.board.iconImage) {
+    return (
+      <Image
+        source={{ uri: props.board.iconImage }}
+        style={{ width: size, height: size, borderRadius: 5 }}
+        contentFit="cover"
+      />
+    );
+  }
   const name = kanbanBoardIcon(props.board);
   if (name === null) {
     return (

@@ -1,5 +1,6 @@
 import type { KanbanBoardSummary, KanbanCardDetail, KanbanMessage } from "@t3tools/contracts";
 import {
+  boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
   type KanbanBoardState,
@@ -53,6 +54,12 @@ function useFeed(store: SnapshotStore<unknown>): FeedState {
 export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
   const boards = useStore(kanbanClient().boards);
   return useMemo(() => boards?.filter((summary) => summary.board.archivedAt === null), [boards]);
+}
+
+/** Threads the boards started, archived boards too, for thread lists to leave out. */
+export function useKanbanBoardThreadIds(): ReadonlySet<string> {
+  const boards = useStore(kanbanClient().boards);
+  return useMemo(() => boardThreadIds(boards), [boards]);
 }
 
 export function useKanbanBoard(boardId: string): KanbanBoardState | undefined {
