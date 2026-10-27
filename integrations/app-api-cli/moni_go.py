@@ -260,20 +260,21 @@ def _source_of(row):
     return row.get('_source') or 'imsg'
 
 
-def _ambiguous_receipt_order(go_row, mine):
-    """A cross-DB cancel whose send order against the go cannot be proven.
+def _ambiguous_rows(go_row, mine):
+    """Cross-DB cancels whose send order against this go cannot be proven.
 
     A row with a send time (sentAt) is ordered by it. A row without one (receipt only) was
     sent at or before its receipt time, so it can only be placed relative to a timed row
     when that bound settles the order: a receipt-only cancel received before a timed go
     was sent, or a receipt-only go received before a timed cancel was sent. Anything else
-    (two receipt-only rows, or a receipt time that overlaps the other row) fails closed.
+    (two receipt-only rows, or a receipt time that overlaps the other row) is ambiguous.
     Chat 45 rows are excluded: verify's own guard covers them.
     """
     if not go_row.get('_bridge'):
-        return None
+        return []
     go_timed = not go_row.get('_receipt_time')
     go_at = _parse_time(go_row.get('created_at'))
+    out = []
     for row in mine:
         if not row.get('_bridge') or _source_of(row) == _source_of(go_row):
             continue
@@ -282,21 +283,30 @@ def _ambiguous_receipt_order(go_row, mine):
         row_timed = not row.get('_receipt_time')
         row_at = _parse_time(row.get('created_at'))
         if go_at is None or row_at is None:
-            return row
-        if go_timed and row_timed:
+            out.append(row)
+        elif go_timed and row_timed:
             continue
-        if go_timed and not row_timed:
+        elif go_timed and not row_timed:
             # The cancel was sent no later than its receipt; it is before the go only if received before the go was sent.
-            if row_at < go_at:
-                continue
-            return row
-        if not go_timed and row_timed:
+            if row_at >= go_at:
+                out.append(row)
+        elif not go_timed and row_timed:
             # The go was sent no later than its receipt; it is before the cancel only if received before the cancel was sent.
-            if go_at < row_at:
-                continue
-            return row
-        return row
-    return None
+            if go_at >= row_at:
+                out.append(row)
+        else:
+            out.append(row)
+    return out
+
+
+def _proven_before(row, go_row):
+    """True when the cancel is provably sent before this go: the go is timed and the cancel's
+    upper bound on send time (its own send time, or its receipt) is earlier than it."""
+    if go_row.get('_receipt_time'):
+        return False
+    row_at = _parse_time(row.get('created_at'))
+    go_at = _parse_time(go_row.get('created_at'))
+    return row_at is not None and go_at is not None and row_at < go_at
 
 
 def _moni_rows(rows, oldest, latest, bridge_rows=()):
@@ -388,10 +398,15 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
     if any(mid > _row_id(go_row) for mid in unparsed) or unheard is not None:
         # A newer message of hers has no readable time or words; it could be a cancel after the go.
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
-    for candidate in [*replaced, go_row]:
-        if candidate is not None and _ambiguous_receipt_order(candidate, mine) is not None:
-            # A go (current or one a repeat replaced) whose order against a cancel from another source is unprovable.
-            raise RuntimeError('MONI_GO_UNVERIFIABLE')
+    if _ambiguous_rows(go_row, mine):
+        raise RuntimeError('MONI_GO_UNVERIFIABLE')
+    # A repeat that replaced an earlier go keeps that go's uncertainty, unless the final go is
+    # clear (specific words) and provably sent after each conflicting cancel.
+    final_clear = rego_by_words or any(_has(normalize(go_row.get('text')), p) for p in GO_PHRASES)
+    for candidate in replaced:
+        for row in _ambiguous_rows(candidate, mine):
+            if not (final_clear and _proven_before(row, go_row)):
+                raise RuntimeError('MONI_GO_UNVERIFIABLE')
     if cancel_row is None and bridge_go_at is not None:
         # Bridge times are when the bridge stored a message, which can lag her send by any
         # amount, so once a go from her Robob thread counted, a chat 45 cancel anywhere

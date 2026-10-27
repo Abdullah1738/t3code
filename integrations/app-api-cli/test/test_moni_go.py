@@ -787,5 +787,66 @@ class ReplacedGoOrderTests(unittest.TestCase):
         self.assertEqual(got['text'], 'ok psl')
 
 
+class ReplacementClearanceTests(unittest.TestCase):
+    """Uncertainty from a replaced go is cleared only by a clear final go provably sent after the cancel."""
+
+    def timed(self, row_id, text, sent_ago):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-clear-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_fresh_timed_go_in_chat_45_clears_the_earlier_uncertain_group_go(self):
+        got = self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                             'group-sb_gro': [self.recv('G1', 'yes order it', 5)]},
+                            chat_45=[msg('yes order it', 1, mid=900)])
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_fresh_timed_go_in_another_group_clears_the_earlier_uncertain_group_go(self):
+        got = self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                             'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                             'group-other': [self.timed('G2', 'yes order it', 1)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_unclear_final_repeat_keeps_the_uncertainty(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'moni': [self.timed('P1', 'nvm', 20)],
+                                     'group-sb_gro': [self.recv('G1', 'ok psl', 5)]},
+                          chat_45=[msg('ok psl', 1, mid=900)])
+
+    def test_final_repeat_with_only_receipt_time_cannot_prove_it_is_after_the_cancel(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                           'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                           'group-other': [self.recv('G2', 'yes order it', 1)]})
+
+    def test_fresh_go_not_proven_after_a_cancel_keeps_the_uncertainty(self):
+        # The cancel was sent after the fresh go's send time (both timed, cancel later): the cancel wins anyway.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 1)],
+                                           'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                           'group-other': [self.timed('G2', 'yes order it', 3)]})
+
+
 if __name__ == '__main__':
     unittest.main()
