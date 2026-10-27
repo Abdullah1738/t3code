@@ -12,7 +12,7 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentAuthorizationError,
 } from "../auth.ts";
-import { NonNegativeInt, ProjectId } from "../baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, ProjectId } from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlock,
@@ -60,6 +60,7 @@ export const KANBAN_WS_METHODS = {
   poolSet: "kanban.pool.set",
   discussionCreate: "kanban.discussion.create",
   discussionRead: "kanban.discussion.read",
+  discussionUpdate: "kanban.discussion.update",
   messagePost: "kanban.message.post",
   answer: "kanban.answer",
   scripts: "kanban.scripts",
@@ -110,6 +111,15 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   instructions: Schema.optional(KanbanInstructions),
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
+
+/** Owner changes to a discussion. `settled: false` and `snoozedUntil: null` undo. */
+export const KanbanDiscussionUpdateInput = Schema.Struct({
+  discussionId: KanbanDiscussionId,
+  title: Schema.optional(Schema.String),
+  settled: Schema.optional(Schema.Boolean),
+  snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
+});
+export type KanbanDiscussionUpdateInput = typeof KanbanDiscussionUpdateInput.Type;
 
 const KanbanRpcError = Schema.Union([KanbanError, EnvironmentAuthorizationError]);
 
@@ -190,6 +200,7 @@ export const KanbanRpcs = RpcGroup.make(
     Schema.Struct({ discussionId: KanbanDiscussionId, seq: NonNegativeInt }),
     Schema.Struct({}),
   ),
+  call(M.discussionUpdate, KanbanDiscussionUpdateInput, KanbanDiscussion),
   call(
     M.messagePost,
     Schema.Struct({ discussionId: KanbanDiscussionId, blocks: Schema.Array(KanbanBlock) }),
@@ -244,6 +255,7 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.poolSet]: AuthOrchestrationOperateScope,
   [M.discussionCreate]: AuthOrchestrationOperateScope,
   [M.discussionRead]: AuthOrchestrationOperateScope,
+  [M.discussionUpdate]: AuthOrchestrationOperateScope,
   [M.messagePost]: AuthOrchestrationOperateScope,
   [M.answer]: AuthOrchestrationOperateScope,
   [M.scriptEnable]: AuthOrchestrationOperateScope,

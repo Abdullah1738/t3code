@@ -6,6 +6,7 @@ import {
   type KanbanCardDetail,
   type KanbanCardPatchInput,
   type KanbanDiscussion,
+  type KanbanDiscussionUpdateInput,
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
@@ -23,6 +24,7 @@ import {
   type Unsubscribe,
 } from "../common/store.ts";
 import {
+  applyKanbanChange,
   applyKanbanWatchEvent,
   withDiscussionList,
   withDiscussions,
@@ -70,6 +72,12 @@ export interface KanbanClient {
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
   createDiscussion(boardId: string, title: string): Promise<KanbanDiscussion>;
+  /** Owner rename, settle or snooze; the board feed brings the result. */
+  updateDiscussion(
+    boardId: string,
+    discussionId: string,
+    patch: Omit<KanbanDiscussionUpdateInput, "discussionId">,
+  ): Promise<KanbanDiscussion>;
   /** Marks read at once; the server catches up in the background. */
   markRead(boardId: string, discussionId: string, seq: number): void;
   post(boardId: string, discussionId: string, blocks: ReadonlyArray<KanbanBlock>): Promise<void>;
@@ -717,6 +725,21 @@ export function createKanbanClient(
         title,
       });
       withDiscussion(boardId, discussion);
+      return discussion;
+    },
+    async updateDiscussion(boardId, discussionId, patch) {
+      const discussion = await transport.request(M.discussionUpdate, {
+        ...patch,
+        discussionId: discussionId as never,
+      });
+      // The board feed carries the same change. Titles, settles and read marks
+      // don't move lastSeq, so a reply can't tell whether a held entry is newer:
+      // only fill in an entry the board doesn't hold yet.
+      update(boardId, (state) =>
+        state.discussions.has(discussion.id)
+          ? state
+          : applyKanbanChange(state, { _tag: "discussion", discussion }),
+      );
       return discussion;
     },
     markRead(boardId, discussionId, seq) {

@@ -77,8 +77,9 @@ export function BoardColumns(props: {
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
 
-// Four stage columns at their narrowest, the shipped column, Needs Owner and the gaps.
-const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 5 * 10;
+// Four stage columns at their narrowest, the shipped column, Needs Owner with its
+// right margin, and the gaps.
+const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 20 + 5 * 10;
 
 function StageGrid(props: ColumnsProps) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
@@ -104,20 +105,29 @@ function StageGrid(props: ColumnsProps) {
           onOpenCard={props.onOpenCard}
         />
       </div>
-      <div className="flex min-h-0 w-56 shrink-0 flex-col gap-2 rounded-tl-xl bg-(--m-warnband) px-3 pt-1.5 xl:w-auto xl:min-w-60 xl:flex-1">
+      {/* A column like the others: header on the same line, its cards in a tinted well
+          that grows with them, so an empty Needs Owner isn't a full-height band. */}
+      <section
+        aria-label={board.owner.label}
+        className="me-5 mb-4 flex min-h-0 w-56 shrink-0 flex-col gap-2 xl:w-64"
+      >
         <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pb-3">
-          {board.owner.cards.map((card) => (
-            <CardTile
-              key={card.id}
-              card={card}
-              raised
-              selected={card.id === props.selectedCardId}
-              onOpen={props.onOpenCard}
-            />
-          ))}
+        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto rounded-xl bg-(--m-warnband) p-2">
+          {board.owner.cards.length === 0 ? (
+            <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
+          ) : (
+            board.owner.cards.map((card) => (
+              <CardTile
+                key={card.id}
+                card={card}
+                raised
+                selected={card.id === props.selectedCardId}
+                onOpen={props.onOpenCard}
+              />
+            ))
+          )}
         </div>
-      </div>
+      </section>
     </div>
   );
 }

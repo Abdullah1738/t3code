@@ -40,7 +40,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
     "",
     "How the board works:",
-    "- Your card tools: card_get, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read.",
+    "- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read.",
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
@@ -220,7 +220,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     purposeText(purpose),
     "",
     "What you can do:",
-    "- Read everything: board_get, card_get, discussions, the wiki, the cards' threads (t3_thread_read), past sessions (recall), the web, Dia for logged-in pages.",
+    "- Read everything: board_get, card_search (cards by words or #number, settled ones too), card_get, discussions, the wiki, the cards' threads (t3_thread_read), past sessions (recall), the web, Dia for logged-in pages.",
     "- Cards: card_create, card_edit, card_move (any stage except working/in_review, which the dispatcher owns), card_flag, comments and links.",
     "- Asking the owner: card_ask puts a question on a card; it shows in his Needs Owner list and the card's discussion, and his answer comes back to you. Async by default: the card and its thread go on. Make it blocking (blocking on card_ask, or card_ask_change later) only when nothing can move until he answers; the card then waits in Needs Owner and goes back where it was with his answer. Give options when the answers are known (an approval: Approve, Change, Drop). The owner can make an async ask blocking himself, and drop asks. Drop your own asks with card_ask_change once they no longer matter.",
     "- Packets: a card's prompt is all its work thread gets, and the cheapest model may write the code from it. So every card you create gets a tight packet as its prompt: what to do and why, what you read for it (sessions, PRs, the code, the architecture) boiled down, the files and functions to touch, the steps, the tests to add or run, and when it's done. Detailed enough that the writer never has to guess or go looking. Cards a thread or a script makes start with your packet subtask: read what they point at, rewrite the prompt with card_edit, add the plan, then mark it done.",

@@ -1462,3 +1462,130 @@ it.effect("the owner's reply in an evaluator's discussion goes to that evaluator
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateThreadTitle: (input) =>
+          Effect.sync(() => {
+            asked.push(input.message);
+            return { title: "Kafka cert expiry" };
+          }),
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () => Effect.succeed(Option.some({ workspaceRoot: "/repo" } as never)),
+      }),
+    ),
+  );
+
+it.effect("an owner's channel gets a title from his first message, unless he named it", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const titled = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) =>
+            change._tag === "discussion" && change.discussion.title === "Kafka cert expiry",
+        ),
+      );
+
+      const channel = yield* kanban.createDiscussion(board.id, "When do the Kafka", owner);
+      yield* kanban.post(channel.id, owner, [
+        { _tag: "md", text: "When do the Kafka certs expire?" },
+      ]);
+      assert.isTrue(Option.isSome(yield* titled));
+      assert.strictEqual((yield* kanban.discussion(channel.id)).title, "Kafka cert expiry");
+      assert.deepStrictEqual(asked, ["When do the Kafka certs expire?"]);
+
+      // Only the first owner message names it.
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "And the CA?" }]);
+      assert.lengthOf(asked, 1);
+
+      // A channel the owner named keeps his title.
+      const named = yield* kanban.createDiscussion(board.id, "Draft", owner);
+      const renamed = yield* kanban.updateDiscussion(named.id, { title: "  Fees  " }, owner);
+      assert.strictEqual(renamed.title, "Fees");
+      assert.isNotNull(renamed.titleEditedAt);
+      yield* kanban.post(named.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      assert.lengthOf(asked, 1);
+      assert.strictEqual((yield* kanban.discussion(named.id)).title, "Fees");
+
+      // A card's discussion keeps the card's title.
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const cardTalk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(cardTalk.id, owner, [{ _tag: "md", text: "Note" }]);
+      assert.lengthOf(asked, 1);
+
+      const blank = yield* kanban
+        .updateDiscussion(named.id, { title: " " }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(blank.code, "invalid");
+      const agent = yield* kanban
+        .updateDiscussion(
+          named.id,
+          { title: "Mine" },
+          { _tag: "evaluator", threadId: ThreadId.make("t") },
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(agent.code, "denied");
+    }).pipe(Effect.scoped, Effect.provide(titledLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("the owner settles and snoozes a discussion; someone else posting brings it back", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = {
+        _tag: "evaluator",
+        threadId: yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set up" }),
+      };
+      const talk = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+
+      let current = yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
+      assert.isNotNull(current.settledAt);
+      // The owner's own post leaves it settled.
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Thanks" }]);
+      assert.isNotNull((yield* kanban.discussion(talk.id)).settledAt);
+      yield* kanban.post(talk.id, evaluator, [{ _tag: "md", text: "One more thing" }]);
+      assert.isNull((yield* kanban.discussion(talk.id)).settledAt);
+
+      const later = "2999-01-01T09:00:00.000Z";
+      current = yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
+      current = yield* kanban.updateDiscussion(talk.id, { snoozedUntil: later }, owner);
+      assert.strictEqual(current.snoozedUntil, later);
+      assert.isNull(current.settledAt);
+      // Settling clears the snooze; unsettling and unsnoozing undo.
+      current = yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
+      assert.isNull(current.snoozedUntil);
+      current = yield* kanban.updateDiscussion(talk.id, { settled: false }, owner);
+      assert.isNull(current.settledAt);
+      current = yield* kanban.updateDiscussion(talk.id, { snoozedUntil: later }, owner);
+      current = yield* kanban.updateDiscussion(talk.id, { snoozedUntil: null }, owner);
+      assert.isNull(current.snoozedUntil);
+
+      yield* kanban.updateDiscussion(talk.id, { snoozedUntil: later }, owner);
+      yield* kanban.post(talk.id, evaluator, [{ _tag: "md", text: "Done" }]);
+      assert.isNull((yield* kanban.discussion(talk.id)).snoozedUntil);
+
+      const past = yield* kanban
+        .updateDiscussion(talk.id, { snoozedUntil: "1969-12-31T00:00:00.000Z" }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(past.code, "invalid");
+      const both = yield* kanban
+        .updateDiscussion(talk.id, { settled: true, snoozedUntil: later }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(both.code, "invalid");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

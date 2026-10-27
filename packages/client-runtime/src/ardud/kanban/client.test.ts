@@ -88,6 +88,9 @@ function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
     createdBy: { _tag: "owner" },
     createdAt: "2026-10-25T09:00:00.000Z",
     archivedAt: null,
+    titleEditedAt: null,
+    settledAt: null,
+    snoozedUntil: null,
   } as never;
 }
 
@@ -204,6 +207,37 @@ describe("createKanbanClient", () => {
     fake.push(snapshotEvent(0));
     await settle();
     expect(fake.pending.some((entry) => entry.tag === "kanban.discussion.read")).toBe(false);
+    stop();
+  });
+
+  it("leaves a settle's result to the board feed, so a late reply can't undo a newer change", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const store = client.board("board-toy");
+    const stop = store.subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    fake.take("kanban.discussions").resolve([discussion(3, 3)]);
+    await settle();
+
+    const settled = client.updateDiscussion("board-toy", "disc-1", { settled: true });
+    const request = fake.take("kanban.discussion.update");
+    expect(request.input).toEqual({ discussionId: "disc-1", settled: true });
+    const settledEntry = { ...discussion(3, 3), settledAt: "2026-10-25T12:00:00.000Z" };
+    fake.push({
+      _tag: "change",
+      change: { _tag: "discussion", discussion: settledEntry },
+    } as never);
+    // Another device renames it (lastSeq doesn't move) before this reply lands.
+    fake.push({
+      _tag: "change",
+      change: { _tag: "discussion", discussion: { ...settledEntry, title: "Renamed" } },
+    } as never);
+    request.resolve(settledEntry);
+    await settled;
+    expect(store.get()?.discussions.get("disc-1")).toMatchObject({
+      settledAt: "2026-10-25T12:00:00.000Z",
+      title: "Renamed",
+    });
     stop();
   });
 

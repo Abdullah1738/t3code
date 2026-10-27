@@ -114,6 +114,13 @@ export interface CardPatch {
   readonly comment?: string | undefined;
 }
 
+/** The owner's changes to a discussion; `settled: false` and `snoozedUntil: null` undo. */
+export interface DiscussionPatch {
+  readonly title?: string | undefined;
+  readonly settled?: boolean | undefined;
+  readonly snoozedUntil?: string | null | undefined;
+}
+
 export interface GoalInput {
   readonly id?: KanbanGoal["id"] | undefined;
   readonly name?: string | undefined;
@@ -281,6 +288,12 @@ export interface KanbanServiceShape {
     title: string,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
+  /** Owner only: rename, settle or snooze a discussion. */
+  readonly updateDiscussion: (
+    discussionId: KanbanDiscussion["id"],
+    patch: DiscussionPatch,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanDiscussion, KanbanError>;
   readonly cardDiscussion: (
     cardId: KanbanCard["id"],
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
@@ -368,6 +381,10 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+
+const DISCUSSION_TITLE_MAX = 80;
+/** Past this many messages a discussion has long had the owner's first one. */
+const TITLE_SCAN_MAX = 20;
 
 const WriterOutput = Schema.Struct({ title: Schema.String, description: Schema.String });
 
@@ -917,6 +934,65 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "discussion", discussion });
   });
 
+  const writeDiscussionTitle = Effect.fn("KanbanService.writeDiscussionTitle")(function* (
+    discussionId: KanbanDiscussion["id"],
+    message: string,
+  ) {
+    const discussion = yield* discussionOf(discussionId);
+    const board = yield* boardOf(discussion.boardId);
+    if (board.defaultProjectId === null) return;
+    const project = yield* projects.getById(board.defaultProjectId);
+    if (Option.isNone(project)) return;
+    const written = yield* textGeneration.generateThreadTitle({
+      cwd: project.value.workspaceRoot,
+      message,
+      modelSelection: board.managerModel,
+    });
+    const title = written.title.trim().slice(0, DISCUSSION_TITLE_MAX);
+    if (!title) return;
+    yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* discussionOf(discussionId);
+        // The owner may have renamed it while the title was being written.
+        if (current.titleEditedAt !== null) return;
+        yield* saveDiscussion({ ...current, title });
+      }),
+    );
+  });
+
+  /**
+   * An owner's channel he never renamed gets a written title from his first
+   * message. Card discussions keep the card's title; agents name their own.
+   */
+  const wantsWrittenTitle = Effect.fn("KanbanService.wantsWrittenTitle")(function* (
+    discussion: KanbanDiscussion,
+  ) {
+    if (
+      discussion.cardId !== null ||
+      discussion.titleEditedAt !== null ||
+      discussion.createdBy._tag !== "owner"
+    ) {
+      return false;
+    }
+    if (discussion.lastSeq === 0) return true;
+    if (discussion.lastSeq > TITLE_SCAN_MAX) return false;
+    const earlier = yield* store.messages(discussion.id, { limit: TITLE_SCAN_MAX + 1 });
+    // `discussion` is as it was before the post being routed, which is already stored.
+    return !earlier.some(
+      (message) => message.seq <= discussion.lastSeq && message.author._tag === "owner",
+    );
+  });
+
+  // The client's first-line title stays when the writer fails.
+  const forkDiscussionTitle = (discussionId: KanbanDiscussion["id"], message: string) =>
+    writeDiscussionTitle(discussionId, message).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
+      ),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
   const newDiscussion = Effect.fn("KanbanService.newDiscussion")(function* (
     boardId: KanbanBoard["id"],
     title: string,
@@ -944,6 +1020,9 @@ const make = Effect.gen(function* () {
       createdBy: actor,
       createdAt: at,
       archivedAt: null,
+      titleEditedAt: null,
+      settledAt: null,
+      snoozedUntil: null,
     };
     // The evaluator that opens a discussion is the one the owner's replies go to.
     const discussion = actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
@@ -1328,8 +1407,11 @@ const make = Effect.gen(function* () {
       author._tag === "evaluator" && discussion.cardId === null
         ? adoptEvaluator(discussion, author)
         : discussion;
+    // Someone else speaking brings a settled or snoozed discussion back, like a thread waking.
+    const woken =
+      author._tag === "owner" ? owned : { ...owned, settledAt: null, snoozedUntil: null };
     const posted = withParticipant(
-      { ...owned, lastSeq: message.seq, lastMessageAt: at },
+      { ...woken, lastSeq: message.seq, lastMessageAt: at },
       author,
       authorName,
       {
@@ -1342,6 +1424,9 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(blocks);
+    if (author._tag === "owner" && (yield* wantsWrittenTitle(discussion))) {
+      yield* forkDiscussionTitle(discussion.id, text);
+    }
     if (!route) return message;
     if (author._tag === "owner") {
       yield* routeToOwnerAgent(posted, Briefs.ownerMessageText(posted.title, posted.id, text));
@@ -2628,6 +2713,41 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const updateDiscussion: KanbanServiceShape["updateDiscussion"] = (discussionId, patch, actor) =>
+    guard(
+      Effect.gen(function* () {
+        if (actor._tag !== "owner") {
+          return yield* failWith("denied", "only the owner renames, settles or snoozes");
+        }
+        const discussion = yield* discussionOf(discussionId);
+        const at = yield* nowIso;
+        let next = discussion;
+        if (patch.title !== undefined) {
+          const title = patch.title.trim().slice(0, DISCUSSION_TITLE_MAX);
+          if (!title) return yield* failWith("invalid", "a discussion needs a title");
+          next = { ...next, title, titleEditedAt: at };
+        }
+        if (patch.settled === true && typeof patch.snoozedUntil === "string") {
+          return yield* failWith("invalid", "settle or snooze, not both");
+        }
+        if (patch.settled === true) next = { ...next, settledAt: at, snoozedUntil: null };
+        else if (patch.settled === false) next = { ...next, settledAt: null };
+        if (patch.snoozedUntil === null) next = { ...next, snoozedUntil: null };
+        else if (patch.snoozedUntil !== undefined) {
+          const until = DateTime.make(patch.snoozedUntil);
+          if (Option.isNone(until)) {
+            return yield* failWith("invalid", "snoozedUntil is not a time");
+          }
+          if (DateTime.toEpochMillis(until.value) <= (yield* nowMillis)) {
+            return yield* failWith("invalid", "snoozedUntil must be in the future");
+          }
+          next = { ...next, snoozedUntil: DateTime.formatIso(until.value), settledAt: null };
+        }
+        if (next !== discussion) yield* saveDiscussion(next);
+        return next;
+      }),
+    );
+
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by) =>
     guard(
       Effect.gen(function* () {
@@ -2819,6 +2939,7 @@ const make = Effect.gen(function* () {
     discussions: (boardId) => read(store.discussions(boardId)),
     discussion: (id) => read(discussionOf(id)),
     createDiscussion,
+    updateDiscussion,
     cardDiscussion: (cardId) => guard(cardDiscussionUnlocked(cardId)),
     messages: (id, options) => read(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),

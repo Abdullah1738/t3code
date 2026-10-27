@@ -4505,7 +4505,8 @@ export default function ChatView(props: ChatViewProps) {
   }, [timelineThreadReset]);
 
   useEffect(() => {
-    if (!activeThread?.id || terminalUiState.terminalOpen) return;
+    // ardud: only the desktop app focuses the composer by itself; on web (iPad) it's a tap.
+    if (!isElectron || !activeThread?.id || terminalUiState.terminalOpen) return;
     const frame = window.requestAnimationFrame(() => {
       focusComposerStable();
     });
@@ -4515,7 +4516,8 @@ export default function ChatView(props: ChatViewProps) {
   }, [activeThread?.id, focusComposerStable, terminalUiState.terminalOpen]);
 
   useEffect(() => {
-    if (!activeThread?.id || terminalUiState.terminalOpen || isMobileViewport) return;
+    if (!isElectron || !activeThread?.id || terminalUiState.terminalOpen || isMobileViewport)
+      return;
     let frame: number | null = null;
     const onWindowFocus = () => {
       if (frame !== null) window.cancelAnimationFrame(frame);

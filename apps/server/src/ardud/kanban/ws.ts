@@ -2,6 +2,7 @@ import {
   KANBAN_WS_METHODS as M,
   type KanbanBoardUpdateInput,
   type KanbanCardPatchInput,
+  type KanbanDiscussionUpdateInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -84,6 +85,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;
     }) => service.createDiscussion(input.boardId, input.title, OWNER),
+    [M.discussionUpdate]: ({ discussionId, ...patch }: KanbanDiscussionUpdateInput) =>
+      service.updateDiscussion(discussionId, patch, OWNER),
     [M.discussionRead]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["markRead"]>[0];
       readonly seq: number;

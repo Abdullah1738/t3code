@@ -139,6 +139,21 @@ const BoardGet = tool(
   { readonly: true },
 );
 
+const CardSearch = tool(
+  "card_search",
+  "Search cards",
+  "Find cards on a board by words in their title, description, prompt or links, or by #number. Settled cards are left out unless includeSettled. Returns short rows, newest first; read one in full with card_get.",
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    query: describe(Schema.String, "Words to match (all of them), or #12. Empty lists every card."),
+    stage: Schema.optional(KanbanStage),
+    includeSettled: Schema.optional(Schema.Boolean),
+    limit: Schema.optional(describe(PositiveInt, "At most this many rows (default 20).")),
+  },
+  { cards: Records, total: NonNegativeInt },
+  { readonly: true },
+);
+
 const CardGet = tool(
   "card_get",
   "Read a card",
@@ -468,6 +483,7 @@ const EvaluatorStart = tool(
 
 export const KanbanToolkit = Toolkit.make(
   BoardGet,
+  CardSearch,
   CardGet,
   CardUpdate,
   CardMove,

@@ -242,6 +242,9 @@ export function CardTile(props: {
       <View className="flex-row items-center gap-2">
         <PriorityBars priority={view.priority} />
         <Text className="text-[12px] text-foreground-muted">{view.number}</Text>
+        {view.card.settledAt !== null ? (
+          <Text className="text-[12px] text-foreground-muted">Settled</Text>
+        ) : null}
         <View className="flex-1" />
         {view.unread > 0 ? (
           <View className="flex-row items-center gap-1">

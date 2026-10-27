@@ -208,3 +208,68 @@ it.effect("board_open gives a board its icon only while it has none", () => {
     assert.include(String(unknown), "Invalid parameters");
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("card_search finds cards by words or number and hides settled ones by default", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const kafka = yield* kanban.createCard(
+      board.id,
+      { prompt: "Rotate the broker certs", title: "Kafka cert expiry" },
+      owner,
+    );
+    const docs = yield* kanban.createCard(
+      board.id,
+      { prompt: "Write the onboarding guide", title: "Docs" },
+      owner,
+    );
+    const evaluator = ThreadId.make("thread-evaluator");
+    const numbers = (result: { structured: Record<string, unknown> }) =>
+      (result.structured.cards as ReadonlyArray<{ number: number }>).map((card) => card.number);
+
+    const words = yield* call(evaluator, "card_search", { query: "broker KAFKA" });
+    assert.isFalse(words.isError, words.text);
+    assert.deepStrictEqual(numbers(words), [kafka.number]);
+
+    const byNumber = yield* call(evaluator, "card_search", { query: `#${docs.number}` });
+    assert.deepStrictEqual(numbers(byNumber), [docs.number]);
+
+    // Empty query lists every open card, newest first.
+    const all = yield* call(evaluator, "card_search", { query: "", limit: 1 });
+    assert.deepStrictEqual(numbers(all), [docs.number]);
+    assert.strictEqual(all.structured.total, 2);
+
+    yield* kanban.moveCard(kafka.id, "verified", "owner", owner);
+    yield* kanban.settleCard(kafka.id);
+    const hidden = yield* call(evaluator, "card_search", { query: "kafka" });
+    assert.deepStrictEqual(numbers(hidden), []);
+    const settled = yield* call(evaluator, "card_search", {
+      query: "kafka",
+      includeSettled: true,
+    });
+    assert.deepStrictEqual(numbers(settled), [kafka.number]);
+
+    const staged = yield* call(evaluator, "card_search", { query: "", stage: "verified" });
+    assert.deepStrictEqual(numbers(staged), []);
+
+    // "#1" also appears in #10-#12; the exact card still comes first under the limit.
+    for (let index = 3; index <= 12; index += 1) {
+      yield* kanban.createCard(
+        board.id,
+        { prompt: `Step ${index}`, title: `Step ${index}` },
+        owner,
+      );
+    }
+    const exact = yield* call(evaluator, "card_search", {
+      query: `#${kafka.number}`,
+      includeSettled: true,
+      limit: 1,
+    });
+    assert.deepStrictEqual(numbers(exact), [kafka.number]);
+  }).pipe(Effect.provide(layer));
+});

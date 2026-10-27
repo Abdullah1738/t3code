@@ -985,6 +985,7 @@ function ComposerPromptEditorTiptapInner(
   const importFragmentRef = useRef(importContextFragment);
   const latestValueRef = useRef(value);
   const editorHolder = useRef<TiptapEditor | null>(null);
+  const shiftEnterAtRef = useRef(0);
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -1137,7 +1138,21 @@ function ComposerPromptEditorTiptapInner(
       editable: !disabled,
       editorProps: {
         attributes: editorAttributes,
-        handleKeyDown: (view, event) => {
+        handleDOMEvents: {
+          keydown: (_view, event) => {
+            shiftEnterAtRef.current = event.key === "Enter" && event.shiftKey ? Date.now() : 0;
+            return false;
+          },
+        },
+        handleKeyDown: (view, keyEvent) => {
+          // ardud: on iOS/iPadOS ProseMirror replays Enter as a bare synthetic event without
+          // Shift, so Shift+Enter sent the message. Put Shift back so it breaks the line.
+          const event =
+            keyEvent.key === "Enter" &&
+            !(keyEvent instanceof KeyboardEvent) &&
+            Date.now() - shiftEnterAtRef.current < 400
+              ? new KeyboardEvent("keydown", { key: "Enter", code: "Enter", shiftKey: true })
+              : keyEvent;
           const boundary = event.metaKey
             ? event.key === "ArrowLeft" || event.key === "ArrowRight"
               ? "lineboundary"

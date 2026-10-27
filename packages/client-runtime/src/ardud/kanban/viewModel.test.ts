@@ -21,9 +21,11 @@ import {
   goalProgress,
   groupCards,
   mergeMessages,
+  nextDiscussionWakeMs,
   poolViews,
   stageBoard,
   subtaskSteps,
+  visibleCards,
 } from "./viewModel.ts";
 
 const NOW = Date.parse("2026-10-25T12:00:00.000Z");
@@ -120,6 +122,9 @@ function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
     createdBy: { _tag: "owner" },
     createdAt: "2026-10-25T09:00:00.000Z",
     archivedAt: null,
+    titleEditedAt: null,
+    settledAt: null,
+    snoozedUntil: null,
   } as never;
 }
 
@@ -182,7 +187,11 @@ describe("stageBoard", () => {
     );
     const view = stageBoard(state, NOW);
     expect(view.owner.cards.map((c) => c.number)).toEqual([2, 1]);
-    expect(view.owner.cards[1]!.flag).toEqual({ kind: "ask", label: "Tone? (+1)", blocking: false });
+    expect(view.owner.cards[1]!.flag).toEqual({
+      kind: "ask",
+      label: "Tone? (+1)",
+      blocking: false,
+    });
     const working = view.active.find((column) => column.stage === "working")!;
     expect(working.cards.map((c) => c.number)).toEqual([1]);
     expect(askViews(state.cards.get("card-1")!, NOW).map((a) => [a.id, a.blocking, a.by])).toEqual([
@@ -335,18 +344,106 @@ describe("goalProgress", () => {
   });
 });
 
+describe("card search", () => {
+  const cards = [
+    card(1, { title: "Login page", description: "Fix the OTP field" }),
+    card(2, { prompt: "Rewrite the webhook handler" }),
+    card(3, {
+      links: [
+        {
+          kind: "pr",
+          url: "https://github.com/acme/app/pull/77",
+          label: "Billing PR",
+          state: "open",
+          checkedAt: null,
+        },
+      ],
+    }),
+    card(12, { title: "Old work", settledAt: "2026-10-24T10:00:00.000Z" }),
+  ];
+  const state = boardStateFromSnapshot(snapshot(cards));
+  const numbers = (filter: Parameters<typeof visibleCards>[1]) =>
+    visibleCards(state, filter)
+      .map((entry) => entry.number)
+      .sort((a, b) => a - b);
+
+  it("matches description, prompt, link labels and urls, and #number", () => {
+    expect(numbers({ query: "otp" })).toEqual([1]);
+    expect(numbers({ query: "webhook" })).toEqual([2]);
+    expect(numbers({ query: "billing" })).toEqual([3]);
+    expect(numbers({ query: "pull/77" })).toEqual([3]);
+    expect(numbers({ query: "#1" })).toEqual([1]);
+  });
+
+  it("needs every word, in any order, like the agents' card_search", () => {
+    expect(numbers({ query: "otp login" })).toEqual([1]);
+    expect(numbers({ query: "otp webhook" })).toEqual([]);
+  });
+
+  it("hides settled cards unless asked", () => {
+    expect(numbers({})).toEqual([1, 2, 3]);
+    expect(numbers({ settled: "only" })).toEqual([12]);
+    expect(numbers({ settled: "include", query: "#1" })).toEqual([1, 12]);
+  });
+});
+
 describe("discussions", () => {
   it("tracks unread from discussion changes and clears it when the owner reads", () => {
     let state = boardStateFromSnapshot(snapshot([]));
     state = withDiscussionList(state, [discussion(3, 1)]);
     state = withDiscussions(state, [], [message(3, false, "Window?")]);
-    expect(discussionRows(state)).toMatchObject([
+    expect(discussionRows(state, NOW).active).toMatchObject([
       { id: "disc-1", unread: 2, preview: "Evaluator: Window?" },
     ]);
     state = applyKanbanChange(state, { _tag: "discussion", discussion: discussion(4, 1) });
     expect(state.unread.get("disc-1")).toBe(3);
     state = withOwnerRead(state, "disc-1", 4);
     expect(state.unread.get("disc-1")).toBe(0);
+  });
+
+  it("groups settled and snoozed discussions, and wakes a lapsed snooze", () => {
+    const named = (id: string, patch: Partial<KanbanDiscussion>) =>
+      ({ ...discussion(1, 1), id, title: id, ...patch }) as KanbanDiscussion;
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [
+      named("plain", {}),
+      named("parked", { settledAt: "2026-10-25T11:30:00.000Z" }),
+      named("later", { snoozedUntil: "2026-10-25T15:00:00.000Z" }),
+      named("lapsed", { snoozedUntil: "2026-10-25T11:59:00.000Z" }),
+      // Settled wins over a snooze still on the record.
+      named("both", {
+        settledAt: "2026-10-25T11:30:00.000Z",
+        snoozedUntil: "2026-10-25T15:00:00.000Z",
+      }),
+    ]);
+    const ids = (rows: ReadonlyArray<{ id: string }>) => rows.map((row) => row.id).sort();
+    const groups = discussionRows(state, NOW);
+    expect(ids(groups.active)).toEqual(["lapsed", "plain"]);
+    expect(ids(groups.snoozed)).toEqual(["later"]);
+    expect(ids(groups.settled)).toEqual(["both", "parked"]);
+    expect(groups.active.find((row) => row.id === "lapsed")?.snoozedUntil).toBeNull();
+    expect(nextDiscussionWakeMs(state, NOW)).toBe(Date.parse("2026-10-25T15:00:00.000Z"));
+    expect(ids(discussionRows(state, Date.parse("2026-10-25T16:00:00.000Z")).active)).toEqual([
+      "lapsed",
+      "later",
+      "plain",
+    ]);
+  });
+
+  it("searches discussions by title and latest message", () => {
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [
+      discussion(3, 3),
+      { ...discussion(1, 1), id: "disc-2" as KanbanDiscussion["id"], title: "Deploy" },
+    ]);
+    state = withDiscussions(state, [], [message(3, false, "Which window frame?")]);
+    expect(discussionRows(state, NOW, { query: "deploy" }).active.map((row) => row.id)).toEqual([
+      "disc-2",
+    ]);
+    expect(discussionRows(state, NOW, { query: "FRAME" }).active.map((row) => row.id)).toEqual([
+      "disc-1",
+    ]);
+    expect(discussionRows(state, NOW, { query: "nothing" }).active).toEqual([]);
   });
 
   it("keeps a live change that landed during a list read, and drops stale entries", () => {

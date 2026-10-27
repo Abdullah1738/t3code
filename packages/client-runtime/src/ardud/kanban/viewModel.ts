@@ -204,25 +204,47 @@ export function subtaskSteps(card: Pick<KanbanCard, "subtasks">): ReadonlyArray<
     }));
 }
 
+export type SettledFilter = "hide" | "only" | "include";
+
 export interface BoardFilter {
   readonly goalId?: string | null;
   readonly query?: string;
+  /** Settled cards: hidden by default. */
+  readonly settled?: SettledFilter;
 }
 
-/** Cards on the board: not settled, matching the filter. */
+/**
+ * Every word must appear in the card's number, title, description, prompt or
+ * links, like the agents' card_search; a lone "12" or "#12" also finds cards
+ * whose number starts with it.
+ */
+export function cardMatches(card: KanbanCard, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  if (/^#?\d+$/.test(needle) && String(card.number).startsWith(needle.replace(/^#/, ""))) {
+    return true;
+  }
+  const text = [
+    `#${card.number}`,
+    card.title,
+    card.description,
+    card.prompt,
+    ...card.links.flatMap((link) => [link.label ?? "", link.url]),
+  ]
+    .join("\n")
+    .toLowerCase();
+  return needle.split(/\s+/).every((word) => text.includes(word));
+}
+
+/** Cards on the board matching the filter; settled ones only when asked for. */
 export function visibleCards(state: KanbanBoardState, filter: BoardFilter = {}): KanbanCard[] {
-  const query = filter.query?.trim().toLowerCase() ?? "";
+  const settled = filter.settled ?? "hide";
   const cards: KanbanCard[] = [];
   for (const card of state.cards.values()) {
-    if (card.settledAt !== null) continue;
+    if (settled === "hide" && card.settledAt !== null) continue;
+    if (settled === "only" && card.settledAt === null) continue;
     if (filter.goalId != null && card.goalId !== filter.goalId) continue;
-    if (
-      query &&
-      !card.title.toLowerCase().includes(query) &&
-      !String(card.number).startsWith(query.replace(/^#/, ""))
-    ) {
-      continue;
-    }
+    if (filter.query && !cardMatches(card, filter.query)) continue;
     cards.push(card);
   }
   return cards;
@@ -525,13 +547,46 @@ export interface DiscussionRow {
   readonly unread: number;
   readonly preview: string;
   readonly at: string | null;
+  readonly settledAt: string | null;
+  /** Set while the snooze still holds at the time the rows were built. */
+  readonly snoozedUntil: string | null;
 }
 
-export function discussionRows(state: KanbanBoardState): DiscussionRow[] {
-  return [...state.discussions.values()]
+export interface DiscussionGroups {
+  readonly active: ReadonlyArray<DiscussionRow>;
+  readonly snoozed: ReadonlyArray<DiscussionRow>;
+  readonly settled: ReadonlyArray<DiscussionRow>;
+}
+
+/** A snooze holds until its time passes; then the discussion is active again. */
+export const discussionSnoozed = (
+  discussion: Pick<KanbanDiscussion, "snoozedUntil">,
+  nowMs: number,
+): boolean => {
+  if (discussion.snoozedUntil === null) return false;
+  const wakeMs = Date.parse(discussion.snoozedUntil);
+  return Number.isFinite(wakeMs) && wakeMs > nowMs;
+};
+
+/**
+ * Discussions newest first in three groups, like sidebar threads. Settled wins
+ * over snoozed; a lapsed snooze counts as active. `query` matches the title and
+ * the latest message preview.
+ */
+export function discussionRows(
+  state: KanbanBoardState,
+  nowMs: number,
+  options: { readonly query?: string } = {},
+): DiscussionGroups {
+  const needle = options.query?.trim().toLowerCase() ?? "";
+  const active: DiscussionRow[] = [];
+  const snoozed: DiscussionRow[] = [];
+  const settled: DiscussionRow[] = [];
+  const rows = [...state.discussions.values()]
     .filter((discussion) => discussion.archivedAt === null)
     .map((discussion) => {
       const last = state.lastMessages.get(discussion.id);
+      const sleeping = discussion.settledAt === null && discussionSnoozed(discussion, nowMs);
       return {
         id: discussion.id,
         title: discussion.title,
@@ -539,9 +594,34 @@ export function discussionRows(state: KanbanBoardState): DiscussionRow[] {
         unread: state.unread.get(discussion.id) ?? 0,
         preview: last ? messagePreview(last) : "",
         at: discussion.lastMessageAt ?? discussion.createdAt,
-      };
+        settledAt: discussion.settledAt,
+        snoozedUntil: sleeping ? discussion.snoozedUntil : null,
+      } satisfies DiscussionRow;
     })
+    .filter(
+      (row) =>
+        !needle ||
+        row.title.toLowerCase().includes(needle) ||
+        row.preview.toLowerCase().includes(needle),
+    )
     .sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
+  for (const row of rows) {
+    if (row.settledAt !== null) settled.push(row);
+    else if (row.snoozedUntil !== null) snoozed.push(row);
+    else active.push(row);
+  }
+  return { active, snoozed, settled };
+}
+
+/** The earliest snooze still holding, so a screen knows when to regroup. */
+export function nextDiscussionWakeMs(state: KanbanBoardState, nowMs: number): number | null {
+  let next: number | null = null;
+  for (const discussion of state.discussions.values()) {
+    if (discussion.settledAt !== null || !discussionSnoozed(discussion, nowMs)) continue;
+    const wakeMs = Date.parse(discussion.snoozedUntil ?? "");
+    if (next === null || wakeMs < next) next = wakeMs;
+  }
+  return next;
 }
 
 export const totalUnread = (state: KanbanBoardState) => {

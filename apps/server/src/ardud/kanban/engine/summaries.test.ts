@@ -93,6 +93,9 @@ const discussion = (id: string, lastSeq: number, ownerRead: number): KanbanDiscu
   createdBy: { _tag: "owner" },
   createdAt: at,
   archivedAt: null,
+  titleEditedAt: null,
+  settledAt: null,
+  snoozedUntil: null,
 });
 
 const thread = ThreadId.make("t1");

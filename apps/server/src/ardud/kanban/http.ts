@@ -13,6 +13,7 @@ import {
   type KanbanCard,
   KanbanCardId,
   KanbanDiscussionId,
+  KanbanDiscussionUpdateInput,
   KanbanError,
   KanbanPriority,
   KanbanScriptId,
@@ -23,6 +24,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
@@ -109,6 +111,8 @@ const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
 const PostBody = Schema.Struct({ text: Text, blocks: Schema.optional(Schema.Array(KanbanBlock)) });
 
 const TitleBody = Schema.Struct({ title: Schema.String });
+
+const DiscussionPatchBody = KanbanDiscussionUpdateInput.mapFields(Struct.omit(["discussionId"]));
 
 const AnswerBody = Schema.Struct({
   seq: Schema.Int,
@@ -343,6 +347,14 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const updateDiscussion = write(
+      Effect.gen(function* () {
+        const id = KanbanDiscussionId.make(yield* param("discussion"));
+        const input = yield* body(DiscussionPatchBody);
+        return yield* service.updateDiscussion(id, input, OWNER);
+      }),
+    );
+
     const listMessages = read(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
@@ -449,6 +461,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),
+      HttpRouter.route("PATCH", `${p}/discussions/:discussion`, handle(updateDiscussion)),
       HttpRouter.route("GET", `${p}/discussions/:discussion/messages`, handle(listMessages)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/messages`, handle(postMessage)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/answer`, handle(answer)),

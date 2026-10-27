@@ -1,10 +1,18 @@
-import { ChevronDownIcon, ListFilterIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  ChevronDownIcon,
+  ListFilterIcon,
+  PlusIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
 import { useState } from "react";
 
 import {
   activeGoals,
   type GroupBy,
   type KanbanBoardState,
+  type SettledFilter,
 } from "@t3tools/client-runtime/ardud/kanban";
 
 import {
@@ -62,6 +70,7 @@ export function BoardPage(props: {
   const view = search.view ?? "board";
   const nowMs = useNowMs();
   const [query, setQuery] = useState("");
+  const [settled, setSettled] = useState<SettledFilter>("hide");
 
   const go = (patch: SearchPatch) => {
     const next: Record<string, unknown> = { ...search, ...patch };
@@ -110,7 +119,15 @@ export function BoardPage(props: {
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
           {view === "board" && state ? (
-            <BoardControls state={state} search={search} go={go} query={query} onQuery={setQuery} />
+            <BoardControls
+              state={state}
+              search={search}
+              go={go}
+              query={query}
+              onQuery={setQuery}
+              settled={settled}
+              onSettled={setSettled}
+            />
           ) : (
             <span className="flex-1" />
           )}
@@ -120,7 +137,7 @@ export function BoardPage(props: {
             className="inline-flex h-8.5 shrink-0 items-center gap-1.5 rounded-full bg-(--m-accent) ps-3 pe-3.5 text-sm font-medium text-(--m-accent-ink) max-md:px-2.25 outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text)"
           >
             <PlusIcon className="size-4" aria-hidden />
-            <span className="max-md:sr-only">Request</span>
+            <span className="max-md:sr-only">New</span>
           </button>
         </WorkspacePageHeader>
         <main className="relative mx-2 mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl bg-(--m-ground) ps-5 pt-4.5 ring-1 ring-(--m-rule)">
@@ -165,6 +182,7 @@ export function BoardPage(props: {
                   state={state}
                   search={search}
                   query={query}
+                  settled={settled}
                   nowMs={nowMs}
                   go={go}
                   openCard={openCard}
@@ -194,6 +212,7 @@ function BoardBody(props: {
   state: KanbanBoardState;
   search: BoardSearch;
   query: string;
+  settled: SettledFilter;
   nowMs: number;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
@@ -204,6 +223,7 @@ function BoardBody(props: {
   const filter = {
     ...(search.only ? { goalId: search.only } : {}),
     ...(query ? { query } : {}),
+    settled: props.settled,
   };
   switch (search.view ?? "board") {
     case "board":
@@ -279,6 +299,8 @@ function BoardControls(props: {
   go: (patch: SearchPatch) => void;
   query: string;
   onQuery: (query: string) => void;
+  settled: SettledFilter;
+  onSettled: (settled: SettledFilter) => void;
 }) {
   const narrow = useMediaQuery("max-md");
   const goals = activeGoals(props.state);
@@ -347,6 +369,37 @@ function BoardControls(props: {
           </MenuPopup>
         </Menu>
       ) : null}
+      <Menu>
+        <MenuTrigger
+          render={
+            <button
+              type="button"
+              aria-label="Settled cards"
+              className={cn(
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+                props.settled !== "hide"
+                  ? "bg-(--m-text) text-(--m-ground)"
+                  : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
+              )}
+            />
+          }
+        >
+          <ArchiveIcon className="size-3.5 shrink-0" aria-hidden />
+          <span className="max-md:sr-only">
+            {props.settled === "only" ? "Settled only" : "Settled"}
+          </span>
+        </MenuTrigger>
+        <MenuPopup align="start" side="bottom">
+          <MenuRadioGroup
+            value={props.settled}
+            onValueChange={(value) => props.onSettled(value as SettledFilter)}
+          >
+            <MenuRadioItem value="hide">Hide settled</MenuRadioItem>
+            <MenuRadioItem value="include">Show settled</MenuRadioItem>
+            <MenuRadioItem value="only">Only settled</MenuRadioItem>
+          </MenuRadioGroup>
+        </MenuPopup>
+      </Menu>
       <span className="flex-1" />
       <QueryField value={props.query} onChange={props.onQuery} />
     </div>

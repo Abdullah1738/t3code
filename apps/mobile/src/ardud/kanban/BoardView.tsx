@@ -4,13 +4,15 @@ import {
   type CardView,
   type GoalSummary,
   type KanbanBoardState,
+  type SettledFilter,
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { Fragment, useState } from "react";
-import { Pressable, ScrollView, View } from "react-native";
+import { Fragment, useRef, useState } from "react";
+import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
+import { SearchField } from "../../components/ui/SearchField";
 import { cn } from "../../lib/cn";
 import { ChoiceRow, LinkButton } from "../common/parts";
 import {
@@ -44,19 +46,55 @@ export function BoardView(props: {
   const [goalId, setGoalId] = useState<string | null>(null);
   // A goal that finished or vanished stops filtering.
   const filter = goals.some((entry) => entry.goal.id === goalId) ? goalId : null;
-  const board = stageBoard(props.state, props.nowMs, { goalId: filter });
-  const filterRow =
-    goals.length > 0 ? (
-      <ChoiceRow
-        accessibilityLabel="Goal"
-        options={[
-          { value: "", label: "All" },
-          ...goals.map((entry) => ({ value: entry.goal.id, label: entry.goal.name })),
-        ]}
-        selected={filter ?? ""}
-        onSelect={(value) => setGoalId(value === "" ? null : value)}
-      />
-    ) : null;
+  const [query, setQuery] = useState("");
+  const [settled, setSettled] = useState<SettledFilter>("hide");
+  const searchRef = useRef<TextInputInstance | null>(null);
+  const board = stageBoard(props.state, props.nowMs, { goalId: filter, query, settled });
+  const filterRow = (
+    <View className="gap-2.5">
+      <View className="flex-row items-center gap-2">
+        <SearchField
+          inputRef={searchRef}
+          autoFocus={false}
+          accessibilityLabel="Search cards"
+          clearAccessibilityLabel="Clear search"
+          placeholder="Search cards"
+          value={query}
+          onChangeText={setQuery}
+        />
+        <Pressable
+          accessibilityRole="switch"
+          accessibilityLabel="Show settled cards"
+          accessibilityState={{ checked: settled === "include" }}
+          onPress={() => setSettled((current) => (current === "hide" ? "include" : "hide"))}
+          className={cn(
+            "min-h-11 justify-center rounded-full px-4",
+            settled === "include" ? "bg-foreground" : "bg-grouped-card",
+          )}
+        >
+          <Text
+            className={cn(
+              "text-[13px] font-t3-semibold",
+              settled === "include" ? "text-screen" : "text-foreground",
+            )}
+          >
+            Settled
+          </Text>
+        </Pressable>
+      </View>
+      {goals.length > 0 ? (
+        <ChoiceRow
+          accessibilityLabel="Goal"
+          options={[
+            { value: "", label: "All" },
+            ...goals.map((entry) => ({ value: entry.goal.id, label: entry.goal.name })),
+          ]}
+          selected={filter ?? ""}
+          onSelect={(value) => setGoalId(value === "" ? null : value)}
+        />
+      ) : null}
+    </View>
+  );
 
   if (props.layout.kind === "tabs") {
     return (
@@ -254,12 +292,12 @@ function ColumnsBoard(props: {
 
   return (
     <View className="flex-1 gap-3 pt-2">
-      {props.goals.length > 0 ? (
-        <View className="gap-2.5" style={{ paddingHorizontal: BOARD_PAD }}>
+      <View className="gap-2.5" style={{ paddingHorizontal: BOARD_PAD }}>
+        {props.goals.length > 0 ? (
           <GoalStrip goals={props.goals} onOpenGoal={props.onOpenGoal} />
-          {props.filterRow}
-        </View>
-      ) : null}
+        ) : null}
+        {props.filterRow}
+      </View>
       <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
         {layout.scrolls ? (
           <ScrollView

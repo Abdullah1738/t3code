@@ -1,17 +1,19 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import type { KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import { discussionSnoozed, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import type { KanbanDiscussion } from "@t3tools/contracts";
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
-import type { AppBarAction } from "../../components/ui/AppBar.types";
+import type { AppBarAction, AppBarMenu } from "../../components/ui/AppBar.types";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
 import { useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
 import { Chat } from "./Chat";
+import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
@@ -118,6 +120,7 @@ function Shell(props: {
   readonly title: string;
   readonly onBack: () => void;
   readonly actions?: ReadonlyArray<AppBarAction>;
+  readonly menus?: ReadonlyArray<AppBarMenu>;
   readonly children: ReactNode;
 }) {
   const headerInset = useHeaderInset();
@@ -128,6 +131,7 @@ function Shell(props: {
         sidebar={false}
         onBack={props.onBack}
         {...(props.actions ? { actions: props.actions } : {})}
+        {...(props.menus ? { menus: props.menus } : {})}
       />
       <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
         {props.children}
@@ -158,6 +162,7 @@ function DiscussionScreen(props: {
     <Shell
       title={title}
       onBack={props.onBack}
+      menus={discussion ? [discussionOptions(props.boardId, discussion, props.nowMs)] : []}
       actions={
         card
           ? [
@@ -185,6 +190,39 @@ function DiscussionScreen(props: {
       />
     </Shell>
   );
+}
+
+/** Settle, snooze and rename from the open discussion's header. */
+function discussionOptions(
+  boardId: string,
+  discussion: KanbanDiscussion,
+  nowMs: number,
+): AppBarMenu {
+  const run = (choice: string) =>
+    runDiscussionMenu({ boardId, discussionId: discussion.id, title: discussion.title, choice });
+  return {
+    title: "Discussion options",
+    icon: "ellipsis.circle",
+    items: discussionMenu({
+      settled: discussion.settledAt !== null,
+      snoozed: discussionSnoozed(discussion, nowMs),
+      now: new Date(nowMs),
+    }).map((item) =>
+      "presets" in item
+        ? {
+            id: item.id,
+            title: item.title,
+            icon: MENU_ICONS[item.id],
+            items: item.presets.map((preset) => ({ ...preset, onPress: () => run(preset.id) })),
+          }
+        : {
+            id: item.id,
+            title: item.title,
+            icon: MENU_ICONS[item.id],
+            onPress: () => run(item.id),
+          },
+    ),
+  };
 }
 
 function DiscussionsScreen(props: {

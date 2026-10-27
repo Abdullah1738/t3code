@@ -555,6 +555,12 @@ export const KanbanDiscussion = Schema.Struct({
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
+  /** Set when the owner names it; the server stops writing titles for it then. */
+  titleEditedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The owner put it away; a new message from anyone else brings it back. */
+  settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** Hidden until then, or until someone else posts. */
+  snoozedUntil: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanDiscussion = typeof KanbanDiscussion.Type;
 

@@ -34,6 +34,7 @@ export const CardTile = memo(function CardTile(props: {
         <Pri priority={card.priority} />
         <span className="tabular-nums">#{card.number}</span>
         {card.unread > 0 ? <UnreadDot label={`${card.unread} unread`} /> : null}
+        {card.card.settledAt !== null ? <span>Settled</span> : null}
         <span className="ms-auto tabular-nums">{card.age}</span>
       </span>
       <span className="line-clamp-2 leading-snug font-medium">{card.title}</span>
