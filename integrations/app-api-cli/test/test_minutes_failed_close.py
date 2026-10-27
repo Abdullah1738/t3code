@@ -162,6 +162,17 @@ class EvidenceGateTests(unittest.TestCase):
     def test_cancelled_passes(self):
         self.assertEqual(self.gate(snap=order_snap(status='cancelled'))['order_status'], 'cancelled')
 
+    def test_pending_status_and_echo_mismatch_refuse(self):
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_ORDER_NOT_FAILED'):
+            self.gate(snap=order_snap(status='pending'))
+        with self.assertRaisesRegex(Exception, 'ORDER_MISMATCH'):
+            order_snap(echoed='IAEGOTHERORDER')
+
+    def test_authorized_or_captured_alone_refuses(self):
+        for pay in (intent(authorized=Decimal('1.00')), intent(captured=Decimal('1.00'))):
+            with self.subTest(pay.wire), self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED'):
+                self.gate(pay=pay)
+
 
 class CloseFailedFlowTests(JournalCase):
     def run_close(self, client, receipts_list=None, changed=False):
@@ -196,8 +207,20 @@ class CloseFailedFlowTests(JournalCase):
                                                         total_minor=AMOUNT, timeout=25)
         for name in ('complete_payment', 'place_order', 'sync'):
             getattr(c, name).assert_not_called()
+        self.assertEqual({name for name, _, _ in c.method_calls},
+                         {'order_status', 'active_orders', 'payment_intent_status'})
         self.assertNotIn('PRIVATE-INTENT', str(out))
         self.assertNotIn(ACCOUNT, str(out))
+
+    def test_second_close_refuses_and_writes_once(self):
+        self.placed()
+        self.run_close(self.client())
+        with self.assertRaisesRegex(j.JournalError, 'MINUTES_FAILED_FLOW_REQUIRED'):
+            self.run_close(self.client())
+        with j._db() as db:
+            rows = db.execute("SELECT COUNT(*) FROM observations WHERE flow_id=? AND outcome='MINUTES_CLOSED_FAILED_UNCAPTURED'",
+                              (FLOW,)).fetchone()[0]
+        self.assertEqual(rows, 1)
 
     def test_receipt_change_during_reads_vetoes(self):
         self.placed()
