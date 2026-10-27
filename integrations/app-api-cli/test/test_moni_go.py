@@ -736,5 +736,56 @@ class ReceiptGapOrderTests(unittest.TestCase):
         self.assertEqual(got['text'], 'yes order it')
 
 
+class ReplacedGoOrderTests(unittest.TestCase):
+    """A short repeat of her go must not restart an order whose earlier go is unprovably ordered."""
+
+    def timed(self, row_id, text, sent_ago, *, group=None):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-replace-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_short_repeat_in_chat_45_does_not_restart_an_ambiguous_group_go(self):
+        # Receipt-only group go 'ok psl' (received 5 min ago) vs her 1:1 cancel (received 20 min ago): unprovable.
+        # A repeat 'ok psl' in chat 45 one minute ago must not make the order stand.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'group-sb_gro': [self.recv('G1', 'ok psl', 5)],
+                                     'moni': [self.recv('P1', 'nvm', 20)]},
+                          chat_45=[msg('ok psl', 1, mid=900)])
+
+    def test_short_repeat_in_timed_group_does_not_restart_an_ambiguous_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'group-sb_gro': [self.recv('G1', 'ok psl', 5)],
+                                     'moni': [self.recv('P1', 'nvm', 20)],
+                                     'group-other': [self.timed('G2', 'ok psl', 1)]})
+
+    def test_repeat_after_a_provably_earlier_cancel_still_stands(self):
+        # The cancel was sent before the first go: nothing unprovable, so the repeat is the go that stands.
+        got = self.run_case('ok psl', {'group-sb_gro': [self.timed('G1', 'ok psl', 5)],
+                                       'moni': [self.timed('P1', 'nvm', 30)]},
+                            chat_45=[msg('ok psl', 1, mid=900)])
+        self.assertEqual(got['text'], 'ok psl')
+
+
 if __name__ == '__main__':
     unittest.main()

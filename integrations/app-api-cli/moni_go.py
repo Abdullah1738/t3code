@@ -347,6 +347,9 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
     # After a cancel, only a clear go phrase, or her go words when they are specific, put it back on.
     rego_by_words = len(wanted.split()) >= REGO_MIN_WORDS
     go_row = cancel_row = unheard = bridge_go_at = None
+    # Every go a later message replaced: a short repeat must not restart an order whose
+    # original go is still unprovably ordered against a cancel from another source.
+    replaced = []
     mine, unparsed = _moni_rows(rows, oldest, now + dt.timedelta(minutes=2), bridge_rows)
     for row in mine:
         if go_row is not None and go_row.get('_bridge'):
@@ -371,10 +374,12 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
             cancel_row = cancel_row or row
         elif cancel_row is None:
             if _has(text, wanted):
+                replaced.append(go_row)
                 go_row = row
         elif (rego_by_words and _has(text, wanted)) or (
                 any(_has(text, p) for p in GO_PHRASES) and not _has(text, 'myself')):
             # "ok order it myself" means she will order it, not us.
+            replaced.append(go_row)
             go_row, cancel_row = row, None
     if go_row is not None and go_row.get('_bridge'):
         bridge_go_at = _parse_time(go_row.get('created_at'))
@@ -383,9 +388,10 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
     if any(mid > _row_id(go_row) for mid in unparsed) or unheard is not None:
         # A newer message of hers has no readable time or words; it could be a cancel after the go.
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
-    if _ambiguous_receipt_order(go_row, mine) is not None:
-        # Her go and a cancel from another source are ordered only by receipt time, close enough to swap.
-        raise RuntimeError('MONI_GO_UNVERIFIABLE')
+    for candidate in [*replaced, go_row]:
+        if candidate is not None and _ambiguous_receipt_order(candidate, mine) is not None:
+            # A go (current or one a repeat replaced) whose order against a cancel from another source is unprovable.
+            raise RuntimeError('MONI_GO_UNVERIFIABLE')
     if cancel_row is None and bridge_go_at is not None:
         # Bridge times are when the bridge stored a message, which can lag her send by any
         # amount, so once a go from her Robob thread counted, a chat 45 cancel anywhere
