@@ -26,6 +26,7 @@ import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
+import { CardDescription } from "./CardDescription";
 import { PrGlyph } from "./CardTile";
 import { Chat, Composer } from "./Chat";
 import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from "./kanbanStore";
@@ -187,7 +188,7 @@ export function CardDrawer(props: {
           {card.title}
         </h2>
         {card.description ? (
-          <p className="line-clamp-4 text-sm leading-normal text-(--m-text)">{card.description}</p>
+          <CardDescription key={card.description} text={card.description} />
         ) : null}
         <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
           <Chip>
