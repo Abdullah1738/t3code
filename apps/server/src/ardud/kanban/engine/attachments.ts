@@ -72,10 +72,14 @@ export const makeBoardAttachments = (
           pending.push(attachment);
           continue;
         }
+        // The caller's name and mimeType decide the path agents open, so they must
+        // resolve to the file the id already points at, not a different extension.
         const kept =
           segment !== null &&
           parseThreadSegmentFromAttachmentId(attachment.id) === segment &&
-          existing !== null;
+          existing !== null &&
+          existing ===
+            resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment });
         if (!kept) return yield* cantPost(attachment);
       }
 

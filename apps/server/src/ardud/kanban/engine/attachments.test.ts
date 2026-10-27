@@ -7,7 +7,11 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 
-import { createPendingAttachmentId, resolveAttachmentPath } from "../../../attachmentStore.ts";
+import {
+  createAttachmentId,
+  createPendingAttachmentId,
+  resolveAttachmentPath,
+} from "../../../attachmentStore.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -75,6 +79,24 @@ const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(attachmentsLayerTest),
   );
+
+/** A file already kept under a given owner segment, as a claim would leave it. */
+const writeKept = (attachmentsDir: string, segment: string, name: string, bytes: string) =>
+  Effect.gen(function* () {
+    const path = yield* Path.Path;
+    const fs = yield* FileSystem.FileSystem;
+    const id = createAttachmentId(segment, path.extname(name).slice(1) || undefined)!;
+    const attachment = {
+      type: "file" as const,
+      id,
+      name,
+      mimeType: "application/pdf",
+      sizeBytes: new TextEncoder().encode(bytes).byteLength,
+    };
+    yield* fs.makeDirectory(attachmentsDir, { recursive: true });
+    yield* fs.writeFileString(resolveAttachmentPath({ attachmentsDir, attachment })!, bytes);
+    return attachment;
+  });
 
 /** A pending upload written the way the upload endpoint would store it. */
 const writePending = (
@@ -153,6 +175,9 @@ it.effect("the text the agent receives carries the absolute path of the stored f
       })!;
       const path = yield* Path.Path;
       assert.isTrue(path.isAbsolute(storedPath));
+      // The agent receives the text; it must carry the path it can open.
+      const delivered = [...(yield* Ref.get(fake.threads)).values()].flatMap((thread) => thread.messages);
+      assert.isTrue(delivered.some((text) => text.includes(storedPath)));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -167,20 +192,25 @@ it.effect("another thread's id is refused as invalid and nothing is stored", () 
         name: "Attach foreign",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      const config = yield* ServerConfig.ServerConfig;
       const discussion = yield* kanban.createDiscussion(board.id, "Foreign", owner);
-      const foreign = {
+      const otherThread = yield* writeKept(config.attachmentsDir, "thread-abc", "secret.pdf", "%PDF");
+      const otherBoard = yield* writeKept(config.attachmentsDir, "kanban-other-board", "plan.pdf", "%PDF");
+      const missing = {
         type: "file" as const,
-        id: "thread-abc-00000000-0000-4000-8000-000000000000-pdf",
-        name: "secret.pdf",
+        id: createAttachmentId(`kanban-${board.id}`, "pdf")!,
+        name: "gone.pdf",
         mimeType: "application/pdf",
         sizeBytes: 3,
       };
 
-      const error = yield* kanban
-        .post(discussion.id, owner, [{ _tag: "attachment", attachment: foreign }])
-        .pipe(Effect.flip);
-      assert.strictEqual(error.code, "invalid");
-      assert.include(error.detail, "secret.pdf");
+      for (const foreign of [otherThread, otherBoard, missing]) {
+        const error = yield* kanban
+          .post(discussion.id, owner, [{ _tag: "attachment", attachment: foreign }])
+          .pipe(Effect.flip);
+        assert.strictEqual(error.code, "invalid");
+        assert.include(error.detail, foreign.name);
+      }
       assert.strictEqual((yield* kanban.messages(discussion.id)).length, 0);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
