@@ -1,10 +1,8 @@
 import { createHash } from 'node:crypto';
 import { tx, get, all, run, CoordError, setOnOpen } from './db.mjs';
 import * as evidence from './evidence.mjs';
-import * as forward from './forward.mjs';
 
 export { evidence, CoordError };
-export { messagingTarget } from './forward.mjs';
 
 export { open, close } from './db.mjs';
 
@@ -115,31 +113,35 @@ function requireMode(scope, allowDrain) {
     throw refuse(g.mode === 'pause' ? 'paused' : 'draining', `${g.key} is ${g.mode}${g.reason ? `: ${g.reason}` : ''}`, { gate: g });
 }
 
-// Messaging mode. `messaging=coord` (default, also the rollback) keeps post/inbox/ack on coord.db and the pump rings.
-// `messaging=robob` forwards post/inbox/ack to the Robob missions API (lib/forward.mjs) for the mission in
-// `messaging:mission`, and the pump stops ringing. Claims, QA windows, releases, deps and the arch queue stay here.
-export const MESSAGING_MODES = ['coord', 'robob'];
+// Messaging always lives in coord.db (post/inbox/ack, rung by the pump). The old `messaging=robob` mode forwarded
+// them to the Robob missions API, which is gone; a control row that still says `robob` is ignored (logged once per
+// process) and shown as `retired` in status. `coord messaging coord --as master` clears it.
+export const MESSAGING_MODES = ['coord'];
 export const MESSAGING_SETTERS = ['master'];
+let retiredLogged = false;
 export function messaging() {
   const r = get("SELECT * FROM control WHERE k='messaging'");
+  const retired = r && r.v !== 'coord' ? r.v : null;
+  if (retired && !retiredLogged) {
+    retiredLogged = true;
+    console.error(`coord: messaging=${retired} is retired (Robob missions are gone); using coord.db messaging. Clear it with: coord messaging coord --as master`);
+  }
   return {
-    mode: r?.v === 'robob' ? 'robob' : 'coord',
-    mission: get("SELECT v FROM control WHERE k='messaging:mission'")?.v ?? null,
+    mode: 'coord',
+    ...(retired ? { retired } : {}),
     set_by: r?.set_by ?? null, set_at: r?.set_at ?? null, reason: r?.reason ?? null,
   };
 }
-export function setMessaging(mode, { as, reason, mission } = {}) {
-  if (!MESSAGING_MODES.includes(mode)) throw refuse('invalid', `messaging must be ${MESSAGING_MODES.join('|')}`);
+export function setMessaging(mode, { as, reason } = {}) {
+  if (!MESSAGING_MODES.includes(mode)) throw refuse('invalid', `messaging must be ${MESSAGING_MODES.join('|')} (robob forwarding is retired)`);
   need(as, 'as');
   if (!MESSAGING_SETTERS.includes(as)) throw refuse('forbidden', `only ${MESSAGING_SETTERS.join('|')} may switch messaging`);
-  const upsert = (k, v) => run('INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at, reason=excluded.reason',
-    k, v, as, now(), reason ?? null);
-  return tx(() => {
-    if (mission !== undefined && mission !== null && mission !== '') upsert('messaging:mission', String(mission).trim());
-    if (mode === 'robob' && !messaging().mission) throw refuse('mission_required', 'messaging=robob needs --mission (the Robob mission the coord channels were imported into)');
-    upsert('messaging', mode);
-    return messaging();
+  tx(() => {
+    run('INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at, reason=excluded.reason',
+      'messaging', mode, as, now(), reason ?? null);
+    run("DELETE FROM control WHERE k='messaging:mission'");
   });
+  return messaging();
 }
 
 // ---------- actors, channels, members ----------
@@ -215,14 +217,6 @@ export function memberRm(channel, actorId) {
 // ---------- events, deliveries, ack ----------
 
 // Unambiguous per (event, recipient): colons in either part cannot collide.
-// post, inbox and ack stay synchronous on coord.db. With messaging=robob they return a Promise of the same shape.
-const forwarding = () => {
-  const m = messaging();
-  if (m.mode !== 'robob') return null;
-  if (!m.mission) throw refuse('mission_required', 'messaging=robob but no messaging:mission row; run coord messaging robob --mission ID');
-  return m;
-};
-
 export const deliveryId = (eventKey, recipient) => `coord:${createHash('sha256').update(JSON.stringify([eventKey, recipient])).digest('hex')}`;
 
 export function post(channel, o = {}) {
@@ -233,9 +227,6 @@ export function post(channel, o = {}) {
   const ev = o.env === undefined || o.env === null ? null : canonicalEnv(o.env, { supported: false });
   const fields = { channel, kind, sender: as, work: o.work, env: ev ?? undefined, rev: o.rev, authority: o.authority, summary, body: o.body, reply_to: o.replyTo, to };
   const h = hash(fields);
-  const m = forwarding();
-  if (m) return forward.post({ mission: m.mission, channel, as, kind, key, hash: h, summary, to: to ?? null, work: o.work ?? null,
-    env: ev, rev: o.rev ?? null, authority: o.authority ?? null, body: o.body ?? null, replyTo: o.replyTo ?? null });
   return tx(() => {
     const prev = get('SELECT seq, body_hash FROM events WHERE event_key=?', key);
     if (prev) {
@@ -264,8 +255,6 @@ export function post(channel, o = {}) {
 
 export function inbox({ as, unacked = false, after = 0, limit = 100 } = {}) {
   need(as, 'as');
-  const m = forwarding();
-  if (m) return forward.inbox({ mission: m.mission, as, unacked: !!unacked, after: Number(after) || 0, limit: Number(limit) });
   return {
     events: all(`SELECT e.*, d.status delivery, d.acked_at FROM deliveries d JOIN events e ON e.seq=d.event_seq
       WHERE d.recipient=? AND e.seq>? ${unacked ? "AND d.status!='acked'" : ''} ORDER BY e.seq LIMIT ?`, as, Number(after) || 0, Number(limit))
@@ -275,8 +264,6 @@ export function inbox({ as, unacked = false, after = 0, limit = 100 } = {}) {
 
 export function ack(as, refs = []) {
   need(as, 'as');
-  const m = forwarding();
-  if (m) return forward.ack({ mission: m.mission, as, refs: refs.map(String) });
   return tx(() => ({
     acked: refs.map(ref => {
       const e = /^\d+$/.test(String(ref)) ? get('SELECT seq FROM events WHERE seq=?', Number(ref)) : get('SELECT seq FROM events WHERE event_key=?', ref);
@@ -1164,7 +1151,8 @@ function checkStoredState() {
     throw refuse('noncanonical_state', `stored state is not canonical; reconcile by hand: ${list_}${bad.length > 10 ? `; and ${bad.length - 10} more` : ''}`, { rows: bad });
   }
 }
-setOnOpen(checkStoredState);
+// messaging() logs a retired `messaging=robob` row once per process.
+setOnOpen(() => { checkStoredState(); messaging(); });
 
 export const archKey = (repos, pins, prefix = 'crw-drift') => `${prefix}:${[...repos].sort().join(',')}:${hash(pins).slice(0, 16)}`;
 
@@ -1276,8 +1264,7 @@ export async function drainReport({ threadState, scope } = {}) {
   const inflight = {
     releases: all("SELECT id, kind, environment, state, requester FROM releases WHERE state IN ('admitted','running')"),
     claims: all("SELECT resource, owner, fence, state, op_ref FROM claims WHERE state IN ('active','reconcile_required')"),
-    // messaging=robob: the pump no longer rings, so coord.db's pending deliveries are history, not in-flight work.
-    deliveries: messaging().mode === 'robob' ? 0 : get("SELECT COUNT(*) n FROM deliveries WHERE status='pending'").n,
+    deliveries: get("SELECT COUNT(*) n FROM deliveries WHERE status='pending'").n,
     threads: [],
   };
   // Thread actors that cannot be checked count as not drained.
@@ -1291,13 +1278,6 @@ export async function drainReport({ threadState, scope } = {}) {
 
 export function attention({ unackedAfter = DEFAULTS.unackedAfter } = {}) {
   const t = now();
-  const m = messaging();
-  // messaging=robob: unread messages live in Robob (its inbox and doorbell); coord.db deliveries are pre-cutover history.
-  if (m.mode === 'robob') return { ...attentionAll(t, unackedAfter), unacked: [], failed_deliveries: [], pending_overdue: [], messaging: { mode: m.mode, mission: m.mission } };
-  return attentionAll(t, unackedAfter);
-}
-
-function attentionAll(t, unackedAfter) {
   return {
     unacked: all(`SELECT d.event_seq seq, d.recipient, d.status, d.sent_at, d.reminded, e.channel_id, e.summary FROM deliveries d JOIN events e ON e.seq=d.event_seq
       WHERE d.status IN ('sent','skipped') AND COALESCE(d.sent_at, e.created_at)<=?`, t - unackedAfter),

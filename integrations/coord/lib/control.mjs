@@ -1,8 +1,7 @@
-// Robob control API location and token, shared by the pump (thread sends) and the messaging forward mode
-// (missions API). Explicit values win, then T3_CONTROL_URL/T3_CONTROL_TOKEN, then coord's own credential file:
-// COORD_CONTROL_TOKEN_FILE, default ~/.robob/components/coord.json. The file must be chmod 600.
-// T3_CONTROL_TOKEN_FILE is ignored on purpose: crw loads coord in-process and points that setting at its own
-// credential, and Robob only takes forwarded coord calls from the coord credential.
+// Robob control API location and token for the pump's thread sends. Explicit values win, then
+// T3_CONTROL_URL/T3_CONTROL_TOKEN, then coord's own credential file: COORD_CONTROL_TOKEN_FILE, default
+// ~/.robob/components/coord.json. The file must be chmod 600. T3_CONTROL_TOKEN_FILE is ignored on purpose: crw
+// loads coord in-process and points that setting at its own credential.
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';

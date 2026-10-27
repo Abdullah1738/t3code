@@ -86,17 +86,6 @@ export interface ControlMessage {
   updatedAt: string | null;
 }
 
-/** A mission as the missions status snapshot lists it; only the fields the bridge reads. */
-export interface MissionThreads {
-  id: string;
-  /** Threads that belong to the mission. */
-  threadIds?: string[];
-  /** The master's threads; older servers leave it out. */
-  masterThreadIds?: string[];
-  /** Threads attached by a component, with no role or lane; older servers leave it out. */
-  attachedThreadIds?: string[];
-}
-
 export interface ControlEventFrame {
   id?: string;
   event?: string;
@@ -205,45 +194,6 @@ export class ControlClient {
 
   projects(): Promise<{ projects: Array<{ projectId: string; title: string; workspaceRoot: string; scratch?: boolean }> }> {
     return this.request("GET", "/projects");
-  }
-
-  /** Robob's session board snapshot. It lives outside the control prefix and has no `ok` envelope. */
-  board<T>(): Promise<T> {
-    return this.outside<T>("/api/ardud/board", "board");
-  }
-
-  /** Every listed mission with its thread ids (`GET /api/ardud/missions/status`). */
-  missions(): Promise<{ missions: MissionThreads[] }> {
-    return this.outside("/api/ardud/missions/status", "missions");
-  }
-
-  /**
-   * Whether Robob's router takes a thread's questions and permission requests
-   * to a lead, a thread delegated by a lane included (`GET /api/ardud/missions/lead-routed`).
-   */
-  leadRouted(threadId: string): Promise<{ routed: boolean }> {
-    return this.outside(`/api/ardud/missions/lead-routed?threadId=${encodeURIComponent(threadId)}`, "lead routing");
-  }
-
-  /** A read-only GET outside the control prefix. */
-  private async outside<T>(path: string, what: string): Promise<T> {
-    let response: Response;
-    try {
-      response = await fetch(`${this.url}${path}`, {
-        headers: { authorization: `Bearer ${this.token}`, accept: "application/json" },
-        signal: AbortSignal.timeout(15_000),
-        redirect: "manual",
-        proxy: "",
-        verbose: false,
-      });
-    } catch {
-      throw new ControlError(0);
-    }
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new ControlError(response.status, what);
-    }
-    return await response.json() as T;
   }
 
   respond(threadId: string, requestId: string, body: Record<string, unknown>): Promise<unknown> {

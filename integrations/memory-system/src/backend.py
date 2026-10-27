@@ -289,9 +289,8 @@ def scheduled_task_session_ids(con):
 
 
 def board_backlog_session_ids(con):
-    """Native session ids of threads on the Robob board Backlog lane, or None
-    when the board tables do not exist yet.
-    TODO: read GET /api/ardud/board once the session board lands, instead of its tables."""
+    """Native session ids of threads on the retired Robob board's Backlog lane,
+    or None when its table is not in the DB."""
     board = tables(con, "ardud_board_%")
     if "ardud_board_rows" not in board:
         return None

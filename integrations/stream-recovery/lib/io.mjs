@@ -229,8 +229,7 @@ export function threadMessageIdsSince(db, threadId, sinceIso) {
 // Robob's address and credential: T3_CONTROL_URL/T3_CONTROL_TOKEN, else
 // T3_CONTROL_TOKEN_FILE, else the component credential
 // ~/.robob/components/stream-recovery.json (from `t3 ardud component-token
-// issue stream-recovery`). Mission recovery takes restart reports only from
-// that credential. Token files must be chmod 600.
+// issue stream-recovery`). Token files must be chmod 600.
 export function controlConfig(env = process.env, home = HOME) {
   // A named file must exist; only the default is skipped when missing.
   const named = env.T3_CONTROL_TOKEN_FILE;
@@ -286,20 +285,6 @@ async function api(method, path, body) {
     throw e;
   }
   return data;
-}
-
-// Hands a restart incident to Robob's mission recovery. It records the incident
-// for mission members (deduped by reportId) and returns which threads it owns.
-// body: {reportId, cause, startAt, endAt, threads: [{threadId, runIds, childIds}], dryRun?}
-export async function missionRecoveryReport(body) {
-  return api("POST", "/api/ardud/missions/recovery/incident", body);
-}
-
-// Which of these threads belong to a live mission. A read, so it still works
-// with a credential the report itself is refused for.
-export async function missionRecoveryMembers(threadIds) {
-  const query = encodeURIComponent(threadIds.join(","));
-  return (await api("GET", `/api/ardud/missions/recovery/members?threadIds=${query}`)).members ?? [];
 }
 
 export async function getThread(threadId) {

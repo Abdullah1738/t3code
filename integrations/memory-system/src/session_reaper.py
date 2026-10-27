@@ -211,8 +211,9 @@ def openchamber_backlog_ids():
 
 
 def robob_backlog_ids():
-    # Same rule for the Robob session board, and no board at all also means no run.
-    # TODO: switch to GET /api/ardud/board once the session board API lands.
+    # Same rule for the old Robob session board. The board is retired (its API is
+    # gone, the table stays as an archive); a DB without the table has no Backlog
+    # to protect, so that doesn't stop the run. A table that can't be read does.
     try:
         con = backend.robob_ro()
         try:
@@ -221,10 +222,7 @@ def robob_backlog_ids():
             con.close()
     except Exception as e:
         raise Gate(f"cannot read Robob session board backlog ({e!r})")
-    if ids is None:
-        raise Gate("Robob session board not found (no ardud_board_rows table); "
-                   "not deleting anything until its backlog can be read")
-    return ids
+    return set() if ids is None else ids
 
 
 def control_gate():

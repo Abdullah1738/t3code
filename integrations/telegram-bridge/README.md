@@ -82,9 +82,10 @@ config.json (default `openchamber`). The token comes from
   reads it once a minute; opened requests also arrive as events. Button taps,
   replies and the final send check read it live.
   Replies use the respond route.
-- Board: read from Robob's session board (`GET /api/ardud/board`, same
-  bearer token) only to find directories with running or attention-needing
-  threads. It no longer produces review notices.
+- Busy folders: `GET /threads?active=true` (root threads that are not idle,
+  iMessage chats left out) finds directories with running or
+  attention-needing threads, and a thread whose reply is out stops being
+  polled. It never produces review notices.
 - iMessage family: every thread reports its root's origin, so subagents of an
   iMessage chat stay quiet without a parent walk.
 

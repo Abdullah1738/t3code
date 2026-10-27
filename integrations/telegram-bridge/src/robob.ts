@@ -1,19 +1,16 @@
 import type { NotificationEvent } from "./notification-events.ts";
 import {
-  type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
+  IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
   type QuestionRequest, type RequestReader, type SessionRecord, type SessionStatus,
 } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
-  type ControlConfigOptions, type MissionThreads, type PendingRequest, type ThreadState, type ThreadSummary,
+  type ControlConfigOptions, type PendingRequest, type ThreadState, type ThreadSummary,
 } from "./control.ts";
-
-/** How long one missions status read answers `leadAnswers`: about one attention tick. */
-const MISSIONS_FRESH_MS = 5_000;
 
 /** States that mean a thread is still working. `waiting` is not: its reply is out, only background work drains. */
 const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
-/** Where review notices come from: Robob's session board, or a stand-in in tests. */
+/** Where attention finds busy folders: Robob's active thread list, or a stand-in in tests. */
 export interface ReviewBoard {
   snapshot(): Promise<BoardSnapshot>;
 }
@@ -24,59 +21,43 @@ export function runOrdinal(runId: string | null | undefined): number {
   return match ? Number(match[1]) : 0;
 }
 
-/** One card of Robob's session board (/api/ardud/board), as the server sends it. */
-export interface RobobBoardEntry {
-  threadId: string;
-  projectId: string | null;
-  title: string;
-  state: BoardEntry["state"];
-  /** `working`, `queued`, `background`, `needs-input`, `idle`, `deleted` or `unknown`. */
-  status: string;
-  workRevision: number;
-  updatedAt: number;
-  attention?: { kind: "question" | "approval"; count: number };
-  worktreePath?: string | null;
-}
-
-export interface RobobBoardSnapshot {
-  version: 1;
-  revision: number;
-  activatedAt: number;
-  entries: RobobBoardEntry[];
-  syncError: string | null;
-}
-
 /**
- * Maps a server card onto attention.ts's board vocabulary. The server already
- * leaves iMessage threads off the board, files automated origins under
- * scheduled and rolls subagents up into their parent, so only the live status
- * needs translating: a card is idle only when nothing under it still works.
+ * Maps one control thread onto attention.ts's board vocabulary. A working
+ * thread is `running`; a thread whose reply is out is `waiting` and idle, so
+ * attention stops polling its folder.
  */
-export function boardEntry(entry: RobobBoardEntry, directory: string): BoardEntry {
+export function boardEntry(thread: ThreadSummary, directory: string): BoardEntry {
+  const busy = BUSY.has(thread.state);
   return {
-    sessionId: entry.threadId,
+    sessionId: thread.threadId,
     directory,
-    title: entry.title,
-    ...(entry.projectId ? { projectId: entry.projectId } : {}),
-    state: entry.state,
-    status: entry.status === "idle" ? "idle" : entry.status === "deleted" || entry.status === "unknown" ? entry.status : "busy",
-    workRevision: entry.workRevision,
-    updatedAt: entry.updatedAt,
-    ...(entry.attention ? { attention: entry.attention } : {}),
+    title: thread.title,
+    ...(thread.projectId ? { projectId: thread.projectId } : {}),
+    state: busy ? "running" : "waiting",
+    status: busy ? "busy" : "idle",
+    workRevision: runOrdinal(thread.latestRunId),
+    updatedAt: epoch(thread.updatedAt),
+    ...(thread.pendingRequest ? { attention: { kind: thread.pendingRequest.kind, count: 1 } } : {}),
   };
 }
 
-export class ServerReviewBoard implements ReviewBoard {
-  constructor(private readonly client: Pick<ControlClient, "board">, private readonly directories: ThreadDirectories) {}
+/**
+ * The board attention reads each tick, built from `GET /threads?active=true`:
+ * root threads that are not idle, iMessage chats left out (that bridge asks
+ * them in-chat). Subagents are not listed; their requests are found through
+ * the shared `/requests` read.
+ */
+export class ActiveThreadsBoard implements ReviewBoard {
+  constructor(private readonly client: Pick<ControlClient, "listThreads">, private readonly directories: ThreadDirectories) {}
 
   async snapshot(): Promise<BoardSnapshot> {
-    const board = await this.client.board<RobobBoardSnapshot>();
+    const { threads } = await this.client.listThreads({ active: true, limit: 500 });
     const entries: BoardEntry[] = [];
-    for (const entry of board.entries) {
-      const directory = entry.worktreePath ?? (entry.projectId ? await this.directories.rootOf(entry.projectId) : undefined) ?? "/";
-      entries.push(boardEntry(entry, directory));
+    for (const thread of threads) {
+      if (thread.origin === IMESSAGE_ORIGIN) continue;
+      entries.push(boardEntry(thread, await this.directories.of(thread)));
     }
-    return { version: 1, revision: board.revision, activatedAt: board.activatedAt, migrationComplete: true, entries, syncError: board.syncError };
+    return { version: 1, revision: 0, activatedAt: 0, migrationComplete: true, entries, syncError: null };
   }
 }
 
@@ -94,14 +75,11 @@ export class RobobAlertBackend implements AlertBackend {
   /** Thread id to directory; a thread's folder does not change. */
   private readonly threadDirectories = new Map<string, string>();
   private readonly native = new Map<string, string>();
-  private missionsRead?: { at: number; read: Promise<{ missions: MissionThreads[] }> };
-  /** Router lead-routing answers by thread, kept about one attention tick. */
-  private readonly routedReads = new Map<string, { at: number; read: Promise<boolean> }>();
 
   constructor(options: RobobAlertOptions = {}) {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
-    this.board = options.board ?? new ServerReviewBoard(this.client, this.directories);
+    this.board = options.board ?? new ActiveThreadsBoard(this.client, this.directories);
   }
 
   private async resolve(id: string): Promise<string> {
@@ -207,49 +185,6 @@ export class RobobAlertBackend implements AlertBackend {
   /** Full-access threads never ask; subagents inherit their parent's mode. Undefined when unknown. */
   async isSessionAutoAccepting(sessionId: string): Promise<boolean | undefined> {
     try { return (await this.client.thread(await this.resolve(sessionId))).thread.runtimeMode === "full-access"; } catch { return undefined; }
-  }
-
-  /**
-   * Mission threads other than the master take their questions and permission
-   * requests to their lead (Robob's router tells it), and so do the threads a
-   * lane delegated. Attached threads have no lead, and a server that can't say
-   * which threads are which leaves the question with the owner. One status
-   * read serves a whole attention tick; the router is asked about the rest.
-   */
-  async leadAnswers(sessionId: string): Promise<boolean> {
-    let threadId: string;
-    try { threadId = await this.resolve(sessionId); } catch { return false; }
-    const listed = await this.missionThreads().then(({ missions }) => missions.some(mission => mission.masterThreadIds !== undefined
-      && mission.attachedThreadIds !== undefined
-      && mission.threadIds?.includes(threadId) === true
-      && !mission.masterThreadIds.includes(threadId)
-      && !mission.attachedThreadIds.includes(threadId))).catch(() => false);
-    return listed || await this.leadRouted(threadId);
-  }
-
-  private missionThreads(): Promise<{ missions: MissionThreads[] }> {
-    const now = Date.now();
-    if (!this.missionsRead || now - this.missionsRead.at > MISSIONS_FRESH_MS) {
-      const read = this.client.missions();
-      this.missionsRead = { at: now, read };
-      // A failed read is not kept: the next check asks again.
-      read.catch(() => { if (this.missionsRead?.read === read) this.missionsRead = undefined; });
-    }
-    return this.missionsRead.read;
-  }
-
-  /** The router's answer for one thread, kept as long as a status read; any failure is false. */
-  private leadRouted(threadId: string): Promise<boolean> {
-    const now = Date.now();
-    for (const [id, entry] of this.routedReads) if (now - entry.at > MISSIONS_FRESH_MS) this.routedReads.delete(id);
-    const cached = this.routedReads.get(threadId);
-    if (cached) return cached.read;
-    const read = this.client.leadRouted(threadId).then(({ routed }) => routed === true, () => {
-      if (this.routedReads.get(threadId)?.read === read) this.routedReads.delete(threadId);
-      return false;
-    });
-    this.routedReads.set(threadId, { at: now, read });
-    return read;
   }
 
   /**

@@ -196,27 +196,6 @@ export class ControlClient {
     return this.request("GET", "/projects");
   }
 
-  /** Robob's session board snapshot. It lives outside the control prefix and has no `ok` envelope. */
-  async board<T>(): Promise<T> {
-    let response: Response;
-    try {
-      response = await fetch(`${this.url}/api/ardud/board`, {
-        headers: { authorization: `Bearer ${this.token}`, accept: "application/json" },
-        signal: AbortSignal.timeout(15_000),
-        redirect: "manual",
-        proxy: "",
-        verbose: false,
-      });
-    } catch {
-      throw new ControlError(0);
-    }
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new ControlError(response.status, "board");
-    }
-    return await response.json() as T;
-  }
-
   respond(threadId: string, requestId: string, body: Record<string, unknown>): Promise<unknown> {
     return this.request("POST", `/threads/${encodeURIComponent(threadId)}/requests/${encodeURIComponent(requestId)}/respond`, body);
   }

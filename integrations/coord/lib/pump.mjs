@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { renameSync, statSync } from 'node:fs';
 import { tx, get, all, run } from './db.mjs';
-import { clock, gate, DEFAULTS, releaseObserve, messaging } from './coord.mjs';
+import { clock, gate, DEFAULTS, releaseObserve } from './coord.mjs';
 import { controlConfig } from './control.mjs';
 
 export { controlConfig };
@@ -330,9 +330,6 @@ async function sweep(cfg, look, queue, res) {
 export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, queue = queueApi, unackedAfter = DEFAULTS.unackedAfter } = {}) {
   const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0, healed: 0, heals: [], stuck: [],
     superseded: 0, supersedes: [], queueErrors: [] };
-  // messaging=robob: Robob's doorbell wakes threads; coord rings nobody and leaves its own deliveries as they are.
-  const m = messaging();
-  if (m.mode === 'robob') return { ...res, messaging: { mode: m.mode, mission: m.mission } };
   cfg ??= controlConfig();
   const one = seq == null ? null : Number(seq);
   if (one == null) await sweep(cfg, look, queue, res);

@@ -36,7 +36,7 @@ const USAGE = `coord <command> [args] (JSON output; see README.md)
   arch transfer ID --as A --fence N | arch closeout ID --as A --fence N --commits a,b --evidence E | arch list [--state S]
   pause|drain|resume [--scope S] --as A --reason R
   flag KEY on|off --as A [--reason R]              gate [SCOPE]
-  messaging [coord|robob] --as master [--mission ID] [--reason R]   (no mode: show; robob forwards post/inbox/ack)
+  messaging [coord --as master [--reason R]]       (no mode: show; coord clears a retired robob row)
   attention | status`;
 
 const OPTS = {
@@ -50,7 +50,6 @@ const OPTS = {
   risk: { type: 'string' }, batch: { type: 'string' }, 'force-manual': { type: 'boolean' }, 'release-run': { type: 'string' },
   'deploy-run': { type: 'string' }, 'tf-run': { type: 'string' }, repos: { type: 'string' }, 'pins-file': { type: 'string' }, packet: { type: 'string' },
   commits: { type: 'string' }, superseded: { type: 'boolean' }, scope: { type: 'string' }, reason: { type: 'string' }, help: { type: 'boolean', short: 'h' },
-  mission: { type: 'string' },
 };
 
 const { values: o, positionals: p } = parseArgs({ args: process.argv.slice(2), options: OPTS, allowPositionals: true, strict: true });
@@ -86,8 +85,7 @@ async function main() {
     case 'post': {
       const r = await C.post(sub, { as: o.as, kind: o.kind, key: o.key, summary: o.summary, to: o.to, work: o.work, env: o.env, rev: o.rev,
         authority: o.authority, body: o['body-file'] ? readJson(o['body-file']) : undefined, replyTo: o['reply-to'] ? Number(o['reply-to']) : undefined });
-      // messaging=robob: Robob's doorbell wakes the recipients; there is no coord delivery to nudge.
-      return o['no-deliver'] || r.duplicate || C.messaging().mode === 'robob' ? r : { ...r, delivery: await tryDeliver(r.seq) };
+      return o['no-deliver'] || r.duplicate ? r : { ...r, delivery: await tryDeliver(r.seq) };
     }
     case 'inbox': return C.inbox({ as: o.as, unacked: o.unacked, after: o.after });
     case 'ack': return C.ack(o.as, p.slice(1));
@@ -138,7 +136,7 @@ async function main() {
       if (!g.ok) throw new C.CoordError(g.mode === 'pause' ? 'paused' : 'draining', `${g.key} is ${g.mode}${g.reason ? `: ${g.reason}` : ''}`, { gate: g });
       return g;
     }
-    case 'messaging': return { messaging: sub ? C.setMessaging(sub, { as: o.as, reason: o.reason, mission: o.mission }) : C.messaging() };
+    case 'messaging': return { messaging: sub ? C.setMessaging(sub, { as: o.as, reason: o.reason }) : C.messaging() };
     case 'attention': return C.attention();
     case 'status': return C.status();
   }

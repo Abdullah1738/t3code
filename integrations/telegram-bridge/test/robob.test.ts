@@ -3,8 +3,6 @@ import { Attention } from "../src/attention.ts";
 import { backendKind } from "../src/config.ts";
 import type { PendingRequest } from "../src/control.ts";
 import { boardEntry, RobobAlertBackend, runOrdinal } from "../src/robob.ts";
-
-const BOARD_ACTIVATED = 1_000;
 import { Store } from "../src/store.ts";
 
 type Thread = {
@@ -22,13 +20,9 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.db.close();
 });
 
-type MissionThreads = { id: string; threadIds?: string[]; masterThreadIds?: string[]; attachedThreadIds?: string[] };
-
 function fakeControl(events: string[] = []) {
   const threads = new Map<string, Thread>();
   const calls: Call[] = [];
-  /** The missions status the server reports; null answers 503. */
-  const missions: { list: MissionThreads[] | null; routed: string[] | null } = { list: [], routed: [] };
   const summary = (thread: Thread) => ({
     ...thread, status: thread.state === "running" ? "running" : "completed", nativeSessionId: null, rootThreadId: thread.parentThreadId ?? thread.threadId,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
@@ -41,25 +35,8 @@ function fakeControl(events: string[] = []) {
     const body = request.method === "GET" ? undefined : await request.json().catch(() => undefined);
     calls.push({ method: request.method, path: path + (searchParams.size ? `?${searchParams}` : ""), body });
     if (request.headers.get("authorization") !== "Bearer test-token") return Response.json({ ok: false }, { status: 401 });
-    if (pathname === "/api/ardud/board") {
-      // A small stand-in for the server board: roots only, iMessage quiet, automated origins scheduled.
-      const entries = [...threads.values()].filter(thread => !thread.parentThreadId && thread.origin !== "imessage").map(thread => ({
-        threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
-        state: thread.origin ? "scheduled" : thread.settled ? "backlog" : thread.state === "waiting" || thread.state === "idle" ? "waiting" : "running",
-        status: thread.state === "needs-input" ? "needs-input" : thread.state === "running" ? "working" : "idle",
-        workRevision: runOrdinal(thread.latestRunId), updatedAt: now, worktreePath: thread.worktreePath,
-        ...(thread.pending[0] ? { attention: { kind: thread.pending[0].kind, count: thread.pending.length } } : {}),
-      }));
-      return Response.json({ version: 1, revision: 1, activatedAt: BOARD_ACTIVATED, entries, syncError: null });
-    }
-    if (pathname === "/api/ardud/missions/status") {
-      if (missions.list === null) return Response.json({ ok: false }, { status: 503 });
-      return Response.json({ ok: true, revision: 1, missions: missions.list });
-    }
-    if (pathname === "/api/ardud/missions/lead-routed") {
-      if (missions.routed === null) return Response.json({ ok: false }, { status: 503 });
-      return Response.json({ ok: true, routed: missions.routed.includes(searchParams.get("threadId") ?? "") });
-    }
+    // Retired routes fall through to the web app, as the real server does.
+    if (!pathname.startsWith("/api/ardud/control")) return new Response("<!doctype html>", { headers: { "content-type": "text/html" } });
     const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
     if (path === "/health") return ok({ status: "healthy" });
     if (path === "/projects") return ok({ projects: [{ projectId: "p1", title: "repo", workspaceRoot: "/repo" }] });
@@ -90,7 +67,7 @@ function fakeControl(events: string[] = []) {
     state: "idle", latestRunId: null, pending: [], ...thread,
   });
   const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token" });
-  return { threads, calls, add, backend, missions };
+  return { threads, calls, add, backend };
 }
 
 function attention(backend: RobobAlertBackend) {
@@ -106,16 +83,37 @@ test("backend switch defaults to OpenChamber", () => {
   expect(() => backendKind({}, { backend: "other" })).toThrow();
 });
 
-test("server board cards map onto attention's board entries", () => {
-  const base = { threadId: "t", projectId: "p", title: "T", state: "waiting" as const, status: "idle", workRevision: 4, updatedAt: 5 };
-  expect(boardEntry(base, "/repo")).toMatchObject({ sessionId: "t", state: "waiting", status: "idle", workRevision: 4, directory: "/repo" });
-  expect(boardEntry({ ...base, state: "running", status: "working" }, "/repo")).toMatchObject({ state: "running", status: "busy" });
-  expect(boardEntry({ ...base, state: "waiting", status: "background" }, "/repo")).toMatchObject({ status: "busy" });
-  expect(boardEntry({ ...base, state: "running", status: "needs-input", attention: { kind: "approval", count: 1 } }, "/repo"))
+test("active threads map onto attention's board entries", () => {
+  const base = {
+    threadId: "t", projectId: "p", title: "T", state: "waiting" as const, status: "completed", origin: null, nativeSessionId: null,
+    runtimeMode: "approval-required", parentThreadId: null, rootThreadId: "t", worktreePath: null, latestRunId: "run:thread:t:ordinal:4",
+    pendingRequest: null, createdAt: null, updatedAt: "1970-01-01T00:00:00.005Z",
+  };
+  expect(boardEntry(base, "/repo")).toMatchObject({ sessionId: "t", state: "waiting", status: "idle", workRevision: 4, updatedAt: 5, directory: "/repo" });
+  expect(boardEntry({ ...base, state: "running" }, "/repo")).toMatchObject({ state: "running", status: "busy" });
+  expect(boardEntry({ ...base, state: "queued" }, "/repo")).toMatchObject({ state: "running", status: "busy" });
+  expect(boardEntry({ ...base, state: "needs-input", pendingRequest: { requestId: "r", kind: "approval", requestKind: "command" } }, "/repo"))
     .toMatchObject({ state: "running", attention: { kind: "approval", count: 1 } });
-  expect(boardEntry({ ...base, projectId: null }, "/repo")).not.toHaveProperty("projectId");
+  expect(boardEntry(base, "/repo")).not.toHaveProperty("attention");
+  expect(boardEntry({ ...base, projectId: "" }, "/repo")).not.toHaveProperty("projectId");
   expect(runOrdinal("run:thread:a%3Ab:ordinal:12")).toBe(12);
   expect(runOrdinal(null)).toBe(0);
+});
+
+test("the board is the active thread list, iMessage chats left out", async () => {
+  const control = fakeControl();
+  control.add({ threadId: "work", title: "Fix the build", state: "running", worktreePath: "/repo/wt", latestRunId: "run:thread:work:ordinal:3" });
+  control.add({ threadId: "done", title: "Done", state: "waiting" });
+  control.add({ threadId: "old", state: "idle" });
+  control.add({ threadId: "chat", origin: "imessage", state: "running" });
+  const board = await control.backend.sessionBoard();
+  expect(board.migrationComplete).toBe(true);
+  expect(board.entries.map(entry => [entry.sessionId, entry.directory, entry.state, entry.status, entry.workRevision])).toEqual([
+    ["work", "/repo/wt", "running", "busy", 3],
+    ["done", "/repo", "waiting", "idle", 0],
+  ]);
+  expect(control.calls.some(call => call.path.startsWith("/threads?") && call.path.includes("active=true"))).toBe(true);
+  expect(control.calls.some(call => call.path.startsWith("/api/"))).toBe(false);
 });
 
 test("requests are scoped by thread folder and answered through respond", async () => {
@@ -203,143 +201,22 @@ test("a pending approval on a root thread becomes an approval prompt with button
   expect(outbox[0]!.keyboard).toMatchObject({ rows: [[{ text: "Approve once" }, { text: "Reject" }]] });
 });
 
-test("a mission thread's question goes to its lead; the master's and everyone else's still alert", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  const ask = (requestId: string) => [{ requestId, kind: "question" as const, requestKind: "user_input", canRespond: true,
-    questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }];
-  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: ask("q-lane") });
-  control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: ask("q-master") });
-  control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: ask("q-solo") });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  const texts = store.pendingOutbox().map(entry => entry.text);
-  expect(texts).toHaveLength(2);
-  expect(texts.some(text => text.includes("Crpko master"))).toBe(true);
-  expect(texts.some(text => text.includes("Solo work"))).toBe(true);
-  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
-});
-
-test("an attached thread's question and permission request still alert; it has no lead", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  control.add({ threadId: "review", title: "PR review", state: "needs-input", pending: [
-    { requestId: "q-review", kind: "question", requestKind: "user_input", canRespond: true,
-      questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] },
-    { requestId: "perm-review", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true },
-  ] });
-  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: [{ requestId: "q-lane", kind: "question",
-    requestKind: "user_input", canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane", "review"], masterThreadIds: ["master"], attachedThreadIds: ["review"] }];
-  expect(await control.backend.leadAnswers("review")).toBe(false);
-  expect(await control.backend.leadAnswers("lane")).toBe(true);
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  const texts = store.pendingOutbox().map(entry => entry.text);
-  expect(texts.filter(text => text.includes("PR review"))).toHaveLength(2);
-  expect(texts.some(text => text.includes("PR review needs your approval"))).toBe(true);
-  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
-});
-
-test("a server that doesn't list attached threads leaves every mission question with the owner", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  control.add({ threadId: "review", title: "PR review", state: "needs-input", pending: [{ requestId: "q-review", kind: "question",
-    requestKind: "user_input", canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane", "review"], masterThreadIds: ["master"] }];
-  expect(await control.backend.leadAnswers("review")).toBe(false);
-  expect(await control.backend.leadAnswers("lane")).toBe(false);
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("PR review"))).toBe(true);
-});
-
-test("when the missions read fails, a question alerts as before", async () => {
+test("every root thread's question and permission request alerts the owner; there is no lead routing", async () => {
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: [{ requestId: "q-lane", kind: "question", requestKind: "user_input",
     canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
-  control.missions.list = null;
-  expect(await control.backend.leadAnswers("lane")).toBe(false);
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane"))).toBe(true);
-});
-
-test("a thread a lane delegated leaves its requests to the lane; a failed router read alerts", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  control.add({ threadId: "lane", title: "GST lane", state: "running" });
-  control.add({ threadId: "sol-review", parentThreadId: "lane", title: "Sol review", state: "needs-input", pending: [
-    { requestId: "perm-review", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true },
-  ] });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
-  control.missions.routed = ["lane", "sol-review"];
-  expect(await control.backend.leadAnswers("sol-review")).toBe(true);
-  expect(await control.backend.leadAnswers("stranger")).toBe(false);
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("Sol review"))).toBe(false);
-
-  const failing = fakeControl();
-  failing.missions.list = [];
-  failing.missions.routed = null;
-  expect(await failing.backend.leadAnswers("sol-review")).toBe(false);
-  // A failed read is not kept: the next check asks again.
-  failing.missions.routed = ["sol-review"];
-  expect(await failing.backend.leadAnswers("sol-review")).toBe(true);
-
-  // A status answer the bridge can't read still leaves the router to decide.
-  const garbled = fakeControl();
-  garbled.missions.list = [null as unknown as MissionThreads];
-  garbled.missions.routed = [];
-  expect(await garbled.backend.leadAnswers("sol-review")).toBe(false);
-  garbled.missions.routed = ["sol-review"];
-  setSystemTime(now + 60_000);
-  expect(await garbled.backend.leadAnswers("sol-review")).toBe(true);
-});
-
-test("a mission thread's permission request goes to its lead; the master's and everyone else's still alert", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  const approve = (requestId: string) => [{ requestId, kind: "approval" as const, requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }];
-  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: approve("perm-lane") });
-  control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: approve("perm-master") });
-  control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: approve("perm-solo") });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
+  control.add({ threadId: "master", title: "Crpko master", state: "needs-input",
+    pending: [{ requestId: "perm-master", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }] });
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
   setSystemTime(now + 20_000);
   await alerts.tick();
   const texts = store.pendingOutbox().map(entry => entry.text);
   expect(texts).toHaveLength(2);
+  expect(texts.some(text => text.includes("GST lane"))).toBe(true);
   expect(texts.some(text => text.includes("Crpko master needs your approval"))).toBe(true);
-  expect(texts.some(text => text.includes("Solo work needs your approval"))).toBe(true);
-  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
-});
-
-test("when the missions read fails, a mission thread's permission request alerts as before", async () => {
-  setSystemTime(now);
-  const control = fakeControl();
-  control.add({ threadId: "lane", title: "GST lane", state: "needs-input",
-    pending: [{ requestId: "perm-lane", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }] });
-  control.missions.list = null;
-  const { store, attention: alerts } = attention(control.backend);
-  await alerts.tick();
-  setSystemTime(now + 20_000);
-  await alerts.tick();
-  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane needs your approval"))).toBe(true);
+  expect(control.calls.some(call => call.path.includes("missions") || call.path.includes("/board"))).toBe(false);
 });
 
 test("an attention tick reads pending requests once, however many folders are busy", async () => {

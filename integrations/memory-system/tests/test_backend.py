@@ -355,14 +355,22 @@ class ReaperProtection(unittest.TestCase):
             self.assertEqual(session_reaper.protected_ids(),
                              {"ses_kept", "ses_a_new", "ses_b", "ses_th_back", "ses_task"})
 
-    def test_robob_without_board_fails_closed(self):
+    def test_robob_without_board_table_still_runs(self):
         make_state_db(self.db, board=False)
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
+            self.assertEqual(session_reaper.backlog_ids(), set())
+            self.assertEqual(session_reaper.protected_ids(), {"ses_kept", "ses_a_new", "ses_b"})
+
+    def test_robob_unreadable_board_fails_closed(self):
+        make_state_db(self.db, board=False)
+        con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE ardud_board_rows (id TEXT)")
+        con.commit()
+        con.close()
+        with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
             with self.assertRaises(session_reaper.Gate) as cm:
-                session_reaper.protected_ids()
-            self.assertIn("board", str(cm.exception))
-            with self.assertRaises(session_reaper.Gate):
                 session_reaper.backlog_ids()
+            self.assertIn("board", str(cm.exception))
 
     def test_robob_missing_state_db_fails_closed(self):
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=os.path.join(self.tmp.name, "nope.sqlite")):

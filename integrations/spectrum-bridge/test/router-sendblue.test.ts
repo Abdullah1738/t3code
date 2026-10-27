@@ -171,22 +171,24 @@ test("other chats' prompts say who reads background replies and keep agent talk 
   expect(sendblueContextPrompt(context("owner"), false, [])).not.toContain("Who reads your replies");
 });
 
-test("only the owner's prompt sends Robob fixes to the mission as his request", () => {
+test("only the owner's prompt sends Robob fixes to the Robob master thread in his words", () => {
   const owner = sendblueContextPrompt(context("owner"), false, []);
-  expect(owner).toContain("mission request open robob");
-  expect(owner).toContain("--inbound <id of the message where he asked>");
-  for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [])).not.toContain("mission request");
+  expect(owner).toContain("t3ctl send mcp:84c5ca53-5aa8-46e8-9fbd-06b34f2190e0 --mode queue \"<his words> (from iMessage, message <id>)\"");
+  expect(owner).toContain("it's with the Robob team");
+  expect(owner).not.toMatch(/\bmission/);
+  for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [])).not.toContain("t3ctl send");
 });
 
 test("a wake's chat prompt drops what only typed messages need and keeps who reads it", () => {
   const owner = sendblueContextPrompt(context("owner"), false, [], true);
-  for (const line of ["Files:", "Polls are not available", "mission request open robob", "guest-allow --address"]) expect(owner).not.toContain(line);
-  for (const line of ["send --to <slug>", "wake --chat <slug>", "location --session", "publish --app SLUG", "the `mission` CLI", "never answered by you directly"]) expect(owner).toContain(line);
+  for (const line of ["Files:", "Polls are not available", "t3ctl send mcp:", "guest-allow --address"]) expect(owner).not.toContain(line);
+  expect(owner).not.toMatch(/\bmission/);
+  for (const line of ["send --to <slug>", "wake --chat <slug>", "location --session", "publish --app SLUG", "never answered by you directly"]) expect(owner).toContain(line);
   expect(owner.length).toBeLessThan(sendblueContextPrompt(context("owner"), false, []).length / 2);
   const moni = sendblueContextPrompt(context("dm"), false, ["+971585933213"], true);
   expect(moni).toContain("Moni (admin)");
   expect(moni).toContain("including your reply after a watcher event");
-  expect(moni).not.toContain("the `mission` CLI");
+  expect(moni).not.toMatch(/\bmission/);
   expect(sendblueContextPrompt(context("group"), false, [], true)).toContain("silent observer");
 });
 

@@ -88,6 +88,7 @@ if [ -x "$REAL_RSYNC" ]; then
   "$SQLITE" "$T/robob.sqlite" "PRAGMA journal_mode=wal;
     CREATE TABLE scheduled_tasks(id TEXT PRIMARY KEY, name TEXT); INSERT INTO scheduled_tasks VALUES ('a','it''s 7');
     CREATE TABLE ardud_board_rows(id TEXT); INSERT INTO ardud_board_rows VALUES ('b');
+    CREATE TABLE ardud_mission_events(id TEXT); INSERT INTO ardud_mission_events VALUES ('m');
     CREATE TABLE orchestration_v2_events(x); INSERT INTO orchestration_v2_events VALUES ('big');" >/dev/null
   echo old > "$T/stage/robob-state.sqlite"; echo old > "$T/stage/robob-state.sqlite-wal"
   ROBOB_STATE_DB="$T/robob.sqlite" run
@@ -98,7 +99,9 @@ if [ -x "$REAL_RSYNC" ]; then
     && fail "robob dump includes the event log" || pass "robob dump skips the event log"
   ls "$T"/stage/robob-state.sqlite* >/dev/null 2>&1 \
     && fail "old full robob replica kept" || pass "old full robob replica removed"
-  grep -q "robob-state.sql: 2 tables.*missing:.* projection_projects" "$R"/logs/backup-*.log \
+  [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT id FROM ardud_mission_events')" = "m" ] \
+    && pass "retired mission tables backed up" || fail "ardud_mission_events not in the robob dump"
+  grep -q "robob-state.sql: 3 tables.*missing:.* projection_projects" "$R"/logs/backup-*.log \
     && pass "missing robob tables logged" || fail "robob log: $(grep robob "$R"/logs/backup-*.log)"
   rm -rf "$T"
 fi

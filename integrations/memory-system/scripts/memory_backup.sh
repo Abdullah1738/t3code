@@ -126,13 +126,15 @@ PY
 ) || log "retired replicas not removed: $(printf '%s' "$out" | tail -1)"
 [ -n "$out" ] && log "$(printf '%s' "$out" | tr '\n' ' ')"
 # Robob state: only the small tables nothing else backs up (schedules, projects,
-# session board, OpenCode import map, thread origins, thread/subagent index).
+# session board, OpenCode import map, thread origins, thread/subagent index), plus
+# the retired missions' tables (ardud_mission_*), kept in the DB as an archive.
+# A name with % is a LIKE pattern (sqlite .dump takes them).
 # The full DB is ~70 GB of event log and message projections rebuilt from the
 # OpenCode/Muse sessions that memory.db and opencode_raw.db already hold; it
 # added 2-4 GB to restic every run. .dump reads in one transaction (~2 s).
 # Restore: sqlite3 new.sqlite < robob-state.sql. Skipped until Robob is installed.
 ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
-ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_rows ardud_board_meta
+ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_% ardud_mission_%
   ardud_opencode_import ardud_opencode_import_state ardud_thread_origin
   orchestration_v2_projection_threads orchestration_v2_projection_provider_threads
   orchestration_v2_projection_provider_session_bindings
@@ -152,7 +154,9 @@ made = set(re.findall(r'^CREATE TABLE (?:IF NOT EXISTS )?"?(\w+)"?', text, re.M)
 if not made:
     sys.exit("no tables dumped")
 os.replace(tmp, dst)
-missing = [t for t in tables if t not in made]
+def like(pat):
+    return re.compile("".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in pat) + "$")
+missing = [t for t in tables if not any(like(t).match(m) for m in made)]
 print(f"{len(made)} tables, {os.path.getsize(dst)} bytes" + (", missing: " + " ".join(missing) if missing else ""))
 PY
 ) || fail replica "robob-state.sql: $(printf '%s' "$out" | tail -1)"

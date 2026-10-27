@@ -324,7 +324,7 @@ def approver_for(chat, p, owner, admin_list, routes):
 
 
 def owner_typed(p):
-    """Same rule as the missions inbound check: typed text only (no wakes, voice notes or attachments)."""
+    """Typed text only (no wakes, voice notes or attachments)."""
     return p.get("source") == "typed" and not p.get("isAudioMessage") and not p.get("attachments") \
         and bool(str(p.get("text") or "").strip())
 

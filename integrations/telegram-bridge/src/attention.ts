@@ -376,9 +376,6 @@ export class Attention {
     const requests = await pending();
     if (!requests) return "wait";
     if (!requests.some(request => request.id === notice.requestId && request.sessionID === notice.sessionId)) return "cancel";
-    // Robob hands a mission thread's question or permission request to its lead,
-    // who answers it or asks the owner.
-    if (await this.backend.leadAnswers?.(notice.sessionId)) return "cancel";
     const session = await this.session(notice);
     // The iMessage bridge asks these over iMessage, even when it is not running.
     if (await this.imessageFamily(session, parents)) return "cancel";
