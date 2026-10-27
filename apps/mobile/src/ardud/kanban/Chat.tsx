@@ -2,6 +2,7 @@ import { useIsFocused } from "@react-navigation/native";
 import type { KanbanBlock, KanbanMessage, KanbanParticipant } from "@t3tools/contracts";
 import {
   avatarOf,
+  canSendChoice,
   cardView,
   discussionPresence,
   ownerReadSeq,
@@ -390,35 +391,50 @@ function ChoiceBlock(props: {
       ?.at ?? null;
   const current = draft !== null && draft.against === ownAt ? draft : null;
   const mine = current?.choice ?? view.mine;
+  const text = current?.text ?? "";
   const poll = block.style === "poll";
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
-  const locked = !poll && (view.mine.length > 0 || current?.sent === true);
+  const locked = !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
+  const canSend = canSendChoice(block, mine, text);
 
-  const send = (choice: ReadonlyArray<string>) => {
+  const send = (choice: ReadonlyArray<string>, words: string) => {
     const discussionId = props.discussionId;
-    if (discussionId === null || choice.length === 0) return;
+    if (discussionId === null || !canSendChoice(block, choice, words)) return;
     const against = ownAt;
-    setDraft({ choice, against, sent: true });
+    setDraft({ choice, text: words, against, sent: true });
     void action
       .run("Couldn't send the answer", () =>
-        kanbanClient().answer(props.boardId, discussionId, message.seq, block.id, [...choice]),
+        kanbanClient().answer(
+          props.boardId,
+          discussionId,
+          message.seq,
+          block.id,
+          [...choice],
+          words.trim() || null,
+        ),
       )
       .then((ok) => {
-        // A failed multi pick keeps what was ticked so Send can try again.
-        if (!ok) setDraft(multiPick ? { choice, against, sent: false } : null);
+        // A failed answer keeps what was ticked and typed so it can be sent again.
+        if (!ok) {
+          const keep = multiPick || words.trim() !== "";
+          setDraft(keep ? { choice, text: words, against, sent: false } : null);
+        }
       });
   };
+
+  const setWords = (words: string) =>
+    setDraft({ choice: mine, text: words, against: ownAt, sent: false });
 
   const pick = (optionId: string) => {
     if (locked) return;
     const next = toggleChoice(mine, optionId, block.multi);
     if (multiPick) {
-      setDraft({ choice: next, against: ownAt, sent: false });
+      setDraft({ choice: next, text, against: ownAt, sent: false });
       return;
     }
-    send(next);
+    send(next, "");
   };
 
   return (
@@ -471,27 +487,69 @@ function ChoiceBlock(props: {
           );
         })}
       </View>
+      {!poll && !locked ? (
+        <View className="min-h-10 flex-row items-end gap-2 rounded-[12px] border-[1.5px] border-transparent bg-screen py-1.5 pl-3 pr-1.5">
+          <AppTextInput
+            multiline
+            accessibilityLabel="Your own answer"
+            value={text}
+            onChangeText={setWords}
+            editable={!action.pending}
+            placeholder="Your own answer"
+            placeholderTextColorClassName="accent-foreground-muted"
+            className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
+          />
+          {!multiPick ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Send your answer"
+              accessibilityState={{ disabled: !canSend || action.pending }}
+              disabled={!canSend || action.pending}
+              onPress={() => send([], text)}
+              className={cn(
+                "size-8 items-center justify-center rounded-full",
+                !canSend || action.pending ? "bg-secondary" : "bg-foreground",
+              )}
+            >
+              <SymbolView
+                name="arrow.up"
+                size={15}
+                tintColorClassName={
+                  !canSend || action.pending ? "accent-icon-muted" : "accent-screen"
+                }
+                type="monochrome"
+              />
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
+      {locked && view.mineText !== null ? (
+        <View className="min-h-10 flex-row items-center gap-2.5 rounded-[12px] border-[1.5px] border-primary bg-screen px-3 py-2">
+          <View className="size-4 rounded-[5px] border-[5px] border-primary" />
+          <Text className="flex-1 text-[14px] text-foreground">{view.mineText}</Text>
+        </View>
+      ) : null}
       {locked ? (
         <Text className="text-[12px] text-foreground-muted">
-          {view.mine.length > 0 ? "Answer sent" : "Sending…"}
+          {view.mine.length > 0 || view.mineText !== null ? "Answer sent" : "Sending…"}
         </Text>
       ) : null}
       {multiPick && !locked ? (
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send answer"
-          accessibilityState={{ disabled: mine.length === 0 || action.pending }}
-          disabled={mine.length === 0 || action.pending}
-          onPress={() => send(mine)}
+          accessibilityState={{ disabled: !canSend || action.pending }}
+          disabled={!canSend || action.pending}
+          onPress={() => send(mine, text)}
           className={cn(
             "h-9 self-start justify-center rounded-full px-4",
-            mine.length === 0 || action.pending ? "bg-secondary" : "bg-foreground",
+            !canSend || action.pending ? "bg-secondary" : "bg-foreground",
           )}
         >
           <Text
             className={cn(
               "text-[14px] font-t3-medium",
-              mine.length === 0 || action.pending ? "text-foreground-muted" : "text-screen",
+              !canSend || action.pending ? "text-foreground-muted" : "text-screen",
             )}
           >
             Send
@@ -504,6 +562,7 @@ function ChoiceBlock(props: {
 
 interface ChoiceDraft {
   readonly choice: ReadonlyArray<string>;
+  readonly text: string;
   readonly against: string | null;
   readonly sent: boolean;
 }

@@ -5,7 +5,7 @@ import type {
   KanbanParticipant,
   KanbanStage,
 } from "@t3tools/contracts";
-import type { StageBoard } from "@t3tools/client-runtime/ardud/kanban";
+import { ownerChoiceAnswer, type StageBoard } from "@t3tools/client-runtime/ardud/kanban";
 
 /** Completed, Deployed and Verified share one Shipped tab. */
 export type BoardTab = "todo" | "working" | "needs_review" | "in_review" | "shipped";
@@ -128,12 +128,20 @@ export interface ChoiceOptionView {
 export function choiceView(
   block: ChoiceBlock,
   answers: ReadonlyArray<KanbanAnswer>,
-): { readonly options: ChoiceOptionView[]; readonly answered: number; readonly mine: string[] } {
+): {
+  readonly options: ChoiceOptionView[];
+  readonly answered: number;
+  readonly mine: string[];
+  /** The owner's own words on this block, or null when he wrote none. */
+  readonly mineText: string | null;
+} {
   const own = answers.filter((answer) => answer.blockId === block.id);
-  const mine = own.find((answer) => answer.by._tag === "owner")?.choice ?? [];
+  const ownerAnswer = ownerChoiceAnswer(block, answers);
+  const mine = ownerAnswer?.choice ?? [];
   return {
     answered: own.length,
     mine: [...mine],
+    mineText: ownerAnswer?.text ?? null,
     options: block.options.map((option) => {
       const count = own.filter((answer) => answer.choice.includes(option.id)).length;
       return {

@@ -90,8 +90,13 @@ const pick: Extract<KanbanBlock, { _tag: "choice" }> = {
   multi: false,
 };
 
-const answer = (by: KanbanAnswer["by"], choice: string[], blockId = "window"): KanbanAnswer =>
-  ({ blockId, by, choice, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
+const answer = (
+  by: KanbanAnswer["by"],
+  choice: string[],
+  blockId = "window",
+  text: string | null = null,
+): KanbanAnswer =>
+  ({ blockId, by, choice, text, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
 
 describe("choiceView", () => {
   it("shares out the answers to this block and marks the owner's", () => {
@@ -111,6 +116,26 @@ describe("choiceView", () => {
 
   it("shows zero for every option before anyone answers", () => {
     expect(choiceView(pick, []).options.map((option) => option.percent)).toEqual([0, 0]);
+  });
+
+  it("returns the owner's own words for a words-only answer", () => {
+    const view = choiceView(pick, [answer({ _tag: "owner" }, [], "window", "after nine")]);
+    expect(view.mine).toEqual([]);
+    expect(view.mineText).toBe("after nine");
+    expect(view.answered).toBe(1);
+  });
+
+  it("ignores other people's words and words on other blocks", () => {
+    const view = choiceView(pick, [
+      answer({ _tag: "evaluator", threadId: "t1" } as never, ["tonight"], "window", "not mine"),
+      answer({ _tag: "owner" }, ["sunday"], "other-block", "elsewhere"),
+    ]);
+    expect(view.mineText).toBeNull();
+    expect(view.mine).toEqual([]);
+  });
+
+  it("returns null words when the owner only picked options", () => {
+    expect(choiceView(pick, [answer({ _tag: "owner" }, ["tonight"])]).mineText).toBeNull();
   });
 });
 
