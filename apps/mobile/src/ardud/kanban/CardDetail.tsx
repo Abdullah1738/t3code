@@ -24,7 +24,7 @@ import { kanbanClient, useKanbanCard, useKanbanCardFeed } from "./kanbanStore";
 import { cardGlyph, prGlyph, stageGlyph } from "./logic";
 import { ChipLink, DetailRow, FlagLine, Glyph, KChip, PriorityBars, UnderlineTabs } from "./parts";
 
-type CardTab = "discussion" | "details" | "threads";
+type CardTab = "details" | "discussion" | "threads";
 
 const ROLE_LABEL: Record<KanbanThreadLink["role"], string> = {
   work: "Worker",
@@ -32,7 +32,7 @@ const ROLE_LABEL: Record<KanbanThreadLink["role"], string> = {
   evaluator: "Evaluator",
 };
 
-/** One card: title and chips, then its discussion, details and threads. */
+/** One card: title and chips, then its details, discussion and threads. */
 export function CardDetail(props: {
   readonly boardId: string;
   readonly state: KanbanBoardState;
@@ -46,7 +46,7 @@ export function CardDetail(props: {
   readonly onClose?: () => void;
 }) {
   const card = props.state.cards.get(props.cardId);
-  const [tab, setTab] = useState<CardTab>("discussion");
+  const [tab, setTab] = useState<CardTab>("details");
   // A discussion made by the first message, until the card's own change lands.
   const [createdId, setCreatedId] = useState<string | null>(null);
   if (card === undefined) return <EmptyLine label="This card is gone." />;
@@ -59,13 +59,14 @@ export function CardDetail(props: {
         nowMs={props.nowMs}
         onClose={props.onClose}
         onOpenGoal={props.onOpenGoal}
+        onAnswer={() => setTab("discussion")}
       />
       <UnderlineTabs
         accessibilityLabel="Card"
         className="-mx-4"
         tabs={[
-          { value: "discussion", label: "Discussion" },
           { value: "details", label: "Details" },
+          { value: "discussion", label: "Discussion" },
           { value: "threads", label: "Threads" },
         ]}
         selected={tab}
@@ -128,6 +129,7 @@ function CardHeader(props: {
   readonly nowMs: number;
   readonly onClose: (() => void) | undefined;
   readonly onOpenGoal: (goalId: string) => void;
+  readonly onAnswer: () => void;
 }) {
   const { card } = props;
   const view = cardView(card, props.state, props.nowMs);
@@ -164,7 +166,7 @@ function CardHeader(props: {
       {view.flag?.kind === "ask" && asks.length > 0 ? null : (
         <FlagLine flag={view.flag} lines={6} />
       )}
-      <OwnerAsks card={card} asks={asks} />
+      <OwnerAsks card={card} asks={asks} onAnswer={props.onAnswer} />
       {card.description.trim() ? (
         <Text selectable className="text-[15px] leading-[22px] text-foreground">
           {card.description}
@@ -175,10 +177,11 @@ function CardHeader(props: {
   );
 }
 
-/** Open questions for the owner; he answers in the discussion below. */
+/** Open questions for the owner; Answer opens the card's discussion. */
 function OwnerAsks(props: {
   readonly card: KanbanCard;
   readonly asks: ReturnType<typeof askViews>;
+  readonly onAnswer: () => void;
 }) {
   const { card } = props;
   const action = useBoardAction();
@@ -201,6 +204,7 @@ function OwnerAsks(props: {
             </View>
           </View>
           <View className="flex-row flex-wrap gap-2 ps-[18px]">
+            <ActionButton label="Answer" onPress={props.onAnswer} />
             {ask.blocking ? null : (
               <ActionButton
                 label="Make blocking"

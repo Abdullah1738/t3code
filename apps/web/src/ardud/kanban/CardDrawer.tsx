@@ -32,7 +32,7 @@ import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from ".
 import { CopyLinkButton, KanbanMarkdown } from "./links";
 import { Chip, Glyph, LinkChip, Pri, priorityLabel, stageGlyph, Tabs } from "./parts";
 
-type DrawerTab = "discussion" | "details" | "threads" | "comments";
+type DrawerTab = "details" | "discussion" | "threads" | "comments";
 
 /** Stages the owner can move a card to; Working and In Review belong to the dispatcher. */
 const OWNER_STAGES: ReadonlyArray<KanbanStage> = [
@@ -70,7 +70,7 @@ export function CardDrawer(props: {
   const detail = useCardDetail(boardId, props.cardId);
   const detailFeed = useFeed(kanban.card(boardId, props.cardId));
   const nowMs = useNowMs();
-  const [tab, setTab] = useState<DrawerTab>("discussion");
+  const [tab, setTab] = useState<DrawerTab>("details");
   const panelRef = useRef<HTMLElement>(null);
 
   const onClose = useStableCallback(props.onClose);
@@ -210,8 +210,8 @@ export function CardDrawer(props: {
           value={tab}
           onChange={setTab}
           options={[
-            { value: "discussion", label: "Discussion" },
             { value: "details", label: "Details" },
+            { value: "discussion", label: "Discussion" },
             { value: "threads", label: "Threads", count: threads.length },
             { value: "comments", label: "Comments", count: comments.length },
           ]}
