@@ -1943,24 +1943,21 @@ const make = Effect.gen(function* () {
     return [...seen.values()];
   };
 
-  /** Adds a 0-slot pool for each model that has none yet; existing pools are never touched. */
-  const addMissingPools = Effect.fn("KanbanService.addMissingPools")(function* (
-    boardId: KanbanBoard["id"],
+  /** The 0-slot pools a board still needs for its models; existing pools are never touched. */
+  const missingPools = (
+    existing: ReadonlyArray<KanbanPool>,
     models: ReadonlyArray<ModelSelection>,
-  ) {
-    const have = new Set((yield* store.pools(boardId)).map((pool) => pool.key));
-    const added: Array<ModelSelection> = [];
+  ): Array<KanbanPool> => {
+    const have = new Set(existing.map((pool) => pool.key));
+    const added: Array<KanbanPool> = [];
     for (const model of models) {
       const key = Rules.poolKey(model);
       if (have.has(key)) continue;
       have.add(key);
-      added.push(model);
-      yield* store.putPool(boardId, { key, model, slots: 0 });
+      added.push({ key, model, slots: 0 });
     }
-    if (added.length > 0) {
-      yield* publish(boardId, { _tag: "pools", pools: yield* store.pools(boardId) });
-    }
-  });
+    return added;
+  };
 
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
@@ -1984,8 +1981,7 @@ const make = Effect.gen(function* () {
           createdAt: yield* nowIso,
           archivedAt: null,
         };
-        yield* store.putBoard(board);
-        yield* addMissingPools(board.id, boardModels(board));
+        yield* store.putBoardWithPools(board, missingPools([], boardModels(board)));
         yield* publish(board.id, { _tag: "board", board });
         return board;
       }),
@@ -1996,8 +1992,11 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const next: KanbanBoard = { ...board, ...patch };
-        yield* store.putBoard(next);
-        yield* addMissingPools(board.id, boardModels(next));
+        const pools = missingPools(yield* store.pools(board.id), boardModels(next));
+        yield* store.putBoardWithPools(next, pools);
+        if (pools.length > 0) {
+          yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
+        }
         yield* publish(board.id, { _tag: "board", board: next });
         yield* kick;
         return next;

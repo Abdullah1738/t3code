@@ -19,6 +19,7 @@ import {
   KanbanScriptId,
   KanbanScriptTrigger,
   KanbanStage,
+  ModelSelection,
   ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -91,9 +92,9 @@ const CreateBoardBody = Schema.Struct({
   slug: Schema.String,
   name: Schema.String,
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
-  managerModel: Schema.optional(ModelBody),
-  evaluatorModel: Schema.optional(ModelBody),
-  defaultCardModel: Schema.optional(ModelBody),
+  managerModel: Schema.optional(ModelSelection),
+  evaluatorModel: Schema.optional(ModelSelection),
+  defaultCardModel: Schema.optional(ModelSelection),
 });
 
 const CreateCardBody = Schema.Struct({
@@ -240,11 +241,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           slug: input.slug,
           name: input.name,
           defaultProjectId: projectId,
-          ...(input.managerModel ? { managerModel: modelSelectionOf(input.managerModel) } : {}),
-          ...(input.evaluatorModel ? { evaluatorModel: modelSelectionOf(input.evaluatorModel) } : {}),
-          ...(input.defaultCardModel
-            ? { defaultCardModel: modelSelectionOf(input.defaultCardModel) }
-            : {}),
+          ...(input.managerModel ? { managerModel: input.managerModel } : {}),
+          ...(input.evaluatorModel ? { evaluatorModel: input.evaluatorModel } : {}),
+          ...(input.defaultCardModel ? { defaultCardModel: input.defaultCardModel } : {}),
         });
         if (projectId && board.defaultProjectId !== projectId) {
           return yield* service.updateBoard(board.id, { defaultProjectId: projectId });

@@ -2065,3 +2065,26 @@ it.effect("ensureBoard on an existing board leaves its settings and pools untouc
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("a board's picked models keep their options (variant) through creation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const evaluatorModel = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      const defaultCardModel = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+      const board = yield* kanban.ensureBoard({
+        slug: "variants",
+        name: "Variants",
+        defaultProjectId: null,
+        evaluatorModel,
+        defaultCardModel,
+      });
+      assert.deepStrictEqual(board.evaluatorModel, evaluatorModel);
+      assert.deepStrictEqual(board.defaultCardModel, defaultCardModel);
+      const keys = (yield* kanban.snapshot(board.id)).pools.map((pool) => pool.key);
+      assert.include(keys, Rules.poolKey(evaluatorModel));
+      assert.include(keys, Rules.poolKey(defaultCardModel));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

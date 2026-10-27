@@ -171,6 +171,11 @@ export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 export interface KanbanStoreShape {
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly putBoard: (board: KanbanBoard) => Effect.Effect<void, KanbanStoreError>;
+  /** The board and any new pools in one transaction: all of it commits, or none of it does. */
+  readonly putBoardWithPools: (
+    board: KanbanBoard,
+    pools: ReadonlyArray<KanbanPool>,
+  ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly cards: (
     boardId: KanbanBoardId,
@@ -333,6 +338,27 @@ const make = Effect.gen(function* () {
           ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
         `;
       }),
+    );
+
+  const putBoardWithPools = (board: KanbanBoard, pools: ReadonlyArray<KanbanPool>) =>
+    run(
+      "write board with pools",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const json = yield* Board.encode(board);
+          yield* sql`
+            INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${board.id}, ${board.slug}, ${json})
+            ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
+          `;
+          for (const pool of pools) {
+            const poolJson = yield* Pool.encode(pool);
+            yield* sql`
+              INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${board.id}, ${pool.key}, ${poolJson})
+              ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
+            `;
+          }
+        }),
+      ),
     );
 
   const cards = (boardId: KanbanBoardId) =>
@@ -741,6 +767,7 @@ const make = Effect.gen(function* () {
   return KanbanStore.of({
     boards,
     putBoard,
+    putBoardWithPools,
     cards,
     card,
     cardsByThread,
