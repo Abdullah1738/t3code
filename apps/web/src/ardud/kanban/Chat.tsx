@@ -587,7 +587,9 @@ export function Composer(props: {
   const pendingSlotsRef = useRef(0);
   // Preparations still running. A send waits for these before taking its snapshot,
   // so a file being compressed when Send is pressed is part of that message.
-  const pendingPrepsRef = useRef(new Set<Promise<void>>());
+  const pendingPrepsRef = useRef(
+    new Set<{ prep: Promise<void>; staged: ComposerDraftFile[]; selected: number }>(),
+  );
   const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
   // Set after unmount, so a file still being prepared is released on arrival.
@@ -650,11 +652,14 @@ export function Composer(props: {
         pendingSlotsRef.current -= batch.length;
       }
     })();
-    pendingPrepsRef.current.add(prep);
+    // Registered with the files it selected: a send that waits on it knows which
+    // selection it depends on, and whether that selection was staged.
+    const entry = { prep, staged: next, selected: batch.length };
+    pendingPrepsRef.current.add(entry);
     try {
       await prep;
     } finally {
-      pendingPrepsRef.current.delete(prep);
+      pendingPrepsRef.current.delete(entry);
     }
     // The composer went away while files were being prepared: nothing will
     // ever own these, so release their previews now and start no uploads.
@@ -695,21 +700,37 @@ export function Composer(props: {
 
   const send = async () => {
     // A ref, not state: a second Enter or click before the re-render must not
-    // start another send of the same draft.
+    // start another send. Taken before any wait, so the lock holds while files
+    // are still being prepared.
     if (sendingRef.current) return;
-    // Files still being prepared join this message, so wait for them first.
-    while (pendingPrepsRef.current.size > 0) {
-      await Promise.allSettled([...pendingPrepsRef.current]);
-    }
-    const body = outgoing(text).trim();
-    // Snapshot the draft now. Files added while this send is in flight are not
-    // part of this message and must survive it.
-    const draft = filesRef.current;
-    if (body.length === 0 && draft.length === 0) return;
     sendingRef.current = true;
+    setSending(true);
+    try {
+      // Files still being prepared join this message, so wait for them first.
+      // Each one is awaited, then whatever it staged is part of the snapshot.
+      const selections = [...pendingPrepsRef.current];
+      await Promise.allSettled(selections.map((entry) => entry.prep));
+      // A selection that did not stage is a file the user asked to send: refuse
+      // to post without it, rather than sending the text alone.
+      const lost = selections.some((entry) => entry.staged.length < entry.selected);
+      if (lost) {
+        setAttachError("A selected file did not finish preparing. Attach it again.");
+        return;
+      }
+      const body = outgoing(text).trim();
+      // The draft as it is now, including what was just staged.
+      const draft = filesRef.current;
+      if (body.length === 0 && draft.length === 0) return;
+      await sendSnapshot(body, draft);
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
+  };
+
+  const sendSnapshot = async (body: string, draft: ReadonlyArray<ComposerDraftFile>) => {
     sendingDraft.current = draft;
     setInFlightIds(new Set(draft.map((file) => file.id)));
-    setSending(true);
     // Set when the send gives up, so the finally can release what an unmounted
     // composer would otherwise leave behind.
     let posted = false;
@@ -745,7 +766,6 @@ export function Composer(props: {
       setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
       editorRef.current?.focus();
     } finally {
-      sendingRef.current = false;
       sendingDraft.current = [];
       // An unmounted composer has no owner for a failed snapshot: release it.
       if (!posted && !mountedRef.current) {
@@ -754,10 +774,7 @@ export function Composer(props: {
           revokePreview(file);
         }
       }
-      if (mountedRef.current) {
-        setInFlightIds(new Set());
-        setSending(false);
-      }
+      if (mountedRef.current) setInFlightIds(new Set());
     }
   };
 
