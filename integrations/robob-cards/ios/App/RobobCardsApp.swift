@@ -1,10 +1,22 @@
 import SwiftUI
+import UIKit
 
 @main
 struct RobobCardsApp: App {
     var body: some Scene {
         WindowGroup {
             InstalledView()
+                .onOpenURL { url in
+                    // robobcards://open?url=<https page> from the Messages extension's
+                    // Open in Safari button. Only card pages are opened.
+                    guard url.scheme == "robobcards", url.host == "open",
+                          let target = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                              .queryItems?.first(where: { $0.name == "url" })?.value,
+                          let page = URL(string: target), page.scheme?.lowercased() == "https",
+                          page.host?.isEmpty == false
+                    else { return }
+                    UIApplication.shared.open(page)
+                }
         }
     }
 }
