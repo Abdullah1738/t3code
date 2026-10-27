@@ -4,7 +4,8 @@ import { Fragment } from "react";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { Group, NewCount, Row, SectionHead, Separator, Title } from "../common/parts";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { Group, Row, SectionHead, Separator, Title } from "../common/parts";
 import { BoardIcon } from "./BoardIcon";
 import { useKanbanBoards } from "./kanbanStore";
 import { Glyph } from "./parts";
@@ -35,6 +36,38 @@ export function KanbanBoardsGroup() {
   );
 }
 
+/** Icon and count for one pending kind, read by screen readers as a single label. */
+function BoardBadge(props: {
+  readonly symbol: "text.bubble" | "questionmark.bubble";
+  readonly count: number;
+  readonly accessibilityLabel: string;
+  readonly warning?: boolean;
+}) {
+  return (
+    <View
+      accessible
+      accessibilityLabel={props.accessibilityLabel}
+      className="flex-row items-center gap-1"
+    >
+      <SymbolView
+        name={props.symbol}
+        size={12}
+        tintColorClassName={props.warning ? "accent-warning-foreground" : "accent-icon-muted"}
+        type="monochrome"
+      />
+      <Text
+        className={
+          props.warning
+            ? "text-xs font-t3-semibold text-warning-foreground"
+            : "text-xs font-t3-semibold text-foreground-muted"
+        }
+      >
+        {props.count}
+      </Text>
+    </View>
+  );
+}
+
 function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen: () => void }) {
   const { board, needsOwner: owner, running, unread } = props.summary;
   const name = board.name;
@@ -47,11 +80,20 @@ function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen
       <BoardIcon board={board} />
       <Title className="flex-1">{name}</Title>
       {owner === 0 && running > 0 ? <Glyph kind="ok" /> : null}
-      <NewCount count={unread} accessibilityLabel={`${unread} unread`} />
+      {unread > 0 ? (
+        <BoardBadge
+          symbol="text.bubble"
+          count={unread}
+          accessibilityLabel={`${unread} unread messages`}
+        />
+      ) : null}
       {owner > 0 ? (
-        <View className="h-[22px] min-w-[22px] items-center justify-center rounded-full bg-warning-foreground px-1.5">
-          <Text className="text-xs font-t3-bold text-screen">{owner}</Text>
-        </View>
+        <BoardBadge
+          symbol="questionmark.bubble"
+          count={owner}
+          accessibilityLabel={`${owner} questions for you`}
+          warning
+        />
       ) : null}
     </Row>
   );
