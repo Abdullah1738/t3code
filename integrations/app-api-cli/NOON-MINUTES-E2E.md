@@ -114,6 +114,21 @@ mutation is possible on that path).
 
 ## Releasing a fenced never-paid flow
 
+## Building and editing a basket (no temp scripts)
+
+1. `commerce cart minutes show` prints the cart as items-file rows plus
+   `cart_hash`. It is read-only.
+2. Edit the rows in a JSON file (`{"sku","qty","modifiers":[...]}`, option codes
+   from `commerce item-options minutes --sku SKU --query NAME`).
+3. `commerce cart minutes set --items-file F --expect-hash HASH` replaces the
+   whole cart with one journalled sync. It refuses if the cart changed since
+   `show`, if there is an active order, or if the cart has bundle/deal lines. It
+   never orders or pays.
+4. `commerce order minutes --items-file F --use-current-cart --prepare-only`
+   orders the cart already on the server, but only when it matches `F` exactly
+   (`MINUTES_CURRENT_CART_MISMATCH` otherwise). Nothing is synced. Drop
+   `--prepare-only` only for the paid order.
+
 For a closed **cart-only** preparation, `commerce clear-cart minutes --flow UUID`
 can remove the unchanged cart. First use `abandon-flow` to close eligible
 preparation. Cleanup requires an observed sync, zero reservation, no order or

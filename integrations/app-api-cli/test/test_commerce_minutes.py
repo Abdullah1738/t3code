@@ -52,6 +52,25 @@ class MinutesIntegrationTests(unittest.TestCase):
         flow.current=c.m.Snapshot(fixture(),c.m.project_session(fixture()),time.time())
         with self.assertRaisesRegex(c.j.JournalError,'MUST_NOT_BE_REPLACED'):flow.fill_empty()
 
+    def test_use_current_cart_adopts_matching_cart_without_sync(self):
+        flow=object.__new__(c.MinutesFlow)
+        flow.use_current_cart=True
+        flow.skus=c.m._skus([{'sku':'SYNTHETIC_SHAKE','qty':1,'modifiers':[]}])
+        flow.current=c.m.Snapshot(fixture(),c.m.project_session(fixture()),time.time())
+        flow.client=unittest.mock.Mock()
+        self.assertTrue(flow.fill_empty()['lines'])
+        self.assertTrue(flow.adopted_current_cart)
+        flow.client.sync.assert_not_called()
+
+    def test_use_current_cart_mismatch_refuses_without_sync(self):
+        flow=object.__new__(c.MinutesFlow)
+        flow.use_current_cart=True
+        flow.skus=c.m._skus([{'sku':'SYNTHETIC_SHAKE','qty':2,'modifiers':[]}])
+        flow.current=c.m.Snapshot(fixture(),c.m.project_session(fixture()),time.time())
+        flow.client=unittest.mock.Mock()
+        with self.assertRaisesRegex(c.m.MinutesError,'MINUTES_CURRENT_CART_MISMATCH'):flow.fill_empty()
+        flow.client.sync.assert_not_called()
+
     def test_fenced_payment_never_reads_auth_or_sends(self):
         flow=object.__new__(c.MinutesFlow)
         flow.flow_id='10000000-0000-4000-8000-000000000001'
