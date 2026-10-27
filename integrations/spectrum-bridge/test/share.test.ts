@@ -271,13 +271,49 @@ describe("Shares on a stable origin", () => {
     expect((await fetch(local(result.url))).status).toBe(404);
   });
 
-  test("an origin link is dropped when its app is removed, instead of staying as a dead link", async () => {
+  test("a missing page keeps its link: the sweep doesn't drop it, and restoring the page recovers the same URL", async () => {
     const result = await onOrigin.share("trip");
-    await fs.rm(join(appsRoot, "trip"), { recursive: true, force: true });
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
     await onOrigin.sweep();
-    expect(events).toEqual(["share-dropped trip"]);
-    expect(onOrigin.list()).toEqual([]);
+    expect(events).toEqual([]);
+    expect(onOrigin.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: Number.MAX_SAFE_INTEGER, live: false }]);
     expect((await fetch(local(result.url))).status).toBe(404);
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(503);
+    await fs.rename(join(appsRoot, "trip-away"), join(appsRoot, "trip"));
+    expect((await fetch(local(result.url))).status).toBe(200);
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
+    expect((await onOrigin.share("trip")).url).toBe(result.url);
+  });
+
+  test("a whole-folder swap to a symlink outside the apps folder can't be served through the token", async () => {
+    const outside = join(base, "outside");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(join(outside, "private.txt"), "PRIVATE");
+    await fs.writeFile(join(outside, "index.html"), PAGE);
+    const result = await onOrigin.share("trip");
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
+    await fs.symlink(outside, join(appsRoot, "trip"));
+    for (const path of [`/s/${token}/`, `/s/${token}/private.txt`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(503);
+  });
+
+  test("a whole-folder swap to a sibling app can't be served through the token", async () => {
+    await app("other");
+    await fs.writeFile(join(appsRoot, "other", "private.txt"), "PRIVATE");
+    const result = await onOrigin.share("trip");
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
+    await fs.symlink(join(appsRoot, "other"), join(appsRoot, "trip"));
+    for (const path of [`/s/${token}/`, `/s/${token}/private.txt`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
   });
 
   test("quick-tunnel shares from before move to the origin once, and then never expire", async () => {

@@ -46,11 +46,14 @@ class QcardCleanTest(unittest.TestCase):
         self.assertEqual(gone, ["q-old-free"])
         self.assertEqual(self.remaining(), ["q-new", "q-old-shared"])
 
-    def test_a_dead_share_does_not_keep_its_card(self):
+    def test_a_share_that_is_down_still_keeps_its_card(self):
+        # After a restart the origin may fail to bind, so shares reports live:false while the permanent link and its
+        # files remain. Deleting the directory would break the link for good.
         payload = {"shares": [{"app": "q-old-shared", "live": False}]}
         with mock.patch.object(self.qcard, "bridge", return_value=payload):
-            gone = sorted(self.qcard.clean(14))
-        self.assertEqual(gone, ["q-old-free", "q-old-shared"])
+            gone = self.qcard.clean(14)
+        self.assertEqual(gone, ["q-old-free"])
+        self.assertEqual(self.remaining(), ["q-new", "q-old-shared"])
 
     def test_unreadable_share_list_deletes_nothing(self):
         with mock.patch.object(self.qcard, "bridge", side_effect=SystemExit("bridge shares failed")):

@@ -7,7 +7,8 @@
  * dies with its process, so a restart means a new URL.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { createShareHandler, metadataWarnings, notFoundResponse, resolveAppFile, serveAppFile, validAppSlug } from "./apps.ts";
 import type { Store } from "./store.ts";
@@ -210,33 +211,61 @@ export class Shares {
     const match = SHARE_PATH.exec(pathname);
     const origin = this.options.origin!;
     const found = match ? this.records().find(([, record]) => record.token === match[1] && onOrigin(origin, record)) : undefined;
-    // The root is the directory approved at share time; an app's index being swapped later can't retarget the token.
     if (!match || !found || !found[1].root) return notFoundResponse();
+    // The root is the directory approved at share time. If its name now points somewhere else (a symlink to another
+    // app, or to a directory outside the apps folder), the token stops serving rather than following the swap.
+    if (!(await this.approvedRoot(found[0], found[1]))) return notFoundResponse();
     // Pages load data.json and assets relative to their directory, so the share root needs its slash.
     if (match[2] === undefined) return new Response(null, { status: 308, headers: { Location: `/s/${match[1]}/${search}`, "Cache-Control": "no-store" } });
     return serveAppFile(request, found[1].root, match[2]);
   }
 
   /**
+   * True while the share's approved directory still is the app's directory: the app folder is the approved root
+   * (real path unchanged) and its index is a regular file inside it. A whole-folder swap, or an index that points
+   * out, fails this, so an origin token never follows a symlink to another app.
+   */
+  private async approvedRoot(slug: string, record: ShareRecord): Promise<boolean> {
+    if (!record.root) return false;
+    try {
+      const current = await realpath(join(this.options.appsRoot, slug));
+      if (current !== record.root) return false;
+    } catch {
+      return false;
+    }
+    const index = await this.index(slug);
+    return index !== undefined && dirname(index) === record.root;
+  }
+
+  /**
    * The tunnel's health check, and it must mean the card links work. 503 names the broken shares: a live origin
-   * share whose page no longer serves (its index was removed or moved out of its directory), so a dead page can't
-   * read as healthy.
+   * share whose page no longer serves, so a dead page can't read as healthy.
    */
   private async health(origin: ShareOrigin): Promise<Response> {
     const broken: string[] = [];
     for (const [slug, record] of this.records()) {
       if (!onOrigin(origin, record) || !record.root) continue;
-      const index = await this.index(slug);
-      if (!index || dirname(index) !== record.root) broken.push(slug);
+      if (!(await this.approvedRoot(slug, record))) broken.push(slug);
     }
     const headers = { "Cache-Control": "no-store", "Content-Type": "text/plain" };
     if (broken.length === 0) return new Response("ok\n", { headers });
     return new Response(`broken shares: ${broken.join(", ")}\n`, { status: 503, headers });
   }
 
+  /** Synchronous twin of approvedRoot for list(). */
+  private approvedRootSync(slug: string, record: ShareRecord): boolean {
+    if (!record.root) return false;
+    try {
+      if (realpathSync(join(this.options.appsRoot, slug)) !== record.root) return false;
+    } catch {
+      return false;
+    }
+    return existsSync(join(record.root, "index.html"));
+  }
+
   private alive(slug: string, record: ShareRecord): boolean {
     // An origin share is live only while its page still exists where it was approved.
-    if (record.token) return this.server !== undefined && record.root !== undefined && existsSync(join(record.root, "index.html"));
+    if (record.token) return this.server !== undefined && this.approvedRootSync(slug, record);
     return this.live.get(slug)?.tunnel.alive() ?? false;
   }
 
@@ -250,11 +279,9 @@ export class Shares {
         if (origin) this.serveOrigin();
         for (const [slug, record] of this.records()) {
           if (origin) {
-            if (onOrigin(origin, record)) {
-              // An origin share whose app was removed has nothing to serve; drop it rather than leave a dead link.
-              if (!(await this.index(slug))) { await this.close(slug); this.forget(slug); this.log("share-dropped", slug); }
-              continue;
-            }
+            // An origin share is permanent until unshared. If its page is missing, keep the record so the same URL
+            // recovers when the page is restored; /healthz reports it broken meanwhile.
+            if (onOrigin(origin, record)) continue;
             // A quick-tunnel share (or one on an older origin) moves to the origin once. The move makes it permanent
             // (origin shares don't expire) and binds the approved directory, which is still the app's current one.
             const index = await this.index(slug);
