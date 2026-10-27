@@ -52,12 +52,17 @@ const ANSWER_CLEARANCE = 12;
  * to the newest message. Null outside the list, where nothing needs revealing.
  */
 interface AnswerScroll {
-  readonly attach: (row: ComponentRef<typeof View> | null) => void;
-  readonly focus: () => void;
-  readonly blur: () => void;
-  /** The field's content grew or the list resized; re-reveal while it's focused. */
+  /** A field gained focus: its own row becomes the one to keep visible. */
+  readonly focus: (row: AnswerRow) => void;
+  /** A field lost focus or unmounted; clears the target only if it is still this row. */
+  readonly blur: (row: AnswerRow) => void;
+  /** The focused field's content grew or the list resized; re-reveal while it's focused. */
   readonly reveal: () => void;
+  /** Whether some question's answer field currently holds focus. */
+  readonly isFocused: () => boolean;
 }
+
+type AnswerRow = ComponentRef<typeof View>;
 
 const AnswerScrollContext = createContext<AnswerScroll | null>(null);
 
@@ -98,21 +103,22 @@ export function Chat(props: {
   const following = useRef(props.startAtEnd ?? true);
   const placed = useRef(false);
   const scrollY = useRef(0);
-  const answerRow = useRef<ComponentRef<typeof View> | null>(null);
-  const answerFocused = useRef(false);
+  // The one focused answer field's row, or null. Only a field's own focus sets
+  // it, and only that same row clears it, so other questions can't move it.
+  const answerRow = useRef<AnswerRow | null>(null);
   const followToEnd = () => {
     following.current = true;
     scroll.current?.scrollToEnd({ animated: true });
   };
 
   // Scrolls only as far as the focused field's bottom edge needs, so the
-  // list stays where the owner is reading.
-  // Every callback reads refs only, so one stable object serves the whole list.
+  // list stays where the owner is reading. Every callback reads refs only, so
+  // one stable object serves the whole list.
   const answerScroll = useMemo<AnswerScroll>(() => {
     const reveal = () => {
       const row = answerRow.current;
       const box = frame.current;
-      if (!answerFocused.current || row === null || box === null) return;
+      if (row === null || box === null) return;
       row.measureInWindow((_x, rowY, _width, rowHeight) => {
         box.measureInWindow((_bx, boxY, _boxWidth, boxHeight) => {
           const overflow = rowY + rowHeight - (boxY + boxHeight) + ANSWER_CLEARANCE;
@@ -122,17 +128,15 @@ export function Chat(props: {
       });
     };
     return {
-      attach: (row) => {
+      focus: (row) => {
         answerRow.current = row;
-      },
-      focus: () => {
-        answerFocused.current = true;
         reveal();
       },
-      blur: () => {
-        answerFocused.current = false;
+      blur: (row) => {
+        if (answerRow.current === row) answerRow.current = null;
       },
       reveal,
+      isFocused: () => answerRow.current !== null,
     };
   }, []);
 
@@ -154,7 +158,7 @@ export function Chat(props: {
           }}
           onContentSizeChange={() => {
             // A focused answer keeps its own place; following the newest message would push it out of view.
-            if (answerFocused.current) return answerScroll.reveal();
+            if (answerScroll.isFocused()) return answerScroll.reveal();
             if (!following.current) return;
             scroll.current?.scrollToEnd({ animated: placed.current });
             placed.current = true;
@@ -162,7 +166,7 @@ export function Chat(props: {
           // The keyboard shrinks the list without changing its content; keep
           // the newest message above the composer.
           onLayout={() => {
-            if (following.current && placed.current && !answerFocused.current) {
+            if (following.current && placed.current && !answerScroll.isFocused()) {
               scroll.current?.scrollToEnd({ animated: false });
             }
           }}
@@ -447,6 +451,19 @@ function ChoiceBlock(props: {
   const { block, message } = props;
   const action = useBoardAction();
   const answerScroll = useContext(AnswerScrollContext);
+  const answerRowRef = useRef<AnswerRow | null>(null);
+  // The row this field registered on focus. Kept apart from answerRowRef because
+  // React detaches that ref before unmount cleanup runs.
+  const focusedRowRef = useRef<AnswerRow | null>(null);
+  // Unmounting while focused must not leave the list pinned to this row.
+  useEffect(
+    () => () => {
+      const row = focusedRowRef.current;
+      focusedRowRef.current = null;
+      if (row !== null) answerScroll?.blur(row);
+    },
+    [answerScroll],
+  );
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -555,7 +572,7 @@ function ChoiceBlock(props: {
       </View>
       {!poll && !locked ? (
         <View
-          ref={answerScroll?.attach}
+          ref={answerRowRef}
           className="min-h-10 flex-row items-end gap-2 rounded-[12px] border-[1.5px] border-transparent bg-screen py-1.5 pl-3 pr-1.5"
         >
           <AppTextInput
@@ -563,8 +580,17 @@ function ChoiceBlock(props: {
             accessibilityLabel="Your own answer"
             value={text}
             onChangeText={setWords}
-            onFocus={() => answerScroll?.focus()}
-            onBlur={() => answerScroll?.blur()}
+            onFocus={() => {
+              const row = answerRowRef.current;
+              if (row === null) return;
+              focusedRowRef.current = row;
+              answerScroll?.focus(row);
+            }}
+            onBlur={() => {
+              const row = focusedRowRef.current;
+              focusedRowRef.current = null;
+              if (row !== null) answerScroll?.blur(row);
+            }}
             onContentSizeChange={() => answerScroll?.reveal()}
             editable={!action.pending}
             placeholder="Your own answer"
