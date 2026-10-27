@@ -1049,12 +1049,12 @@ def main(argv=None):
         elif args.command=='cart':
             from commerce_minutes_cart import show as cart_show,set_cart as cart_set
             if args.action=='show':
-                result=cart_show()
+                result=cart_show(auth=CommerceAuth().noon)
             else:
                 if args.items_file is None or args.expect_hash is None:
                     journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')
                 from commerce_basket_input import read_items
-                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash)
+                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon)
         elif args.command=='clear-cart':
             if args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart

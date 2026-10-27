@@ -35,9 +35,10 @@ def manifest_hash(rows):
 
 
 def _special_count(lines):
-    return sum(1 for line in lines if line.get('is_freebie') is not True and
-               (line.get('bundle_present') or line.get('deal_code') or
-                line.get('cart_line_type') not in (None, 'normal')))
+    # Every line counts, freebies included: a bundled or deal gift is not a plain gift and a
+    # full-cart sync with bundles=[] would drop it.
+    return sum(1 for line in lines if line.get('bundle_present') or line.get('deal_code') or
+               line.get('cart_line_type') not in (None, 'normal'))
 
 
 def _titles(lines):
@@ -161,7 +162,9 @@ def set_cart(rows, *, expect_hash, auth=None):
             j.abandon(flow_id)
             if refusal:
                 raise refusal[0] from None
-        raise
+            raise
+        # Consumed send, then a transport/receipt/cookie failure: the fence stays and nothing is retried.
+        raise OutcomeUnverified(flow_id, getattr(exc, 'code', None) or type(exc).__name__) from None
     try:
         after = readback_session(auth)
         m.require(_special_count(after.projection['lines']) == 0, 'MINUTES_CART_SET_VERIFY_MISMATCH')

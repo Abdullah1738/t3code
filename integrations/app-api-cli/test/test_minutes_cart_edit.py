@@ -5,6 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import commerce_cli
 import commerce_journal as j
 import commerce_minutes as c
 import commerce_minutes_cart as cart
@@ -42,6 +43,22 @@ class CartTestBase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.auth = flow_tests.ResumeActiveTests().auth()
+        # Fixture auth at every seam: direct calls, the CLI's CommerceAuth, and no real NoonAuthLifecycle.
+        from unittest.mock import Mock
+        fake_commerce = Mock()
+        fake_commerce.noon = self.auth
+        for target in (patch.object(cart, 'NoonAuthLifecycle', return_value=self.auth),
+                       patch.object(commerce_cli, 'CommerceAuth', return_value=fake_commerce)):
+            target.start()
+            self.addCleanup(target.stop)
+        # No outbound sockets: any real network call fails the test instead of reaching Noon.
+        import socket
+        def refuse(*a, **kw):
+            raise AssertionError('outbound network blocked in cart tests')
+        for name in ('socket', 'create_connection'):
+            p = patch.object(socket, name, side_effect=refuse)
+            p.start()
+            self.addCleanup(p.stop)
         p = patch.object(options, 'read_options', return_value={'groups': []})
         self.read_options = p.start()
         self.addCleanup(p.stop)
@@ -162,6 +179,66 @@ class FinalReadbackTests(CartTestBase):
             with self.assertRaisesRegex(m.MinutesError, 'MINUTES_CART_SPECIAL_LINES'):
                 cart.set_cart([{'sku': 'SKU_A', 'qty': 2}], expect_hash=expect, auth=self.auth)
         self.assertEqual(harness.calls, [])
+
+
+class BundledFreebieTests(CartTestBase):
+    def test_bundled_freebie_on_final_readback_sends_nothing(self):
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        bundled_gift = lines_of([row('SKU_A', 1), row('GIFT', 1, freebie=True, bundle={'id': 7})])
+        harness = Harness([lines_of([row('SKU_A', 2)])])
+        real = m.MinutesCheckout
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(bundled_gift)]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with self.assertRaisesRegex(m.MinutesError, 'MINUTES_CART_SPECIAL_LINES'):
+                cart.set_cart([{'sku': 'SKU_A', 'qty': 2}], expect_hash=expect, auth=self.auth)
+        self.assertEqual(harness.calls, [])
+
+
+class TransportFailureTests(CartTestBase):
+    def run_failing_sync(self, error):
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        harness = Harness([error])
+        real = m.MinutesCheckout
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur))]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with self.assertRaises(cart.OutcomeUnverified) as ctx:
+                cart.set_cart([{'sku': 'SKU_A', 'qty': 2}], expect_hash=expect, auth=self.auth)
+        return ctx.exception, harness
+
+    def test_transport_timeout_after_consumed_send_is_unverified_and_not_retried(self):
+        exc, harness = self.run_failing_sync(m.MinutesError('REQUEST_FAILED'))
+        self.assertEqual(exc.code, 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
+        self.assertEqual([x[0] for x in harness.calls], ['sync'])  # exactly one send, never retried
+        self.assertEqual(j.inspect(exc.flow_id)['state'], 'FENCED')
+        self.assertIn('commerce abandon-flow ' + exc.flow_id, exc.details['recovery'])
+
+    def test_cli_prints_flow_id_and_recovery_for_transport_failure(self):
+        import io, contextlib, json, tempfile as tf
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        harness = Harness([m.MinutesError('REQUEST_FAILED')])
+        real = m.MinutesCheckout
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur))]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with tf.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+                json.dump([{'sku': 'SKU_A', 'qty': 2, 'modifiers': []}], f)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = commerce_cli.main(['cart', 'minutes', 'set', '--items-file', f.name, '--expect-hash', expect])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload['error'], 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
+        self.assertTrue(payload['flow_id'])
+        self.assertIn('commerce abandon-flow ' + payload['flow_id'], payload['recovery'])
+        self.assertEqual(len(harness.calls), 1)
 
 
 class SnapshotRefreshTests(CartTestBase):
