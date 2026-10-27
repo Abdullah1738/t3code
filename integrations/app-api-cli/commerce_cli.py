@@ -951,7 +951,8 @@ def main(argv=None):
         help='Minutes: terminal close when noon reports the exact order failed/cancelled, inactive, '
              'zero total and its payment intent uncaptured; never retries')
     disposition.add_argument('--owner-attest-no-charge',action='store_true',
-        help='terminal Talabat close using explicit owner evidence plus fresh exact provider checks; never retries')
+        help='terminal close of a Talabat flow, or a noon Minutes flow whose payment noon reports failed, '
+             'on explicit owner evidence plus fresh exact provider checks; never retries')
     disposition.add_argument('--evidence',metavar='TEXT',
         help='owner no-charge statement and source/context, retained in the private journal')
     disposition.add_argument('--attested-by',choices=('owner',))
@@ -1088,7 +1089,12 @@ def main(argv=None):
             elif args.separate_order is not None or args.separate_order_after is not None or args.legacy_rejection_evidence is not None:
                 journal.fail('DUPLICATE_CLOSURE_FLAG_REQUIRED')
             elif args.owner_attest_no_charge:
-                result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
+                owner_binding=journal.binding(args.flow_id)
+                if owner_binding['app']=='noon' and owner_binding['vertical']=='minutes':
+                    from commerce_minutes_disposition import owner_attest_failed
+                    result=owner_attest_failed(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
+                else:
+                    result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
             elif args.evidence is not None or args.attested_by is not None:
                 journal.fail('OWNER_ATTESTATION_FLAG_REQUIRED')
             else:

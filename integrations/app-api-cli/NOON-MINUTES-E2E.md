@@ -172,6 +172,19 @@ failed/missing intent read. The close is terminal
 counted, the order ID stays owned, nothing is resent and no retry is authorized.
 It records "uncaptured at check", not a bank-side void.
 
+When `--close-failed` refuses (for example the intent is still in its 3DS or
+redirect state), and Abdullah has checked his card and confirmed nothing was
+charged, close it with the owner attestation:
+
+```
+commerce reconcile-order FLOW_UUID --owner-attest-no-charge --attested-by owner --evidence "<what Abdullah checked, when>"
+```
+
+It runs the same fresh reads (order failed/cancelled, inactive, total 0, intent
+not paid, no capture or authorization) and refuses on any other shape. It is
+terminal (`OWNER_ATTESTED_UNCHARGED`): the reservation and order ownership stay
+recorded, nothing is resent or retried, and it is not provider proof of no charge.
+
 Both allowlists are empty: no transaction status noon finalises as a non-capture
 has been captured yet, so today the close refuses every real failed order with
 `MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED` and the flow stays fenced. Add a
