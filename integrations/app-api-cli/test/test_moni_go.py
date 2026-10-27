@@ -848,5 +848,59 @@ class ReplacementClearanceTests(unittest.TestCase):
                                            'group-other': [self.timed('G2', 'yes order it', 3)]})
 
 
+class MyselfClearanceTests(unittest.TestCase):
+    """'ok order it myself' is her ordering it herself, so it must not clear an unresolved cancel."""
+
+    def timed(self, row_id, text, sent_ago):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-myself-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_myself_repeat_in_chat_45_does_not_clear_the_uncertain_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                       'group-sb_gro': [self.recv('G1', 'order it', 5)]},
+                          chat_45=[msg('ok order it myself', 1, mid=900)])
+
+    def test_myself_repeat_in_timed_group_does_not_clear_the_uncertain_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                       'group-sb_gro': [self.recv('G1', 'order it', 5)],
+                                       'group-other': [self.timed('G2', 'ok order it myself', 1)]})
+
+    def test_ok_order_it_still_clears_the_uncertain_group_go_in_chat_45(self):
+        got = self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                         'group-sb_gro': [self.recv('G1', 'order it', 5)]},
+                            chat_45=[msg('ok order it', 1, mid=900)])
+        self.assertEqual(got['text'], 'ok order it')
+
+    def test_ok_order_it_still_clears_the_uncertain_group_go_in_a_timed_group(self):
+        got = self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                         'group-sb_gro': [self.recv('G1', 'order it', 5)],
+                                         'group-other': [self.timed('G2', 'ok order it', 1)]})
+        self.assertEqual(got['text'], 'ok order it')
+
+
 if __name__ == '__main__':
     unittest.main()

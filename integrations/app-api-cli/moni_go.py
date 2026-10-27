@@ -99,6 +99,14 @@ GO_PHRASES = tuple(normalize(p) for p in ('yes order', 'ok order', 'okay order',
 REGO_MIN_WORDS = 3
 
 
+def _restarts(text, wanted, rego_by_words):
+    """True when a message after a cancel puts her order back on: her specific go words, or a clear
+    go phrase. "ok order it myself" is her ordering it herself, so it never restarts."""
+    if _has(text, 'myself'):
+        return False
+    return (rego_by_words and _has(text, wanted)) or any(_has(text, p) for p in GO_PHRASES)
+
+
 def _has(text, phrase):
     return bool(phrase) and f' {phrase} ' in f' {text} '
 
@@ -386,9 +394,7 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
             if _has(text, wanted):
                 replaced.append(go_row)
                 go_row = row
-        elif (rego_by_words and _has(text, wanted)) or (
-                any(_has(text, p) for p in GO_PHRASES) and not _has(text, 'myself')):
-            # "ok order it myself" means she will order it, not us.
+        elif _restarts(text, wanted, rego_by_words):
             replaced.append(go_row)
             go_row, cancel_row = row, None
     if go_row is not None and go_row.get('_bridge'):
@@ -402,7 +408,7 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
     # A repeat that replaced an earlier go keeps that go's uncertainty, unless the final go is
     # clear (specific words) and provably sent after each conflicting cancel.
-    final_clear = rego_by_words or any(_has(normalize(go_row.get('text')), p) for p in GO_PHRASES)
+    final_clear = _restarts(normalize(go_row.get('text')), wanted, rego_by_words)
     for candidate in replaced:
         for row in _ambiguous_rows(candidate, mine):
             if not (final_clear and _proven_before(row, go_row)):
