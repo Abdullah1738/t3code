@@ -305,6 +305,45 @@ class ProjectionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(m.MinutesError):
                 self.review(self.snapshot(data))
 
+    def test_cvv_ask_refused_by_default_and_allowed_only_when_asked(self):
+        data=fixture();data['isCvvRequired']=True
+        with self.assertRaisesRegex(m.MinutesError,'PAYMENT_CHALLENGE_REQUIRED'):
+            self.review(self.snapshot(data))
+        digest=m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
+            expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
+            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=True)
+        self.assertRegex(digest,r'^[a-f0-9]{64}$')
+
+    def test_verify_device_and_unknown_cvv_flag_always_refuse(self):
+        for key,value,allow in [('verifyDevice',True,False),('verifyDevice',True,True),
+                                ('isCvvRequired',None,True),('isCvvRequired',None,False)]:
+            data=fixture();data[key]=value
+            with self.subTest(key=key,value=value,allow=allow), self.assertRaises(m.MinutesError):
+                m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
+                    expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
+                    card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=allow)
+
+    def test_home_provider_refreshes_old_home_and_refuses_address_move(self):
+        h=Harness([fixture()])
+        old=AccountHome('minutes',h.home.account_ref,h.home.address_ref,time.time()-200)
+        calls=[]
+        def provider(deadline):
+            calls.append(deadline)
+            return AccountHome('minutes',h.home.account_ref,h.home.address_ref,time.time())
+        client=m.MinutesCheckout(HEADERS,old,request=h.request,receipt=h.receipt,
+            response_cookies=h.response_cookies,home_provider=provider)
+        client.get_session(before_send=h.reserve)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(len(h.calls),1)
+        h2=Harness([fixture()])
+        old2=AccountHome('minutes',h2.home.account_ref,h2.home.address_ref,time.time()-200)
+        moved=AccountHome('minutes',h2.home.account_ref,fingerprint('moved-address'),time.time())
+        client2=m.MinutesCheckout(HEADERS,old2,request=h2.request,receipt=h2.receipt,
+            response_cookies=h2.response_cookies,home_provider=lambda deadline:moved)
+        with self.assertRaisesRegex(m.MinutesError,'VERIFIED_ACCOUNT_CHANGED'):
+            client2.get_session(before_send=h2.reserve)
+        self.assertEqual(h2.calls,[])
+
     def test_unexpected_cart_item_never_ignored(self):
         data=fixture();data['items'].append(dict(data['items'][0],sku='UNOWNED_SKU'))
         snapshot=self.snapshot(data)

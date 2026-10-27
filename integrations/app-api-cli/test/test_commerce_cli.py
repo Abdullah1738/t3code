@@ -7,6 +7,7 @@ import io
 from unittest.mock import patch
 
 import commerce_cli as c
+import commerce_minutes
 from commerce_flow import FlowGate
 from talabat_place_contract import PlaceObservation
 from talabat_http_checkout import AsyncPaymentContext, PaymentResult
@@ -410,7 +411,7 @@ class MinutesOrderTests(unittest.TestCase):
         with patch.object(cm.subprocess,'run',side_effect=OSError):
             result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
                                       notify={'wraps':cm.telegram_3ds_notify},flows=flows)
-        flows[0].await_payment.assert_called_once_with()
+        flows[0].await_payment.assert_called_once_with(wait_seconds=600,stall=commerce_minutes.telegram_stall_notify)
         self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
         result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
                                   notify={'side_effect':RuntimeError('telegram down')})
@@ -438,7 +439,7 @@ class MinutesOrderTests(unittest.TestCase):
                 'transaction_status':'CREATED','polls':1,'timed_out':True}
             self.assertEqual(c.main(['await-payment','flow','--no-notify']),1)
         flow.resume_payment.assert_called_once_with('flow')
-        flow.resume_payment.return_value.await_payment.assert_called_once_with(notify=None,wait_seconds=600.0)
+        flow.resume_payment.return_value.await_payment.assert_called_once_with(notify=None,wait_seconds=600.0,stall=None)
         notify.assert_not_called()
         # Unconfirmed is never reported as uncharged.
         result=json.loads(output.getvalue().strip().splitlines()[-1])

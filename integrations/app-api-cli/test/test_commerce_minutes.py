@@ -218,6 +218,83 @@ class PaymentAwaitTests(unittest.TestCase):
             self.assertTrue(flow.await_payment(notify=lambda *_:None,
                 sleep=lambda _:None,clock=iter([0,5]).__next__)['paid'])
 
+    def test_stall_alert_fires_once_after_300s_and_not_when_paid(self):
+        flow=self.flow()
+        stalls=[]
+        # Unpaid for 320 s of fake clock time: stall once at >=300 s, never twice.
+        flow.client.payment_intent_status.return_value=c.m.Snapshot({},
+            paid_projection(status='payment_in_progress',txn='AUTHORIZED',authorized=0,captured=0,error_code='0'),time.time())
+        now=[0.0]
+        def clock():return now[0]
+        def sleep(s):now[0]+=s
+        with patch.object(c.j,'observe'):
+            result=flow.await_payment(notify=lambda *_:None,stall=lambda o,t:stalls.append((o,t)),
+                wait_seconds=320,poll_seconds=5,sleep=sleep,clock=clock)
+        self.assertTrue(result['timed_out'])
+        self.assertEqual(stalls,[('IAEGA123',1725)])
+        # Paid before 300 s: the stall never fires.
+        flow2=self.flow()
+        flow2.client.payment_intent_status.return_value=c.m.Snapshot({},paid_projection(),time.time())
+        quiet=[]
+        now=[0.0]
+        with patch.object(c.j,'observe'):
+            paid=flow2.await_payment(notify=lambda *_:None,stall=lambda o,t:quiet.append((o,t)),
+                wait_seconds=600,poll_seconds=5,sleep=sleep,clock=clock)
+        self.assertTrue(paid['paid'])
+        self.assertEqual(quiet,[])
+
+    def test_place_refuses_cvv_asking_review_without_cvv_and_journals_nothing(self):
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':True}
+        flow.client=Mock()
+        flow.approve=Mock(side_effect=AssertionError('no approve before the CVV gate'))
+        with patch.object(c.j,'consume',side_effect=AssertionError('no consume')) as consume, \
+                patch.object(c.j,'fail',side_effect=c.j.JournalError('MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')):
+            with self.assertRaisesRegex(c.j.JournalError,'MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN'):
+                flow.place()
+        consume.assert_not_called()
+        flow.client.place_order.assert_not_called()
+
+    def test_fresh_home_returns_reverified_home_and_refuses_moved_address(self):
+        # _fresh_home is what the client's home_provider calls once a home is >90 s
+        # old: it re-verifies live auth and must refuse a moved account or address.
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.snapshot=AuthSnapshot('minutes',fingerprint('account'),
+            fingerprint(HEADERS['x-addresscode'],HEADERS['x-addresskey']),
+            time.time()-300,dict(HEADERS),time.monotonic()+30)
+        flow.auth=Mock()
+        flow.auth.status.return_value={'maintenance_state':'none'}
+        fresh=AuthSnapshot('minutes',fingerprint('account'),
+            fingerprint(HEADERS['x-addresscode'],HEADERS['x-addresskey']),
+            time.time(),dict(HEADERS),time.monotonic()+30)
+        flow.auth.revalidate.return_value=fresh
+        home=flow._fresh_home(time.monotonic()+30)
+        self.assertEqual(home.service,'minutes')
+        self.assertEqual(home.account_ref,flow.snapshot.account_ref)
+        self.assertGreater(home.checked_at,time.time()-5)
+        moved=AuthSnapshot('minutes',fingerprint('account'),fingerprint('moved'),
+            time.time(),dict(HEADERS),time.monotonic()+30)
+        flow.auth.revalidate.return_value=moved
+        with self.assertRaisesRegex(c.j.JournalError,'MINUTES_ACCOUNT_HOME_CHANGED'):
+            flow._fresh_home(time.monotonic()+30)
+
+    def test_place_rechecks_cvv_after_refresh_and_places_with_cvv_ready(self):
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':True}
+        flow.client=Mock()
+        flow.client.active_orders.return_value=c.m.Snapshot({},{'active':[],'count':0,'resend_allowed':False},time.time())
+        flow.client.place_order.return_value={'order':'IAEGA123'}
+        flow._expect=Mock()
+        with patch.object(c.MinutesFlow,'approve',lambda self:self.review), \
+                patch.object(c.MinutesFlow,'refresh_cart_readback',return_value={}), \
+                patch.object(c.j,'consume',return_value=True):
+            result=flow.place(cvv_ready=True)
+        self.assertEqual(result['order'],'IAEGA123')
+        self.assertEqual(flow.client.place_order.call_count,1)
+
     def test_telegram_notify_shape_and_failure(self):
         flow=self.flow()
         with patch.object(c.subprocess,'run') as run:
@@ -227,9 +304,8 @@ class PaymentAwaitTests(unittest.TestCase):
         command=run.call_args.args[0]
         self.assertIn('minutes-cli-3ds-IAEGA123',command)
         text=command[command.index('--text')+1]
-        self.assertEqual(text,'Noon Minutes CLI test order IAEGA123 AED 17.25 needs ENBD 3DS approval: '
-            'open ENBD X app notification / Activity and approve. ~2 min window.')
-        self.assertEqual(command[command.index('--source')+1],'Minutes CLI build')
+        self.assertEqual(text,'this is ours: approve noon Minutes AED 17.25 in ENBD X now (order IAEGA123)')
+        self.assertEqual(command[command.index('--source')+1],'Noon payment')
         self.assertEqual(command[command.index('--severity')+1],'attention')
         env=run.call_args.kwargs['env']
         self.assertNotIn('BUN_INSPECT',env)
