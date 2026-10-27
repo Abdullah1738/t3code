@@ -69,19 +69,22 @@ const draftJson = (id: string) => JSON.parse(readFileSync(join(draftDir, `${id}.
 afterAll(() => rmSync(box, { recursive: true, force: true }));
 beforeEach(reset);
 
-test("direct send to another person is blocked and wacli is never called", () => {
+test("direct send to another person goes out now and prints the Tip on stderr", () => {
   const r = wa("send", BOB, "hello there");
-  expect(r.code).toBe(2);
-  expect(r.err).toContain("Blocked: WhatsApp sends need Abdullah's OK");
-  expect(callLog()).toHaveLength(0);
+  expect(r.code).toBe(0);
+  expect(r.out).toBe("(sent) Me: hello there");
+  expect(r.err).toBe("Tip: when a message speaks for Abdullah with new wording, money, dates or a commitment, show him a wa draft preview first.");
+  expect(callLog()).toEqual([`--json send text --to ${BOB} --message hello there`]);
+  expect(approvalLog()).toHaveLength(0);
 });
 
-test("direct sendfile to another person is blocked", () => {
+test("direct sendfile to another person goes out now without --allow-self", () => {
   const f = join(box, "pic.png");
   writeFileSync(f, "x");
   const r = wa("sendfile", BOB, f, "image");
-  expect(r.code).toBe(2);
-  expect(callLog()).toHaveLength(0);
+  expect(r.code).toBe(0);
+  expect(r.err).toContain("Tip:");
+  expect(callLog()).toEqual([`--json send file --to ${BOB} --file ${f} --as image`]);
 });
 
 test("owner self-send goes straight through with --allow-self", () => {
@@ -100,7 +103,8 @@ test("draft prints a preview with name and number; send --approved needs his OK 
   expect(id).toMatch(/^[0-9a-f]{10}$/);
   const preview = `WhatsApp to Bob (+971500000001):\nCan we do EUR 3500?\n(draft ${id})`;
   expect(d.out).toContain(preview);
-  expect(d.out).toContain(`After his OK: wa send --approved ${id} --inbound <incoming message ID of his reply>`);
+  expect(d.out).toContain("Preview (to get Abdullah's OK first");
+  expect(d.out).toContain(`Send: wa send --approved ${id}`);
   expect(callLog()).toHaveLength(0);
   const j = draftJson(id);
   expect(j).toMatchObject({ kind: "text", jid: BOB, text: "Can we do EUR 3500?", preview });
@@ -108,35 +112,31 @@ test("draft prints a preview with name and number; send --approved needs his OK 
 
   const s = wa("send", "--approved", id, ...OK);
   expect(s.code).toBe(0);
-  expect(s.out).toBe("approved: ok\n(sent) Me: Can we do EUR 3500?");
-  expect(approvalLog()).toEqual([["check", ...OK, "--preview", preview, "--drafted-at", String(j.created_at)]]);
+  expect(s.out).toBe("(sent) Me: Can we do EUR 3500?");
+  expect(approvalLog()).toHaveLength(0);
   expect(callLog()).toEqual([`--json send text --to ${BOB} --message Can we do EUR 3500?`]);
   expect(existsSync(join(draftDir, `${id}.sent.json`))).toBe(true);
   expect(existsSync(join(draftDir, `${id}.json`))).toBe(false);
 });
 
-test("--approved <id> alone is not consent: refused before anything is checked or sent", () => {
+test("--approved <id> alone sends the draft once and never runs send-approval", () => {
   const id = idFrom(wa("draft", BOB, "no ok yet").out);
-  for (const extra of [[], ["--inbound"], ["--inbound", ""], ["--yes"]]) {
-    const r = wa("send", "--approved", id, ...extra);
-    expect(r.code).toBe(2);
-    expect(r.err).toContain("alone isn't Abdullah's OK");
-  }
+  const r = wa("send", "--approved", id);
+  expect(r.code).toBe(0);
+  expect(r.out).toBe("(sent) Me: no ok yet");
   expect(approvalLog()).toHaveLength(0);
-  expect(callLog()).toHaveLength(0);
-  expect(existsSync(join(draftDir, `${id}.json`))).toBe(true);
+  expect(callLog()).toEqual([`--json send text --to ${BOB} --message no ok yet`]);
+  expect(wa("send", "--approved", id).code).toBe(2);
+  expect(callLog()).toHaveLength(1);
 });
 
-test("a refused approval leaves the draft pending and sends nothing; a later OK still works", () => {
+test("a refusing send-approval changes nothing: the draft still sends once", () => {
   const id = idFrom(wa("draft", BOB, "wait for him").out);
   const r = waEnv({ SA_REFUSE: "1" }, "send", "--approved", id, ...OK);
-  expect(r.code).toBe(2);
-  expect(r.err).toContain("Refused: not shown");
-  expect(callLog()).toHaveLength(0);
-  expect(existsSync(join(draftDir, `${id}.json`))).toBe(true);
-  expect(wa("send", "--approved", id, "--app").code).toBe(0);
-  expect(approvalLog()[1]?.slice(0, 2)).toEqual(["check", "--app"]);
+  expect(r.code).toBe(0);
+  expect(approvalLog()).toHaveLength(0);
   expect(callLog()).toHaveLength(1);
+  expect(existsSync(join(draftDir, `${id}.sent.json`))).toBe(true);
 });
 
 test("a revised text is a new draft that needs its own OK", () => {
@@ -144,7 +144,7 @@ test("a revised text is a new draft that needs its own OK", () => {
   const b = idFrom(wa("draft", BOB, "EUR 3400").out);
   expect(a).not.toBe(b);
   expect(wa("send", "--approved", b, ...OK).code).toBe(0);
-  expect(approvalLog()[0]?.[4]).toBe(`WhatsApp to Bob (+971500000001):\nEUR 3400\n(draft ${b})`);
+  expect(callLog()).toEqual([`--json send text --to ${BOB} --message EUR 3400`]);
 });
 
 test("a LID recipient becomes its phone number, so the same message has one draft either way", () => {
@@ -168,16 +168,15 @@ test("a group preview names the group and its jid, so same-named chats differ", 
   expect(idFrom(a.out)).not.toBe(idFrom(b.out));
 });
 
-test("a text draft from before preview binding is refused", () => {
+test("a text draft without a stored preview still sends once: no OK is checked any more", () => {
   const id = idFrom(wa("draft", BOB, "old style").out);
   const j = draftJson(id);
   delete j.preview;
   writeFileSync(join(draftDir, `${id}.json`), JSON.stringify(j));
   const r = wa("send", "--approved", id, ...OK);
-  expect(r.code).toBe(2);
-  expect(r.err).toContain("predates preview binding");
+  expect(r.code).toBe(0);
   expect(approvalLog()).toHaveLength(0);
-  expect(callLog()).toHaveLength(0);
+  expect(callLog()).toHaveLength(1);
 });
 
 test("two senders at once send once", async () => {
@@ -315,15 +314,15 @@ test("draftfile binds the file bytes; sendfile --approved passes --as and captio
   const preview = `WhatsApp to Bob (+971500000001): file ${f} [document] (sha256 ${sha.slice(0, 12)})\n` +
     `Caption: the menu\n(draft ${id})`;
   expect(d.out).toContain(preview);
-  expect(d.out).toContain(`wa sendfile --approved ${id}`);
+  expect(d.out).toContain(`Send: wa sendfile --approved ${id}`);
   expect(d.out).toContain(`send-file him ${f}`);
   const j = draftJson(id);
   expect(j).toMatchObject({ kind: "file", jid: BOB, path: f, as: "document", caption: "the menu", sha256: sha, preview });
 
   const s = wa("sendfile", "--approved", id, ...OK);
   expect(s.code).toBe(0);
-  expect(s.out).toBe("approved: ok\n(sent) Me: [document] menu.pdf");
-  expect(approvalLog()[0]).toEqual(["check", ...OK, "--preview", preview, "--drafted-at", String(j.created_at), "--file", sha, "menu.pdf"]);
+  expect(s.out).toBe("(sent) Me: [document] menu.pdf");
+  expect(approvalLog()).toHaveLength(0);
   expect(callLog()).toEqual([`--json send file --to ${BOB} --file ${f} --as document --caption the menu`]);
   expect(existsSync(join(draftDir, `${id}.sent.json`))).toBe(true);
   expect(wa("sendfile", "--approved", id, ...OK).code).toBe(2);
@@ -355,14 +354,14 @@ test("a file draft from before file binding is refused", () => {
   expect(callLog()).toHaveLength(0);
 });
 
-test("draftfile refuses a missing path and direct sendfile to others stays blocked", () => {
+test("draftfile refuses a missing path; direct sendfile to others goes out now", () => {
   const r = wa("draftfile", BOB, join(box, "nope.png"));
   expect(r.code).toBe(2);
   expect(existsSync(draftDir)).toBe(false);
   const f = join(box, "pic.png");
   writeFileSync(f, "x");
-  expect(wa("sendfile", BOB, f).code).toBe(2);
-  expect(callLog()).toHaveLength(0);
+  expect(wa("sendfile", BOB, f).code).toBe(0);
+  expect(callLog()).toHaveLength(1);
 });
 
 test("owner self-drafts skip the approval check", () => {

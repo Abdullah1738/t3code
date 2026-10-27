@@ -11,12 +11,11 @@
 #                             --more N shows N*40 more and asks the phone for older history when the store runs out
 #   wa draft <jid> <text...>  store a single-line text draft (sends nothing); prints the preview lines to show Abdullah
 #   wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]   same for a file (bound to its bytes)
-#   wa send --approved <id> (--inbound <id> | --app)   send a text draft once Abdullah (or Moni, in her chat) OKed its preview.
-#                             --inbound: the incoming message ID of his OK (iMessage), --app: his reply in this Robob
-#                             thread. send-approval checks he got the preview lines before that reply and that it is an OK.
-#   wa sendfile --approved <id> (--inbound <id> | --app)   same for a file draft
-#   wa send <jid> <text...>   blocked for everyone but the owner's own number (draft first, see above)
-#   wa sendfile <jid> <path> [image|video|audio|doc]   blocked the same way; owner's own number only
+#   wa send --approved <id> [--inbound <id> | --app]   send a text draft once, right away. --inbound/--app are optional
+#                             and not checked. Where his OK makes sense, show him the draft preview first and send after his reply.
+#   wa sendfile --approved <id> [--inbound <id> | --app]   same for a file draft
+#   wa send <jid> <text...>   send now, to anyone (the owner's own number needs no extra flag)
+#   wa sendfile <jid> <path> [image|video|audio|doc]   same, for a file
 #   wa download <jid> [N]     download the Nth-newest media message (default 1) -> prints the file path
 #   wa ids <jid> [N]          last N messages with message ids (for download/reply-to)
 #   wa start                  (re)start the sync daemon
@@ -90,30 +89,14 @@ recipient() {
   elif [[ $jid == *@s.whatsapp.net ]]; then TO="${name:+$name (}+${jid%%@*}${name:+)}"
   else TO="${name:+$name }($jid)"; fi
 }
-# Approval evidence from `send --approved <id> (--inbound <id> | --app)`; fills VIA.
-approval_args() {
-  VIA=()
-  case ${1:-} in
-    --inbound) [[ -n ${2:-} ]] && VIA=(--inbound "$2") ;;
-    --app) VIA=(--app) ;;
-  esac
-  (( ${#VIA} )) || die "Refused: --approved <id> alone isn't Abdullah's OK. Add --inbound <incoming message ID of his reply> (iMessage) or --app (his reply in this Robob thread), after he saw the preview."
-}
-# Abdullah's OK on exactly this draft's preview, given after he got it (send-approval). Exits 2 when refused.
-check_ok() {
-  local f=$1 pv files=()
-  [[ ${$(jget "$f" jid)%%@*} == $OWNER ]] && return 0
-  pv=$(jget "$f" preview)
-  [[ -n $pv ]] || die "Refused: draft ${${f:t}%.json} predates preview binding. Write it again and show the new preview."
-  [[ $(jget "$f" kind) == file ]] && files=(--file "$(jget "$f" sha256)" "${$(jget "$f" path):t}")
-  "$SA" check "${VIA[@]}" --preview "$pv" --drafted-at "$(jget "$f" created_at)" "${files[@]}" || exit 2
-}
-# Print the preview lines the agent pastes to Abdullah before asking for his OK.
+# Print the preview lines the agent shows Abdullah where his OK makes sense (no check runs; the send isn't held).
 show_preview() {
-  print -r -- "Show Abdullah these lines as is (for Moni's own request: Moni, in her chat; in a Robob thread: alone in a plain \`\`\` code block), then wait for the OK:"
+  print -r -- "Preview (to get Abdullah's OK first, show him these lines as is; for Moni's own request: Moni, in her chat; in a Robob thread: alone in a plain \`\`\` code block):"
   print -r -- "$3"
-  print -r -- "After his OK: wa $2 --approved $1 --inbound <incoming message ID of his reply> (in a Robob thread: --app)"
+  print -r -- "Send: wa $2 --approved $1"
 }
+# Printed after a send to someone other than the owner. Stderr, so stdout stays the sent line.
+tip() { [[ ${1%%@*} == $OWNER ]] || print -r -- "Tip: when a message speaks for Abdullah with new wording, money, dates or a commitment, show him a wa draft preview first." >&2; }
 # A pending draft with this id is kept as is while it is fresh (same preview, same clock). Over 24h old, or its
 # file gone or changed: it becomes <id>.expired.json and this prints nothing (the caller takes a new id).
 # Prints the stored preview and exits when it is still fresh.
@@ -170,7 +153,6 @@ claim_draft() {
     [[ -f $fp ]] || die "Refused: file is gone: $fp"
     [[ $(/usr/bin/shasum -a 256 "$fp" | cut -c1-64) == $sha ]] || die "Refused: $fp changed since draft $id. Write a new draft and show it again."
   fi
-  check_ok "$f"
   { ln "$f" "$D/$id.sending.json" 2>/dev/null && rm -f "$f"; } || die "Refused: draft $id already used."
   CLAIMED=$D/$id.sending.json
 }
@@ -354,30 +336,27 @@ if not ok:
     print -r -- "In iMessage, send-file him $abs in the same chat right before the preview (the file has to reach him too)." ;;
   send)
     if [[ ${1:-} == --approved ]]; then
-      approval_args "${@:3}"
-      claim_draft "${2:?usage: wa send --approved <id> (--inbound <id> | --app)}" text
+      claim_draft "${2:?usage: wa send --approved <id> [--inbound <id> | --app]}" text
       jid=$(jget "$CLAIMED" jid); text=$(jget "$CLAIMED" text)
       self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
       out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
       if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then
-        settle sent; print -r -- "(sent) Me: $text"
+        settle sent; print -r -- "(sent) Me: $text"; tip "$jid"
       else
         settle failed; print -r -- "$out" >&2; exit 1
       fi
       exit 0
     fi
     jid=$(norm ${1:?usage: wa send <jid> <text>}); shift
-    [[ ${jid%%@*} == $OWNER ]] || die "Blocked: WhatsApp sends need Abdullah's OK on the exact draft. Run: wa draft $jid <text>"
     text="${*}"
     [[ $text == *$'\n'* ]] && die "error: single-line text only"
     [[ -n $text ]] || die "error: empty text"
-    self=(--allow-self)
+    self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
     out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
-    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: $text"; else print -r -- "$out" >&2; exit 1; fi ;;
+    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: $text"; tip "$jid"; else print -r -- "$out" >&2; exit 1; fi ;;
   sendfile)
     if [[ ${1:-} == --approved ]]; then
-      approval_args "${@:3}"
-      claim_draft "${2:?usage: wa sendfile --approved <id> (--inbound <id> | --app)}" file
+      claim_draft "${2:?usage: wa sendfile --approved <id> [--inbound <id> | --app]}" file
       jid=$(jget "$CLAIMED" jid); fp=$(jget "$CLAIMED" path); as=$(jget "$CLAIMED" as); caption=$(jget "$CLAIMED" caption)
       if [[ ! -f $fp || $(/usr/bin/shasum -a 256 "$fp" | cut -c1-64) != $(jget "$CLAIMED" sha256) ]]; then
         settle failed; die "Refused: $fp is gone or changed. Write a new draft."
@@ -386,18 +365,17 @@ if not ok:
       cap=(); [[ -n $caption ]] && cap=(--caption "$caption")
       out=$("$W" --json send file --to "$jid" --file "$fp" --as "$as" $self "${cap[@]}" 2>&1); rc=$?
       if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then
-        settle sent; print -r -- "(sent) Me: [$as] ${fp:t}"
+        settle sent; print -r -- "(sent) Me: [$as] ${fp:t}"; tip "$jid"
       else
         settle failed; print -r -- "$out" >&2; exit 1
       fi
       exit 0
     fi
     jid=$(norm ${1:?usage: wa sendfile <jid> <path> [kind]}); file=${2:?file}; kind=${3:-doc}
-    [[ ${jid%%@*} == $OWNER ]] || die "Blocked: WhatsApp sends need Abdullah's OK on the exact draft. Run: wa draftfile $jid <path>"
     case $kind in image|video|audio) as=$kind;; doc|document) as=document;; *) as=auto;; esac
-    self=(--allow-self)
+    self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
     out=$("$W" --json send file --to "$jid" --file "$file" --as $as $self 2>&1); rc=$?
-    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: [$as] ${file:t}"; else print -r -- "$out" >&2; exit 1; fi ;;
+    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: [$as] ${file:t}"; tip "$jid"; else print -r -- "$out" >&2; exit 1; fi ;;
   download)
     jid=$(norm ${1:?usage: wa download <jid> [N]}); n=${2:-1}
     q=$("$H" resolve "$jid" | sed "s/.*/'&'/" | paste -sd, -)
@@ -412,6 +390,6 @@ d=json.load(sys.stdin); x=d.get("data") or {}
 print(x.get("path") or x.get("Path") or x.get("local_path") or x.get("LocalPath") or "")' 2>/dev/null)
     [[ -n $p && -f $p ]] || { print -r -- "$out" >&2; exit 1; }
     print -r -- "$p" ;;
-  screen|tui) die "wa tui is retired: the old whatscli wrapper sent without Abdullah's OK. Use wa draft / wa send --approved." ;;
+  screen|tui) die "wa tui is retired (the old whatscli wrapper is gone). Use wa send." ;;
   *) sed -n '2,26p' "$0" ;;
 esac
