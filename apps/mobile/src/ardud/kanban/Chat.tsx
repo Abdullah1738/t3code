@@ -12,10 +12,13 @@ import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { Image } from "expo-image";
 import {
   type ComponentRef,
+  createContext,
   Fragment,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -41,6 +44,22 @@ const HTML_DEFAULT_HEIGHT = 240;
 const HTML_MAX_HEIGHT = 480;
 // How close to the end counts as reading the newest message.
 const FOLLOW_SLACK = 80;
+/** Space kept between a focused answer field and the list's bottom edge. */
+const ANSWER_CLEARANCE = 12;
+
+/**
+ * Lets an answer field keep itself above the keyboard without the list jumping
+ * to the newest message. Null outside the list, where nothing needs revealing.
+ */
+interface AnswerScroll {
+  readonly attach: (row: ComponentRef<typeof View> | null) => void;
+  readonly focus: () => void;
+  readonly blur: () => void;
+  /** The field's content grew or the list resized; re-reveal while it's focused. */
+  readonly reveal: () => void;
+}
+
+const AnswerScrollContext = createContext<AnswerScroll | null>(null);
 
 /**
  * One discussion: messages oldest first, who has seen your last message, who
@@ -75,80 +94,126 @@ export function Chat(props: {
   useMarkRead(boardId, discussionId, state, messages);
 
   const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
+  const frame = useRef<ComponentRef<typeof View>>(null);
   const following = useRef(props.startAtEnd ?? true);
   const placed = useRef(false);
+  const scrollY = useRef(0);
+  const answerRow = useRef<ComponentRef<typeof View> | null>(null);
+  const answerFocused = useRef(false);
   const followToEnd = () => {
     following.current = true;
     scroll.current?.scrollToEnd({ animated: true });
   };
 
+  // Scrolls only as far as the focused field's bottom edge needs, so the
+  // list stays where the owner is reading.
+  // Every callback reads refs only, so one stable object serves the whole list.
+  const answerScroll = useMemo<AnswerScroll>(() => {
+    const reveal = () => {
+      const row = answerRow.current;
+      const box = frame.current;
+      if (!answerFocused.current || row === null || box === null) return;
+      row.measureInWindow((_x, rowY, _width, rowHeight) => {
+        box.measureInWindow((_bx, boxY, _boxWidth, boxHeight) => {
+          const overflow = rowY + rowHeight - (boxY + boxHeight) + ANSWER_CLEARANCE;
+          if (overflow <= 0) return;
+          scroll.current?.scrollTo({ y: Math.max(0, scrollY.current + overflow), animated: true });
+        });
+      });
+    };
+    return {
+      attach: (row) => {
+        answerRow.current = row;
+      },
+      focus: () => {
+        answerFocused.current = true;
+        reveal();
+      },
+      blur: () => {
+        answerFocused.current = false;
+      },
+      reveal,
+    };
+  }, []);
+
   return (
     <View className="flex-1">
-      <ScrollView
-        ref={scroll}
-        className="flex-1"
-        contentContainerClassName="gap-3 px-4 pb-4 pt-2"
-        keyboardShouldPersistTaps="handled"
-        keyboardDismissMode="interactive"
-        scrollEventThrottle={64}
-        onScroll={(event) => {
-          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
-          following.current =
-            contentOffset.y + layoutMeasurement.height >= contentSize.height - FOLLOW_SLACK;
-        }}
-        onContentSizeChange={() => {
-          if (!following.current) return;
-          scroll.current?.scrollToEnd({ animated: placed.current });
-          placed.current = true;
-        }}
-        // The keyboard shrinks the list without changing its content; keep
-        // the newest message above the composer.
-        onLayout={() => {
-          if (following.current && placed.current) scroll.current?.scrollToEnd({ animated: false });
-        }}
-      >
-        {props.header}
-        <FeedError what="the discussion" feed={feed} nowMs={props.nowMs} />
-        {discussionId !== null && messages === undefined && !feed.failure ? <LoadingLine /> : null}
-        {messages?.map((message) => (
-          <Fragment key={message.seq}>
-            <MessageView
-              boardId={boardId}
-              discussionId={discussionId}
-              message={message}
-              state={state}
-              nowMs={props.nowMs}
-              onOpenCard={props.onOpenCard}
-            />
-            {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
-              <View
-                accessible
-                accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
-                className="-mt-1.5 flex-row justify-end gap-[3px]"
-              >
-                {presence.seenBy.map((face) => (
-                  <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
-                ))}
-              </View>
+      <View ref={frame} className="flex-1" onLayout={answerScroll.reveal}>
+        <ScrollView
+          ref={scroll}
+          className="flex-1"
+          contentContainerClassName="gap-3 px-4 pb-4 pt-2"
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
+          scrollEventThrottle={64}
+          onScroll={(event) => {
+            const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+            scrollY.current = contentOffset.y;
+            following.current =
+              contentOffset.y + layoutMeasurement.height >= contentSize.height - FOLLOW_SLACK;
+          }}
+          onContentSizeChange={() => {
+            // A focused answer keeps its own place; following the newest message would push it out of view.
+            if (answerFocused.current) return answerScroll.reveal();
+            if (!following.current) return;
+            scroll.current?.scrollToEnd({ animated: placed.current });
+            placed.current = true;
+          }}
+          // The keyboard shrinks the list without changing its content; keep
+          // the newest message above the composer.
+          onLayout={() => {
+            if (following.current && placed.current && !answerFocused.current) {
+              scroll.current?.scrollToEnd({ animated: false });
+            }
+          }}
+        >
+          <AnswerScrollContext.Provider value={answerScroll}>
+            {props.header}
+            <FeedError what="the discussion" feed={feed} nowMs={props.nowMs} />
+            {discussionId !== null && messages === undefined && !feed.failure ? (
+              <LoadingLine />
             ) : null}
-          </Fragment>
-        ))}
-        {presence?.typing.map((face) => (
-          <View
-            key={face.key}
-            accessible
-            accessibilityLabel={`${face.name} is typing`}
-            className="flex-row items-center gap-2.5"
-          >
-            <Avatar kind={face.kind} letter={face.letter} />
-            <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-            </View>
-          </View>
-        ))}
-      </ScrollView>
+            {messages?.map((message) => (
+              <Fragment key={message.seq}>
+                <MessageView
+                  boardId={boardId}
+                  discussionId={discussionId}
+                  message={message}
+                  state={state}
+                  nowMs={props.nowMs}
+                  onOpenCard={props.onOpenCard}
+                />
+                {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
+                  <View
+                    accessible
+                    accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
+                    className="-mt-1.5 flex-row justify-end gap-[3px]"
+                  >
+                    {presence.seenBy.map((face) => (
+                      <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
+                    ))}
+                  </View>
+                ) : null}
+              </Fragment>
+            ))}
+            {presence?.typing.map((face) => (
+              <View
+                key={face.key}
+                accessible
+                accessibilityLabel={`${face.name} is typing`}
+                className="flex-row items-center gap-2.5"
+              >
+                <Avatar kind={face.kind} letter={face.letter} />
+                <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                </View>
+              </View>
+            ))}
+          </AnswerScrollContext.Provider>
+        </ScrollView>
+      </View>
       <Composer
         boardId={boardId}
         discussionId={discussionId}
@@ -381,6 +446,7 @@ function ChoiceBlock(props: {
 }) {
   const { block, message } = props;
   const action = useBoardAction();
+  const answerScroll = useContext(AnswerScrollContext);
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -488,12 +554,18 @@ function ChoiceBlock(props: {
         })}
       </View>
       {!poll && !locked ? (
-        <View className="min-h-10 flex-row items-end gap-2 rounded-[12px] border-[1.5px] border-transparent bg-screen py-1.5 pl-3 pr-1.5">
+        <View
+          ref={answerScroll?.attach}
+          className="min-h-10 flex-row items-end gap-2 rounded-[12px] border-[1.5px] border-transparent bg-screen py-1.5 pl-3 pr-1.5"
+        >
           <AppTextInput
             multiline
             accessibilityLabel="Your own answer"
             value={text}
             onChangeText={setWords}
+            onFocus={() => answerScroll?.focus()}
+            onBlur={() => answerScroll?.blur()}
+            onContentSizeChange={() => answerScroll?.reveal()}
             editable={!action.pending}
             placeholder="Your own answer"
             placeholderTextColorClassName="accent-foreground-muted"
