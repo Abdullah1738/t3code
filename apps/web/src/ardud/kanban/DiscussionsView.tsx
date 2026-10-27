@@ -22,7 +22,11 @@ import {
   linkLabels,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanDiscussion, KanbanDiscussionUpdateInput } from "@t3tools/contracts";
+import {
+  KANBAN_WS_METHODS,
+  type KanbanDiscussion,
+  type KanbanDiscussionUpdateInput,
+} from "@t3tools/contracts";
 
 import { requestCustomSnooze } from "../../components/CustomSnoozeDialog";
 import { resolveSnoozePresets, snoozeWakeLabel } from "../../components/Sidebar.snooze";
@@ -45,7 +49,7 @@ import { useClientSettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { Chat, Composer } from "./Chat";
 import { composerTitleSource } from "./composerAttachments";
-import { kanban, runAction } from "./kanbanStore";
+import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { CopyLinkButton } from "./links";
 import { Avatar, UnreadDot } from "./parts";
 
@@ -83,6 +87,7 @@ function DraftRoom(props: {
   // Created but the first post failed: the retry goes into that discussion
   // instead of creating another.
   const created = useRef<string | null>(null);
+  const canCreate = useKanbanPermission(KANBAN_WS_METHODS.discussionCreate);
   return (
     <div className="flex min-h-0 min-w-0 flex-col pe-5 md:px-6">
       <div className="flex h-9 shrink-0 items-center gap-3">
@@ -93,6 +98,7 @@ function DraftRoom(props: {
         <Composer
           placeholder="What do you need?"
           attachments
+          blockedReason={canCreate ? null : "Your connection can't start discussions"}
           onSend={async (blocks) => {
             const text = blocks.find((block) => block._tag === "md")?.text ?? "";
             const firstFile = blocks.find((block) => block._tag === "attachment");

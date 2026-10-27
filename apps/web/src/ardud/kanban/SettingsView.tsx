@@ -15,6 +15,7 @@ import {
   type KanbanBoardIcon,
   type KanbanInstructions,
   type ModelSelection,
+  KANBAN_WS_METHODS,
 } from "@t3tools/contracts";
 
 import {
@@ -27,7 +28,7 @@ import {
 import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
 import { BOARD_ICONS, BoardIcon } from "./boardIcon";
-import { kanban, runAction } from "./kanbanStore";
+import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
 
@@ -40,6 +41,7 @@ export function SettingsView(props: { state: KanbanBoardState }) {
   const models = state.pools.map((pool) => pool.model);
   const update = (input: Omit<Parameters<typeof kanban.updateBoard>[0], "boardId">) =>
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
+  const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
