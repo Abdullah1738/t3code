@@ -654,5 +654,87 @@ class DelayedSourceOrderTests(unittest.TestCase):
         self.assertEqual(self.run_case('yes order it', {'moni': [row]})['text'], 'yes order it')
 
 
+class ReceiptGapOrderTests(unittest.TestCase):
+    """Receipt-only rows are upper bounds on send time: a cross-DB cancel is ordered only when provable.
+
+    A timed row (sentAt) keeps its send time; a receipt-only row was sent no later than its receipt.
+    Gaps here are well past 15 minutes, so a fixed skew window would wrongly trust the receipt order.
+    """
+
+    def timed(self, row_id, text, sent_ago, *, sender=moni_go.MONI_NUMBER):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': sender}, 'done')
+
+    def recv(self, row_id, text, recv_ago, *, sender=moni_go.MONI_NUMBER):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': sender}, 'done')
+
+    def run_case(self, go, rows_by_db):
+        root = _tempfile.mkdtemp(prefix='moni-gap-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_both_receipt_only_20_min_apart_fails_closed_group_then_1to1(self):
+        # Go received 1 min ago could have been sent before the cancel received 20 min ago.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 1)],
+                                           'moni': [self.recv('P1', 'nvm', 20)]})
+
+    def test_both_receipt_only_20_min_apart_fails_closed_1to1_then_group(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.recv('P1', 'yes order it', 1)],
+                                           'group-sb_gro': [self.recv('G1', 'nvm', 20)]})
+
+    def test_both_receipt_only_20_min_apart_fails_closed_group_then_group(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-a': [self.recv('G1', 'yes order it', 1)],
+                                           'group-b': [self.recv('G2', 'nvm', 20)]})
+
+    def test_timed_go_with_receipt_only_cancel_received_long_after_fails_closed(self):
+        # Go sent 20 min ago; the cancel was received 1 min ago but may have been sent 19 min ago, after it.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'yes order it', 20)],
+                                           'group-sb_gro': [self.recv('G1', 'nvm', 1)]})
+
+    def test_receipt_only_go_with_timed_cancel_sent_long_before_fails_closed(self):
+        # Cancel sent 20 min ago; the go was received 1 min ago, so it may have been sent after the cancel.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 1)],
+                                           'moni': [self.timed('P1', 'nvm', 20)]})
+
+    def test_receipt_only_cancel_received_before_timed_go_was_sent_is_provably_earlier(self):
+        # The cancel was sent no later than 30 min ago; the go was sent 5 min ago, so the go stands.
+        got = self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'nvm', 30)],
+                                             'moni': [self.timed('P1', 'yes order it', 5)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_receipt_only_go_received_before_timed_cancel_was_sent_is_called_off(self):
+        # The go was sent no later than 30 min ago, before the cancel sent 5 min ago: a real cancel after the go.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 30)],
+                                           'moni': [self.timed('P1', 'nvm', 5)]})
+
+    def test_both_timed_across_dbs_use_sent_order(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [self.timed('G1', 'yes order it', 20)],
+                                           'moni': [self.timed('P1', 'nvm', 2)]})
+        got = self.run_case('yes order it', {'group-sb_gro': [self.timed('G1', 'nvm', 20)],
+                                             'moni': [self.timed('P1', 'yes order it', 2)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+
 if __name__ == '__main__':
     unittest.main()

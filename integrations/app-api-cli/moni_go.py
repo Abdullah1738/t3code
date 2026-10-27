@@ -260,31 +260,42 @@ def _source_of(row):
     return row.get('_source') or 'imsg'
 
 
-# Without a send time (sentAt) a bridge row is ordered by ingestion (receivedAt), which can lag
-# her send by any amount. A cancel from another source that close to such a go may really come
-# after it, so it fails closed. Rows with a send time keep their sender chronology.
-RECEIPT_SKEW_MINUTES = 15
-
-
 def _ambiguous_receipt_order(go_row, mine):
-    """A cancel from another bridge DB close to a go that has no send time, ordered only by receipt.
+    """A cross-DB cancel whose send order against the go cannot be proven.
 
-    Chat 45 rows are excluded: their own guard in verify already covers them.
+    A row with a send time (sentAt) is ordered by it. A row without one (receipt only) was
+    sent at or before its receipt time, so it can only be placed relative to a timed row
+    when that bound settles the order: a receipt-only cancel received before a timed go
+    was sent, or a receipt-only go received before a timed cancel was sent. Anything else
+    (two receipt-only rows, or a receipt time that overlaps the other row) fails closed.
+    Chat 45 rows are excluded: verify's own guard covers them.
     """
-    go_at = _parse_time(go_row.get('created_at'))
-    skew = dt.timedelta(minutes=RECEIPT_SKEW_MINUTES)
     if not go_row.get('_bridge'):
         return None
+    go_timed = not go_row.get('_receipt_time')
+    go_at = _parse_time(go_row.get('created_at'))
     for row in mine:
         if not row.get('_bridge') or _source_of(row) == _source_of(go_row):
             continue
         if not (row.get('_opaque') or reads_as_cancel(row.get('text'))):
             continue
-        if not (row.get('_receipt_time') or go_row.get('_receipt_time')):
-            continue
-        at = _parse_time(row.get('created_at'))
-        if at is None or go_at is None or abs(at - go_at) <= skew:
+        row_timed = not row.get('_receipt_time')
+        row_at = _parse_time(row.get('created_at'))
+        if go_at is None or row_at is None:
             return row
+        if go_timed and row_timed:
+            continue
+        if go_timed and not row_timed:
+            # The cancel was sent no later than its receipt; it is before the go only if received before the go was sent.
+            if row_at < go_at:
+                continue
+            return row
+        if not go_timed and row_timed:
+            # The go was sent no later than its receipt; it is before the cancel only if received before the cancel was sent.
+            if go_at < row_at:
+                continue
+            return row
+        return row
     return None
 
 
