@@ -268,6 +268,9 @@ function CardDiscussion(props: {
     }
   }, [boardId, card.id, card.discussionId, discussion, state.discussionsLoaded]);
 
+  // One key for both the first-post composer and the chat that replaces it, so a
+  // failed first post resumes here instead of an empty composer.
+  const draftKey = `card:${boardId}:${card.id}`;
   if (discussion) {
     return (
       <Chat
@@ -276,6 +279,7 @@ function CardDiscussion(props: {
         state={state}
         onOpenCard={props.onOpenCard}
         className="pt-2"
+        draftKey={draftKey}
       />
     );
   }
@@ -285,7 +289,7 @@ function CardDiscussion(props: {
       <Composer
         placeholder="Message"
         attachments
-        draftKey={`card:${boardId}:${card.id}`}
+        draftKey={draftKey}
         onSend={async (blocks) => {
           const room = await kanban.cardDiscussion(boardId, card.id);
           await kanban.post(boardId, room.id, blocks);
