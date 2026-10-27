@@ -557,6 +557,12 @@ export function Composer(props: {
   placeholder: string;
   onSend: (blocks: KanbanBlock[]) => Promise<unknown>;
   attachments?: boolean;
+  /**
+   * Keeps an unsent draft alive across a remount. The card discussion swaps this
+   * composer for the chat once its room exists, so a failed first post must find
+   * its files again.
+   */
+  draftKey?: string;
 }) {
   const environmentId = usePrimaryEnvironmentId();
   const serverConfig = useServerConfigs().get(environmentId ?? ("" as EnvironmentId));
@@ -564,23 +570,38 @@ export function Composer(props: {
     props.attachments === true &&
     environmentId !== null &&
     serverConfig?.environment.capabilities.attachmentUploads === true;
-  const [text, setText] = useState("");
+  // A kept draft (see keptDrafts) restores once, on the first render, so the
+  // remount never shows an empty composer.
+  const [kept] = useState(() =>
+    props.draftKey === undefined ? undefined : takeKeptDraft(props.draftKey),
+  );
+  const [text, setText] = useState(kept?.text ?? "");
+  const textRef = useRef("");
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
   const [cursor, setCursor] = useState(0);
   const [records, setRecords] = useState<ComposerDraftContextRecords>(
     EMPTY_COMPOSER_CONTEXT_RECORDS,
   );
-  const [files, setFilesState] = useState<ReadonlyArray<ComposerDraftFile>>([]);
+  // Read once: the first render's restored draft, which the ref starts from too.
+  const [restored] = useState(() => kept?.files ?? []);
+  const [files, setFilesState] = useState<ReadonlyArray<ComposerDraftFile>>(restored);
   const [sending, setSending] = useState(false);
+  // Ids of the draft the current send is posting. State, so render never reads a ref.
+  const [inFlightIds, setInFlightIds] = useState<ReadonlySet<string>>(() => new Set());
   const [attachError, setAttachError] = useState<string | null>(null);
   const editorRef = useRef<ComposerPromptEditorHandle | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   // The draft as of the latest write. State lags a render behind, so overlapping
   // paste/pick calls and the send snapshot read this instead.
-  const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>([]);
+  const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>(restored);
   // Slots reserved by addFiles calls that are still preparing their files.
   const pendingSlotsRef = useRef(0);
   const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
+  // Set after unmount, so a file still being prepared is released on arrival.
+  const mountedRef = useRef(true);
 
   const setFiles = (
     update: (current: ReadonlyArray<ComposerDraftFile>) => ReadonlyArray<ComposerDraftFile>,
@@ -595,15 +616,28 @@ export function Composer(props: {
   // discussion swaps this composer for the chat once its room exists) must
   // not delete files the post is about to claim.
   const sendingDraft = useRef<ReadonlyArray<ComposerDraftFile>>([]);
+  const { draftKey } = props;
+  // The mount-time value is the one the restore reads: a draft key is fixed per composer.
+  const [mountDraftKey] = useState(draftKey);
+  // Unmount reads one stable object, so the cleanup needs no dependencies.
+  // Unmount: release what this composer still owns. Every value it reads is a
+  // ref, which the dependency list names so the cleanup always sees live state.
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      // A keyed draft outlives this composer: a remount restores it from keptDrafts.
+      if (mountDraftKey !== undefined && filesRef.current.length > 0) {
+        keptDrafts.set(mountDraftKey, { files: filesRef.current, text: textRef.current });
+        return;
+      }
       for (const file of filesRef.current) {
         if (sendingDraft.current.some((entry) => entry.id === file.id)) continue;
         if (!sentIds.current.has(file.id)) releaseAttachmentUpload(file.id);
         revokePreview(file);
       }
     };
-  }, [filesRef, sentIds, sendingDraft]);
+  }, [filesRef, textRef, sentIds, sendingDraft, mountedRef, mountDraftKey]);
 
   const addFiles = async (picked: File[]) => {
     if (!canAttach || environmentId === null || picked.length === 0) return;
@@ -611,25 +645,33 @@ export function Composer(props: {
       serverConfig?.environment.capabilities.fileAttachments?.maxUploadBytes ??
         PROVIDER_SEND_TURN_MAX_FILE_BYTES,
     );
+    // Reserve the whole batch's room before any await: overlapping calls and a
+    // batch larger than the room both see the slots as taken.
+    const room = Math.max(
+      0,
+      PROVIDER_SEND_TURN_MAX_ATTACHMENTS - filesRef.current.length - pendingSlotsRef.current,
+    );
+    const batch = picked.slice(0, room);
+    let error: string | null = room < picked.length ? composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1) : null;
+    pendingSlotsRef.current += batch.length;
     const next: ComposerDraftFile[] = [];
-    let error: string | null = null;
-    for (const raw of picked) {
-      // Reserve the slot before any await, so overlapping calls count each other.
-      if (filesRef.current.length + pendingSlotsRef.current >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
-        error = composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1);
-        break;
-      }
-      pendingSlotsRef.current += 1;
-      try {
+    try {
+      for (const raw of batch) {
         const added = await prepareDraftFile(raw, maxBytes);
         if (typeof added === "string") {
           error = added;
           continue;
         }
         next.push(added);
-      } finally {
-        pendingSlotsRef.current -= 1;
       }
+    } finally {
+      pendingSlotsRef.current -= batch.length;
+    }
+    // The composer went away while files were being prepared: nothing will
+    // ever own these, so release their previews now and start no uploads.
+    if (!mountedRef.current) {
+      for (const file of next) revokePreview(file);
+      return;
     }
     setAttachError(error);
     if (next.length === 0) return;
@@ -640,13 +682,15 @@ export function Composer(props: {
   };
 
   const removeFile = (file: ComposerDraftFile) => {
+    // An in-flight send claims this file; releasing it now would race the post.
+    if (inFlightIds.has(file.id)) return;
     releaseAttachmentUpload(file.id);
     revokePreview(file);
     setFiles((current) => current.filter((entry) => entry.id !== file.id));
   };
 
   const retryFile = (file: ComposerDraftFile) => {
-    if (environmentId === null) return;
+    if (environmentId === null || inFlightIds.has(file.id)) return;
     retryAttachmentUpload({ environmentId, image: file });
   };
 
@@ -671,6 +715,7 @@ export function Composer(props: {
     if (body.length === 0 && draft.length === 0) return;
     sendingRef.current = true;
     sendingDraft.current = draft;
+    setInFlightIds(new Set(draft.map((file) => file.id)));
     setSending(true);
     try {
       let blocks: KanbanBlock[];
@@ -705,6 +750,7 @@ export function Composer(props: {
     } finally {
       sendingRef.current = false;
       sendingDraft.current = [];
+      setInFlightIds(new Set());
       setSending(false);
     }
   };
@@ -776,6 +822,7 @@ export function Composer(props: {
             <DraftChip
               key={file.id}
               file={file}
+              locked={inFlightIds.has(file.id)}
               onRemove={() => removeFile(file)}
               onRetry={() => retryFile(file)}
             />
@@ -884,6 +931,20 @@ async function prepareDraftFile(raw: File, maxBytes: number): Promise<ComposerDr
   };
 }
 
+/**
+ * Unsent drafts by key (the card id), kept when their composer unmounts. The
+ * card discussion swaps its composer for the chat once the room exists, so a
+ * failed first post restores its files here.
+ */
+const keptDrafts = new Map<string, { files: ReadonlyArray<ComposerDraftFile>; text: string }>();
+
+/** Reads and removes a kept draft, so only the next composer for the key gets it. */
+function takeKeptDraft(key: string) {
+  const kept = keptDrafts.get(key);
+  keptDrafts.delete(key);
+  return kept;
+}
+
 function revokePreview(file: ComposerDraftFile) {
   if (file.type === "image") URL.revokeObjectURL(file.previewUrl);
 }
@@ -891,6 +952,7 @@ function revokePreview(file: ComposerDraftFile) {
 /** One draft file above the editor: thumbnail or name, its state, and a remove button. */
 function DraftChip(props: {
   file: ComposerDraftFile;
+  locked: boolean;
   onRemove: () => void;
   onRetry: () => void;
 }) {
@@ -921,6 +983,7 @@ function DraftChip(props: {
         <button
           type="button"
           aria-label="Retry upload"
+          disabled={props.locked}
           onClick={props.onRetry}
           className="grid size-6 shrink-0 place-items-center rounded-full text-(--m-accent-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
         >
@@ -930,6 +993,7 @@ function DraftChip(props: {
       <button
         type="button"
         aria-label={`Remove ${props.file.name}`}
+        disabled={props.locked}
         onClick={props.onRemove}
         className="grid size-6 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
       >

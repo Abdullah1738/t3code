@@ -285,6 +285,7 @@ function CardDiscussion(props: {
       <Composer
         placeholder="Message"
         attachments
+        draftKey={`card:${boardId}:${card.id}`}
         onSend={async (blocks) => {
           const room = await kanban.cardDiscussion(boardId, card.id);
           await kanban.post(boardId, room.id, blocks);
