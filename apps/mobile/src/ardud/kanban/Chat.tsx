@@ -481,6 +481,14 @@ function ChoiceBlock(props: {
   const locked = !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
+  // Sending from the field removes it while ChoiceBlock stays mounted, and
+  // React Native doesn't reliably deliver onBlur for a removed input.
+  useEffect(() => {
+    if (!locked) return;
+    const row = focusedRowRef.current;
+    focusedRowRef.current = null;
+    if (row !== null) answerScroll?.blur(row);
+  }, [locked, answerScroll]);
 
   const send = (choice: ReadonlyArray<string>, words: string) => {
     const discussionId = props.discussionId;
