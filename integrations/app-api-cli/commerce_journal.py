@@ -545,6 +545,9 @@ def close_marketplace_uncharged(flow_id, *, evidence, expected_local):
 
 
 MINUTES_FAILED_CLOSE_MIN_AGE = 15 * 60
+# Mirrors commerce_minutes_disposition.TERMINAL_NO_CAPTURE_TXNS. Empty until a real
+# terminal non-capture transaction status is observed; the journal re-checks evidence.
+MINUTES_TERMINAL_NO_CAPTURE_TXNS = ()
 MINUTES_CLOSED_FAILED_UNCAPTURED = 'MINUTES_CLOSED_FAILED_UNCAPTURED'
 
 
@@ -562,11 +565,13 @@ def _minutes_failed_close_shape(db, flow, now):
                   "('PAYMENT_REPORTED_SUCCESS','EXACT_ORDER_CONFIRMED','TRACKER_REGISTERED')",
                   (flow['id'],)).fetchone():
         fail('MINUTES_FAILED_CLOSE_SUCCESS_ALREADY_OBSERVED')
-    placed = db.execute("SELECT MIN(o.observed_at) AS t FROM observations o JOIN operations p "
-                        "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
-                        "AND p.kind='place' AND o.order_id=?", (flow['id'], flow['order_id'])).fetchone()['t']
-    # A just-sent payment can still be inside its 3DS window; give noon time to settle it.
-    if placed is None or now - placed < MINUTES_FAILED_CLOSE_MIN_AGE:
+    # Grace runs from the latest financial send, not place: a payment sent minutes ago can
+    # still be inside its 3DS window even when the order itself was placed long ago.
+    last_send = db.execute("SELECT MAX(o.observed_at) AS t FROM observations o JOIN operations p "
+                           "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
+                           "AND p.kind IN ('place','payment') AND o.order_id=?",
+                           (flow['id'], flow['order_id'])).fetchone()['t']
+    if last_send is None or now - last_send < MINUTES_FAILED_CLOSE_MIN_AGE:
         fail('MINUTES_FAILED_CLOSE_TOO_EARLY')
     return ops
 
@@ -588,7 +593,10 @@ def close_minutes_failed_uncaptured(flow_id, *, evidence, expected_local, now=No
             or evidence.get('uncaptured_at_check') is not True or evidence.get('order_active') is not False
             or evidence.get('authorized_minor') != 0 or evidence.get('captured_minor') != 0
             or evidence.get('order_total_minor') != 0 or evidence.get('currency') != 'AED'
-            or evidence.get('order_status') not in ('failed', 'cancelled')):
+            or evidence.get('order_status') not in ('failed', 'cancelled')
+            or evidence.get('intent_status') not in ('payment_failed', 'payment_error')
+            or evidence.get('intent_transaction_status') not in MINUTES_TERMINAL_NO_CAPTURE_TXNS
+            or evidence.get('redirect_required') is True):
         fail('MINUTES_FAILED_CLOSE_EVIDENCE_REQUIRED')
     now = time.time() if now is None else now
     with _db() as db:
