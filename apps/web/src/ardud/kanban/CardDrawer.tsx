@@ -291,15 +291,10 @@ function CardDiscussion(props: {
         attachments
         onSend={async (blocks) => {
           setFirstPosting(true);
-          try {
-            const room = await kanban.cardDiscussion(boardId, card.id);
-            await kanban.post(boardId, room.id, blocks);
-          } catch (error) {
-            // The room may exist now, but the draft must stay here for a retry:
-            // leave the first-post composer in place on failure.
-            setFirstPosting(false);
-            throw error;
-          }
+          const room = await kanban.cardDiscussion(boardId, card.id);
+          // A rejected post throws before the next line, so the first-post
+          // composer and its text and files stay on screen for a retry.
+          await kanban.post(boardId, room.id, blocks);
           setFirstPosting(false);
         }}
       />

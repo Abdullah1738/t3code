@@ -585,6 +585,9 @@ export function Composer(props: {
   const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>([]);
   // Slots reserved by addFiles calls that are still preparing their files.
   const pendingSlotsRef = useRef(0);
+  // Preparations still running. A send waits for these before taking its snapshot,
+  // so a file being compressed when Send is pressed is part of that message.
+  const pendingPrepsRef = useRef(new Set<Promise<void>>());
   const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
   // Set after unmount, so a file still being prepared is released on arrival.
@@ -629,20 +632,29 @@ export function Composer(props: {
       PROVIDER_SEND_TURN_MAX_ATTACHMENTS - filesRef.current.length - pendingSlotsRef.current,
     );
     const batch = picked.slice(0, room);
-    let error: string | null = room < picked.length ? composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1) : null;
+    let error: string | null =
+      room < picked.length ? composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1) : null;
     pendingSlotsRef.current += batch.length;
     const next: ComposerDraftFile[] = [];
-    try {
-      for (const raw of batch) {
-        const added = await prepareDraftFile(raw, maxBytes);
-        if (typeof added === "string") {
-          error = added;
-          continue;
+    const prep = (async () => {
+      try {
+        for (const raw of batch) {
+          const added = await prepareDraftFile(raw, maxBytes);
+          if (typeof added === "string") {
+            error = added;
+            continue;
+          }
+          next.push(added);
         }
-        next.push(added);
+      } finally {
+        pendingSlotsRef.current -= batch.length;
       }
+    })();
+    pendingPrepsRef.current.add(prep);
+    try {
+      await prep;
     } finally {
-      pendingSlotsRef.current -= batch.length;
+      pendingPrepsRef.current.delete(prep);
     }
     // The composer went away while files were being prepared: nothing will
     // ever own these, so release their previews now and start no uploads.
@@ -682,10 +694,14 @@ export function Composer(props: {
     });
 
   const send = async () => {
-    const body = outgoing(text).trim();
     // A ref, not state: a second Enter or click before the re-render must not
     // start another send of the same draft.
     if (sendingRef.current) return;
+    // Files still being prepared join this message, so wait for them first.
+    while (pendingPrepsRef.current.size > 0) {
+      await Promise.allSettled([...pendingPrepsRef.current]);
+    }
+    const body = outgoing(text).trim();
     // Snapshot the draft now. Files added while this send is in flight are not
     // part of this message and must survive it.
     const draft = filesRef.current;
