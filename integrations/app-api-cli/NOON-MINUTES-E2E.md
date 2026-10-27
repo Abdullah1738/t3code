@@ -181,10 +181,17 @@ hold can still show on the card until the bank drops it. First live use: flow
   Server responses were identical in practice.
 - `payment_intent_status` binds the expected total and reference; the raw
   app client does not (it trusts the body). Stricter is intentional.
+- Quiet toggles are per cart. The lane sets every quiet code noon offers
+  (`dont_ring_the_bell`, `leave_it_at_my_door`) and refuses only when neither is
+  offered. A cart offering just `dont_ring_the_bell` (seen 2026-10-27, Moni's
+  18-line basket) still places with the quiet note; the review and the
+  `quiet_notice` field report `quiet_codes_not_offered`. The driver-note check
+  ignores curly quotes, whitespace runs and case; `--driver-note-extra TEXT`
+  (1-200 chars, no newlines) is appended after the quiet note and is part of the
+  scope digest only when given.
 - Live-only findings (2026-10-10 replay, absent from the phone capture):
   the session now exposes a third delivery preference code
-  `delivery_instructions` (left untouched; only the two quiet codes are
-  set); a just-paid order reports track status `ready_for_pickup`
+  `delivery_instructions` (left untouched; only the quiet codes are set); a just-paid order reports track status `ready_for_pickup`
   ("Packing your order") before `confirmed`/`picked_up` — mapped to
   `preparing`; and a dead failed order's paymentintent/status read returns
   HTTP 400 (treated as closure corroboration in `release-flow`, never as
