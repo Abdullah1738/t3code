@@ -169,6 +169,27 @@ describe("applyReviewResult", () => {
 });
 
 describe("planDispatch", () => {
+  it("starts no card work or review while the board's setup runs", () => {
+    const setupRunning: KanbanBoard = {
+      ...board,
+      setup: {
+        status: "running",
+        discussionId: KanbanDiscussionId.make("disc-setup"),
+        threadId: ThreadId.make("t-setup"),
+        startedAt: "2026-10-28T00:00:00Z",
+        finishedAt: null,
+      },
+    };
+    const review = card({ stage: "needs_review" });
+    const todo = card();
+    expect(planDispatch(setupRunning, [review, todo], pools([[opus, 2]]))).toEqual([]);
+    const setupDone: KanbanBoard = {
+      ...setupRunning,
+      setup: { ...setupRunning.setup!, status: "done", finishedAt: "2026-10-28T01:00:00Z" },
+    };
+    expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
+  });
+
   it("takes reviews before work and todo by priority", () => {
     const low = card({ priority: 3 });
     const high = card({ priority: 1 });

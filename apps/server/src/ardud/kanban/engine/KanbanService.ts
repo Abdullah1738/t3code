@@ -1141,7 +1141,15 @@ const make = Effect.gen(function* () {
     if (board.defaultProjectId === null) {
       return yield* failWith("invalid", `board ${board.slug} has no default project`);
     }
+    if (purpose.kind === "setup" && board.setup?.status === "running") {
+      return yield* failWith("invalid", `board ${board.slug} is already in setup`);
+    }
     const at = yield* nowIso;
+    // The setup evaluator talks in a Setup discussion, so the owner has somewhere to read and reply.
+    const setupDiscussion =
+      purpose.kind === "setup"
+        ? yield* newDiscussion(board.id, "Setup", null, { _tag: "system", component: "setup" })
+        : null;
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
     const threadId = yield* threads.launch({
@@ -1159,13 +1167,30 @@ const make = Effect.gen(function* () {
         role: "evaluator",
         purpose: Briefs.purposeKey(purpose),
         discussionId:
-          purpose.kind === "discussion" ? KanbanDiscussionId.make(purpose.discussionId) : null,
+          purpose.kind === "discussion"
+            ? KanbanDiscussionId.make(purpose.discussionId)
+            : (setupDiscussion?.id ?? null),
         model: board.evaluatorModel,
         startedAt: at,
         endedAt: null,
       },
       title,
     );
+    if (setupDiscussion) {
+      yield* saveDiscussion(adoptEvaluator(setupDiscussion, { _tag: "evaluator", threadId }));
+      const running: KanbanBoard = {
+        ...board,
+        setup: {
+          status: "running",
+          discussionId: setupDiscussion.id,
+          threadId,
+          startedAt: at,
+          finishedAt: null,
+        },
+      };
+      yield* store.putBoard(running);
+      yield* publish(board.id, { _tag: "board", board: running });
+    }
     return threadId;
   });
 

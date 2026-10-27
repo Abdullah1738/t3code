@@ -245,6 +245,8 @@ export function planDispatch(
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
 ): ReadonlyArray<Dispatch> {
+  // A board's first setup holds all card work and review until the setup evaluator ends it.
+  if (board.setup?.status === "running") return [];
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
