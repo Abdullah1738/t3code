@@ -171,17 +171,25 @@ test("other chats' prompts say who reads background replies and keep agent talk 
   expect(sendblueContextPrompt(context("owner"), false, [])).not.toContain("Who reads your replies");
 });
 
-test("only the owner's prompt sends Robob fixes to the Robob master thread in his words", () => {
-  const owner = sendblueContextPrompt(context("owner"), false, []);
-  expect(owner).toContain("t3ctl send mcp:84c5ca53-5aa8-46e8-9fbd-06b34f2190e0 --mode queue \"<his words> (from iMessage, message <id>)\"");
-  expect(owner).toContain("it's with the Robob team");
-  expect(owner).not.toMatch(/\bmission/);
-  for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [])).not.toContain("t3ctl send");
+test("every chat hands Robob problems to the Robob board with a workaround first, never a fix agent", () => {
+  for (const kind of ["owner", "dm", "group"] as const) {
+    const prompt = sendblueContextPrompt(context(kind), false, []);
+    expect(prompt).toContain("call evaluator_start (the T3 Code MCP tool) with boardId \"robob\", kind \"request\"");
+    expect(prompt).toContain("Check for an existing card first.");
+    expect(prompt).toContain("don't start a fix agent");
+    expect(prompt).toContain("open the card in Safari");
+    expect(prompt).not.toContain("t3ctl send");
+    expect(prompt).not.toMatch(/\bmission/);
+  }
+  expect(sendblueContextPrompt(context("owner"), false, [])).toContain("Tell him it's on the Robob board");
+  const moni = sendblueContextPrompt(context("dm"), false, []);
+  expect(moni).toContain("tell them it's been passed on");
+  expect(moni).toContain("tells the owner.");
 });
 
 test("a wake's chat prompt drops what only typed messages need and keeps who reads it", () => {
   const owner = sendblueContextPrompt(context("owner"), false, [], true);
-  for (const line of ["Files:", "Polls are not available", "t3ctl send mcp:", "guest-allow --address"]) expect(owner).not.toContain(line);
+  for (const line of ["Files:", "Polls are not available", "evaluator_start", "guest-allow --address"]) expect(owner).not.toContain(line);
   expect(owner).not.toMatch(/\bmission/);
   for (const line of ["send --to <slug>", "wake --chat <slug>", "location --session", "publish --app SLUG", "never answered by you directly"]) expect(owner).toContain(line);
   expect(owner.length).toBeLessThan(sendblueContextPrompt(context("owner"), false, []).length / 2);
