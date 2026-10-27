@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { ProjectId, ThreadId, type KanbanActor, type ModelSelection } from "@t3tools/contracts";
 
@@ -1586,6 +1587,149 @@ it.effect("the owner settles and snoozes a discussion; someone else posting brin
         .updateDiscussion(talk.id, { settled: true, snoozedUntil: later }, owner)
         .pipe(Effect.flip);
       assert.strictEqual(both.code, "invalid");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "an evaluator that only asked on a card stops typing there while it works elsewhere",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+        const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.askOwner(
+          card.id,
+          { question: "Ship?", blocking: false, options: ["A", "B"] },
+          evaluator,
+          "evaluator",
+        );
+        yield* kanban.answer((yield* kanban.cardDiscussion(card.id)).id, 1, "q1", ["o1"], owner);
+        yield* setRunning(fake, setup, true);
+
+        const talk = yield* kanban.cardDiscussion(card.id);
+        const before = talk.participants.find((p) => p.actor._tag === "evaluator");
+        assert.isNotNull(before?.typingUntil);
+
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        const after = (yield* kanban.cardDiscussion(card.id)).participants.find(
+          (p) => p.actor._tag === "evaluator",
+        );
+        assert.isNull(after?.typingUntil);
+        assert.isNull(after?.owes);
+
+        // A board channel's own evaluator is home there, so it keeps typing.
+        const channel = yield* kanban.createDiscussion(board.id, "Channel", owner);
+        yield* kanban.post(channel.id, evaluator, [{ _tag: "md", text: "On it" }]);
+        yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Thanks" }]);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        const home = (yield* kanban.discussion(channel.id)).participants.find(
+          (p) => p.actor._tag === "evaluator",
+        );
+        assert.isNotNull(home?.typingUntil);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("turn end clears typing where an agent isn't home, without a nudge", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Ship?", blocking: false, options: ["A", "B"] },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.answer((yield* kanban.cardDiscussion(card.id)).id, 1, "q1", ["o1"], owner);
+
+      yield* kanban.turnEnded(setup);
+      const talk = yield* kanban.cardDiscussion(card.id);
+      const participant = talk.participants.find((p) => p.actor._tag === "evaluator");
+      assert.isNull(participant?.typingUntil);
+      assert.isNull(participant?.owes);
+      const texts = (yield* Ref.get(fake.threads)).get(setup)!.messages;
+      assert.strictEqual(
+        texts.filter((text) => text.includes("is waiting for your reply")).length,
+        0,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an adopted evaluator is nudged once at turn end", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const opened = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+      yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Question?" }]);
+
+      yield* kanban.turnEnded(setup);
+      const current = yield* kanban.discussion(opened.id);
+      const participant = current.participants.find((p) => p.actor._tag === "evaluator");
+      assert.strictEqual(participant?.owes, "nudged");
+      const texts = (yield* Ref.get(fake.threads)).get(setup)!.messages;
+      assert.strictEqual(
+        texts.filter((text) => text.includes("is waiting for your reply")).length,
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card discussion's new evaluator takes over from the evaluator that asked", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Ship?", blocking: false, options: ["A", "B"] },
+        evaluator,
+        "evaluator",
+      );
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.answer(talk.id, 1, "q1", ["o1"], owner);
+
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Actually, go with B" }]);
+      const current = yield* kanban.discussion(talk.id);
+      assert.notStrictEqual(current.evaluatorThreadId, setup);
+      const next = current.evaluatorThreadId!;
+
+      const threads = yield* Ref.get(fake.threads);
+      const handoffs = threads.get(setup)!.messages.filter((text) => text.includes(next));
+      assert.strictEqual(handoffs.length, 1);
+      assert.include(handoffs[0]!, `card #${card.number}`);
+      const setupPart = current.participants.find(
+        (p) => p.actor._tag === "evaluator" && p.actor.threadId === setup,
+      );
+      assert.isNull(setupPart?.typingUntil ?? null);
+      assert.isNull(setupPart?.owes ?? null);
+      assert.include(
+        threads.get(next)!.messages[0] ?? "",
+        `Evaluator ${setup} asked here before you`,
+      );
+
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "And one more thing" }]);
+      const again = (yield* Ref.get(fake.threads))
+        .get(setup)!
+        .messages.filter((text) => text.includes(next));
+      assert.strictEqual(again.length, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

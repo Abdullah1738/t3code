@@ -257,6 +257,19 @@ export const ownerMessageText = (discussionTitle: string, discussionId: string, 
 export const nudgeDiscussionText = (discussionId: string) =>
   `The owner is waiting for your reply in discussion ${discussionId}. Post it with discussion_post.`;
 
+/** Handed to an evaluator that asked on a card before the card discussion got its own evaluator. */
+export const cardHandoffText = (cardNumber: number, discussionId: string, threadId: string) =>
+  `The owner followed up in the discussion of card #${cardNumber} (${discussionId}), and it now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; if you know something it needs, post it in that discussion.`;
+
+/** Start text for a new card evaluator: the evaluators that asked there first may have acted already. */
+export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
+  threadIds
+    .map(
+      (threadId) =>
+        `Evaluator ${threadId} asked here before you and may already have changed the card on the owner's answer: check the card's events first.`,
+    )
+    .join("\n");
+
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
   return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, ask with card_ask. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;

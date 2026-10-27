@@ -1116,6 +1116,19 @@ const make = Effect.gen(function* () {
     return threadId;
   });
 
+  /** Live evaluators that asked on a card; a new card evaluator takes it over from them. */
+  const liveEvaluatorAskers = Effect.fn("KanbanService.liveEvaluatorAskers")(function* (
+    card: KanbanCard,
+  ) {
+    const ids: ThreadId[] = [];
+    for (const ask of card.asks) {
+      if (ask.by._tag !== "evaluator" || ids.includes(ask.by.threadId)) continue;
+      if (!(yield* threads.view(ask.by.threadId))) continue;
+      ids.push(ask.by.threadId);
+    }
+    return ids;
+  });
+
   /**
    * The discussion's evaluator gets the text: an existing one is steered,
    * otherwise one starts. A `note` owes no reply in the discussion.
@@ -1141,6 +1154,9 @@ const make = Effect.gen(function* () {
     }
     const board = yield* boardOf(discussion.boardId);
     const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
+    // One evaluator per card discussion: the evaluators that asked on the card
+    // hear it is handed over, and stop typing there.
+    const priors = card ? yield* liveEvaluatorAskers(card) : [];
     const threadId = yield* startEvaluatorUnlocked(
       board,
       {
@@ -1149,9 +1165,12 @@ const make = Effect.gen(function* () {
         title: discussion.title,
         cardNumber: card?.number ?? null,
       },
-      { text, cardId: discussion.cardId },
+      {
+        text: priors.length > 0 ? `${text}\n\n${Briefs.priorAskerText(priors)}` : text,
+        cardId: discussion.cardId,
+      },
     );
-    const next = withParticipant(
+    let next = withParticipant(
       { ...discussion, evaluatorThreadId: threadId },
       actorOf(threadId),
       "Evaluator",
@@ -1159,6 +1178,16 @@ const make = Effect.gen(function* () {
         ? { lastReadSeq: discussion.lastSeq }
         : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
     );
+    if (card) {
+      for (const priorId of priors) {
+        const handoff = Briefs.cardHandoffText(card.number, discussion.id, threadId);
+        yield* threads.send({ threadId: priorId, text: handoff }).pipe(Effect.ignore);
+        const prior = actorOf(priorId);
+        if (next.participants.some((p) => actorKey(p.actor) === actorKey(prior))) {
+          next = withParticipant(next, prior, "Evaluator", { typingUntil: null, owes: null });
+        }
+      }
+    }
     yield* saveDiscussion(next);
     return next;
   });
@@ -1449,6 +1478,25 @@ const make = Effect.gen(function* () {
     return message;
   });
 
+  /**
+   * Whether a discussion is the thread's home: it is the discussion the thread
+   * evaluates, or its own link's discussion, or a card discussion for a card
+   * the thread works on or carries. Elsewhere the thread was only told things,
+   * so it never types there or gets a nudge.
+   */
+  const isHome = Effect.fn("KanbanService.isHome")(function* (
+    discussion: KanbanDiscussion,
+    threadId: ThreadId,
+  ) {
+    if (discussion.evaluatorThreadId === threadId) return true;
+    const link = yield* store.threadLink(threadId);
+    if (link?.discussionId === discussion.id) return true;
+    if (discussion.cardId === null) return false;
+    const card = yield* store.card(discussion.cardId);
+    if (card?.activeThreadId === threadId) return true;
+    return (yield* store.threadCards(threadId)).includes(discussion.cardId);
+  });
+
   /** A finished turn settles the agent's typing and, once, nudges an unanswered discussion. */
   const settleParticipant = Effect.fn("KanbanService.settleParticipant")(function* (
     discussion: KanbanDiscussion,
@@ -1642,9 +1690,37 @@ const make = Effect.gen(function* () {
       const other = id === card?.id ? card : yield* store.card(id);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
-    for (const id of discussionIds) {
-      const discussion = yield* store.discussion(KanbanDiscussionId.make(id));
-      if (discussion) yield* settleParticipant(discussion, threadId);
+    // Discussions the thread evaluates, or is still typing or owing in after
+    // being told something there (which the link and card don't name).
+    for (const discussion of yield* store.discussions(link.boardId)) {
+      const participant = discussion.participants.find(
+        (candidate) =>
+          (candidate.actor._tag === "thread" || candidate.actor._tag === "evaluator") &&
+          candidate.actor.threadId === threadId,
+      );
+      const pending =
+        participant !== undefined &&
+        (participant.typingUntil !== null || participant.owes !== null);
+      if (
+        !discussionIds.has(discussion.id) &&
+        discussion.evaluatorThreadId !== threadId &&
+        !pending
+      ) {
+        continue;
+      }
+      if (yield* isHome(discussion, threadId)) {
+        yield* settleParticipant(discussion, threadId);
+        continue;
+      }
+      // Told something here, not put in charge: its typing ends without a nudge.
+      if (participant && pending) {
+        yield* saveDiscussion(
+          withParticipant(discussion, participant.actor, participant.name, {
+            owes: null,
+            typingUntil: null,
+          }),
+        );
+      }
     }
 
     if (link.role === "evaluator") {
@@ -1748,12 +1824,17 @@ const make = Effect.gen(function* () {
           const actor = participant.actor;
           if (actor._tag !== "thread" && actor._tag !== "evaluator") continue;
           const view = yield* threads.view(actor.threadId);
-          if (view && view.state !== "idle") {
+          // Typing is kept alive only where the agent is working on a reply;
+          // elsewhere it lapses along with what it owed there.
+          if (view && view.state !== "idle" && (yield* isHome(discussion, actor.threadId))) {
             next = withParticipant(next, actor, participant.name, {
               typingUntil: yield* typingUntil,
             });
           } else if (Date.parse(participant.typingUntil) < now) {
-            next = withParticipant(next, actor, participant.name, { typingUntil: null });
+            next = withParticipant(next, actor, participant.name, {
+              typingUntil: null,
+              owes: null,
+            });
           }
         }
         if (next !== discussion) yield* saveDiscussion(next);
