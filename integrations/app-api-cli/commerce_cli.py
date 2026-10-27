@@ -928,7 +928,9 @@ def main(argv=None):
     options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
     cart=commands.add_parser('cart',help='Read or replace the whole Minutes cart; never orders')
     cart.add_argument('vertical',choices=('minutes',))
-    cart.add_argument('action',choices=('show','set'))
+    cart.add_argument('action',choices=('show','set','reconcile'))
+    cart.add_argument('--flow',dest='flow_id',default=None,metavar='FLOW_UUID',
+        help='reconcile: the flow whose consumed cart send has no receipt; closes it only after an exact readback')
     cart.add_argument('--items-file',dest='items_file',default=None,metavar='PATH',
         help='set: the full basket (JSON array or {"items":[...]}), same format as order minutes')
     cart.add_argument('--expect-hash',dest='expect_hash',default=None,metavar='HASH',
@@ -1050,6 +1052,11 @@ def main(argv=None):
             from commerce_minutes_cart import show as cart_show,set_cart as cart_set
             if args.action=='show':
                 result=cart_show(auth=CommerceAuth().noon)
+            elif args.action=='reconcile':
+                if args.flow_id is None or args.expect_hash is None:
+                    journal.fail('MINUTES_CART_RECONCILE_REQUIRES_FLOW_AND_EXPECT_HASH')
+                from commerce_minutes_cart import reconcile as cart_reconcile
+                result=cart_reconcile(args.flow_id,expect_hash=args.expect_hash,auth=CommerceAuth().noon)
             else:
                 if args.items_file is None or args.expect_hash is None:
                     journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')

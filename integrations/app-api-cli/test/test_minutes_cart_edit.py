@@ -216,7 +216,7 @@ class TransportFailureTests(CartTestBase):
         self.assertEqual(exc.code, 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
         self.assertEqual([x[0] for x in harness.calls], ['sync'])  # exactly one send, never retried
         self.assertEqual(j.inspect(exc.flow_id)['state'], 'FENCED')
-        self.assertIn('commerce abandon-flow ' + exc.flow_id, exc.details['recovery'])
+        self.assertIn('minutes reconcile --flow ' + exc.flow_id, exc.details['recovery'])
 
     def test_cli_prints_flow_id_and_recovery_for_transport_failure(self):
         import io, contextlib, json, tempfile as tf
@@ -237,7 +237,7 @@ class TransportFailureTests(CartTestBase):
         payload = json.loads(out.getvalue().strip().splitlines()[-1])
         self.assertEqual(payload['error'], 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
         self.assertTrue(payload['flow_id'])
-        self.assertIn('commerce abandon-flow ' + payload['flow_id'], payload['recovery'])
+        self.assertIn('minutes reconcile --flow ' + payload['flow_id'], payload['recovery'])
         self.assertEqual(len(harness.calls), 1)
 
 
@@ -306,7 +306,7 @@ class PostSendFailureTests(CartTestBase):
         self.assertEqual(payload['error'], 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
         self.assertTrue(payload['flow_id'])
         self.assertTrue(payload['cart_mutation_sent'])
-        self.assertIn('commerce abandon-flow ' + payload['flow_id'], payload['recovery'])
+        self.assertIn('minutes reconcile --flow ' + payload['flow_id'], payload['recovery'])
         self.assertEqual(j.inspect(payload['flow_id'])['state'], 'ACTIVE')
 
 
@@ -383,3 +383,62 @@ class OrderUseCurrentCartTests(CartTestBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReceiptFailureRecoveryTests(CartTestBase):
+    def send_with_failed_receipt(self):
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        after = lines_of([row('SKU_A', 2)])
+        harness = Harness([after])
+        real = m.MinutesCheckout
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur))]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(cart.j, 'observe', side_effect=j.JournalError('JOURNAL_DOWN')), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with self.assertRaises(cart.OutcomeUnverified) as ctx:
+                cart.set_cart([{'sku': 'SKU_A', 'qty': 2}], expect_hash=expect, auth=self.auth)
+        return ctx.exception, harness, expect, after
+
+    def test_receipt_failure_leaves_consumed_send_and_reconcile_closes_after_exact_readback(self):
+        exc, harness, expect, after = self.send_with_failed_receipt()
+        self.assertEqual(exc.code, 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
+        self.assertEqual([x[0] for x in harness.calls], ['sync'])  # one send, never retried
+        self.assertEqual(j.inspect(exc.flow_id)['operations'][0]['state'], 'MAY_HAVE_SENT')
+        self.assertIn('minutes reconcile --flow ' + exc.flow_id, exc.details['recovery'])
+        # Abandon must refuse here; the recovery path is reconcile, not abandon-flow.
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_ABANDON_UNSENT_ONLY'):
+            j.abandon(exc.flow_id)
+        # After an exact readback matching the requested basket, reconcile closes the flow without sending.
+        with patch.object(cart, 'readback_session', return_value=snap(after)):
+            result = cart.reconcile(exc.flow_id, expect_hash=cart.manifest_hash(cart.manifest(
+                m.project_session(after)['lines'])), auth=self.auth)
+        self.assertEqual(result['state'], 'RELEASED')
+        self.assertFalse(result['cart_mutation_sent'])
+        self.assertEqual(j.inspect(exc.flow_id)['state'], 'RELEASED')
+        self.assertEqual([x[0] for x in harness.calls], ['sync'])  # reconcile never sends
+
+    def test_reconcile_refuses_when_readback_differs_and_leaves_flow_fenced(self):
+        exc, harness, expect, after = self.send_with_failed_receipt()
+        with patch.object(cart, 'readback_session', return_value=snap(lines_of([row('SKU_A', 9)]))):
+            with self.assertRaisesRegex(j.JournalError, 'MINUTES_CART_RECONCILE_CART_MISMATCH'):
+                cart.reconcile(exc.flow_id, expect_hash=cart.manifest_hash(cart.manifest(
+                    m.project_session(after)['lines'])), auth=self.auth)
+        self.assertNotEqual(j.inspect(exc.flow_id)['state'], 'RELEASED')
+        self.assertEqual([x[0] for x in harness.calls], ['sync'])
+
+    def test_cli_reconcile_after_receipt_failure(self):
+        import io, contextlib, json
+        exc, harness, expect, after = self.send_with_failed_receipt()
+        with patch.object(cart, 'readback_session', return_value=snap(after)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = commerce_cli.main(['cart', 'minutes', 'reconcile', '--flow', exc.flow_id,
+                                        '--expect-hash', cart.manifest_hash(cart.manifest(
+                                            m.project_session(after)['lines']))])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertTrue(payload['ok'])
+        self.assertFalse(payload['cart_mutation_sent'])
+        self.assertEqual(len(harness.calls), 1)
