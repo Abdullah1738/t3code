@@ -1,5 +1,12 @@
-import { ArrowUpIcon } from "lucide-react";
-import { memo, useEffect, useRef, useState, type ClipboardEvent } from "react";
+import { ArrowUpIcon, PaperclipIcon, RotateCcwIcon, XIcon } from "lucide-react";
+import {
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+} from "react";
 
 import {
   avatarOf,
@@ -10,12 +17,18 @@ import {
   type PresenceFace,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
-import type {
-  KanbanBlock,
-  KanbanDiscussion,
-  KanbanMessage,
-  ServerProviderSkill,
+import {
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
+  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+  type ChatAttachment,
+  type EnvironmentId,
+  type KanbanBlock,
+  type KanbanDiscussion,
+  type KanbanMessage,
+  type ServerProviderSkill,
 } from "@t3tools/contracts";
+import { clampFileAttachmentUploadBytes, fileAttachmentTooLargeMessage, formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import { formatThreadLink, parseThreadLinkHref } from "@t3tools/shared/threadLinks";
 
@@ -27,15 +40,36 @@ import {
   EMPTY_COMPOSER_CONTEXT_RECORDS,
   type ComposerDraftContextRecords,
 } from "../../components/composerContextPresentation";
+import {
+  classifyComposerAttachmentFile,
+  normalizeComposerImageFileMimeType,
+} from "../../components/chat/composerAttachmentFiles";
 import { collapseExpandedComposerCursor } from "../../composer-logic";
+import type { ComposerFileAttachment, ComposerImageAttachment } from "../../composerDraftStore";
+import { prepareImageForAttachment } from "../../lib/imageCompression";
+import {
+  awaitAttachmentUploads,
+  getUploadedAttachments,
+  releaseAttachmentUpload,
+  retryAttachmentUpload,
+  startAttachmentUpload,
+  useAttachmentUploadStore,
+} from "../../lib/attachmentUploadQueue";
 import { threadContextRecord, threadContextReference } from "../../lib/composerContextRecords";
 import { formatInlineContextReference } from "../../lib/composerContextReferences";
-import { cn } from "../../lib/utils";
+import { cn, randomUUID } from "../../lib/utils";
+import { useAssetUrls } from "../../assets/assetUrls";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useServerConfigs } from "../../state/entities";
 import { useNowMs } from "./useNowMs";
 import { kanban, kanbanErrorMessage, runAction, useFeed, useMessages } from "./kanbanStore";
 import { KanbanMarkdown } from "./links";
 import { Avatar, Chip, Glyph, stageGlyph } from "./parts";
+import {
+  composerBlocks,
+  composerLimitError,
+  type ChatAttachmentBlock,
+} from "./composerAttachments";
 
 /** One discussion: messages, read receipts, typing and the composer. */
 export function Chat(props: {
@@ -111,7 +145,8 @@ export function Chat(props: {
       </div>
       <Composer
         placeholder="Message"
-        onSend={(text) => kanban.post(boardId, discussion.id, [{ _tag: "md", text }])}
+        attachments
+        onSend={(blocks) => kanban.post(boardId, discussion.id, blocks)}
       />
     </div>
   );
@@ -227,9 +262,8 @@ function Block(props: {
           className="max-h-80 w-auto max-w-full rounded-xl object-contain"
         />
       );
-    // Composer and rendering for uploads come in the follow-up cards; until then, the name only.
     case "attachment":
-      return <p className="text-sm text-(--m-muted)">{block.attachment.name}</p>;
+      return <AttachmentBlock attachment={block.attachment} />;
     case "card": {
       const card = props.cards.get(block.cardId);
       if (!card) return <span className="text-(--m-muted)">Card</span>;
@@ -248,6 +282,50 @@ function Block(props: {
     case "choice":
       return <ChoiceBlock block={block} boardId={props.boardId} message={props.message} />;
   }
+}
+
+/** A posted file: images as a thumbnail that opens full size, other files as a chip. */
+function AttachmentBlock(props: {
+  attachment: Extract<KanbanBlock, { _tag: "attachment" }>["attachment"];
+}) {
+  const environmentId = usePrimaryEnvironmentId();
+  const { attachment } = props;
+  const [url] = useAssetUrls(environmentId ?? ("" as EnvironmentId), [
+    {
+      _tag: "attachment",
+      attachmentId: attachment.id,
+      fileName: attachment.name,
+      mimeType: attachment.mimeType,
+    },
+  ]);
+  if (attachment.type === "image") {
+    if (url === null || url === undefined) {
+      return <span className="text-sm text-(--m-muted)">{attachment.name}</span>;
+    }
+    return (
+      <a href={url} target="_blank" rel="noreferrer" className="block w-fit max-w-full">
+        <img
+          src={url}
+          alt={attachment.name}
+          className="max-h-60 max-w-full rounded-xl object-contain"
+        />
+      </a>
+    );
+  }
+  return (
+    <a
+      href={url ?? undefined}
+      target="_blank"
+      rel="noreferrer"
+      aria-disabled={url === null || url === undefined ? true : undefined}
+      className="flex h-9 max-w-full items-center gap-2 rounded-xl bg-(--m-ground) px-3 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+    >
+      <span className="min-w-0 truncate">{attachment.name}</span>
+      <span className="shrink-0 text-xs text-(--m-muted)">
+        {formatAttachmentSize(attachment.sizeBytes)}
+      </span>
+    </a>
+  );
 }
 
 interface ChoiceDraft {
@@ -445,22 +523,120 @@ function ChoiceBlock(props: {
 const NO_SKILLS: ReadonlyArray<ServerProviderSkill> = [];
 const THREAD_LINK = /\[([^\]\n]*)\]\((t3-thread:\/\/v1\/[^\s)]+)\)/g;
 
+type ComposerDraftFile = ComposerImageAttachment | ComposerFileAttachment;
+
 /**
  * Message box: Enter sends, Shift+Enter breaks the line. A pasted board link
  * turns into a chip, the same way thread links do in the thread composer.
+ * With `attachments`, it also takes files (paperclip, drop, paste): each file
+ * uploads as soon as it is added and goes out as an attachment block.
  */
 export function Composer(props: {
   placeholder: string;
-  onSend: (text: string) => Promise<unknown>;
+  onSend: (blocks: KanbanBlock[]) => Promise<unknown>;
+  attachments?: boolean;
 }) {
   const environmentId = usePrimaryEnvironmentId();
+  const serverConfig = useServerConfigs().get(environmentId ?? ("" as EnvironmentId));
+  const canAttach =
+    props.attachments === true &&
+    environmentId !== null &&
+    serverConfig?.environment.capabilities.attachmentUploads === true;
   const [text, setText] = useState("");
   const [cursor, setCursor] = useState(0);
   const [records, setRecords] = useState<ComposerDraftContextRecords>(
     EMPTY_COMPOSER_CONTEXT_RECORDS,
   );
+  const [files, setFiles] = useState<ReadonlyArray<ComposerDraftFile>>([]);
   const [sending, setSending] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const editorRef = useRef<ComposerPromptEditorHandle | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Mirror of `files` for the unmount cleanup, which must see the latest list.
+  const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>([]);
+  const sentIds = useRef(new Set<string>());
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+
+  // Uploads that were never sent are released when the composer goes away.
+  useEffect(() => {
+    return () => {
+      for (const file of filesRef.current) {
+        if (!sentIds.current.has(file.id)) releaseAttachmentUpload(file.id);
+        revokePreview(file);
+      }
+    };
+  }, []);
+
+  const addFiles = async (picked: File[]) => {
+    if (!canAttach || environmentId === null || picked.length === 0) return;
+    const maxBytes = clampFileAttachmentUploadBytes(
+      serverConfig?.environment.capabilities.fileAttachments?.maxUploadBytes ??
+        PROVIDER_SEND_TURN_MAX_FILE_BYTES,
+    );
+    const next: ComposerDraftFile[] = [];
+    let error: string | null = null;
+    for (const raw of picked) {
+      if (files.length + next.length >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+        error = composerLimitError(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1);
+        break;
+      }
+      const file = normalizeComposerImageFileMimeType(raw);
+      const kind = classifyComposerAttachmentFile(file);
+      if (kind === "unsupported-image") {
+        error = `'${file.name}' is not a supported image type.`;
+        continue;
+      }
+      if (file.size > maxBytes) {
+        error = fileAttachmentTooLargeMessage(file.name, maxBytes);
+        continue;
+      }
+      if (kind === "image") {
+        const compressed = await prepareImageForAttachment(file, PROVIDER_SEND_TURN_MAX_IMAGE_BYTES);
+        if (!compressed.ok) {
+          error = `'${file.name}' is too large to attach, even after compression.`;
+          continue;
+        }
+        const attachmentFile = compressed.file;
+        next.push({
+          type: "image",
+          id: randomUUID(),
+          name: attachmentFile.name || "image",
+          mimeType: attachmentFile.type,
+          sizeBytes: attachmentFile.size,
+          previewUrl: URL.createObjectURL(attachmentFile),
+          file: attachmentFile,
+        });
+      } else {
+        next.push({
+          type: "file",
+          id: randomUUID(),
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          sizeBytes: file.size,
+          file,
+        });
+      }
+    }
+    setAttachError(error);
+    if (next.length === 0) return;
+    setFiles((current) => [...current, ...next]);
+    for (const image of next) {
+      startAttachmentUpload({ environmentId, image });
+    }
+  };
+
+  const removeFile = (file: ComposerDraftFile) => {
+    releaseAttachmentUpload(file.id);
+    revokePreview(file);
+    setFiles((current) => current.filter((entry) => entry.id !== file.id));
+  };
+
+  const retryFile = (file: ComposerDraftFile) => {
+    if (environmentId === null) return;
+    retryAttachmentUpload({ environmentId, image: file });
+  };
 
   // Thread chips go out as plain thread links, which messages show as live
   // links and agents can read.
@@ -474,16 +650,65 @@ export function Composer(props: {
 
   const send = async () => {
     const body = outgoing(text).trim();
-    if (body.length === 0 || sending) return;
-    setSending(true);
-    const ok = await runAction("Couldn't send", () => props.onSend(body));
-    setSending(false);
-    if (ok) {
-      setText("");
-      setCursor(0);
-      setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
+    if ((body.length === 0 && files.length === 0) || sending) return;
+    if (files.length > 0 && environmentId !== null) {
+      // Waiting here instead of sending early: the server only claims an upload
+      // that finished, so a half-uploaded file must not reach the message.
+      const ids = files.map((file) => file.id);
+      await awaitAttachmentUploads(ids);
+      const uploaded = getUploadedAttachments({ environmentId, images: files });
+      if (uploaded === null) {
+        setAttachError("Some files did not upload. Retry them or remove them.");
+        return;
+      }
+      setSending(true);
+      // Unknown attachment kinds never come from this composer, so they can't
+      // be posted as a block.
+      const blocks = composerBlocks(
+        body,
+        uploaded.filter(isPostableAttachment),
+      );
+      const ok = await runAction("Couldn't send", () => props.onSend(blocks));
+      setSending(false);
+      if (!ok) return;
+      for (const file of files) {
+        sentIds.current.add(file.id);
+        revokePreview(file);
+      }
+      setFiles([]);
+      setAttachError(null);
+    } else {
+      setSending(true);
+      const ok = await runAction("Couldn't send", () => props.onSend(composerBlocks(body, [])));
+      setSending(false);
+      if (!ok) return;
     }
+    setText("");
+    setCursor(0);
+    setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
     editorRef.current?.focus();
+  };
+
+  const onFilesPicked = (list: FileList | null) => {
+    if (!list || list.length === 0) return;
+    void addFiles(Array.from(list));
+  };
+
+  const onDrop = (event: DragEvent<HTMLFormElement>) => {
+    if (!canAttach || event.dataTransfer.files.length === 0) return;
+    event.preventDefault();
+    onFilesPicked(event.dataTransfer.files);
+  };
+
+  // Image and file paste go to the attachment path; a pasted thread link stays
+  // a chip (handled in onPaste).
+  const onPasteFiles = (event: ClipboardEvent<HTMLElement>) => {
+    if (!canAttach) return;
+    const pasted = Array.from(event.clipboardData.files);
+    if (pasted.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void addFiles(pasted);
   };
 
   // A pasted thread link becomes a thread chip, like in a thread's composer.
@@ -515,13 +740,53 @@ export function Composer(props: {
 
   return (
     <form
-      className="mb-3.5 flex min-h-11 shrink-0 items-end gap-1.5 rounded-3xl bg-(--m-surface) py-1.5 ps-4 pe-1.5"
+      className="mb-3.5 flex shrink-0 flex-col gap-2 rounded-3xl bg-(--m-surface) py-1.5 ps-4 pe-1.5"
       onSubmit={(event) => {
         event.preventDefault();
         void send();
       }}
+      onDragOver={(event) => {
+        if (canAttach) event.preventDefault();
+      }}
+      onDrop={onDrop}
     >
-      <div className="min-w-0 flex-1 py-1.5">
+      {files.length > 0 || attachError ? (
+        <div className="flex flex-wrap items-center gap-2 pt-1.5">
+          {files.map((file) => (
+            <DraftChip
+              key={file.id}
+              file={file}
+              onRemove={() => removeFile(file)}
+              onRetry={() => retryFile(file)}
+            />
+          ))}
+          {attachError ? <p className="text-xs text-(--m-danger)">{attachError}</p> : null}
+        </div>
+      ) : null}
+      <div className="flex min-h-11 items-end gap-1.5">
+        {canAttach ? (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                onFilesPicked(event.target.files);
+                event.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              aria-label="Attach files"
+              onClick={() => fileInputRef.current?.click()}
+              className="grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+            >
+              <PaperclipIcon className="size-4" aria-hidden />
+            </button>
+          </>
+        ) : null}
+        <div className="min-w-0 flex-1 py-1.5">
         <ComposerPromptEditor
           value={text}
           cursor={cursor}
@@ -533,7 +798,10 @@ export function Composer(props: {
           className="max-h-40 min-h-5 text-sm leading-5 text-(--m-text)"
           placeholderClassName="leading-5 text-(--m-muted)"
           editorRef={editorRef}
-          onPaste={onPaste}
+          onPaste={(event) => {
+            onPasteFiles(event);
+            if (!event.defaultPrevented) onPaste(event);
+          }}
           onChange={(value, nextCursor) => {
             setText(value);
             setCursor(nextCursor);
@@ -544,15 +812,76 @@ export function Composer(props: {
             return true;
           }}
         />
+        </div>
+        <button
+          type="submit"
+          disabled={(text.trim().length === 0 && files.length === 0) || sending}
+          aria-label="Send"
+          className="grid size-8 shrink-0 place-items-center rounded-full bg-(--m-text) text-(--m-ground) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"
+        >
+          <ArrowUpIcon className="size-4" />
+        </button>
       </div>
-      <button
-        type="submit"
-        disabled={text.trim().length === 0 || sending}
-        aria-label="Send"
-        className="grid size-8 shrink-0 place-items-center rounded-full bg-(--m-text) text-(--m-ground) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"
-      >
-        <ArrowUpIcon className="size-4" />
-      </button>
     </form>
+  );
+}
+
+/** Unknown attachment kinds never come from this composer, so they can't be posted as a block. */
+function isPostableAttachment(attachment: ChatAttachment): attachment is ChatAttachmentBlock {
+  return attachment.type === "image" || attachment.type === "file";
+}
+
+function revokePreview(file: ComposerDraftFile) {
+  if (file.type === "image") URL.revokeObjectURL(file.previewUrl);
+}
+
+/** One draft file above the editor: thumbnail or name, its state, and a remove button. */
+function DraftChip(props: {
+  file: ComposerDraftFile;
+  onRemove: () => void;
+  onRetry: () => void;
+}) {
+  const upload = useAttachmentUploadStore((state) => state.uploadsByImageId[props.file.id]);
+  const failed = upload?.status === "failed";
+  const uploading = upload === undefined || upload.status === "uploading";
+  return (
+    <div className="flex h-9 max-w-full items-center gap-2 rounded-xl bg-(--m-ground) pe-1 ps-1 text-sm">
+      {props.file.type === "image" ? (
+        <img
+          src={props.file.previewUrl}
+          alt=""
+          className="size-7 shrink-0 rounded-md object-cover"
+        />
+      ) : null}
+      <span className="min-w-0 truncate">{props.file.name}</span>
+      <span className="shrink-0 text-xs text-(--m-muted)">
+        {formatAttachmentSize(props.file.sizeBytes)}
+      </span>
+      {uploading ? (
+        <span
+          role="status"
+          aria-label="Uploading"
+          className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-(--m-muted) border-t-transparent"
+        />
+      ) : null}
+      {failed ? (
+        <button
+          type="button"
+          aria-label="Retry upload"
+          onClick={props.onRetry}
+          className="grid size-6 shrink-0 place-items-center rounded-full text-(--m-accent-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        >
+          <RotateCcwIcon className="size-3.5" aria-hidden />
+        </button>
+      ) : null}
+      <button
+        type="button"
+        aria-label={`Remove ${props.file.name}`}
+        onClick={props.onRemove}
+        className="grid size-6 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
+        <XIcon className="size-3.5" aria-hidden />
+      </button>
+    </div>
   );
 }

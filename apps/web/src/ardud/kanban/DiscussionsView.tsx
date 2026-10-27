@@ -44,6 +44,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useClientSettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { Chat, Composer } from "./Chat";
+import { composerTitleSource } from "./composerAttachments";
 import { kanban, runAction } from "./kanbanStore";
 import { CopyLinkButton } from "./links";
 import { Avatar, UnreadDot } from "./parts";
@@ -91,12 +92,23 @@ function DraftRoom(props: {
       <div className="flex min-h-0 w-full max-w-160 flex-1 flex-col justify-end">
         <Composer
           placeholder="What do you need?"
-          onSend={async (text) => {
+          attachments
+          onSend={async (blocks) => {
+            const text = blocks.find((block) => block._tag === "md")?.text ?? "";
+            const firstFile = blocks.find((block) => block._tag === "attachment");
             created.current ??= (
-              await kanban.createDiscussion(props.boardId, requestTitle(text))
+              await kanban.createDiscussion(
+                props.boardId,
+                requestTitle(
+                  composerTitleSource(
+                    text,
+                    firstFile?._tag === "attachment" ? [firstFile.attachment.name] : [],
+                  ),
+                ),
+              )
             ).id;
             const discussionId = created.current;
-            await kanban.post(props.boardId, discussionId, [{ _tag: "md", text }]);
+            await kanban.post(props.boardId, discussionId, blocks);
             created.current = null;
             props.onOpenDiscussion(discussionId);
           }}

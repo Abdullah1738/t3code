@@ -284,9 +284,10 @@ function CardDiscussion(props: {
     <div className="flex min-h-0 flex-1 flex-col justify-end">
       <Composer
         placeholder="Message"
-        onSend={async (text) => {
+        attachments
+        onSend={async (blocks) => {
           const room = await kanban.cardDiscussion(boardId, card.id);
-          await kanban.post(boardId, room.id, [{ _tag: "md", text }]);
+          await kanban.post(boardId, room.id, blocks);
         }}
       />
     </div>
@@ -707,7 +708,10 @@ function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEve
       </ol>
       <Composer
         placeholder="Comment"
-        onSend={(text) => kanban.patchCard({ cardId: props.cardId as never, comment: text })}
+        onSend={(blocks) => {
+          const text = blocks.find((block) => block._tag === "md")?.text ?? "";
+          return kanban.patchCard({ cardId: props.cardId as never, comment: text });
+        }}
       />
     </div>
   );
