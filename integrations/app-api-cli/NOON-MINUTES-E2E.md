@@ -159,17 +159,26 @@ commerce reconcile-order FLOW_UUID --close-failed
 
 Reads only, on the flow's bound account: order/get with echoed orderNr and
 `statusCode` `failed`/`cancelled`, `orderTotal` 0, the order absent from
-order/get-active, and a successful paymentintent/status read with authorized and
-captured 0, not `payment_confirmed` and no capture/authorization/settle/refund
-transaction status. It refuses within 15 minutes of the place (3DS window), on any
-unobserved send, a payment-success receipt or observation, prepay/preauthorize
-history, a changed journal or receipts, or a failed/missing intent read. The close
-is terminal (`MINUTES_CLOSED_FAILED_UNCAPTURED`, state `RELEASED`): the reservation
-stays counted, the order ID stays owned, nothing is resent and no retry is
-authorized. It records "uncaptured at check", not a bank-side void: a pending
-hold can still show on the card until the bank drops it. First live use: flow
-95df7e79 / IAEGAR1482ANIBCZKA (intent `payment_ready_to_redirect`,
-`3DS_ENROLL_INITIATED`, 0 authorized/captured).
+order/get-active, and a successful paymentintent/status read that is terminal:
+state `payment_failed`, payment status `payment_failed`/`payment_error`, no
+redirect, error code empty or `0`, authorized and captured 0, and a transaction
+status listed in `TERMINAL_NO_CAPTURE_TXNS` (`commerce_minutes_disposition.py`,
+mirrored as `MINUTES_TERMINAL_NO_CAPTURE_TXNS` in `commerce_journal.py`, which
+re-checks the evidence). It refuses within 15 minutes of the latest place or
+payment send (3DS window), on any unobserved send, a payment-success receipt or
+observation, prepay/preauthorize history, a changed journal or receipts, or a
+failed/missing intent read. The close is terminal
+(`MINUTES_CLOSED_FAILED_UNCAPTURED`, state `RELEASED`): the reservation stays
+counted, the order ID stays owned, nothing is resent and no retry is authorized.
+It records "uncaptured at check", not a bank-side void.
+
+Both allowlists are empty: no transaction status noon finalises as a non-capture
+has been captured yet, so today the close refuses every real failed order with
+`MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED` and the flow stays fenced. Add a
+status only from a captured live fixture, in separately reviewed work. The first
+live use (flow 95df7e79 / IAEGAR1482ANIBCZKA, 27 Oct, before this check) closed
+an intent still at `payment_ready_to_redirect` / `3DS_ENROLL_INITIATED`, which
+the current gate refuses; noon showed that order failed and nothing was charged.
 
 ## Deviations from the capture (deliberate, benign)
 
