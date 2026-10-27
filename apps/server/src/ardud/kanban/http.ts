@@ -81,16 +81,19 @@ const query = Effect.fn("KanbanHttp.query")(function* (name: string) {
 
 const Text = Schema.optional(Schema.String);
 
-const CreateBoardBody = Schema.Struct({
-  slug: Schema.String,
-  name: Schema.String,
-  projectId: Schema.optional(Schema.NullOr(Schema.String)),
-});
-
 const ModelBody = Schema.Struct({
   model: Schema.String,
   instanceId: Text,
   variant: Text,
+});
+
+const CreateBoardBody = Schema.Struct({
+  slug: Schema.String,
+  name: Schema.String,
+  projectId: Schema.optional(Schema.NullOr(Schema.String)),
+  managerModel: Schema.optional(ModelBody),
+  evaluatorModel: Schema.optional(ModelBody),
+  defaultCardModel: Schema.optional(ModelBody),
 });
 
 const CreateCardBody = Schema.Struct({
@@ -237,6 +240,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           slug: input.slug,
           name: input.name,
           defaultProjectId: projectId,
+          ...(input.managerModel ? { managerModel: modelSelectionOf(input.managerModel) } : {}),
+          ...(input.evaluatorModel ? { evaluatorModel: modelSelectionOf(input.evaluatorModel) } : {}),
+          ...(input.defaultCardModel
+            ? { defaultCardModel: modelSelectionOf(input.defaultCardModel) }
+            : {}),
         });
         if (projectId && board.defaultProjectId !== projectId) {
           return yield* service.updateBoard(board.id, { defaultProjectId: projectId });

@@ -15,6 +15,8 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import { modelSelectionOf } from "./defaults.ts";
+import * as Rules from "./rules.ts";
 import * as KanbanService from "./KanbanService.ts";
 import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
 
@@ -100,6 +102,7 @@ it.effect("runs a card from To-Do through work, review findings, fix and a clear
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
       const created = yield* kanban.createCard(
         board.id,
         { prompt: "Fix the flaky test", title: "Flaky test" },
@@ -167,6 +170,15 @@ it.effect("walks the critical chain on the same review thread, switching models"
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "high" });
+      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Critical", steps: [sol, astra] }],
+        defaultReviewChain: "Critical",
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.setPool(board.id, sol, 2);
+      yield* kanban.setPool(board.id, astra, 2);
       const created = yield* kanban.createCard(
         board.id,
         { prompt: "Change fee rounding", title: "Fee rounding", reviewChain: "Critical" },
@@ -210,6 +222,7 @@ it.effect("routes owner messages to the live thread, or to an evaluator when non
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
       const created = yield* kanban.createCard(
         board.id,
         { prompt: "Add a retry", title: "Retry" },
@@ -424,6 +437,7 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
       const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
       yield* kanban.dispatchNow;
       const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
@@ -462,8 +476,18 @@ const toyBoard = Effect.gen(function* () {
     name: "Toy",
     defaultProjectId: ProjectId.make("project-1"),
   });
-  yield* kanban.setPool(board.id, board.defaultCardModel, 1);
-  return { kanban, board };
+  const chained = yield* kanban.updateBoard(board.id, {
+    reviewChains: [
+      { name: "Standard", steps: [board.evaluatorModel] },
+      {
+        name: "Critical",
+        steps: [board.evaluatorModel, board.defaultCardModel],
+      },
+    ],
+    defaultReviewChain: "Standard",
+  });
+  yield* kanban.setPool(chained.id, chained.defaultCardModel, 1);
+  return { kanban, board: chained };
 });
 
 const setRunning = (fake: Effect.Success<typeof makeFake>, threadId: string, running: boolean) =>
@@ -1939,6 +1963,105 @@ it.effect("a home owner message survives the typing lapse and still gets its nud
         texts.filter((text) => text.includes("is waiting for your reply")).length,
         1,
       );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a new board starts with empty instructions, no review chains and a 0-slot pool per model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "fresh",
+        name: "Fresh",
+        defaultProjectId: null,
+      });
+      assert.strictEqual(board.instructions.modelRouting, "");
+      assert.strictEqual(board.instructions.reviewerRouting, "");
+      assert.strictEqual(board.instructions.escalation, "");
+      assert.deepStrictEqual(board.reviewChains, []);
+      assert.strictEqual(board.defaultReviewChain, null);
+      const snapshot = yield* kanban.snapshot(board.id);
+      const keys = snapshot.pools.map((pool) => pool.key).sort();
+      const expected = [
+        Rules.poolKey(board.managerModel),
+        Rules.poolKey(board.evaluatorModel),
+        Rules.poolKey(board.defaultCardModel),
+      ]
+        .filter((key, index, all) => all.indexOf(key) === index)
+        .sort();
+      assert.deepStrictEqual(keys, expected);
+      for (const pool of snapshot.pools) assert.strictEqual(pool.slots, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a board created with picked models uses them and pools exactly those", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const picked = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+      const board = yield* kanban.ensureBoard({
+        slug: "picked",
+        name: "Picked",
+        defaultProjectId: null,
+        evaluatorModel: picked,
+        defaultCardModel: picked,
+      });
+      assert.deepStrictEqual(board.evaluatorModel, picked);
+      assert.deepStrictEqual(board.defaultCardModel, picked);
+      const snapshot = yield* kanban.snapshot(board.id);
+      const keys = snapshot.pools.map((pool) => pool.key).sort();
+      assert.deepStrictEqual(
+        keys,
+        [Rules.poolKey(picked), Rules.poolKey(board.managerModel)].sort(),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("updateBoard with a new evaluator model adds a 0-slot pool without resizing others", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "grow",
+        name: "Grow",
+        defaultProjectId: null,
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const newModel = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      yield* kanban.updateBoard(board.id, { evaluatorModel: newModel });
+      const pools = (yield* kanban.snapshot(board.id)).pools;
+      const added = pools.find((pool) => pool.key === Rules.poolKey(newModel));
+      assert.isDefined(added);
+      assert.strictEqual(added!.slots, 0);
+      const card = pools.find((pool) => pool.key === Rules.poolKey(board.defaultCardModel));
+      assert.strictEqual(card!.slots, 2);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("ensureBoard on an existing board leaves its settings and pools untouched", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const again = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Other name",
+        defaultProjectId: null,
+      });
+      assert.strictEqual(again.id, board.id);
+      assert.strictEqual(again.name, "Toy");
+      assert.deepStrictEqual(again.reviewChains, board.reviewChains);
+      const pool = (yield* kanban.snapshot(board.id)).pools.find(
+        (entry) => entry.key === Rules.poolKey(board.defaultCardModel),
+      );
+      assert.strictEqual(pool!.slots, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

@@ -178,6 +178,9 @@ export interface KanbanServiceShape {
     readonly slug: string;
     readonly name: string;
     readonly defaultProjectId: ProjectId | null;
+    readonly managerModel?: ModelSelection | undefined;
+    readonly evaluatorModel?: ModelSelection | undefined;
+    readonly defaultCardModel?: ModelSelection | undefined;
   }) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly updateBoard: (
     boardId: KanbanBoard["id"],
@@ -1926,6 +1929,39 @@ const make = Effect.gen(function* () {
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(toKanbanError));
 
+  /** Every model a board uses, deduped by pool key. */
+  const boardModels = (board: KanbanBoard): Array<ModelSelection> => {
+    const seen = new Map<string, ModelSelection>();
+    const add = (model: ModelSelection) => {
+      const key = Rules.poolKey(model);
+      if (!seen.has(key)) seen.set(key, model);
+    };
+    add(board.managerModel);
+    add(board.evaluatorModel);
+    add(board.defaultCardModel);
+    for (const chain of board.reviewChains) for (const step of chain.steps) add(step);
+    return [...seen.values()];
+  };
+
+  /** Adds a 0-slot pool for each model that has none yet; existing pools are never touched. */
+  const addMissingPools = Effect.fn("KanbanService.addMissingPools")(function* (
+    boardId: KanbanBoard["id"],
+    models: ReadonlyArray<ModelSelection>,
+  ) {
+    const have = new Set((yield* store.pools(boardId)).map((pool) => pool.key));
+    const added: Array<ModelSelection> = [];
+    for (const model of models) {
+      const key = Rules.poolKey(model);
+      if (have.has(key)) continue;
+      have.add(key);
+      added.push(model);
+      yield* store.putPool(boardId, { key, model, slots: 0 });
+    }
+    if (added.length > 0) {
+      yield* publish(boardId, { _tag: "pools", pools: yield* store.pools(boardId) });
+    }
+  });
+
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
@@ -1939,23 +1975,17 @@ const make = Effect.gen(function* () {
           icon: null,
           iconImage: null,
           defaultProjectId: input.defaultProjectId,
-          managerModel: Defaults.DEFAULT_MANAGER_MODEL,
-          evaluatorModel: Defaults.DEFAULT_EVALUATOR_MODEL,
-          defaultCardModel: Defaults.DEFAULT_CARD_MODEL,
-          reviewChains: Defaults.DEFAULT_REVIEW_CHAINS,
-          defaultReviewChain: Defaults.DEFAULT_REVIEW_CHAIN,
+          managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
+          evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
+          defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
+          reviewChains: [],
+          defaultReviewChain: null,
           instructions: Defaults.DEFAULT_INSTRUCTIONS,
           createdAt: yield* nowIso,
           archivedAt: null,
         };
         yield* store.putBoard(board);
-        for (const pool of Defaults.DEFAULT_POOLS) {
-          yield* store.putPool(board.id, {
-            key: Rules.poolKey(pool.model),
-            model: pool.model,
-            slots: pool.slots,
-          });
-        }
+        yield* addMissingPools(board.id, boardModels(board));
         yield* publish(board.id, { _tag: "board", board });
         return board;
       }),
@@ -1967,6 +1997,7 @@ const make = Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const next: KanbanBoard = { ...board, ...patch };
         yield* store.putBoard(next);
+        yield* addMissingPools(board.id, boardModels(next));
         yield* publish(board.id, { _tag: "board", board: next });
         yield* kick;
         return next;
