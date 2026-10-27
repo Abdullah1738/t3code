@@ -193,7 +193,9 @@ def capabilities():
             'place':'live_order_created','payment':'live_confirmed_e2e_paid_order_2026_10_10',
             'tracking':'exact_native','rejected_auth_renewal_proven':False,
              'multi_item_baskets':True,'multi_item_cart_live_verified':True,
-             'multi_item_purchase_live_verified':True},
+             'multi_item_purchase_live_verified':True,
+             'cart_edit':'cart minutes show | cart minutes set --items-file F --expect-hash H (journalled whole-cart replace, never orders)',
+             'order_current_cart':'order minutes --items-file F --use-current-cart (orders the server cart only when it matches F exactly)'},
         'noon.main':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
             'place':'live_order_created','payment':'frictionless_saved_card_live_paid_2026_10_10',
             'tracking':'exact_shipment_manifest','multi_item_baskets':True,
@@ -286,11 +288,13 @@ def order_minutes(args):
                           'active_orders':guard.projection['active']}),flush=True)
         journal.fail('MINUTES_ACTIVE_ORDER_PRESENT')
     extra=getattr(args,'driver_note_extra',None)
+    use_current=bool(getattr(args,'use_current_cart',False))
     if args.resume_flow:
-        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth,driver_note_extra=extra)
+        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth,driver_note_extra=extra,
+                                       use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
     else:
-        flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra)
+        flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra,use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
     try:
         prepared=flow.prepare_only()
@@ -922,6 +926,13 @@ def main(argv=None):
     options.add_argument('vertical',choices=('minutes',))
     options.add_argument('--sku',required=True)
     options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
+    cart=commands.add_parser('cart',help='Read or replace the whole Minutes cart; never orders')
+    cart.add_argument('vertical',choices=('minutes',))
+    cart.add_argument('action',choices=('show','set'))
+    cart.add_argument('--items-file',dest='items_file',default=None,metavar='PATH',
+        help='set: the full basket (JSON array or {"items":[...]}), same format as order minutes')
+    cart.add_argument('--expect-hash',dest='expect_hash',default=None,metavar='HASH',
+        help='set: cart_hash from the last cart minutes show; refused if the cart changed since')
     clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only noon flow')
     clear.add_argument('vertical',choices=('minutes','main','supermall'))
     clear.add_argument('--flow',dest='flow_id',required=True)
@@ -978,6 +989,8 @@ def main(argv=None):
     basket_arguments(minutes_order,'--sku')
     minutes_order.add_argument('--cvv-from-keychain',action='store_true',
         help='read the saved-card CVV from Keychain robob-card into RAM (required when the session demands CVV)')
+    minutes_order.add_argument('--use-current-cart',dest='use_current_cart',action='store_true',
+        help='order the cart already on the server when it matches the basket file exactly; nothing is synced')
     minutes_order.add_argument('--label',default='Noon Minutes order')
     minutes_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE preparation flow (exact cart readback; nothing re-sent)')
@@ -1033,6 +1046,15 @@ def main(argv=None):
             from noon_minutes_options import read_options
             result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
                     **read_options(args.sku,query=args.query)}
+        elif args.command=='cart':
+            from commerce_minutes_cart import show as cart_show,set_cart as cart_set
+            if args.action=='show':
+                result=cart_show()
+            else:
+                if args.items_file is None or args.expect_hash is None:
+                    journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')
+                from commerce_basket_input import read_items
+                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash)
         elif args.command=='clear-cart':
             if args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart

@@ -158,19 +158,23 @@ def _driver_note_extra(extra):
     return extra.strip()
 
 
-def _scope_hash(skus, home, extra):
-    """Scope digest; 'note' is included only when an extra driver note is set, so existing flows keep their digest."""
+def _scope_hash(skus, home, extra, use_current_cart=False):
+    """Scope digest; optional keys are included only when set, so existing flows keep their digest."""
     scope={'skus':skus,'home':home,'card':'5542','quiet':True,'extras':False}
     if extra is not None:
         scope['note']=extra
+    if use_current_cart:
+        scope['use_current_cart']=True
     return j.digest(scope)
 
 
 class MinutesFlow:
     # Default driver note; instances built without __init__ (resume paths) keep the quiet note.
     driver_note=m.QUIET_NOTE
+    # Instances built without __init__ (resume and test paths) keep the old refusal.
+    use_current_cart=False
 
-    def __init__(self, *, skus=None, items=None, auth=None, driver_note_extra=None):
+    def __init__(self, *, skus=None, items=None, auth=None, driver_note_extra=None, use_current_cart=False):
         # Lane-native validation strictly BEFORE any auth/network work.
         if skus is not None and items is not None:
             j.fail('MINUTES_ITEMS_CONFLICT')
@@ -186,7 +190,8 @@ class MinutesFlow:
         self.snapshot=self.auth.fresh_before_mutation('minutes')
         j.require_account_available('noon',self.snapshot.account_ref)
         self.flow_id=str(uuid.uuid4())
-        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra)
+        self.use_current_cart=bool(use_current_cart)
+        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra,self.use_current_cart)
         self.opened=False
         self.expected=None
         self.review=None
@@ -263,6 +268,11 @@ class MinutesFlow:
         return self.current.projection
 
     def fill_empty(self):
+        if self.use_current_cart and self.current is not None and self.current.projection['lines']:
+            # Adopt the cart already on the server: it must match the basket exactly, and nothing is sent.
+            m.review_manifest(self.current.projection['lines'],self.skus,mismatch='MINUTES_CURRENT_CART_MISMATCH')
+            self.adopted_current_cart=True
+            return self.current.projection
         if self.current is None or self.current.projection['lines']:
             j.fail('EXISTING_MINUTES_CART_MUST_NOT_BE_REPLACED')
         if not getattr(self,'_options_validated',False):
@@ -329,7 +339,7 @@ class MinutesFlow:
         return self
 
     @classmethod
-    def resume_active(cls, flow_id, *, skus=None, items=None, auth=None, driver_note_extra=None):
+    def resume_active(cls, flow_id, *, skus=None, items=None, auth=None, driver_note_extra=None, use_current_cart=False):
         """Continue an ACTIVE preparation flow from exact native readback.
 
         Only for flows whose consumed operations are non-financial (cart/
@@ -355,7 +365,8 @@ class MinutesFlow:
         self.flow_id=flow_id;self.skus=normalized
         self.driver_note_extra=_driver_note_extra(driver_note_extra)
         self.driver_note=m.quiet_note(self.driver_note_extra)
-        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra)
+        self.use_current_cart=bool(use_current_cart)
+        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra,self.use_current_cart)
         if self.scope_hash!=binding['scope_hash'] or self.snapshot.account_ref!=binding['account_hash']:
             j.fail('MINUTES_RECOVERY_SCOPE_MISMATCH')
         m.review_manifest(self.current.projection['lines'],self.skus,
