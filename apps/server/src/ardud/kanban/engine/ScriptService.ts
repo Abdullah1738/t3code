@@ -56,6 +56,15 @@ export interface NewScript {
   readonly enabled?: boolean | undefined;
 }
 
+// Cron lines run in the process's zone (see Scripts.cronProblem), so that's the zone shown.
+// Every script record the server returns or publishes goes through this, so a
+// client never loses the zone by taking a record from a write or a feed.
+const serverZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const withZone = (script: KanbanScript): KanbanScript =>
+  script.trigger._tag === "schedule" && script.trigger.cron !== null
+    ? { ...script, trigger: { ...script.trigger, timeZone: serverZone } }
+    : script;
+
 export interface KanbanScriptsShape {
   readonly scripts: (
     boardId: KanbanBoard["id"],
@@ -162,8 +171,9 @@ const make = Effect.gen(function* () {
 
   const save = Effect.fn("KanbanScripts.save")(function* (script: KanbanScript) {
     yield* io(store.putScript(script));
-    yield* service.announce(script.boardId, { _tag: "script", script });
-    return script;
+    const shown = withZone(script);
+    yield* service.announce(script.boardId, { _tag: "script", script: shown });
+    return shown;
   });
 
   const saveRun = Effect.fn("KanbanScripts.saveRun")(function* (
@@ -517,18 +527,8 @@ const make = Effect.gen(function* () {
     );
   });
 
-  // Cron lines run in the process's zone (see Scripts.cronProblem), so that's the zone shown.
-  const serverZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   const scripts: KanbanScriptsShape["scripts"] = (boardId) =>
-    io(store.scripts(boardId)).pipe(
-      Effect.map((list) =>
-        list.map((script) =>
-          script.trigger._tag === "schedule" && script.trigger.cron !== null
-            ? { ...script, trigger: { ...script.trigger, timeZone: serverZone } }
-            : script,
-        ),
-      ),
-    );
+    io(store.scripts(boardId)).pipe(Effect.map((list) => list.map(withZone)));
 
   const runs: KanbanScriptsShape["runs"] = (scriptId, limit) =>
     io(store.scriptRuns(scriptId, Math.max(1, Math.min(limit, 200))));
