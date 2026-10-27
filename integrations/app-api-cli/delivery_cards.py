@@ -714,6 +714,16 @@ def attempt(holder, field, save):
         return 'sent'
 
 
+
+def public_url(url):
+    """A link people off the tailnet can open: https on a public host (the bridge's share origin or a
+    quick tunnel), never the tailnet (.ts.net), loopback or a bare IP."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    return (parsed.scheme == 'https' and '.' in host and not host.endswith('.ts.net')
+            and not re.fullmatch(r'[0-9.]+|[0-9a-f:]+', host) and host not in ('localhost',))
+
+
 def bridge(args, timeout=12):
     env = {k: v for k, v in os.environ.items() if k not in ('BUN_INSPECT', 'BUN_OPTIONS', 'NODE_OPTIONS')}
     p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
@@ -812,7 +822,7 @@ def sync(cfg, data, *, send=False):
                         url = published.get('url')
                         if not isinstance(url, str) or not url.startswith('https://'):
                             raise ValueError('card_publish_bad_ack')
-                        if recipient != 'owner' and not urlparse(url).hostname.endswith('.trycloudflare.com'):
+                        if recipient != 'owner' and not public_url(url):
                             raise ValueError('public_card_url_required')
                         state['url'] = url
                         atomic(statepath, state)
@@ -874,7 +884,7 @@ def repair_link(cfg, data):
             url = current.get('url') if current else None
             if not url:
                 url = bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))],timeout=65).get('url')
-            if not isinstance(url,str) or not (urlparse(url).hostname or '').endswith('.trycloudflare.com'):
+            if not isinstance(url,str) or not public_url(url):
                 raise ValueError('public_card_url_required')
             if url == state['url']:
                 state['link_health'] = 'ok'; atomic(path,state)

@@ -283,6 +283,13 @@ class CardTests(unittest.TestCase):
         self.assertIn('https://cards.trycloudflare.com/preview.png',doc)
         self.assertIn('Delivered', doc)
 
+    def test_public_links_on_the_share_origin_count_and_tailnet_links_do_not(self):
+        for url in ('https://cards.abdullah.fund/s/AbCdEfGhIjKlMnOpQrStUv/', 'https://quiet-words.trycloudflare.com/'):
+            self.assertTrue(c.public_url(url), url)
+        for url in ('https://host.ts.net:18400/card/', 'http://cards.abdullah.fund/s/x/', 'https://127.0.0.1:8443/',
+                    'https://localhost/', 'https://[::1]/', 'file:///tmp/x'):
+            self.assertFalse(c.public_url(url), url)
+
     def test_owner_card_tailnet_and_hold_release(self):
         cfg = {**self.cfg,'for':'owner','delivery_card':{'held':True}}
         self.assertEqual(c.sync(cfg,self.data,send=True)['status'],'held:payment_unconfirmed')
