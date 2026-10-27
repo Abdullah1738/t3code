@@ -1,4 +1,6 @@
 import type {
+  ChatFileAttachment,
+  ChatImageAttachment,
   KanbanAnswer,
   KanbanBlock,
   KanbanLink,
@@ -221,4 +223,54 @@ export function kanbanRecordState(
   const id = params?.id?.trim() || null;
   if (id === null && (kind === "card" || kind === "goal")) return null;
   return { kind, boardId, id };
+}
+
+/** An attachment the server has stored, as a block refers to it. */
+export type StoredAttachment = ChatImageAttachment | ChatFileAttachment;
+
+/** The blocks one send posts: the text first (when there is any), then each attachment in order. */
+export function sendBlocks(
+  text: string,
+  attachments: ReadonlyArray<StoredAttachment>,
+): KanbanBlock[] {
+  const body = text.trim();
+  return [
+    ...(body === "" ? [] : [{ _tag: "md" as const, text: body }]),
+    ...attachments.map((attachment) => ({ _tag: "attachment" as const, attachment })),
+  ];
+}
+
+/** What a new discussion is titled from: the text, else the first file's name, else nothing. */
+export function firstSendText(
+  text: string,
+  attachments: ReadonlyArray<{ readonly name: string }>,
+): string {
+  const body = text.trim();
+  return body !== "" ? body : (attachments[0]?.name ?? "");
+}
+
+export type BlockRun =
+  | { readonly kind: "block"; readonly index: number; readonly block: KanbanBlock }
+  | {
+      readonly kind: "attachments";
+      readonly index: number;
+      readonly attachments: ReadonlyArray<StoredAttachment>;
+    };
+
+/** Consecutive attachment blocks share one wrapping row; every other block stands alone. */
+export function groupBlockRuns(blocks: ReadonlyArray<KanbanBlock>): BlockRun[] {
+  const runs: BlockRun[] = [];
+  blocks.forEach((block, index) => {
+    if (block._tag !== "attachment") {
+      runs.push({ kind: "block", index, block });
+      return;
+    }
+    const last = runs.at(-1);
+    if (last?.kind === "attachments") {
+      runs[runs.length - 1] = { ...last, attachments: [...last.attachments, block.attachment] };
+    } else {
+      runs.push({ kind: "attachments", index, attachments: [block.attachment] });
+    }
+  });
+  return runs;
 }

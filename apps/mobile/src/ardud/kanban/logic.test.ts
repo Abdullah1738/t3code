@@ -11,9 +11,28 @@ import {
   kanbanRecordState,
   nextTypingExpiry,
   priorityFill,
+  firstSendText,
+  groupBlockRuns,
   requestTitle,
+  sendBlocks,
   toggleChoice,
+  type StoredAttachment,
 } from "./logic";
+
+const photo: StoredAttachment = {
+  type: "image",
+  id: "att-photo",
+  name: "shot.png",
+  mimeType: "image/png",
+  sizeBytes: 10,
+};
+const pdf: StoredAttachment = {
+  type: "file",
+  id: "att-pdf",
+  name: "spec.pdf",
+  mimeType: "application/pdf",
+  sizeBytes: 20,
+};
 
 const column = (stage: string, count: number) => ({
   stage,
@@ -199,5 +218,62 @@ describe("kanbanRecordState", () => {
     expect(kanbanRecordState({ kind: "card", boardId: "b" })).toBeNull();
     expect(kanbanRecordState({ kind: "room", boardId: "b", id: "x" })).toBeNull();
     expect(kanbanRecordState({ kind: "goal", id: "g" })).toBeNull();
+  });
+});
+
+describe("sendBlocks", () => {
+  it("posts only the text when there are no files", () => {
+    expect(sendBlocks("  hello  ", [])).toEqual([{ _tag: "md", text: "hello" }]);
+  });
+
+  it("posts only the attachments when there is no text", () => {
+    expect(sendBlocks("   ", [photo, pdf])).toEqual([
+      { _tag: "attachment", attachment: photo },
+      { _tag: "attachment", attachment: pdf },
+    ]);
+  });
+
+  it("puts the text first, then the files in order", () => {
+    expect(sendBlocks("see these", [pdf, photo])).toEqual([
+      { _tag: "md", text: "see these" },
+      { _tag: "attachment", attachment: pdf },
+      { _tag: "attachment", attachment: photo },
+    ]);
+  });
+
+  it("posts nothing for an empty send", () => {
+    expect(sendBlocks("", [])).toEqual([]);
+  });
+});
+
+describe("firstSendText", () => {
+  it("titles a discussion from its text", () => {
+    expect(firstSendText(" plan ", [pdf])).toBe("plan");
+  });
+
+  it("falls back to the first file's name when there is no text", () => {
+    expect(firstSendText("", [pdf, photo])).toBe("spec.pdf");
+  });
+
+  it("is empty when there is neither text nor a file", () => {
+    expect(firstSendText("  ", [])).toBe("");
+  });
+});
+
+describe("groupBlockRuns", () => {
+  it("wraps consecutive attachments into one run and leaves other blocks alone", () => {
+    const blocks = [
+      { _tag: "md" as const, text: "hi" },
+      { _tag: "attachment" as const, attachment: photo },
+      { _tag: "attachment" as const, attachment: pdf },
+      { _tag: "md" as const, text: "after" },
+      { _tag: "attachment" as const, attachment: photo },
+    ];
+    expect(groupBlockRuns(blocks)).toEqual([
+      { kind: "block", index: 0, block: blocks[0] },
+      { kind: "attachments", index: 1, attachments: [photo, pdf] },
+      { kind: "block", index: 3, block: blocks[3] },
+      { kind: "attachments", index: 4, attachments: [photo] },
+    ]);
   });
 });

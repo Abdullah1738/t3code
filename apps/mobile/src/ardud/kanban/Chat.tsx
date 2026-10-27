@@ -1,5 +1,6 @@
 import { useIsFocused } from "@react-navigation/native";
 import type { KanbanBlock, KanbanMessage, KanbanParticipant } from "@t3tools/contracts";
+import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import {
   avatarOf,
   canSendChoice,
@@ -35,7 +36,27 @@ import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
 import { MarkdownText } from "../common/MarkdownText";
 import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
-import { cardGlyph, choiceView, isLoadableImageUrl, nextTypingExpiry, toggleChoice } from "./logic";
+import {
+  cardGlyph,
+  choiceView,
+  firstSendText,
+  groupBlockRuns,
+  isLoadableImageUrl,
+  nextTypingExpiry,
+  sendBlocks,
+  toggleChoice,
+  type StoredAttachment,
+} from "./logic";
+import { usePairedEnvironmentId } from "../common/environment";
+import { ComposerAttachmentButton } from "../../features/threads/ComposerAttachmentButton";
+import { pickComposerFiles, pickComposerMedia, type DraftComposerAttachment } from "../../lib/composerImages";
+import {
+  prepareTurnAttachments,
+  releasePendingAttachmentUploads,
+} from "../../lib/attachmentUpload";
+import { useServerConfigs } from "../../state/entities";
+import { useAssetUrl } from "../../state/assets";
+import * as Dialog from "../../components/ui/Dialog";
 import { Avatar, Glyph } from "./parts";
 
 // Agent posts fold past this many lines and open in place or in a reader.
@@ -325,14 +346,18 @@ function Blocks(props: {
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
-  return props.message.blocks.map((block, index) => (
-    <BlockView
-      // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
-      key={index}
-      block={block}
-      {...props}
-    />
-  ));
+  return groupBlockRuns(props.message.blocks).map((run) =>
+    run.kind === "attachments" ? (
+      <AttachmentRun key={run.index} attachments={run.attachments} />
+    ) : (
+      <BlockView
+        // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
+        key={run.index}
+        block={run.block}
+        {...props}
+      />
+    ),
+  );
 }
 
 function BlockView(props: {
@@ -378,10 +403,94 @@ function BlockView(props: {
       );
     case "image":
       return <ImageBlock url={block.url} alt={block.alt} />;
-    // Composer and rendering for uploads come in the follow-up cards; until then, the name only.
+    // Attachment runs render through AttachmentRun in Blocks.
     case "attachment":
-      return <Text className="text-[14px] text-foreground-muted">{block.attachment.name}</Text>;
+      return <AttachmentRun attachments={[block.attachment]} />;
   }
+}
+
+/** Consecutive attachments share one wrapping row. */
+function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
+  return (
+    <View className="flex-row flex-wrap gap-2">
+      {props.attachments.map((attachment) => (
+        <StoredAttachmentView key={attachment.id} attachment={attachment} />
+      ))}
+    </View>
+  );
+}
+
+function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) {
+  const { attachment } = props;
+  const environmentId = usePairedEnvironmentId();
+  const isImage = attachment.type === "image";
+  const resource = {
+    _tag: "attachment" as const,
+    attachmentId: attachment.id,
+    fileName: attachment.name,
+    mimeType: attachment.mimeType,
+  };
+  const uri = useAssetUrl(environmentId, resource);
+  const [preview, setPreview] = useState<FilePreviewSource | null>(null);
+  if (environmentId === null) return null;
+  if (isImage) {
+    return (
+      <>
+        <Pressable
+          accessibilityRole="imagebutton"
+          accessibilityLabel={`Open ${attachment.name}`}
+          onPress={() =>
+            uri !== null &&
+            setPreview({
+              kind: "image",
+              environmentId,
+              resource,
+              name: attachment.name,
+            })
+          }
+          className="size-24 overflow-hidden rounded-[12px] bg-secondary"
+        >
+          {uri !== null ? (
+            <Image
+              source={{ uri }}
+              cachePolicy="memory-disk"
+              contentFit="cover"
+              style={{ width: "100%", height: "100%" }}
+              accessibilityIgnoresInvertColors
+            />
+          ) : null}
+        </Pressable>
+        <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
+      </>
+    );
+  }
+  return (
+    <>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Open ${attachment.name}`}
+        accessibilityValue={{ text: formatAttachmentSize(attachment.sizeBytes) }}
+        onPress={() =>
+          setPreview({
+            kind: "document",
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            environmentId,
+            resource,
+          })
+        }
+        className="min-h-10 max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen px-3 py-2"
+      >
+        <Text numberOfLines={1} className="shrink text-[14px] font-t3-medium text-foreground">
+          {attachment.name}
+        </Text>
+        <Text className="text-[12px] text-foreground-muted">
+          {formatAttachmentSize(attachment.sizeBytes)}
+        </Text>
+      </Pressable>
+      <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
+    </>
+  );
 }
 
 function Collapse(props: { readonly title: string; readonly text: string }) {
@@ -732,6 +841,13 @@ function ImageBlock(props: { readonly url: string; readonly alt: string | null }
   );
 }
 
+/** A picked file on its way to the server. The chip shows it uploading until the server has it. */
+interface ComposerDraft {
+  readonly local: DraftComposerAttachment;
+  readonly uploaded: StoredAttachment | null;
+  readonly failed: boolean;
+}
+
 function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
@@ -740,28 +856,137 @@ function Composer(props: {
   readonly onSent: () => void;
 }) {
   const [text, setText] = useState("");
+  const [drafts, setDrafts] = useState<ReadonlyArray<ComposerDraft>>([]);
   // iOS keeps a grown multiline input tall after its value is cleared; a new one starts short.
   const [field, setField] = useState(0);
   const action = useBoardAction();
-  const empty = text.trim().length === 0;
+  const environmentId = usePairedEnvironmentId();
+  const configs = useServerConfigs();
+  const capabilities =
+    environmentId === null ? undefined : configs.get(environmentId)?.environment.capabilities;
+  const canAttach = capabilities?.attachmentUploads === true;
+  const maxFileBytes = capabilities?.fileAttachments?.maxUploadBytes;
+  const uploading = drafts.some((draft) => draft.uploaded === null && !draft.failed);
+  const empty = text.trim().length === 0 && drafts.length === 0;
+  const blocked = empty || action.pending || uploading;
+  // The latest drafts, for the unmount cleanup, which runs once.
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+  const environmentRef = useRef(environmentId);
+  environmentRef.current = environmentId;
+  useEffect(
+    () => () => {
+      const id = environmentRef.current;
+      const uploads = draftsRef.current.flatMap((draft) =>
+        draft.uploaded === null ? [] : [draft.uploaded.id],
+      );
+      if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
+    },
+    [],
+  );
+
+  const addPicked = (picked: ReadonlyArray<DraftComposerAttachment>) => {
+    if (picked.length === 0 || environmentId === null) return;
+    setDrafts((current) => [
+      ...current,
+      ...picked.map((local) => ({ local, uploaded: null, failed: false })),
+    ]);
+    // Each file uploads as it is picked, so its chip can show progress and a removed one is released.
+    for (const local of picked) {
+      void prepareTurnAttachments({
+        environmentId,
+        attachments: [local],
+        supportsImageUploads: true,
+      })
+        .then((result) => {
+          const stored = result.status === "ready" ? result.attachments[0] : undefined;
+          if (stored === undefined) throw new Error("Upload cancelled.");
+          setDrafts((current) =>
+            current.map((draft) =>
+              draft.local.id === local.id
+                ? { ...draft, uploaded: stored as StoredAttachment }
+                : draft,
+            ),
+          );
+        })
+        .catch((error: unknown) => {
+          setDrafts((current) =>
+            current.map((draft) =>
+              draft.local.id === local.id ? { ...draft, failed: true } : draft,
+            ),
+          );
+          Dialog.alert(
+            "Couldn't attach file",
+            error instanceof Error ? error.message : "Try again.",
+          );
+        });
+    }
+  };
+
+  const pick = async (kind: "media" | "files") => {
+    const result =
+      kind === "files"
+        ? await pickComposerFiles({ existingCount: drafts.length, maxBytes: maxFileBytes })
+        : await pickComposerMedia({ existingCount: drafts.length, maxVideoBytes: maxFileBytes });
+    addPicked("files" in result ? result.files : result.attachments);
+    if (result.error) Dialog.alert("Could not attach file", result.error);
+  };
+
+  const removeDraft = (id: string) => {
+    const removed = drafts.find((draft) => draft.local.id === id);
+    setDrafts((current) => current.filter((draft) => draft.local.id !== id));
+    if (removed?.uploaded && environmentId !== null) {
+      void releasePendingAttachmentUploads(environmentId, [removed.uploaded.id]);
+    }
+  };
+
   const send = () => {
+    if (blocked) return;
     const body = text.trim();
-    if (body === "" || action.pending) return;
+    const sending = drafts;
+    const stored = sending.flatMap((draft) => (draft.uploaded ? [draft.uploaded] : []));
     setText("");
+    setDrafts([]);
     setField((key) => key + 1);
     void action
       .run("Couldn't send", async () => {
-        const discussionId = props.discussionId ?? (await props.ensureDiscussion(body));
-        await kanbanClient().post(props.boardId, discussionId, [{ _tag: "md", text: body }]);
+        const discussionId =
+          props.discussionId ?? (await props.ensureDiscussion(firstSendText(body, stored)));
+        await kanbanClient().post(props.boardId, discussionId, sendBlocks(body, stored));
       })
       .then((sent) => {
-        if (sent) props.onSent();
-        else setText((current) => (current === "" ? body : current));
+        if (sent) {
+          props.onSent();
+          return;
+        }
+        // A failed send gives the text and files back so the owner can send again.
+        setText((current) => (current === "" ? body : current));
+        setDrafts((current) => [...sending, ...current]);
       });
   };
+
   return (
-    <View className="bg-screen px-3 pt-2" style={{ paddingBottom: props.bottomInset }}>
-      <View className="flex-row items-end gap-1.5 rounded-[22px] bg-card py-1.5 pl-4 pr-1.5">
+    <View className="gap-2 bg-screen px-3 pt-2" style={{ paddingBottom: props.bottomInset }}>
+      {drafts.length > 0 ? (
+        <View className="flex-row flex-wrap gap-2">
+          {drafts.map((draft) => (
+            <DraftChip
+              key={draft.local.id}
+              draft={draft}
+              onRemove={() => removeDraft(draft.local.id)}
+            />
+          ))}
+        </View>
+      ) : null}
+      <View className="flex-row items-end gap-1.5 rounded-[22px] bg-card py-1.5 pl-1.5 pr-1.5">
+        {canAttach ? (
+          <ComposerAttachmentButton
+            disabled={action.pending}
+            supportsFiles={capabilities?.fileAttachments !== undefined}
+            onPickMedia={() => pick("media")}
+            onPickFiles={() => pick("files")}
+          />
+        ) : null}
         <AppTextInput
           key={field}
           // The new input after a send takes the focus back, so the keyboard stays up.
@@ -777,22 +1002,58 @@ function Composer(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send"
-          accessibilityState={{ disabled: empty || action.pending }}
-          disabled={empty || action.pending}
+          accessibilityState={{ disabled: blocked }}
+          disabled={blocked}
           onPress={send}
           className={cn(
-            "size-8 items-center justify-center rounded-full",
-            empty || action.pending ? "bg-secondary" : "bg-foreground",
+            "mr-1 size-8 items-center justify-center rounded-full",
+            blocked ? "bg-secondary" : "bg-foreground",
           )}
         >
           <SymbolView
             name="arrow.up"
             size={15}
-            tintColorClassName={empty || action.pending ? "accent-icon-muted" : "accent-screen"}
+            tintColorClassName={blocked ? "accent-icon-muted" : "accent-screen"}
             type="monochrome"
           />
         </Pressable>
       </View>
+    </View>
+  );
+}
+
+/** A picked file as a removable chip: a thumbnail for pictures, the name and size otherwise. */
+function DraftChip(props: { readonly draft: ComposerDraft; readonly onRemove: () => void }) {
+  const { local } = props.draft;
+  const uploading = props.draft.uploaded === null && !props.draft.failed;
+  const previewUri = "previewUri" in local ? local.previewUri : null;
+  const label = props.draft.failed ? "Failed" : uploading ? "Uploading…" : null;
+  return (
+    <View className="max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen py-1.5 pl-1.5 pr-1">
+      {previewUri ? (
+        <Image
+          source={{ uri: previewUri }}
+          contentFit="cover"
+          style={{ width: 36, height: 36, borderRadius: 8 }}
+          accessibilityIgnoresInvertColors
+        />
+      ) : null}
+      <View className="min-w-0 shrink">
+        <Text numberOfLines={1} className="text-[13px] font-t3-medium text-foreground">
+          {local.name}
+        </Text>
+        <Text className="text-[11px] text-foreground-muted">
+          {label ?? formatAttachmentSize(local.sizeBytes)}
+        </Text>
+      </View>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Remove ${local.name}`}
+        onPress={props.onRemove}
+        className="size-7 items-center justify-center rounded-full"
+      >
+        <SymbolView name="xmark" size={11} tintColorClassName="accent-icon-muted" type="monochrome" />
+      </Pressable>
     </View>
   );
 }
