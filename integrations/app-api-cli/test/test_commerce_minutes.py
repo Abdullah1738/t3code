@@ -289,6 +289,64 @@ class ResumeActiveTests(unittest.TestCase):
         with self.assertRaisesRegex(c.j.JournalError,'QUIET_CODES_UNSUPPORTED'):
             flow.select_quiet()
 
+    def test_select_quiet_sends_only_offered_toggle_with_note(self):
+        data=fixture()
+        data['deliveryPreferences']=[{'code':'dont_ring_the_bell','value':False,'title':None}]
+        flow=object.__new__(c.MinutesFlow)
+        flow.flow_id='10000000-0000-4000-8000-000000000006'
+        flow.current=c.m.Snapshot(data,c.m.project_session(data),time.time())
+        flow.expected=None;flow.review=None;flow.opened=True;flow.driver_note=c.m.quiet_note()
+        flow.snapshot=None;flow.cookies_in_ram=[];flow.store=None;flow.skus=[]
+        flow.cart_hash='a'*64
+        harness=Harness([fixture()])
+        flow.client=harness.client
+        from unittest.mock import Mock
+        with patch.object(c.j,'consume',return_value=True), \
+                patch.object(c.j,'observe',return_value={'outcome':'RESPONSE_RECEIVED'}):
+            flow.store=Mock()
+            flow.select_quiet()
+        body=harness.calls[0][1]
+        self.assertEqual(body['deliveryPreferences'],{'dont_ring_the_bell':True})
+        self.assertEqual(body['driverNotes'],c.m.QUIET_NOTE)
+        self.assertFalse(body['save'])
+
+    def test_select_quiet_neither_toggle_offered_still_refuses(self):
+        data=fixture()
+        data['deliveryPreferences']=[{'code':'delivery_instructions','value':False,'title':None}]
+        flow=object.__new__(c.MinutesFlow)
+        flow.current=c.m.Snapshot(data,c.m.project_session(data),time.time())
+        flow.expected=None;flow.review=None;flow.opened=True;flow.driver_note=c.m.quiet_note()
+        with self.assertRaisesRegex(c.j.JournalError,'QUIET_CODES_UNSUPPORTED'):
+            flow.select_quiet()
+
+    def test_scope_digest_unchanged_without_extra_and_differs_with_extra(self):
+        skus=[{'sku':'SYNTHETIC_SHAKE','qty':1,'modifiers':()}]
+        home=fingerprint('home')
+        old=c.j.digest({'skus':skus,'home':home,'card':'5542','quiet':True,'extras':False})
+        self.assertEqual(c._scope_hash(skus,home,None),old)
+        self.assertNotEqual(c._scope_hash(skus,home,'Gate 1'),old)
+
+    def test_prepare_only_flags_quiet_toggle_not_offered(self):
+        data=fixture()
+        for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
+                    'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee','orderLateNightFee'):
+            data[key]=0
+        data['orderDeliveryFee']=8
+        data['deliveryPreferences']=[{'code':'dont_ring_the_bell','value':True,'title':None}]
+        flow=object.__new__(c.MinutesFlow)
+        flow.current=c.m.Snapshot(data,c.m.project_session(data),time.time())
+        flow.skus=[c.m.sku_line('SYNTHETIC_SHAKE',1)]
+        flow.driver_note=c.m.quiet_note()
+        from unittest.mock import Mock
+        flow.client=Mock()
+        with patch.object(c.m,'saved_card_5542',return_value=c.m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard')):
+            review=flow.approve()
+        self.assertEqual(review['quiet_codes_set'],['dont_ring_the_bell'])
+        self.assertEqual(review['quiet_codes_not_offered'],['leave_it_at_my_door'])
+        self.assertTrue(review['quiet'])
+        import commerce_cli
+        self.assertEqual(commerce_cli.quiet_notice(review),commerce_cli.QUIET_NOT_OFFERED_NOTICE)
+
     def test_resume_active_continues_exact_cart_without_resending(self):
         from unittest.mock import patch
         auth=self.auth()
