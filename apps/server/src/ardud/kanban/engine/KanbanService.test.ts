@@ -1733,3 +1733,74 @@ it.effect("a card discussion's new evaluator takes over from the evaluator that 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("turn end after a reviewer's verdict still nudges its unanswered card discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      // The pool has one slot: the work thread's turn must end before the reviewer can start.
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.dispatchNow;
+      const reviewThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.notStrictEqual(reviewThread, workThread);
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Check the fee too" }]);
+
+      // The verdict releases the reviewer's card; its turn end must still nudge.
+      yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"]);
+      assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+      yield* kanban.turnEnded(reviewThread);
+
+      const reviewer = (yield* kanban.discussion(talk.id)).participants.find(
+        (p) => p.actor._tag === "thread" && p.actor.threadId === reviewThread,
+      );
+      assert.strictEqual(reviewer?.owes, "nudged");
+      const texts = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages;
+      assert.strictEqual(
+        texts.filter((text) => text.includes("is waiting for your reply")).length,
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a home owner message survives the typing lapse and still gets its nudge", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const opened = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+      yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Question?" }]);
+
+      // The evaluator is idle and home here: typing lapses, the owed reply stays.
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const lapsed = (yield* kanban.discussion(opened.id)).participants.find(
+        (p) => p.actor._tag === "evaluator",
+      );
+      assert.isNull(lapsed?.typingUntil);
+      assert.strictEqual(lapsed?.owes, "asked");
+
+      yield* kanban.turnEnded(setup);
+      const nudged = (yield* kanban.discussion(opened.id)).participants.find(
+        (p) => p.actor._tag === "evaluator",
+      );
+      assert.strictEqual(nudged?.owes, "nudged");
+      const texts = (yield* Ref.get(fake.threads)).get(setup)!.messages;
+      assert.strictEqual(
+        texts.filter((text) => text.includes("is waiting for your reply")).length,
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

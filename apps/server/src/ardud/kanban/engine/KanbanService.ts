@@ -1492,6 +1492,8 @@ const make = Effect.gen(function* () {
     const link = yield* store.threadLink(threadId);
     if (link?.discussionId === discussion.id) return true;
     if (discussion.cardId === null) return false;
+    // A reviewer's card is released when its verdict lands, but its turn end still owes the discussion.
+    if (link?.cardId === discussion.cardId) return true;
     const card = yield* store.card(discussion.cardId);
     if (card?.activeThreadId === threadId) return true;
     return (yield* store.threadCards(threadId)).includes(discussion.cardId);
@@ -1824,16 +1826,18 @@ const make = Effect.gen(function* () {
           const actor = participant.actor;
           if (actor._tag !== "thread" && actor._tag !== "evaluator") continue;
           const view = yield* threads.view(actor.threadId);
-          // Typing is kept alive only where the agent is working on a reply;
-          // elsewhere it lapses along with what it owed there.
+          // Typing is kept alive only where the agent is working on a reply.
+          // Once it lapses, a non-home thread's owes go too; home keeps them so
+          // its turn end still nudges.
           if (view && view.state !== "idle" && (yield* isHome(discussion, actor.threadId))) {
             next = withParticipant(next, actor, participant.name, {
               typingUntil: yield* typingUntil,
             });
           } else if (Date.parse(participant.typingUntil) < now) {
+            const home = yield* isHome(discussion, actor.threadId);
             next = withParticipant(next, actor, participant.name, {
               typingUntil: null,
-              owes: null,
+              owes: home ? participant.owes : null,
             });
           }
         }
