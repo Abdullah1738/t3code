@@ -428,4 +428,20 @@ describe("createKanbanClient", () => {
     stop();
     stopBoard();
   });
+
+  it("sends his own words with an answer, and leaves the key out without them", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const sent = client.answer("board-toy", "disc-1", 4, "q1", [], "Wait");
+    const withWords = fake.take("kanban.answer");
+    expect(withWords.input).toEqual({ discussionId: "disc-1", seq: 4, blockId: "q1", choice: [], text: "Wait" });
+    withWords.resolve(message(4));
+    await sent;
+
+    const plain = client.answer("board-toy", "disc-1", 4, "q1", ["o1"]);
+    const bare = fake.take("kanban.answer");
+    expect(bare.input).not.toHaveProperty("text");
+    bare.resolve(message(4));
+    await plain;
+  });
 });

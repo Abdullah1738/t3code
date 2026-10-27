@@ -8,6 +8,7 @@ import {
   kanbanPickOrder,
   kanbanWaitsOnEvaluator,
   type KanbanActor,
+  type KanbanAnswer,
   type KanbanBlock,
   type KanbanCard,
   type KanbanDiscussion,
@@ -739,4 +740,26 @@ export function poolViews(state: KanbanBoardState): PoolView[] {
       model: pool.model,
     };
   });
+}
+
+/** The owner's answer to this choice block, or null when he hasn't answered it. */
+export function ownerChoiceAnswer(
+  block: Extract<KanbanBlock, { _tag: "choice" }>,
+  answers: ReadonlyArray<KanbanAnswer>,
+): KanbanAnswer | null {
+  return (
+    answers.find((answer) => answer.blockId === block.id && answer.by._tag === "owner") ?? null
+  );
+}
+
+/** Mirrors the server's answer rule so Send buttons match what it accepts. */
+export function canSendChoice(
+  block: Extract<KanbanBlock, { _tag: "choice" }>,
+  choice: ReadonlyArray<string>,
+  text: string,
+): boolean {
+  const words = text.trim() !== "";
+  if (block.style === "poll") return choice.length > 0 && !words;
+  if (block.multi) return choice.length > 0 || words;
+  return (choice.length === 1 && !words) || (choice.length === 0 && words);
 }

@@ -118,6 +118,7 @@ const AnswerBody = Schema.Struct({
   seq: Schema.Int,
   blockId: Schema.String,
   choice: Schema.Array(Schema.String),
+  text: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const BoardBody = Schema.Struct({
@@ -383,7 +384,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
         const input = yield* body(AnswerBody);
-        return yield* service.answer(id, input.seq, input.blockId, input.choice, OWNER);
+        return yield* service.answer(id, input.seq, input.blockId, input.choice, OWNER, input.text ?? null);
       }),
     );
 

@@ -213,6 +213,7 @@ export const KanbanRpcs = RpcGroup.make(
       seq: NonNegativeInt,
       blockId: Schema.String,
       choice: Schema.Array(Schema.String),
+      text: Schema.optional(Schema.NullOr(Schema.String)),
     }),
     KanbanMessage,
   ),

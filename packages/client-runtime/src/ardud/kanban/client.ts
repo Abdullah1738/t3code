@@ -87,6 +87,7 @@ export interface KanbanClient {
     seq: number,
     blockId: string,
     choice: ReadonlyArray<string>,
+    text?: string | null,
   ): Promise<void>;
   setScriptEnabled(scriptId: string, enabled: boolean): Promise<void>;
   /** Starts a run now; it shows up in the runs store as it opens and ends. */
@@ -752,12 +753,13 @@ export function createKanbanClient(
     async post(_boardId, discussionId, blocks) {
       await transport.request(M.messagePost, { discussionId: discussionId as never, blocks });
     },
-    async answer(_boardId, discussionId, seq, blockId, choice) {
+    async answer(_boardId, discussionId, seq, blockId, choice, text) {
       await transport.request(M.answer, {
         discussionId: discussionId as never,
         seq,
         blockId,
         choice,
+        ...(text ? { text } : {}),
       });
     },
     async setScriptEnabled(scriptId, enabled) {

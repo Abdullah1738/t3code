@@ -1,4 +1,5 @@
 import type {
+  KanbanBlock,
   KanbanBoardSnapshot,
   KanbanCard,
   KanbanDiscussion,
@@ -15,6 +16,7 @@ import {
 } from "./boardState.ts";
 import {
   askViews,
+  canSendChoice,
   discussionPresence,
   discussionRows,
   goalPage,
@@ -22,6 +24,7 @@ import {
   groupCards,
   mergeMessages,
   nextDiscussionWakeMs,
+  ownerChoiceAnswer,
   poolViews,
   stageBoard,
   subtaskSteps,
@@ -479,4 +482,51 @@ describe("discussions", () => {
     expect(presence.seenBy.map((p) => p.name)).toEqual(["Evaluator"]);
     expect(presence.typing.map((p) => p.letter)).toEqual(["E"]);
   });
+
+describe("own answers on a choice block", () => {
+  type Choice = Extract<KanbanBlock, { _tag: "choice" }>;
+  const choice = (style: "poll" | "pick", multi: boolean): Choice => ({
+    _tag: "choice",
+    id: "q1",
+    style,
+    question: "Ship?",
+    options: [
+      { id: "yes", label: "Yes" },
+      { id: "no", label: "No" },
+    ],
+    multi,
+  });
+
+  it("allows a poll only with options, a single pick with one of the two, a multi pick with either", () => {
+    const poll = choice("poll", false);
+    expect(canSendChoice(poll, ["yes"], "")).toBe(true);
+    expect(canSendChoice(poll, ["yes"], "maybe")).toBe(false);
+    expect(canSendChoice(poll, [], "maybe")).toBe(false);
+
+    const single = choice("pick", false);
+    expect(canSendChoice(single, ["yes"], "")).toBe(true);
+    expect(canSendChoice(single, [], "Wait")).toBe(true);
+    expect(canSendChoice(single, ["yes"], "Wait")).toBe(false);
+    expect(canSendChoice(single, [], "   ")).toBe(false);
+    expect(canSendChoice(single, [], "")).toBe(false);
+
+    const multi = choice("pick", true);
+    expect(canSendChoice(multi, ["yes", "no"], "")).toBe(true);
+    expect(canSendChoice(multi, ["yes"], "and more")).toBe(true);
+    expect(canSendChoice(multi, [], "only words")).toBe(true);
+    expect(canSendChoice(multi, [], "  ")).toBe(false);
+  });
+
+  it("finds only the owner's answer on this block", () => {
+    const block = choice("pick", false);
+    const at = "2026-10-27T10:00:00.000Z";
+    const answers = [
+      { blockId: "other", by: { _tag: "owner" as const }, choice: ["yes"], text: null, at },
+      { blockId: "q1", by: { _tag: "evaluator" as const, threadId: "t1" }, choice: ["no"], text: null, at },
+      { blockId: "q1", by: { _tag: "owner" as const }, choice: [], text: "Wait", at },
+    ];
+    expect(ownerChoiceAnswer(block, answers)?.text).toBe("Wait");
+    expect(ownerChoiceAnswer(block, answers.slice(0, 2))).toBeNull();
+  });
+});
 });

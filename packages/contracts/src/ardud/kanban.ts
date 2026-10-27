@@ -514,6 +514,8 @@ export const KanbanAnswer = Schema.Struct({
   blockId: TrimmedNonEmptyString,
   by: KanbanActor,
   choice: Schema.Array(TrimmedNonEmptyString),
+  /** His own words, for a pick; null when he only picked options. */
+  text: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   at: IsoDateTime,
 });
 export type KanbanAnswer = typeof KanbanAnswer.Type;

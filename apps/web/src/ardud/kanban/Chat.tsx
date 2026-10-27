@@ -3,7 +3,9 @@ import { memo, useEffect, useRef, useState, type ClipboardEvent } from "react";
 
 import {
   avatarOf,
+  canSendChoice,
   discussionPresence,
+  ownerChoiceAnswer,
   type KanbanBoardState,
   type PresenceFace,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -247,6 +249,7 @@ function Block(props: {
 
 interface ChoiceDraft {
   readonly choice: ReadonlyArray<string>;
+  readonly text: string;
   readonly against: string | null;
   readonly sent: boolean;
 }
@@ -258,8 +261,11 @@ function ChoiceBlock(props: {
 }) {
   const { block, message } = props;
   const answers = message.answers.filter((answer) => answer.blockId === block.id);
-  const own = answers.find((answer) => answer.by._tag === "owner");
+  const own = ownerChoiceAnswer(block, message.answers);
   const mine = own?.choice ?? [];
+  // Words he sent but the server hasn't echoed yet still show as his answer.
+  const sentWords = current?.sent && current.text.trim() !== "" ? current.text.trim() : null;
+  const ownWords = own?.text ?? sentWords;
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -268,21 +274,33 @@ function ChoiceBlock(props: {
   const [sending, setSending] = useState(false);
   const current = draft !== null && draft.against === ownAt ? draft : null;
   const picked = current?.choice ?? mine;
-  const answered = mine.length > 0 || current?.sent === true;
+  const words = current?.text ?? "";
+  const answered = mine.length > 0 || own?.text != null || current?.sent === true;
   const recommended = block.options[0]?.id;
 
-  const send = async (choice: ReadonlyArray<string>) => {
-    if (choice.length === 0 || sending) return;
+  const send = async (choice: ReadonlyArray<string>, text: string) => {
+    if (!canSendChoice(block, choice, text) || sending) return;
     const against = ownAt;
-    setDraft({ choice, against, sent: true });
+    setDraft({ choice, text, against, sent: true });
     setSending(true);
     const ok = await runAction("Couldn't send your answer", () =>
-      kanban.answer(props.boardId, message.discussionId, message.seq, block.id, [...choice]),
+      kanban.answer(
+        props.boardId,
+        message.discussionId,
+        message.seq,
+        block.id,
+        [...choice],
+        text.trim() || null,
+      ),
     );
     setSending(false);
-    // A failed multi pick keeps what was ticked so Send can try again.
+    // A failed pick keeps what was ticked and typed so it can be sent again.
     if (!ok)
-      setDraft(block.multi && block.style === "pick" ? { choice, against, sent: false } : null);
+      setDraft(
+        block.multi || text.trim() !== ""
+          ? { choice: block.multi ? choice : [], text, against, sent: false }
+          : null,
+      );
   };
 
   // A poll takes every change at once (votes can change); a multi pick waits
@@ -295,10 +313,10 @@ function ChoiceBlock(props: {
         : [...picked, optionId]
       : [optionId];
     if (block.style === "poll" || !block.multi) {
-      void send(next);
+      void send(next, "");
       return;
     }
-    setDraft({ choice: next, against: ownAt, sent: false });
+    setDraft({ choice: next, text: words, against: ownAt, sent: false });
   };
 
   if (block.style === "poll") {
@@ -369,11 +387,49 @@ function ChoiceBlock(props: {
           </button>
         );
       })}
+      {!answered ? (
+        <div className="flex min-h-9 items-center gap-2.5 rounded-xl bg-(--m-ground) px-3 py-1.5 text-sm ring-inset focus-within:ring-2 focus-within:ring-(--m-accent)">
+          <textarea
+            rows={1}
+            value={words}
+            placeholder="Your own answer"
+            aria-label="Your own answer"
+            onChange={(event) =>
+              setDraft({ choice: picked, text: event.target.value, against: ownAt, sent: false })
+            }
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+              event.preventDefault();
+              void send(block.multi ? picked : [], words);
+            }}
+            className="max-h-32 min-w-0 flex-1 resize-none bg-transparent text-sm leading-5 text-(--m-text) outline-none [field-sizing:content] placeholder:text-(--m-muted)"
+          />
+          {block.multi ? null : (
+            <button
+              type="button"
+              aria-label="Send your answer"
+              disabled={!canSendChoice(block, [], words) || sending}
+              onClick={() => void send([], words)}
+              className="flex size-7 shrink-0 items-center justify-center rounded-full bg-(--m-accent) text-(--m-accent-ink) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) disabled:opacity-50"
+            >
+              <ArrowUpIcon className="size-4" aria-hidden />
+            </button>
+          )}
+        </div>
+      ) : ownWords !== null ? (
+        <div className="flex min-h-9 items-center gap-2.5 rounded-xl bg-(--m-ground) px-3 py-1.5 text-left text-sm ring-2 ring-inset ring-(--m-accent)">
+          <span
+            aria-hidden
+            className="size-4 shrink-0 rounded-full ring-4 ring-inset ring-(--m-accent)"
+          />
+          <span className="min-w-0 flex-1 whitespace-pre-wrap">{ownWords}</span>
+        </div>
+      ) : null}
       {block.multi && !answered ? (
         <button
           type="button"
-          disabled={picked.length === 0 || sending}
-          onClick={() => void send(picked)}
+          disabled={!canSendChoice(block, picked, words) || sending}
+          onClick={() => void send(picked, words)}
           className="h-8 self-start rounded-full bg-(--m-accent) px-3.5 text-sm font-medium text-(--m-accent-ink) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) disabled:opacity-50"
         >
           Send

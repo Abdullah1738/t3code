@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   KANBAN_BACKLOG,
+  KanbanAnswer,
   KanbanBoard,
   kanbanBlocking,
   kanbanBoardIcon,
@@ -116,4 +117,17 @@ describe("kanbanBoardIcon", () => {
     expect(valid("https://example.com/icon.png")).toBe(false);
     expect(valid(`data:image/png;base64,${"A".repeat(KANBAN_BOARD_IMAGE_MAX)}`)).toBe(false);
   });
+
+describe("own answers", () => {
+  it("decodes an answer saved before own words existed with text null", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanAnswer)({
+      blockId: "q1",
+      by: { _tag: "owner" },
+      choice: ["o1"],
+      at: "2026-10-27T10:00:00.000Z",
+    });
+    expect(decoded.text).toBeNull();
+    expect(decoded.choice).toEqual(["o1"]);
+  });
+});
 });

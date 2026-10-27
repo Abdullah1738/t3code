@@ -100,7 +100,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly seq: number;
       readonly blockId: string;
       readonly choice: ReadonlyArray<string>;
-    }) => service.answer(input.discussionId, input.seq, input.blockId, input.choice, OWNER),
+      readonly text?: string | null | undefined;
+    }) => service.answer(input.discussionId, input.seq, input.blockId, input.choice, OWNER, input.text ?? null),
     [M.scripts]: (input: { readonly boardId: Parameters<KanbanScriptsShape["scripts"]>[0] }) =>
       scripts.scripts(input.boardId),
     [M.scriptRuns]: (input: { readonly scriptId: ScriptId; readonly limit?: number | undefined }) =>

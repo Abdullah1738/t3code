@@ -312,6 +312,7 @@ export interface KanbanServiceShape {
     blockId: string,
     choice: ReadonlyArray<string>,
     by: KanbanActor,
+    text?: string | null,
   ) => Effect.Effect<KanbanMessage, KanbanError>;
   readonly markRead: (
     discussionId: KanbanDiscussion["id"],
@@ -2833,7 +2834,7 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by) =>
+  const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
     guard(
       Effect.gen(function* () {
         const discussion = yield* discussionOf(discussionId);
@@ -2844,9 +2845,16 @@ const make = Effect.gen(function* () {
             candidate._tag === "choice" && candidate.id === blockId,
         );
         if (!block) return yield* failWith("not-found", `choice ${blockId}`);
+        const words = (text ?? "").trim();
+        if (words !== "" && block.style === "poll") {
+          return yield* failWith("invalid", "a poll takes one of its options");
+        }
         const picked = block.options.filter((option) => choice.includes(option.id));
-        if (picked.length === 0 || (!block.multi && picked.length > 1)) {
-          return yield* failWith("invalid", "pick one of the options");
+        if (picked.length === 0 && words === "") {
+          return yield* failWith("invalid", "pick an option or write your own answer");
+        }
+        if (!block.multi && picked.length + (words === "" ? 0 : 1) > 1) {
+          return yield* failWith("invalid", "pick one option or write your own answer");
         }
         const at = yield* nowIso;
         const key = actorKey(by);
@@ -2856,31 +2864,41 @@ const make = Effect.gen(function* () {
             ...message.answers.filter(
               (entry) => !(entry.blockId === blockId && actorKey(entry.by) === key),
             ),
-            { blockId, by, choice: picked.map((option) => option.id), at },
+            {
+              blockId,
+              by,
+              choice: picked.map((option) => option.id),
+              text: words === "" ? null : words,
+              at,
+            },
           ],
         };
         yield* store.putMessage(next);
         yield* publish(discussion.boardId, { _tag: "message", message: next });
         if (by._tag !== "owner") return next;
-        const text = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${picked.map((option) => option.label).join(", ")}`;
+        const said = [
+          ...picked.map((option) => option.label),
+          ...(words === "" ? [] : [`his own answer: "${words}"`]),
+        ].join(", ");
+        const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${said}`;
         const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
         // A pick on an ask answers that ask alone.
         const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
         if (card !== null && ask !== undefined && ask.closedAt === null) {
-          yield* routeToOwnerAgent(discussion, text, "owner", (open) => open.id === ask.id);
+          yield* routeToOwnerAgent(discussion, note, "owner", (open) => open.id === ask.id);
           return next;
         }
         if (card !== null && ask !== undefined) {
           // Already answered or dropped: its asker hears the late pick, and nothing else closes.
           const by = ask.by;
           if (by._tag === "thread" && by.threadId === card.activeThreadId) {
-            yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, text);
+            yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, note);
           } else if (by._tag === "evaluator" && (yield* threads.view(by.threadId))) {
-            yield* deliver(discussion, by, "Evaluator", by.threadId, text);
+            yield* deliver(discussion, by, "Evaluator", by.threadId, note);
           } else {
             yield* toEvaluator(
               discussion,
-              by._tag === "thread" ? Asks.passOnText(card, ask, text) : text,
+              by._tag === "thread" ? Asks.passOnText(card, ask, note) : note,
             );
           }
           return next;
@@ -2891,11 +2909,11 @@ const make = Effect.gen(function* () {
         if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
           const view = yield* threads.view(author.threadId);
           if (view) {
-            yield* deliver(discussion, author, message.authorName, author.threadId, text);
+            yield* deliver(discussion, author, message.authorName, author.threadId, note);
             return next;
           }
         }
-        yield* routeToOwnerAgent(discussion, text);
+        yield* routeToOwnerAgent(discussion, note);
         return next;
       }),
     );

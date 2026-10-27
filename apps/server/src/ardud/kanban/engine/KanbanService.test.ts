@@ -1281,6 +1281,134 @@ it.effect("the owner makes an ask blocking: the card waits, then wakes with his 
   }),
 );
 
+it.effect("a blocked ask answered in his own words wakes the card with them", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Ship tonight?", blocking: false, options: ["Yes", "No"] },
+        worker,
+        "cardThread",
+      );
+      yield* kanban.changeAsk(card.id, "q1", "block", owner, "owner");
+
+      const talk = yield* kanban.cardDiscussion(card.id);
+      const answered = yield* kanban.answer(
+        talk.id,
+        asked.asks[0]!.seq!,
+        "q1",
+        [],
+        owner,
+        "Wait for Monday",
+      );
+      const ownAnswer = answered.answers.find((entry) => entry.by._tag === "owner");
+      assert.deepStrictEqual(ownAnswer?.choice, []);
+      assert.strictEqual(ownAnswer?.text, "Wait for Monday");
+      const woken = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(woken.stage, "todo");
+      assert.include(woken.wakeNote ?? "", "Wait for Monday");
+      assert.isNotNull(woken.asks[0]!.closedAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an async ask answered in his own words reaches the working thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Ship tonight?", blocking: false, options: ["Yes", "No"] },
+        worker,
+        "cardThread",
+      );
+
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", [], owner, "Use 2%");
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "working");
+      assert.isNotNull(after.asks[0]!.closedAt);
+      const sent = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.strictEqual(sent.filter((message) => message.includes("Use 2%")).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("own words are refused where they don't fit", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.moveCard(card.id, "completed", "evaluator", evaluator);
+      const talk = yield* kanban.cardDiscussion(card.id);
+      const poll = yield* kanban.post(talk.id, evaluator, [
+        {
+          _tag: "choice",
+          id: "p1",
+          style: "poll",
+          question: "Which?",
+          options: [
+            { id: "yes", label: "Yes" },
+            { id: "no", label: "No" },
+          ],
+          multi: false,
+        },
+      ]);
+      const refused = yield* kanban
+        .answer(talk.id, poll.seq, "p1", ["yes"], owner, "maybe")
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+
+      const single = yield* kanban.post(talk.id, evaluator, [
+        {
+          _tag: "choice",
+          id: "s1",
+          style: "pick",
+          question: "Ship?",
+          options: [{ id: "yes", label: "Yes" }],
+          multi: false,
+        },
+      ]);
+      const both = yield* kanban
+        .answer(talk.id, single.seq, "s1", ["yes"], owner, "maybe")
+        .pipe(Effect.flip);
+      assert.strictEqual(both.code, "invalid");
+      const blank = yield* kanban
+        .answer(talk.id, single.seq, "s1", [], owner, "   ")
+        .pipe(Effect.flip);
+      assert.strictEqual(blank.code, "invalid");
+
+      const multi = yield* kanban.post(talk.id, evaluator, [
+        {
+          _tag: "choice",
+          id: "m1",
+          style: "pick",
+          question: "Which?",
+          options: [{ id: "a", label: "A" }],
+          multi: true,
+        },
+      ]);
+      const stored = yield* kanban.answer(talk.id, multi.seq, "m1", ["a"], owner, "and b");
+      const answer = stored.answers.find((entry) => entry.blockId === "m1");
+      assert.deepStrictEqual(answer?.choice, ["a"]);
+      assert.strictEqual(answer?.text, "and b");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a dropped ask tells its asker; an evaluator's blocking ask goes back where it was", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
