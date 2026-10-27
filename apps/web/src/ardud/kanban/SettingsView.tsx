@@ -42,12 +42,17 @@ export function SettingsView(props: { state: KanbanBoardState }) {
   const update = (input: Omit<Parameters<typeof kanban.updateBoard>[0], "boardId">) =>
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
+  const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
+  const editNote = canEdit ? undefined : "Your connection can't change the board";
+  const poolNote = canPool ? undefined : "Your connection can't change pools";
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
       <Section title="Icon">
         <IconPicker
           board={board}
+          disabled={!canEdit}
+          disabledReason={editNote}
           onChange={(icon) => update({ icon, iconImage: null })}
           onImage={(iconImage) => update({ iconImage })}
         />
@@ -84,6 +89,8 @@ export function SettingsView(props: { state: KanbanBoardState }) {
               value={pool.slots}
               min={0}
               max={MAX_SLOTS}
+              disabled={!canPool}
+              disabledReason={poolNote}
               onChange={(slots) =>
                 void runAction("Couldn't change the pool", () =>
                   kanban.setPool(board.id, pool.model, slots),
@@ -93,6 +100,8 @@ export function SettingsView(props: { state: KanbanBoardState }) {
             <Switch
               size="sm"
               checked={pool.slots > 0}
+              disabled={!canPool}
+              title={poolNote}
               aria-label={`${pool.name} pool on`}
               onCheckedChange={(on) =>
                 void runAction("Couldn't change the pool", () =>
@@ -108,18 +117,24 @@ export function SettingsView(props: { state: KanbanBoardState }) {
           label="Board manager"
           value={board.managerModel}
           models={models}
+          disabled={!canEdit}
+          disabledReason={editNote}
           onChange={(managerModel) => update({ managerModel })}
         />
         <ModelRow
           label="Evaluator"
           value={board.evaluatorModel}
           models={models}
+          disabled={!canEdit}
+          disabledReason={editNote}
           onChange={(evaluatorModel) => update({ evaluatorModel })}
         />
         <ModelRow
           label="New cards"
           value={board.defaultCardModel}
           models={models}
+          disabled={!canEdit}
+          disabledReason={editNote}
           onChange={(defaultCardModel) => update({ defaultCardModel })}
         />
       </Section>
@@ -154,6 +169,8 @@ export function SettingsView(props: { state: KanbanBoardState }) {
               ) : (
                 <button
                   type="button"
+                  disabled={!canEdit}
+                  title={editNote}
                   onClick={() => update({ defaultReviewChain: chain.name })}
                   className="h-7 rounded-full px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
                 >
@@ -165,7 +182,12 @@ export function SettingsView(props: { state: KanbanBoardState }) {
         })}
       </Section>
       <Section title="Instructions" plain>
-        <Instructions board={board} onSave={(instructions) => update({ instructions })} />
+        <Instructions
+          board={board}
+          disabled={!canEdit}
+          disabledReason={editNote}
+          onSave={(instructions) => update({ instructions })}
+        />
       </Section>
     </div>
   );
@@ -208,6 +230,8 @@ async function boardImage(file: File): Promise<string | null> {
 
 function IconPicker(props: {
   board: KanbanBoard;
+  disabled: boolean;
+  disabledReason: string | undefined;
   onChange: (icon: KanbanBoardIcon | null) => void;
   onImage: (image: string | null) => void;
 }) {
@@ -220,6 +244,8 @@ function IconPicker(props: {
       type="button"
       aria-label={label}
       aria-pressed={current === icon}
+      disabled={props.disabled}
+      title={props.disabledReason}
       onClick={() => {
         if (current !== icon) props.onChange(icon);
       }}
@@ -248,6 +274,8 @@ function IconPicker(props: {
         type="button"
         aria-label={image ? "Change the picture" : "Upload a picture"}
         aria-pressed={image !== null}
+        disabled={props.disabled}
+        title={props.disabledReason}
         onClick={() => fileInput.current?.click()}
         className={cn(
           "grid size-9 place-items-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
@@ -304,18 +332,21 @@ function Stepper(props: {
   value: number;
   min: number;
   max: number;
+  disabled?: boolean;
+  disabledReason?: string | undefined;
   onChange: (value: number) => void;
 }) {
   return (
     <span
       role="group"
       aria-label={props.label}
+      title={props.disabledReason}
       className="inline-flex items-center gap-0.5 rounded-full bg-(--m-raised) p-0.5"
     >
       <button
         type="button"
         aria-label="Fewer"
-        disabled={props.value <= props.min}
+        disabled={props.disabled || props.value <= props.min}
         onClick={() => props.onChange(props.value - 1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
@@ -325,7 +356,7 @@ function Stepper(props: {
       <button
         type="button"
         aria-label="More"
-        disabled={props.value >= props.max}
+        disabled={props.disabled || props.value >= props.max}
         onClick={() => props.onChange(props.value + 1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
@@ -342,6 +373,8 @@ function ModelRow(props: {
   label: string;
   value: ModelSelection;
   models: ReadonlyArray<ModelSelection>;
+  disabled: boolean;
+  disabledReason: string | undefined;
   onChange: (model: ModelSelection) => void;
 }) {
   const choices = props.models.some((model) => modelKey(model) === modelKey(props.value))
@@ -355,6 +388,8 @@ function ModelRow(props: {
           render={
             <button
               type="button"
+              disabled={props.disabled}
+              title={props.disabledReason}
               className="inline-flex h-7.5 items-center gap-1.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             />
           }
@@ -393,6 +428,8 @@ const INSTRUCTION_FIELDS: ReadonlyArray<{ key: keyof KanbanInstructions; label: 
 
 function Instructions(props: {
   board: KanbanBoard;
+  disabled: boolean;
+  disabledReason: string | undefined;
   onSave: (instructions: KanbanInstructions) => void;
 }) {
   return (
@@ -402,6 +439,8 @@ function Instructions(props: {
           key={`${field.key}:${props.board.instructions[field.key]}`}
           label={field.label}
           value={props.board.instructions[field.key]}
+          disabled={props.disabled}
+          disabledReason={props.disabledReason}
           onSave={(text) => props.onSave({ ...props.board.instructions, [field.key]: text })}
         />
       ))}
@@ -409,13 +448,21 @@ function Instructions(props: {
   );
 }
 
-function InstructionBlock(props: { label: string; value: string; onSave: (text: string) => void }) {
+function InstructionBlock(props: {
+  label: string;
+  value: string;
+  disabled: boolean;
+  disabledReason: string | undefined;
+  onSave: (text: string) => void;
+}) {
   const [draft, setDraft] = useState(props.value);
   return (
     <label className="flex flex-col gap-1.5 rounded-xl bg-(--m-surface) px-3.5 pt-3 pb-2">
       <span className="text-sm font-semibold">{props.label}</span>
       <textarea
         value={draft}
+        disabled={props.disabled}
+        title={props.disabledReason}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={() => {
           if (draft !== props.value) props.onSave(draft);
