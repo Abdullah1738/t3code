@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from decimal import Decimal
 import tempfile
 import time
 import unittest
@@ -16,13 +17,13 @@ ACCOUNT = '1' * 64
 AMOUNT = 48265
 
 
-def order_snap(status='failed', total=0, echoed=ORDER, token='PRIVATE-INTENT'):
+def order_snap(status='failed', total=Decimal('0.00'), echoed=ORDER, token='PRIVATE-INTENT'):
     wire = {'orderNr': echoed, 'statusCode': status, 'orderTotal': total, 'paymentIntentToken': token,
             'paymentErrorMsg': 'payment failed', 'isPaymentSubscriptionUsed': False}
     return m.Snapshot(wire, m.project_order_get(wire, ORDER), time.time())
 
 
-def intent(status='payment_ready_to_redirect', txn='3DS_ENROLL_INITIATED', authorized=0, captured=0):
+def intent(status='payment_ready_to_redirect', txn='3DS_ENROLL_INITIATED', authorized=Decimal('0.00'), captured=Decimal('0.00')):
     wire = {'status': status, 'transaction_status': txn, 'reference': ORDER, 'error_code': None,
             'is_3ds_failure': False, 'authorized_amount': authorized, 'captured_amount': captured}
     return m.Snapshot(wire, m.project_payment_status(wire, ORDER, AMOUNT), time.time())
@@ -137,6 +138,7 @@ class EvidenceGateTests(unittest.TestCase):
 
     def test_live_shape_passes(self):
         ev = self.gate(act=active('IAEGANOTHERORDER'))
+        j.digest(ev)  # Decimal wire amounts must not break the journal evidence hash
         self.assertTrue(ev['provider_order_failed'] and ev['uncaptured_at_check'])
         self.assertNotIn('PRIVATE-INTENT', str(ev))
 

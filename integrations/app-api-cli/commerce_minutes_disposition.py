@@ -5,6 +5,8 @@ paymentintent/status. Never sends a cart, place or payment operation. The closur
 terminal local disposition: the reservation, order ownership and consumed operations
 stay recorded, and nothing here authorizes a retry or a replacement purchase.
 """
+import hashlib
+import json
 import re
 import time
 
@@ -17,6 +19,11 @@ from noon_checkout import AccountHome
 DEAD_STATUSES = ('failed', 'cancelled')
 # Any of these in the intent's transaction status means money may have moved.
 MONEY_MOVED = re.compile(r'CAPTUR|AUTHORI[SZ]|SETTL|REFUND|CHARGE')
+
+
+def _wire_hash(value):
+    # Native wire money is Decimal (parse_float=Decimal); hash its exact text.
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), default=str).encode()).hexdigest()
 
 
 def failed_uncaptured_evidence(order_snap, active, intent, *, order, reserved_minor):
@@ -48,8 +55,8 @@ def failed_uncaptured_evidence(order_snap, active, intent, *, order, reserved_mi
             'intent_status': pay.get('payment_status'), 'intent_transaction_status': txn or None,
             'authorized_minor': 0, 'captured_minor': 0, 'is_3ds_failure': pay.get('is_3ds_failure'),
             'provider_order_failed': True, 'uncaptured_at_check': True,
-            'response_hashes': [journal.digest(order_snap.wire), journal.digest(active),
-                                journal.digest(intent.wire)]}
+            'response_hashes': [_wire_hash(order_snap.wire), _wire_hash(active),
+                                _wire_hash(intent.wire)]}
 
 
 def _client(binding, auth):
