@@ -861,6 +861,14 @@ interface ComposerDraft {
   readonly controller: AbortController;
 }
 
+/**
+ * One composer's lifetime. Pickers and uploads capture it before they start; once it is retired
+ * (unmount, or the discussion switched) their late results are released rather than applied.
+ */
+interface ComposerScope {
+  live: boolean;
+}
+
 function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
@@ -885,16 +893,20 @@ function Composer(props: {
   // A failed upload must be retried or removed first; sending around it would post a partial set.
   const blocked = empty || action.pending || uploading || failing;
 
-  // Live drafts, read by the unmount cleanup, which runs once.
+  // Live drafts and the in-flight send batch, read by the unmount cleanup, which runs once.
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
+  // Files of a send whose post has not settled yet. They are out of `drafts` by then, so the
+  // unmount cleanup reads them here; they are released only after the post settles.
+  const sendingRef = useRef<ReadonlyArray<ComposerDraft>>([]);
   const environmentRef = useRef(environmentId);
   environmentRef.current = environmentId;
-  // Set on unmount so a late upload result is released instead of landing in a gone component.
-  const mounted = useRef(true);
-  useEffect(
-    () => () => {
-      mounted.current = false;
+  const scope = useRef<ComposerScope>({ live: true });
+  useEffect(() => {
+    const current = scope.current;
+    current.live = true;
+    return () => {
+      current.live = false;
       const id = environmentRef.current;
       for (const draft of draftsRef.current) draft.controller.abort();
       const uploads = draftsRef.current.flatMap((draft) =>
@@ -902,14 +914,13 @@ function Composer(props: {
       );
       if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
       void releaseUnusedComposerAttachmentFiles(draftsRef.current.map((draft) => draft.local));
-    },
-    [],
-  );
+    };
+  }, []);
 
   const patch = (id: string, change: (draft: ComposerDraft) => ComposerDraft) =>
     setDrafts((current) => current.map((draft) => (draft.local.id === id ? change(draft) : draft)));
 
-  const startUpload = (draft: ComposerDraft, environment: EnvironmentId) => {
+  const startUpload = (draft: ComposerDraft, environment: EnvironmentId, owner: ComposerScope) => {
     const { local, controller } = draft;
     void prepareTurnAttachments({
       environmentId: environment,
@@ -921,7 +932,7 @@ function Composer(props: {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
         const storedId = stored !== undefined && "id" in stored ? stored.id : undefined;
         if (stored === undefined || storedId === undefined) throw new Error("Upload cancelled.");
-        if (controller.signal.aborted || !mounted.current) {
+        if (controller.signal.aborted || !owner.live) {
           // Removed or unmounted while uploading: the server copy has no owner, so drop it.
           void releasePendingAttachmentUploads(environment, [storedId]);
           return;
@@ -929,7 +940,7 @@ function Composer(props: {
         patch(local.id, (current) => ({ ...current, uploaded: stored as StoredAttachment }));
       })
       .catch((error: unknown) => {
-        if (controller.signal.aborted || !mounted.current) return;
+        if (controller.signal.aborted || !owner.live) return;
         patch(local.id, (current) => ({ ...current, failed: true }));
         Dialog.alert(
           "Couldn't attach file",
@@ -938,8 +949,18 @@ function Composer(props: {
       });
   };
 
-  const addPicked = (picked: ReadonlyArray<DraftComposerAttachment>) => {
-    if (picked.length === 0 || environmentId === null) return;
+  const addPicked = (
+    picked: ReadonlyArray<DraftComposerAttachment>,
+    owner: ComposerScope,
+    environment: EnvironmentId,
+  ) => {
+    // The picker finished after the composer was retired: its copies have no owner, so drop them
+    // and do not start uploads for them.
+    if (!owner.live) {
+      void releaseUnusedComposerAttachmentFiles(picked);
+      return;
+    }
+    if (picked.length === 0) return;
     const fresh = picked.map((local) => ({
       local,
       uploaded: null,
@@ -947,16 +968,19 @@ function Composer(props: {
       controller: new AbortController(),
     }));
     setDrafts((current) => [...current, ...fresh]);
-    for (const draft of fresh) startUpload(draft, environmentId);
+    for (const draft of fresh) startUpload(draft, environment, owner);
   };
 
   const pick = async (kind: "media" | "files") => {
+    const owner = scope.current;
+    const environment = environmentId;
+    if (environment === null) return;
     const result =
       kind === "files"
         ? await pickComposerFiles({ existingCount: drafts.length, maxBytes: maxFileBytes })
         : await pickComposerMedia({ existingCount: drafts.length, maxVideoBytes: maxFileBytes });
-    addPicked("files" in result ? result.files : result.attachments);
-    if (result.error) Dialog.alert("Could not attach file", result.error);
+    addPicked("files" in result ? result.files : result.attachments, owner, environment);
+    if (result.error && owner.live) Dialog.alert("Could not attach file", result.error);
   };
 
   const retry = (id: string) => {
@@ -964,7 +988,7 @@ function Composer(props: {
     if (draft === undefined || environmentId === null) return;
     const fresh = { ...draft, failed: false, controller: new AbortController() };
     setDrafts((current) => current.map((other) => (other.local.id === id ? fresh : other)));
-    startUpload(fresh, environmentId);
+    startUpload(fresh, environmentId, scope.current);
   };
 
   const removeDraft = (id: string) => {
@@ -983,6 +1007,8 @@ function Composer(props: {
     const body = text.trim();
     const sending = drafts;
     const stored = sending.flatMap((draft) => (draft.uploaded ? [draft.uploaded] : []));
+    const owner = scope.current;
+    sendingRef.current = sending;
     setText("");
     setDrafts([]);
     setField((key) => key + 1);
@@ -993,10 +1019,23 @@ function Composer(props: {
         await kanbanClient().post(props.boardId, discussionId, sendBlocks(body, stored));
       })
       .then((sent) => {
+        sendingRef.current = [];
         if (sent) {
           // Sent: the local copies are kept only while a draft or queued send still needs them.
           void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
-          props.onSent();
+          if (owner.live) props.onSent();
+          return;
+        }
+        if (!owner.live) {
+          // The composer is gone, so nothing can restore the batch: release its files and uploads.
+          for (const draft of sending) draft.controller.abort();
+          const ids = sending.flatMap((draft) =>
+            draft.uploaded === null ? [] : [draft.uploaded.id],
+          );
+          if (environmentRef.current !== null && ids.length > 0) {
+            void releasePendingAttachmentUploads(environmentRef.current, ids);
+          }
+          void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
           return;
         }
         // A failed send gives the text and files back so the owner can send again.
