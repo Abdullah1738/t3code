@@ -614,7 +614,10 @@ export function Composer(props: {
   }, [filesRef, sentIds, sendingDraft, mountedRef]);
 
   const addFiles = async (picked: File[]) => {
+    // A send owns its snapshot: files added during it would be released with the
+    // composer after a first post, so attaching waits until the send settles.
     if (!canAttach || environmentId === null || picked.length === 0) return;
+    if (sendingRef.current) return;
     const maxBytes = clampFileAttachmentUploadBytes(
       serverConfig?.environment.capabilities.fileAttachments?.maxUploadBytes ??
         PROVIDER_SEND_TURN_MAX_FILE_BYTES,
@@ -748,7 +751,7 @@ export function Composer(props: {
   };
 
   const onDrop = (event: DragEvent<HTMLFormElement>) => {
-    if (!canAttach || event.dataTransfer.files.length === 0) return;
+    if (!canAttach || sendingRef.current || event.dataTransfer.files.length === 0) return;
     event.preventDefault();
     onFilesPicked(event.dataTransfer.files);
   };
@@ -756,7 +759,7 @@ export function Composer(props: {
   // Image and file paste go to the attachment path; a pasted thread link stays
   // a chip (handled in onPaste).
   const onPasteFiles = (event: ClipboardEvent<HTMLElement>) => {
-    if (!canAttach) return;
+    if (!canAttach || sendingRef.current) return;
     const pasted = Array.from(event.clipboardData.files);
     if (pasted.length === 0) return;
     event.preventDefault();
@@ -799,7 +802,7 @@ export function Composer(props: {
         void send();
       }}
       onDragOver={(event) => {
-        if (canAttach) event.preventDefault();
+        if (canAttach && !sendingRef.current) event.preventDefault();
       }}
       onDrop={onDrop}
     >
@@ -833,6 +836,7 @@ export function Composer(props: {
             <button
               type="button"
               aria-label="Attach files"
+              disabled={sending}
               onClick={() => fileInputRef.current?.click()}
               className="grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >

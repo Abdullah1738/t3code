@@ -294,9 +294,13 @@ function CardDiscussion(props: {
           try {
             const room = await kanban.cardDiscussion(boardId, card.id);
             await kanban.post(boardId, room.id, blocks);
-          } finally {
+          } catch (error) {
+            // The room may exist now, but the draft must stay here for a retry:
+            // leave the first-post composer in place on failure.
             setFirstPosting(false);
+            throw error;
           }
+          setFirstPosting(false);
         }}
       />
     </div>
