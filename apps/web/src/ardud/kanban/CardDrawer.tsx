@@ -268,10 +268,11 @@ function CardDiscussion(props: {
     }
   }, [boardId, card.id, card.discussionId, discussion, state.discussionsLoaded]);
 
-  // One key for both the first-post composer and the chat that replaces it, so a
-  // failed first post resumes here instead of an empty composer.
-  const draftKey = `card:${boardId}:${card.id}`;
-  if (discussion) {
+  // The first post creates the room and posts into it. This composer stays
+  // mounted for that whole send, so a failed post keeps its draft in place and
+  // the room switch to Chat happens only after a successful post.
+  const [firstPosting, setFirstPosting] = useState(false);
+  if (discussion && !firstPosting) {
     return (
       <Chat
         boardId={boardId}
@@ -279,20 +280,23 @@ function CardDiscussion(props: {
         state={state}
         onOpenCard={props.onOpenCard}
         className="pt-2"
-        draftKey={draftKey}
       />
     );
   }
-  if (card.discussionId) return <div className="flex-1" />;
+  if (card.discussionId && !firstPosting) return <div className="flex-1" />;
   return (
     <div className="flex min-h-0 flex-1 flex-col justify-end">
       <Composer
         placeholder="Message"
         attachments
-        draftKey={draftKey}
         onSend={async (blocks) => {
-          const room = await kanban.cardDiscussion(boardId, card.id);
-          await kanban.post(boardId, room.id, blocks);
+          setFirstPosting(true);
+          try {
+            const room = await kanban.cardDiscussion(boardId, card.id);
+            await kanban.post(boardId, room.id, blocks);
+          } finally {
+            setFirstPosting(false);
+          }
         }}
       />
     </div>

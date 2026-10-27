@@ -79,8 +79,6 @@ export function Chat(props: {
   state: KanbanBoardState;
   onOpenCard?: (cardId: string) => void;
   className?: string;
-  /** Set for the room a card's first-post composer created; see Composer's draftKey. */
-  draftKey?: string;
 }) {
   const { boardId, discussion, state } = props;
   const messages = useMessages(boardId, discussion.id);
@@ -149,7 +147,6 @@ export function Chat(props: {
       <Composer
         placeholder="Message"
         attachments
-        {...(props.draftKey === undefined ? {} : { draftKey: props.draftKey })}
         onSend={(blocks) => kanban.post(boardId, discussion.id, blocks)}
       />
     </div>
@@ -560,47 +557,35 @@ export function Composer(props: {
   placeholder: string;
   onSend: (blocks: KanbanBlock[]) => Promise<unknown>;
   attachments?: boolean;
-  /**
-   * Keys the unsent draft (files, text, an in-flight send) in keptDrafts, so a
-   * composer for the same key resumes it on mount. The card discussion swaps its
-   * first-post composer for the chat once the room exists; both pass one key.
-   */
-  draftKey?: string;
 }) {
-  const { draftKey } = props;
   const environmentId = usePrimaryEnvironmentId();
   const serverConfig = useServerConfigs().get(environmentId ?? ("" as EnvironmentId));
   const canAttach =
     props.attachments === true &&
     environmentId !== null &&
     serverConfig?.environment.capabilities.attachmentUploads === true;
-
-  // Read once, on the first render: this composer resumes the kept draft, if any.
-  const [kept] = useState(() => (draftKey === undefined ? undefined : keptDrafts.get(draftKey)));
-  const [text, setText] = useState(kept?.text ?? "");
+  const [text, setText] = useState("");
+  const textRef = useRef("");
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
   const [cursor, setCursor] = useState(0);
   const [records, setRecords] = useState<ComposerDraftContextRecords>(
-    kept?.records ?? EMPTY_COMPOSER_CONTEXT_RECORDS,
+    EMPTY_COMPOSER_CONTEXT_RECORDS,
   );
-  const [files, setFilesState] = useState<ReadonlyArray<ComposerDraftFile>>(kept?.files ?? []);
-  // A send the previous composer started and has not settled: this one waits on it.
-  const [carriedSend] = useState(() => kept?.sending ?? null);
-  const [sending, setSending] = useState(carriedSend !== null);
+  const [files, setFilesState] = useState<ReadonlyArray<ComposerDraftFile>>([]);
+  const [sending, setSending] = useState(false);
   // Ids of the draft the current send is posting. State, so render never reads a ref.
-  const [inFlightIds, setInFlightIds] = useState<ReadonlySet<string>>(
-    () => new Set(carriedSend === null ? [] : (kept?.files ?? []).map((file) => file.id)),
-  );
+  const [inFlightIds, setInFlightIds] = useState<ReadonlySet<string>>(() => new Set());
   const [attachError, setAttachError] = useState<string | null>(null);
   const editorRef = useRef<ComposerPromptEditorHandle | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  // Latest values for the send and the unmount path; state lags one render.
-  const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>(kept?.files ?? []);
-  const textRef = useRef(kept?.text ?? "");
-  const sendingRef = useRef<Promise<boolean> | null>(carriedSend);
-  const sendingDraft = useRef<ReadonlyArray<ComposerDraftFile>>(
-    carriedSend === null ? [] : (kept?.files ?? []),
-  );
+  // The draft as of the latest write. State lags a render behind, so overlapping
+  // paste/pick calls and the send snapshot read this instead.
+  const filesRef = useRef<ReadonlyArray<ComposerDraftFile>>([]);
+  // Slots reserved by addFiles calls that are still preparing their files.
   const pendingSlotsRef = useRef(0);
+  const sendingRef = useRef(false);
   const sentIds = useRef(new Set<string>());
   // Set after unmount, so a file still being prepared is released on arrival.
   const mountedRef = useRef(true);
@@ -613,47 +598,20 @@ export function Composer(props: {
     setFilesState(next);
   };
 
-  useEffect(() => {
-    textRef.current = text;
-  }, [text]);
-
-  // A keyed draft is written as it changes, not at unmount: the replacement
-  // composer renders before this one unmounts, so it must find the draft already.
-  useEffect(() => {
-    if (draftKey === undefined) return;
-    syncKeptDraft(draftKey, { files, text, records, sending: sendingRef.current });
-  }, [draftKey, files, text, records, sendingRef]);
-
-  // A carried send settles here: its files unlock, and clear if it posted.
+  // A send in flight still owns its snapshot: unmounting mid-send must not
+  // delete files the post is about to claim. Its settle releases what it owns.
+  const sendingDraft = useRef<ReadonlyArray<ComposerDraftFile>>([]);
   useEffect(() => {
     mountedRef.current = true;
-    if (carriedSend !== null) {
-      void carriedSend.then((posted) => {
-        if (!mountedRef.current) return;
-        sendingRef.current = null;
-        setSending(false);
-        setInFlightIds(new Set());
-        if (posted) {
-          filesRef.current = [];
-          setFilesState([]);
-          setText("");
-          setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
-        }
-      });
-    }
     return () => {
       mountedRef.current = false;
-      // A keyed draft stays in keptDrafts for its replacement composer.
-      if (draftKey !== undefined) return;
-      // An unkeyed draft has no other owner, so its uploads are released here,
-      // except the files an in-flight send still claims.
       for (const file of filesRef.current) {
         if (sendingDraft.current.some((entry) => entry.id === file.id)) continue;
         if (!sentIds.current.has(file.id)) releaseAttachmentUpload(file.id);
         revokePreview(file);
       }
     };
-  }, [carriedSend, draftKey, filesRef, sendingDraft, sendingRef, sentIds, mountedRef]);
+  }, [filesRef, sentIds, sendingDraft, mountedRef]);
 
   const addFiles = async (picked: File[]) => {
     if (!canAttach || environmentId === null || picked.length === 0) return;
@@ -720,89 +678,63 @@ export function Composer(props: {
         : reference.source;
     });
 
-  // Settles a send once it has posted or failed. The composer may have unmounted
-  // meanwhile (the card discussion swaps composers), so the outcome is written
-  // to keptDrafts or the files are released, instead of touching this component.
-  const settle = (draft: ReadonlyArray<ComposerDraftFile>, posted: boolean) => {
-    if (posted) {
-      for (const file of draft) {
-        sentIds.current.add(file.id);
-        revokePreview(file);
-      }
-      if (draftKey !== undefined) keptDrafts.delete(draftKey);
-      if (mountedRef.current) {
-        const sentIdSet = new Set(draft.map((file) => file.id));
-        setFiles((current) => current.filter((file) => !sentIdSet.has(file.id)));
-        setAttachError(null);
-        setText("");
-        setCursor(0);
-        setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
-        editorRef.current?.focus();
-      }
-      return;
-    }
-    if (mountedRef.current) return;
-    // Unmounted and not posted: a keyed draft waits for its replacement composer,
-    // an unkeyed one has no owner left, so its uploads are released now.
-    if (draftKey !== undefined) {
-      const entry = keptDrafts.get(draftKey);
-      if (entry) keptDrafts.set(draftKey, { ...entry, sending: null });
-      return;
-    }
-    for (const file of draft) {
-      releaseAttachmentUpload(file.id);
-      revokePreview(file);
-    }
-  };
-
-  const postDraft = async (
-    body: string,
-    draft: ReadonlyArray<ComposerDraftFile>,
-  ): Promise<boolean> => {
+  const send = async () => {
+    const body = outgoing(text).trim();
+    // A ref, not state: a second Enter or click before the re-render must not
+    // start another send of the same draft.
+    if (sendingRef.current) return;
+    // Snapshot the draft now. Files added while this send is in flight are not
+    // part of this message and must survive it.
+    const draft = filesRef.current;
+    if (body.length === 0 && draft.length === 0) return;
+    sendingRef.current = true;
+    sendingDraft.current = draft;
+    setInFlightIds(new Set(draft.map((file) => file.id)));
+    setSending(true);
+    // Set when the send gives up, so the finally can release what an unmounted
+    // composer would otherwise leave behind.
     let posted = false;
     try {
-      let blocks = composerBlocks(body, []);
+      let blocks: KanbanBlock[];
       if (draft.length > 0 && environmentId !== null) {
         // The server only claims an upload that finished, so a half-uploaded
         // file must not reach the message.
         await awaitAttachmentUploads(draft.map((file) => file.id));
         const uploaded = getUploadedAttachments({ environmentId, images: draft });
         if (uploaded === null) {
-          if (mountedRef.current) {
-            setAttachError("Some files did not upload. Retry them or remove them.");
-          }
-          return false;
+          setAttachError("Some files did not upload. Retry them or remove them.");
+          return;
         }
         // Unknown attachment kinds never come from this composer, so they can't
         // be posted as a block.
         blocks = composerBlocks(body, uploaded.filter(isPostableAttachment));
+      } else {
+        blocks = composerBlocks(body, []);
       }
-      posted = await runAction("Couldn't send", () => props.onSend(blocks));
-      return posted;
+      const ok = await runAction("Couldn't send", () => props.onSend(blocks));
+      if (!ok) return;
+      posted = true;
+      const sentIdSet = new Set(draft.map((file) => file.id));
+      for (const file of draft) {
+        sentIds.current.add(file.id);
+        revokePreview(file);
+      }
+      setFiles((current) => current.filter((file) => !sentIdSet.has(file.id)));
+      setAttachError(null);
+      setText("");
+      setCursor(0);
+      setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
+      editorRef.current?.focus();
     } finally {
-      settle(draft, posted);
-    }
-  };
-
-  const send = async () => {
-    // A ref, not state: a second Enter or click before the re-render must not
-    // start another send.
-    if (sendingRef.current !== null) return;
-    const body = outgoing(text).trim();
-    // The draft is this send's until it settles; files added meanwhile are not in it.
-    const draft = filesRef.current;
-    if (body.length === 0 && draft.length === 0) return;
-    const run = postDraft(body, draft);
-    sendingRef.current = run;
-    sendingDraft.current = draft;
-    setInFlightIds(new Set(draft.map((file) => file.id)));
-    setSending(true);
-    try {
-      await run;
-    } finally {
-      // Always released, so an unmounted composer cannot leave the lock held.
-      sendingRef.current = null;
+      sendingRef.current = false;
       sendingDraft.current = [];
+      // An unmounted composer has no owner for a failed snapshot: release it.
+      if (!posted && !mountedRef.current) {
+        for (const file of draft) {
+          releaseAttachmentUpload(file.id);
+          revokePreview(file);
+        }
+      }
       if (mountedRef.current) {
         setInFlightIds(new Set());
         setSending(false);
@@ -984,28 +916,6 @@ async function prepareDraftFile(raw: File, maxBytes: number): Promise<ComposerDr
     sizeBytes: file.size,
     file,
   };
-}
-
-/**
- * Keyed drafts by the card id: files, text and an unsettled send. Written as
- * they change, so a composer that replaces another for the same key resumes it.
- */
-interface KeptDraft {
-  readonly files: ReadonlyArray<ComposerDraftFile>;
-  readonly text: string;
-  readonly records: ComposerDraftContextRecords;
-  /** Set while a send of this draft has not settled. */
-  readonly sending: Promise<boolean> | null;
-}
-const keptDrafts = new Map<string, KeptDraft>();
-
-/** Keeps a draft while it has content or a send in flight, and forgets it otherwise. */
-function syncKeptDraft(key: string, draft: KeptDraft) {
-  if (draft.files.length === 0 && draft.text.length === 0 && draft.sending === null) {
-    keptDrafts.delete(key);
-    return;
-  }
-  keptDrafts.set(key, draft);
 }
 
 function revokePreview(file: ComposerDraftFile) {
