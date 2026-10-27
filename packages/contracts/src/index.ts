@@ -60,27 +60,14 @@ export * from "./resourceTelemetry.ts";
 export * from "./usage.ts";
 export * from "./scheduledTask.ts";
 export * from "./ardud/scheduledTaskSchedules.ts";
-export * from "./ardud/scheduleImport.ts";
 export * from "./worktreeMcp.ts";
 export * from "./resourceTelemetry.ts";
 export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
 // ardud fork
-export * from "./ardud/board.ts";
 export * from "./ardud/kanban.ts";
 export * from "./ardud/kanbanRpc.ts";
 export * from "./ardud/contextReset.ts";
 export * from "./ardud/scheduledTaskBlockRetry.ts";
-export * from "./ardud/missions.ts";
-export * from "./ardud/missionsPolicyRpc.ts";
-// ardud missions: asks
-export * from "./ardud/missionsAsksRpc.ts";
-// ardud missions: recovery
-export * from "./ardud/missionsRecoveryRpc.ts";
-// ardud missions: request images
-export * from "./ardud/missionsRequestImages.ts";
-// ardud missions: views
-export * from "./ardud/missionsViews.ts";
-export * from "./ardud/missionsViewsRpc.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";

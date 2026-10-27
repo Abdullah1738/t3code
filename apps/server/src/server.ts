@@ -69,7 +69,6 @@ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
-import { scheduleImportRouteLayer } from "./ardud/schedules/ScheduleImport.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ServerBrowser from "./preview/ServerBrowser.ts";
@@ -185,14 +184,10 @@ import { loopbackUrlHostForAddress } from "./startupAccess.ts";
 import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
-// ardud fork: session board
-import { ArdudBoardLive } from "./ardud/board/layer.ts";
-import { ardudBoardRouteLayer } from "./ardud/board/http.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
-// ardud missions: core
-import { ArdudMissionsLive, ArdudMissionsRoutesLive } from "./ardud/missions/layer.ts";
+// ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
@@ -604,10 +599,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ProviderUsageLimitsIngestion.layer,
   layerProviderInstallationRefresh,
   ReplayMarkers.layer,
-  ArdudBoardLive,
   ArdudOpenCodeImportLive,
-  // ardud missions: core
-  ArdudMissionsLive,
   // ardud: missions board
   ArdudKanbanLive,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
@@ -715,14 +707,9 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerAttachmentUploadRoute,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
-    // ardud fork routes
-    scheduleImportRouteLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
-    ardudBoardRouteLayer,
     openCodeImportRouteLayer,
-    // ardud missions: core
-    ArdudMissionsRoutesLive,
     // ardud: missions board
     kanbanRouteLayer,
     ServerHttp.layerStaticAndDevRoute,

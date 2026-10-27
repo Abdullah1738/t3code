@@ -26,14 +26,6 @@ import {
   AuthTerminalReadScope,
   type AuthEnvironmentScope,
   EnvironmentAuthorizationError,
-  // ardud missions: policy
-  MISSIONS_POLICY_READ_SCOPES,
-  // ardud missions: asks
-  MISSIONS_ASKS_READ_SCOPES,
-  // ardud missions: recovery
-  MISSIONS_RECOVERY_READ_SCOPES,
-  // ardud missions: views
-  MISSIONS_VIEWS_READ_SCOPES,
   // ardud: missions board
   KANBAN_READ_SCOPES,
   RpcScopeAuthorization,
@@ -215,32 +207,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.subscribeServerLifecycle]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeAuthAccess]: AuthAccessReadScope,
   [WS_METHODS.subscribeBackgroundPolicy]: AuthOrchestrationReadScope,
-  // ardud missions: core
-  [WS_METHODS.missionsSubscribeList]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsSubscribe]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsInbox]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsWorkItems]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsTimeline]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsPortfolio]: AuthOrchestrationReadScope,
-  // ardud missions: policy
-  ...MISSIONS_POLICY_READ_SCOPES,
-  // ardud missions: asks
-  ...MISSIONS_ASKS_READ_SCOPES,
-  // ardud missions: recovery
-  ...MISSIONS_RECOVERY_READ_SCOPES,
-  // ardud missions: views
-  ...MISSIONS_VIEWS_READ_SCOPES,
   // ardud: missions board
   ...KANBAN_READ_SCOPES,
-  // ardud missions: router
-  [WS_METHODS.missionsRooms]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsRoomPage]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsMessageBody]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsRoomTuning]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsAttention]: AuthOrchestrationReadScope,
-  [WS_METHODS.missionsOwnerRequests]: AuthOrchestrationReadScope,
-  // ardud missions: fix-p3
-  [WS_METHODS.missionsRoomActivity]: AuthOrchestrationReadScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

@@ -14,13 +14,14 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 
-import type { Listener, Unsubscribe } from "../missions/source.ts";
 import {
   createKeyedSnapshotStores,
   createSnapshotStore,
+  type Listener,
   type SnapshotStore,
   type SnapshotStoreOptions,
-} from "../missions/store.ts";
+  type Unsubscribe,
+} from "../common/store.ts";
 import {
   applyKanbanWatchEvent,
   withDiscussionList,
@@ -29,6 +30,7 @@ import {
   withOwnerRead,
   type KanbanBoardState,
 } from "./boardState.ts";
+import { mergeBoardList } from "./threads.ts";
 import { isKanbanServerError, type KanbanTransport } from "./transport.ts";
 import { mergeMessages } from "./viewModel.ts";
 
@@ -532,6 +534,7 @@ export function createKanbanClient(
   // Never fails: the stream follows reconnects, and after a server error it
   // opens again after a growing pause.
   const boards = createSnapshotStore<ReadonlyArray<KanbanBoardSummary>>((emit) => {
+    let list: ReadonlyArray<KanbanBoardSummary> | undefined;
     let close: Unsubscribe | null = null;
     let closed = false;
     let pause = RETRY_MIN_MS;
@@ -542,8 +545,9 @@ export function createKanbanClient(
       const stop = transport.stream(
         M.boards,
         {},
-        (list) => {
+        (update) => {
           pause = RETRY_MIN_MS;
+          list = mergeBoardList(list, update);
           emit(list);
         },
         () => {

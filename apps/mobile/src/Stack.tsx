@@ -128,10 +128,6 @@ import { SettingsProjectGroupingRouteScreen } from "./features/settings/Settings
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
-// ardud missions: ui-mobile
-import { MissionRecordRouteScreen } from "./ardud/missions/MissionRecordRouteScreen";
-import { MissionsRouteScreen } from "./ardud/missions/MissionsRouteScreen";
-// end ardud missions: ui-mobile
 // ardud kanban: ui-mobile
 import { KanbanBoardRouteScreen } from "./ardud/kanban/KanbanBoardRouteScreen";
 import { KanbanRecordRouteScreen } from "./ardud/kanban/KanbanRecordRouteScreen";
@@ -788,18 +784,6 @@ const RootStackConfig = createWorkspaceStackNavigator({
       linking: THREAD_LINKING_PREFIX,
       options: DETAIL_HEADER_OPTIONS,
     }),
-    // ardud missions: ui-mobile
-    Missions: createNativeStackScreen({
-      screen: MissionsRouteScreen,
-      linking: "missions",
-      options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
-    }),
-    MissionRecord: createNativeStackScreen({
-      screen: MissionRecordRouteScreen,
-      linking: "missions/:kind/:id",
-      options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
-    }),
-    // end ardud missions: ui-mobile
     // ardud kanban: ui-mobile
     KanbanBoard: createNativeStackScreen({
       screen: KanbanBoardRouteScreen,

@@ -95,17 +95,8 @@ import {
   type PullRequestRef,
   WS_METHODS,
   WsRpcGroup,
-  // ardud missions: core
+  // ardud: domain groups get their own handler layer, see rpc.ts
   WsCoreRpcGroup,
-  WsMissionsRpcGroup,
-  // ardud missions: policy
-  WsMissionsPolicyRpcGroup,
-  // ardud missions: asks
-  WsMissionsAsksRpcGroup,
-  // ardud missions: recovery
-  WsMissionsRecoveryRpcGroup,
-  // ardud missions: views
-  WsMissionsViewsRpcGroup,
   // ardud: missions board
   WsKanbanRpcGroup,
 } from "@t3tools/contracts";
@@ -130,23 +121,8 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
-// ardud missions: core
-import { missionWsHandlers } from "./ardud/missions/ws.ts";
-// ardud missions: policy
-import { ownerAppProvenance } from "./ardud/missions/core/provenance.ts";
-import * as MissionPolicy from "./ardud/missions/policy/PolicyService.ts";
-import { makePolicyWsHandlers } from "./ardud/missions/policy/ws.ts";
-// ardud missions: asks
-import { asksWsHandlers } from "./ardud/missions/asks/ws.ts";
-// ardud missions: views
-import { viewsWsHandlers } from "./ardud/missions/views/ws.ts";
-// ardud missions: guard
-import { makeWsGuard } from "./ardud/missions/guard/ws.ts";
-// ardud missions: request images
-import { guardRequestImageUrl } from "./ardud/missions/views/requestImageAccess.ts";
-// ardud missions: recovery
-import { RecoveryService } from "./ardud/missions/recovery/RecoveryService.ts";
-import { makeRecoveryWsHandlers } from "./ardud/missions/recovery/ws.ts";
+// ardud: owner provenance
+import { ownerAppProvenance, sessionActor } from "./ardud/auth/provenance.ts";
 // ardud: missions board
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
 import { KanbanScripts } from "./ardud/kanban/engine/ScriptService.ts";
@@ -573,17 +549,8 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
-// ardud missions: core (domain groups get their own handler layer, see rpc.ts)
+// ardud: domain groups get their own handler layer, see rpc.ts
 const ServerWsCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
-const ServerWsMissionsRpcGroup = WsMissionsRpcGroup.middleware(RpcInstrumentation);
-// ardud missions: policy
-const ServerWsMissionsPolicyRpcGroup = WsMissionsPolicyRpcGroup.middleware(RpcInstrumentation);
-// ardud missions: asks
-const ServerWsMissionsAsksRpcGroup = WsMissionsAsksRpcGroup.middleware(RpcInstrumentation);
-// ardud missions: recovery
-const ServerWsMissionsRecoveryRpcGroup = WsMissionsRecoveryRpcGroup.middleware(RpcInstrumentation);
-// ardud missions: views
-const ServerWsMissionsViewsRpcGroup = WsMissionsViewsRpcGroup.middleware(RpcInstrumentation);
 // ardud: missions board
 const ServerWsKanbanRpcGroup = WsKanbanRpcGroup.middleware(RpcInstrumentation);
 // Replaying each intervening event costs a shell refetch; past this gap a
@@ -1200,73 +1167,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   },
 );
 
-// ardud missions: core
-const layerWsMissionsRpc = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  clientOrigin: OrchestrationClientOrigin,
-) =>
-  ServerWsMissionsRpcGroup.toLayer(
-    Effect.map(
-      missionWsHandlers({ surface: clientOrigin.surface, session: currentSession }),
-      (handlers) => ServerWsMissionsRpcGroup.of(handlers),
-    ),
-  );
-
-// ardud missions: policy
-const layerWsMissionsPolicyRpc = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  clientOrigin: OrchestrationClientOrigin,
-) =>
-  ServerWsMissionsPolicyRpcGroup.toLayer(
-    Effect.map(MissionPolicy.PolicyService, (policy) =>
-      ServerWsMissionsPolicyRpcGroup.of(
-        makePolicyWsHandlers(
-          policy,
-          ownerAppProvenance({ surface: clientOrigin.surface, session: currentSession }),
-        ),
-      ),
-    ),
-  );
-
-// ardud missions: asks
-const layerWsMissionsAsksRpc = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  clientOrigin: OrchestrationClientOrigin,
-) =>
-  ServerWsMissionsAsksRpcGroup.toLayer(
-    Effect.map(
-      asksWsHandlers({ surface: clientOrigin.surface, session: currentSession }),
-      (handlers) => ServerWsMissionsAsksRpcGroup.of(handlers),
-    ),
-  );
-// ardud missions: views
-const layerWsMissionsViewsRpc = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  clientOrigin: OrchestrationClientOrigin,
-) =>
-  ServerWsMissionsViewsRpcGroup.toLayer(
-    Effect.map(
-      viewsWsHandlers({ surface: clientOrigin.surface, session: currentSession }),
-      (handlers) => ServerWsMissionsViewsRpcGroup.of(handlers),
-    ),
-  );
-
-// ardud missions: recovery
-const layerWsMissionsRecoveryRpc = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  clientOrigin: OrchestrationClientOrigin,
-) =>
-  ServerWsMissionsRecoveryRpcGroup.toLayer(
-    Effect.map(RecoveryService, (recovery) =>
-      ServerWsMissionsRecoveryRpcGroup.of(
-        makeRecoveryWsHandlers(
-          recovery,
-          ownerAppProvenance({ surface: clientOrigin.surface, session: currentSession }),
-        ),
-      ),
-    ),
-  );
-
 // ardud: missions board
 const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
   Effect.gen(function* () {
@@ -1287,12 +1187,12 @@ export const layerWsRpc = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
-      // ardud missions: guard - classify this connection once for the send guard.
-      const missionGuard = makeWsGuard({
+      // ardud: the paired owner's app writes as `user`; any other session as `system`.
+      const ownerApp = ownerAppProvenance({
         surface: clientOrigin.surface,
         session: currentSession,
-        sql,
       });
+      const sessionCreatedBy = sessionActor(ownerApp);
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
         | ThreadManagementService.ThreadManagementService
@@ -1591,8 +1491,8 @@ export const layerWsRpc = (
                       ...(input.updatedAt === undefined ? {} : { updatedAt: input.updatedAt }),
                     },
                   },
-                  // ardud missions: guard
-                  createdBy: missionGuard.actor,
+                  // ardud: owner provenance
+                  createdBy: sessionCreatedBy,
                   creationSource: "web",
                 }),
               ),
@@ -1925,23 +1825,18 @@ export const layerWsRpc = (
             Effect.andThen(
               startup
                 .enqueueCommand(
-                  // ardud missions: guard - a non-owner session's text into an
-                  // existing thread goes through the send guard first.
-                  missionGuard.command(command).pipe(
-                    Effect.andThen(
-                      // A retry also restarts the preparation work the launch owns.
-                      (command.type === "prepared-run.retry"
-                        ? threadLaunch.retryPreparation(command)
-                        : ThreadMessageIntake.dispatchCommand(
-                            ThreadManagementService.withCreationProvenance(command, {
-                              createdBy: missionGuard.actor,
-                              creationSource:
-                                "creationSource" in command ? command.creationSource : "web",
-                            }),
-                          )
-                      ).pipe(Effect.provide(intakeContext)),
-                    ),
-                  ),
+                  // A retry also restarts the preparation work the launch owns.
+                  (command.type === "prepared-run.retry"
+                    ? threadLaunch.retryPreparation(command)
+                    : ThreadMessageIntake.dispatchCommand(
+                        ThreadManagementService.withCreationProvenance(command, {
+                          // ardud: owner provenance
+                          createdBy: sessionCreatedBy,
+                          creationSource:
+                            "creationSource" in command ? command.creationSource : "web",
+                        }),
+                      )
+                  ).pipe(Effect.provide(intakeContext)),
                 )
                 .pipe(
                   Effect.tap(() => recordClientCommandAnalytics(command)),
@@ -2079,17 +1974,10 @@ export const layerWsRpc = (
                               : { context: input.initialMessage.context }),
                           },
                         }),
-                    // ardud missions: guard
-                    createdBy: missionGuard.actor,
+                    // ardud: owner provenance
+                    createdBy: sessionCreatedBy,
                     creationSource: input.creationSource ?? "web",
-                  }).pipe(
-                    Effect.provide(intakeContext),
-                    // ardud missions: guard - reusing an existing thread is a send into it.
-                    (launch) =>
-                      missionGuard
-                        .launch({ ...input, text: input.initialMessage?.text })
-                        .pipe(Effect.andThen(launch)),
-                  ),
+                  }).pipe(Effect.provide(intakeContext)),
                 )
                 .pipe(
                   Effect.tap(() =>
@@ -2137,21 +2025,6 @@ export const layerWsRpc = (
                         message: cause.message,
                         cause,
                       }),
-                    // ardud missions: guard
-                    SendRefused: (cause) =>
-                      new OrchestrationV2ThreadLaunchError({
-                        commandId: input.commandId,
-                        projectId: input.projectId,
-                        message: cause.message,
-                        cause,
-                      }),
-                    SendGuardFailed: (cause) =>
-                      new OrchestrationV2ThreadLaunchError({
-                        commandId: input.commandId,
-                        projectId: input.projectId,
-                        message: cause.message,
-                        cause,
-                      }),
                   }),
                 ),
             ),
@@ -2172,46 +2045,33 @@ export const layerWsRpc = (
               Effect.as(commandOutputHub.subscribe(input)),
             ),
           ),
-        // ardud missions: guard - schedule calls run as this connection, and a
-        // member-bound webhook URL is shown only to its authority.
         [WS_METHODS.scheduledTasksList]: (_input) =>
-          scheduledTasks
-            .list()
-            .pipe(Effect.map(withVisibleWebhookUrls), Effect.flatMap(missionGuard.visibleWebhooks)),
+          scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
-          scheduledTasks
-            .subscribeList()
-            .pipe(
-              Stream.map(withVisibleWebhookUrls),
-              Stream.mapEffect(missionGuard.visibleWebhooks),
-            ),
+          scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksUpsert]: (input) =>
-          missionGuard.schedules(scheduledTasks.upsert(input)),
+          // ardud: a bearer session cannot stamp its schedule as the owner's.
+          scheduledTasks.upsert(ownerApp === null ? { ...input, createdBy: "system" } : input),
         [WS_METHODS.scheduledTasksSetEnabled]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(missionGuard.schedules(scheduledTasks.setEnabled(input))),
+            Effect.andThen(scheduledTasks.setEnabled(input)),
           ),
         [WS_METHODS.scheduledTasksDelete]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(missionGuard.schedules(scheduledTasks.delete(input))),
+            Effect.andThen(scheduledTasks.delete(input)),
           ),
         [WS_METHODS.scheduledTasksRunNow]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(missionGuard.schedules(scheduledTasks.runNow(input))),
+            Effect.andThen(scheduledTasks.runNow(input)),
           ),
         [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(missionGuard.schedules(scheduledTasks.rotateWebhookToken(input))),
+            Effect.andThen(scheduledTasks.rotateWebhookToken(input)),
           ),
         [WS_METHODS.secretsAnswerRequest]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-            // ardud missions: core - only the paired owner answers a secret card.
-            Effect.andThen(
-              secretRequests.answer(
-                input,
-                ownerAppProvenance({ surface: clientOrigin.surface, session: currentSession }),
-              ),
-            ),
+            // ardud: only the paired owner answers a secret card.
+            Effect.andThen(secretRequests.answer(input, ownerApp)),
           ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
@@ -2396,18 +2256,7 @@ export const layerWsRpc = (
           }),
         [WS_METHODS.mcpAppsCallTool]: (input) => mcpAppRequests.callTool(input),
         [WS_METHODS.mcpAppsToolInfo]: (input) => mcpAppRequests.toolInfo(input),
-        [WS_METHODS.mcpAppsUpdateModelContext]: (input) =>
-          // ardud missions: guard - app context reaches the conversation's next turn.
-          missionGuard.modelContext(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new EnvironmentAuthorizationError({
-                  message: cause.message,
-                  requiredScope: AuthOrchestrationOperateScope,
-                }),
-            ),
-            Effect.andThen(mcpAppRequests.updateModelContext(input)),
-          ),
+        [WS_METHODS.mcpAppsUpdateModelContext]: (input) => mcpAppRequests.updateModelContext(input),
         [WS_METHODS.mcpAppsReadResource]: (input) => mcpAppRequests.readResource(input),
         [WS_METHODS.providerUploadFeedback]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
@@ -2856,11 +2705,6 @@ export const layerWsRpc = (
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {
             const path = yield* Path.Path;
-            // ardud missions: request images - only for readers of his words.
-            yield* guardRequestImageUrl(
-              { surface: clientOrigin.surface, session: currentSession, sql },
-              input.resource,
-            );
             if (
               input.resource._tag === "attachment" ||
               input.resource._tag === "native-app-icon" ||
@@ -3353,19 +3197,9 @@ export const layer = Layer.unwrap(
                 previewAutomationBroker,
                 serverBrowser,
               ),
-              // ardud missions: core
-              layerWsMissionsRpc(session, clientOrigin),
-            ).pipe(
-              // ardud missions: policy
-              Layer.merge(layerWsMissionsPolicyRpc(session, clientOrigin)),
-              // ardud missions: asks
-              Layer.merge(layerWsMissionsAsksRpc(session, clientOrigin)),
-              // ardud missions: recovery
-              Layer.merge(layerWsMissionsRecoveryRpc(session, clientOrigin)),
-              // ardud missions: views
-              Layer.merge(layerWsMissionsViewsRpc(session, clientOrigin)),
               // ardud: missions board
-              Layer.merge(layerWsKanbanRpc),
+              layerWsKanbanRpc,
+            ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.

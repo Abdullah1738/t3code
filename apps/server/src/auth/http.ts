@@ -445,7 +445,7 @@ export const layer = HttpApiBuilder.group(
                 return yield* failEnvironmentScopeRequired(delegatedScope);
               }
             }
-            // ardud missions: core
+            // ardud:
             // The issuer decides whether the link carries the owner mark.
             return yield* serverAuth.issuePairingCredential(args.payload, {
               sessionId: session.sessionId,
@@ -511,7 +511,7 @@ export const layer = HttpApiBuilder.group(
           Effect.catchTags({
             ServerAuthForbiddenOperationError: (error) =>
               failEnvironmentOperationForbidden(
-                // ardud missions: core
+                // ardud:
                 error.reason === "owner_session"
                   ? "owner_session_revoke_not_allowed"
                   : "current_session_revoke_not_allowed",

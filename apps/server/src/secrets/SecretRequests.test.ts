@@ -24,7 +24,7 @@ import * as SecretRequests from "./SecretRequests.ts";
 const threadId = ThreadId.make("thread-orchestrator");
 const turnItemId = TurnItemId.make("turn-item:secret-request:1");
 const projectId = ProjectId.make("project-1");
-/** ardud missions: core - the paired owner's session, the only one that answers a card. */
+/** ardud: - the paired owner's session, the only one that answers a card. */
 const owner = { _tag: "owner-app", surface: "web", sessionId: "s-owner" } as const;
 
 const withService = <A, E>(
@@ -286,27 +286,16 @@ it.effect("declining stores nothing, and a request is answered once", () =>
   ),
 );
 
-// ardud missions: core
+// ardud: owner-only secret answers
 it.effect("N7: only the paired owner answers a card; nobody else stores or records anything", () =>
   withService(({ service, stored, dispatched }) =>
     Effect.gen(function* () {
-      const others = [
-        null,
-        { _tag: "system", component: "crw" },
-        { _tag: "agent", threadId: ThreadId.make("thread-agent"), roleId: null },
-        { _tag: "owner-imessage", chat: "owner", inboundId: "inbound-1" },
-      ] as const;
-      for (const answeredBy of others) {
-        for (const answer of [
-          { type: "save", secret: "ghp_secret" },
-          { type: "decline" },
-        ] as const) {
-          const refused = yield* service
-            .answer({ threadId, turnItemId, answer }, answeredBy)
-            .pipe(Effect.flip);
-          assert.equal(refused._tag, "EnvironmentAuthorizationError");
-          assert.notInclude(refused.message, "ghp_secret");
-        }
+      for (const answer of [{ type: "save", secret: "ghp_secret" }, { type: "decline" }] as const) {
+        const refused = yield* service
+          .answer({ threadId, turnItemId, answer }, null)
+          .pipe(Effect.flip);
+        assert.equal(refused._tag, "EnvironmentAuthorizationError");
+        assert.notInclude(refused.message, "ghp_secret");
       }
       assert.deepEqual(valuesOf(stored), []);
       assert.equal(dispatched.length, 0);

@@ -13,8 +13,6 @@ import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageInt
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readThread, unavailable } from "../../threadAccess.ts";
 import { AttachmentToolkit } from "./tools.ts";
-// ardud missions: router
-import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
 
 export function resolveAttachmentReferences(
   requested: ReadonlyArray<ChatAttachment>,
@@ -81,7 +79,7 @@ export const layer = McpToolAccess.toLayer(
         (input) => [input.threadId],
         (input) =>
           Effect.gen(function* () {
-            const { caller, projection, scope } = yield* readThread(input.threadId, ["messages"]);
+            const { caller, projection } = yield* readThread(input.threadId, ["messages"]);
             if (projection.thread.archivedAt !== null)
               return yield* new OrchestratorMcpFailure({
                 code: "invalid_request",
@@ -93,17 +91,6 @@ export const layer = McpToolAccess.toLayer(
             );
             const commandId = yield* newCommandId();
             const messageId = MessageId.make(commandId);
-            // ardud missions: router - mission member threads only take sends the guard passes.
-            yield* guardMcpWrite({
-              path: "thread-send-attachments",
-              targetThreadId: projection.thread.id,
-              caller: {
-                thread: caller === undefined ? undefined : { id: caller.id, title: caller.title },
-                client: scope.client,
-              },
-              text: `${input.message ?? ""} [${attachments.length} attachment(s)]`.trim(),
-              requestKey: commandId,
-            });
             const result = yield* ThreadMessageIntake.sendToThread({
               projectId: projection.thread.projectId,
               threadId: projection.thread.id,

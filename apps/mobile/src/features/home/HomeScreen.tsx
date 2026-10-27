@@ -88,9 +88,6 @@ import { SwipeableScrollGateProvider, useSwipeableScrollGate } from "./thread-sw
 import { useFabScroll } from "./FabScrollContext";
 import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
 import { ThreadListFilters } from "./ThreadListFilters";
-// ardud missions: mobile
-import { MissionsThreadGroup } from "../../ardud/missions/MissionsThreadGroup";
-// end ardud missions: mobile
 // ardud kanban: ui-mobile
 import { KanbanBoardsGroup } from "../../ardud/kanban/KanbanBoardsGroup";
 // end ardud kanban: ui-mobile
@@ -801,9 +798,6 @@ export function HomeScreen(props: HomeScreenProps) {
           onProjectChange={props.onProjectChange}
         />
       ) : null}
-      {/* ardud missions: mobile */}
-      {hasSearchQuery ? null : <MissionsThreadGroup />}
-      {/* end ardud missions: mobile */}
       {/* ardud kanban: ui-mobile */}
       {hasSearchQuery ? null : <KanbanBoardsGroup />}
       {/* end ardud kanban: ui-mobile */}

@@ -7,8 +7,8 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-// ardud missions: guard
-import { withChannelGuidance } from "../ardud/missions/guard/guidance.ts";
+// ardud: iMessage channel guidance
+import { withChannelGuidance } from "../ardud/imessage/guidance.ts";
 
 class ProviderInputTooLongError extends Schema.TaggedError<ProviderInputTooLongError>()(
   "ProviderInputTooLongError",
@@ -37,6 +37,6 @@ export const providerUserMessageText = (message: {
   const text = expandAssistantCitationsForProvider(projected);
   return text !== projected && text.length > PROVIDER_SEND_TURN_MAX_INPUT_CHARS
     ? Effect.fail(new ProviderInputTooLongError({ inputLength: text.length }))
-    : // ardud missions: guard - a relay's channel guidance goes first, framed as not his.
+    : // ardud: a relay's channel guidance goes first, framed as not his.
       Effect.succeed(withChannelGuidance(message.context, text));
 };

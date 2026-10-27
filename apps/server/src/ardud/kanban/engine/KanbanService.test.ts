@@ -678,17 +678,19 @@ it.effect("board summaries count running, waiting and unread, and list the board
       const pull = yield* Stream.toPull(kanban.boardSummaries);
       // Each pull takes what is queued, one list per batch; the last is the list now.
       const latest = Effect.map(pull, (chunk) => {
-        const { board: summarized, ...counts } = chunk.at(-1)![0]!;
-        assert.strictEqual(summarized.id, board.id);
-        return counts;
+        const { board: summarized, boardId, ...counts } = chunk.at(-1)![0]!;
+        assert.strictEqual(boardId, board.id);
+        return { ...counts, sentBoard: summarized !== null };
       });
       assert.deepStrictEqual(yield* latest, {
         needsOwner: 0,
         running: 0,
         unread: 0,
         threadIds: [],
+        sentBoard: true,
       });
 
+      // After the first list only what changed comes: no board, only new threads.
       yield* kanban.dispatchNow;
       const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
       assert.deepStrictEqual(yield* latest, {
@@ -696,6 +698,7 @@ it.effect("board summaries count running, waiting and unread, and list the board
         running: 1,
         unread: 0,
         threadIds: [thread],
+        sentBoard: false,
       });
 
       yield* kanban.moveCard(
@@ -709,6 +712,7 @@ it.effect("board summaries count running, waiting and unread, and list the board
       assert.strictEqual(waiting.needsOwner, 1);
       assert.strictEqual(waiting.running, 0);
       assert.isAbove(waiting.unread, 0);
+      assert.deepStrictEqual(waiting.threadIds, []);
 
       const discussion = yield* kanban.cardDiscussion(card.id);
       yield* kanban.markRead(discussion.id, owner, discussion.lastSeq);

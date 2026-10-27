@@ -6,9 +6,9 @@ import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-co
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
-import { FeedError, LoadingLine } from "../missions/FeedError";
-import { EmptyLine } from "../missions/parts";
-import { useHeaderInset, useNowMs } from "../missions/useMissionsLogic";
+import { FeedError, LoadingLine } from "../common/FeedError";
+import { EmptyLine } from "../common/parts";
+import { useHeaderInset, useNowMs } from "../common/hooks";
 import { BoardView } from "./BoardView";
 import { CardDetail } from "./CardDetail";
 import { useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";

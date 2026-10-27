@@ -16,7 +16,7 @@ import {
   runAtomCommand,
   squashAtomCommandFailure,
 } from "../../state/runtime.ts";
-import type { Unsubscribe } from "../missions/source.ts";
+import type { Unsubscribe } from "../common/store.ts";
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
 export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe | typeof KANBAN_WS_METHODS.boards;
@@ -70,8 +70,8 @@ const isTransportFailure = (cause: Cause.Cause<unknown>) =>
   cause.reasons.length > 0 &&
   cause.reasons.every((reason) => reason._tag === "Fail" && isRpcClientError(reason.error));
 
-// Same shape as the missions transport: a dropped connection ends the
-// session's stream quietly and the next session replays the snapshot.
+// A dropped connection ends the session's stream quietly and the next session
+// replays the snapshot.
 function sessionStream(tag: KanbanStreamTag, input: unknown) {
   return Stream.unwrap(
     Effect.gen(function* () {

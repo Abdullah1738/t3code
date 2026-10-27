@@ -17,7 +17,7 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 
-import { ageView } from "../missions/viewModel.ts";
+import { ageView } from "../common/time.ts";
 import type { KanbanBoardState } from "./boardState.ts";
 import { linkLabels } from "./links.ts";
 

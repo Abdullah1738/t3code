@@ -34,9 +34,6 @@ import { Route as SettingsAppearanceRouteImport } from './routes/settings.appear
 import { Route as ProjectsProjectKeyRouteImport } from './routes/projects.$projectKey'
 import { Route as ChatPullRequestsRouteImport } from './routes/_chat.pull-requests'
 import { Route as ChatNewRouteImport } from './routes/_chat.new'
-import { Route as ChatMissionsPortfolioRouteImport } from './routes/_chat.missions.portfolio'
-import { Route as ChatMissionsInboxRouteImport } from './routes/_chat.missions.inbox'
-import { Route as ChatMissionsMissionIdRouteImport } from './routes/_chat.missions.$missionId'
 import { Route as ChatImessageChatSlugRouteImport } from './routes/_chat.imessage.$chatSlug'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatBoardsBoardIdRouteImport } from './routes/_chat.boards.$boardId'
@@ -167,21 +164,6 @@ const ChatNewRoute = ChatNewRouteImport.update({
   path: '/new',
   getParentRoute: () => ChatRoute,
 } as any)
-const ChatMissionsPortfolioRoute = ChatMissionsPortfolioRouteImport.update({
-  id: '/missions/portfolio',
-  path: '/missions/portfolio',
-  getParentRoute: () => ChatRoute,
-} as any)
-const ChatMissionsInboxRoute = ChatMissionsInboxRouteImport.update({
-  id: '/missions/inbox',
-  path: '/missions/inbox',
-  getParentRoute: () => ChatRoute,
-} as any)
-const ChatMissionsMissionIdRoute = ChatMissionsMissionIdRouteImport.update({
-  id: '/missions/$missionId',
-  path: '/missions/$missionId',
-  getParentRoute: () => ChatRoute,
-} as any)
 const ChatImessageChatSlugRoute = ChatImessageChatSlugRouteImport.update({
   id: '/imessage/$chatSlug',
   path: '/imessage/$chatSlug',
@@ -233,9 +215,6 @@ export interface FileRoutesByFullPath {
   '/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
-  '/missions/$missionId': typeof ChatMissionsMissionIdRoute
-  '/missions/inbox': typeof ChatMissionsInboxRoute
-  '/missions/portfolio': typeof ChatMissionsPortfolioRoute
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
@@ -266,9 +245,6 @@ export interface FileRoutesByTo {
   '/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
-  '/missions/$missionId': typeof ChatMissionsMissionIdRoute
-  '/missions/inbox': typeof ChatMissionsInboxRoute
-  '/missions/portfolio': typeof ChatMissionsPortfolioRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -301,9 +277,6 @@ export interface FileRoutesById {
   '/_chat/boards/$boardId': typeof ChatBoardsBoardIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/_chat/imessage/$chatSlug': typeof ChatImessageChatSlugRoute
-  '/_chat/missions/$missionId': typeof ChatMissionsMissionIdRoute
-  '/_chat/missions/inbox': typeof ChatMissionsInboxRoute
-  '/_chat/missions/portfolio': typeof ChatMissionsPortfolioRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -336,9 +309,6 @@ export interface FileRouteTypes {
     | '/boards/$boardId'
     | '/draft/$draftId'
     | '/imessage/$chatSlug'
-    | '/missions/$missionId'
-    | '/missions/inbox'
-    | '/missions/portfolio'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
@@ -369,9 +339,6 @@ export interface FileRouteTypes {
     | '/boards/$boardId'
     | '/draft/$draftId'
     | '/imessage/$chatSlug'
-    | '/missions/$missionId'
-    | '/missions/inbox'
-    | '/missions/portfolio'
   id:
     | '__root__'
     | '/_chat'
@@ -403,9 +370,6 @@ export interface FileRouteTypes {
     | '/_chat/boards/$boardId'
     | '/_chat/draft/$draftId'
     | '/_chat/imessage/$chatSlug'
-    | '/_chat/missions/$missionId'
-    | '/_chat/missions/inbox'
-    | '/_chat/missions/portfolio'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -596,27 +560,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatNewRouteImport
       parentRoute: typeof ChatRoute
     }
-    '/_chat/missions/portfolio': {
-      id: '/_chat/missions/portfolio'
-      path: '/missions/portfolio'
-      fullPath: '/missions/portfolio'
-      preLoaderRoute: typeof ChatMissionsPortfolioRouteImport
-      parentRoute: typeof ChatRoute
-    }
-    '/_chat/missions/inbox': {
-      id: '/_chat/missions/inbox'
-      path: '/missions/inbox'
-      fullPath: '/missions/inbox'
-      preLoaderRoute: typeof ChatMissionsInboxRouteImport
-      parentRoute: typeof ChatRoute
-    }
-    '/_chat/missions/$missionId': {
-      id: '/_chat/missions/$missionId'
-      path: '/missions/$missionId'
-      fullPath: '/missions/$missionId'
-      preLoaderRoute: typeof ChatMissionsMissionIdRouteImport
-      parentRoute: typeof ChatRoute
-    }
     '/_chat/imessage/$chatSlug': {
       id: '/_chat/imessage/$chatSlug'
       path: '/imessage/$chatSlug'
@@ -656,9 +599,6 @@ interface ChatRouteChildren {
   ChatBoardsBoardIdRoute: typeof ChatBoardsBoardIdRoute
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
   ChatImessageChatSlugRoute: typeof ChatImessageChatSlugRoute
-  ChatMissionsMissionIdRoute: typeof ChatMissionsMissionIdRoute
-  ChatMissionsInboxRoute: typeof ChatMissionsInboxRoute
-  ChatMissionsPortfolioRoute: typeof ChatMissionsPortfolioRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
@@ -669,9 +609,6 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatBoardsBoardIdRoute: ChatBoardsBoardIdRoute,
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
   ChatImessageChatSlugRoute: ChatImessageChatSlugRoute,
-  ChatMissionsMissionIdRoute: ChatMissionsMissionIdRoute,
-  ChatMissionsInboxRoute: ChatMissionsInboxRoute,
-  ChatMissionsPortfolioRoute: ChatMissionsPortfolioRoute,
 }
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)

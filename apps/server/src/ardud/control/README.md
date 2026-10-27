@@ -30,8 +30,8 @@ narrower option). `t3 auth session list` / `revoke` manage it. Default TTL is 30
 Clients find the server and token in this order: explicit options, then
 `T3_CONTROL_URL` and `T3_CONTROL_TOKEN`, then the file named by
 `T3_CONTROL_TOKEN_FILE` (it must exist), else the first that exists of the
-tool's own component credential (`~/.robob/components/<name>.json`: `t3ctl`
-for t3ctl, `mission-cli` for mission) and the old shared
+tool's own component credential (`~/.robob/components/<name>.json`, e.g.
+`t3ctl` for t3ctl) and the old shared
 `~/.robob/ardud-control.json`. Each holds
 `{"url":"http://127.0.0.1:<port>","token":"..."}` and must be chmod 600, or
 the client refuses it. `t3 ardud component-token issue <name>` issues the
@@ -299,7 +299,7 @@ t3ctl native ses_...
 
 | OpenChamber                                                                                        | t3 control API                                                                                                                                  |
 | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | `GET /api/ardud/board` (read-only snapshot, no events). `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention. |
+| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention. |
 | `GET /api/permission/request`, `GET /api/form` (directory-wide)                                    | `GET /requests` (all threads; `?origin=none` excludes iMessage)                                                                                 |
 | reply/cancel permission and form                                                                   | `respond` as above                                                                                                                              |
 | `GET /api/session/active`                                                                          | `GET /threads?active=true`                                                                                                                      |
@@ -362,9 +362,8 @@ favourites and recents, `session.send` to a thread in another project, and
   all t3 has.
 - No synthetic or system context record before a prompt (spectrum's channel
   guidance). Prepend it to the message.
-- No session board here. The board UI is gone; only its read-only snapshot,
-  `GET /api/ardud/board` (`apps/server/src/ardud/board/`), is left for the
-  telegram bridge.
+- No session board. `GET /api/ardud/board` was removed; use `GET /threads`
+  and `GET /requests`.
 - `ardud_opencode_import` is only filled by the importer (opencode-import
   branch). Before that, `by-native` resolves only sessions t3 itself created.
 - Tokens come from `t3 auth session issue` with administrative scopes. There is

@@ -36,7 +36,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
-import { runProcess, scriptEnv } from "../../missions/views/sources/runner.ts";
+import { runProcess, scriptEnv } from "./scriptRunner.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService } from "./KanbanService.ts";
 import * as Scripts from "./scripts.ts";

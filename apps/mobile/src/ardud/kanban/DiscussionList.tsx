@@ -1,12 +1,12 @@
 import { discussionRows, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
-import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
+import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useEffect } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
-import { LoadingLine } from "../missions/FeedError";
-import { EmptyLine } from "../missions/parts";
+import { LoadingLine } from "../common/FeedError";
+import { EmptyLine } from "../common/parts";
 import { kanbanClient } from "./kanbanStore";
 
 /** Board discussions, newest first: title with an unread dot, the last line under it. */

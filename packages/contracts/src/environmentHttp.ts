@@ -105,7 +105,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
-  // ardud missions: core - only an owner session revokes an owner session.
+  // ardud: only an owner session revokes an owner session.
   "owner_session_revoke_not_allowed",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;

@@ -673,9 +673,25 @@ export const KanbanBoardSummary = Schema.Struct({
   /** Unread owner messages across the board's discussions. */
   unread: NonNegativeInt,
   /** Every thread the board started; thread lists leave them out, the board shows them. */
-  threadIds: Schema.Array(ThreadId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  threadIds: Schema.Array(ThreadId),
 });
 export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
+
+/**
+ * A board in one board list update. The stream's first list is whole. After
+ * that a null board is unchanged since the stream's previous list and
+ * threadIds holds only the threads started since then, so a count change
+ * resends neither board pictures nor every thread id.
+ */
+export const KanbanBoardListEntry = Schema.Struct({
+  boardId: KanbanBoardId,
+  board: Schema.NullOr(KanbanBoard),
+  needsOwner: NonNegativeInt,
+  running: NonNegativeInt,
+  unread: NonNegativeInt,
+  threadIds: Schema.Array(ThreadId),
+});
+export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 
 export const KanbanChange = Schema.Union([
   Schema.TaggedStruct("card", { card: KanbanCard }),

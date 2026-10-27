@@ -47,20 +47,13 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
-import { BoardService } from "../board/BoardService.ts";
-// ardud missions: router
-import { guardControlSend, type SendRefused } from "../missions/router/guardPaths.ts";
-// ardud missions: guard
-import { optionalAuthorityStore } from "../missions/guard/authority.ts";
 import {
-  CONTROL_ACTOR,
-  controlActor,
-  guardControlRespond,
-  recordControlWrite,
-  telegramAnswerOwner,
-} from "../missions/guard/control.ts";
-import { GUIDANCE_MAX_CHARS, guidanceContext, guidanceFits } from "../missions/guard/guidance.ts";
-import { isBridgeSession, optionalIMessageOwner } from "../missions/guard/imessage.ts";
+  GUIDANCE_MAX_CHARS,
+  guidanceContext,
+  guidanceFits,
+  isBridgeSession,
+} from "../imessage/guidance.ts";
+import { CONTROL_ACTOR, controlActor, telegramAnswerOwner } from "./actor.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -150,18 +143,6 @@ const json = (body: unknown, status = 200) =>
 
 const errorResponse = (error: ControlError) =>
   json({ ok: false, error: { code: error.code, message: error.message } }, STATUS[error.code]);
-
-// ardud missions: router - a guarded send is refused with 403 and says where it went.
-const controlRefusal = (threadId: ThreadId, refusal: SendRefused) =>
-  json(
-    {
-      ok: false,
-      threadId,
-      error: { code: "forbidden", message: refusal.message },
-      guard: refusal.outcome,
-    },
-    STATUS.forbidden,
-  );
 
 // ---------------------------------------------------------------------------
 // Request helpers
@@ -255,9 +236,9 @@ const SendBody = Schema.Struct({
   variant: OptionalString,
   attachments: Schema.optional(Schema.Array(Attachment)),
   clientRequestId: OptionalString,
-  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store,
-  // and the bridge's channel guidance, kept beside the text instead of inside it.
+  // The iMessage bridge still sends the relayed message's id; it is accepted and ignored.
   inboundId: OptionalString,
+  // The iMessage bridge's channel guidance, kept beside the text instead of inside it.
   guidance: OptionalString,
 });
 
@@ -273,7 +254,7 @@ const RespondBody = Schema.Struct({
   answers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   dismiss: Schema.optional(Schema.Boolean),
   clientRequestId: OptionalString,
-  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store.
+  // The iMessage bridge still sends the relayed message's id; it is accepted and ignored.
   inboundId: OptionalString,
 });
 
@@ -442,13 +423,6 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
-  // Optional so the control API still works without the board layer.
-  const board = yield* Effect.serviceOption(BoardService);
-  const refreshBoard = (threadId: string) =>
-    board._tag === "Some" ? board.value.refreshThread(threadId).pipe(Effect.ignore) : Effect.void;
-  // ardud missions: guard - control sessions are kept beside what they write.
-  const guardAuthority = yield* optionalAuthorityStore;
-  const imessageOwner = yield* optionalIMessageOwner;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -712,7 +686,7 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   const createThread = Effect.gen(function* () {
-    const session = yield* authenticate(AuthOrchestrationOperateScope);
+    yield* authenticate(AuthOrchestrationOperateScope);
     const body = yield* decodeBody(decodeCreateThreadBody);
     const target = yield* resolveProject(body);
     const settings = yield* settingsService.getSettings.pipe(
@@ -774,19 +748,16 @@ const makeRoutes = Effect.gen(function* () {
                   attachments,
                 },
               }),
-          // ardud missions: guard - a bearer token is not the owner typing.
+          // ardud: a bearer token is not the owner typing.
           createdBy: CONTROL_ACTOR,
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
-    // ardud missions: guard
-    yield* recordControlWrite(guardAuthority, "thread", launched.threadId, session);
     if (body.origin !== undefined && body.origin.trim().length > 0) {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
         .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      yield* refreshBoard(launched.threadId);
     }
     const initialMessageId = MessageId.make(commandId);
     const run = launched.projection.runs.find(
@@ -942,8 +913,8 @@ const makeRoutes = Effect.gen(function* () {
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
     const shell = yield* getShell(threadId);
-    const requestedId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
-    // ardud missions: guard - channel guidance is framed as the bridge's, so only it may send some.
+    const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
+    // ardud: channel guidance is framed as the bridge's, so only it may send some.
     if (body.guidance !== undefined && !isBridgeSession(session)) {
       return yield* fail("forbidden", "Only the iMessage bridge sends channel guidance.");
     }
@@ -953,37 +924,7 @@ const makeRoutes = Effect.gen(function* () {
         `Channel guidance is limited to ${GUIDANCE_MAX_CHARS} characters once encoded.`,
       );
     }
-    // ardud missions: guard - the owner's word only when the bridge relays a verified iMessage
-    // to a thread outside every mission. One iMessage is one send: a retry gets the first answer back.
-    const verified = yield* imessageOwner.relay({
-      session,
-      inboundId: body.inboundId,
-      threadId: shell.id,
-      commandId: requestedId,
-      text: body.text,
-      attachments: body.attachments?.length ?? 0,
-      mode: body.mode,
-    });
-    if (verified !== null && verified.result !== null) return json(verified.result);
-    const commandId = verified === null ? requestedId : CommandId.make(verified.commandId);
-    const owner = verified?.provenance ?? null;
     const context = guidanceContext(body.guidance);
-    // ardud missions: router - mission member threads only take sends the guard passes.
-    const refused = yield* guardControlSend({
-      session,
-      owner,
-      targetThreadId: shell.id,
-      text: body.text,
-      commandId,
-      clientRequestId: body.clientRequestId,
-    }).pipe(
-      Effect.as(null),
-      Effect.catchTags({
-        SendRefused: (refusal) => Effect.succeed(controlRefusal(shell.id, refusal)),
-        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
-      }),
-    );
-    if (refused !== null) return refused;
     const modelSelection =
       body.model === undefined && body.variant === undefined
         ? undefined
@@ -1003,8 +944,8 @@ const makeRoutes = Effect.gen(function* () {
           attachments: toChatAttachments(body.attachments),
           ...(modelSelection === undefined ? {} : { modelSelection }),
           mode: body.mode ?? "auto",
-          // ardud missions: guard - a bearer token is not the owner typing.
-          createdBy: controlActor(owner),
+          // ardud: a bearer token is not the owner typing.
+          createdBy: CONTROL_ACTOR,
           creationSource: "server",
           ...(context === undefined ? {} : { context }),
         }).pipe(Effect.provide(intakeContext)),
@@ -1016,19 +957,14 @@ const makeRoutes = Effect.gen(function* () {
             : fail("conflict", errorDetail(cause)),
         ),
       );
-    // ardud missions: guard
-    yield* recordControlWrite(guardAuthority, "message", result.message.id, session, owner);
-    const sent = {
+    return json({
       ok: true,
       threadId: shell.id,
       messageId: result.message.id,
       runId: result.run.id,
       status: result.run.status,
       delivery: result.delivery,
-    };
-    // ardud missions: guard
-    if (verified !== null) yield* verified.finish(sent);
-    return json(sent);
+    });
   });
 
   const interrupt = Effect.gen(function* () {
@@ -1067,9 +1003,7 @@ const makeRoutes = Effect.gen(function* () {
       return yield* fail("not_found", `Request ${requestId} was not found on thread ${threadId}.`);
     }
     const alreadyIs = () => fail("conflict", `Request ${requestId} is already ${request.status}.`);
-    // ardud missions: guard - an answered request may still replay an iMessage's recorded answer.
-    const open = request.status === "pending";
-    if (!open && body.inboundId === undefined) return yield* alreadyIs();
+    if (request.status !== "pending") return yield* alreadyIs();
     const commandId = yield* commandIdFor(`respond:${requestId}`, body.clientRequestId);
     const decision: ProviderApprovalDecision | undefined =
       body.decision === undefined
@@ -1120,55 +1054,14 @@ const makeRoutes = Effect.gen(function* () {
         decision,
       };
     }
-    // ardud missions: guard - the answer is judged before the request changes
-    // state, so a routed or knocked answer leaves it pending. It is the owner's
-    // when the bridge relays a verified iMessage for a thread outside every
-    // mission, or when the Telegram bridge answers from his chat. One iMessage
-    // is one answer: a retry gets the first answer back, and runs as the first
-    // attempt's command.
-    const answer = {
-      decision: command.type === "runtime-request.respond" ? command.decision : undefined,
-      answers: command.type === "runtime-request.respond" ? command.answers : undefined,
-      dismissed: command.type === "thread.user-input.dismiss",
-    };
-    const verified = yield* imessageOwner.answer({
-      session,
-      inboundId: body.inboundId,
-      threadId,
-      commandId,
-      requestId,
-      open,
-      askedAt: request.createdAt,
-      ...answer,
-    });
-    if (verified !== null && verified.result !== null) return json(verified.result);
-    if (!open) return yield* alreadyIs();
-    const owner = verified?.provenance ?? telegramAnswerOwner(session);
-    const actedAs = verified === null ? commandId : CommandId.make(verified.commandId);
+    // ardud: an answer the Telegram bridge relays from the owner's chat is the owner's.
+    const owner = telegramAnswerOwner(session);
     const decided: OrchestrationV2Command =
       command.type === "runtime-request.respond"
-        ? { ...command, commandId: actedAs, createdBy: controlActor(owner) }
-        : { ...command, commandId: actedAs };
-    const refused = yield* guardControlRespond({
-      session,
-      owner,
-      threadId: ThreadId.make(threadId),
-      requestId,
-      ...answer,
-      commandId: actedAs,
-    }).pipe(
-      Effect.as(null),
-      Effect.catchTags({
-        SendRefused: (refusal) => Effect.succeed(controlRefusal(ThreadId.make(threadId), refusal)),
-        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
-      }),
-    );
-    if (refused !== null) return refused;
+        ? { ...command, createdBy: controlActor(owner) }
+        : command;
     const result = yield* dispatch(decided);
-    const answered = { ok: true, threadId, requestId, sequence: result.sequence };
-    // ardud missions: guard
-    if (verified !== null) yield* verified.finish(answered);
-    return json(answered);
+    return json({ ok: true, threadId, requestId, sequence: result.sequence });
   });
 
   const putOrigin = Effect.gen(function* () {
@@ -1180,7 +1073,6 @@ const makeRoutes = Effect.gen(function* () {
     yield* store
       .setOrigin(threadId, origin)
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    yield* refreshBoard(threadId);
     return json({ ok: true, threadId, origin });
   });
 

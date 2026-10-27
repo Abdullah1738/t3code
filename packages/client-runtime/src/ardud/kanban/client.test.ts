@@ -1,5 +1,5 @@
 import type {
-  KanbanBoardSummary,
+  KanbanBoardListEntry,
   KanbanDiscussion,
   KanbanMessage,
   KanbanScriptRun,
@@ -23,7 +23,7 @@ function fakeTransport() {
   let push: ((event: KanbanWatchEvent) => void) | null = null;
   let fail: ((error: unknown) => void) | null = null;
   let streams = 0;
-  const lists: Array<(list: ReadonlyArray<KanbanBoardSummary>) => void> = [];
+  const lists: Array<(list: ReadonlyArray<KanbanBoardListEntry>) => void> = [];
   const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
     stream(tag, _input, onValue, onError) {
@@ -57,7 +57,7 @@ function fakeTransport() {
     push: (event: KanbanWatchEvent) => push?.(event),
     fail: (error: unknown) => fail?.(error),
     streams: () => streams,
-    pushList: (list: ReadonlyArray<KanbanBoardSummary>) => lists.at(-1)?.(list),
+    pushList: (list: ReadonlyArray<KanbanBoardListEntry>) => lists.at(-1)?.(list),
     failList: (error: unknown) => listFailures.at(-1)?.(error),
   };
 }
@@ -315,9 +315,20 @@ describe("createKanbanClient", () => {
       const fake = fakeTransport();
       const client = createKanbanClient(fake.transport);
       const stop = client.boards.subscribe(() => {});
-      const list = [{ board: { id: "board-toy" }, needsOwner: 1, running: 0, unread: 2 }] as never;
-      fake.pushList(list);
-      expect(client.boards.get()).toBe(list);
+      fake.pushList([
+        {
+          boardId: "board-toy",
+          board: { id: "board-toy" },
+          needsOwner: 1,
+          running: 0,
+          unread: 2,
+          threadIds: [],
+        },
+      ] as never);
+      const list = client.boards.get();
+      expect(list?.map((summary) => [summary.board.id, summary.needsOwner])).toEqual([
+        ["board-toy", 1],
+      ]);
 
       fake.failList(new Error("denied"));
       expect(client.boards.failure()).toBeUndefined();

@@ -68,21 +68,6 @@ import * as ContextResetService from "../ardud/context-reset/ContextResetService
 import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
-// ardud missions: asks
-import * as MissionsHandlers from "../ardud/missions/tools/handlers.ts";
-import { MissionsToolkit } from "../ardud/missions/tools/tools.ts";
-// ardud missions: policy
-import * as PolicyToolHandlers from "../ardud/missions/policy/toolHandlers.ts";
-import { PolicyToolkit } from "../ardud/missions/policy/tools.ts";
-// ardud missions: router
-import * as RouterToolHandlers from "../ardud/missions/router/toolHandlers.ts";
-import { RouterToolkit } from "../ardud/missions/router/tools.ts";
-// ardud missions: recovery
-import * as MissionsRecoveryTools from "../ardud/missions/tools/recovery.ts";
-// ardud missions: views
-import * as MissionsViewsTools from "../ardud/missions/views/tools.ts";
-// ardud missions: reports
-import * as MissionsReportTools from "../ardud/missions/scribe/tools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
 import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
@@ -1042,30 +1027,6 @@ const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
 ).pipe(Layer.provide(WorktreeMcpService.layer));
-// ardud missions: asks (AsksService comes from ArdudMissionsLive in server.ts)
-const layerMissionsToolkitRegistration = toolkitRegistration(
-  MissionsToolkit,
-  MissionsHandlers.layer,
-);
-// ardud missions: policy (PolicyService comes from ArdudMissionsLive in server.ts)
-const layerPolicyToolkitRegistration = toolkitRegistration(PolicyToolkit, PolicyToolHandlers.layer);
-// ardud missions: router (MissionRouter comes from ArdudMissionsLive in server.ts)
-const layerRouterToolkitRegistration = toolkitRegistration(RouterToolkit, RouterToolHandlers.layer);
-// ardud missions: recovery (RecoveryService comes from ArdudMissionsLive in server.ts)
-const layerMissionsRecoveryToolkitRegistration = toolkitRegistration(
-  MissionsRecoveryTools.RecoveryToolkit,
-  MissionsRecoveryTools.layer,
-);
-// ardud missions: views (ViewService comes from ArdudMissionsLive in server.ts)
-const layerMissionsViewsToolkitRegistration = toolkitRegistration(
-  MissionsViewsTools.ViewsToolkit,
-  MissionsViewsTools.layer,
-);
-// ardud missions: reports (ScribeService comes from ArdudMissionsLive in server.ts)
-const layerMissionsReportToolkitRegistration = toolkitRegistration(
-  MissionsReportTools.ReportsToolkit,
-  MissionsReportTools.layer,
-);
 // ardud: missions board (KanbanService comes from ArdudKanbanLive in server.ts)
 const layerKanbanToolkitRegistration = toolkitRegistration(KanbanToolkit, KanbanHandlers.layer);
 const layerContextResetToolkitRegistration = toolkitRegistration(
@@ -1133,18 +1094,6 @@ export const layer = Layer.mergeAll(
   layerWorktreeToolkitRegistration,
   layerContextResetToolkitRegistration,
   layerScheduledTaskBlockRetryRegistration,
-  // ardud missions: asks
-  layerMissionsToolkitRegistration,
-  // ardud missions: policy
-  layerPolicyToolkitRegistration,
-  // ardud missions: router
-  layerRouterToolkitRegistration,
-  // ardud missions: recovery
-  layerMissionsRecoveryToolkitRegistration,
-  // ardud missions: views
-  layerMissionsViewsToolkitRegistration,
-  // ardud missions: reports
-  layerMissionsReportToolkitRegistration,
   // ardud: missions board
   layerKanbanToolkitRegistration,
   layerPullRequestsToolkit,

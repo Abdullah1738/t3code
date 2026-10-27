@@ -29,7 +29,7 @@ import { servicePreflightCommand } from "./cli/servicePreflight.ts";
 import { themeCommand } from "./cli/theme.ts";
 import { traceCommand } from "./cli/trace.ts";
 import { triageCommand } from "./cli/triage.ts";
-import { ardudCommand } from "./ardud/schedules/importOpenChamberCommand.ts";
+import { ardudCommand } from "./ardud/cli/ardudCommand.ts";
 
 const layerCliRuntime = Layer.mergeAll(NodeServices.layer, NetService.layer);
 

@@ -4,14 +4,14 @@ import { Fragment } from "react";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { Group, NewCount, Row, SectionHead, Separator, Title } from "../missions/parts";
+import { Group, NewCount, Row, SectionHead, Separator, Title } from "../common/parts";
 import { BoardIcon } from "./BoardIcon";
 import { useKanbanBoards } from "./kanbanStore";
 import { Glyph } from "./parts";
 
 /**
- * The Boards group on the phone's thread list, under Missions: one row per
- * board with what waits on the owner. Nothing shows until a board exists.
+ * The Boards group on the phone's thread list: one row per board with what
+ * waits on the owner. Nothing shows until a board exists.
  */
 export function KanbanBoardsGroup() {
   const navigation = useNavigation();

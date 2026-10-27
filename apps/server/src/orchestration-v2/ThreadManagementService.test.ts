@@ -88,7 +88,7 @@ it("leaves commands that do not create durable authored content unchanged", () =
   ).toBe(command);
 });
 
-// ardud missions: core
+// ardud:
 it("M4: stamps who answered a runtime request, over anything the client sent", () => {
   const command: OrchestrationV2Command = {
     type: "runtime-request.respond",

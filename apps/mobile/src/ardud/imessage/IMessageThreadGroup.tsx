@@ -14,7 +14,7 @@ import {
 import { threadHasUnseenCompletion } from "../../features/threads/threadListV2";
 import { cn } from "../../lib/cn";
 import { environmentThreadShells } from "../../state/threads";
-import { Group, Meta, Row, SectionHead, Separator } from "../missions/parts";
+import { Group, Meta, Row, SectionHead, Separator } from "../common/parts";
 import { IMessageAvatar } from "./IMessageAvatar";
 import { useIMessagePalette } from "./palette";
 import { useIMessageChats } from "./useIMessageChat";

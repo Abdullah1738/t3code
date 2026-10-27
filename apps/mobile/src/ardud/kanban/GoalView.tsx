@@ -1,10 +1,10 @@
 import { goalPage, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
-import { formatDayLabel } from "@t3tools/client-runtime/ardud/missions";
+import { formatDayLabel } from "@t3tools/client-runtime/ardud/common";
 import { Fragment } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { EmptyLine } from "../missions/parts";
+import { EmptyLine } from "../common/parts";
 import { cardGlyph } from "./logic";
 import { GoalBar, Glyph, KChip, StageHead } from "./parts";
 

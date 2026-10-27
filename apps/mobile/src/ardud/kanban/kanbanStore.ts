@@ -6,25 +6,25 @@ import {
   type KanbanBoardState,
   type KanbanClient,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { SnapshotStore } from "@t3tools/client-runtime/ardud/missions";
+import type { SnapshotStore } from "@t3tools/client-runtime/ardud/common";
 import { useMemo, useSyncExternalStore } from "react";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../state/atom-registry";
-import { type FeedState, missionsEnvironmentIdAtom } from "../missions/missionsStore";
+import { type FeedState, pairedEnvironmentIdAtom } from "../common/environment";
 
 // Leaving a card or discussion and coming back finds its feed still open.
 const KEEP_ALIVE_MS = 2 * 60_000;
 
 let client: KanbanClient | null = null;
 
-/** The phone's one board client, over the same paired server as Missions. */
+/** The phone's one board client, over the paired server. */
 export function kanbanClient(): KanbanClient {
   client ??= createKanbanClient(
     createAtomKanbanTransport({
       runtime: connectionAtomRuntime,
       registry: appAtomRegistry,
-      environmentId: missionsEnvironmentIdAtom,
+      environmentId: pairedEnvironmentIdAtom,
     }),
     { keepAliveMs: KEEP_ALIVE_MS },
   );

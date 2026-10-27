@@ -2954,7 +2954,7 @@ export const OrchestrationV2Command = Schema.Union([
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
     /**
-     * ardud missions: core - who answered, stamped by the server from the
+     * ardud: who answered, stamped by the server from the
      * authenticated caller. Absent means a server-side caller, never a human.
      */
     createdBy: Schema.optional(OrchestrationV2Actor),

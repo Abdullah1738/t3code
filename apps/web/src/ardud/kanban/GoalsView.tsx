@@ -1,5 +1,5 @@
 import { activeGoals, goalPage, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
-import { formatDayLabel } from "@t3tools/client-runtime/ardud/missions";
+import { formatDayLabel } from "@t3tools/client-runtime/ardud/common";
 
 import { Chip, GoalBar, Glyph, stageGlyph } from "./parts";
 

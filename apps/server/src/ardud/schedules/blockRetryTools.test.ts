@@ -18,18 +18,18 @@ import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
-import { master, membershipGuard, outsider } from "../missions/guard/guard.testkit.ts";
 import * as BlockRetry from "./blockRetryTools.ts";
 import { ensureRunFollowTables, readBlockRetry, writeBlockRetry } from "./runFollow.ts";
 
 const lowCaller = ThreadId.make("t-low");
+const boundThread = ThreadId.make("t-bound");
 const fallback = { instanceId: "opencode", model: "opus/gpt-6-astra" } as never;
 
-/** Bound to the mission master, whose thread now runs above the task's own modes. */
+/** Bound to a thread that now runs above the task's own modes. */
 const task = {
   id: ScheduledTaskId.make("scheduled-task:bound"),
-  title: "Master check",
-  threadId: master,
+  title: "Bound check",
+  threadId: boundThread,
   createdAt: "2026-10-22T00:00:00.000Z",
   runtimeMode: "approval-required",
   interactionMode: "default",
@@ -108,18 +108,13 @@ const call = (threadId: ThreadId, args: Record<string, unknown>) =>
 describe("t3_scheduled_task_block_retry", () => {
   it.effect("changes to a bound task's retry pass the same checks as an edit", () =>
     Effect.gen(function* () {
-      yield* membershipGuard;
       const sql = yield* SqlClient.SqlClient;
-      // Armed while the task was unbound, then bound to the master.
+      // Armed while the task was unbound, then bound.
       yield* writeBlockRetry(sql, task, {
         fallbacks: [fallback],
         limits: { runtimeMode: "full-access", interactionMode: "default" },
       });
       const clear = { scheduledTaskId: task.id, fallbacks: null };
-
-      const fromOutsider = yield* call(outsider, clear);
-      expect(fromOutsider.isError).toBe(true);
-      expect(yield* readBlockRetry(sql, task)).not.toBeNull();
 
       // Within the task's modes, but below the bound thread's current ones.
       const fromLow = yield* call(lowCaller, clear);
@@ -127,8 +122,8 @@ describe("t3_scheduled_task_block_retry", () => {
       expect(fromLow.text).toContain("broader than");
       expect(yield* readBlockRetry(sql, task)).not.toBeNull();
 
-      const fromMaster = yield* call(master, clear);
-      expect(fromMaster.isError).toBe(false);
+      const fromBound = yield* call(boundThread, clear);
+      expect(fromBound.isError).toBe(false);
       expect(yield* readBlockRetry(sql, task)).toBeNull();
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );

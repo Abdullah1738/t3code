@@ -277,7 +277,7 @@ describe("threadHistoryPaging", () => {
     );
   });
 
-  // ardud missions: guard - a bearer's prompt is a person's turn too.
+  // ardud: - a bearer's prompt is a person's turn too.
   it.each([
     {
       name: "control API",

@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -14,7 +14,7 @@ import {
   createKanbanClient,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { FeedFailure, SnapshotStore } from "@t3tools/client-runtime/ardud/missions";
+import type { FeedFailure, SnapshotStore } from "@t3tools/client-runtime/ardud/common";
 
 import { toastManager } from "../../components/ui/toast";
 import { connectionAtomRuntime } from "../../connection/runtime";
@@ -41,8 +41,7 @@ export function useBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
 
 /** Threads the boards started, archived boards too, for thread lists to leave out. */
 export function useBoardThreadIds(): ReadonlySet<string> {
-  const boards = useStore(kanban.boards);
-  return useMemo(() => boardThreadIds(boards), [boards]);
+  return boardThreadIds(useStore(kanban.boards));
 }
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {

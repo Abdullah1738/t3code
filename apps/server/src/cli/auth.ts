@@ -11,7 +11,7 @@ import * as References from "effect/References";
 import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
-// ardud missions: core
+// ardud:
 import {
   isReservedSessionSubject,
   MAC_LINK_NOT_OWNER,
@@ -107,7 +107,7 @@ const pairingCreateCommand = Command.make("create", {
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),
           });
-          // ardud missions: core
+          // ardud:
           yield* Console.error(MAC_LINK_NOT_OWNER);
           const output = formatIssuedPairingCredential(issued, {
             json: flags.json,
@@ -183,7 +183,7 @@ const sessionIssueCommand = Command.make("issue", {
       flags,
       (environmentAuth) =>
         Effect.gen(function* () {
-          // ardud missions: core
+          // ardud:
           // Server-made subjects are not for hand-issued tokens.
           if (Option.isSome(flags.subject) && isReservedSessionSubject(flags.subject.value)) {
             return yield* new ReservedSessionSubjectError({ subject: flags.subject.value });

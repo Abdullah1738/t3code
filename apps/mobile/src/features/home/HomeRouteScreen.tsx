@@ -32,10 +32,6 @@ import { usePendingTaskListActions } from "./usePendingTaskListActions";
 import { useThreadListActions } from "./useThreadListActions";
 import { getConnectionAwareBrandHeaderOptions } from "./WorkspaceConnectionTitle";
 import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
-// ardud missions: ui-web
-import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
-import { useMissionList } from "../../ardud/missions/missionsStore";
-// end ardud missions: ui-web
 // ardud kanban: mobile (board threads open from their cards, not the list)
 import { withoutBoardThreads } from "@t3tools/client-runtime/ardud/kanban";
 import { useKanbanBoardThreadIds } from "../../ardud/kanban/kanbanStore";
@@ -56,16 +52,12 @@ export function HomeRouteScreen() {
   // Streaming turns rewrite thread shells many times a second. While a Thread
   // covers Home, rebuilding this list is invisible work.
   const visible = useHomeRouteVisible();
-  // ardud missions: ui-web (a mission's threads open from the mission, not the list)
-  const missionThreads = missionThreadIds(useMissionList());
+  // ardud kanban: mobile
   const listThreads = withoutBoardThreads(
-    withoutMissionThreads(
-      useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
-      missionThreads,
-    ),
+    useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
     useKanbanBoardThreadIds(),
   );
-  // end ardud missions: ui-web
+  // end ardud kanban: mobile
   // ardud imessage: mobile
   const threads = withoutIMessageThreads(listThreads);
   // end ardud imessage: mobile

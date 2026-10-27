@@ -26,14 +26,10 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
-// ardud missions: core
-import type { EnvironmentAuthorizationError, MissionProvenance } from "@t3tools/contracts";
-import {
-  requireSecretAnswerAuthority,
-  secretStatusOf,
-  type MasterSecretClose,
-  type SecretAnswerInput,
-} from "../ardud/missions/core/secrets.ts";
+// ardud: owner-only secret answers
+import type { EnvironmentAuthorizationError } from "@t3tools/contracts";
+import type { OwnerProvenance } from "../ardud/auth/provenance.ts";
+import { requireSecretAnswerAuthority, secretStatusOf } from "../ardud/auth/secretAnswers.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 
@@ -63,13 +59,12 @@ export class SecretRequests extends Context.Service<
     /**
      * Answers a pending request in a thread. Saving stores the value under a
      * new ref that the requesting tool reads from the request's status.
-     * ardud missions: core - `answeredBy` is the transport-derived caller;
-     * only the paired owner saves a value. A mission master's grant may
-     * decline or withdraw its own member's card, nothing else.
+     * ardud: `answeredBy` is the transport-derived caller; only the paired
+     * owner answers.
      */
     readonly answer: (
-      input: SecretRequestAnswerInput | SecretAnswerInput,
-      answeredBy: MissionProvenance | MasterSecretClose | null,
+      input: SecretRequestAnswerInput,
+      answeredBy: OwnerProvenance | null,
     ) => Effect.Effect<void, SecretRequestError | EnvironmentAuthorizationError>;
     /** The ref minted when this request was saved, for the tool that asked. */
     readonly savedRef: (input: {
@@ -98,8 +93,8 @@ const make = Effect.gen(function* () {
         "orchestration_v2.thread_id": input.threadId,
         "secret_request.answer": input.answer.type,
       });
-      // ardud missions: core
-      yield* requireSecretAnswerAuthority(input, answeredBy);
+      // ardud: owner-only secret answers
+      yield* requireSecretAnswerAuthority(answeredBy);
       const records = yield* threadManagement
         .getThreadRecords(input.threadId, ["runs", "turnItems"], {
           turnItemTypes: ["secret_request"],
@@ -139,7 +134,6 @@ const make = Effect.gen(function* () {
             ),
           );
       }
-      // ardud missions: core - a master's withdraw closes the card as cancelled
       const secretStatus = secretStatusOf(input.answer);
       yield* threadManagement
         .dispatch({

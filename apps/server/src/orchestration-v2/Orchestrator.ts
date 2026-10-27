@@ -153,8 +153,8 @@ import {
   OrchestratorThreadNotIdleError,
   sessionHoldsWork,
 } from "../ardud/archive-if-idle/idle.ts";
-// ardud missions: guard
-import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
+// ardud: control turns
+import { countsAsUserTurn } from "../ardud/control/turns.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 import {
@@ -4907,7 +4907,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (yield* projectionStore
           .getMessageCount(command.threadId)
           .pipe(mapDispatchError(command))) === 0) ||
-        // ardud missions: guard - a bearer's prompt is a person's turn too.
+        // ardud: a bearer's prompt is a person's turn too.
         (countsAsUserTurn(command) && onlyMaintenanceHistory))
     ) {
       const now = yield* DateTime.now;
@@ -7932,7 +7932,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             messageId: MessageId.make(`async-answer:${command.requestId}`),
             text: replies.join("\n\n"),
             attachments: [],
-            // ardud missions: core - the answering principal, not a hard-coded human.
+            // ardud: the answering principal, not a hard-coded human.
             createdBy: command.createdBy ?? "system",
             creationSource: "server",
             dispatchMode,

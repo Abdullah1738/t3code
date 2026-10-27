@@ -9,16 +9,16 @@ import {
   subtaskSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
+import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { type ReactNode, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
-import { FeedError, LoadingLine } from "../missions/FeedError";
-import { ActionButton, EmptyLine } from "../missions/parts";
-import { confirmAction, useMissionAction } from "../missions/useMissionsLogic";
+import { FeedError, LoadingLine } from "../common/FeedError";
+import { ActionButton, EmptyLine } from "../common/parts";
+import { confirmAction, useBoardAction } from "../common/hooks";
 import { Chat } from "./Chat";
 import { kanbanClient, useKanbanCard, useKanbanCardFeed } from "./kanbanStore";
 import { cardGlyph, prGlyph, stageGlyph } from "./logic";
@@ -181,7 +181,7 @@ function OwnerAsks(props: {
   readonly asks: ReturnType<typeof askViews>;
 }) {
   const { card } = props;
-  const action = useMissionAction();
+  const action = useBoardAction();
   if (props.asks.length === 0) return null;
   return (
     <View className="gap-3 rounded-2xl bg-warning px-3.5 py-3">
@@ -231,7 +231,7 @@ function OwnerAsks(props: {
 /** Settle once verified, Stop while a thread runs, back to To-Do from Needs Owner. */
 function CardActions(props: { readonly card: KanbanCard }) {
   const { card } = props;
-  const action = useMissionAction();
+  const action = useBoardAction();
   const canSettle = card.stage === "verified" && card.settledAt === null;
   const canStop = card.activeThreadId !== null;
   const canQueue = card.stage === "needs_owner";

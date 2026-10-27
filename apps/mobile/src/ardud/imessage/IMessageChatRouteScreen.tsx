@@ -32,8 +32,8 @@ import { threadHasUnseenCompletion } from "../../features/threads/threadListV2";
 import { cn } from "../../lib/cn";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { EmptyLine, LinkButton, Meta } from "../missions/parts";
-import { useHeaderInset } from "../missions/useMissionsLogic";
+import { EmptyLine, LinkButton, Meta } from "../common/parts";
+import { useHeaderInset } from "../common/hooks";
 import { IMessageAvatar } from "./IMessageAvatar";
 import { type IMessagePalette, useIMessagePalette } from "./palette";
 import {

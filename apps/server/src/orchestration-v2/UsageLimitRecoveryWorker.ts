@@ -66,7 +66,7 @@ export function limitRecoveryCommand(
     text: "Continue where you left off.",
     attachments: [],
     dispatchMode: { type: "start_immediately" },
-    // ardud missions: guard - the server resumes the run; the owner did not type this.
+    // ardud: - the server resumes the run; the owner did not type this.
     createdBy: "system",
     creationSource: "server",
   };

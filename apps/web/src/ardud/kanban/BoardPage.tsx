@@ -25,7 +25,7 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { useNowMs } from "../missions/useNowMs";
+import { useNowMs } from "./useNowMs";
 import { BoardColumns } from "./BoardColumns";
 import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
@@ -37,7 +37,7 @@ import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
 import { SettingsView } from "./SettingsView";
 import { AutomationsView, WikiView } from "./SideViews";
-import "../missions/missions.css";
+import "./tokens.css";
 import "./kanban.css";
 
 /** Keys set to undefined are dropped from the URL. */

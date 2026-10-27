@@ -7,7 +7,7 @@ import {
   ownerReadSeq,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
+import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { Image } from "expo-image";
 import {
   type ComponentRef,
@@ -27,9 +27,9 @@ import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
-import { FeedError, LoadingLine } from "../missions/FeedError";
-import { useMissionAction } from "../missions/useMissionsLogic";
-import { MarkdownText } from "../missions/ViewBlocks";
+import { FeedError, LoadingLine } from "../common/FeedError";
+import { useBoardAction } from "../common/hooks";
+import { MarkdownText } from "../common/MarkdownText";
 import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
 import { cardGlyph, choiceView, isLoadableImageUrl, nextTypingExpiry, toggleChoice } from "./logic";
 import { Avatar, Glyph } from "./parts";
@@ -372,7 +372,7 @@ function ChoiceBlock(props: {
   readonly message: KanbanMessage;
 }) {
   const { block, message } = props;
-  const action = useMissionAction();
+  const action = useBoardAction();
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -562,7 +562,7 @@ function Composer(props: {
   const [text, setText] = useState("");
   // iOS keeps a grown multiline input tall after its value is cleared; a new one starts short.
   const [field, setField] = useState(0);
-  const action = useMissionAction();
+  const action = useBoardAction();
   const empty = text.trim().length === 0;
   const send = () => {
     const body = text.trim();

@@ -22,15 +22,6 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
-// ardud missions: router
-import { answerText } from "../../../ardud/missions/router/answers.ts";
-import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
-// ardud missions: guard
-import { optionalAuthorityStore } from "../../../ardud/missions/guard/authority.ts";
-import { guardFork } from "../../../ardud/missions/guard/forks.ts";
-import { guardFailure, mcpPrincipal, schedulesAs } from "../../../ardud/missions/guard/mcp.ts";
-// ardud missions: core
-import { principalActor } from "../../../ardud/missions/guard/principal.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -79,28 +70,6 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
     });
   return { ...context, request, item };
 });
-// ardud missions: router - text an agent pushes into another thread goes through the send guard.
-const guardThreadWrite = Effect.fn("mcp.guardThreadWrite")(function* (input: {
-  readonly path: "queued-edit" | "merge-back" | "request-respond";
-  readonly threadId: ThreadId | undefined;
-  readonly text: string;
-}) {
-  const { caller, projection, scope } = yield* readThread(input.threadId);
-  // Same caller, target and text decide once, so a retried call never knocks twice.
-  const sender = caller?.id ?? scope.client?.sessionId ?? "unknown";
-  const requestKey = `${input.path}:${sender}:${projection.thread.id}:${input.text}`;
-  yield* guardMcpWrite({
-    path: input.path,
-    targetThreadId: projection.thread.id,
-    caller: {
-      thread: caller === undefined ? undefined : { id: caller.id, title: caller.title },
-      client: scope.client,
-    },
-    text: input.text,
-    requestKey,
-  });
-});
-
 /** A tool that changes `threadId`, or the caller's own thread when it is omitted. */
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
   handle: (params: P) => Effect.Effect<A, E, R>,
@@ -116,11 +85,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
-      // ardud missions: guard - a manual run speaks as the caller, not the task's creator.
-      const { caller, scope } = yield* readCaller();
       const { task } = yield* scheduler
         .runNow({ id: input.taskId })
-        .pipe(schedulesAs(mcpPrincipal(scope, caller)), Effect.mapError(unavailable));
+        .pipe(Effect.mapError(unavailable));
       return {
         taskId: task.id,
         threadId: task.threadId,
@@ -147,18 +114,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_thread_fork: writesThread((input) =>
     Effect.gen(function* () {
-      const { threads, projection, caller, scope } = yield* readThread(input.threadId);
+      const { threads, projection } = yield* readThread(input.threadId);
       const commandId = yield* newCommandId();
       const targetThreadId = ThreadId.make(`${commandId}:fork`);
-      // ardud missions: guard - forking a mission member copies its context into a
-      // thread that inherits its lineage, so only those who may reach it may fork it,
-      // and the fork's creator is recorded apart from that lineage.
-      yield* guardFork(yield* optionalAuthorityStore, {
-        caller: mcpPrincipal(scope, caller),
-        sourceThreadId: projection.thread.id,
-        targetThreadId,
-        title: input.title,
-      }).pipe(Effect.mapError(guardFailure));
       const result = yield* threads
         .dispatch({
           type: "thread.fork",
@@ -180,12 +138,6 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       Effect.gen(function* () {
         const context = yield* readThread(input.targetThreadId);
         const source = yield* readThread(input.sourceThreadId);
-        // ardud missions: router
-        yield* guardThreadWrite({
-          path: "merge-back",
-          threadId: input.targetThreadId,
-          text: `Merge back from thread ${source.projection.thread.id} (${source.projection.thread.title}).`,
-        });
         const result = yield* context.threads
           .dispatch({
             type: "thread.merge_back",
@@ -264,13 +216,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_pending_request_respond: writesThread((input) =>
     Effect.gen(function* () {
-      const { threads, projection, item, caller, scope } = yield* readQuestion(input);
-      // ardud missions: router
-      yield* guardThreadWrite({
-        path: "request-respond",
-        threadId: projection.thread.id,
-        text: answerText({ ...input, questions: item.questions }),
-      });
+      const { threads, projection, scope } = yield* readQuestion(input);
       const result = yield* threads
         .dispatch({
           type: "runtime-request.respond",
@@ -278,8 +224,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           commandId: yield* newCommandId(),
           requestId: input.requestId,
           answers: input.answers,
-          // ardud missions: core - an agent's answer is recorded as the agent's.
-          createdBy: principalActor(mcpPrincipal(scope, caller)),
+          // ardud: an agent's answer is recorded as the agent's.
+          createdBy: scope.thread !== undefined ? "agent" : "system",
         })
         .pipe(Effect.mapError(dispatchFailure));
       return { sequence: result.sequence };
@@ -314,17 +260,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     }),
   ),
   t3_queue_edit: writesThread((input) =>
-    // ardud missions: router - editing a queued message rewrites what the thread will read.
-    guardThreadWrite({ path: "queued-edit", threadId: input.threadId, text: input.text }).pipe(
-      Effect.andThen(
-        dispatch(input.threadId, (common) => ({
-          ...common,
-          type: "queued-run.edit",
-          runId: input.queuedRunId,
-          text: input.text,
-        })),
-      ),
-    ),
+    dispatch(input.threadId, (common) => ({
+      ...common,
+      type: "queued-run.edit",
+      runId: input.queuedRunId,
+      text: input.text,
+    })),
   ),
   t3_queue_cancel: writesThread((input) =>
     dispatch(input.threadId, (common) => ({

@@ -1637,7 +1637,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
-  // ardud missions: guard - a bearer's prompt is a person's turn too.
+  // ardud: - a bearer's prompt is a person's turn too.
   it.effect("windows a thread of bearer prompts by its turns, not server notices", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;

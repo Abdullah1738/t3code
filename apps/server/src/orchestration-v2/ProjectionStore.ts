@@ -88,8 +88,8 @@ import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
-// ardud missions: guard
-import { CONTROL_MESSAGE_PREFIX } from "../ardud/missions/guard/turns.ts";
+// ardud: control turns
+import { CONTROL_MESSAGE_PREFIX } from "../ardud/control/turns.ts";
 import {
   isThreadHistoryUserTurn,
   isConversationHistoryItem,
@@ -2927,7 +2927,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   SELECT ordinal
                   FROM turn_anchors
                   WHERE json_extract(payload_json, '$.createdBy') = 'user'
-                    -- ardud missions: guard - a bearer's prompt is a person's turn too.
+                    -- ardud: a bearer's prompt is a person's turn too.
                     OR (
                       json_extract(payload_json, '$.createdBy') = 'system'
                       AND (
@@ -5236,7 +5236,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         { type: "user_message" }
       >["inputIntent"];
       readonly createdBy?: "user" | "agent" | "system";
-      // ardud missions: guard - a bearer's prompt is a person's turn too.
+      // ardud: a bearer's prompt is a person's turn too.
       readonly creationSource?: string;
       readonly messageId?: MessageId;
     };

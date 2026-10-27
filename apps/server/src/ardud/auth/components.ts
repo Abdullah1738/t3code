@@ -31,7 +31,7 @@ export interface ComponentSpec {
 const READ_OPERATE = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope] as const;
 
 /**
- * Every caller of the control and missions APIs. None needs more than
+ * Every caller of the control API. None needs more than
  * orchestration read/operate, so none can mint pairing links or sessions.
  */
 export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
@@ -41,7 +41,7 @@ export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
   },
   "telegram-bridge": {
     scopes: READ_OPERATE,
-    description: "Telegram bridge: pending requests, answers, board.",
+    description: "Telegram bridge: pending requests, answers.",
   },
   "stream-recovery": {
     scopes: READ_OPERATE,
@@ -52,7 +52,6 @@ export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
     description: "PR review workflow: its own threads, review plans, records, holds, approvals.",
   },
   coord: { scopes: READ_OPERATE, description: "coord pump and forward mode." },
-  scribe: { scopes: READ_OPERATE, description: "Scribe runner: lanes, notes, editor, reports." },
   memory: { scopes: READ_OPERATE, description: "memory-system session reaper." },
   rcsim: { scopes: READ_OPERATE, description: "Run Cloud sim monitor nudges." },
   offbox: { scopes: READ_OPERATE, description: "offbox-monitor load nudges." },
@@ -65,7 +64,6 @@ export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
     scopes: [AuthOrchestrationReadScope],
     description: "coord-guard OpenCode plugin: thread reads.",
   },
-  "mission-cli": { scopes: READ_OPERATE, description: "The `mission` desk CLI." },
   t3ctl: { scopes: READ_OPERATE, description: "Agents and scripts running t3ctl by hand." },
 };
 

@@ -17,8 +17,8 @@ import {
   type KanbanActor,
   type KanbanBlock,
   type KanbanBoard,
+  type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
-  type KanbanBoardSummary,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanCardModel,
@@ -176,8 +176,8 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
   ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
   readonly watch: (boardId: KanbanBoard["id"]) => Stream.Stream<KanbanWatchEvent, KanbanError>;
-  /** Every board with its list counts, again whenever one changes. */
-  readonly boardSummaries: Stream.Stream<ReadonlyArray<KanbanBoardSummary>, KanbanError>;
+  /** Every board with its list counts, then what changed whenever a count, board or thread does. */
+  readonly boardSummaries: Stream.Stream<ReadonlyArray<KanbanBoardListEntry>, KanbanError>;
   /** Sends a change from another board service (scripts) to every watcher. */
   readonly announce: (boardId: KanbanBoard["id"], change: KanbanChange) => Effect.Effect<void>;
   /** Every board change from the moment the scope subscribes. */
@@ -1007,15 +1007,15 @@ const make = Effect.gen(function* () {
     yield* linkThread(
       {
         threadId,
-      boardId: board.id,
-      cardId: extra.cardId ?? null,
-      role: "evaluator",
-      purpose: Briefs.purposeKey(purpose),
-      discussionId:
-        purpose.kind === "discussion" ? KanbanDiscussionId.make(purpose.discussionId) : null,
-      model: board.evaluatorModel,
-      startedAt: at,
-      endedAt: null,
+        boardId: board.id,
+        cardId: extra.cardId ?? null,
+        role: "evaluator",
+        purpose: Briefs.purposeKey(purpose),
+        discussionId:
+          purpose.kind === "discussion" ? KanbanDiscussionId.make(purpose.discussionId) : null,
+        model: board.evaluatorModel,
+        startedAt: at,
+        endedAt: null,
       },
       title,
     );

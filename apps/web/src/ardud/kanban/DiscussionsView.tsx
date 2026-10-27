@@ -8,7 +8,7 @@ import {
   type KanbanBoardState,
   linkLabels,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { ageView } from "@t3tools/client-runtime/ardud/missions";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";

@@ -27,8 +27,6 @@ import {
   restartCancelledBackgroundWorkNote,
   restartContinuationNote,
 } from "./RestartBackgroundNote.ts";
-// ardud missions: recovery
-import { recoveryTakesRestartedRun } from "../ardud/missions/recovery/continuationGate.ts";
 
 const CONTINUE_PROMPT = "Continue where you left off.";
 
@@ -276,9 +274,6 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     );
     const noteText =
       note.work.length === 0 ? undefined : restartCancelledBackgroundWorkNote(note.work);
-    // ardud missions: recovery - mission recovery resumes its member threads itself, in order;
-    // a pending background-work note rides on that run. A settled note-only wake still goes.
-    if (!note.settled && (yield* recoveryTakesRestartedRun(projection.thread, source))) return;
     const text =
       noteText === undefined
         ? CONTINUE_PROMPT

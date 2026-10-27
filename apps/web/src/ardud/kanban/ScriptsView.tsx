@@ -10,7 +10,7 @@ import {
   sortScripts,
   type ScriptRunTone,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { ageView } from "@t3tools/client-runtime/ardud/missions";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 import type { KanbanScript, KanbanScriptRun } from "@t3tools/contracts";
 
 import { Button } from "../../components/ui/button";

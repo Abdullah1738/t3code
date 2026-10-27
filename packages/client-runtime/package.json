@@ -59,17 +59,13 @@
       "types": "./src/ardud/scheduleDraft.ts",
       "default": "./src/ardud/scheduleDraft.ts"
     },
-    "./ardud/missions": {
-      "types": "./src/ardud/missions/index.ts",
-      "default": "./src/ardud/missions/index.ts"
+    "./ardud/common": {
+      "types": "./src/ardud/common/index.ts",
+      "default": "./src/ardud/common/index.ts"
     },
     "./ardud/imessage": {
       "types": "./src/ardud/imessage/index.ts",
       "default": "./src/ardud/imessage/index.ts"
-    },
-    "./ardud/missions/mobile": {
-      "types": "./src/ardud/missions/mobile/index.ts",
-      "default": "./src/ardud/missions/mobile/index.ts"
     },
     "./ardud/kanban": {
       "types": "./src/ardud/kanban/index.ts",

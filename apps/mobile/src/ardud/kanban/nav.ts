@@ -2,7 +2,7 @@ import { StackActions, useNavigation } from "@react-navigation/native";
 import type { ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 
-import { useMissionsEnvironmentId } from "../missions/missionsStore";
+import { usePairedEnvironmentId } from "../common/environment";
 import type { KanbanRecordKind } from "./logic";
 
 export interface KanbanNav {
@@ -21,7 +21,7 @@ export interface KanbanNav {
  */
 export function useKanbanNav(boardId: string): KanbanNav {
   const navigation = useNavigation();
-  const environmentId = useMissionsEnvironmentId();
+  const environmentId = usePairedEnvironmentId();
   return useMemo(() => {
     const push = (kind: KanbanRecordKind, id?: string) =>
       navigation.dispatch(StackActions.push("KanbanRecord", { kind, boardId, id }));

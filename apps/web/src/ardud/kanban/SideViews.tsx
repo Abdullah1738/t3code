@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { ageView } from "@t3tools/client-runtime/ardud/missions";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 
 import ChatMarkdown from "../../components/ChatMarkdown";
 import { cn } from "../../lib/utils";

@@ -76,7 +76,7 @@ export function withCreationProvenance(
     case "thread.merge_back":
     case "delegated_task.request":
       return { ...command, ...provenance };
-    // ardud missions: core - an answer becomes a message; keep who sent it.
+    // ardud: - an answer becomes a message; keep who sent it.
     case "runtime-request.respond":
       return { ...command, createdBy: provenance.createdBy };
     default:
@@ -137,7 +137,7 @@ export interface ThreadManagementSendInput {
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
   readonly contextReset?: boolean;
-  // ardud missions: guard - structured context (the bridge's channel guidance) beside the text.
+  // ardud: - structured context (the bridge's channel guidance) beside the text.
   readonly context?: OrchestrationMessageContext;
 }
 
@@ -803,7 +803,7 @@ const make = Effect.gen(function* () {
       createdBy: input.createdBy,
       creationSource: input.creationSource,
       ...(input.contextReset === true ? { contextReset: true } : {}),
-      // ardud missions: guard
+      // ardud:
       ...(input.context === undefined ? {} : { context: input.context }),
     });
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {

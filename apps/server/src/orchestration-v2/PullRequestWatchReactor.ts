@@ -32,9 +32,6 @@ import {
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
-// ardud missions: guard
-import { optionalAuthorityStore } from "../ardud/missions/guard/authority.ts";
-import { admitWatchWake } from "../ardud/missions/guard/watches.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { evaluatePullRequestWatch, pullRequestWatchMessage } from "./pullRequestWatch.ts";
@@ -195,8 +192,6 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const crypto = yield* Crypto.Crypto;
-  // ardud missions: guard
-  const guardAuthority = yield* optionalAuthorityStore;
   const bootedAt = yield* Clock.currentTimeMillis;
   const lives = new Map<string, WatchLife>();
 
@@ -277,16 +272,6 @@ export const make = Effect.gen(function* () {
     endedWatch?: ThreadPullRequestWatch,
   ) {
     const uuid = yield* crypto.randomUUIDv4();
-    // ardud missions: guard - a wake speaks as the watch's initiator; a refused
-    // one is held by the guard, and the watch state is still recorded.
-    const admitted =
-      wake !== undefined &&
-      (yield* admitWatchWake(guardAuthority, {
-        threadId: target.thread.id,
-        link: target.link,
-        text: wake.text,
-        wakeId: uuid,
-      }));
     yield* engine.dispatch({
       type: "thread.pull-request-watch.sync",
       commandId: CommandId.make(`server:pr-watch:${target.thread.id}:${uuid}`),
@@ -295,7 +280,7 @@ export const make = Effect.gen(function* () {
       startedAt: target.watch.startedAt,
       watch: next,
       ...(endedWatch === undefined ? {} : { endedWatch }),
-      ...(wake === undefined || !admitted
+      ...(wake === undefined
         ? {}
         : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
     });

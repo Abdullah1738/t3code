@@ -12,7 +12,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 
-import { applyChange, follow, summaries, tallyBoards } from "./summaries.ts";
+import { applyChange, follow, listUpdate, summaries, tallyBoards } from "./summaries.ts";
 
 const opus = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
 const at = "2026-10-26T00:00:00Z";
@@ -123,7 +123,9 @@ describe("board summaries", () => {
   });
 
   it("follows changes and reports only those that move a count", () => {
-    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+    const tallies = tallyBoards([
+      { board: board("b1"), cards: [], discussions: [], threadIds: [] },
+    ]);
     const counts = () => {
       const [summary] = summaries(tallies);
       return summary && [summary.needsOwner, summary.running, summary.unread];
@@ -160,7 +162,9 @@ describe("board summaries", () => {
   });
 
   it("keeps every thread a board starts, once", () => {
-    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+    const tallies = tallyBoards([
+      { board: board("b1"), cards: [], discussions: [], threadIds: [] },
+    ]);
     const started = {
       _tag: "thread" as const,
       thread: { threadId: thread, title: "#1 work", running: true, lastActivityAt: at },
@@ -170,8 +174,41 @@ describe("board summaries", () => {
     expect(summaries(tallies)[0]?.threadIds).toEqual([thread]);
   });
 
+  it("sends the whole list first, then only changed boards and new threads", () => {
+    const tallies = tallyBoards([
+      { board: board("b1"), cards: [], discussions: [], threadIds: [thread] },
+      { board: board("b2"), cards: [], discussions: [], threadIds: [] },
+    ]);
+    const shape = (first: boolean) =>
+      listUpdate(tallies, first).map((entry) => [
+        entry.boardId,
+        entry.board?.name ?? null,
+        entry.threadIds,
+      ]);
+    expect(shape(true)).toEqual([
+      ["b1", "b1", [thread]],
+      ["b2", "b2", []],
+    ]);
+    const second = ThreadId.make("t2");
+    applyChange(tallies, "b1", {
+      _tag: "thread",
+      thread: { threadId: second, title: "#2 work", running: true, lastActivityAt: at },
+    });
+    applyChange(tallies, "b2", { _tag: "board", board: board("b2", "Renamed") });
+    expect(shape(false)).toEqual([
+      ["b1", null, [second]],
+      ["b2", "Renamed", []],
+    ]);
+    expect(shape(false)).toEqual([
+      ["b1", null, []],
+      ["b2", null, []],
+    ]);
+  });
+
   it("adds new boards and renames from board changes", () => {
-    const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+    const tallies = tallyBoards([
+      { board: board("b1"), cards: [], discussions: [], threadIds: [] },
+    ]);
     expect(applyChange(tallies, "b1", { _tag: "board", board: board("b1", "Renamed") })).toBe(true);
     expect(applyChange(tallies, "b2", { _tag: "board", board: board("b2") })).toBe(true);
     expect(summaries(tallies).map((summary) => summary.board.name)).toEqual(["Renamed", "b2"]);
@@ -179,7 +216,9 @@ describe("board summaries", () => {
 
   it.effect("streams the list first, then only changes that move a count", () =>
     Effect.gen(function* () {
-      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+      const tallies = tallyBoards([
+        { board: board("b1"), cards: [], discussions: [], threadIds: [] },
+      ]);
       const changes = Stream.fromIterable([
         { boardId: "b1", change: { _tag: "card" as const, card: card("c1") } },
         {
@@ -198,7 +237,9 @@ describe("board summaries", () => {
 
   it.effect("sends one list for a burst of changes that arrive together", () =>
     Effect.gen(function* () {
-      const tallies = tallyBoards([{ board: board("b1"), cards: [], discussions: [], threadIds: [] }]);
+      const tallies = tallyBoards([
+        { board: board("b1"), cards: [], discussions: [], threadIds: [] },
+      ]);
       const owner = (id: string) => ({
         boardId: "b1",
         change: { _tag: "card" as const, card: card(id, { stage: "needs_owner" }) },

@@ -25,7 +25,7 @@ import {
   SERVICE_LAUNCHER_PROTOCOL,
 } from "../cloud/serviceProtocol.ts";
 import * as ServiceLauncherClient from "../cloud/serviceLauncherClient.ts";
-// ardud missions: core
+// ardud:
 import { MAC_LINK_NOT_OWNER } from "../ardud/auth/SessionOrigins.ts";
 import {
   makePersistedServerRuntimeState,
@@ -310,7 +310,7 @@ describe("t3 pair", () => {
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  // ardud missions: core
+  // ardud:
   it.effect("N1: links made on the Mac are never owner links, even before any owner", () =>
     withDescriptorServer((origin) =>
       Effect.gen(function* () {

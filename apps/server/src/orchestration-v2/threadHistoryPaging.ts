@@ -5,8 +5,8 @@ import type {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
-// ardud missions: guard
-import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
+// ardud: control turns
+import { countsAsUserTurn } from "../ardud/control/turns.ts";
 
 /**
  * Item/byte budgets only apply to histories without turn starts; tool activity
@@ -52,7 +52,7 @@ type HistoryRow = Pick<
     readonly messageId?: string;
     readonly inputIntent?: string;
     readonly createdBy?: string;
-    // ardud missions: guard - a bearer's prompt is a person's turn too.
+    // ardud: a bearer's prompt is a person's turn too.
     readonly creationSource?: string;
     readonly runId?: string | null;
   };
@@ -209,7 +209,7 @@ export function threadHistoryTurnStarts(
 
 export function isThreadHistoryUserTurn(item: HistoryRow["item"]): boolean {
   return (
-    // ardud missions: guard - a bearer's prompt is a person's turn too.
+    // ardud: a bearer's prompt is a person's turn too.
     isThreadHistoryTurnStart(item) && item.type === "user_message" && countsAsUserTurn(item)
   );
 }

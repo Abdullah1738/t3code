@@ -12,7 +12,7 @@ import {
   subtaskSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/missions";
+import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
 import type { KanbanCard, KanbanCardEvent, KanbanStage } from "@t3tools/contracts";
 
 import {
@@ -25,7 +25,7 @@ import {
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { useNowMs } from "../missions/useNowMs";
+import { useNowMs } from "./useNowMs";
 import { PrGlyph } from "./CardTile";
 import { Chat, Composer } from "./Chat";
 import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from "./kanbanStore";

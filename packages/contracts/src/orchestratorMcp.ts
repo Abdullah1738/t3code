@@ -649,8 +649,7 @@ export const OrchestratorMcpRequestSecretResult = Schema.Union([
   Schema.Struct({
     status: Schema.Literals(["declined", "cancelled", "timed_out"]).annotate({
       description:
-        // ardud missions: core - a mission master may withdraw a member's card
-        "declined: the user chose not to. cancelled: the request ended with the run, or your mission's master withdrew it. timed_out: the user did not answer in time; the card is closed, so ask again with a new clientRequestId if still needed.",
+        "declined: the user chose not to. cancelled: the request ended with the run. timed_out: the user did not answer in time; the card is closed, so ask again with a new clientRequestId if still needed.",
     }),
   }),
 ]);

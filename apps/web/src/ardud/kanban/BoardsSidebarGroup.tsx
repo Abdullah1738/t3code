@@ -12,7 +12,7 @@ import { BoardIcon } from "./boardIcon";
 import { useBoards } from "./kanbanStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
-import "../missions/missions.css";
+import "./tokens.css";
 import "./kanban.css";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-boards:sidebar";

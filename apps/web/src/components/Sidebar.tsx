@@ -279,10 +279,7 @@ import {
   useComboboxFilter,
 } from "./ui/combobox";
 import { SidebarContent, SidebarGroup, useSidebar } from "./ui/sidebar";
-// ardud missions: ui-web
-import { MissionsSidebarGroup } from "../ardud/missions/MissionsSidebarGroup";
-import { useMissionList } from "../ardud/missions/missionsStore";
-import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
+// ardud imessage: ui-web
 import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
 import { IMessageSidebarGroup } from "../ardud/imessage/IMessageSidebarGroup";
 // ardud kanban: ui-web
@@ -465,13 +462,9 @@ function useSidebarThreads(input: {
 }) {
   const { projectScopeKey, scopedProjectKeys, serverConfigs, optimisticDrop, routeThreadRef } =
     input;
-  // ardud missions: ui-web (a mission's threads open from the mission, not the list)
-  const missionThreads = missionThreadIds(useMissionList());
+  // ardud kanban/imessage: ui-web (board and iMessage threads open from their own groups)
   const threads = withoutIMessageThreads(
-    withoutBoardThreads(
-      withoutMissionThreads(useThreadShells(), missionThreads),
-      useBoardThreadIds(),
-    ),
+    withoutBoardThreads(useThreadShells(), useBoardThreadIds()),
   );
   const routeRowThreadKey =
     routeThreadRef === null
@@ -4733,14 +4726,11 @@ export default function Sidebar() {
           </SidebarGroup>
         }
       >
-        {/* ardud missions: ui-web */}
         {/* ardud kanban: ui-web */}
         {!isSearchingThreads ? <BoardsSidebarGroup /> : null}
-        {!isSearchingThreads ? <MissionsSidebarGroup /> : null}
         {/* ardud imessage: ui-web */}
         {!isSearchingThreads ? <IMessageSidebarGroup /> : null}
         {/* end ardud imessage: ui-web */}
-        {/* end ardud missions: ui-web */}
         <SidebarGroup className="flex-1" role="presentation">
           {isSearchingThreads ? (
             threadSearchResults.length > 0 ? (

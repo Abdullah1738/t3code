@@ -773,7 +773,7 @@ it.effect.each([" /COMPACT ", "/logout"])(
     }),
 );
 
-// ardud missions: guard - a bearer's prompt is a person's turn too.
+// ardud: - a bearer's prompt is a person's turn too.
 it.effect.each([
   { name: "control", messageId: "ardud-control:send:t:msg-1", source: "server", titled: true },
   { name: "browser", messageId: "bearer-browser-message", source: "web", titled: true },

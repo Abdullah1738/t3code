@@ -7,7 +7,7 @@ import {
   type KanbanBoardState,
   type PresenceFace,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { formatTimeOfDay } from "@t3tools/client-runtime/ardud/missions";
+import { formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
 import type {
   KanbanBlock,
   KanbanDiscussion,
@@ -30,7 +30,7 @@ import { threadContextRecord, threadContextReference } from "../../lib/composerC
 import { formatInlineContextReference } from "../../lib/composerContextReferences";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { useNowMs } from "../missions/useNowMs";
+import { useNowMs } from "./useNowMs";
 import { kanban, kanbanErrorMessage, runAction, useFeed, useMessages } from "./kanbanStore";
 import { KanbanMarkdown } from "./links";
 import { Avatar, Chip, Glyph, stageGlyph } from "./parts";
