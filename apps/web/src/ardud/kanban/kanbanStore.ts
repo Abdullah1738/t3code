@@ -67,11 +67,13 @@ export function useScripts(boardId: string): ReadonlyArray<KanbanScript> | undef
   return useStore(kanban.scripts(boardId));
 }
 
-export function useScriptRuns(
+/** A script's runs with the read's failure and retry, so a failed read can say so. */
+export function useScriptRunsFeed(
   boardId: string,
   scriptId: string,
-): ReadonlyArray<KanbanScriptRun> | undefined {
-  return useStore(kanban.scriptRuns(boardId, scriptId));
+): { readonly runs: ReadonlyArray<KanbanScriptRun> | undefined; readonly feed: FeedState } {
+  const store = kanban.scriptRuns(boardId, scriptId);
+  return { runs: useStore(store), feed: useFeed(store) };
 }
 
 export interface FeedState {
