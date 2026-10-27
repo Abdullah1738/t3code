@@ -5,10 +5,11 @@ import type {
   KanbanScriptRun,
   KanbanWatchEvent,
 } from "@t3tools/contracts";
+import { Atom } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { createKanbanClient } from "./client.ts";
-import { KanbanOfflineError, type KanbanTransport } from "./transport.ts";
+import { KanbanOfflineError, type KanbanRequestTag, type KanbanTransport } from "./transport.ts";
 
 interface Pending {
   readonly tag: string;
@@ -26,6 +27,7 @@ function fakeTransport() {
   const lists: Array<(list: ReadonlyArray<KanbanBoardListEntry>) => void> = [];
   const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
+    permission: () => Atom.make(() => true),
     stream(tag, _input, onValue, onError) {
       streams += 1;
       if (tag === "kanban.boards") {

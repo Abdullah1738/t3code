@@ -11,7 +11,7 @@ import {
   type ScriptRunTone,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanScript, KanbanScriptRun } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS, type KanbanScript, type KanbanScriptRun } from "@t3tools/contracts";
 
 import { Button } from "../../components/ui/button";
 import { Switch } from "../../components/ui/switch";
@@ -20,6 +20,7 @@ import {
   kanban,
   kanbanErrorMessage,
   runAction,
+  useKanbanPermission,
   useScriptRunsFeed,
   useScripts,
 } from "./kanbanStore";
@@ -43,10 +44,13 @@ const startLabel = (startedAt: string, nowMs: number) => {
 
 function ScriptSwitch(props: { script: KanbanScript }) {
   const { script } = props;
+  const canToggle = useKanbanPermission(KANBAN_WS_METHODS.scriptEnable);
   return (
     <Switch
       size="sm"
       checked={script.enabled}
+      disabled={!canToggle}
+      title={canToggle ? undefined : "Your connection can't change scripts"}
       aria-label={`${script.name} on`}
       onCheckedChange={(enabled) =>
         void runAction("Couldn't change the script", () =>
@@ -114,6 +118,7 @@ export function ScriptsView(props: { boardId: string; nowMs: number }) {
 function ScriptDetail(props: { boardId: string; script: KanbanScript; nowMs: number }) {
   const { script } = props;
   const { runs, feed } = useScriptRunsFeed(props.boardId, script.id);
+  const canRun = useKanbanPermission(KANBAN_WS_METHODS.scriptRun);
   const [runId, setRunId] = useState<number | undefined>(undefined);
   const running = scriptState(script).tone === "running";
   const shown = runs?.find((run) => run.id === runId) ?? runs?.[0];
@@ -127,7 +132,8 @@ function ScriptDetail(props: { boardId: string; script: KanbanScript; nowMs: num
         <Button
           variant="outline"
           size="sm"
-          disabled={running}
+          disabled={running || !canRun}
+          title={canRun ? undefined : "Your connection can't run scripts"}
           onClick={() =>
             void runAction("Couldn't run the script", () => kanban.runScript(script.id))
           }

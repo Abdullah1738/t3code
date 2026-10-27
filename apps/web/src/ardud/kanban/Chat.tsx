@@ -19,6 +19,7 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import { formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
 import {
+  KANBAN_WS_METHODS,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
@@ -63,7 +64,14 @@ import { useAssetUrls } from "../../assets/assetUrls";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useServerConfigs } from "../../state/entities";
 import { useNowMs } from "./useNowMs";
-import { kanban, kanbanErrorMessage, runAction, useFeed, useMessages } from "./kanbanStore";
+import {
+  kanban,
+  kanbanErrorMessage,
+  runAction,
+  useFeed,
+  useKanbanPermission,
+  useMessages,
+} from "./kanbanStore";
 import { KanbanMarkdown } from "./links";
 import { Avatar, Chip, Glyph, stageGlyph } from "./parts";
 import {
@@ -82,6 +90,7 @@ export function Chat(props: {
 }) {
   const { boardId, discussion, state } = props;
   const messages = useMessages(boardId, discussion.id);
+  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
   const feed = useFeed(kanban.messages(boardId, discussion.id));
   const nowMs = useNowMs();
   const presence = discussionPresence(discussion, messages ?? [], nowMs);
@@ -147,6 +156,7 @@ export function Chat(props: {
       <Composer
         placeholder="Message"
         attachments
+        blockedReason={canPost ? null : "Your connection can't post here"}
         onSend={(blocks) => kanban.post(boardId, discussion.id, blocks)}
       />
     </div>
@@ -564,10 +574,14 @@ export function Composer(props: {
   placeholder: string;
   onSend: (blocks: KanbanBlock[]) => Promise<unknown>;
   attachments?: boolean;
+  /** Why sending is off (no grant); the composer stays visible with this as its note. */
+  blockedReason?: string | null;
 }) {
   const environmentId = usePrimaryEnvironmentId();
+  const blocked = props.blockedReason ?? null;
   const serverConfig = useServerConfigs().get(environmentId ?? ("" as EnvironmentId));
   const canAttach =
+    blocked === null &&
     props.attachments === true &&
     environmentId !== null &&
     serverConfig?.environment.capabilities.attachmentUploads === true;
@@ -709,7 +723,7 @@ export function Composer(props: {
     // A ref, not state: a second Enter or click before the re-render must not
     // start another send. Taken before any wait, so the lock holds while files
     // are still being prepared.
-    if (sendingRef.current) return;
+    if (sendingRef.current || blocked !== null) return;
     sendingRef.current = true;
     setSending(true);
     try {
@@ -890,8 +904,8 @@ export function Composer(props: {
           cursor={cursor}
           contextRecords={records}
           skills={NO_SKILLS}
-          disabled={false}
-          placeholder={props.placeholder}
+          disabled={blocked !== null}
+          placeholder={blocked ?? props.placeholder}
           ariaLabel={props.placeholder}
           className="max-h-40 min-h-5 text-sm leading-5 text-(--m-text)"
           placeholderClassName="leading-5 text-(--m-muted)"
@@ -913,7 +927,10 @@ export function Composer(props: {
         </div>
         <button
           type="submit"
-          disabled={(text.trim().length === 0 && files.length === 0) || sending}
+          disabled={
+            (text.trim().length === 0 && files.length === 0) || sending || blocked !== null
+          }
+          title={blocked ?? undefined}
           aria-label="Send"
           className="grid size-8 shrink-0 place-items-center rounded-full bg-(--m-text) text-(--m-ground) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"
         >

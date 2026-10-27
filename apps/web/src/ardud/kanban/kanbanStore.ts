@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import { useSyncExternalStore } from "react";
 
 import type {
@@ -12,6 +13,7 @@ import {
   boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
+  type KanbanRequestTag,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { FeedFailure, SnapshotStore } from "@t3tools/client-runtime/ardud/common";
@@ -61,6 +63,14 @@ export function useCardDetail(boardId: string, cardId: string): KanbanCardDetail
 
 export function useWiki(boardId: string): ReadonlyArray<KanbanWikiPage> | undefined {
   return useStore(kanban.wiki(boardId));
+}
+
+/**
+ * Whether this connection's grants allow a kanban write. The server still
+ * checks every call; this only decides whether the control is offered.
+ */
+export function useKanbanPermission(tag: KanbanRequestTag): boolean {
+  return useAtomValue(kanban.permission(tag));
 }
 
 export function useScripts(boardId: string): ReadonlyArray<KanbanScript> | undefined {
