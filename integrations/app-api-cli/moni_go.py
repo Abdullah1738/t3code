@@ -230,12 +230,17 @@ def read_bridge(path=None):
             continue
         text = item.get('text')
         tapback = isinstance(text, str) and bool(TAPBACK.match(text) or TAPBACK_ATTACHMENT.match(text))
-        rows.append({'id': f'{BRIDGE_ID_PREFIX}{row_id}', 'created_at': _bridge_time(item.get('receivedAt')),
+        # sentAt is when she sent it; receivedAt can be a late backfill. Fall back only when sentAt is absent.
+        sent = item.get('sentAt')
+        when = sent if sent is not None else item.get('receivedAt')
+        rows.append({'id': f'{BRIDGE_ID_PREFIX}{row_id}', 'created_at': _bridge_time(when),
+                     '_receipt_time': sent is None,
                      'text': text, '_bridge': True,
                      # Only her number starts an order; a tapback or her other address can only call it off.
                      '_cancel_only': tapback or who != _address(MONI_NUMBER),
                      # A voice note's words are not in the row, so it could be a cancel.
-                     '_opaque': item.get('isAudioMessage') is True})
+                     '_opaque': item.get('isAudioMessage') is True,
+                     '_source': str(db)})
     return rows
 
 
@@ -249,6 +254,38 @@ def read_bridges(paths):
         merged.extend(rows)
     merged.sort(key=lambda row: _parse_time(row.get('created_at')) or _NEVER)
     return merged
+
+
+def _source_of(row):
+    return row.get('_source') or 'imsg'
+
+
+# Without a send time (sentAt) a bridge row is ordered by ingestion (receivedAt), which can lag
+# her send by any amount. A cancel from another source that close to such a go may really come
+# after it, so it fails closed. Rows with a send time keep their sender chronology.
+RECEIPT_SKEW_MINUTES = 15
+
+
+def _ambiguous_receipt_order(go_row, mine):
+    """A cancel from another bridge DB close to a go that has no send time, ordered only by receipt.
+
+    Chat 45 rows are excluded: their own guard in verify already covers them.
+    """
+    go_at = _parse_time(go_row.get('created_at'))
+    skew = dt.timedelta(minutes=RECEIPT_SKEW_MINUTES)
+    if not go_row.get('_bridge'):
+        return None
+    for row in mine:
+        if not row.get('_bridge') or _source_of(row) == _source_of(go_row):
+            continue
+        if not (row.get('_opaque') or reads_as_cancel(row.get('text'))):
+            continue
+        if not (row.get('_receipt_time') or go_row.get('_receipt_time')):
+            continue
+        at = _parse_time(row.get('created_at'))
+        if at is None or go_at is None or abs(at - go_at) <= skew:
+            return row
+    return None
 
 
 def _moni_rows(rows, oldest, latest, bridge_rows=()):
@@ -334,6 +371,9 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
         raise RuntimeError('MONI_GO_NOT_FOUND')
     if any(mid > _row_id(go_row) for mid in unparsed) or unheard is not None:
         # A newer message of hers has no readable time or words; it could be a cancel after the go.
+        raise RuntimeError('MONI_GO_UNVERIFIABLE')
+    if _ambiguous_receipt_order(go_row, mine) is not None:
+        # Her go and a cancel from another source are ordered only by receipt time, close enough to swap.
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
     if cancel_row is None and bridge_go_at is not None:
         # Bridge times are when the bridge stored a message, which can lag her send by any

@@ -465,8 +465,9 @@ class CliGateTests(unittest.TestCase):
 
 
 def _bridge_payload(text, sender, minutes_ago, *, audio=False):
-    at = NOW - dt.timedelta(minutes=minutes_ago)
-    return {'text': text, 'sender': sender, 'isAudioMessage': audio, 'receivedAt': int(at.timestamp() * 1000)}
+    at = int((NOW - dt.timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    # The bridge writes sentAt (her send time) alongside receivedAt; tests use the real shape.
+    return {'text': text, 'sender': sender, 'isAudioMessage': audio, 'receivedAt': at, 'sentAt': at}
 
 
 class GroupChatGoTests(unittest.TestCase):
@@ -588,6 +589,69 @@ class GroupChatGoTests(unittest.TestCase):
                            '--moni-go', 'Order pls', '--moni-chat', 'group-sb_gro'])
         self.assertEqual(code, 0)
         verify.assert_called_once_with('Order pls', chat='group-sb_gro')
+
+
+class DelayedSourceOrderTests(unittest.TestCase):
+    """Bridge rows sent at one time can be ingested later; cross-source order must not trust receipt time."""
+
+    def sent(self, row_id, text, sent_ago, recv_ago, *, group=None, sender=moni_go.MONI_NUMBER):
+        at = lambda m: int((NOW - dt.timedelta(minutes=m)).timestamp() * 1000)
+        payload = {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                   'receivedAt': at(recv_ago), 'sentAt': at(sent_ago), 'source': 'typed', 'sender': sender}
+        return (row_id, payload, 'done'), group
+
+    def recv_only(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db):
+        root = _tempfile.mkdtemp(prefix='moni-delay-test-')
+        dbs = {}
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            dbs[name] = path
+        paths = list(dbs.values())
+        return moni_go.verify(go, now=NOW, runner=history(), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_group_go_sent_before_her_1to1_cancel_is_called_off_even_if_received_later(self):
+        go, _ = self.sent('G1', 'yes order it', sent_ago=5, recv_ago=1)
+        cancel, _ = self.sent('P1', 'nvm', sent_ago=2, recv_ago=2)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [go], 'moni': [cancel]})
+
+    def test_1to1_go_sent_before_group_cancel_is_called_off_even_if_received_later(self):
+        go, _ = self.sent('P1', 'yes order it', sent_ago=5, recv_ago=1)
+        cancel, _ = self.sent('G1', 'nvm', sent_ago=2, recv_ago=2)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'moni': [go], 'group-sb_gro': [cancel]})
+
+    def test_cancel_sent_clearly_before_the_go_does_not_count_across_groups(self):
+        cancel, _ = self.sent('G1', 'nvm', sent_ago=20, recv_ago=1)
+        go, _ = self.sent('G2', 'yes order it', sent_ago=5, recv_ago=5)
+        got = self.run_case('yes order it', {'moni': [], 'group-a': [cancel], 'group-b': [go]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_ambiguous_cross_group_order_fails_closed(self):
+        # No sentAt on either row: ordering is only receipt time, so a close cancel may really follow the go.
+        go = self.recv_only('G1', 'yes order it', 5)
+        cancel = self.recv_only('G2', 'nvm', 4)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [], 'group-a': [go], 'group-b': [cancel]})
+
+    def test_missing_sent_time_falls_back_to_received(self):
+        at = int((NOW - dt.timedelta(minutes=3)).timestamp() * 1000)
+        row = ('R1', {'id': 'R1', 'text': 'yes order it', 'isAudioMessage': False, 'attachments': [],
+                      'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+        self.assertEqual(self.run_case('yes order it', {'moni': [row]})['text'], 'yes order it')
 
 
 if __name__ == '__main__':
