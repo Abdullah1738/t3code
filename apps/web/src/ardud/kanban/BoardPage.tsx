@@ -45,6 +45,7 @@ import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
 import { SettingsView } from "./SettingsView";
 import { AutomationsView, WikiView } from "./SideViews";
+import { ThreadsView } from "./ThreadsView";
 import "./tokens.css";
 import "./kanban.css";
 
@@ -282,6 +283,12 @@ function BoardBody(props: {
       return (
         <div className="flex min-h-0 flex-1 flex-col pe-5">
           <WikiView boardId={props.boardId} nowMs={nowMs} />
+        </div>
+      );
+    case "threads":
+      return (
+        <div className="flex min-h-0 flex-1 flex-col pe-5">
+          <ThreadsView boardId={props.boardId} state={state} />
         </div>
       );
     case "settings":

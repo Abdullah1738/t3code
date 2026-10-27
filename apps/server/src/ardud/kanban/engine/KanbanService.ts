@@ -282,6 +282,10 @@ export interface KanbanServiceShape {
   readonly discussions: (
     boardId: KanbanBoard["id"],
   ) => Effect.Effect<ReadonlyArray<KanbanDiscussion>, KanbanError>;
+  /** Every thread a board started (work, review, evaluator), open or ended. */
+  readonly threads: (
+    boardId: KanbanBoard["id"],
+  ) => Effect.Effect<ReadonlyArray<KanbanThreadLink>, KanbanError>;
   readonly discussion: (id: KanbanDiscussion["id"]) => Effect.Effect<KanbanDiscussion, KanbanError>;
   readonly createDiscussion: (
     boardId: KanbanBoard["id"],
@@ -3040,6 +3044,7 @@ const make = Effect.gen(function* () {
     setGoal,
     setGroups,
     discussions: (boardId) => read(store.discussions(boardId)),
+    threads: (boardId) => read(store.threadLinks({ boardId, open: false })),
     discussion: (id) => read(discussionOf(id)),
     createDiscussion,
     updateDiscussion,

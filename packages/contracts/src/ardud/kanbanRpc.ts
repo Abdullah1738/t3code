@@ -48,6 +48,7 @@ export const KANBAN_WS_METHODS = {
   subscribe: "kanban.subscribe",
   card: "kanban.card",
   discussions: "kanban.discussions",
+  threads: "kanban.threads",
   messages: "kanban.messages",
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
@@ -150,6 +151,7 @@ export const KanbanRpcs = RpcGroup.make(
   }),
   call(M.card, CardRef, KanbanCardDetail),
   call(M.discussions, BoardRef, Schema.Array(KanbanDiscussion)),
+  call(M.threads, BoardRef, Schema.Array(KanbanThreadLink)),
   call(
     M.messages,
     Schema.Struct({

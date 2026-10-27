@@ -1206,6 +1206,8 @@ export const layerWsRpc = (
       const projectService = yield* ProjectService.ProjectService;
       const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
       const threadSearch = yield* ThreadSearch.ThreadSearch;
+      // ardud: board-run threads are read-only to the owner; the board drives them.
+      const kanban = yield* KanbanService;
 
       const providerSessionsV2 = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const mcpAppRequests = yield* McpAppRequests.McpAppRequests;
@@ -1805,6 +1807,33 @@ export const layerWsRpc = (
 
       const handlers = ServerWsCoreRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
+          (command.type === "message.dispatch"
+            ? kanban.caller(command.threadId).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationV2DispatchCommandError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      message: "Failed to check the board thread state",
+                      cause,
+                    }),
+                ),
+                Effect.flatMap((link) =>
+                  link === null
+                    ? Effect.void
+                    : Effect.fail(
+                        new OrchestrationV2DispatchCommandError({
+                          commandId: command.commandId,
+                          commandType: command.type,
+                          message: "This thread belongs to a board run and is read-only.",
+                          detail: "board-thread-read-only",
+                        }),
+                      ),
+                ),
+              )
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
             "orchestration_v2.command_type": command.type,
@@ -1852,6 +1881,8 @@ export const layerWsRpc = (
                     });
                   }),
                 ),
+            ),
+          ),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),

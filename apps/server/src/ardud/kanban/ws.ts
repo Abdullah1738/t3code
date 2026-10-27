@@ -49,6 +49,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.discussions]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["discussions"]>[0];
     }) => service.discussions(input.boardId),
+    [M.threads]: (input: { readonly boardId: Parameters<KanbanServiceShape["threads"]>[0] }) =>
+      service.threads(input.boardId),
     [M.messages]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["messages"]>[0];
       readonly afterSeq?: number | undefined;

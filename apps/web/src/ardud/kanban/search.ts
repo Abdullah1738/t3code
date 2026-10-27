@@ -7,6 +7,7 @@ export const BOARD_VIEWS = [
   "automations",
   "scripts",
   "wiki",
+  "threads",
   "settings",
 ] as const;
 export type BoardView = (typeof BOARD_VIEWS)[number];
@@ -18,6 +19,7 @@ export const BOARD_VIEW_LABELS: Record<BoardView, string> = {
   automations: "Automations",
   scripts: "Scripts",
   wiki: "Wiki",
+  threads: "Threads",
   settings: "Settings",
 };
 

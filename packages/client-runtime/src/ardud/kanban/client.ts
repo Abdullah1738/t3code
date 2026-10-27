@@ -10,6 +10,7 @@ import {
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanThreadLink,
   type KanbanWatchEvent,
   type KanbanWikiPage,
   type ModelSelection,
@@ -57,6 +58,8 @@ export interface KanbanClient {
   messages(boardId: string, discussionId: string): SnapshotStore<ReadonlyArray<KanbanMessage>>;
   card(boardId: string, cardId: string): SnapshotStore<KanbanCardDetail>;
   wiki(boardId: string): SnapshotStore<ReadonlyArray<KanbanWikiPage>>;
+  /** Every thread the board started, cards and evaluators alike. */
+  threads(boardId: string): SnapshotStore<ReadonlyArray<KanbanThreadLink>>;
   /** The board's scripts, kept current by the board feed. */
   scripts(boardId: string): SnapshotStore<ReadonlyArray<KanbanScript>>;
   /** A script's recent runs, newest first, kept current by the board feed. */
@@ -581,6 +584,19 @@ export function createKanbanClient(
     };
   }, options);
 
+  const threads = createKeyedSnapshotStores<string, ReadonlyArray<KanbanThreadLink>>(
+    (boardId, emit, fail) => {
+      let closed = false;
+      transport.request(M.threads, { boardId: boardId as never }).then((links) => {
+        if (!closed) emit(links);
+      }, fail);
+      return () => {
+        closed = true;
+      };
+    },
+    options,
+  );
+
   const wiki = createKeyedSnapshotStores<string, ReadonlyArray<KanbanWikiPage>>(
     (boardId, emit, fail) => {
       let closed = false;
@@ -694,6 +710,7 @@ export function createKanbanClient(
     messages: (boardId, discussionId) => messages(`${boardId}\n${discussionId}`),
     card: (boardId, cardId) => card(`${boardId}\n${cardId}`),
     wiki,
+    threads,
     scripts,
     scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
 

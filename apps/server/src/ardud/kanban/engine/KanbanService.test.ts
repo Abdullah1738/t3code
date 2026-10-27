@@ -247,6 +247,43 @@ it.effect("routes owner messages to the live thread, or to an evaluator when non
   }),
 );
 
+it.effect("lists a board's card and evaluator threads, and marks board threads as board runs", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "threads",
+        name: "Threads",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Add a retry", title: "Retry" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+
+      const channel = yield* kanban.createDiscussion(board.id, "Certs", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "When do certs expire?" }]);
+      const evaluatorThread = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+
+      const threads = yield* kanban.threads(board.id);
+      const roles = new Map(threads.map((link) => [link.threadId, link.role]));
+      assert.strictEqual(roles.get(workThread), "work");
+      assert.strictEqual(roles.get(evaluatorThread), "evaluator");
+      assert.strictEqual(
+        threads.find((link) => link.threadId === workThread)?.cardId,
+        created.id,
+      );
+      // Board threads are the only ones the owner path refuses.
+      assert.isNotNull(yield* kanban.caller(workThread));
+      assert.isNull(yield* kanban.caller(ThreadId.make("thread-not-from-a-board")));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("respects pool sizes and blocked cards", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
