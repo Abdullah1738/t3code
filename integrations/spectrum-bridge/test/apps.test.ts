@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { absoluteMeta, contentType, createAppsHandler, createShareHandler, metadataWarnings, resolveAppFile, startAppsServer } from "../src/apps.ts";
-import { APPS_DEFAULTS, appsConfig, loadAppsConfig } from "../src/config.ts";
+import { APPS_DEFAULTS, appsConfig, loadAppsConfig, shareOriginConfig } from "../src/config.ts";
 
 let base: string;
 let root: string;
@@ -94,6 +94,16 @@ test("apps config applies defaults and validates overrides", () => {
   expect(appsConfig({ appsRoot: "/srv/apps", appsPort: 9000 })).toEqual({ appsRoot: "/srv/apps", appsPort: 9000 });
   for (const bad of [{ appsRoot: "relative" }, { appsPort: 0 }, { appsPort: 70000 }, { appsPort: 1.5 }]) {
     expect(() => appsConfig(bad as never)).toThrow("Invalid bridge configuration");
+  }
+});
+
+test("shareOrigin is an https origin without a path plus a loopback port, or unset", () => {
+  expect(shareOriginConfig(undefined)).toBeUndefined();
+  expect(shareOriginConfig({ url: "https://cards.abdullah.fund/", port: 18793 })).toEqual({ url: "https://cards.abdullah.fund", port: 18793 });
+  for (const bad of [{ url: "http://cards.abdullah.fund", port: 18793 }, { url: "https://cards.abdullah.fund/x", port: 18793 },
+    { url: "https://localhost", port: 18793 }, { url: "https://cards.abdullah.fund", port: 80 }, { url: "https://a.b", port: "18793" },
+    { url: "https://a.b.c?x", port: 18793 }, null, "https://a.b"]) {
+    expect(() => shareOriginConfig(bad)).toThrow("Invalid bridge configuration");
   }
 });
 
