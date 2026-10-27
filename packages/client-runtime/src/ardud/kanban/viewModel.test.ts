@@ -50,6 +50,7 @@ function card(number: number, patch: Partial<KanbanCard> = {}): KanbanCard {
     model,
     models: [],
     subtasks: [],
+    subtaskSeq: 0,
     projectId: null,
     links: [],
     blockedBy: [],

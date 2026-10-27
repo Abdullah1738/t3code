@@ -53,6 +53,7 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   model,
   models: [],
   subtasks: [],
+  subtaskSeq: 0,
   projectId: null,
   links: [],
   blockedBy: [],

@@ -2027,6 +2027,7 @@ const make = Effect.gen(function* () {
       description: input.description?.trim() ?? "",
       prompt,
       subtasks: plan.subtasks,
+      subtaskSeq: plan.subtaskSeq,
       stage,
       priority: clampPriority(input.priority, 3),
       goalId: input.goalId ?? null,
@@ -2367,7 +2368,9 @@ const make = Effect.gen(function* () {
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
-        const plan = patch.subtasks ? Subtasks.planSubtasks(card.subtasks, patch.subtasks) : null;
+        const plan = patch.subtasks
+          ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
+          : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
         const next: KanbanCard = {
           ...card,
@@ -2375,6 +2378,7 @@ const make = Effect.gen(function* () {
           description: patch.description?.trim() ?? card.description,
           prompt: patch.prompt?.trim() || card.prompt,
           subtasks: plan?.ok ? plan.subtasks : card.subtasks,
+          subtaskSeq: plan?.ok ? plan.subtaskSeq : card.subtaskSeq,
           priority: clampPriority(patch.priority, card.priority),
           goalId: patch.goalId === undefined ? card.goalId : patch.goalId,
           projects: patch.projects ?? card.projects,

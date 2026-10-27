@@ -159,6 +159,8 @@ export const KanbanCard = Schema.Struct({
   prompt: Schema.String,
   /** The card's flow, step by step: the work, its review and what comes after. */
   subtasks: Schema.Array(KanbanSubtask).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  /** Highest subtask number ever handed out on this card, so a dropped id is never reused. */
+  subtaskSeq: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   stage: KanbanStage,
   priority: KanbanPriority,
   goalId: Schema.NullOr(KanbanGoalId),

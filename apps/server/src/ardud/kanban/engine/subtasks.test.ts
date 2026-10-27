@@ -74,6 +74,36 @@ describe("planSubtasks", () => {
   });
 });
 
+describe("subtask ids stay unique for the life of a card", () => {
+  it("never hands out a dropped open id again", () => {
+    const first = planSubtasks([], flow);
+    if (!first.ok) throw new Error(first.reason);
+    // Drop the open s4 (and s5), keep the rest, then add one new step.
+    const second = planSubtasks(
+      first.subtasks,
+      [
+        { id: "s1", text: "Write the PR", owner: "work" },
+        { id: "s2", text: "Review", owner: "review" },
+        { id: "s3", text: "Merge and deploy", owner: "evaluator" },
+        { text: "A new step", owner: "evaluator" },
+      ],
+      first.subtaskSeq,
+    );
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.subtasks.map((subtask) => subtask.id)).toEqual(["s1", "s2", "s3", "s7"]);
+    expect(second.subtaskSeq).toBe(7);
+  });
+
+  it("defaults to the highest id still on the card for a card saved without a counter", () => {
+    const plan = planSubtasks(planned(), [{ text: "Extra", owner: "evaluator" }]);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.subtasks.map((subtask) => subtask.id)).toContain("s7");
+    expect(plan.subtaskSeq).toBe(7);
+  });
+});
+
 describe("marking subtasks", () => {
   it("lets each role mark only its own kind, in the step the card is on", () => {
     const card = { number: 3, subtasks: planned() };
