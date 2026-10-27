@@ -175,12 +175,25 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         safari.isHidden = true
         webView.isHidden = false
         spinner.startAnimating()
+        currentNavigation = webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.loadTimeout))
+    }
+
+    // Every main-frame navigation (the card, an https link tapped in the page, a
+    // client-side redirect) arms the timer and becomes the one callbacks are
+    // checked against. Arming only in load(_:) left those later navigations
+    // unguarded, and a cancelled predecessor could clear the timer for nothing.
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        currentNavigation = navigation
+        spinner.startAnimating()
+        armLoadTimer()
+    }
+
+    private func armLoadTimer() {
         loadTimer?.invalidate()
         loadTimer = Timer.scheduledTimer(withTimeInterval: Self.loadTimeout, repeats: false) { [weak self] _ in
             Self.log.error("load timed out")
             self?.showNote("This card is taking too long to load.", canRetry: true)
         }
-        currentNavigation = webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.loadTimeout))
     }
 
     private func layout(for style: MSMessagesAppPresentationStyle) {
@@ -296,14 +309,20 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         failed(error)
     }
 
+    // A superseded navigation's cancellation (a redirect replaced it, or the
+    // user picked another card) must not touch the timer or spinner of the
+    // navigation that replaced it.
     private func failed(_ error: Error) {
-        // A cancelled load is a redirect or a link handed to the system, not a failure.
         if (error as NSError).code == NSURLErrorCancelled {
-            loadTimer?.invalidate()
-            loadTimer = nil
-            return spinner.stopAnimating()
+            // Cancelled and still current: a redirect or a link handed to the
+            // system with nothing shown. Show the note rather than a blank sheet.
+            if !webView.isLoading, webView.url == nil {
+                showNote("This card didn't load. Check your connection and try again.", canRetry: true)
+            }
+            return
         }
         Self.log.error("load failed: \((error as NSError).code)")
         showNote("This card didn't load. Check your connection and try again.", canRetry: true)
     }
+
 }
