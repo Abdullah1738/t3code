@@ -1151,6 +1151,10 @@ def main(argv=None):
             print(json.dumps({'ok':False,'error':exc.code,'details':exc.details,
                               'financial_send':False,'financial_retry':False}))
             return 1
+        from commerce_minutes_cart import OutcomeUnverified
+        if isinstance(exc,OutcomeUnverified):
+            print(json.dumps({'ok':False,'error':exc.code,**exc.details,'financial_retry':False}))
+            return 1
         code=str(exc)
         preparation=re.fullmatch(r'PREPARATION_FAILED:(quote_(?:initial|initial_quiet|selected|selected_quiet|final_quiet)):([A-Z][A-Z0-9_]{1,99})',code)
         if isinstance(exc,talabat.orders.TalabatError) and preparation:

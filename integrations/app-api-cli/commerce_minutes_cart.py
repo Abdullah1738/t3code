@@ -58,6 +58,20 @@ def show(*, auth=None):
             'cart_hash': manifest_hash(rows), 'financial_send': False, 'cart_mutation_sent': False}
 
 
+class OutcomeUnverified(Exception):
+    """Post-send cart failure: the send was consumed, the flow stays ACTIVE until the owner reconciles."""
+    code = 'MINUTES_CART_SET_OUTCOME_UNVERIFIED'
+
+    def __init__(self, flow_id, cause):
+        self.flow_id = flow_id
+        self.cause = str(cause)[:120]
+        self.details = {'flow_id': flow_id, 'cause': self.cause, 'cart_mutation_sent': True,
+                        'financial_send': False,
+                        'recovery': "run 'commerce cart minutes show' to read the cart, then "
+                                    "'commerce abandon-flow " + flow_id + "' once it is confirmed"}
+        super().__init__(self.code)
+
+
 def set_cart(rows, *, expect_hash, auth=None):
     m.require(isinstance(expect_hash, str) and expect_hash, 'MINUTES_CART_EXPECT_HASH_REQUIRED')
     queries = {row.get('sku'): row.get('catalog_query') for row in rows if isinstance(row, dict)}
@@ -89,25 +103,34 @@ def set_cart(rows, *, expect_hash, auth=None):
             catalog = options.read_options(item['sku'], query=queries.get(item['sku']), auth=auth)
             options.validate_selection(item, catalog)
 
+    # Option discovery can outlive the 30 s snapshot; take a fresh one before the flow opens.
+    snapshot = auth.fresh_before_mutation('minutes')
     flow_id = str(uuid.uuid4())
     scope_hash = j.digest({'minutes_cart_set': new_hash, 'from': expect_hash})
-    j.open_flow(flow_id=flow_id, app='noon', vertical='minutes',
-                account_hash=snapshot.account_ref, scope_hash=scope_hash)
-
     body = {'skus': new_rows, 'bundles': [], 'refresh': False}
     request_hash = hashlib.sha256(m._json(body)).hexdigest()
+
+    refusal = []
 
     def headers(operation, deadline):
         nonlocal snapshot
         # Re-check the cart and the hash right before the mutation headers; a
         # cookie-rotating read must come before the fresh headers, as in clear_cart.
-        m.require(readback_active_orders(auth).projection['count'] == 0, 'MINUTES_ACTIVE_ORDER_PRESENT')
-        verify = readback_session(auth)
-        if manifest_hash(manifest(verify.projection['lines'])) != expect_hash:
-            j.fail('MINUTES_CART_CHANGED_SINCE_SHOW')
-        fresh = auth.fresh_before_mutation('minutes', deadline=deadline)
-        m.require((fresh.account_ref, fresh.address_ref) == (snapshot.account_ref, snapshot.address_ref),
-                  'MINUTES_ACCOUNT_HOME_CHANGED')
+        try:
+            m.require(readback_active_orders(auth).projection['count'] == 0, 'MINUTES_ACTIVE_ORDER_PRESENT')
+            verify = readback_session(auth)
+            # Special lines must be refused on this final readback too: a normal row can gain bundle/deal
+            # metadata with the same hash, and a sync with bundles=[] would then overwrite that line.
+            m.require(_special_count(verify.projection['lines']) == 0, 'MINUTES_CART_SPECIAL_LINES')
+            if manifest_hash(manifest(verify.projection['lines'])) != expect_hash:
+                j.fail('MINUTES_CART_CHANGED_SINCE_SHOW')
+            fresh = auth.fresh_before_mutation('minutes', deadline=deadline)
+            m.require((fresh.account_ref, fresh.address_ref) == (snapshot.account_ref, snapshot.address_ref),
+                      'MINUTES_ACCOUNT_HOME_CHANGED')
+        except Exception as exc:
+            # MinutesCheckout wraps any header failure as AUTH_HEADERS_FAILED; keep the real reason.
+            refusal.append(exc)
+            raise
         snapshot = fresh
         return fresh.mutation_headers('minutes')
 
@@ -125,23 +148,28 @@ def set_cart(rows, *, expect_hash, auth=None):
                 response_url=response_url, http_status=http_status)
         return True
 
-    client = m.MinutesCheckout(snapshot.read_headers(),
-        AccountHome('minutes', snapshot.account_ref, snapshot.address_ref, time.time()),
-        header_provider=headers, receipt=receipt, response_cookies=cookies)
     try:
+        j.open_flow(flow_id=flow_id, app='noon', vertical='minutes',
+                    account_hash=snapshot.account_ref, scope_hash=scope_hash)
+        client = m.MinutesCheckout(snapshot.read_headers(),
+            AccountHome('minutes', snapshot.account_ref, snapshot.address_ref, time.time()),
+            header_provider=headers, receipt=receipt, response_cookies=cookies)
         result = client.sync(skus=new_rows, bundles=[], refresh=False, before_send=before, timeout=25)
-        after = readback_session(auth)
-        m.review_manifest(after.projection['lines'], new_manifest, mismatch='MINUTES_CART_SET_VERIFY_MISMATCH')
-        j.abandon(flow_id)
-    except Exception:
-        # A consumed send keeps the fence; never auto-retry a cart write.
+    except Exception as exc:
+        # Nothing consumed: the flow never sent, so it can be closed here and the real refusal passes through.
         if not j.inspect(flow_id)['operations']:
             j.abandon(flow_id)
-        else:
-            raise j.JournalError('MINUTES_CART_SET_OUTCOME_UNVERIFIED: after the send, run '
-                                 "'commerce cart minutes show' to confirm the cart, then "
-                                 "'commerce abandon-flow " + flow_id + "' to free the account.") from None
+            if refusal:
+                raise refusal[0] from None
         raise
+    try:
+        after = readback_session(auth)
+        m.require(_special_count(after.projection['lines']) == 0, 'MINUTES_CART_SET_VERIFY_MISMATCH')
+        m.review_manifest(after.projection['lines'], new_manifest, mismatch='MINUTES_CART_SET_VERIFY_MISMATCH')
+        j.abandon(flow_id)
+    except Exception as exc:
+        # The send was consumed: the fence stays. Fixed code plus recovery fields for the CLI.
+        raise OutcomeUnverified(flow_id, getattr(exc, 'args', ('',))[0]) from None
     return {'ok': True, 'flow_id': flow_id, 'items': new_manifest,
             'cart_hash': new_hash, 'total_minor': result.projection.get('total_minor'),
             'cart_mutation_sent': True, 'financial_send': False}

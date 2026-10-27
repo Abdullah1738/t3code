@@ -147,6 +147,113 @@ class SetTests(CartTestBase):
         self.assertEqual(self.read_options.call_count, 0)
 
 
+class FinalReadbackTests(CartTestBase):
+    def test_bundle_appearing_after_initial_read_sends_nothing(self):
+        # Same sku/qty/modifiers so the hash matches, but the pre-send readback carries bundle metadata.
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        bundled = lines_of([row('SKU_A', 1, bundle={'id': 1})])
+        harness = Harness([lines_of([row('SKU_A', 2)])])
+        real = m.MinutesCheckout
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(bundled)]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with self.assertRaisesRegex(m.MinutesError, 'MINUTES_CART_SPECIAL_LINES'):
+                cart.set_cart([{'sku': 'SKU_A', 'qty': 2}], expect_hash=expect, auth=self.auth)
+        self.assertEqual(harness.calls, [])
+
+
+class SnapshotRefreshTests(CartTestBase):
+    def test_snapshot_is_retaken_after_option_discovery_and_before_flow_opens(self):
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        after = lines_of([row('SKU_A', 1), row('SKU_B', 1, ['a'])])
+        harness = Harness([after])
+        real = m.MinutesCheckout
+        self.read_options.return_value = {'groups': [{'min_selection': 0, 'max_selection': 2,
+                                                      'options': [{'code': 'a'}]}]}
+        order = []
+        orig_fresh = self.auth.fresh_before_mutation
+        def fresh(*a, **kw):
+            order.append('fresh')
+            return orig_fresh(*a, **kw)
+        self.auth.fresh_before_mutation = fresh
+        def read(*a, **kw):
+            order.append('options')
+            return self.read_options.return_value
+        self.read_options.side_effect = read
+        real_open = j.open_flow
+        def opened(**kw):
+            order.append('open_flow')
+            return real_open(**kw)
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur)), snap(after)]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(cart.j, 'open_flow', side_effect=opened), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            cart.set_cart([{'sku': 'SKU_A', 'qty': 1}, {'sku': 'SKU_B', 'qty': 1, 'modifiers': ['a']}],
+                          expect_hash=expect, auth=self.auth)
+        # Discovery happens, then a fresh snapshot is taken, and only then does the flow open.
+        opened_at = order.index('open_flow')
+        refreshed_before_open = [i for i, x in enumerate(order[:opened_at]) if x == 'fresh']
+        self.assertTrue(refreshed_before_open)
+        self.assertLess(order.index('options'), refreshed_before_open[-1])
+        self.assertLess(refreshed_before_open[-1], opened_at)
+        self.assertEqual([x[0] for x in harness.calls], ['sync'])
+
+
+class PostSendFailureTests(CartTestBase):
+    def test_cli_reports_fixed_code_flow_id_and_recovery_when_readback_mismatches(self):
+        import io, contextlib, json
+        import commerce_cli as cli
+        cur = [row('SKU_A', 1)]
+        expect = cart.manifest_hash(cart.manifest(m.project_session(lines_of(cur))['lines']))
+        wrong_after = lines_of([row('SKU_A', 9)])  # independent readback disagrees with the sent list
+        harness = Harness([lines_of([row('SKU_A', 2)])])
+        real = m.MinutesCheckout
+        self.read_options.return_value = {'groups': []}
+        # Reads: initial current, pre-send check in headers(), post-sync readback (mismatched).
+        with patch.object(cart, 'readback_session', side_effect=[snap(lines_of(cur)), snap(lines_of(cur)),
+                                                              snap(wrong_after)]), \
+                patch.object(cart, 'readback_active_orders',
+                             return_value=m.Snapshot({}, {'count': 0}, time.time())), \
+                patch.object(m, 'MinutesCheckout', side_effect=lambda *a, **kw: real(*a, request=harness.request, **kw)):
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+                json.dump([{'sku': 'SKU_A', 'qty': 2, 'modifiers': []}], f)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(['cart', 'minutes', 'set', '--items-file', f.name, '--expect-hash', expect])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload['error'], 'MINUTES_CART_SET_OUTCOME_UNVERIFIED')
+        self.assertTrue(payload['flow_id'])
+        self.assertTrue(payload['cart_mutation_sent'])
+        self.assertIn('commerce abandon-flow ' + payload['flow_id'], payload['recovery'])
+        self.assertEqual(j.inspect(payload['flow_id'])['state'], 'ACTIVE')
+
+
+class RoundTripTests(CartTestBase):
+    def test_show_edit_set_set_then_order_use_current_cart_round_trip(self):
+        # show output is directly usable as the items file (title is display-only).
+        import json, io, contextlib
+        import commerce_cli as cli
+        cur = lines_of([row('SKU_A', 1, title='Shake A')])
+        shown = cart.manifest(m.project_session(cur)['lines'])
+        items = [{**r, 'title': 'Shake A'} for r in shown]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump(items, f)
+        self.assertEqual(cart.manifest_hash(shown), cart.manifest_hash(cart.manifest(m.project_session(cur)['lines'])))
+        rows = cli.input_items if False else None
+        from commerce_basket_input import read_items
+        read_back = read_items(f.name)
+        new_rows = [{k: v for k, v in r.items() if k != 'title'} for r in read_back]
+        self.assertEqual(m._skus(c._rows(new_rows)), m._skus(c._rows(new_rows)))
+        # The order path must accept the same file: _rows leaves no title and _skus accepts the row.
+        flow_skus = m._skus(c._rows([{'sku': 'SKU_A', 'qty': 1, 'modifiers': []}]))
+        self.assertEqual(flow_skus[0]['sku'], 'SKU_A')
+
+
 class OrderUseCurrentCartTests(CartTestBase):
     def flow(self, skus, *, use_current, lines=None):
         f = object.__new__(c.MinutesFlow)

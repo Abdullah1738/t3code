@@ -142,6 +142,8 @@ def _rows(rows):
     for row in rows:
         if isinstance(row,dict):
             row=dict(row)
+            # 'title' is display-only (cart minutes show prints it); the order path ignores it.
+            row.pop('title',None)
             query=row.pop('catalog_query',None)
             m.require(query is None or isinstance(query,str) and 0 < len(query.strip()) <= 200,
                       'INVALID_CATALOG_QUERY')
