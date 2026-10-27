@@ -464,5 +464,131 @@ class CliGateTests(unittest.TestCase):
         self.assertEqual(purchase.call_count, 2)
 
 
+def _bridge_payload(text, sender, minutes_ago, *, audio=False):
+    at = NOW - dt.timedelta(minutes=minutes_ago)
+    return {'text': text, 'sender': sender, 'isAudioMessage': audio, 'receivedAt': int(at.timestamp() * 1000)}
+
+
+class GroupChatGoTests(unittest.TestCase):
+    """Her go counts in her 1:1 and any group chat; only her addresses count in a group."""
+
+    def setUp(self):
+        self.root = _tempfile.mkdtemp(prefix='moni-chats-test-')
+        self.env = patch.dict(_os.environ, {'MONI_BRIDGE_CHATS_DIR': self.root}, clear=False)
+        self.env.start()
+        _os.environ.pop('MONI_BRIDGE_DB', None)
+        self.addCleanup(self.env.stop)
+
+    def chat(self, slug, *rows):
+        d = _os.path.join(self.root, slug)
+        _os.makedirs(d, exist_ok=True)
+        path = _os.path.join(d, 'state.sqlite')
+        if _os.path.exists(path):
+            _os.unlink(path)
+        con = sqlite3.connect(path)
+        con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+        for i, (payload) in enumerate(rows, 1):
+            con.execute('insert into inbound values (?, ?, ?)', (f'{slug}-{i}', json.dumps(payload), 'done'))
+        con.commit()
+        con.close()
+        return path
+
+    def verify(self, go, *, chat=None, runner=None):
+        return moni_go.verify(go, now=NOW, runner=runner or history(), chat=chat)
+
+    def test_go_in_group_counts_by_default(self):
+        self.chat('moni')
+        self.chat('group-sb_gro', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        got = self.verify('Order pls')
+        self.assertEqual(got['text'], 'Order pls')
+
+    def test_abdullah_in_group_is_ignored(self):
+        self.chat('moni')
+        self.chat('group-sb_gro', _bridge_payload('order pls', '+971585134795', 3),
+                  _bridge_payload('wait', '+971585134795', 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('order pls')
+        self.chat('group-sb_gro', _bridge_payload('order pls', moni_go.MONI_NUMBER, 5),
+                  _bridge_payload('cancel', '+971585134795', 2))
+        self.assertEqual(self.verify('order pls')['text'], 'order pls')
+
+    def test_go_in_1to1_then_cancel_in_group_is_cancelled(self):
+        self.chat('moni', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        self.chat('group-sb_gro', _bridge_payload('nvm leave it', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_go_in_group_then_cancel_in_1to1_is_cancelled(self):
+        self.chat('moni', _bridge_payload('nvm leave it', moni_go.MONI_NUMBER, 2))
+        self.chat('group-sb_gro', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_chat_reads_only_moni_and_that_group(self):
+        self.chat('moni')
+        self.chat('group-test', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        self.chat('group-other', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        self.assertEqual(self.verify('Order pls', chat='group-test')['text'], 'Order pls')
+        self.chat('group-test')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('Order pls', chat='group-test')
+
+    def test_invalid_chat_slug_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_CHAT_INVALID'):
+            self.verify('Order pls', chat='../x')
+
+    def test_missing_chat_dir_is_unverifiable(self):
+        self.chat('moni')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.verify('Order pls', chat='group-missing')
+
+    def test_broken_group_db_is_unverifiable(self):
+        self.chat('moni')
+        d = _os.path.join(self.root, 'group-broken')
+        _os.makedirs(d)
+        with open(_os.path.join(d, 'state.sqlite'), 'w') as f:
+            f.write('not a database')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.verify('Order pls')
+
+    def test_legacy_env_db_in_group_dir_applies_sender_filter(self):
+        path = self.chat('group-sb_gro', _bridge_payload('order pls', '+971585134795', 3),
+                         _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        with patch.dict(_os.environ, {'MONI_BRIDGE_DB': path}):
+            got = self.verify('Order pls')
+        self.assertEqual(got['text'], 'Order pls')
+        self.assertEqual(moni_go.read_bridge(path)[0]['text'], 'Order pls')
+        self.assertEqual(len(moni_go.read_bridge(path)), 1)
+
+    def test_lithuanian_and_attachment_tapbacks_never_start_an_order(self):
+        self.chat('moni', _bridge_payload('Labai patiko \u201eOrder pls\u201c', moni_go.MONI_NUMBER, 3),
+                  _bridge_payload('Loved an image', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('Order pls')
+
+    def test_tapback_can_call_off_a_go(self):
+        self.chat('moni', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        self.chat('group-sb_gro', _bridge_payload('Pasijuokta i\u0161 \u201envm\u201c', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_cli_check_accepts_chat_flag(self):
+        self.chat('moni')
+        self.chat('group-test', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = moni_go.main(['check', '--go', 'Order pls', '--chat', 'group-test'], runner=history(), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out.getvalue())['ok'])
+
+    def test_commerce_passes_moni_chat_to_verify(self):
+        with patch.object(c, 'purchase_talabat', return_value={'ok': True}), \
+                patch.object(moni_go, 'verify', return_value={'message_id': 1}) as verify:
+            code = c.main(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+                           '--moni-go', 'Order pls', '--moni-chat', 'group-sb_gro'])
+        self.assertEqual(code, 0)
+        verify.assert_called_once_with('Order pls', chat='group-sb_gro')
+
+
 if __name__ == '__main__':
     unittest.main()

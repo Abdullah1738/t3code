@@ -4,20 +4,22 @@ Abdullah's standing approval covers paying for Moni's orders, not choosing
 them. Before a `--for moni` order is placed, the caller passes her words
 (`--moni-go "yes order it"`) and this module confirms that a message from her,
 containing those words, arrived within the window, and that she did not call
-it off in a later message. Her messages come from two places, merged in time
-order: her Robob thread on the assistant line (the bridge's moni chat DB) and
-her iMessage chat with Abdullah (chat 45). It fails closed: no matching
-message, either source unreadable, or a later cancel from her in either one
-means no order.
+it off in a later message. Her messages come from three kinds of place, merged
+in time order: her iMessage chat with Abdullah (chat 45), her Robob 1:1 thread
+(the bridge's `moni` chat DB), and any group chat she is in (bridge
+`group-*` chat DBs, or one named with --chat). In a group only her own
+addresses count; Abdullah's group messages are ignored. It fails closed: no
+matching message, any source unreadable, or a later cancel from her in any of
+them means no order.
 
 Agents can run the same check before any order step (prepare-only, resume,
 recover) without placing anything:
 
-    python3 moni_go.py check --go "<her words>"
+    python3 moni_go.py check --go "<her words>" [--chat group-sb_gro]
 
 It prints JSON and exits 0 (go stands), 4 (she cancelled after it) or 2 (no
 go found, or her messages could not be read). It only runs `imsg history` and
-a read-only open of the bridge's moni chat DB.
+read-only opens of the bridge chat DBs.
 """
 import argparse
 import datetime as dt
@@ -32,7 +34,11 @@ import unicodedata
 
 MONI_CHAT_ID = '45'
 MONI_NUMBER = '+971585933213'
+# Her addresses in bridge rows: her phone and her Gmail. In a group chat only these count as her.
+MONI_ADDRESSES = ('+971585933213', 'monikagaleckaite@gmail.com')
 BRIDGE_DB = Path.home() / '.config/spectrum-bridge/chats/moni/state.sqlite'
+CHAT_SLUG = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
+_NEVER = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
 # Bridge rows get string ids, so they never collide with imsg's integer ids.
 BRIDGE_ID_PREFIX = 'bridge:'
 WINDOW_MINUTES = 45
@@ -149,7 +155,37 @@ def read_history(runner=subprocess.run):
 
 # iMessage tapbacks arrive as text quoting the message they react to; the quote is not her words.
 TAPBACK = re.compile(r'^\s*(?:loved|liked|disliked|laughed at|emphasized|questioned|reacted .{1,16} to|'
-                     r'removed an? .{1,24} from)\s+["\u201c]', re.I)
+                     r'removed an? .{1,24} from|labai patiko|pasijuokta i\u0161)\s+["\u201c\u201e]', re.I)
+# Attachment tapbacks ("Loved an image") quote nothing, so they are matched at the end of the text.
+TAPBACK_ATTACHMENT = re.compile(r'^\s*(?:loved|liked|disliked|laughed at|emphasized|questioned|reacted .{1,16} to)\s+'
+                                r'an?\s+(?:image|photo|video|attachment|audio message|sticker)\s*$', re.I)
+
+
+def _address(value):
+    return str(value).strip().casefold()
+
+
+_MONI_KEYS = frozenset(_address(a) for a in MONI_ADDRESSES)
+
+
+def chats_dir():
+    return Path(os.environ.get('MONI_BRIDGE_CHATS_DIR') or '~/.config/spectrum-bridge/chats').expanduser()
+
+
+def bridge_paths(chat=None):
+    """Bridge chat DBs to read: her 1:1, plus `chat` when given, else every group chat.
+
+    MONI_BRIDGE_DB (legacy override, used by tests) still names the only DB.
+    """
+    if chat is not None and not CHAT_SLUG.fullmatch(chat):
+        raise RuntimeError('MONI_GO_CHAT_INVALID')
+    if os.environ.get('MONI_BRIDGE_DB'):
+        return [Path(os.environ['MONI_BRIDGE_DB'])]
+    root = chats_dir()
+    if chat is not None:
+        slugs = ['moni'] if chat == 'moni' else ['moni', chat]
+        return [root / slug / 'state.sqlite' for slug in slugs]
+    return [root / 'moni' / 'state.sqlite', *sorted(root.glob('group-*/state.sqlite'))]
 
 
 def _bridge_time(value):
@@ -175,6 +211,7 @@ def read_bridge(path=None):
             con.close()
     except (OSError, ValueError, RuntimeError, sqlite3.Error):
         return None
+    group = db.parent.name.startswith('group-')
     rows = []
     for row_id, payload in raw:
         try:
@@ -185,17 +222,33 @@ def read_bridge(path=None):
             return None
         sender = item.get('sender')
         # Bridge wakes and other machine rows carry no sender.
-        if not isinstance(sender, str) or not sender:
+        if not isinstance(sender, str) or not sender.strip():
+            continue
+        who = _address(sender)
+        # In a group, anyone but Moni (Abdullah included) is not her, so their words are ignored.
+        if group and who not in _MONI_KEYS:
             continue
         text = item.get('text')
-        tapback = isinstance(text, str) and bool(TAPBACK.match(text))
+        tapback = isinstance(text, str) and bool(TAPBACK.match(text) or TAPBACK_ATTACHMENT.match(text))
         rows.append({'id': f'{BRIDGE_ID_PREFIX}{row_id}', 'created_at': _bridge_time(item.get('receivedAt')),
                      'text': text, '_bridge': True,
                      # Only her number starts an order; a tapback or her other address can only call it off.
-                     '_cancel_only': tapback or sender != MONI_NUMBER,
+                     '_cancel_only': tapback or who != _address(MONI_NUMBER),
                      # A voice note's words are not in the row, so it could be a cancel.
                      '_opaque': item.get('isAudioMessage') is True})
     return rows
+
+
+def read_bridges(paths):
+    """Rows from every bridge DB in `paths`, merged oldest first; None if any one can't be read."""
+    merged = []
+    for path in paths:
+        rows = read_bridge(path)
+        if rows is None:
+            return None
+        merged.extend(rows)
+    merged.sort(key=lambda row: _parse_time(row.get('created_at')) or _NEVER)
+    return merged
 
 
 def _moni_rows(rows, oldest, latest, bridge_rows=()):
@@ -221,7 +274,7 @@ def _moni_rows(rows, oldest, latest, bridge_rows=()):
     return [item[-1] for item in kept], unparsed
 
 
-def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subprocess.run, bridge=None):
+def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subprocess.run, bridge=None, chat=None):
     """Return the go that stands or raise RuntimeError with a stable code.
 
     Walks her messages from both sources in time order from the first one with
@@ -234,8 +287,11 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
     wanted = normalize(go_text)
     if len(wanted) < 2:
         raise RuntimeError('MONI_GO_REQUIRED')
+    if bridge is None:
+        paths = bridge_paths(chat)
+        bridge = lambda: read_bridges(paths)
     rows = read_history(runner)
-    bridge_rows = (bridge or read_bridge)()
+    bridge_rows = bridge()
     if rows is None or bridge_rows is None:
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -299,9 +355,11 @@ def main(argv=None, runner=subprocess.run, now=None, bridge=None):
     commands = parser.add_subparsers(dest='command', required=True)
     check = commands.add_parser('check', help='exit 0 go stands, 4 cancelled after the go, 2 not found or unverifiable')
     check.add_argument('--go', required=True, metavar='HER_WORDS', help='her go, quoted from her chat')
+    check.add_argument('--chat', default=None, metavar='SLUG',
+                       help='bridge chat where she gave the go, e.g. group-sb_gro; default: her 1:1 plus every group chat')
     args = parser.parse_args(argv)
     try:
-        found = verify(args.go, now=now, runner=runner, bridge=bridge)
+        found = verify(args.go, now=now, runner=runner, bridge=bridge, chat=args.chat)
     except RuntimeError as exc:
         code = str(exc)
         go = getattr(exc, 'go', None) or {'message_id': None, 'at': None, 'text': None}
