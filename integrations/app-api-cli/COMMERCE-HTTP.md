@@ -19,6 +19,7 @@ commerce inspect FLOW_UUID
 commerce capabilities
 commerce order-status FLOW_UUID
 commerce reconcile-order FLOW_UUID
+commerce reconcile-order FLOW_UUID --close-failed   # Minutes: noon-failed, uncaptured order
 commerce recover-payment FLOW_UUID --max-reads 90
 commerce await-payment FLOW_UUID --minutes 10
 commerce release-flow FLOW_UUID
@@ -193,6 +194,14 @@ balance, exact item IDs, and noon's explicit statement that payment was not
 captured and will not be charged. It records the evidence hash, releases the local
 reservation and preserves consumed order/operation ownership. Bank hold release
 timing remains bank-side. Failure without this evidence keeps the financial fence.
+
+For Minutes, `commerce reconcile-order FLOW_UUID --close-failed` closes a flow
+(ACTIVE or FENCED, payment sent or not) only when fresh account-bound reads show the
+exact order `failed`/`cancelled` with zero total, not active, and its payment intent
+with 0 authorized/captured and no capture-like transaction status, at least 15
+minutes after place. Terminal `RELEASED` with a `MINUTES_CLOSED_FAILED_UNCAPTURED`
+observation; reservation and order ownership retained; no sends. See
+NOON-MINUTES-E2E.md.
 
 For the other lanes, plain `reconcile-order` reads the persisted place receipt
 first, then the exact native order and available intent/transaction status. It reports route/method/time and

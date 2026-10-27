@@ -929,6 +929,9 @@ def main(argv=None):
         help='caller-attested independent-placement lower time bound with timezone')
     disposition.add_argument('--legacy-rejection-evidence',metavar='TEXT',
         help='explicit evidence of definitive rejection for a legacy lossy SUBMISSION_UNKNOWN receipt')
+    disposition.add_argument('--close-failed',action='store_true',
+        help='Minutes: terminal close when noon reports the exact order failed/cancelled, inactive, '
+             'zero total and its payment intent uncaptured; never retries')
     disposition.add_argument('--owner-attest-no-charge',action='store_true',
         help='terminal Talabat close using explicit owner evidence plus fresh exact provider checks; never retries')
     disposition.add_argument('--evidence',metavar='TEXT',
@@ -1048,7 +1051,14 @@ def main(argv=None):
             result=status(args.flow_id)
         elif args.command=='reconcile-order':
             from commerce_reconcile import reconcile, owner_attest_no_charge
-            if args.close_duplicate:
+            if args.close_failed:
+                if (args.close_duplicate or args.owner_attest_no_charge or args.attested_by is not None
+                        or args.evidence is not None or args.separate_order is not None
+                        or args.separate_order_after is not None or args.legacy_rejection_evidence is not None):
+                    journal.fail('FAILED_CLOSURE_FLAGS_CONFLICT')
+                from commerce_minutes_disposition import close_failed
+                result=close_failed(args.flow_id)
+            elif args.close_duplicate:
                 if args.owner_attest_no_charge or args.attested_by is not None:
                     journal.fail('DUPLICATE_CLOSURE_FLAGS_CONFLICT')
                 from commerce_talabat_duplicate import close_duplicate

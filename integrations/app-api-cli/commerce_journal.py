@@ -544,6 +544,72 @@ def close_marketplace_uncharged(flow_id, *, evidence, expected_local):
             'account_fence_lifted': True, 'retry_allowed': False}
 
 
+MINUTES_FAILED_CLOSE_MIN_AGE = 15 * 60
+MINUTES_CLOSED_FAILED_UNCAPTURED = 'MINUTES_CLOSED_FAILED_UNCAPTURED'
+
+
+def _minutes_failed_close_shape(db, flow, now):
+    if (flow['app'] != 'noon' or flow['vertical'] != 'minutes'
+            or flow['state'] not in ('ACTIVE', 'FENCED') or not flow['order_id']
+            or flow['reserved_minor'] <= 0):
+        fail('MINUTES_FAILED_FLOW_REQUIRED')
+    ops = [dict(o) for o in db.execute('SELECT name,kind,state FROM operations WHERE flow_id=? '
+                                       'ORDER BY created_at,name', (flow['id'],))]
+    if (sum(o['kind'] == 'place' for o in ops) != 1 or sum(o['kind'] == 'payment' for o in ops) > 1
+            or any(o['state'] != 'OBSERVED' or o['kind'] in ('prepay', 'preauthorize') for o in ops)):
+        fail('MINUTES_FAILED_CLOSE_FINANCIAL_HISTORY_INVALID')
+    if db.execute("SELECT 1 FROM observations WHERE flow_id=? AND outcome IN "
+                  "('PAYMENT_REPORTED_SUCCESS','EXACT_ORDER_CONFIRMED','TRACKER_REGISTERED')",
+                  (flow['id'],)).fetchone():
+        fail('MINUTES_FAILED_CLOSE_SUCCESS_ALREADY_OBSERVED')
+    placed = db.execute("SELECT MIN(o.observed_at) AS t FROM observations o JOIN operations p "
+                        "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
+                        "AND p.kind='place' AND o.order_id=?", (flow['id'], flow['order_id'])).fetchone()['t']
+    # A just-sent payment can still be inside its 3DS window; give noon time to settle it.
+    if placed is None or now - placed < MINUTES_FAILED_CLOSE_MIN_AGE:
+        fail('MINUTES_FAILED_CLOSE_TOO_EARLY')
+    return ops
+
+
+def minutes_failed_close_precheck(flow_id, *, now=None):
+    """Read-only local eligibility, checked before any network read."""
+    with _db() as db:
+        _minutes_failed_close_shape(db, _get(db, flow_id), time.time() if now is None else now)
+    return True
+
+
+def close_minutes_failed_uncaptured(flow_id, *, evidence, expected_local, now=None):
+    """Terminal close of a Minutes flow on noon's own failed/uncaptured order reads.
+
+    Frees only the account slot. The reservation, order ownership and every consumed
+    operation stay recorded; a released flow cannot be resumed, observed or retried.
+    """
+    if (not isinstance(evidence, dict) or evidence.get('provider_order_failed') is not True
+            or evidence.get('uncaptured_at_check') is not True or evidence.get('order_active') is not False
+            or evidence.get('authorized_minor') != 0 or evidence.get('captured_minor') != 0
+            or evidence.get('order_total_minor') != 0 or evidence.get('currency') != 'AED'
+            or evidence.get('order_status') not in ('failed', 'cancelled')):
+        fail('MINUTES_FAILED_CLOSE_EVIDENCE_REQUIRED')
+    now = time.time() if now is None else now
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = _minutes_failed_close_shape(db, flow, now)
+        if (flow['order_id'] != evidence.get('order') or flow['account_hash'] != evidence.get('account_hash')
+                or flow['reserved_minor'] != evidence.get('amount_minor')
+                or flow['state'] != expected_local['state']
+                or flow['reserved_minor'] != expected_local['reserved_minor']
+                or sorted(ops, key=lambda o: o['name']) !=
+                   sorted(expected_local['operations'], key=lambda o: o['name'])):
+            fail('MINUTES_FAILED_CLOSE_CHANGED')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+                   'VALUES (?,?,?,?,?,?)', (flow_id, next(o['name'] for o in ops if o['kind'] == 'place'),
+                   MINUTES_CLOSED_FAILED_UNCAPTURED, digest(evidence), flow['order_id'], now))
+        db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (flow_id,))
+    return {'state': 'RELEASED', 'outcome': MINUTES_CLOSED_FAILED_UNCAPTURED,
+            'account_fence_lifted': True, 'reservation_minor_retained': flow['reserved_minor'],
+            'retry_allowed': False}
+
+
 def complete(flow_id):
     """Close a known successful order, allowing a distinct deliberate next order.
 

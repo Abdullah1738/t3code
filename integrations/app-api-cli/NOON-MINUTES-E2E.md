@@ -147,6 +147,30 @@ rebindable), and nothing authorizes a retry. The journal's account-fence
 index migrates once (same unique shape, `RELEASED` also terminal); any other
 unexpected schema is still refused, not repaired.
 
+### Closing a sent-payment flow noon reports failed (27 Oct 2026)
+
+`release-flow` never touches a flow whose payment continuation was consumed. When
+noon itself later fails that order (e.g. 3DS never completed, "could not be placed
+due to a payment error" email), close it with:
+
+```
+commerce reconcile-order FLOW_UUID --close-failed
+```
+
+Reads only, on the flow's bound account: order/get with echoed orderNr and
+`statusCode` `failed`/`cancelled`, `orderTotal` 0, the order absent from
+order/get-active, and a successful paymentintent/status read with authorized and
+captured 0, not `payment_confirmed` and no capture/authorization/settle/refund
+transaction status. It refuses within 15 minutes of the place (3DS window), on any
+unobserved send, a payment-success receipt or observation, prepay/preauthorize
+history, a changed journal or receipts, or a failed/missing intent read. The close
+is terminal (`MINUTES_CLOSED_FAILED_UNCAPTURED`, state `RELEASED`): the reservation
+stays counted, the order ID stays owned, nothing is resent and no retry is
+authorized. It records "uncaptured at check", not a bank-side void: a pending
+hold can still show on the card until the bank drops it. First live use: flow
+95df7e79 / IAEGAR1482ANIBCZKA (intent `payment_ready_to_redirect`,
+`3DS_ENROLL_INITIATED`, 0 authorized/captured).
+
 ## Deviations from the capture (deliberate, benign)
 
 - The transport sends `accept: application/json`; the app sends
