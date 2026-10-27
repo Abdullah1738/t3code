@@ -7,7 +7,8 @@
  * dies with its process, so a restart means a new URL.
  */
 import { spawnSync } from "node:child_process";
-import { dirname, isAbsolute } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { createShareHandler, metadataWarnings, notFoundResponse, resolveAppFile, serveAppFile, validAppSlug } from "./apps.ts";
 import type { Store } from "./store.ts";
 
@@ -19,7 +20,8 @@ const DAY_MS = 24 * 60 * 60_000;
 const KEY_PREFIX = "share:";
 
 /** `token` marks a share on the public origin; quick-tunnel shares have `pid` instead. */
-export type ShareRecord = { url: string; port: number; startedAt: number; expiresAt: number; pid?: number; token?: string };
+/** `root` (origin shares only) is the approved app directory's real path, fixed at share time. */
+export type ShareRecord = { url: string; port: number; startedAt: number; expiresAt: number; pid?: number; token?: string; root?: string };
 export type Tunnel = { url: string; pid: number; alive(): boolean; stop(): Promise<void>; kill(): void };
 export type StartTunnel = (localPort: number) => Promise<Tunnel>;
 export type ShareResult = { url: string; created: boolean; expiresAt: number; metadataWarnings: string[] };
@@ -96,11 +98,14 @@ export type ShareOrigin = { url: string; port: number };
 
 const TOKEN = /^[A-Za-z0-9_-]{22}$/;
 const SHARE_PATH = /^\/s\/([A-Za-z0-9_-]{22})(\/.*)?$/;
+// Origin shares don't expire: a card link lives until it is unshared or its app is removed.
+const NEVER = Number.MAX_SAFE_INTEGER;
 // 128 random bits: the token is the only thing between a link and the page.
 const newToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64url");
 const originUrl = (origin: ShareOrigin, token: string) => `${origin.url}/s/${token}/`;
 const onOrigin = (origin: ShareOrigin, record: ShareRecord) =>
-  record.token !== undefined && TOKEN.test(record.token) && record.url === originUrl(origin, record.token);
+  record.token !== undefined && TOKEN.test(record.token) && record.url === originUrl(origin, record.token)
+  && typeof record.root === "string";
 
 export type SharesOptions = {
   /** The owner store: shares are bridge-wide, not per chat. */
@@ -139,15 +144,15 @@ export class Shares {
       const origin = this.options.origin;
       if (origin) {
         if (!this.serveOrigin()) throw new ShareError(502, `The share server can't listen on 127.0.0.1:${origin.port}`);
-        if (record && onOrigin(origin, record) && record.expiresAt > this.now()) {
-          record.expiresAt = Math.max(record.expiresAt, expiresAt);
-          this.save(slug, record);
-          return { url: record.url, created: false, expiresAt: record.expiresAt, metadataWarnings: warnings };
+        if (record && onOrigin(origin, record)) {
+          this.save(slug, { ...record, root: dirname(index) });
+          return { url: record.url, created: false, expiresAt: NEVER, metadataWarnings: warnings };
         }
         await this.close(slug);
         const token = newToken();
-        this.save(slug, { url: originUrl(origin, token), port: origin.port, token, startedAt: this.now(), expiresAt });
-        return { url: originUrl(origin, token), created: true, expiresAt, metadataWarnings: warnings };
+        this.save(slug, { url: originUrl(origin, token), port: origin.port, token, startedAt: this.now(),
+          expiresAt: NEVER, root: dirname(index) });
+        return { url: originUrl(origin, token), created: true, expiresAt: NEVER, metadataWarnings: warnings };
       }
       if (record && this.live.get(slug)?.tunnel.alive()) {
         record.expiresAt = Math.max(record.expiresAt, expiresAt);
@@ -201,20 +206,37 @@ export class Shares {
 
   private async handle(request: Request): Promise<Response> {
     const { pathname, search } = new URL(request.url);
-    if (pathname === "/healthz") return new Response("ok\n", { headers: { "Cache-Control": "no-store", "Content-Type": "text/plain" } });
+    if (pathname === "/healthz") return this.health(this.options.origin!);
     const match = SHARE_PATH.exec(pathname);
     const origin = this.options.origin!;
-    const found = match ? this.records().find(([, record]) => record.token === match[1] && onOrigin(origin, record)
-      && record.expiresAt > this.now()) : undefined;
-    const index = found && await this.index(found[0]);
-    if (!match || !index) return notFoundResponse();
+    const found = match ? this.records().find(([, record]) => record.token === match[1] && onOrigin(origin, record)) : undefined;
+    // The root is the directory approved at share time; an app's index being swapped later can't retarget the token.
+    if (!match || !found || !found[1].root) return notFoundResponse();
     // Pages load data.json and assets relative to their directory, so the share root needs its slash.
     if (match[2] === undefined) return new Response(null, { status: 308, headers: { Location: `/s/${match[1]}/${search}`, "Cache-Control": "no-store" } });
-    return serveAppFile(request, dirname(index), match[2]);
+    return serveAppFile(request, found[1].root, match[2]);
+  }
+
+  /**
+   * The tunnel's health check, and it must mean the card links work. 503 names the broken shares: a live origin
+   * share whose page no longer serves (its index was removed or moved out of its directory), so a dead page can't
+   * read as healthy.
+   */
+  private async health(origin: ShareOrigin): Promise<Response> {
+    const broken: string[] = [];
+    for (const [slug, record] of this.records()) {
+      if (!onOrigin(origin, record) || !record.root) continue;
+      const index = await this.index(slug);
+      if (!index || dirname(index) !== record.root) broken.push(slug);
+    }
+    const headers = { "Cache-Control": "no-store", "Content-Type": "text/plain" };
+    if (broken.length === 0) return new Response("ok\n", { headers });
+    return new Response(`broken shares: ${broken.join(", ")}\n`, { status: 503, headers });
   }
 
   private alive(slug: string, record: ShareRecord): boolean {
-    if (record.token) return this.server !== undefined && record.expiresAt > this.now();
+    // An origin share is live only while its page still exists where it was approved.
+    if (record.token) return this.server !== undefined && record.root !== undefined && existsSync(join(record.root, "index.html"));
     return this.live.get(slug)?.tunnel.alive() ?? false;
   }
 
@@ -227,20 +249,27 @@ export class Shares {
         const origin = this.options.origin;
         if (origin) this.serveOrigin();
         for (const [slug, record] of this.records()) {
+          if (origin) {
+            if (onOrigin(origin, record)) {
+              // An origin share whose app was removed has nothing to serve; drop it rather than leave a dead link.
+              if (!(await this.index(slug))) { await this.close(slug); this.forget(slug); this.log("share-dropped", slug); }
+              continue;
+            }
+            // A quick-tunnel share (or one on an older origin) moves to the origin once. The move makes it permanent
+            // (origin shares don't expire) and binds the approved directory, which is still the app's current one.
+            const index = await this.index(slug);
+            await this.close(slug);
+            if (!index) { this.forget(slug); this.log("share-dropped", slug); continue; }
+            const token = newToken();
+            const url = originUrl(origin, token);
+            this.save(slug, { url, port: origin.port, token, startedAt: record.startedAt, expiresAt: NEVER, root: dirname(index) });
+            this.log("share-moved", `${slug} ${record.url} ${url}`);
+            continue;
+          }
           if (record.expiresAt <= this.now()) {
             await this.close(slug);
             this.forget(slug);
             this.log("share-expired", slug);
-            continue;
-          }
-          if (origin) {
-            if (onOrigin(origin, record)) continue;
-            // A quick-tunnel share (or one on an older origin) moves to the origin once, keeping its expiry.
-            await this.close(slug);
-            const token = newToken();
-            const url = originUrl(origin, token);
-            this.save(slug, { url, port: origin.port, token, startedAt: record.startedAt, expiresAt: record.expiresAt });
-            this.log("share-moved", `${slug} ${record.url} ${url}`);
             continue;
           }
           if (this.live.get(slug)?.tunnel.alive()) continue;
