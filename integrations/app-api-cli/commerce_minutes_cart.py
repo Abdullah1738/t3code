@@ -179,28 +179,46 @@ def set_cart(rows, *, expect_hash, auth=None):
             'cart_mutation_sent': True, 'financial_send': False}
 
 
-def reconcile(flow_id, *, expect_hash, auth=None):
+
+def reconcile(flow_id, *, rows, expect_hash, auth=None):
     """Close a flow whose consumed cart send has no persisted receipt, after an exact readback.
 
-    Read-only against noon: one session readback must equal the expected basket hash. Only then is
-    the consumed minutes_cart_set operation observed (CART_READBACK) and the flow abandoned through
-    the unchanged journal guard. No sync is sent; a mismatch refuses and leaves the flow as it is.
+    The caller names the intended basket (rows, as sent) and its hash. Reconcile proves that
+    basket is the one the journal recorded: the rebuilt sync body must hash to the consumed
+    minutes_cart_set operation's stored request_hash, and the account must match the flow.
+    Then one read-only readback must equal the basket. Only then is CART_READBACK observed and the
+    flow abandoned through the unchanged guard. No sync is sent; any mismatch refuses untouched.
     """
     m.require(isinstance(expect_hash, str) and expect_hash, 'MINUTES_CART_EXPECT_HASH_REQUIRED')
+    new_rows = m._skus(_rows(rows))
+    m.require(new_rows and all(x['qty'] > 0 for x in new_rows), 'INVALID_QUANTITY')
+    new_manifest = [_sorted_row(x['sku'], x['qty'], x['modifiers']) for x in new_rows]
+    new_hash = manifest_hash(new_manifest)
+    m.require(new_hash == expect_hash, 'MINUTES_CART_RECONCILE_BASKET_HASH_MISMATCH')
+    body = {'skus': new_rows, 'bundles': [], 'refresh': False}
+    request_hash = hashlib.sha256(m._json(body)).hexdigest()
+
     binding = j.binding(flow_id)
     m.require(binding['app'] == 'noon' and binding['vertical'] == 'minutes', 'MINUTES_FLOW_REQUIRED')
     state = j.inspect(flow_id)
     ops = [x for x in state['operations'] if x['name'] == 'minutes_cart_set']
     m.require(state['state'] in ('ACTIVE', 'FENCED') and len(ops) == 1
               and ops[0]['kind'] == 'cart', 'MINUTES_CART_RECONCILE_NOT_CART_SEND')
+    with j._db() as db:
+        sent = db.execute("SELECT request_hash FROM operations WHERE flow_id=? AND name='minutes_cart_set'",
+                          (flow_id,)).fetchone()
+    m.require(sent is not None and sent['request_hash'] == request_hash,
+              'MINUTES_CART_RECONCILE_BASKET_NOT_SENT')
+
     auth = auth or NoonAuthLifecycle()
+    account = auth.revalidate('minutes').account_ref
+    m.require(account == binding['account_hash'], 'MINUTES_CART_RECONCILE_ACCOUNT_MISMATCH')
     current = readback_session(auth)
-    rows = manifest(current.projection['lines'])
-    if manifest_hash(rows) != expect_hash:
-        j.fail('MINUTES_CART_RECONCILE_CART_MISMATCH')
     m.require(_special_count(current.projection['lines']) == 0, 'MINUTES_CART_SPECIAL_LINES')
+    if manifest_hash(manifest(current.projection['lines'])) != new_hash:
+        j.fail('MINUTES_CART_RECONCILE_CART_MISMATCH')
     evidence = hashlib.sha256(m._json(current.projection)).hexdigest()
     j.observe(flow_id, 'minutes_cart_set', outcome='CART_READBACK', evidence_hash=evidence)
     j.abandon(flow_id)
-    return {'ok': True, 'flow_id': flow_id, 'state': 'RELEASED', 'cart_hash': expect_hash,
+    return {'ok': True, 'flow_id': flow_id, 'state': 'RELEASED', 'cart_hash': new_hash,
             'cart_mutation_sent': False, 'financial_send': False, 'readback_verified': True}

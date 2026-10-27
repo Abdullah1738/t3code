@@ -1050,17 +1050,18 @@ def main(argv=None):
                     **read_options(args.sku,query=args.query)}
         elif args.command=='cart':
             from commerce_minutes_cart import show as cart_show,set_cart as cart_set
+            from commerce_basket_input import read_items
             if args.action=='show':
                 result=cart_show(auth=CommerceAuth().noon)
             elif args.action=='reconcile':
-                if args.flow_id is None or args.expect_hash is None:
-                    journal.fail('MINUTES_CART_RECONCILE_REQUIRES_FLOW_AND_EXPECT_HASH')
+                if args.flow_id is None or args.expect_hash is None or args.items_file is None:
+                    journal.fail('MINUTES_CART_RECONCILE_REQUIRES_FLOW_ITEMS_AND_EXPECT_HASH')
                 from commerce_minutes_cart import reconcile as cart_reconcile
-                result=cart_reconcile(args.flow_id,expect_hash=args.expect_hash,auth=CommerceAuth().noon)
+                result=cart_reconcile(args.flow_id,rows=read_items(args.items_file),expect_hash=args.expect_hash,
+                                      auth=CommerceAuth().noon)
             else:
                 if args.items_file is None or args.expect_hash is None:
                     journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')
-                from commerce_basket_input import read_items
                 result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon)
         elif args.command=='clear-cart':
             if args.vertical=='minutes':
