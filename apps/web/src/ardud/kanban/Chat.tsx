@@ -263,9 +263,6 @@ function ChoiceBlock(props: {
   const answers = message.answers.filter((answer) => answer.blockId === block.id);
   const own = ownerChoiceAnswer(block, message.answers);
   const mine = own?.choice ?? [];
-  // Words he sent but the server hasn't echoed yet still show as his answer.
-  const sentWords = current?.sent && current.text.trim() !== "" ? current.text.trim() : null;
-  const ownWords = own?.text ?? sentWords;
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -273,6 +270,9 @@ function ChoiceBlock(props: {
   const [draft, setDraft] = useState<ChoiceDraft | null>(null);
   const [sending, setSending] = useState(false);
   const current = draft !== null && draft.against === ownAt ? draft : null;
+  // Words he sent but the server hasn't echoed yet still show as his answer.
+  const sentWords = current?.sent && current.text.trim() !== "" ? current.text.trim() : null;
+  const ownWords = own?.text ?? sentWords;
   const picked = current?.choice ?? mine;
   const words = current?.text ?? "";
   const answered = mine.length > 0 || own?.text != null || current?.sent === true;
