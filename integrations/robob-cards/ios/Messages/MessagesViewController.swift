@@ -33,6 +33,9 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         return "Robob Cards \(version) (\(build))"
     }()
     private var loadTimer: Timer?
+    // Only callbacks from the newest navigation may change the sheet. A load
+    // that was replaced (another card, Try again) reports -999 late.
+    private var currentNavigation: WKNavigation?
     private var crashReloads = 0
     private static let loadTimeout: TimeInterval = 15
     private static let log = Logger(subsystem: "com.abdullah.robob.cards", category: "card")
@@ -177,7 +180,7 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
             Self.log.error("load timed out")
             self?.showNote("This card is taking too long to load.", canRetry: true)
         }
-        webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.loadTimeout))
+        currentNavigation = webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.loadTimeout))
     }
 
     private func layout(for style: MSMessagesAppPresentationStyle) {
@@ -204,9 +207,19 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
         safari.isHidden = cardURL == nil
     }
 
+    // An iMessage extension may only open its parent app (and only when that
+    // app is on the Home Screen), so Safari is reached through the container
+    // app: it receives the page URL and opens it with UIApplication.open.
     @objc private func openInSafari() {
         guard let url = webView.url ?? cardURL, Self.isCardPage(url) else { return }
-        extensionContext?.open(url)
+        var handoff = URLComponents()
+        handoff.scheme = "robobcards"
+        handoff.host = "open"
+        handoff.queryItems = [URLQueryItem(name: "url", value: url.absoluteString)]
+        guard let link = handoff.url else { return }
+        extensionContext?.open(link) { opened in
+            if !opened { Self.log.error("handoff to the container app failed") }
+        }
     }
 
     @objc private func expand() {
@@ -249,6 +262,7 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard navigation === currentNavigation else { return }
         Self.log.info("loaded")
         loadTimer?.invalidate()
         loadTimer = nil
@@ -273,10 +287,12 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard navigation === currentNavigation else { return }
         failed(error)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard navigation === currentNavigation else { return }
         failed(error)
     }
 
