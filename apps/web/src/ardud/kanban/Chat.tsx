@@ -390,9 +390,12 @@ function ChoiceBlock(props: {
   const words = current?.text ?? "";
   const answered = mine.length > 0 || own?.text != null || current?.sent === true;
   const recommended = block.options[0]?.id;
+  // The owner's answer is a write; without the grant every control here is off.
+  const canAnswer = useKanbanPermission(KANBAN_WS_METHODS.answer);
+  const answerNote = canAnswer ? undefined : "Your connection can't answer questions";
 
   const send = async (choice: ReadonlyArray<string>, text: string) => {
-    if (!canSendChoice(block, choice, text) || sending) return;
+    if (!canAnswer || !canSendChoice(block, choice, text) || sending) return;
     const against = ownAt;
     setDraft({ choice, text, against, sent: true });
     setSending(true);
@@ -445,7 +448,8 @@ function ChoiceBlock(props: {
             <button
               key={option.id}
               type="button"
-              disabled={sending}
+              disabled={sending || !canAnswer}
+              title={answerNote}
               onClick={() => toggle(option.id)}
               aria-pressed={on}
               className={cn(
@@ -477,7 +481,8 @@ function ChoiceBlock(props: {
             type="button"
             role={block.multi ? "checkbox" : "radio"}
             aria-checked={on}
-            disabled={answered || sending}
+            disabled={answered || sending || !canAnswer}
+            title={answerNote}
             onClick={() => toggle(option.id)}
             className={cn(
               "flex min-h-9 items-center gap-2.5 rounded-xl bg-(--m-ground) px-3 py-1.5 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:cursor-default",
@@ -507,6 +512,8 @@ function ChoiceBlock(props: {
             value={words}
             placeholder="Your own answer"
             aria-label="Your own answer"
+            disabled={!canAnswer}
+            title={answerNote}
             onChange={(event) =>
               setDraft({ choice: picked, text: event.target.value, against: ownAt, sent: false })
             }
@@ -521,7 +528,8 @@ function ChoiceBlock(props: {
             <button
               type="button"
               aria-label="Send your answer"
-              disabled={!canSendChoice(block, [], words) || sending}
+              disabled={!canAnswer || !canSendChoice(block, [], words) || sending}
+              title={answerNote}
               onClick={() => void send([], words)}
               className="flex size-7 shrink-0 items-center justify-center rounded-full bg-(--m-accent) text-(--m-accent-ink) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) disabled:opacity-50"
             >
@@ -541,7 +549,8 @@ function ChoiceBlock(props: {
       {block.multi && !answered ? (
         <button
           type="button"
-          disabled={!canSendChoice(block, picked, words) || sending}
+          disabled={!canAnswer || !canSendChoice(block, picked, words) || sending}
+          title={answerNote}
           onClick={() => void send(picked, words)}
           className="h-8 self-start rounded-full bg-(--m-accent) px-3.5 text-sm font-medium text-(--m-accent-ink) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) disabled:opacity-50"
         >

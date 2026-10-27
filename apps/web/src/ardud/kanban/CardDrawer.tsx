@@ -336,6 +336,8 @@ function Details(props: {
   events: ReadonlyArray<KanbanCardEvent>;
   nowMs: number;
 }) {
+  const canPatch = useKanbanPermission(KANBAN_WS_METHODS.cardPatch);
+  const patchNote = canPatch ? undefined : "Your connection can't change cards";
   const { card, state } = props;
   const board = state.board;
   const goals = [...state.goals.values()].filter((goal) => goal.status === "active");
@@ -359,7 +361,7 @@ function Details(props: {
       <dl className="grid grid-cols-[112px_1fr] items-center gap-x-4 gap-y-3 text-sm">
         <Fact label="Stage">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               <Glyph kind={stageGlyph(card.stage)} />
               {STAGE_LABELS[card.stage]}
             </MenuTrigger>
@@ -379,7 +381,7 @@ function Details(props: {
         </Fact>
         <Fact label="Priority">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               <Pri priority={card.priority} />
               {priorityLabel(card.priority)}
             </MenuTrigger>
@@ -399,7 +401,7 @@ function Details(props: {
         </Fact>
         <Fact label="Goal">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               {card.goalId ? (state.goals.get(card.goalId)?.name ?? "Goal") : "None"}
             </MenuTrigger>
             <MenuPopup align="start" side="bottom">
@@ -492,7 +494,13 @@ function Details(props: {
           <Fact label="Stalled">
             <span className="flex items-center gap-2">
               <span className="text-(--m-negative)">{card.stalled.reason}</span>
-              <QuietButton onClick={() => patch({ stalled: false })}>Clear</QuietButton>
+              <QuietButton
+                disabled={!canPatch}
+                title={patchNote}
+                onClick={() => patch({ stalled: false })}
+              >
+                Clear
+              </QuietButton>
             </span>
           </Fact>
         ) : null}
@@ -594,6 +602,8 @@ function FactButton(props: React.ComponentProps<"button">) {
 /** Open questions for the owner. Answers go in the card's discussion. */
 function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => void }) {
   const { card } = props;
+  const canAsk = useKanbanPermission(KANBAN_WS_METHODS.cardAsk);
+  const askNote = canAsk ? undefined : "Your connection can't change questions";
   const asks = askViews(card, props.nowMs);
   // Cards from before asks were kept only carry the question.
   if (asks.length === 0) {
@@ -619,6 +629,8 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
             <QuietButton onClick={props.onAnswer}>Answer</QuietButton>
             {ask.blocking ? null : (
               <QuietButton
+                disabled={!canAsk}
+                title={askNote}
                 onClick={() =>
                   void runAction("Couldn't make it blocking", () =>
                     kanban.changeAsk(card.id, ask.id, "block"),
@@ -629,6 +641,8 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
               </QuietButton>
             )}
             <QuietButton
+              disabled={!canAsk}
+              title={askNote}
               onClick={() =>
                 void runAction("Couldn't drop the question", () =>
                   kanban.changeAsk(card.id, ask.id, "drop"),

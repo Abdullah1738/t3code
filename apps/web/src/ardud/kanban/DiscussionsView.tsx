@@ -439,6 +439,8 @@ function DiscussionMenu(props: {
   const settled = discussion.settledAt !== null;
   const snoozed = !settled && discussionSnoozed(discussion, props.nowMs);
   const presets = open ? resolveSnoozePresets(new Date(), timestampFormat) : [];
+  const canUpdate = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
+  const updateNote = canUpdate ? undefined : "Your connection can't change discussions";
   const update = (patch: DiscussionPatch) =>
     void updateDiscussion(props.boardId, discussion.id, patch);
   return (
@@ -456,24 +458,24 @@ function DiscussionMenu(props: {
       </MenuTrigger>
       <MenuPopup side="bottom" align="end">
         {settled ? (
-          <MenuItem onClick={() => update({ settled: false })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: false })}>
             <Undo2Icon />
             Unsettle
           </MenuItem>
         ) : (
-          <MenuItem onClick={() => update({ settled: true })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: true })}>
             <CircleCheckIcon />
             Settle
           </MenuItem>
         )}
         {snoozed ? (
-          <MenuItem onClick={() => update({ snoozedUntil: null })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ snoozedUntil: null })}>
             <AlarmClockOffIcon />
             Unsnooze
           </MenuItem>
         ) : (
           <MenuSub>
-            <MenuSubTrigger>
+            <MenuSubTrigger disabled={!canUpdate} title={updateNote}>
               <AlarmClockIcon />
               Snooze
             </MenuSubTrigger>
@@ -500,7 +502,7 @@ function DiscussionMenu(props: {
           </MenuSub>
         )}
         <MenuSeparator />
-        <MenuItem onClick={props.onRename}>
+        <MenuItem disabled={!canUpdate} title={updateNote} onClick={props.onRename}>
           <PencilIcon />
           Rename
         </MenuItem>
@@ -530,6 +532,7 @@ function RoomTitle(props: {
   onEditingChange: (editing: boolean) => void;
   onSave: (title: string) => Promise<boolean>;
 }) {
+  const canRename = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
   if (!props.editing) {
     return (
       <h3 className="flex min-w-0 flex-1">
@@ -538,6 +541,8 @@ function RoomTitle(props: {
             render={
               <button
                 type="button"
+                disabled={!canRename}
+                title={canRename ? undefined : "Your connection can't rename discussions"}
                 onClick={() => props.onEditingChange(true)}
                 className="-ms-1.5 min-w-0 truncate rounded-lg px-1.5 py-0.5 text-left text-base font-medium outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               />
