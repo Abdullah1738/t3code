@@ -1,9 +1,10 @@
-import type {
-  KanbanBlock,
-  KanbanBoardSnapshot,
-  KanbanCard,
-  KanbanDiscussion,
-  KanbanMessage,
+import {
+  ThreadId,
+  type KanbanBlock,
+  type KanbanBoardSnapshot,
+  type KanbanCard,
+  type KanbanDiscussion,
+  type KanbanMessage,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -522,7 +523,13 @@ describe("own answers on a choice block", () => {
     const at = "2026-10-27T10:00:00.000Z";
     const answers = [
       { blockId: "other", by: { _tag: "owner" as const }, choice: ["yes"], text: null, at },
-      { blockId: "q1", by: { _tag: "evaluator" as const, threadId: "t1" }, choice: ["no"], text: null, at },
+      {
+        blockId: "q1",
+        by: { _tag: "evaluator" as const, threadId: ThreadId.make("t1") },
+        choice: ["no"],
+        text: null,
+        at,
+      },
       { blockId: "q1", by: { _tag: "owner" as const }, choice: [], text: "Wait", at },
     ];
     expect(ownerChoiceAnswer(block, answers)?.text).toBe("Wait");
