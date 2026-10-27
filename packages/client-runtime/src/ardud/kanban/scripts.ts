@@ -43,12 +43,17 @@ function cronLabel(cron: string): string {
   return `Cron ${cron}`;
 }
 
-/** When a script runs, in a few words: "Every 15 min", "Daily 09:00", "When a card moves". */
+/**
+ * When a script runs, in a few words: "Every 15 min", "Daily 09:00 · Asia/Dubai",
+ * "When a card moves". Cron times get the zone the server runs them in, since
+ * the browser's zone can differ.
+ */
 export function scriptTriggerLabel(trigger: KanbanScriptTrigger): string {
   switch (trigger._tag) {
     case "schedule":
       if (trigger.everyMs !== null) return everyLabel(trigger.everyMs);
-      return trigger.cron === null ? "On a schedule" : cronLabel(trigger.cron);
+      if (trigger.cron === null) return "On a schedule";
+      return trigger.timeZone ? `${cronLabel(trigger.cron)} · ${trigger.timeZone}` : cronLabel(trigger.cron);
     case "event":
       return EVENT_LABELS[trigger.event];
     case "webhook":

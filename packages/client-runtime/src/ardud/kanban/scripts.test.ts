@@ -21,6 +21,15 @@ describe("board scripts", () => {
     expect(cron("30 18 * * 1-5")).toBe("Weekdays 18:30");
     expect(cron("*/30 * * * *")).toBe("Every 30 min");
     expect(cron("0 9 1 * *")).toBe("Cron 0 9 1 * *");
+    // The zone is the server's, so it's shown even when the browser is elsewhere.
+    expect(
+      scriptTriggerLabel({
+        _tag: "schedule",
+        everyMs: null,
+        cron: "0 9 * * *",
+        timeZone: "Asia/Dubai",
+      }),
+    ).toBe("Daily 09:00 · Asia/Dubai");
     expect(scriptTriggerLabel({ _tag: "event", event: "card.moved" })).toBe("When a card moves");
     expect(scriptTriggerLabel({ _tag: "manual" })).toBe("When you run it");
   });

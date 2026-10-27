@@ -577,6 +577,8 @@ export const KanbanScriptTrigger = Schema.Union([
   Schema.TaggedStruct("schedule", {
     everyMs: Schema.NullOr(PositiveInt),
     cron: Schema.NullOr(Schema.String),
+    /** The zone a cron line runs in (the server's), filled on read; null when unknown. */
+    timeZone: Schema.optional(Schema.NullOr(Schema.String)),
   }),
   Schema.TaggedStruct("event", {
     event: Schema.Literals(["card.created", "card.moved", "message.posted"]),

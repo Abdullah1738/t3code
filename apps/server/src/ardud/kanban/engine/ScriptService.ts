@@ -517,7 +517,18 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const scripts: KanbanScriptsShape["scripts"] = (boardId) => io(store.scripts(boardId));
+  // Cron lines run in the process's zone (see Scripts.cronProblem), so that's the zone shown.
+  const serverZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const scripts: KanbanScriptsShape["scripts"] = (boardId) =>
+    io(store.scripts(boardId)).pipe(
+      Effect.map((list) =>
+        list.map((script) =>
+          script.trigger._tag === "schedule" && script.trigger.cron !== null
+            ? { ...script, trigger: { ...script.trigger, timeZone: serverZone } }
+            : script,
+        ),
+      ),
+    );
 
   const runs: KanbanScriptsShape["runs"] = (scriptId, limit) =>
     io(store.scriptRuns(scriptId, Math.max(1, Math.min(limit, 200))));
