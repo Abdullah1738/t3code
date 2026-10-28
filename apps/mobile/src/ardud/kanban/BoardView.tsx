@@ -62,26 +62,17 @@ export function BoardView(props: {
           value={query}
           onChangeText={setQuery}
         />
-        <Pressable
-          accessibilityRole="switch"
-          accessibilityLabel="Show settled cards"
-          accessibilityState={{ checked: settled === "include" }}
-          onPress={() => setSettled((current) => (current === "hide" ? "include" : "hide"))}
-          className={cn(
-            "min-h-11 justify-center rounded-full px-4",
-            settled === "include" ? "bg-foreground" : "bg-grouped-card",
-          )}
-        >
-          <Text
-            className={cn(
-              "text-[13px] font-t3-semibold",
-              settled === "include" ? "text-screen" : "text-foreground",
-            )}
-          >
-            Settled
-          </Text>
-        </Pressable>
       </View>
+      <ChoiceRow
+        accessibilityLabel="Settled cards"
+        options={[
+          { value: "hide", label: "Hide settled" },
+          { value: "include", label: "Show settled" },
+          { value: "only", label: "Only settled" },
+        ]}
+        selected={settled}
+        onSelect={setSettled}
+      />
       {goals.length > 0 ? (
         <ChoiceRow
           accessibilityLabel="Goal"
