@@ -13,6 +13,7 @@ import {
   type KanbanActor,
   type KanbanBlock,
   type ModelSelection,
+  type OrchestrationV2ProviderFailure,
 } from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
@@ -20,10 +21,12 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { modelSelectionOf } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as KanbanService from "./KanbanService.ts";
+import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
 
 interface FakeThread {
@@ -37,6 +40,7 @@ const makeFake = Effect.gen(function* () {
   const threads = yield* Ref.make(new Map<string, FakeThread>());
   const interrupted: Array<string> = [];
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
+  const failures = new Map<string, OrchestrationV2ProviderFailure>();
   let next = 0;
   const layer = Layer.succeed(
     KanbanThreads,
@@ -75,10 +79,11 @@ const makeFake = Effect.gen(function* () {
           if (thread) thread.messages.push(input.text);
           return all;
         }),
+      lastFailure: (threadId) => Effect.succeed(failures.get(threadId) ?? null),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
-  return { threads, layer, interrupted, prs };
+  return { threads, layer, interrupted, prs, failures };
 });
 
 /** Board file storage (ServerConfig + FileSystem) that KanbanService now needs when built. */
@@ -93,6 +98,7 @@ const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
 
@@ -1724,6 +1730,7 @@ const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
     Layer.provideMerge(fake),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(
       Layer.mock(TextGeneration.TextGeneration)({
         generateThreadTitle: (input) =>

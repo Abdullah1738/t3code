@@ -22,6 +22,8 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
 import { KanbanThreads } from "../engine/threads.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
 import { KanbanToolkit } from "./tools.ts";
 
@@ -80,6 +82,7 @@ const fakeThreads = () => {
           updatedAt: "2026-10-26T08:00:00.000Z",
           prs: [],
         }),
+      lastFailure: () => Effect.succeed(null),
       launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
       send: () => Effect.void,
       interrupt: () => Effect.void,
@@ -97,6 +100,7 @@ const fakeThreads = () => {
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
   return { running, layer };

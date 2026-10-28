@@ -20,6 +20,8 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import { opencodeTestProvider } from "./testProviders.ts";
 
 const owner: KanbanActor = { _tag: "owner" };
 
@@ -60,6 +62,7 @@ const makeFake = Effect.gen(function* () {
           all.get(input.threadId)?.messages.push(input.text);
           return all;
         }),
+      lastFailure: () => Effect.succeed(null),
       interrupt: () => Effect.void,
     }),
   );
@@ -77,6 +80,7 @@ const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(attachmentsLayerTest),
   );
 
