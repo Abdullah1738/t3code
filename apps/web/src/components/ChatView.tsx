@@ -8242,7 +8242,13 @@ export default function ChatView(props: ChatViewProps) {
                           {showBoardRunBar && boardRun ? (
                             <BoardRunBar
                               boardName={boardRun.boardName}
-                              onOpenBoard={null}
+                              onOpenBoard={() =>
+                                void navigate({
+                                  to: "/boards/$boardId",
+                                  params: { boardId: boardRun.boardId },
+                                  search: {},
+                                })
+                              }
                             />
                           ) : null}
                           {!composerMounted ? null : (
