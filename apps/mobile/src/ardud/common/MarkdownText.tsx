@@ -18,8 +18,12 @@ import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { usePairedEnvironmentId } from "./environment";
 import { LinkButton } from "./parts";
 
-/** A board link resolves to the screen that shows it on the current board, or null when it isn't on that board. */
-export type KanbanLinkTarget = { readonly kind: "card" | "discussion"; readonly id: string };
+/** A board link resolves to the record it opens on the current board, or null when it isn't on that board. */
+export type KanbanLinkTarget = {
+  readonly kind: "card" | "discussion";
+  readonly boardId: string;
+  readonly id: string;
+};
 export type ResolveKanbanLink = (href: string) => KanbanLinkTarget | null;
 
 /**

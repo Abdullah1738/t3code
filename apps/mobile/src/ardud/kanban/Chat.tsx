@@ -49,6 +49,7 @@ import {
   groupBlockRuns,
   isLoadableImageUrl,
   nextTypingExpiry,
+  kanbanLinkTarget,
   sendBlocks,
   toggleChoice,
   type StoredAttachment,
@@ -281,14 +282,10 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
  * Links to this board's own cards and discussions open; anything else (another
  * board's link, a missing record) stays inert, as on web.
  */
-function resolveKanbanLinkFor(state: KanbanBoardState): ResolveKanbanLink {
+function resolveKanbanLinkFor(boardId: string, state: KanbanBoardState): ResolveKanbanLink {
   return (href) => {
     const link = parseKanbanLink(href);
-    if (link === null) return null;
-    if (link.kind === "kanban-card") {
-      return state.cards.has(link.id) ? { kind: "card", id: link.id } : null;
-    }
-    return state.discussions.has(link.id) ? { kind: "discussion", id: link.id } : null;
+    return link === null ? null : kanbanLinkTarget(link, boardId, state);
   };
 }
 
@@ -332,7 +329,7 @@ function MessageView(props: {
       discussionId={props.discussionId}
       message={message}
       state={props.state}
-      resolveKanbanLink={resolveKanbanLinkFor(props.state)}
+      resolveKanbanLink={resolveKanbanLinkFor(props.boardId, props.state)}
       nowMs={props.nowMs}
       onOpenCard={props.onOpenCard}
     />

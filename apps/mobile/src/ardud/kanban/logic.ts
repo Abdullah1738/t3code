@@ -225,6 +225,28 @@ export function kanbanRecordState(
   return { kind, boardId, id };
 }
 
+/**
+ * Where a board link opens, as the record params the pushed screen reads: the
+ * card or discussion on this board. A link to another board, or to a record
+ * that isn't on this board, opens nothing (null).
+ */
+export function kanbanLinkTarget(
+  link: { readonly kind: string; readonly id: string },
+  boardId: string,
+  board: {
+    readonly cards: ReadonlyMap<string, unknown>;
+    readonly discussions: ReadonlyMap<string, unknown>;
+  },
+): { readonly kind: "card" | "discussion"; readonly boardId: string; readonly id: string } | null {
+  if (link.kind === "kanban-card") {
+    return board.cards.has(link.id) ? { kind: "card", boardId, id: link.id } : null;
+  }
+  if (link.kind === "kanban-discussion") {
+    return board.discussions.has(link.id) ? { kind: "discussion", boardId, id: link.id } : null;
+  }
+  return null;
+}
+
 /** An attachment the server has stored, as a block refers to it. */
 export type StoredAttachment = ChatImageAttachment | ChatFileAttachment;
 
