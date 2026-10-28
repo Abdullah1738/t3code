@@ -497,6 +497,12 @@ export const blocksText = (
     })
     .join("\n\n");
 
+/** A post wants an answer: a choice, a question mark ending a sentence, or a call for the evaluator. */
+export const asksSomething = (blocks: ReadonlyArray<KanbanBlock>, text: string) =>
+  blocks.some((block) => block._tag === "choice") ||
+  /\?(\s|$)/.test(text) ||
+  /\bevaluator\b/i.test(text);
+
 const roleName = (role: KanbanThreadLink["role"]) =>
   role === "work" ? "Worker" : role === "review" ? "Reviewer" : "Evaluator";
 
@@ -1514,6 +1520,22 @@ const make = Effect.gen(function* () {
           text: `Evaluator in the discussion of card #${card.number} (${posted.id}):\n\n${text}`,
         });
       }
+    } else if (
+      author._tag === "thread" &&
+      posted.cardId !== null &&
+      asksSomething(storedBlocks, text)
+    ) {
+      // Nothing else reads a worker's post, so its question goes to the discussion's evaluator.
+      const card = yield* cardOf(posted.cardId);
+      yield* toEvaluator(
+        posted,
+        Briefs.workerQuestionText(card.number, posted.id, author.threadId, text),
+        true,
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban worker question routing failed", { cardId: card.id, cause }),
+        ),
+      );
     }
     return message;
   });

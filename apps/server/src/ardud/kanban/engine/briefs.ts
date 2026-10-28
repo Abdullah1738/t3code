@@ -257,6 +257,21 @@ export const ownerMessageText = (discussionTitle: string, discussionId: string, 
 export const nudgeDiscussionText = (discussionId: string) =>
   `The owner is waiting for your reply in discussion ${discussionId}. Post it with discussion_post.`;
 
+/** A worker asked something in its card discussion. */
+export const workerQuestionText = (
+  cardNumber: number,
+  discussionId: string,
+  threadId: string,
+  text: string,
+) =>
+  lines(
+    `The worker on card #${cardNumber} (thread ${threadId}) asked in the card's discussion (${discussionId}):`,
+    "",
+    text,
+    "",
+    `Read the card and the discussion first. If you can answer from the card, its packet, the code or the board, reply with discussion_post (discussionId ${discussionId}); the worker gets your reply. If only the owner can decide, or the worker is answering him, leave it to him: card_ask on the card if it isn't asked yet, and tell the worker to go on with the rest. If it isn't really a question (a status update), don't reply.`,
+  );
+
 /** Handed to an evaluator that asked on a card before the card discussion got its own evaluator. */
 export const cardHandoffText = (cardNumber: number, discussionId: string, threadId: string) =>
   `The owner followed up in the discussion of card #${cardNumber} (${discussionId}), and it now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; if you know something it needs, post it in that discussion.`;

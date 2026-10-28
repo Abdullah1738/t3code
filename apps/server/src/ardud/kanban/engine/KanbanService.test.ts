@@ -7,7 +7,13 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
-import { ProjectId, ThreadId, type KanbanActor, type ModelSelection } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ThreadId,
+  type KanbanActor,
+  type KanbanBlock,
+  type ModelSelection,
+} from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -265,6 +271,94 @@ it.effect("routes owner messages to the live thread, or to an evaluator when non
       assert.isNotNull(current.evaluatorThreadId);
       const link = yield* kanban.caller(current.evaluatorThreadId!);
       assert.strictEqual(link?.role, "evaluator");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("asksSomething spots a question, a choice or a call for the evaluator", () =>
+  Effect.sync(() => {
+    const ask = (blocks: ReadonlyArray<KanbanBlock>) =>
+      KanbanService.asksSomething(blocks, KanbanService.blocksText(blocks, () => null));
+    assert.isFalse(ask([{ _tag: "md", text: "Done, 3 attempts" }]));
+    assert.isFalse(ask([{ _tag: "md", text: "Logs at http://host/api?limit=200 look clean." }]));
+    assert.isTrue(ask([{ _tag: "md", text: "Which layout should I use?" }]));
+    assert.isTrue(ask([{ _tag: "md", text: "Should I keep it?\nThe rest is done." }]));
+    assert.isTrue(ask([{ _tag: "md", text: "Evaluator help needed on card #2." }]));
+    assert.isTrue(
+      ask([
+        {
+          _tag: "choice",
+          id: "q1",
+          style: "pick",
+          question: "Grid or row",
+          options: [{ id: "a", label: "Grid" }],
+          multi: false,
+        },
+      ]),
+    );
+  }),
+);
+
+it.effect("a worker's question in its card discussion reaches the discussion's evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(board.id, { prompt: "PIN pad", title: "PIN" }, owner);
+      yield* kanban.dispatchNow;
+      const worker: KanbanActor = {
+        _tag: "thread",
+        threadId: (yield* kanban.card(created.id)).card.activeThreadId!,
+      };
+      const discussion = yield* kanban.cardDiscussion(created.id);
+
+      // A status update wakes nobody.
+      yield* kanban.post(discussion.id, worker, [{ _tag: "md", text: "Tests pass, moving on." }]);
+      assert.isNull((yield* kanban.discussion(discussion.id)).evaluatorThreadId);
+
+      yield* kanban.post(discussion.id, worker, [
+        { _tag: "md", text: "Should the PIN pad shuffle its digits?" },
+      ]);
+      let current = yield* kanban.discussion(discussion.id);
+      const evaluatorId = current.evaluatorThreadId;
+      assert.isNotNull(evaluatorId);
+      const evaluator = (yield* Ref.get(fake.threads)).get(evaluatorId!)!;
+      assert.include(evaluator.messages.at(-1) ?? "", "Should the PIN pad shuffle its digits?");
+      assert.include(evaluator.messages.at(-1) ?? "", `card #${created.number}`);
+      assert.isTrue(
+        current.participants.every((participant) => participant.owes === null),
+        "a worker's question owes no reply",
+      );
+
+      // The same evaluator hears a choice and a call for help.
+      const heard = evaluator.messages.length;
+      yield* kanban.post(discussion.id, worker, [
+        {
+          _tag: "choice",
+          id: "q1",
+          style: "pick",
+          question: "Which layout",
+          options: [
+            { id: "a", label: "Grid" },
+            { id: "b", label: "Row" },
+          ],
+          multi: false,
+        },
+      ]);
+      yield* kanban.post(discussion.id, worker, [
+        { _tag: "md", text: "Evaluator help needed: check the 9999 path." },
+      ]);
+      current = yield* kanban.discussion(discussion.id);
+      assert.strictEqual(current.evaluatorThreadId, evaluatorId);
+      assert.lengthOf(evaluator.messages, heard + 2);
+      assert.include(evaluator.messages.at(-2) ?? "", "Which layout");
+      assert.include(evaluator.messages.at(-1) ?? "", "9999 path");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
