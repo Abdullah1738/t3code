@@ -10,7 +10,7 @@ import {
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
-  type KanbanThreadLink,
+  type KanbanThreadRow,
   type KanbanWatchEvent,
   type KanbanWikiPage,
   type ModelSelection,
@@ -59,7 +59,7 @@ export interface KanbanClient {
   card(boardId: string, cardId: string): SnapshotStore<KanbanCardDetail>;
   wiki(boardId: string): SnapshotStore<ReadonlyArray<KanbanWikiPage>>;
   /** Every thread the board started, cards and evaluators alike. */
-  threads(boardId: string): SnapshotStore<ReadonlyArray<KanbanThreadLink>>;
+  threads(boardId: string): SnapshotStore<ReadonlyArray<KanbanThreadRow>>;
   /** The board's scripts, kept current by the board feed. */
   scripts(boardId: string): SnapshotStore<ReadonlyArray<KanbanScript>>;
   /** A script's recent runs, newest first, kept current by the board feed. */
@@ -584,14 +584,29 @@ export function createKanbanClient(
     };
   }, options);
 
-  const threads = createKeyedSnapshotStores<string, ReadonlyArray<KanbanThreadLink>>(
+  // The Threads view stays current with the board: every feed snapshot (a
+  // reconnect included) and every board change reads the rows again, so a run
+  // that starts or finishes shows up without reopening the view.
+  const threads = createKeyedSnapshotStores<string, ReadonlyArray<KanbanThreadRow>>(
     (boardId, emit, fail) => {
       let closed = false;
-      transport.request(M.threads, { boardId: boardId as never }).then((links) => {
-        if (!closed) emit(links);
-      }, fail);
+      const read = serialLoader(async () => {
+        const rows = await transport.request(M.threads, { boardId: boardId as never });
+        if (!closed) emit(rows);
+      });
+      read.run();
+      const off = listen(
+        boardId,
+        (event) => {
+          // A row reads its card and thread state, so any board change may move it.
+          read.run();
+        },
+        fail,
+      );
       return () => {
         closed = true;
+        read.close();
+        off();
       };
     },
     options,
