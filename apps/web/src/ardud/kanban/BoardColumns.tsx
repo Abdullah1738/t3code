@@ -136,7 +136,6 @@ function StageGrid(props: ColumnsProps) {
                   label={column.label}
                   edge="right"
                   width={widthOf(column.stage)}
-                  measure={() => measureColumn(column.stage, widthOf(column.stage) !== null)}
                   onCommit={(width) => setWidth(column.stage, width)}
                   onReset={() => resetWidth(column.stage)}
                 />
@@ -171,7 +170,6 @@ function StageGrid(props: ColumnsProps) {
                 label="Shipped"
                 edge="right"
                 width={widthOf("shipped")}
-                measure={() => measureColumn("shipped", widthOf("shipped") !== null)}
                 onCommit={(width) => setWidth("shipped", width)}
                 onReset={() => resetWidth("shipped")}
               />
@@ -203,7 +201,6 @@ function StageGrid(props: ColumnsProps) {
             label={board.owner.label}
             edge="left"
             width={widthOf("needs_owner")}
-            measure={() => measureColumn("needs_owner", widthOf("needs_owner") !== null)}
             onCommit={(width) => setWidth("needs_owner", width)}
             onReset={() => resetWidth("needs_owner")}
           />
@@ -256,26 +253,6 @@ function columnStyle(width: number | null): React.CSSProperties | undefined {
   return width === null ? undefined : { width: `var(${COLUMN_WIDTH_PROPERTY}, ${width}px)` };
 }
 
-/**
- * Width a column starts a drag from. A column with no saved width is flex-1 and stretches
- * to fill the scroller, so its measured width is the whole row, not its own width: start
- * from the default instead. A column that already has a width is measured as it is.
- */
-function measureColumn(key: string, hasWidth: boolean): number {
-  if (!hasWidth) return BOARD_COLUMN_FALLBACK[key as BoardColumnKey] ?? 200;
-  const element = document.querySelector<HTMLElement>(`[data-column="${key}"]`);
-  const measured = element?.getBoundingClientRect().width ?? 0;
-  return measured > 0 ? measured : (BOARD_COLUMN_FALLBACK[key as BoardColumnKey] ?? 200);
-}
-
-const BOARD_COLUMN_FALLBACK: Record<BoardColumnKey, number> = {
-  todo: 200,
-  working: 200,
-  needs_review: 200,
-  in_review: 200,
-  shipped: 160,
-  needs_owner: 224,
-};
 
 function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
@@ -385,7 +362,7 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const commitWidth = (width: number) =>
     updatePrefs((current) => ({ ...current, groupWidth: width }));
   return (
-    <div className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
+    <div data-group-grid className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
       {groups.map((group) => (
         <Column
           key={group.key}
@@ -399,7 +376,7 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
               label={group.label}
               edge="right"
               width={groupWidth}
-              measure={() => groupWidth}
+              liveTarget={(handle) => handle.closest<HTMLElement>("[data-group-grid]")}
               onCommit={commitWidth}
               onReset={() => updatePrefs((current) => ({ ...current, groupWidth: null }))}
             />

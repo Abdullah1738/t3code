@@ -182,3 +182,35 @@ describe("stage columns", () => {
     expect(readStored(boardColumnsStorageKey(BOARD_ID)).hidden).toEqual([]);
   });
 });
+
+function pointer(
+  element: HTMLElement,
+  type: "pointerdown" | "pointermove" | "pointerup",
+  clientX: number,
+) {
+  element.dispatchEvent(
+    new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, pointerId: 7, clientX }),
+  );
+}
+
+describe("pointer drag", () => {
+  it("widens an unsaved column from its rendered width and saves once on release", async () => {
+    const separator = handle("To-Do")!;
+    const column = separator.parentElement as HTMLElement;
+    const startWidth = column.getBoundingClientRect().width;
+    const writes = vi.spyOn(Storage.prototype, "setItem");
+
+    await act(() => pointer(separator, "pointerdown", 100));
+    await act(() => pointer(separator, "pointermove", 160));
+    await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
+
+    // Live: the rendered column follows the pointer, no save yet.
+    expect(column.getBoundingClientRect().width).toBeCloseTo(startWidth + 60, 0);
+    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(0);
+
+    await act(() => pointer(separator, "pointerup", 160));
+
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(startWidth + 60, 0);
+    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(1);
+  });
+});
