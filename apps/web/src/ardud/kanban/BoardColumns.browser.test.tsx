@@ -235,3 +235,50 @@ describe("pointer drag", () => {
     expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(1);
   });
 });
+
+describe("group columns", () => {
+  it("moves every group column together while dragging one handle", async () => {
+    // Two project groups, so there are two columns that must resize together.
+    const withProjects = {
+      ...boardState(),
+      cards: new Map([
+        ["card-1", { ...card(1, "todo"), projects: ["Alpha"] }],
+        ["card-2", { ...card(2, "working"), projects: ["Beta"] }],
+      ]),
+    } as unknown as KanbanBoardState;
+    await act(() => root.unmount());
+    container.replaceChildren();
+    root = createRoot(container);
+    await act(() =>
+      root.render(
+        <BoardColumns
+          boardId={BOARD_ID}
+          state={withProjects}
+          nowMs={NOW}
+          group="project"
+          filter={{}}
+          selectedCardId={undefined}
+          onOpenCard={() => {}}
+          onOpenGoal={() => {}}
+        />,
+      ),
+    );
+
+    const groups = [...container.querySelectorAll<HTMLElement>("section[aria-label]")].filter(
+      (section) => section.querySelector('[role="separator"]'),
+    );
+    expect(groups.length).toBeGreaterThanOrEqual(2);
+    const [first, second] = groups as [HTMLElement, HTMLElement];
+    const separator = first.querySelector<HTMLElement>('[role="separator"]')!;
+    const secondStart = second.getBoundingClientRect().width;
+
+    await act(() => pointer(separator, "pointerdown", 100));
+    await act(() => pointer(separator, "pointermove", 160));
+    await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
+
+    // Live: the second group follows the shared width before anything is saved.
+    expect(second.getBoundingClientRect().width).toBeGreaterThan(secondStart + 40);
+    await act(() => pointer(separator, "pointerup", 160));
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).groupWidth).toBeGreaterThan(256);
+  });
+});
