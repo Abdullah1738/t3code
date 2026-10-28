@@ -2361,9 +2361,14 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
-      // A pool for the bad model lets dispatch pick the card, so the refusal is what stops it.
-      yield* kanban.setPool(board.id, astraHigh, 1);
       const store = yield* KanbanStore.KanbanStore;
+      // A pool for the bad model lets dispatch pick the card, so the refusal is what stops it.
+      // Written to the store directly: setPool itself now refuses the model.
+      yield* store.putPool(board.id, {
+        key: Rules.poolKey(astraHigh),
+        model: astraHigh,
+        slots: 1,
+      });
       const stored = yield* store.card(created.id);
       yield* store.putCard({ ...stored!, model: astraHigh });
       yield* kanban.dispatchNow;
@@ -2415,7 +2420,13 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
         threadId: workThread,
       });
       yield* kanban.dispatchNow;
-      const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const reviewCard = (yield* kanban.card(created.id)).card;
+      const reviewThread = reviewCard.activeThreadId!;
+      assert.strictEqual(
+        reviewThread === null,
+        false,
+        `no review thread: ${JSON.stringify({ stage: reviewCard.stage, role: reviewCard.activeRole, stalled: reviewCard.stalled, pool: reviewCard.activePool })}`,
+      );
       assert.notStrictEqual(reviewThread, workThread);
       const before = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
       fake.failures.set(reviewThread, {
