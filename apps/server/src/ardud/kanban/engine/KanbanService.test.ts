@@ -2981,7 +2981,8 @@ it.effect("setPool refuses an unlisted model with slots and adds a listed one at
       });
       const instance = board.defaultCardModel.instanceId as string;
       const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
-      const other = modelSelectionOf({ model: "opus/not-offered", instanceId: "opencode" });
+      // The provider offers Astra, so the model check passes; the composer list leaves it out (hidden).
+      const other = modelSelectionOf({ model: "opus/gpt-6-astra", instanceId: "opencode" });
       yield* Ref.set(
         listed,
         new Map<string, KanbanModels.ListedModelEntry>([
@@ -2991,6 +2992,7 @@ it.effect("setPool refuses an unlisted model with slots and adds a listed one at
 
       const refused = yield* kanban.setPool(board.id, other, 1).pipe(Effect.flip);
       assert.strictEqual(refused.code, "invalid");
+      assert.include(refused.detail, "isn't in the model list");
       const added = yield* kanban.setPool(board.id, haiku, 0);
       assert.isTrue(added.some((pool) => pool.key === Rules.poolKey(haiku) && pool.slots === 0));
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
@@ -3046,9 +3048,10 @@ it.effect("removePool refuses a pool that a card's pinned work model is on, even
         defaultProjectId: ProjectId.make("project-1"),
       });
       const instance = board.defaultCardModel.instanceId as string;
-      const pinned = modelSelectionOf({ model: "opus/pinned-work", instanceId: "opencode" });
-      const weightedB = modelSelectionOf({ model: "opus/weighted-b", instanceId: "opencode" });
-      const weightedC = modelSelectionOf({ model: "opus/weighted-c", instanceId: "opencode" });
+      // Models the test provider offers; the pinned one is none of the board's own models.
+      const pinned = modelSelectionOf({ model: "opus/gpt-6-astra", instanceId: "opencode" });
+      const weightedB = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", instanceId: "opencode" });
+      const weightedC = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
       yield* Ref.set(
         listed,
         new Map<string, KanbanModels.ListedModelEntry>([
