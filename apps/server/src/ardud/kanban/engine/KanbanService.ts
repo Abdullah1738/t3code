@@ -605,7 +605,8 @@ const make = Effect.gen(function* () {
   /**
    * Agents write model ids in many shapes ("opus/x" vs instance "opus" + "x"). Match the
    * request to one of the board's pools so the dispatcher can run it; a model with no pool
-   * would sit in To-Do forever.
+   * would sit in To-Do forever. The pool's variant wins, so every card on a pool runs at the
+   * board's variant.
    */
   const poolModel = Effect.fn("KanbanService.poolModel")(function* (
     boardId: KanbanBoardId,
@@ -632,10 +633,10 @@ const make = Effect.gen(function* () {
     const selected = {
       instanceId: match.model.instanceId,
       model: match.model.model,
-      ...(model.options
-        ? { options: model.options }
-        : match.model.options
-          ? { options: match.model.options }
+      ...(match.model.options
+        ? { options: match.model.options }
+        : model.options
+          ? { options: model.options }
           : {}),
     } satisfies ModelSelection;
     yield* checkModel(selected);
