@@ -2386,8 +2386,11 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
       );
       assert.isNull(after.activeThreadId);
       assert.isTrue(after.stalled?.reason.startsWith("Model refused") === true);
-      const launched = [...(yield* Ref.get(fake.threads)).values()].map((t) => [t.title, t.model.model]);
-      assert.strictEqual(launched.length, 0, `launched=${JSON.stringify(launched)} stalled=${JSON.stringify(after.stalled)}`);
+      // The refusal starts only the discussion evaluator's note; no work or review thread.
+      const launched = [...(yield* Ref.get(fake.threads)).values()];
+      const workOrReview = launched.filter((t) => !t.title.startsWith("Evaluator:"));
+      assert.strictEqual(workOrReview.length, 0);
+      assert.isTrue(launched.some((t) => t.title.startsWith("Evaluator:")));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
