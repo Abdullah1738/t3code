@@ -42,17 +42,32 @@ export type AndroidAnchoredMenuProps = {
   readonly children: ReactNode | ((open: () => void) => ReactNode);
 };
 
-/** The open submenu, found by walking its id path through the current actions. */
+/**
+ * A submenu's path key: its id, or its position in the level when it has none
+ * (the Provider submenu in ThreadSettingsSheet has no id). Positions are stable
+ * because a level's actions don't reorder while the menu is open.
+ */
+function submenuKey(action: MenuAction, index: number): string {
+  return action.id ?? `#${index}`;
+}
+
+/** The actions a level shows: hidden ones are left out, so keys count only visible rows. */
+function visibleLevel(actions: readonly MenuAction[]): readonly MenuAction[] {
+  return actions.filter((action) => !(action.attributes?.hidden ?? false));
+}
+
+/** The open submenu, found by walking its key path through the current actions. */
 function resolveSubmenu(
   actions: readonly MenuAction[],
   path: readonly string[],
 ): MenuAction | null {
-  let level: readonly MenuAction[] = actions;
+  let level: readonly MenuAction[] = visibleLevel(actions);
   let current: MenuAction | null = null;
-  for (const id of path) {
-    current = level.find((action) => action.id === id) ?? null;
+  for (const key of path) {
+    const index = level.findIndex((action, i) => submenuKey(action, i) === key);
+    current = index < 0 ? null : (level[index] ?? null);
     if (current === null) return null;
-    level = current.subactions ?? [];
+    level = visibleLevel(current.subactions ?? []);
   }
   return current;
 }
@@ -109,9 +124,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
   }, [anchor, close, submenuDepth]);
 
   const parent = resolveSubmenu(props.actions, path);
-  const levelActions = (parent?.subactions ?? props.actions).filter(
-    (action) => !(action.attributes?.hidden ?? false),
-  );
+  const levelActions = visibleLevel(parent?.subactions ?? props.actions);
 
   const local =
     anchor === null || overlay === null
@@ -150,7 +163,8 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
   const onPressItem = useCallback(
     (action: MenuAction) => {
       if ((action.subactions?.length ?? 0) > 0) {
-        if (action.id !== undefined) setPath((current) => [...current, action.id as string]);
+        const index = levelActions.indexOf(action);
+        setPath((current) => [...current, submenuKey(action, index)]);
         return;
       }
       // keepsMenuPresented leaves the menu open so a multi-select (filters) can toggle several items.
@@ -162,7 +176,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
         } as Parameters<NonNullable<MenuComponentProps["onPressAction"]>>[0]);
       }
     },
-    [close, onPressAction],
+    [close, onPressAction, levelActions],
   );
 
   return (
