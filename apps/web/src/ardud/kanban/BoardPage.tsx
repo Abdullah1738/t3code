@@ -3,7 +3,6 @@ import * as Schema from "effect/Schema";
 import { useState } from "react";
 
 import {
-  activeGoals,
   boardFilter,
   clearFilters,
   EMPTY_FILTER_PREFS,

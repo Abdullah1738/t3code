@@ -13,11 +13,10 @@ import {
   type CardView,
   type GoalSummary,
   type KanbanBoardState,
-  type SettledFilter,
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { Fragment, useMemo, useRef, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
@@ -75,10 +74,7 @@ export function BoardView(props: {
   const filter = boardFilter(props.state, prefs, query.trim());
   const board = stageBoard(props.state, props.nowMs, filter);
   const picked = activeFilterCount(prefs);
-  const menuActions = useMemo(
-    () => filterMenuActions(props.state, prefs),
-    [props.state, prefs],
-  );
+  const menuActions = filterMenuActions(props.state, prefs);
   const onFilterAction = (id: string) => {
     const action = parseFilterAction(id);
     if (action === null) return;
