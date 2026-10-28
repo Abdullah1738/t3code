@@ -10,6 +10,7 @@ import {
   type KanbanActor,
   type KanbanAnswer,
   type KanbanBlock,
+  type KanbanBoard,
   type KanbanCard,
   type KanbanDiscussion,
   type KanbanGoal,
@@ -98,6 +99,18 @@ function prLabel(url: string, label: string | null): string {
   return match ? `#${match[1]}` : "PR";
 }
 
+/**
+ * A card the board's running setup holds: it would otherwise start (todo or
+ * needs_review, not running, settled or backlog). Mirrors the waiting filter in
+ * planDispatch, so a card that's already running doesn't claim it is waiting.
+ */
+function setupHolds(card: KanbanCard, board: KanbanBoard): boolean {
+  if (board.setup?.status !== "running") return false;
+  if (card.settledAt !== null || card.activeThreadId !== null) return false;
+  if (card.stalled !== null || card.priority === KANBAN_BACKLOG) return false;
+  return card.stage === "todo" || card.stage === "needs_review";
+}
+
 export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: number): CardView {
   const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
   const pr = card.links.find((link) => link.kind === "pr");
@@ -115,6 +128,9 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
   } else if (card.priority === KANBAN_BACKLOG && !isDoneStage(card.stage)) {
     // Shown like a block: the card waits, here on the owner taking it out.
     flag = { kind: "blocked", label: "In the backlog" };
+  } else if (setupHolds(card, state.board)) {
+    // planDispatch starts no card work or review while a board's first setup runs.
+    flag = { kind: "blocked", label: "Setup is running" };
   } else {
     const blocker = isDoneStage(card.stage) ? undefined : kanbanHeldUpBy(card, state.cards);
     if (blocker !== undefined) {

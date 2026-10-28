@@ -245,6 +245,34 @@ describe("stageBoard", () => {
     expect(numbers("needs_review")).toEqual([6, 5]);
   });
 
+  it("says a card waits on setup while the board's setup runs, and not after it ends", () => {
+    const setup = (status: "running" | "done") => ({
+      status,
+      discussionId: "disc-setup",
+      threadId: "t-setup",
+      startedAt: "2026-10-25T09:00:00.000Z",
+      finishedAt: status === "done" ? "2026-10-25T10:00:00.000Z" : null,
+    });
+    const withSetup = (status: "running" | "done", cards: KanbanCard[]) => {
+      const snap = snapshot(cards);
+      return boardStateFromSnapshot({
+        ...snap,
+        board: { ...snap.board, setup: setup(status) },
+      } as KanbanBoardSnapshot);
+    };
+    const flagOf = (state: ReturnType<typeof withSetup>, n: number) =>
+      stageBoard(state, NOW)
+        .active.flatMap((column) => column.cards)
+        .find((c) => c.number === n)!.flag;
+
+    const waiting = card(1, { priority: 1 });
+    const running = card(2, { priority: 1, stage: "working", activeThreadId: "t-work" as never });
+    const duringSetup = withSetup("running", [waiting, running]);
+    expect(flagOf(duringSetup, 1)).toEqual({ kind: "blocked", label: "Setup is running" });
+    expect(flagOf(duringSetup, 2)).toBeNull();
+    expect(flagOf(withSetup("done", [waiting, running]), 1)).toBeNull();
+  });
+
   it("counts a card's subtasks, and flags one waiting on the evaluator's step", () => {
     const subtask = (
       id: string,
