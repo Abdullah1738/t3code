@@ -7,6 +7,7 @@ import {
   stageBoard,
   toggleColumn,
   type BoardColumnKey,
+  visibleCards,
   type BoardFilter,
   type CardView,
   type GroupBy,
@@ -34,6 +35,7 @@ export function BoardColumns(props: {
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
   onOpenGoal: (goalId: string) => void;
+  onClearFilters: () => void;
 }) {
   // The board's own width decides, not the screen's: an iPad with the sidebar open
   // is a wide screen with a narrow board.
@@ -46,9 +48,12 @@ export function BoardColumns(props: {
     });
   const { state, filter } = props;
   const goals = activeGoals(state);
-  const shownGoals = filter.goalId
-    ? goals.filter((entry) => entry.goal.id === filter.goalId)
-    : goals;
+  if (visibleCards(state, filter).length === 0) {
+    return <NoCardsMatch onClear={props.onClearFilters} />;
+  }
+  const picked = filter.goalIds ?? [];
+  const shownGoals =
+    picked.length > 0 ? goals.filter((entry) => picked.includes(entry.goal.id)) : goals;
 
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
@@ -115,7 +120,9 @@ function StageGrid(props: ColumnsProps) {
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
-      <div className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
+      <div
+        className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
+      >
         {board.active.map((column) =>
           hidden(column.stage) ? (
             <HiddenColumnRail
@@ -205,7 +212,12 @@ function StageGrid(props: ColumnsProps) {
             onReset={() => resetWidth("needs_owner")}
           />
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-          <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
+          <div
+            className={cn(
+              "flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2",
+              HIDE_SCROLLBAR,
+            )}
+          >
             {board.owner.cards.length === 0 ? (
               <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
             ) : (
@@ -253,7 +265,6 @@ function columnStyle(width: number | null): React.CSSProperties | undefined {
   return width === null ? undefined : { width: `var(${COLUMN_WIDTH_PROPERTY}, ${width}px)` };
 }
 
-
 function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
     <div
@@ -288,7 +299,12 @@ function Column(props: {
       {props.summary ? (
         <p className="px-1 pb-1 text-xs leading-snug text-(--m-muted)">{props.summary}</p>
       ) : null}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
+      <div
+        className={cn(
+          "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden pb-3",
+          HIDE_SCROLLBAR,
+        )}
+      >
         {props.children}
       </div>
     </section>
@@ -313,7 +329,12 @@ function ShippedColumn(props: {
       )}
     >
       {props.handle}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
+      <div
+        className={cn(
+          "flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3",
+          HIDE_SCROLLBAR,
+        )}
+      >
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">
             <ColumnHeader label={column.label} count={column.cards.length} />
@@ -353,6 +374,21 @@ function ShippedRow(props: {
   );
 }
 
+function NoCardsMatch(props: { onClear: () => void }) {
+  return (
+    <div className="flex flex-col items-start gap-3 pe-5">
+      <p className="text-(--m-muted)">No cards match these filters.</p>
+      <button
+        type="button"
+        onClick={props.onClear}
+        className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
+        Clear filters
+      </button>
+    </div>
+  );
+}
+
 function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const groups = groupCards(props.state, props.group, props.nowMs, props.filter);
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
@@ -362,7 +398,10 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const commitWidth = (width: number) =>
     updatePrefs((current) => ({ ...current, groupWidth: width }));
   return (
-    <div data-group-grid className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
+    <div
+      data-group-grid
+      className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
+    >
       {groups.map((group) => (
         <Column
           key={group.key}
@@ -407,7 +446,12 @@ function StageList(props: ColumnsProps) {
   const current = columns.find((column) => column.stage === stage) ?? columns[0];
 
   return (
-    <div className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden pe-4 pb-4", HIDE_SCROLLBAR)}>
+    <div
+      className={cn(
+        "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden pe-4 pb-4",
+        HIDE_SCROLLBAR,
+      )}
+    >
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />

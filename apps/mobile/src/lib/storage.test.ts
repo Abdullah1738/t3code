@@ -307,6 +307,39 @@ describe("mobile connection storage", () => {
     await expect(loadPreferences()).resolves.toEqual({});
   });
 
+  it("keeps kanban board filters per board and drops malformed entries", async () => {
+    const kanbanBoardFilters = {
+      "board-robob": {
+        priorities: [1, 2],
+        goalIds: ["goal-1"],
+        projects: [],
+        models: ["Opus"],
+        settled: "include",
+      },
+    };
+    mocks.setPreferencesJson(JSON.stringify({ kanbanBoardFilters }), 10);
+    await expect(loadPreferences()).resolves.toEqual({ kanbanBoardFilters });
+
+    mocks.setPreferencesJson(
+      JSON.stringify({
+        kanbanBoardFilters: { "board-robob": { priorities: [1], settled: "sometimes" } },
+      }),
+      11,
+    );
+    // One malformed board is sanitized to its defaults; the others are kept.
+    await expect(loadPreferences()).resolves.toEqual({
+      kanbanBoardFilters: {
+        "board-robob": {
+          priorities: [1],
+          goalIds: [],
+          projects: [],
+          models: [],
+          settled: "hide",
+        },
+      },
+    });
+  });
+
   it("reconciles fallback preferences after SQLite recovers", async () => {
     mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
     await mocks.setItemAsync(

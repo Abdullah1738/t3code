@@ -61,7 +61,12 @@ function card(number: number, stage: KanbanCard["stage"]): KanbanCard {
 function boardState(): KanbanBoardState {
   const snapshot = {
     board: { id: BOARD_ID, name: "Test", stateSeq: 1 },
-    cards: [card(1, "todo"), card(2, "working"), card(3, "shipped" as never), card(4, "needs_owner")],
+    cards: [
+      card(1, "todo"),
+      card(2, "working"),
+      card(3, "shipped" as never),
+      card(4, "needs_owner"),
+    ],
     goals: [],
     pools: [],
     groups: [],
@@ -94,6 +99,7 @@ async function render(state = boardState()) {
         selectedCardId={undefined}
         onOpenCard={() => {}}
         onOpenGoal={() => {}}
+        onClearFilters={() => {}}
       />,
     ),
   );
@@ -146,7 +152,9 @@ describe("stage columns", () => {
 
   it("resets a column width on double-click and saves the reset", async () => {
     await act(() => {
-      handle("To-Do")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      handle("To-Do")!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
     });
     expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeDefined();
 
@@ -216,12 +224,19 @@ describe("pointer drag", () => {
 
     // Live: the rendered column follows the pointer, no save yet.
     expect(column.getBoundingClientRect().width).toBeCloseTo(startWidth + 60, 0);
-    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(0);
+    expect(
+      writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID)),
+    ).toHaveLength(0);
 
     await act(() => pointer(separator, "pointerup", 160));
 
-    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(startWidth + 60, 0);
-    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(1);
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(
+      startWidth + 60,
+      0,
+    );
+    expect(
+      writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID)),
+    ).toHaveLength(1);
   });
 });
 
@@ -249,6 +264,7 @@ describe("group columns", () => {
           selectedCardId={undefined}
           onOpenCard={() => {}}
           onOpenGoal={() => {}}
+          onClearFilters={() => {}}
         />,
       ),
     );
@@ -284,6 +300,9 @@ describe("left-edge keyboard step", () => {
     });
 
     // The left edge widens when the handle moves left, so ArrowLeft adds 16px.
-    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.needs_owner).toBeCloseTo(before + 16, 0);
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.needs_owner).toBeCloseTo(
+      before + 16,
+      0,
+    );
   });
 });
