@@ -73,7 +73,7 @@ class RemoteWrapperTests(unittest.TestCase):
     def run_script(self, argv):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
-            with patch.object(runs, 'GO_REPAIR', ':'):
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'):
                 script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -22,6 +23,9 @@ ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVA
              "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
              "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "RUST_BACKTRACE", "CARGO_TERM_COLOR", "TERM")
 ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "SESSION", "COOKIE", "AUTH")
+# Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
+DOCKER_HOOK_B64 = base64.b64encode(
+    (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -162,6 +166,26 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     sudo -n rm -rf -- "$_offbox_dir" || _offbox_fail "cannot remove stale staging directory $_offbox_dir"
   done
 ) || { echo offbox-setup-failed >&2; exit 97; }'''
+
+# boat.dev (28 Oct 2026) runs /usr/local/bin/sync-docker-firewall after dockerd starts (docker.service.d drop-in).
+# Boxes resumed from older snapshots can lack it, and systemd then kills dockerd (203/EXEC). Never fails the run.
+DOCKER_REPAIR = r'''(
+  grep -qsF /usr/local/bin/sync-docker-firewall /etc/systemd/system/docker.service.d/*.conf || exit 0
+  if [ ! -x /usr/local/bin/sync-docker-firewall ]; then
+    echo 'offbox: restoring boat docker hook /usr/local/bin/sync-docker-firewall' >&2
+    _offbox_t=$(mktemp) || exit 0
+    printf '%s' '__HOOK_B64__' | base64 -d > "$_offbox_t" &&
+      sudo -n install -m 755 "$_offbox_t" /usr/local/bin/sync-docker-firewall ||
+      echo 'offbox: could not restore the docker hook' >&2
+    rm -f "$_offbox_t"
+  fi
+  if systemctl is-failed --quiet docker 2>/dev/null; then
+    echo 'offbox: docker had failed; restarting it' >&2
+    sudo -n systemctl reset-failed docker 2>/dev/null
+    sudo -n systemctl start docker ||
+      { echo 'offbox: docker still fails to start:' >&2; systemctl status docker --no-pager -n 5 >&2; }
+  fi
+) || true'''.replace('__HOOK_B64__', DOCKER_HOOK_B64)
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
@@ -348,6 +372,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              DOCKER_REPAIR,
               '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,
