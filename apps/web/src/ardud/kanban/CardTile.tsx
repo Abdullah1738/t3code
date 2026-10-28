@@ -3,6 +3,7 @@ import { memo } from "react";
 import type { CardView } from "@t3tools/client-runtime/ardud/kanban";
 
 import { cn } from "../../lib/utils";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { Chip, flagGlyph, Glyph, ModelMark, Pri, stageGlyph, UnreadDot } from "./parts";
 
 export const CardTile = memo(function CardTile(props: {
@@ -37,7 +38,7 @@ export const CardTile = memo(function CardTile(props: {
         {card.card.settledAt !== null ? <span>Settled</span> : null}
         <span className="ms-auto tabular-nums">{card.age}</span>
       </span>
-      <span className="line-clamp-2 leading-snug font-medium">{card.title}</span>
+      <span className="line-clamp-2 leading-snug font-medium wrap-break-word">{card.title}</span>
       {card.flag ? (
         <span
           className={cn(
@@ -72,10 +73,17 @@ export const CardTile = memo(function CardTile(props: {
           </Chip>
         ) : null}
         {card.pr ? (
-          <span className="inline-flex shrink-0 items-center gap-1 px-1 text-xs font-medium tabular-nums">
-            <PrGlyph state={card.pr.state} />
-            {card.pr.label}
-          </span>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <span className="inline-flex min-w-0 shrink items-center gap-1 px-1 text-xs font-medium tabular-nums" />
+              }
+            >
+              <PrGlyph state={card.pr.state} />
+              <span className="truncate">{card.pr.label}</span>
+            </TooltipTrigger>
+            <TooltipPopup>{card.pr.label}</TooltipPopup>
+          </Tooltip>
         ) : null}
         <span className="flex-1" />
         {card.subtasks ? (

@@ -80,14 +80,14 @@ export function KChip(props: {
   return (
     <View
       className={cn(
-        "flex-none flex-row items-center gap-1.5 self-start rounded-full bg-secondary",
+        "max-w-full shrink flex-none flex-row items-center gap-1.5 self-start rounded-full bg-secondary",
         large ? "h-[30px] px-3" : "h-[22px] px-2",
       )}
     >
       {props.glyph ? <Glyph kind={props.glyph} /> : null}
       <Text
         numberOfLines={1}
-        className={cn("font-t3-medium text-foreground", large ? "text-[13px]" : "text-[12px]")}
+        className={cn("shrink font-t3-medium text-foreground", large ? "text-[13px]" : "text-[12px]")}
       >
         {props.label}
       </Text>

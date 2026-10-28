@@ -114,7 +114,7 @@ function StageGrid(props: ColumnsProps) {
         className="me-5 mb-4 flex min-h-0 w-56 shrink-0 flex-col gap-2 xl:w-64"
       >
         <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-        <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
+        <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
           {board.owner.cards.length === 0 ? (
             <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
           ) : (
@@ -163,7 +163,7 @@ function Column(props: {
       {props.summary ? (
         <p className="px-1 pb-1 text-xs leading-snug text-(--m-muted)">{props.summary}</p>
       ) : null}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pb-3", HIDE_SCROLLBAR)}>
+      <div className={cn("flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
         {props.children}
       </div>
     </section>
@@ -177,7 +177,7 @@ function ShippedColumn(props: {
 }) {
   return (
     <section aria-label="Shipped" className="flex min-h-0 w-40 shrink-0 flex-col xl:w-44">
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pb-3", HIDE_SCROLLBAR)}>
+      <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">
             <ColumnHeader label={column.label} count={column.cards.length} />
@@ -249,7 +249,7 @@ function StageList(props: ColumnsProps) {
   const current = columns.find((column) => column.stage === stage) ?? columns[0];
 
   return (
-    <div className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pe-4 pb-4", HIDE_SCROLLBAR)}>
+    <div className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden pe-4 pb-4", HIDE_SCROLLBAR)}>
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
