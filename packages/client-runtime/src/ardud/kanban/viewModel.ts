@@ -208,10 +208,29 @@ export function subtaskSteps(card: Pick<KanbanCard, "subtasks">): ReadonlyArray<
 export type SettledFilter = "hide" | "only" | "include";
 
 export interface BoardFilter {
-  readonly goalId?: string | null;
+  /** Empty or missing: no narrowing. Values within a facet match any (OR); facets all match (AND). */
+  readonly priorities?: ReadonlyArray<number>;
+  /** Goal ids; "" matches cards with no goal. */
+  readonly goalIds?: ReadonlyArray<string>;
+  /** Project names; "" matches cards in no project. */
+  readonly projects?: ReadonlyArray<string>;
+  /** modelName() values; "" matches cards with no model. */
+  readonly models?: ReadonlyArray<string>;
   readonly query?: string;
   /** Settled cards: hidden by default. */
   readonly settled?: SettledFilter;
+}
+
+/** Whether a card passes the facet narrowing (not the query or settled). */
+function matchesFacets(card: KanbanCard, filter: BoardFilter): boolean {
+  if (filter.priorities?.length && !filter.priorities.includes(card.priority)) return false;
+  if (filter.goalIds?.length && !filter.goalIds.includes(card.goalId ?? "")) return false;
+  if (filter.projects?.length) {
+    const names = card.projects.length === 0 ? [""] : card.projects;
+    if (!names.some((name) => filter.projects?.includes(name))) return false;
+  }
+  if (filter.models?.length && !filter.models.includes(modelName(card.model))) return false;
+  return true;
 }
 
 /**
@@ -244,7 +263,7 @@ export function visibleCards(state: KanbanBoardState, filter: BoardFilter = {}):
   for (const card of state.cards.values()) {
     if (settled === "hide" && card.settledAt !== null) continue;
     if (settled === "only" && card.settledAt === null) continue;
-    if (filter.goalId != null && card.goalId !== filter.goalId) continue;
+    if (!matchesFacets(card, filter)) continue;
     if (filter.query && !cardMatches(card, filter.query)) continue;
     cards.push(card);
   }
