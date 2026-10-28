@@ -744,6 +744,9 @@ def prune_completed_shares():
         shared = by_app.get(state.get('slug'))
         if not shared or shared.get('url') != state.get('url'):
             continue
+        # A stable-origin link is permanent: retiring it would break the URL already sent. Only an explicit unshare ends it.
+        if shared.get('permanent'):
+            continue
         bridge(['unshare', '--app', state['slug']], timeout=2)
         state['unshared'] = True
         atomic(path, state)

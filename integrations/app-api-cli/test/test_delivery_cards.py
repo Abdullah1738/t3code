@@ -672,6 +672,23 @@ class CardTests(unittest.TestCase):
         self.assertEqual(self.calls[-1],['unshare','--app',state['slug']])
         self.assertTrue(c.read(path)['unshared'])
 
+    def test_prune_keeps_a_stable_origin_share_that_was_sent(self):
+        # A permanent origin link is already in the recipient's hands: an hour after the order ended, cap cleanup must
+        # leave it alone. Only an explicit unshare retires it.
+        c.sync(self.cfg,{**self.data,'status':'delivered'},send=True)
+        path=c.ROOT/'cards/order-talabat-123.json';state=c.read(path)
+        state['terminal_at']=c.time.time()-3601;c.atomic(path,state)
+        url=state['url']
+        def permanent(args,timeout=12):
+            self.calls.append(list(args))
+            if args[0]=='shares':
+                return {'shares':[{'app':state['slug'],'live':True,'url':url,'permanent':True}]}
+            return {'removed':True}
+        with patch.object(c,'bridge',side_effect=permanent):
+            c.prune_completed_shares()
+        self.assertNotIn('unshare',[a[0] for a in self.calls])
+        self.assertFalse(c.read(path).get('unshared'))
+
     def test_cleanup_failure_cannot_block_new_card(self):
         with patch.object(c,'prune_completed_shares',side_effect=ValueError('offline')):
             result=c.sync(self.cfg,self.data,send=True)

@@ -179,9 +179,11 @@ export class Shares {
     });
   }
 
-  list(): { app: string; url: string; startedAt: number; expiresAt: number; live: boolean }[] {
+  list(): { app: string; url: string; startedAt: number; expiresAt: number; live: boolean; permanent: boolean }[] {
     return this.records().map(([app, record]) => ({
       app, url: record.url, startedAt: record.startedAt, expiresAt: record.expiresAt, live: this.alive(app, record),
+      // Stable-origin links are permanent: cap-driven cleanup must skip them (only an explicit unshare ends them).
+      permanent: record.token !== undefined,
     }));
   }
 
