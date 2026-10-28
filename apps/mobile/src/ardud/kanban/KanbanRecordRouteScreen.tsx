@@ -1,6 +1,11 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { discussionSnoozed, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  discussionSnoozed,
+  kanbanCopyLink,
+  type KanbanBoardState,
+} from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanDiscussion } from "@t3tools/contracts";
+import * as Clipboard from "expo-clipboard";
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
@@ -64,7 +69,13 @@ export function KanbanRecordRouteScreen({
     case "card": {
       const card = state.cards.get(record.id ?? "");
       return (
-        <Shell title={card ? `#${card.number}` : "Card"} onBack={back}>
+        <Shell
+          title={card ? `#${card.number}` : "Card"}
+          onBack={back}
+          actions={
+            card ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)] : []
+          }
+        >
           <CardDetail
             boardId={boardId}
             state={state}
@@ -146,6 +157,17 @@ function Shell(props: {
   );
 }
 
+/** Puts the same link text the web copy button uses on the clipboard. */
+function copyLinkAction(kind: "kanban-card" | "kanban-discussion", id: string, label: string) {
+  return {
+    accessibilityLabel: "Copy link",
+    icon: "link" as const,
+    onPress: () => {
+      void Clipboard.setStringAsync(kanbanCopyLink(kind, id, label));
+    },
+  };
+}
+
 /** Makes a new discussion titled from its first message. */
 const createDiscussion = async (boardId: string, firstText: string) =>
   (await kanbanClient().createDiscussion(boardId, requestTitle(firstText))).id;
@@ -178,17 +200,20 @@ function DiscussionScreen(props: {
             ]
           : []
       }
-      actions={
-        card
+      actions={[
+        ...(card
           ? [
               {
                 accessibilityLabel: `Open #${card.number}`,
-                icon: "doc.text",
+                icon: "doc.text" as const,
                 onPress: () => nav.openCard(card.id),
               },
             ]
-          : []
-      }
+          : []),
+        ...(discussion
+          ? [copyLinkAction("kanban-discussion", discussion.id, discussion.title)]
+          : []),
+      ]}
     >
       <Chat
         boardId={props.boardId}
