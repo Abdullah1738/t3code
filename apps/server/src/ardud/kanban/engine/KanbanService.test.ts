@@ -1391,6 +1391,127 @@ it.effect("an evaluator hears once when a reviewed card waits on it for its PRs"
   }),
 );
 
+it.effect("another evaluator's change that hands a card's step to its evaluator wakes it once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const owner: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const other: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval-other") };
+      const reviewed = Effect.fn(function* (
+        title: string,
+        plan: ReadonlyArray<{ text: string; owner: "work" | "review" | "evaluator"; step?: number }>,
+      ) {
+        const card = yield* kanban.createCard(board.id, { prompt: title, title, subtasks: plan }, owner);
+        yield* kanban.dispatchNow;
+        const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const pr = `https://github.com/o/r/pull/${card.number}`;
+        fake.prs.set(workThread, [{ url: pr, title, state: "open" }]);
+        const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+        yield* kanban.dispatchNow;
+        yield* kanban.reviewResult((yield* kanban.card(card.id)).card.activeThreadId!, "clear", []);
+        return (yield* kanban.card(card.id)).card;
+      });
+      const notes = Effect.fn(function* (threadId: string, ids: string) {
+        const thread = (yield* Ref.get(fake.threads)).get(threadId);
+        return (thread?.messages ?? []).filter((text) =>
+          text.includes(`waiting on your subtasks: ${ids}`),
+        ).length;
+      });
+      const evaluators = Effect.fn(function* () {
+        return [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+          thread.title.startsWith("Evaluator:"),
+        ).length;
+      });
+      const planAB = [
+        { text: "Write the PR", owner: "work" as const },
+        { text: "Review", owner: "review" as const },
+        { text: "Astra gate", owner: "evaluator" as const },
+        { text: "Act on the verdict", owner: "evaluator" as const },
+      ];
+
+      // A: the other evaluator finishes the gate: the discussion's evaluator hears the next step, not started.
+      const a = yield* reviewed("A", planAB);
+      const ownA = (yield* kanban.cardDiscussion(a.id)).evaluatorThreadId!;
+      assert.strictEqual(yield* notes(ownA, "s3"), 1);
+      const before = yield* evaluators();
+      yield* kanban.markSubtask(a.id, "s3", "done", "gate passed", other, "evaluator");
+      assert.strictEqual(yield* notes(ownA, "s4"), 1);
+      const told = [...(yield* Ref.get(fake.threads)).get(ownA)!.messages].pop() ?? "";
+      assert.include(told, "Another evaluator");
+      assert.strictEqual(yield* evaluators(), before);
+
+      // B: the card's own evaluator's change needs no note.
+      const b = yield* reviewed("B", planAB);
+      const ownB = (yield* kanban.cardDiscussion(b.id)).evaluatorThreadId!;
+      yield* kanban.markSubtask(b.id, "s3", "done", "gate passed", { _tag: "evaluator", threadId: ThreadId.make(ownB) }, "evaluator");
+      assert.strictEqual(yield* notes(ownB, "s4"), 0);
+
+      // C: a step with two evaluator gates: the other evaluator finishing one does not re-wake; the next step does.
+      const planC = [
+        { text: "Write the PR", owner: "work" as const },
+        { text: "Review", owner: "review" as const },
+        { text: "Gate A", owner: "evaluator" as const, step: 3 },
+        { text: "Gate B", owner: "evaluator" as const, step: 3 },
+        { text: "Act", owner: "evaluator" as const },
+      ];
+      const c = yield* reviewed("C", planC);
+      const ownC = (yield* kanban.cardDiscussion(c.id)).evaluatorThreadId!;
+      const waitingC = (yield* Ref.get(fake.threads)).get(ownC)!.messages.filter((text) =>
+        text.includes("waiting on your subtasks"),
+      ).length;
+      yield* kanban.markSubtask(c.id, "s3", "done", "A", other, "evaluator");
+      const waitingAfterA = (yield* Ref.get(fake.threads)).get(ownC)!.messages.filter((text) =>
+        text.includes("waiting on your subtasks"),
+      ).length;
+      assert.strictEqual(waitingAfterA, waitingC);
+      yield* kanban.markSubtask(c.id, "s4", "done", "B", other, "evaluator");
+      assert.strictEqual(yield* notes(ownC, "s5"), 1);
+
+      // D: card_edit by another evaluator that hands the card its step.
+      const d = yield* reviewed("D", [
+        { text: "Write the PR", owner: "work" as const },
+        { text: "Review", owner: "review" as const },
+        { text: "Merge", owner: "evaluator" as const },
+      ]);
+      const ownD = (yield* kanban.cardDiscussion(d.id)).evaluatorThreadId!;
+      yield* kanban.editCard(
+        d.id,
+        {
+          subtasks: [
+            { id: "s1", text: "Write the PR", owner: "work" },
+            { id: "s2", text: "Review", owner: "review" },
+            { text: "Merge after the Astra gate", owner: "evaluator" },
+          ],
+        },
+        other,
+      );
+      assert.strictEqual(yield* notes(ownD, "s4"), 1);
+
+      // E: no discussion, so nothing starts.
+      const eCard = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Gate",
+          title: "Gate",
+          subtasks: [
+            { text: "Gate", owner: "evaluator" as const },
+            { text: "Act", owner: "evaluator" as const },
+          ],
+        },
+        owner,
+      );
+      const threadsBefore = (yield* Ref.get(fake.threads)).size;
+      yield* kanban.markSubtask(eCard.id, "s1", "done", null, other, "evaluator");
+      assert.strictEqual((yield* kanban.card(eCard.id)).card.discussionId, null);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, threadsBefore);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the owner's own question and a pick on an evaluator's go where they belong", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
