@@ -6,7 +6,7 @@ import type {
   KanbanMessage,
   KanbanScript,
   KanbanScriptRun,
-  KanbanThreadLink,
+  KanbanThreadRow,
   KanbanWikiPage,
 } from "@t3tools/contracts";
 import {
@@ -46,9 +46,12 @@ export function useBoardThreadIds(): ReadonlySet<string> {
 }
 
 /** The board that started a thread, or undefined for threads a board did not start. */
-export function useBoardRunOf(
-  threadId: string,
-): { readonly boardId: string; readonly boardName: string } | undefined {
+export function useBoardRunOf(threadId: string):
+  | {
+      readonly boardId: string;
+      readonly boardName: string;
+    }
+  | undefined {
   const boards = useStore(kanban.boards);
   if (boards === undefined) return undefined;
   for (const entry of boards) {
@@ -57,6 +60,20 @@ export function useBoardRunOf(
     }
   }
   return undefined;
+}
+
+/**
+ * The owning card or discussion of a board-run thread, read from the board's
+ * thread rows so the bar can link back to the record that owns the run.
+ */
+export function useBoardRunRecord(
+  boardId: string,
+  threadId: string,
+): { readonly cardId: string | null; readonly discussionId: string | null } | undefined {
+  const rows = useStore(kanban.threads(boardId));
+  const row = rows?.find((entry) => entry.threadId === threadId);
+  if (row === undefined) return undefined;
+  return { cardId: row.cardId, discussionId: row.discussionId };
 }
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
@@ -78,7 +95,7 @@ export function useWiki(boardId: string): ReadonlyArray<KanbanWikiPage> | undefi
   return useStore(kanban.wiki(boardId));
 }
 
-export function useBoardThreads(boardId: string): ReadonlyArray<KanbanThreadLink> | undefined {
+export function useBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow> | undefined {
   return useStore(kanban.threads(boardId));
 }
 
