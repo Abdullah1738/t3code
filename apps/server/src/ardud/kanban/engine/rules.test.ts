@@ -2,6 +2,7 @@ import {
   KANBAN_BACKLOG,
   KanbanBoardId,
   KanbanCardId,
+  KanbanDiscussionId,
   ThreadId,
   type KanbanBoard,
   type KanbanCard,
@@ -581,5 +582,105 @@ describe("model weights", () => {
     // Once its thread has it, the card runs only on that thread's model.
     const kept = { ...c, model: opus, workThreadId: t1 };
     expect(checkClaim(board, kept, ctx).ok).toBe(false);
+  });
+});
+
+describe("discussionSettleDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const H = 60 * 60 * 1000;
+  const discussion = (patch: Partial<KanbanDiscussion> = {}): KanbanDiscussion => ({
+    id: KanbanDiscussionId.make("d1"),
+    boardId: board.id,
+    cardId: null,
+    title: "Talk",
+    evaluatorThreadId: null,
+    participants: [],
+    lastSeq: 0,
+    lastMessageAt: null,
+    createdBy: { _tag: "owner" },
+    createdAt: "2026-10-25T00:00:00.000Z",
+    archivedAt: null,
+    titleEditedAt: null,
+    settledAt: null,
+    snoozedUntil: null,
+    pinnedAt: null,
+    reopenedAt: null,
+    ...patch,
+  });
+  const typing = [
+    {
+      actor: { _tag: "owner" as const },
+      name: "Abdullah",
+      lastReadSeq: 0,
+      typingUntil: "2026-10-26T00:00:00.000Z",
+      owes: null,
+    },
+  ] as KanbanDiscussion["participants"];
+
+  it("settles a board channel and a verified card's discussion once a day has passed", () => {
+    expect(discussionSettleDue(discussion(), null, START + 25 * H)).toBe(true);
+    const verified = card({ stage: "verified" });
+    expect(discussionSettleDue(discussion({ cardId: verified.id }), verified, START + 25 * H)).toBe(
+      true,
+    );
+  });
+
+  it("waits for the full idle day before settling", () => {
+    expect(discussionSettleDue(discussion(), null, START + 23 * H)).toBe(false);
+    expect(discussionSettleDue(discussion(), null, START + 24 * H)).toBe(true);
+  });
+
+  it("keeps a discussion whose card is still open", () => {
+    for (const stage of ["todo", "working", "needs_review", "in_review", "completed"] as const) {
+      const open = card({ stage });
+      expect(discussionSettleDue(discussion({ cardId: open.id }), open, START + 25 * H)).toBe(
+        false,
+      );
+    }
+  });
+
+  it("never settles a pinned, settled or archived discussion", () => {
+    expect(
+      discussionSettleDue(discussion({ pinnedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+    expect(
+      discussionSettleDue(discussion({ settledAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+    expect(
+      discussionSettleDue(discussion({ archivedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+  });
+
+  it("keeps a discussion snoozed into the future", () => {
+    const snoozed = discussion({ snoozedUntil: "2026-10-27T00:00:00.000Z" });
+    expect(discussionSettleDue(snoozed, null, START + 25 * H)).toBe(false);
+  });
+
+  it("keeps a discussion while someone is typing in it", () => {
+    expect(discussionSettleDue(discussion({ participants: typing }), null, START + 49 * H)).toBe(
+      false,
+    );
+  });
+
+  it("restarts the idle day when a lapsed snooze ends: 23h false, 25h true", () => {
+    const wake = "2026-10-25T10:00:00.000Z";
+    const wakeMs = Date.parse(wake);
+    const lapsed = discussion({ snoozedUntil: wake });
+    expect(discussionSettleDue(lapsed, null, wakeMs + 23 * H)).toBe(false);
+    expect(discussionSettleDue(lapsed, null, wakeMs + 25 * H)).toBe(true);
+  });
+
+  it("restarts the idle day from reopenedAt: 23h false, 25h true", () => {
+    const reopened = "2026-10-25T10:00:00.000Z";
+    const reopenedMs = Date.parse(reopened);
+    const d = discussion({ reopenedAt: reopened });
+    expect(discussionSettleDue(d, null, reopenedMs + 23 * H)).toBe(false);
+    expect(discussionSettleDue(d, null, reopenedMs + 25 * H)).toBe(true);
+  });
+
+  it("counts the idle day from the last message, not from creation", () => {
+    const d = discussion({ lastMessageAt: "2026-10-25T12:00:00.000Z" });
+    expect(discussionSettleDue(d, null, START + 25 * H)).toBe(false);
+    expect(discussionSettleDue(d, null, START + 37 * H)).toBe(true);
   });
 });
