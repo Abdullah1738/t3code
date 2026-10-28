@@ -42,11 +42,28 @@ export type AndroidAnchoredMenuProps = {
   readonly children: ReactNode | ((open: () => void) => ReactNode);
 };
 
+/** The open submenu, found by walking its id path through the current actions. */
+function resolveSubmenu(
+  actions: readonly MenuAction[],
+  path: readonly string[],
+): MenuAction | null {
+  let level: readonly MenuAction[] = actions;
+  let current: MenuAction | null = null;
+  for (const id of path) {
+    current = level.find((action) => action.id === id) ?? null;
+    if (current === null) return null;
+    level = current.subactions ?? [];
+  }
+  return current;
+}
+
 export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
   const { onPressAction } = props;
   const { scale, menuWidth: desiredMenuWidth } = useAndroidControlSizing();
   const [anchor, setAnchor] = useState<AnchorSnapshot | null>(null);
-  const [path, setPath] = useState<readonly MenuAction[]>([]);
+  // Submenus are kept as ids, not action objects, so each render resolves the
+  // open level from the current actions (checkmarks follow the live selection).
+  const [path, setPath] = useState<readonly string[]>([]);
   const [rootHeight, setRootHeight] = useState<number | null>(null);
   const [overlay, setOverlay] = useState<OverlayFrame | null>(null);
   const windowHinge = use(WindowHingeContext);
@@ -91,7 +108,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
     return () => subscription.remove();
   }, [anchor, close, submenuDepth]);
 
-  const parent = path[path.length - 1] ?? null;
+  const parent = resolveSubmenu(props.actions, path);
   const levelActions = (parent?.subactions ?? props.actions).filter(
     (action) => !(action.attributes?.hidden ?? false),
   );
@@ -133,7 +150,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
   const onPressItem = useCallback(
     (action: MenuAction) => {
       if ((action.subactions?.length ?? 0) > 0) {
-        setPath((current) => [...current, action]);
+        if (action.id !== undefined) setPath((current) => [...current, action.id as string]);
         return;
       }
       // keepsMenuPresented leaves the menu open so a multi-select (filters) can toggle several items.
