@@ -3213,7 +3213,8 @@ const make = Effect.gen(function* () {
             return yield* failWith("invalid", `a thread is running on ${key}`);
           }
           if (card.settledAt !== null) continue;
-          if (kanbanCardModels(card).some((entry) => Rules.poolKey(entry.model) === key)) {
+          // card.model is the pinned work model, kept even when weighted candidates exist.
+          if (Rules.modelOnPool(card, key) !== null) {
             return yield* failWith("invalid", `card #${card.number} uses ${key}`);
           }
         }

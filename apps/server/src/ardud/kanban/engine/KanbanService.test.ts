@@ -3032,3 +3032,51 @@ it.effect("removePool refuses a pool in use or with slots, and drops an unused 0
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );
+
+it.effect("removePool refuses a pool that a card's pinned work model is on, even with weighted candidates", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const instance = board.defaultCardModel.instanceId as string;
+      const pinned = modelSelectionOf({ model: "opus/pinned-work", instanceId: "opencode" });
+      const weightedB = modelSelectionOf({ model: "opus/weighted-b", instanceId: "opencode" });
+      const weightedC = modelSelectionOf({ model: "opus/weighted-c", instanceId: "opencode" });
+      yield* Ref.set(
+        listed,
+        new Map<string, KanbanModels.ListedModelEntry>([
+          [instance, new Set([board.defaultCardModel.model, pinned.model, weightedB.model, weightedC.model])],
+        ]),
+      );
+      yield* kanban.setPool(board.id, pinned, 0);
+      yield* kanban.setPool(board.id, weightedB, 0);
+      yield* kanban.setPool(board.id, weightedC, 0);
+
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "pinned",
+          title: "Pinned",
+          models: [
+            { model: weightedB, weight: 2 },
+            { model: weightedC, weight: 1 },
+          ],
+        },
+        owner,
+      );
+      // A persisted unsettled card whose pinned work model is A but candidates are B and C.
+      yield* store.putCard({ ...card, model: pinned });
+
+      const refused = yield* kanban.removePool(board.id, pinned).pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+      assert.include(refused.detail, `card #${card.number} uses`);
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
+  }),
+);
