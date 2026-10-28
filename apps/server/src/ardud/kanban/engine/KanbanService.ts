@@ -40,6 +40,7 @@ import {
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -2200,6 +2201,9 @@ const make = Effect.gen(function* () {
         const slug = input.slug.trim().toLowerCase();
         const existing = (yield* store.boards).find((board) => board.slug === slug);
         if (existing) return existing;
+        if (input.managerModel) yield* checkModel(input.managerModel);
+        if (input.evaluatorModel) yield* checkModel(input.evaluatorModel);
+        if (input.defaultCardModel) yield* checkModel(input.defaultCardModel);
         const board: KanbanBoard = {
           id: KanbanBoardId.make(`board-${slug}`),
           slug,
@@ -2602,11 +2606,12 @@ const make = Effect.gen(function* () {
         const at = yield* nowIso;
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
         const model = models
-          ? // A card with a work thread stays on its model while the list still has it.
-            card.workThreadId !== null &&
-            models.some((entry) => Rules.poolKey(entry.model) === Rules.poolKey(card.model))
-            ? card.model
-            : (models[0]?.model ?? card.model)
+          ? // A card with a work thread stays on its pool while the list still has it; the list's
+            // entry carries the pool's variant, so a variant change sticks.
+            (card.workThreadId !== null
+              ? models.find((entry) => Rules.poolKey(entry.model) === Rules.poolKey(card.model))
+                  ?.model
+              : undefined) ?? (models[0]?.model ?? card.model)
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
@@ -2651,6 +2656,20 @@ const make = Effect.gen(function* () {
           yield* threads
             .send({ threadId: saved.activeThreadId, text: Briefs.planChangedText(saved) })
             .pipe(Effect.ignore);
+        }
+        if (
+          saved.activeThreadId !== null &&
+          saved.activeRole === "work" &&
+          !modelSelectionsEqual(card.model, saved.model)
+        ) {
+          // An open work thread runs the card's model; switch it now, not on its next wake.
+          yield* threads
+            .setModel(saved.activeThreadId, saved.model)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("kanban thread model switch failed", { cardId: saved.id, cause }),
+              ),
+            );
         }
         yield* kick;
         return saved;
@@ -2996,7 +3015,11 @@ const make = Effect.gen(function* () {
           const threadId = card.activeThreadId ?? card.workThreadId;
           if (threadId === null)
             return yield* failWith("invalid", `card #${card.number} has no thread`);
-          yield* threads.send({ threadId, text });
+          const model =
+            card.activeRole === "review"
+              ? Rules.nextModel(yield* boardOf(card.boardId), card)
+              : card.model;
+          yield* threads.send({ threadId, text, model });
           yield* logEvent(card, actor, "thread", { body: `Steered: ${text}` });
           return card;
         }
@@ -3024,7 +3047,12 @@ const make = Effect.gen(function* () {
           return next;
         }
         if (card.activeThreadId !== null) {
-          if (text.trim()) yield* threads.send({ threadId: card.activeThreadId, text });
+          const model =
+            card.activeRole === "review"
+              ? Rules.nextModel(yield* boardOf(card.boardId), card)
+              : card.model;
+          if (text.trim())
+            yield* threads.send({ threadId: card.activeThreadId, text, model });
           return card;
         }
         const next: KanbanCard = {
