@@ -499,6 +499,13 @@ export const OrchestrationV2RestartCancelledBackgroundWork = Schema.Struct({
   kind: Schema.Literals(["subagent", "shell", "monitor", "task"]),
   label: TrimmedNonEmptyString,
   id: Schema.optional(TrimmedNonEmptyString),
+  /** ardud: the child thread a native subagent runs on, and when it started, so restart can check it. */
+  child: Schema.optional(
+    Schema.Struct({
+      threadId: ThreadId,
+      startedAt: Schema.DateTimeUtc,
+    }),
+  ),
 });
 export type OrchestrationV2RestartCancelledBackgroundWork =
   typeof OrchestrationV2RestartCancelledBackgroundWork.Type;
