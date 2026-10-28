@@ -601,7 +601,6 @@ function RoomTitle(props: {
               <button
                 type="button"
                 disabled={!canRename}
-                title={canRename ? undefined : "Your connection can't rename discussions"}
                 onClick={() => props.onEditingChange(true)}
                 className="-ms-1.5 min-w-0 truncate rounded-lg px-1.5 py-0.5 text-left text-base font-medium outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               />
@@ -609,7 +608,9 @@ function RoomTitle(props: {
           >
             {props.discussion.title}
           </TooltipTrigger>
-          <TooltipPopup>Rename</TooltipPopup>
+          <TooltipPopup>
+            {canRename ? "Rename" : "Your connection can't rename discussions"}
+          </TooltipPopup>
         </Tooltip>
       </h3>
     );
