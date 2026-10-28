@@ -48,7 +48,8 @@ class SendGuardTest(unittest.TestCase):
                      ["messages", "revoke", "--id", "1"],
                      ["messages", "delete", "--id", "1"]):
             self.assert_blocked("wacli", *args)
-        self.assertIn("wa draft", self.run_shim("wacli", "send", "text").stderr)
+        self.assertIn("use wa for WhatsApp sends", self.run_shim("wacli", "send", "text").stderr)
+        self.assertIn("wa send", self.run_shim("wacli", "send", "text").stderr)
 
     def test_wacli_reads_pass(self):
         for args in (["--json", "chats", "list"], ["messages", "list", "--chat", "x"],
@@ -77,7 +78,8 @@ class SendGuardTest(unittest.TestCase):
                          ["msg", "save", "-m", "Sent", "--send", "--", "/tmp/f.eml"],
                          ["message", "compose", "--body", "--send", "-t", "a@x.com"], ["--", "message", "send"]):
                 self.assert_blocked(name, *args)
-        self.assertIn("mailsend", self.run_shim("himalaya", "message", "send").stderr)
+        self.assertIn("use mailsend for email sends", self.run_shim("himalaya", "message", "send").stderr)
+        self.assertIn("mailsend send --approved", self.run_shim("himalaya", "message", "send").stderr)
 
     def test_himalaya_reads_and_drafts_pass(self):
         for name in ("himalaya", "himalaya-heal"):

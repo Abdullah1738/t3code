@@ -363,8 +363,11 @@ test("relays: one stop reaches every watcher of the trip, and ETA updates to a p
   expect(JSON.parse(again.stdout.toString()).watchers).toEqual(["ek58", "ek57"]);
   expect(ok("ek57", "120363@g.us").code).toBe(3);
   const flags = ["--title", "Gate change", "--check", "true", "--context", "Tell the owner. Never wa send to anyone.", "--no-prime"];
-  expect(cli("add", "--id", "gate", ...flags).stderr.toString()).toContain("--owner-only");
-  expect(cli("add", "--id", "gate", ...flags, "--owner-only").exitCode).toBe(0);
+  // Nothing is refused: a watcher that mentions a send without relays is added, with a note on stderr.
+  const gate = cli("add", "--id", "gate", ...flags);
+  expect(gate.exitCode).toBe(0);
+  expect(gate.stderr.toString()).toContain("Note for gate: its text mentions WhatsApp sends");
+  expect(cli("add", "--id", "gate", ...flags, "--owner-only", "--replace").exitCode).toBe(0);
 });
 
 test("watchers from before relays that mention wa sends are listed and fire owner-only, with a log line", async () => {
@@ -383,22 +386,23 @@ test("watchers from before relays that mention wa sends are listed and fire owne
   expect(listed).toContain("old-ek");
   expect(listed).toContain("Old EK ETA");
   expect(listed).not.toContain("old-plain");
-  expect(listed).toContain("owner-only");
+  expect(listed).toContain("relays (his words) are optional");
   writeFileSync(flag, "ETA 21:40");
   await runnerFor(2_500);
   const wake = readCalls().filter(call => call.args[0] === "wake" && call.args.includes("robob-watch old-ek")).at(-1)!;
   const text = wake.args[wake.args.indexOf("--text") + 1]!;
-  expect(text).toContain("No third-party relays: tell only the owner.");
-  expect(text).toContain("no longer applies");
-  expect(cli("logs", "old-ek").stdout.toString()).toContain("lists no relays: told the agent owner-only");
+  expect(text).not.toContain("No third-party relays");
+  expect(text).not.toContain("tell only the owner");
+  expect(text).not.toContain("no longer applies");
+  expect(cli("logs", "old-ek").stdout.toString()).not.toContain("told the agent owner-only");
   // Once it names its relays (here: nobody), it drops off the list.
   writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(dir, "watcher.json"), "utf8")), relays: [] }));
   expect(cli("unscoped").stdout.toString()).toContain("No watchers mention");
   for (const id of ["old-ek", "old-plain"]) cli("remove", id);
 }, 20_000);
 
-test("an old watcher whose check itself runs wa draft is held: the check never runs and the owner hears once", async () => {
-  // Sol r1: an owner-only wake can't take back a draft the check already made, so the check must not run.
+test("an old watcher whose check runs wa draft runs as before: no hold, no held notice", async () => {
+  // 27 Oct: nothing is held any more. The check runs; an agent reads what it drafts.
   const dir = join(sandbox, "root/watchers/old-sender");
   mkdirSync(dir, { recursive: true });
   const ran = join(sandbox, "old-sender-ran");
@@ -406,33 +410,16 @@ test("an old watcher whose check itself runs wa draft is held: the check never r
     interval_s: 1, mode: "wake", context: "Tell the owner.", expires_at: null, max_fires: 0, serial: false,
     created_at: "2026-10-19T08:00:00.000Z", created_by_session: null };
   writeFileSync(join(dir, "watcher.json"), JSON.stringify(old));
-  expect(cli("unscoped").stdout.toString()).toContain("held: its check sends");
+  expect(cli("unscoped").stdout.toString()).not.toContain("held");
   const test = cli("test", "old-sender");
-  expect(test.exitCode).toBe(1);
-  expect(test.stderr.toString()).toContain("is held");
+  expect(test.exitCode).toBe(0);
+  expect(test.stderr.toString()).not.toContain("is held");
   const before = readCalls().length;
   await runnerFor(3_500);
-  expect(existsSync(ran)).toBe(false);
-  const notices = readCalls().slice(before).filter(call => call.args.some(arg => arg.includes("robob-watch:old-sender:held")));
-  expect(notices).toHaveLength(1);
-  expect(readCalls().slice(before).some(call => call.args[0] === "wake" && call.args.includes("robob-watch old-sender"))).toBe(false);
-  expect(state("old-sender").held_alerted).toBe(true);
-  // Sol r2: owner-only doesn't release it; its check would still draft. add refuses it, and a hand-made one stays held.
-  const def = join(sandbox, "old-sender.json");
-  writeFileSync(def, JSON.stringify(old));
-  const replaced = cli("add", "--json", def, "--replace", "--owner-only");
-  expect(replaced.exitCode).toBe(1);
-  expect(replaced.stderr.toString()).toContain("can't run wa draft");
-  writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...old, relays: [] }));
-  expect(cli("unscoped").stdout.toString()).toContain("held: its check sends");
-  await runnerFor(2_500);
-  expect(existsSync(ran)).toBe(false);
-  // A check that only spots the change releases it.
-  writeFileSync(def, JSON.stringify({ ...old, interval_s: 5, check: `print -r -- ran >> ${ran}; true` }));
-  expect(cli("add", "--json", def, "--replace", "--owner-only", "--no-prime").exitCode).toBe(0);
-  await runnerFor(2_500);
   expect(existsSync(ran)).toBe(true);
-  expect(existsSync(waCalls)).toBe(false);
+  const notices = readCalls().slice(before).filter(call => call.args.some(arg => arg.includes("robob-watch:old-sender:held")));
+  expect(notices).toHaveLength(0);
+  expect(state("old-sender").held_alerted).toBeUndefined();
   cli("remove", "old-sender");
 }, 25_000);
 
