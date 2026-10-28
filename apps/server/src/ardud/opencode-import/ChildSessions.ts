@@ -5,11 +5,14 @@
  * parent's session. Telling the parent it is gone makes it start the same work
  * twice; on 24 Oct both "lost" reviews had finished and reported back.
  */
+import type { OrchestrationV2RestartCancelledBackgroundWork } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type * as ServerSettings from "../../serverSettings.ts";
+import { restartCancelledBackgroundWorkNote } from "../../orchestration-v2/RestartBackgroundNote.ts";
 import {
   configuredConnection,
   listActiveSessionIds,
@@ -46,20 +49,25 @@ const RECENT_MESSAGE_LIMIT = 10;
  * everything else is passed through from the upstream note unchanged.
  */
 export const restartNoteParts = (
-  work: ReadonlyArray<{ readonly child?: { readonly threadId: string } }>,
+  work: ReadonlyArray<Pick<OrchestrationV2RestartCancelledBackgroundWork, "child">>,
   checks: ReadonlyMap<string, ChildCheck>,
 ) => {
-  const finished: Array<string> = [];
-  const unknown: Array<string> = [];
+  const finished: Array<{ readonly index: number; readonly result: string }> = [];
+  const unknown: Array<number> = [];
   const rest: Array<number> = [];
   work.forEach((entry, index) => {
     const sessionId = childSessionId(entry.child?.threadId);
     const check = sessionId === undefined ? undefined : checks.get(sessionId);
-    if (check === undefined) return rest.push(index);
-    if (check.state === "running") return;
-    if (check.state === "finished") return finished.push(check.result ?? "");
-    if (check.state === "unknown") return unknown.push(sessionId!);
-    return rest.push(index);
+    if (check?.state === "running") return;
+    if (check?.state === "finished") {
+      finished.push({ index, result: check.result ?? "" });
+      return;
+    }
+    if (check?.state === "unknown") {
+      unknown.push(index);
+      return;
+    }
+    rest.push(index);
   });
   return { rest, finished, unknown };
 };
@@ -89,17 +97,21 @@ const checkOne = Effect.fn("ChildSessions.checkOne")(function* (
   const read = yield* listRecentMessages(connection, child.sessionId, {
     limit: RECENT_MESSAGE_LIMIT,
   }).pipe(
-    Effect.timeoutOption(PROBE_TIMEOUT),
+    Effect.map((value) => ({ kind: "ok" as const, value })),
     Effect.catch((error) =>
       // The session is gone from OpenCode: nothing left to report or resume.
       Effect.succeed(
-        Schema.is(OpenCodeHttpError)(error) && error.status === 404 ? "gone" : "failed",
+        Schema.is(OpenCodeHttpError)(error) && error.status === 404
+          ? { kind: "gone" as const }
+          : { kind: "failed" as const },
       ),
     ),
+    Effect.timeoutOption(PROBE_TIMEOUT),
   );
-  if (read === "gone") return { state: "stopped" } satisfies ChildCheck;
-  if (read === "failed" || Option.isNone(read)) return { state: "unknown" } satisfies ChildCheck;
-  const { messages } = read.value;
+  if (Option.isNone(read) || read.value.kind === "failed")
+    return { state: "unknown" } satisfies ChildCheck;
+  if (read.value.kind === "gone") return { state: "stopped" } satisfies ChildCheck;
+  const { messages } = read.value.value;
   const newest = messages.at(-1);
   // A session with no turn, or whose newest message predates the child, never ran it.
   if (newest === undefined || newest.time.created < child.since - SLACK_MS)
@@ -151,3 +163,39 @@ export const checkChildren = (
     );
     return result as ReadonlyMap<string, ChildCheck>;
   });
+
+/**
+ * ardud: the note for work a restart cut. With no OpenCode child in it there is
+ * no HTTP call and the upstream note is returned unchanged. Otherwise running
+ * children are left out, a finished child's answer is quoted in one line, and
+ * an unknown child gets a hedged paragraph, since it may still report back.
+ */
+export const restartNoteText = Effect.fn("ChildSessions.restartNoteText")(function* (
+  settings: ServerSettings.ServerSettingsService["Service"],
+  work: ReadonlyArray<OrchestrationV2RestartCancelledBackgroundWork>,
+) {
+  const refs = work.flatMap((entry) => {
+    const sessionId = childSessionId(entry.child?.threadId);
+    return entry.child === undefined || sessionId === undefined
+      ? []
+      : [{ sessionId, since: DateTime.toEpochMillis(entry.child.startedAt) }];
+  });
+  if (refs.length === 0) return restartCancelledBackgroundWorkNote(work);
+  const checks = yield* checkChildren(settings, refs);
+  const parts = restartNoteParts(work, checks);
+  const lines: Array<string> = [];
+  const rest = parts.rest.map((index) => work[index]!);
+  if (rest.length > 0) lines.push(restartCancelledBackgroundWorkNote(rest));
+  for (const finished of parts.finished) {
+    const first = finished.result.split("\n")[0]!.trim().slice(0, 200);
+    lines.push(
+      `- finished while the server restarted, already reported back: ${first}`,
+    );
+  }
+  if (parts.unknown.length > 0) {
+    lines.push(
+      "Some background work could not be checked after the restart. It may still be running and report back by itself; don't call it again just to check. Resume one only once you know it stopped without a result.",
+    );
+  }
+  return lines.join("\n\n");
+});
