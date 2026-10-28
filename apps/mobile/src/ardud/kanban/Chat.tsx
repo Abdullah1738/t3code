@@ -387,10 +387,11 @@ function BlockView(props: {
           text={block.text}
           maxLines={MESSAGE_LINES}
           tone={props.message.author._tag === "owner" ? "user" : "screen"}
+          boardId={props.boardId}
         />
       );
     case "collapse":
-      return <Collapse title={block.title} text={block.text} />;
+      return <Collapse title={block.title} text={block.text} boardId={props.boardId} />;
     case "html":
       return <HtmlBlock html={block.html} title={block.title} height={block.height} />;
     case "choice":
@@ -502,7 +503,11 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
   );
 }
 
-function Collapse(props: { readonly title: string; readonly text: string }) {
+function Collapse(props: {
+  readonly title: string;
+  readonly text: string;
+  readonly boardId: string;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <View className="rounded-[12px] bg-screen">
@@ -522,7 +527,7 @@ function Collapse(props: { readonly title: string; readonly text: string }) {
       </Pressable>
       {open ? (
         <View className="px-3 pb-2.5">
-          <MarkdownText text={props.text} maxLines={null} />
+          <MarkdownText text={props.text} maxLines={null} boardId={props.boardId} />
         </View>
       ) : null}
     </View>
@@ -599,7 +604,8 @@ function ChoiceBlock(props: {
   const poll = block.style === "poll";
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
-  const locked = !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
+  const locked =
+    !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
   // Sending from the field removes it while ChoiceBlock stays mounted, and
@@ -942,10 +948,7 @@ function Composer(props: {
       .catch((error: unknown) => {
         if (controller.signal.aborted || !owner.live) return;
         patch(local.id, (current) => ({ ...current, failed: true }));
-        Dialog.alert(
-          "Couldn't attach file",
-          error instanceof Error ? error.message : "Try again.",
-        );
+        Dialog.alert("Couldn't attach file", error instanceof Error ? error.message : "Try again.");
       });
   };
 
@@ -1152,7 +1155,12 @@ function DraftChip(props: {
         onPress={props.onRemove}
         className="size-7 items-center justify-center rounded-full"
       >
-        <SymbolView name="xmark" size={11} tintColorClassName="accent-icon-muted" type="monochrome" />
+        <SymbolView
+          name="xmark"
+          size={11}
+          tintColorClassName="accent-icon-muted"
+          type="monochrome"
+        />
       </Pressable>
     </View>
   );
