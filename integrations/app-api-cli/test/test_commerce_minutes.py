@@ -97,6 +97,41 @@ class MinutesIntegrationTests(unittest.TestCase):
         self.assertEqual(kwargs['order'],'IAEGA123')
         self.assertEqual(result['payment_status'],'payment_pending')
 
+    def test_cvv_payment_chain_from_captured_responses_reaches_paid_triple(self):
+        """CVV-required payment: complete(cvv) then await_payment reaches the captured paid triple.
+
+        Drives the real MinutesFlow.complete and await_payment through the Harness,
+        serving the captured order readback, payment config, complete and status bodies.
+        """
+        from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
+        from test.test_noon_minutes_checkout import Harness
+        from unittest.mock import Mock
+        h=Harness([FIXTURE['order_get_pending'],FIXTURE['config'],FIXTURE['complete']['resp'],
+                   FIXTURE['status_confirmed']])
+        flow=object.__new__(c.MinutesFlow)
+        flow.flow_id='10000000-0000-4000-8000-00000000eeee'
+        flow.review={'order':ORDER,'amount':TOTAL_MINOR,'digest':'a'*64}
+        flow.current=c.m.Snapshot({'isCvvRequired':True,'paymentProviderCode':'NOON_PAY'},{},time.time())
+        flow.card=c.m.SavedCard('synthetic-token','xxxx5542','mastercard')
+        flow.client=h.client
+        flow.store=Mock();flow.expected=None;flow.cookies_in_ram=[];flow.intent=None
+        flow.opened=True
+        flow.client._receipt=h.receipt
+        flow.client._response_cookies=lambda *a,**k:True
+        with patch.object(c.j,'inspect',return_value={'state':'ACTIVE','operations':[]}), \
+                patch.object(c.j,'observe',return_value={'outcome':'RESPONSE_RECEIVED'}), \
+                patch.object(c.j,'consume',return_value=True), \
+                patch.object(c.MinutesFlow,'_before',lambda self,op,digest:True), \
+                patch('noon_cvv.encrypt',return_value={'encCvv':'synthetic-cipher','publicKeyName':'key_1'}) as enc:
+            flow.complete(cvv=b'123')
+            enc.assert_called_once()
+            paid=flow.await_payment(notify=lambda *_:None,sleep=lambda _:None,
+                clock=iter([0,5,10,15]).__next__,poll_seconds=5,wait_seconds=600)
+        self.assertTrue(paid['paid'])
+        self.assertEqual(paid['transaction_status'],'CAPTURED')
+        self.assertEqual(paid['captured_minor'],TOTAL_MINOR)
+        self.assertEqual(paid['authorized_minor'],TOTAL_MINOR)
+
     def test_complete_captures_ram_intent_and_local_timestamps(self):
         from unittest.mock import Mock
         flow=object.__new__(c.MinutesFlow)
