@@ -11,10 +11,12 @@ import {
   type GroupBy,
   type KanbanBoardState,
   type SettledFilter,
+  setupBanner,
 } from "@t3tools/client-runtime/ardud/kanban";
 
 import {
   Menu,
+  MenuItem,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
@@ -103,6 +105,7 @@ export function BoardPage(props: {
   // The page behind an open drawer is out of reach, but only while one shows:
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
+  const setup = state ? setupBanner(state.board) : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -178,6 +181,21 @@ export function BoardPage(props: {
               ) : null
             ) : (
               <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
+                {setup ? (
+                  <SetupBanner
+                    label={setup.label}
+                    onView={() =>
+                      go({
+                        view: "discussions",
+                        discussion: setup.discussionId,
+                        card: undefined,
+                      })
+                    }
+                    onEnd={() =>
+                      void runAction("Couldn't end setup", () => kanban.endSetup(boardId))
+                    }
+                  />
+                ) : null}
                 {feed.failure ? (
                   <div
                     role="status"
@@ -439,6 +457,37 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
       >
         <XIcon className="size-3.5" />
       </button>
+    </div>
+  );
+}
+
+/** Every board view shows this while the board's first setup runs; the menu ends it for the owner. */
+function SetupBanner(props: { label: string; onView: () => void; onEnd: () => void }) {
+  return (
+    <div className="me-5 mb-3 flex items-center gap-2 rounded-xl bg-(--m-warnband) ps-3.5 pe-1.5 py-1.5 text-sm">
+      <button
+        type="button"
+        onClick={props.onView}
+        className="min-w-0 flex-1 truncate text-start font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
+        {props.label}
+      </button>
+      <Menu>
+        <MenuTrigger
+          render={
+            <button
+              type="button"
+              aria-label="Setup actions"
+              className="grid size-7 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+            />
+          }
+        >
+          <span aria-hidden>···</span>
+        </MenuTrigger>
+        <MenuPopup align="end" side="bottom">
+          <MenuItem onClick={props.onEnd}>End setup</MenuItem>
+        </MenuPopup>
+      </Menu>
     </div>
   );
 }

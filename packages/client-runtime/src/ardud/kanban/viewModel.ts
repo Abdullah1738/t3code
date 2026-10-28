@@ -99,6 +99,17 @@ function prLabel(url: string, label: string | null): string {
   return match ? `#${match[1]}` : "PR";
 }
 
+/** The banner every board view shows while the board's first setup runs; null otherwise. */
+export interface SetupBannerView {
+  readonly discussionId: string;
+  readonly label: string;
+}
+
+export function setupBanner(board: KanbanBoard): SetupBannerView | null {
+  if (board.setup?.status !== "running") return null;
+  return { discussionId: board.setup.discussionId, label: "Setup is ongoing · View setup" };
+}
+
 /**
  * A card the board's running setup holds: it would otherwise start (todo or
  * needs_review, not running, settled or backlog). Mirrors the waiting filter in

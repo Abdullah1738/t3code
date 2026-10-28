@@ -8,10 +8,10 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppBar } from "../../components/ui/AppBar";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { useHeaderInset, useNowMs } from "../common/hooks";
+import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { BoardView } from "./BoardView";
 import { CardDetail } from "./CardDetail";
-import { useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
+import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { boardLayout, cardPaneWidth, type KanbanBoardParams } from "./logic";
 import { useKanbanNav } from "./nav";
 
@@ -38,6 +38,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   const nav = useKanbanNav(boardId);
   const [width, setWidth] = useState(0);
   const [paneCardId, setPaneCardId] = useState<string | null>(null);
+  const action = useBoardAction();
   const layout = boardLayout(width);
   const pane = layout.kind === "columns";
   const openCard = (cardId: string) => (pane ? setPaneCardId(cardId) : nav.openCard(cardId));
@@ -64,6 +65,10 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
           bottomInset={bottomInset}
           onOpenCard={openCard}
           onOpenGoal={nav.openGoal}
+          onViewSetup={nav.openDiscussion}
+          onEndSetup={() =>
+            void action.run("Couldn't end setup", () => kanbanClient().endSetup(boardId))
+          }
         />
         {/* A drawer over the columns, so opening a card never reflows the board. */}
         {paneCard !== null ? (

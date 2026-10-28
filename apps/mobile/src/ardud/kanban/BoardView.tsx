@@ -7,6 +7,7 @@ import {
   clearFilters,
   filterFacets,
   sanitizeBoardFilterPrefs,
+  setupBanner,
   stageBoard,
   toggleFilterValue,
   type BoardFilterPrefs,
@@ -54,6 +55,9 @@ export function BoardView(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
   readonly onOpenGoal: (goalId: string) => void;
+  /** Opens the board's Setup discussion; shown only while setup runs. */
+  readonly onViewSetup: (discussionId: string) => void;
+  readonly onEndSetup: () => void;
 }) {
   const goals = activeGoals(props.state);
   const boardId = props.state.board.id;
@@ -69,6 +73,7 @@ export function BoardView(props: {
         kanbanBoardFilters: { ...current.kanbanBoardFilters, [boardId]: next },
       }),
     });
+  const setup = setupBanner(props.state.board);
   const [query, setQuery] = useState("");
   const searchRef = useRef<TextInputInstance | null>(null);
   const filter = boardFilter(props.state, prefs, query.trim());
@@ -83,6 +88,16 @@ export function BoardView(props: {
   };
   const filterRow = (
     <View className="gap-2.5">
+      {setup ? (
+        <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
+          <LinkButton
+            label={setup.label}
+            accessibilityLabel={setup.label}
+            onPress={() => props.onViewSetup(setup.discussionId)}
+          />
+          <LinkButton label="End setup" onPress={props.onEndSetup} />
+        </View>
+      ) : null}
       <View className="flex-row items-center gap-2">
         <SearchField
           inputRef={searchRef}
