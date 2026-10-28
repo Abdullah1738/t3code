@@ -247,6 +247,30 @@ it.effect("routes owner messages to the live thread, or to an evaluator when non
   }),
 );
 
+it.effect("announces a finished one-shot evaluator so its thread stops showing as running", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const ended = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) => change._tag === "thread" && change.thread.running === false,
+        ),
+      );
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+
+      yield* kanban.turnEnded(setup);
+
+      const announced = yield* ended;
+      assert.isTrue(Option.isSome(announced));
+      if (Option.isSome(announced) && announced.value.change._tag === "thread") {
+        assert.strictEqual(announced.value.change.thread.threadId, setup);
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("lists a board's card and evaluator threads, and marks board threads as board runs", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

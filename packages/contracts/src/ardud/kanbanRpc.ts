@@ -12,7 +12,7 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentAuthorizationError,
 } from "../auth.ts";
-import { IsoDateTime, NonNegativeInt, ProjectId } from "../baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, ProjectId, ThreadId } from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlock,
@@ -50,6 +50,7 @@ export const KANBAN_WS_METHODS = {
   card: "kanban.card",
   discussions: "kanban.discussions",
   threads: "kanban.threads",
+  owner: "kanban.owner",
   messages: "kanban.messages",
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
@@ -153,6 +154,7 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.card, CardRef, KanbanCardDetail),
   call(M.discussions, BoardRef, Schema.Array(KanbanDiscussion)),
   call(M.threads, BoardRef, Schema.Array(KanbanThreadRow)),
+  call(M.owner, Schema.Struct({ threadId: ThreadId }), Schema.NullOr(KanbanThreadLink)),
   call(
     M.messages,
     Schema.Struct({
@@ -242,6 +244,7 @@ export const KANBAN_READ_SCOPES = {
   [M.card]: AuthOrchestrationReadScope,
   [M.discussions]: AuthOrchestrationReadScope,
   [M.threads]: AuthOrchestrationReadScope,
+  [M.owner]: AuthOrchestrationReadScope,
   [M.messages]: AuthOrchestrationReadScope,
   [M.wiki]: AuthOrchestrationReadScope,
   [M.scripts]: AuthOrchestrationReadScope,

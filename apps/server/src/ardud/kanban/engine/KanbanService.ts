@@ -1775,6 +1775,18 @@ const make = Effect.gen(function* () {
     if (link.role === "evaluator") {
       if (link.discussionId === null && link.endedAt === null) {
         yield* store.putThreadLink({ ...link, endedAt: at });
+        // A one-shot evaluator is done: announce it so the Threads view rereads
+        // and stops showing it as running on a quiet board.
+        const view = yield* threads.view(link.threadId);
+        yield* publish(link.boardId, {
+          _tag: "thread",
+          thread: {
+            threadId: link.threadId,
+            title: view?.title ?? link.purpose ?? "evaluator",
+            running: false,
+            lastActivityAt: at,
+          },
+        });
       }
       return;
     }
