@@ -8,6 +8,7 @@ import {
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanDiscussion,
   type KanbanGroup,
   type KanbanPool,
   type KanbanStage,
@@ -117,6 +118,30 @@ export function prsLanded(card: KanbanCard): boolean {
   return card.links
     .filter((link) => link.kind === "pr")
     .every((link) => link.state === "merged" || link.state === "closed");
+}
+
+export const DISCUSSION_IDLE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A discussion settles itself after a quiet day unless it is pinned, snoozed, being replied to, or its card is still open.
+ * The caller checks threads.
+ */
+export function discussionSettleDue(
+  discussion: KanbanDiscussion,
+  card: KanbanCard | null,
+  nowMs: number,
+): boolean {
+  if (discussion.archivedAt !== null || discussion.settledAt !== null) return false;
+  if (discussion.pinnedAt !== null) return false;
+  if (discussion.snoozedUntil !== null && Date.parse(discussion.snoozedUntil) > nowMs) return false;
+  if (discussion.participants.some((participant) => participant.typingUntil !== null)) return false;
+  if (card !== null && card.stage !== "verified") return false;
+  const quietSince = Math.max(
+    Date.parse(discussion.lastMessageAt ?? discussion.createdAt),
+    discussion.reopenedAt === null ? 0 : Date.parse(discussion.reopenedAt),
+    discussion.snoozedUntil === null ? 0 : Date.parse(discussion.snoozedUntil),
+  );
+  return nowMs - quietSince >= DISCUSSION_IDLE_MS;
 }
 
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
