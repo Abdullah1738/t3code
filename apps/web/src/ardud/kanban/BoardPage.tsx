@@ -42,7 +42,7 @@ import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
-import { kanban, kanbanErrorMessage, useBoardState, useFeed } from "./kanbanStore";
+import { kanban, kanbanErrorMessage, runAction, useBoardState, useFeed } from "./kanbanStore";
 import { KanbanLinksProvider } from "./links";
 import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
