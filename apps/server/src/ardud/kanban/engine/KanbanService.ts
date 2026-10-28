@@ -33,6 +33,7 @@ import {
   type KanbanPool,
   type KanbanStage,
   type KanbanThreadLink,
+  type KanbanThreadRow,
   type KanbanThreadState,
   type KanbanWikiPage,
   type ModelSelection,
@@ -285,7 +286,7 @@ export interface KanbanServiceShape {
   /** Every thread a board started (work, review, evaluator), open or ended. */
   readonly threads: (
     boardId: KanbanBoard["id"],
-  ) => Effect.Effect<ReadonlyArray<KanbanThreadLink>, KanbanError>;
+  ) => Effect.Effect<ReadonlyArray<KanbanThreadRow>, KanbanError>;
   readonly discussion: (id: KanbanDiscussion["id"]) => Effect.Effect<KanbanDiscussion, KanbanError>;
   readonly createDiscussion: (
     boardId: KanbanBoard["id"],
@@ -637,6 +638,47 @@ const make = Effect.gen(function* () {
       lastActivityAt: view.updatedAt,
     };
     return [state];
+  });
+
+  // Running threads first, then ended history newest first, bounded: a busy board
+  // accumulates sweeps, and the Threads view must not list all of them.
+  const THREAD_ROWS_ENDED_LIMIT = 200;
+  const threadRowsOf = Effect.fn("KanbanService.threadRowsOf")(function* (
+    boardId: KanbanBoard["id"],
+  ) {
+    const links = yield* store.threadLinks({ boardId, open: false });
+    const cards = new Map((yield* store.cards(boardId)).map((card) => [card.id, card]));
+    const rows = yield* Effect.forEach(
+      links,
+      (link) =>
+        Effect.gen(function* () {
+          const view = yield* threads.view(link.threadId);
+          const card = link.cardId === null ? undefined : cards.get(link.cardId);
+          return {
+            threadId: link.threadId,
+            boardId: link.boardId,
+            role: link.role,
+            purpose: link.purpose,
+            cardId: link.cardId,
+            cardNumber: card?.number ?? null,
+            cardTitle: card?.title ?? null,
+            discussionId: link.discussionId,
+            model: link.model,
+            title: view?.title ?? null,
+            running: view !== null && view.state !== "idle",
+            lastActivityAt: view?.updatedAt ?? null,
+            startedAt: link.startedAt,
+            endedAt: link.endedAt,
+          };
+        }),
+      { concurrency: 8 },
+    );
+    const running = rows.filter((row) => row.running);
+    const ended = rows
+      .filter((row) => !row.running)
+      .sort((a, b) => (b.lastActivityAt ?? b.startedAt).localeCompare(a.lastActivityAt ?? a.startedAt))
+      .slice(0, THREAD_ROWS_ENDED_LIMIT);
+    return [...running, ...ended];
   });
 
   const snapshotOf = Effect.fn("KanbanService.snapshotOf")(function* (boardId: KanbanBoard["id"]) {
@@ -3044,7 +3086,7 @@ const make = Effect.gen(function* () {
     setGoal,
     setGroups,
     discussions: (boardId) => read(store.discussions(boardId)),
-    threads: (boardId) => read(store.threadLinks({ boardId, open: false })),
+    threads: (boardId) => read(threadRowsOf(boardId)),
     discussion: (id) => read(discussionOf(id)),
     createDiscussion,
     updateDiscussion,

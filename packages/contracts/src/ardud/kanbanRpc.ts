@@ -40,6 +40,7 @@ import {
   KanbanScriptRun,
   KanbanStage,
   KanbanThreadLink,
+  KanbanThreadRow,
   KanbanWikiPage,
 } from "./kanban.ts";
 
@@ -151,7 +152,7 @@ export const KanbanRpcs = RpcGroup.make(
   }),
   call(M.card, CardRef, KanbanCardDetail),
   call(M.discussions, BoardRef, Schema.Array(KanbanDiscussion)),
-  call(M.threads, BoardRef, Schema.Array(KanbanThreadLink)),
+  call(M.threads, BoardRef, Schema.Array(KanbanThreadRow)),
   call(
     M.messages,
     Schema.Struct({
@@ -240,6 +241,7 @@ export const KANBAN_READ_SCOPES = {
   [M.subscribe]: AuthOrchestrationReadScope,
   [M.card]: AuthOrchestrationReadScope,
   [M.discussions]: AuthOrchestrationReadScope,
+  [M.threads]: AuthOrchestrationReadScope,
   [M.messages]: AuthOrchestrationReadScope,
   [M.wiki]: AuthOrchestrationReadScope,
   [M.scripts]: AuthOrchestrationReadScope,

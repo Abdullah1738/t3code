@@ -659,6 +659,29 @@ export const KanbanThreadState = Schema.Struct({
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;
 
+/**
+ * A board thread as the Threads view lists it: the link plus its card and live
+ * state. `running` comes from the thread's real state, not from whether the
+ * link has ended, so an idle persistent evaluator is not shown as running.
+ */
+export const KanbanThreadRow = Schema.Struct({
+  threadId: ThreadId,
+  boardId: KanbanBoardId,
+  role: Schema.Literals(["work", "review", "evaluator"]),
+  purpose: Schema.NullOr(Schema.String),
+  cardId: Schema.NullOr(KanbanCardId),
+  cardNumber: Schema.NullOr(PositiveInt),
+  cardTitle: Schema.NullOr(Schema.String),
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  model: Schema.NullOr(ModelSelection),
+  title: Schema.NullOr(Schema.String),
+  running: Schema.Boolean,
+  lastActivityAt: Schema.NullOr(IsoDateTime),
+  startedAt: IsoDateTime,
+  endedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanThreadRow = typeof KanbanThreadRow.Type;
+
 export const KanbanBoardSnapshot = Schema.Struct({
   board: KanbanBoard,
   cards: Schema.Array(KanbanCard),
