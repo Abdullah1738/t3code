@@ -2440,3 +2440,89 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("a failed work run with an unanswered owner message is not nudged and is flagged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const discussion = yield* kanban.cardDiscussion(created.id);
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Use 3 attempts" }]);
+      const before = (yield* Ref.get(fake.threads)).get(workThread)!.messages.length;
+      fake.failures.set(workThread, {
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Variant unavailable for opus/gpt-6-astra: high",
+      } as never);
+      yield* kanban.turnEnded(workThread);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(workThread)!.messages.length, before);
+      const flagged = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(flagged.stage, "todo");
+      assert.isNull(flagged.activeThreadId);
+      assert.match(flagged.stalled?.reason ?? "", /^Run failed: /);
+      // The evaluator hears about the failure in the card's discussion.
+      const evaluators = [...(yield* Ref.get(fake.threads)).values()].filter((t) =>
+        t.title.startsWith("Evaluator:"),
+      );
+      assert.isTrue(
+        evaluators.some((t) => t.messages.some((m) => m.includes("run failed"))),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a failed review run with an unanswered owner message is not nudged and is flagged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.evaluatorModel, 1);
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      // The work turn's move frees the slot, then the review starts.
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.dispatchNow;
+      const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const discussion = yield* kanban.cardDiscussion(created.id);
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Check the rounding" }]);
+      const before = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
+      fake.failures.set(reviewThread, {
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Variant unavailable",
+      } as never);
+      yield* kanban.turnEnded(reviewThread);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length, before);
+      const flagged = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(flagged.stage, "needs_review");
+      assert.match(flagged.stalled?.reason ?? "", /^Run failed: /);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a fully qualified model with a refused variant is named even with no pool", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      // No Astra pool on this board: the refusal still names what the model offers.
+      const refused = yield* kanban
+        .createCard(board.id, { prompt: "x", title: "x", model: astraHigh }, owner)
+        .pipe(Effect.flip);
+      assert.include(refused.detail, 'has no "high" variant; it offers: xhigh');
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

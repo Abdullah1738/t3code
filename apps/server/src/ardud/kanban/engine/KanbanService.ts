@@ -614,6 +614,8 @@ const make = Effect.gen(function* () {
         return suffix.length === 1 ? suffix[0] : undefined;
       })();
     if (!match) {
+      // A model the provider refuses is named as such, even when no pool exists for it.
+      yield* checkModel(model);
       return yield* failWith(
         "invalid",
         `no pool runs ${joined}; pools: ${pools.map((pool) => pool.model.model).join(", ") || "none"}`,
@@ -1783,6 +1785,9 @@ const make = Effect.gen(function* () {
       const other = id === card?.id ? card : yield* store.card(id);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
+    // A run that failed (the provider refused the model or variant, or a route is gone)
+    // would only loop on a nudge, so the failure is read first and nothing is nudged.
+    const failure = yield* threads.lastFailure(threadId);
     // Discussions the thread evaluates, or is still typing or owing in after
     // being told something there (which the link and card don't name).
     for (const discussion of yield* store.discussions(link.boardId)) {
@@ -1802,7 +1807,16 @@ const make = Effect.gen(function* () {
         continue;
       }
       if (yield* isHome(discussion, threadId)) {
-        yield* settleParticipant(discussion, threadId);
+        // A failed run gets no discussion nudge: it would start another run on the same selection.
+        if (failure === null) yield* settleParticipant(discussion, threadId);
+        else if (participant && pending) {
+          yield* saveDiscussion(
+            withParticipant(discussion, participant.actor, participant.name, {
+              owes: null,
+              typingUntil: null,
+            }),
+          );
+        }
         continue;
       }
       // Told something here, not put in charge: its typing ends without a nudge.
@@ -1823,9 +1837,6 @@ const make = Effect.gen(function* () {
       return;
     }
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
-    // A run that failed (the provider refused the model or variant, or a route is gone)
-    // would only loop on a nudge, so the card is flagged for the evaluator instead.
-    const failure = yield* threads.lastFailure(threadId);
     if (link.role === "work") {
       // The turn is over, so a slot held for a next card is free again.
       if ((yield* Ref.get(holds)).has(threadId)) {

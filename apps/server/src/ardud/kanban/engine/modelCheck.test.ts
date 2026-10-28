@@ -48,3 +48,37 @@ it("skips descriptor checks when the model has no descriptors", () => {
   ];
   assert.isNull(modelProblem(bare, sel("opus/gpt-6-astra", "high")));
 });
+
+it("refuses a boolean value for a select option whose choice ids are 'true' and 'false'", () => {
+  const boolSelect = [
+    {
+      ...opencodeTestProvider(),
+      models: [
+        {
+          slug: "opus/x",
+          name: "x",
+          isCustom: false,
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "flag",
+                label: "Flag",
+                type: "select",
+                options: [
+                  { id: "true", label: "true" },
+                  { id: "false", label: "false" },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  const selection = ModelSelection.make({
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "opus/x",
+    options: [{ id: "flag", value: true }],
+  });
+  assert.isNotNull(modelProblem(boolSelect, selection));
+});

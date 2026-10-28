@@ -55,10 +55,14 @@ function invalidOptions(
       continue;
     }
     const choices = descriptor.options.map((choice) => choice.id);
-    if (!choices.includes(String(option.value))) {
+    if (typeof option.value !== "string") {
+      problems.push(`Option ${option.id} expects one of: ${choices.join(", ") || "none"}.`);
+      continue;
+    }
+    if (!choices.includes(option.value)) {
       const offered = choices.join(", ");
       problems.push(
-        `has no "${String(option.value)}" ${option.id === "variant" ? "variant" : `${option.id} value`}; it offers: ${offered || "none"}.`,
+        `has no "${option.value}" ${option.id === "variant" ? "variant" : `${option.id} value`}; it offers: ${offered || "none"}.`,
       );
     }
   }
