@@ -135,7 +135,7 @@ class PoolTests(Isolated):
 
     def test_box_lock_excludes_second_caller_even_without_run_row(self):
         self.box('only',member=True)
-        with patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'1'}), patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)):
+        with patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'1'}), patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
             row = pool.acquire(self.me)
             try:
                 with self.assertRaises(capacity.CapacityError):
@@ -148,14 +148,14 @@ class PoolTests(Isolated):
         self.busy('bg')
         self.con.execute("UPDATE runs SET mode='bg',process_id=123 WHERE box_id='bg'")
         self.con.commit()
-        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), patch.object(lease,'idle_ttl'), patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)):
+        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), patch.object(lease,'idle_ttl'), patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
             row=pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-bg'").fetchone()[0],'done')
 
     def test_full_pool_resizes_existing_idle_box_instead_of_creating(self):
         self.box('small',member=True,size='default')
-        with patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'1'}), patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
+        with patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'1'}), patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
             row=pool.acquire(self.me,size='xlarge')
             pool.release_guard(row)
             self.assertEqual(reuse.call_args.args[2],'xlarge')
@@ -168,7 +168,7 @@ class PoolTests(Isolated):
         self.box('idle',used=100)
         self.con.execute("INSERT INTO runs(run_id,status) VALUES ('mine','starting')")
         self.con.commit()
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
             row = pool.acquire(self.me, run_id='mine')
             try:
                 self.assertEqual(row['box_id'],'idle')
@@ -194,7 +194,7 @@ class PoolTests(Isolated):
         capacity.cooldown({}, {'message':'day limit'})
         self.box('stopped','stopped')
         self.box('live')
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse:
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse:
             row = pool.acquire(self.me)
             pool.release_guard(row)
             self.assertEqual(reuse.call_args.args[1]['box_id'],'live')
@@ -211,7 +211,7 @@ class PoolTests(Isolated):
     def test_oversized_running_box_yields_to_stopped_box_at_natural_size(self):
         self.box('big', size='xlarge', member=True, used=500)
         self.box('cold', 'stopped', size='xlarge', member=True, used=100)
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private') as new:
             row = pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'cold')
@@ -243,7 +243,7 @@ class PoolTests(Isolated):
         self.box('cold', 'stopped', size='large', member=True, used=50)
         self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
         self.con.commit()
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse, patch.object(lease,'acquire_private'):
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
             row = pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'mine')
@@ -251,7 +251,7 @@ class PoolTests(Isolated):
     def test_stopped_box_infra_error_falls_through_to_running_box(self):
         self.box('big', size='xlarge', member=True, used=500)
         self.box('cold', 'stopped', size='xlarge', member=True, used=100)
-        def reuse(c, r, s):
+        def reuse(c, r, s, **kw):
             if r['box_id'] == 'cold':
                 raise common.OffboxError('boat API 500 internal: resume failed')
             return dict(r)
@@ -266,7 +266,7 @@ class PoolTests(Isolated):
         self.box('bad', 'stopped', size='large', member=True, used=500)
         self.box('good', 'stopped', size='large', member=True, used=100)
         tried = []
-        def reuse(c, r, s):
+        def reuse(c, r, s, **kw):
             tried.append(r['box_id'])
             if r['box_id'] == 'bad':
                 raise common.OffboxError('boat API 500 internal: resume failed')
@@ -283,7 +283,7 @@ class PoolTests(Isolated):
         self.box('gone', 'stopped', size='large', member=True, used=500)
         self.box('good', 'stopped', size='large', member=True, used=100)
         tried = []
-        def reuse(c, r, s):
+        def reuse(c, r, s, **kw):
             tried.append(r['box_id'])
             return None if r['box_id'] == 'gone' else dict(r)
         with patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'2'}), patch.object(lease,'_reuse',side_effect=reuse), \
@@ -365,7 +365,7 @@ class PoolTests(Isolated):
         self.box('cold', 'stopped', size='large', member=True, used=100)
         self.con.executemany("INSERT INTO start_requests(ts) VALUES (?)",[(common.now()-7200,)]*400)
         self.con.commit()
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse:
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse:
             row = pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'big')
@@ -374,7 +374,7 @@ class PoolTests(Isolated):
     def test_explicit_xlarge_prefers_running_xlarge(self):
         self.box('big', size='xlarge', member=True, used=100)
         self.box('cold', 'stopped', size='large', member=True, used=500)
-        with patch.object(lease,'_reuse',side_effect=lambda c,r,s:dict(r)) as reuse:
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse:
             row = pool.acquire(self.me, size='xlarge')
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'big')

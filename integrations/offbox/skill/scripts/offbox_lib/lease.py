@@ -9,10 +9,12 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event, file_lock,
-                     month_key, new_id, now, read_json, say)
+from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event,
+                     file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
+# Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
+ARCHIVING_WAIT_S = 120
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
@@ -268,7 +270,11 @@ def _bigger(a: str | None, b: str | None) -> bool:
     return rank.get(a, 1) > rank.get(b or "default", 1)
 
 
-def _reuse(con, row, size: str | None):
+class ArchivingSkip(OffboxError):
+    """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
@@ -297,8 +303,10 @@ def _reuse(con, row, size: str | None):
         s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
         st = s.get("state")
     if st == "archiving":
+        if skip_archiving:
+            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
         say(f"{box_id} is stopping; waiting to resume it")
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
+        s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
         st = s.get("state")
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,

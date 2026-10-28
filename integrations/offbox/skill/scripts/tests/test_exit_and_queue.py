@@ -232,7 +232,7 @@ class PoolQueueTests(Isolated):
                 self.con.commit()
         clock.time.sleep = sleep
         with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '600'}), patch.object(pool, 'time', clock.time), \
-                patch.object(lease, '_reuse', side_effect=lambda c, r, s: dict(r)), contextlib.redirect_stderr(io.StringIO()):
+                patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), contextlib.redirect_stderr(io.StringIO()):
             row = pool.acquire(self.me)
         try:
             self.assertEqual(row['box_id'], 'one')
