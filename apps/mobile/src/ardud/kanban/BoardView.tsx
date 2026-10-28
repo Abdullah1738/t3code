@@ -12,6 +12,7 @@ import {
   toggleFilterValue,
   type BoardFilterPrefs,
   type CardView,
+  type SetupBannerView,
   type GoalSummary,
   type KanbanBoardState,
   type StageBoard,
@@ -41,6 +42,24 @@ import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts
 
 // Needs Owner cards shown above the tabs before "All N" opens the rest.
 const OWNER_PREVIEW = 2;
+
+/** Shown on every board view while the board's first setup runs; the owner can end setup here. */
+export function SetupStrip(props: {
+  readonly setup: SetupBannerView;
+  readonly onViewSetup: (discussionId: string) => void;
+  readonly onEndSetup: () => void;
+}) {
+  return (
+    <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
+      <LinkButton
+        label={props.setup.label}
+        accessibilityLabel={props.setup.label}
+        onPress={() => props.onViewSetup(props.setup.discussionId)}
+      />
+      <LinkButton label="End setup" onPress={props.onEndSetup} />
+    </View>
+  );
+}
 
 /**
  * The board: Needs Owner first, then the stages. A phone shows one stage at a
@@ -89,14 +108,11 @@ export function BoardView(props: {
   const filterRow = (
     <View className="gap-2.5">
       {setup ? (
-        <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
-          <LinkButton
-            label={setup.label}
-            accessibilityLabel={setup.label}
-            onPress={() => props.onViewSetup(setup.discussionId)}
-          />
-          <LinkButton label="End setup" onPress={props.onEndSetup} />
-        </View>
+        <SetupStrip
+          setup={setup}
+          onViewSetup={props.onViewSetup}
+          onEndSetup={props.onEndSetup}
+        />
       ) : null}
       <View className="flex-row items-center gap-2">
         <SearchField

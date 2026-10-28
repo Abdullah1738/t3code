@@ -333,6 +333,8 @@ export interface ClaimContext {
  * outside the thread.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
+  // Same hold as planDispatch: no card work starts while the board's setup runs.
+  if (board.setup?.status === "running") return no("Setup is running");
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

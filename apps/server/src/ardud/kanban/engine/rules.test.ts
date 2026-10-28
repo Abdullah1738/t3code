@@ -52,6 +52,7 @@ const board: KanbanBoard = {
   ],
   defaultReviewChain: "Default",
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
   createdAt: "2026-10-25T00:00:00Z",
   archivedAt: null,
 };
@@ -341,6 +342,19 @@ describe("thread batching", () => {
     expect(checkClaim(board, card({ blockedBy: [blocker.id] }), ctx).ok).toBe(false);
     expect(checkClaim(board, card({ blockedBy: [a.id] }), ctx).ok).toBe(true);
     expect(checkClaim(board, card(), { ...ctx, carrying: MAX_BATCH }).ok).toBe(false);
+    // The setup hold covers claims and creates too, not only planDispatch.
+    const setupRunning: KanbanBoard = {
+      ...board,
+      setup: {
+        status: "running",
+        discussionId: KanbanDiscussionId.make("disc-setup"),
+        threadId: ThreadId.make("t-setup"),
+        startedAt: "2026-10-28T00:00:00Z",
+        finishedAt: null,
+      },
+    };
+    expect(checkClaim(setupRunning, card(), ctx)).toEqual({ ok: false, reason: "Setup is running" });
+    expect(checkClaim({ ...setupRunning, setup: { ...setupRunning.setup!, status: "done" } }, card(), ctx).ok).toBe(true);
     expect(checkClaim(board, card({ projectId: "p2" as KanbanCard["projectId"] }), ctx).ok).toBe(
       false,
     );

@@ -1,5 +1,9 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { discussionSnoozed, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  discussionSnoozed,
+  type KanbanBoardState,
+  setupBanner,
+} from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanDiscussion } from "@t3tools/contracts";
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
@@ -11,9 +15,10 @@ import { IconButton } from "../../components/ui/IconButton";
 import type { AppBarAction, AppBarMenu } from "../../components/ui/AppBar.types";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { useHeaderInset, useNowMs } from "../common/hooks";
+import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
 import { copyLinkAction } from "./copyLink";
+import { SetupStrip } from "./BoardView";
 import { Chat } from "./Chat";
 import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
 import {
@@ -72,6 +77,8 @@ export function KanbanRecordRouteScreen({
           actions={
             card ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)] : []
           }
+          state={state}
+          boardId={boardId}
         >
           <CardDetail
             boardId={boardId}
@@ -88,7 +95,12 @@ export function KanbanRecordRouteScreen({
     }
     case "goal":
       return (
-        <Shell title={state.goals.get(record.id ?? "")?.name ?? "Goal"} onBack={back}>
+        <Shell
+          title={state.goals.get(record.id ?? "")?.name ?? "Goal"}
+          onBack={back}
+          state={state}
+          boardId={boardId}
+        >
           <GoalView
             state={state}
             goalId={record.id ?? ""}
@@ -135,9 +147,15 @@ function Shell(props: {
   readonly onBack: () => void;
   readonly actions?: ReadonlyArray<AppBarAction>;
   readonly menus?: ReadonlyArray<AppBarMenu>;
+  /** The board, for its setup strip while the first setup runs. */
+  readonly state?: KanbanBoardState;
+  readonly boardId?: string;
   readonly children: ReactNode;
 }) {
   const headerInset = useHeaderInset();
+  const setup = props.state ? setupBanner(props.state.board) : null;
+  const navSetup = useKanbanNav(props.boardId ?? "");
+  const action = useBoardAction();
   return (
     <View collapsable={false} className="flex-1 bg-screen" style={{ paddingTop: headerInset }}>
       <AppBar
@@ -147,6 +165,19 @@ function Shell(props: {
         {...(props.actions ? { actions: props.actions } : {})}
         {...(props.menus ? { menus: props.menus } : {})}
       />
+      {setup && props.boardId ? (
+        <View className="px-4 pt-2">
+          <SetupStrip
+            setup={setup}
+            onViewSetup={(id) => navSetup.openDiscussion(id)}
+            onEndSetup={() =>
+              void action.run("Couldn't end setup", () =>
+                kanbanClient().endSetup(props.boardId ?? ""),
+              )
+            }
+          />
+        </View>
+      ) : null}
       <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
         {props.children}
       </KeyboardAvoidingView>
@@ -177,6 +208,8 @@ function DiscussionScreen(props: {
     <Shell
       title={title}
       onBack={props.onBack}
+      state={props.state}
+      boardId={props.boardId}
       menus={
         discussion
           ? [
@@ -289,6 +322,8 @@ function DiscussionsScreen(props: {
     <Shell
       title="Discussions"
       onBack={props.onBack}
+      state={props.state}
+      boardId={props.boardId}
       actions={[{ accessibilityLabel: "New discussion", icon: "plus", onPress: () => open(null) }]}
     >
       <View

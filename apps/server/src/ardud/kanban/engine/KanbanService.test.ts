@@ -1816,6 +1816,35 @@ it.effect("a setup can adopt an existing discussion as its Setup discussion", ()
   }),
 );
 
+it.effect("adopting a discussion that already has an evaluator hands it to the setup thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      // An older evaluator already owns this discussion.
+      const old = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at it" });
+      const oldEvaluator: KanbanActor = { _tag: "evaluator", threadId: old };
+      const existing = yield* kanban.createDiscussion(board.id, "Robob setup notes", oldEvaluator);
+      assert.strictEqual((yield* kanban.discussion(existing.id)).evaluatorThreadId, old);
+
+      const setup = yield* kanban.startEvaluator(board.id, {
+        kind: "setup",
+        text: "Set it up",
+        discussionId: existing.id,
+      });
+      // Ownership moved: owner replies reach the setup thread, not the old one.
+      assert.strictEqual((yield* kanban.discussion(existing.id)).evaluatorThreadId, setup);
+      yield* kanban.post(existing.id, owner, [{ _tag: "md", text: "Where are we?" }]);
+      const all = [...(yield* Ref.get(fake.threads)).entries()];
+      assert.include(all.find(([id]) => id === setup)![1].messages.at(-1) ?? "", "Where are we?");
+
+      // The setup thread can end setup from there.
+      const done = yield* kanban.endSetup(board.id, { _tag: "evaluator", threadId: setup });
+      assert.strictEqual(done.setup?.status, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),

@@ -1197,7 +1197,16 @@ const make = Effect.gen(function* () {
       title,
     );
     if (setupDiscussion) {
-      yield* saveDiscussion(adoptEvaluator(setupDiscussion, { _tag: "evaluator", threadId }));
+      // The setup evaluator owns the Setup discussion even when an older evaluator
+      // already had it: owner replies and setup_done must reach this thread.
+      yield* saveDiscussion(
+        withParticipant(
+          { ...setupDiscussion, evaluatorThreadId: threadId },
+          { _tag: "evaluator", threadId },
+          "Evaluator",
+          {},
+        ),
+      );
       const running: KanbanBoard = {
         ...board,
         setup: {
@@ -2203,6 +2212,7 @@ const make = Effect.gen(function* () {
           reviewChains: [],
           defaultReviewChain: null,
           instructions: Defaults.DEFAULT_INSTRUCTIONS,
+          setup: null,
           createdAt: yield* nowIso,
           archivedAt: null,
         };
