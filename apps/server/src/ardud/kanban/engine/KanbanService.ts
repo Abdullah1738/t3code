@@ -1729,6 +1729,20 @@ const make = Effect.gen(function* () {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
     const at = yield* nowIso;
+    // Every board-thread turn end is announced, so the Threads view rereads the run
+    // as finished even when the dispatcher leaves the card as it is (a worker that
+    // moved to needs_owner, a one-shot evaluator, and so on).
+    // The turn has ended, so the run is not running: the provider's view can lag this event.
+    const view = yield* threads.view(threadId);
+    yield* publish(link.boardId, {
+      _tag: "thread",
+      thread: {
+        threadId,
+        title: view?.title ?? link.purpose ?? link.role,
+        running: false,
+        lastActivityAt: at,
+      },
+    });
     const card = link.cardId ? yield* store.card(link.cardId) : null;
     const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
@@ -1775,18 +1789,6 @@ const make = Effect.gen(function* () {
     if (link.role === "evaluator") {
       if (link.discussionId === null && link.endedAt === null) {
         yield* store.putThreadLink({ ...link, endedAt: at });
-        // A one-shot evaluator is done: announce it so the Threads view rereads
-        // and stops showing it as running on a quiet board.
-        const view = yield* threads.view(link.threadId);
-        yield* publish(link.boardId, {
-          _tag: "thread",
-          thread: {
-            threadId: link.threadId,
-            title: view?.title ?? link.purpose ?? "evaluator",
-            running: false,
-            lastActivityAt: at,
-          },
-        });
       }
       return;
     }

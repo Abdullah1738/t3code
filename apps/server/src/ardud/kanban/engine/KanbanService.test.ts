@@ -271,6 +271,39 @@ it.effect("announces a finished one-shot evaluator so its thread stops showing a
   }),
 );
 
+it.effect("announces a worker that ends after moving its card to needs owner", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const ended = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) =>
+            change._tag === "thread" &&
+            change.thread.threadId === thread &&
+            change.thread.running === false,
+        ),
+      );
+      // The worker stops and its card waits on the owner: the dispatcher finds no
+      // carried card to nudge, yet the run has finished and must say so.
+      yield* kanban.moveCard(
+        card.id,
+        "needs_owner",
+        "cardThread",
+        { _tag: "thread", threadId: thread },
+        { question: "Which fee?" },
+      );
+      yield* kanban.turnEnded(thread);
+
+      assert.isTrue(Option.isSome(yield* ended));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("lists a board's card and evaluator threads, and marks board threads as board runs", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
