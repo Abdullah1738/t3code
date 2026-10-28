@@ -36,6 +36,7 @@ import { resolveSnoozePresets, snoozeWakeLabel } from "../../components/Sidebar.
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import {
   Menu,
+  MenuCheckboxItem,
   MenuItem,
   MenuPopup,
   MenuSeparator,
@@ -61,6 +62,7 @@ export const NEW_DISCUSSION = "new";
 
 const SNOOZED_EXPANDED_KEY = "t3code:kanban:discussions:snoozed-expanded";
 const SETTLED_EXPANDED_KEY = "t3code:kanban:discussions:settled-expanded";
+const HIDE_CARDS_KEY = "t3code:kanban:discussions:hide-cards";
 
 const ROUND_BUTTON =
   "grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) data-popup-open:bg-(--m-chip) data-popup-open:text-(--m-text)";
@@ -162,7 +164,10 @@ export function DiscussionsView(props: {
     false,
     Schema.Boolean,
   );
-  const groups = discussionRows(state, props.nowMs, { query });
+  const [hideCards, setHideCards] = useLocalStorage(HIDE_CARDS_KEY, false, Schema.Boolean);
+  // Not saved: a reload shows every discussion again.
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const groups = discussionRows(state, props.nowMs, { query, hideCards, unreadOnly });
   const total =
     groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const searching = query.trim().length > 0;
@@ -197,12 +202,41 @@ export function DiscussionsView(props: {
         <div className="flex min-h-0 flex-col gap-1 pe-2.5 md:border-e md:border-(--m-rule)">
           <div className="flex h-9 shrink-0 items-center ps-2.5">
             <h2 className="text-base font-semibold">Discussions</h2>
+            <span className="flex-1" />
+            <Menu>
+              <MenuTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label="Discussion filters"
+                    className={cn(ROUND_BUTTON, (hideCards || unreadOnly) && "text-(--m-text)")}
+                  />
+                }
+              >
+                <ListFilterIcon className="size-4" />
+              </MenuTrigger>
+              <MenuPopup side="bottom" align="end">
+                <MenuCheckboxItem
+                  checked={!hideCards}
+                  onCheckedChange={(next) => setHideCards(!next)}
+                >
+                  Card discussions
+                </MenuCheckboxItem>
+                <MenuCheckboxItem checked={unreadOnly} onCheckedChange={setUnreadOnly}>
+                  Unread only
+                </MenuCheckboxItem>
+              </MenuPopup>
+            </Menu>
           </div>
           <SearchField value={query} onChange={setQuery} />
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3">
             {!state.discussionsLoaded && total === 0 ? null : total === 0 ? (
               <p className="px-2.5 py-2 text-sm text-(--m-muted)">
-                {searching ? "No matches." : "No discussions yet."}
+                {searching
+                  ? "No matches."
+                  : unreadOnly
+                    ? "No unread discussions."
+                    : "No discussions yet."}
               </p>
             ) : null}
             <ul className="flex flex-col gap-0.5">
