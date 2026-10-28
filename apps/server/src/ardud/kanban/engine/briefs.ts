@@ -8,7 +8,7 @@ import {
   type KanbanStage,
 } from "@t3tools/contracts";
 
-import { MAX_BATCH, NUDGE_LIMIT } from "./rules.ts";
+import { MAX_BATCH } from "./rules.ts";
 import { subtaskIds, subtaskLines } from "./subtasks.ts";
 
 const lines = (...parts: ReadonlyArray<string | null | false | undefined>) =>
@@ -50,7 +50,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,
-    `- Never end a turn while a card of yours is in Working: move it to needs_review, ask with card_ask (blocking when you can't go on), flag it, or keep working. Wait for CI or a deploy inside the turn. Each time you stop with a card in Working you are nudged; after ${NUDGE_LIMIT} nudges in a row the evaluator takes over.`,
+    "- Never end a turn while a card of yours is in Working: move it to needs_review, ask with card_ask (blocking when you can't go on), flag it, or keep working. Wait for CI or a deploy inside the turn. Each time you stop with a card in Working you are nudged.",
     "- If you can't continue (missing access, broken env), call card_flag with the reason: the card goes back to To Do and the evaluator is told.",
     "- Messages from the card discussion arrive here. Answer them with discussion_post; plain replies in this thread are not seen there.",
     "- Read the board wiki (wiki_read) for lessons that apply to this work.",
@@ -289,7 +289,7 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Wait for CI or a deploy inside your turn instead of ending it. After ${NUDGE_LIMIT} nudges in a row the evaluator takes over.`;
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Wait for CI or a deploy inside your turn instead of ending it.`;
 };
 
 export const runFailedText = (
@@ -302,9 +302,6 @@ export const runFailedText = (
 
 export const modelRefusedText = (card: KanbanCard, problem: string) =>
   `Card #${card.number} was not started: ${problem} It is flagged stalled. card_edit its model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain), clear the flag with card_flag stalled false, and say in the card's discussion what you changed.`;
-
-export const workerStuckText = (card: KanbanCard, threadId: string) =>
-  `Card #${card.number} (${card.title || "untitled"}): its work thread ${threadId} ended ${NUDGE_LIMIT + 1} turns in a row with the card still in Working, after ${NUDGE_LIMIT} nudges. The board stops nudging it and the card keeps its slot. Read the thread (t3_thread_read) and its worktree, then card_thread steer with what to do next (that restarts the nudges), or card_thread stop and re-plan the card.`;
 
 export const workerFlaggedText = (card: KanbanCard, reason: string) =>
   `Card #${card.number} (${card.title || "untitled"}): its thread flagged it and let it go: "${reason}". It is in ${card.stage}, flagged, and its slot is free. Read the thread (t3_thread_read), sort out what it needs, then card_thread wake with what to do next (it goes back to the same thread), or re-plan the card.`;

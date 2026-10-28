@@ -909,7 +909,7 @@ const evaluatorNotesFor = (fake: Effect.Success<typeof makeFake>, text: string) 
     ),
   );
 
-it.effect("a worker is nudged at every quiet turn end, then its evaluator takes over", () =>
+it.effect("a worker is nudged at every quiet turn end", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -921,24 +921,15 @@ it.effect("a worker is nudged at every quiet turn end, then its evaluator takes 
       yield* kanban.turnEnded(thread);
       assert.strictEqual(yield* nudgesTo(fake, thread), 0);
       yield* setRunning(fake, thread, false);
-      for (const expected of [1, 2, 3]) {
+      for (const expected of [1, 2, 3, 4, 5]) {
         yield* kanban.turnEnded(thread);
         assert.strictEqual(yield* nudgesTo(fake, thread), expected);
       }
-      assert.strictEqual(yield* evaluatorNotesFor(fake, "nudges"), 0);
-      // The fourth quiet stop hands the card to its evaluator, without a nudge.
-      yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), 3);
-      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
-      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
-      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, thread);
-      yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), 3);
-      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
-      // Anything else on the card restarts the count.
-      yield* kanban.cardThread(card.id, "steer", "Finish the tests", owner);
-      yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), 4);
+      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 0);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "working");
+      assert.strictEqual(after.activeThreadId, thread);
+      assert.isNotNull(after.nudgedAt);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

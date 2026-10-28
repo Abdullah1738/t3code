@@ -8,7 +8,6 @@ import {
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
-  type KanbanCardEvent,
   type KanbanDiscussion,
   type KanbanGroup,
   type KanbanPool,
@@ -145,21 +144,7 @@ export function discussionSettleDue(
   return nowMs - quietSince >= DISCUSSION_IDLE_MS;
 }
 
-export const NUDGE_LIMIT = 3;
-export const NUDGE_NOTE = "Nudged: still in Working";
-export const HANDOFF_NOTE = `Handed to the evaluator after ${NUDGE_LIMIT} nudges`;
 export const WORKER_QUIET_MS = 30 * 60 * 1000;
-
-/** What a stopped worker's card gets: a nudge, a hand-off after NUDGE_LIMIT nudges in a row, or nothing once handed off. Any other event restarts the count. */
-export function nudgeState(
-  events: ReadonlyArray<KanbanCardEvent>,
-): "nudge" | "hand_off" | "handed_off" {
-  if (events.at(-1)?.body === HANDOFF_NOTE) return "handed_off";
-  let nudges = 0;
-  for (let index = events.length - 1; index >= 0 && events[index]!.body === NUDGE_NOTE; index -= 1)
-    nudges += 1;
-  return nudges >= NUDGE_LIMIT ? "hand_off" : "nudge";
-}
 
 /** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
 export function workerQuietDue(

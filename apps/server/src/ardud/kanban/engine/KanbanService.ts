@@ -1860,32 +1860,16 @@ const make = Effect.gen(function* () {
     }
   });
 
-  /** A stopped worker hears about its cards still in Working; after NUDGE_LIMIT nudges in a row the card's evaluator takes over. */
+  /** A stopped worker hears about its cards still in Working, every time. nudgedAt records the last nudge instead of a card event, so a looping worker can't flood the history. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     cards: ReadonlyArray<KanbanCard>,
   ) {
-    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
-    const at = yield* nowIso;
-    const nudge: Array<KanbanCard> = [];
-    for (const card of cards) {
-      if (card.stage !== "working" || card.stalled !== null) continue;
-      const state = Rules.nudgeState(yield* store.cardEvents(card.id));
-      if (state === "nudge") nudge.push(card);
-      if (state !== "hand_off") continue;
-      yield* logEvent(card, system, "thread", { body: Rules.HANDOFF_NOTE });
-      yield* noteDiscussion(card, Briefs.workerStuckText(card, threadId)).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban worker hand-off note failed", { cardId: card.id, cause }),
-        ),
-      );
-    }
+    const nudge = cards.filter((card) => card.stage === "working" && card.stalled === null);
     if (nudge.length === 0) return;
+    const at = yield* nowIso;
     yield* threads.send({ threadId, text: Briefs.nudgeWorkText(nudge) }).pipe(Effect.ignore);
-    for (const card of nudge) {
-      yield* logEvent(card, system, "thread", { body: Rules.NUDGE_NOTE });
-      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
-    }
+    for (const card of nudge) yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
   });
 
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (

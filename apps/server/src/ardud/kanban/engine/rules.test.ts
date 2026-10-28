@@ -18,13 +18,9 @@ import {
   checkClaim,
   checkMove,
   discussionSettleDue,
-  HANDOFF_NOTE,
   isBlocked,
   MAX_BATCH,
   modelOnPool,
-  NUDGE_LIMIT,
-  NUDGE_NOTE,
-  nudgeState,
   planDispatch,
   poolKey,
   prsLanded,
@@ -722,31 +718,6 @@ describe("discussionSettleDue", () => {
     const d = discussion({ lastMessageAt: "2026-10-25T12:00:00.000Z" });
     expect(discussionSettleDue(d, null, START + 25 * H)).toBe(false);
     expect(discussionSettleDue(d, null, START + 37 * H)).toBe(true);
-  });
-});
-
-describe("nudgeState", () => {
-  const event = (body: string | null, kind = "thread") => ({
-    id: 0,
-    cardId: KanbanCardId.make("c1"),
-    at: "2026-10-25T00:00:00Z",
-    actor: { _tag: "system" as const, component: "dispatcher" as const },
-    kind,
-    fromStage: null,
-    toStage: null,
-    body,
-  });
-  const nudges = (count: number) => Array.from({ length: count }, () => event(NUDGE_NOTE));
-
-  it("nudges until the limit, then hands off once", () => {
-    expect(nudgeState([])).toBe("nudge");
-    expect(nudgeState(nudges(2))).toBe("nudge");
-    expect(nudgeState(nudges(NUDGE_LIMIT))).toBe("hand_off");
-    expect(nudgeState([...nudges(NUDGE_LIMIT), event(HANDOFF_NOTE)])).toBe("handed_off");
-  });
-
-  it("starts the count again after any other event", () => {
-    expect(nudgeState([...nudges(NUDGE_LIMIT), event("Steered: go on", "comment")])).toBe("nudge");
   });
 });
 
