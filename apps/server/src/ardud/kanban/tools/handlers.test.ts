@@ -20,6 +20,7 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
+import * as KanbanModels from "../engine/models.ts";
 import { KanbanThreads } from "../engine/threads.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
@@ -100,6 +101,7 @@ const fakeThreads = () => {
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(liveThreadsLayer),
     Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),

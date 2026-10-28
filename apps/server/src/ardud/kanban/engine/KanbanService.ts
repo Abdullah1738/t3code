@@ -5,6 +5,7 @@ import {
   KANBAN_BACKLOG,
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
+  kanbanCardModels,
   kanbanEvaluatorStep,
   kanbanNeedsOwner,
   kanbanOpenAsks,
@@ -69,6 +70,7 @@ import * as Rules from "./rules.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import { KanbanThreads } from "./threads.ts";
+import { KanbanModels, isListed } from "./models.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
@@ -279,6 +281,10 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     model: ModelSelection,
     slots: number,
+  ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
+  readonly removePool: (
+    boardId: KanbanBoard["id"],
+    model: ModelSelection,
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly setGoal: (
     boardId: KanbanBoard["id"],
@@ -522,6 +528,7 @@ const roleName = (role: KanbanThreadLink["role"]) =>
 const make = Effect.gen(function* () {
   const store = yield* KanbanStore;
   const threads = yield* KanbanThreads;
+  const models = yield* KanbanModels;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const projects = yield* ProjectService.ProjectService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
@@ -563,6 +570,9 @@ const make = Effect.gen(function* () {
   // Threads a card was running on that were missing at the last tick. `view`
   // also answers null on a read error, so a card is let go on the second miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  // Pools whose model was off the composer's list at the last tick, as
+  // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
+  const unlistedPools = yield* Ref.make<ReadonlySet<string>>(new Set());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -2217,6 +2227,30 @@ const make = Effect.gen(function* () {
         yield* evaluatorTurn(synced, landed, dispatcher);
       }
     }
+    // A pool whose model left the composer's list drops to 0 slots after two
+    // ticks in a row, so a provider refresh blip never pauses a board. A model
+    // that returns is not raised back up; the owner does that.
+    const listed = yield* models.listed;
+    const unlistedBefore = yield* Ref.get(unlistedPools);
+    const unlistedNow = new Set<string>();
+    for (const board of yield* store.boards) {
+      if (board.archivedAt !== null) continue;
+      let zeroed = false;
+      for (const pool of yield* store.pools(board.id)) {
+        if (pool.slots === 0 || isListed(listed, pool.model) !== false) continue;
+        const id = `${board.id}:${pool.key}`;
+        unlistedNow.add(id);
+        if (!unlistedBefore.has(id)) continue;
+        yield* store.putPool(board.id, { ...pool, slots: 0 });
+        yield* Effect.logInfo(`board ${board.slug}: pool ${pool.key} left the model list, now 0 slots`);
+        zeroed = true;
+      }
+      if (zeroed) {
+        yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
+        yield* kick;
+      }
+    }
+    yield* Ref.set(unlistedPools, unlistedNow);
     yield* Ref.set(missing, missed);
     yield* dispatchUnlocked();
   });
@@ -3129,11 +3163,62 @@ const make = Effect.gen(function* () {
   const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots) =>
     guard(
       Effect.gen(function* () {
-        yield* boardOf(boardId);
+        const board = yield* boardOf(boardId);
         yield* checkModel(model);
         const key = Rules.poolKey(model);
-        yield* store.putPool(boardId, { key, model, slots: Math.max(0, Math.round(slots)) });
+        const count = Math.max(0, Math.round(slots));
+        // Unknown (null) never blocks; only a model the composer is known not to offer does.
+        const listed = isListed(yield* models.listed, model);
+        if (listed === false) {
+          const existing = (yield* store.pools(board.id)).some((pool) => pool.key === key);
+          if (count > 0 || !existing) {
+            return yield* failWith("invalid", `${key} isn't in the model list; pick a model the composer offers`);
+          }
+        }
+        yield* store.putPool(boardId, { key, model, slots: count });
         const pools = yield* store.pools(boardId);
+        yield* publish(boardId, { _tag: "pools", pools });
+        yield* kick;
+        return pools;
+      }),
+    );
+
+  const removePool: KanbanServiceShape["removePool"] = (boardId, model) =>
+    guard(
+      Effect.gen(function* () {
+        const board = yield* boardOf(boardId);
+        const key = Rules.poolKey(model);
+        const pool = (yield* store.pools(board.id)).find((candidate) => candidate.key === key);
+        if (!pool) return yield* failWith("not-found", `pool ${key}`);
+        if (pool.slots > 0) {
+          return yield* failWith("invalid", `${key} has ${pool.slots} slots; set it to 0 before removing`);
+        }
+        const boardUses: Array<[string, ModelSelection | undefined]> = [
+          ["the manager model", board.managerModel],
+          ["the evaluator model", board.evaluatorModel],
+          ["the default card model", board.defaultCardModel],
+        ];
+        for (const [label, used] of boardUses) {
+          if (used && Rules.poolKey(used) === key) {
+            return yield* failWith("invalid", `${label} uses ${key}`);
+          }
+        }
+        for (const chain of board.reviewChains) {
+          if (chain.steps.some((step) => Rules.poolKey(step) === key)) {
+            return yield* failWith("invalid", `a review chain uses ${key}`);
+          }
+        }
+        for (const card of yield* store.cards(board.id)) {
+          if (card.activePool === key && card.activeThreadId !== null) {
+            return yield* failWith("invalid", `a thread is running on ${key}`);
+          }
+          if (card.settledAt !== null) continue;
+          if (kanbanCardModels(card).some((entry) => Rules.poolKey(entry.model) === key)) {
+            return yield* failWith("invalid", `card #${card.number} uses ${key}`);
+          }
+        }
+        yield* store.removePool(board.id, key);
+        const pools = yield* store.pools(board.id);
         yield* publish(boardId, { _tag: "pools", pools });
         yield* kick;
         return pools;
@@ -3447,6 +3532,7 @@ const make = Effect.gen(function* () {
     reviewResult,
     cardThread,
     setPool,
+    removePool,
     setGoal,
     setGroups,
     discussions: (boardId) => read(store.discussions(boardId)),

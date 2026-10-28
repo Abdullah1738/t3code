@@ -400,10 +400,19 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model. Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
   { model: ModelInput, slots: NonNegativeInt },
   { pools: Records },
   { readonly: false },
+);
+
+const PoolRemove = tool(
+  "pool_remove",
+  "Remove a model pool",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  { model: ModelInput },
+  { pools: Records },
+  { readonly: false, destructive: true },
 );
 
 const GoalSet = tool(
@@ -516,6 +525,7 @@ export const KanbanToolkit = Toolkit.make(
   SubtaskDone,
   CardThread,
   PoolSet,
+  PoolRemove,
   GoalSet,
   GroupSet,
   DiscussionCreate,

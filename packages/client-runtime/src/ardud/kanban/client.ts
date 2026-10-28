@@ -77,6 +77,7 @@ export interface KanbanClient {
   /** The card's discussion, created on first use. */
   cardDiscussion(boardId: string, cardId: string): Promise<KanbanDiscussion>;
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
+  removePool(boardId: string, model: ModelSelection): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
   /** Owner ends the board's running setup; card work resumes. */
   endSetup(boardId: string): Promise<void>;
@@ -726,6 +727,9 @@ export function createKanbanClient(
     },
     async setPool(boardId, model, slots) {
       await transport.request(M.poolSet, { boardId: boardId as never, model, slots });
+    },
+    async removePool(boardId, model) {
+      await transport.request(M.poolRemove, { boardId: boardId as never, model });
     },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);

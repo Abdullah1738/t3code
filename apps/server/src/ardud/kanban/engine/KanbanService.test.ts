@@ -24,6 +24,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import * as KanbanModels from "./models.ts";
 import { modelSelectionOf } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as KanbanService from "./KanbanService.ts";
@@ -93,9 +94,20 @@ const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-kanban-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
 
-const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
+/** A composer list that a test can change between ticks. */
+const listedLayer = (listed: Ref.Ref<KanbanModels.ListedModels | null>) =>
+  Layer.succeed(
+    KanbanModels.KanbanModels,
+    KanbanModels.KanbanModels.of({ listed: Ref.get(listed) }),
+  );
+
+const testLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  models: Layer.Layer<KanbanModels.KanbanModels> = KanbanModels.layerTest(null),
+) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
+    Layer.provideMerge(models),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
@@ -2099,6 +2111,7 @@ it.effect("adopting a discussion that already has an evaluator hands it to the s
 const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
@@ -2896,5 +2909,126 @@ it.effect("a fully qualified model with a refused variant is named even with no 
         .pipe(Effect.flip);
       assert.include(refused.detail, 'has no "high" variant; it offers: xhigh');
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a pool whose model leaves the composer's list drops to 0 slots on the second tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const gone = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
+      yield* kanban.setPool(board.id, gone, 2);
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const instance = board.defaultCardModel.instanceId as string;
+      const stillListed: KanbanModels.ListedModels = new Map([
+        [instance, new Set([board.defaultCardModel.model])],
+      ]);
+      yield* Ref.set(listed, stillListed);
+
+      const slotsOf = (key: string) =>
+        Effect.map(
+          kanban.snapshot(board.id),
+          (snapshot) => snapshot.pools.find((pool) => pool.key === key)!.slots,
+        );
+      yield* kanban.tick;
+      assert.strictEqual(yield* slotsOf(Rules.poolKey(gone)), 2);
+      yield* kanban.tick;
+      assert.strictEqual(yield* slotsOf(Rules.poolKey(gone)), 0);
+      assert.strictEqual(yield* slotsOf(Rules.poolKey(board.defaultCardModel)), 2);
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
+  }),
+);
+
+it.effect("with an unknown composer list no pool is zeroed", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
+      yield* kanban.setPool(board.id, haiku, 2);
+      yield* kanban.tick;
+      yield* kanban.tick;
+      const pool = (yield* kanban.snapshot(board.id)).pools.find(
+        (entry) => entry.key === Rules.poolKey(haiku),
+      );
+      assert.strictEqual(pool!.slots, 2);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("setPool refuses an unlisted model with slots and adds a listed one at 0", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const instance = board.defaultCardModel.instanceId as string;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
+      const other = modelSelectionOf({ model: "opus/not-offered", instanceId: "opencode" });
+      yield* Ref.set(
+        listed,
+        new Map<string, ReadonlySet<string> | "missing">([
+          [instance, new Set([board.defaultCardModel.model, haiku.model])],
+        ]),
+      );
+
+      const refused = yield* kanban.setPool(board.id, other, 1).pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+      const added = yield* kanban.setPool(board.id, haiku, 0);
+      assert.isTrue(added.some((pool) => pool.key === Rules.poolKey(haiku) && pool.slots === 0));
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
+  }),
+);
+
+it.effect("removePool refuses a pool in use or with slots, and drops an unused 0-slot pool", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const instance = board.defaultCardModel.instanceId as string;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
+      yield* Ref.set(
+        listed,
+        new Map<string, ReadonlySet<string> | "missing">([
+          [instance, new Set([board.defaultCardModel.model, haiku.model])],
+        ]),
+      );
+
+      const busy = yield* kanban.removePool(board.id, board.evaluatorModel).pipe(Effect.flip);
+      assert.strictEqual(busy.code, "invalid");
+
+      yield* kanban.setPool(board.id, haiku, 1);
+      const withSlots = yield* kanban.removePool(board.id, haiku).pipe(Effect.flip);
+      assert.strictEqual(withSlots.code, "invalid");
+
+      yield* kanban.setPool(board.id, haiku, 0);
+      const pools = yield* kanban.removePool(board.id, haiku);
+      assert.isFalse(pools.some((pool) => pool.key === Rules.poolKey(haiku)));
+      const snapshot = yield* kanban.snapshot(board.id);
+      assert.isFalse(snapshot.pools.some((pool) => pool.key === Rules.poolKey(haiku)));
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );

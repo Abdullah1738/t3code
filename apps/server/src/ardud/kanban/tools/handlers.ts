@@ -623,6 +623,15 @@ const handlers = {
     ),
   ),
 
+  pool_remove: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { pools: yield* service.removePool(board.id, modelOf(input.model)) };
+      }),
+    ),
+  ),
+
   goal_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {

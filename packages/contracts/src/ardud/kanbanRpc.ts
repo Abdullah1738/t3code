@@ -59,6 +59,7 @@ export const KANBAN_WS_METHODS = {
   cardAsk: "kanban.card.ask",
   cardDiscussion: "kanban.card.discussion",
   poolSet: "kanban.pool.set",
+  poolRemove: "kanban.pool.remove",
   discussionCreate: "kanban.discussion.create",
   discussionRead: "kanban.discussion.read",
   discussionUpdate: "kanban.discussion.update",
@@ -197,6 +198,11 @@ export const KanbanRpcs = RpcGroup.make(
     Schema.Array(KanbanPool),
   ),
   call(
+    M.poolRemove,
+    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection }),
+    Schema.Array(KanbanPool),
+  ),
+  call(
     M.discussionCreate,
     Schema.Struct({ boardId: KanbanBoardId, title: Schema.String }),
     KanbanDiscussion,
@@ -261,6 +267,7 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.cardAsk]: AuthOrchestrationOperateScope,
   [M.cardDiscussion]: AuthOrchestrationOperateScope,
   [M.poolSet]: AuthOrchestrationOperateScope,
+  [M.poolRemove]: AuthOrchestrationOperateScope,
   [M.discussionCreate]: AuthOrchestrationOperateScope,
   [M.discussionRead]: AuthOrchestrationOperateScope,
   [M.discussionUpdate]: AuthOrchestrationOperateScope,
