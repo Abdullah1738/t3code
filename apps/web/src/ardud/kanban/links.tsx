@@ -3,12 +3,11 @@ import { CheckIcon, LinkIcon, MessageCircleIcon, SquareKanbanIcon } from "lucide
 import { createContext, use, type ReactElement, type ReactNode } from "react";
 
 import {
-  kanbanLink,
+  kanbanCopyLink,
   kanbanLinkOf,
   type KanbanLink,
   type KanbanLinkKind,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { formatThreadLink } from "@t3tools/shared/threadLinks";
 
 import ChatMarkdown from "../../components/ChatMarkdown";
 import { ComposerContextChipRendererContext } from "../../components/composerContextPresentation";
@@ -153,11 +152,7 @@ export function CopyLinkButton(props: {
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        copyToClipboard(
-          props.kind === "thread"
-            ? formatThreadLink(props.id, props.label)
-            : kanbanLink(props.kind, props.id, props.label),
-        );
+        copyToClipboard(kanbanCopyLink(props.kind, props.id, props.label));
       }}
       className={cn(
         "grid size-7.5 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
