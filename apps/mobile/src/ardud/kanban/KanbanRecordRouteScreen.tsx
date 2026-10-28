@@ -29,6 +29,7 @@ import {
 } from "./discussionActions";
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
+import { useHideCardDiscussions } from "./useHideCardDiscussions";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { kanbanRecordState, type KanbanRecordParams, requestTitle } from "./logic";
 import { useKanbanNav } from "./nav";
@@ -278,6 +279,7 @@ function discussionOptions(
     items: discussionMenu({
       settled: discussion.settledAt !== null,
       snoozed: discussionSnoozed(discussion, nowMs),
+      pinned: discussion.pinnedAt !== null,
       now: new Date(nowMs),
     }).map((item) =>
       "presets" in item
@@ -317,6 +319,8 @@ function DiscussionsScreen(props: {
     wide ? setSelected({ id, key: id ?? `new-${Date.now()}` }) : nav.openDiscussion(id);
   const selectedId = selected?.id ?? null;
   const splitDiscussion = selectedId === null ? undefined : props.state.discussions.get(selectedId);
+  const { hideCards, toggleHideCards } = useHideCardDiscussions();
+  const [unreadOnly, setUnreadOnly] = useState(false);
 
   return (
     <Shell
@@ -325,6 +329,26 @@ function DiscussionsScreen(props: {
       state={props.state}
       boardId={props.boardId}
       actions={[{ accessibilityLabel: "New discussion", icon: "plus", onPress: () => open(null) }]}
+      menus={[
+        {
+          title: "Filter",
+          icon: "line.3.horizontal.decrease.circle",
+          items: [
+            {
+              id: "hide-cards",
+              title: "Hide card discussions",
+              selected: hideCards,
+              onPress: toggleHideCards,
+            },
+            {
+              id: "unread-only",
+              title: "Unread only",
+              selected: unreadOnly,
+              onPress: () => setUnreadOnly((on) => !on),
+            },
+          ],
+        },
+      ]}
     >
       <View
         className="flex-1 flex-row"
@@ -336,6 +360,8 @@ function DiscussionsScreen(props: {
             nowMs={props.nowMs}
             bottomInset={props.bottomInset}
             selectedId={wide ? selectedId : null}
+            hideCards={hideCards}
+            unreadOnly={unreadOnly}
             onOpen={open}
           />
         </View>

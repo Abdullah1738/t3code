@@ -27,21 +27,28 @@ import { kanbanClient } from "./kanbanStore";
 import { useDiscussionShelves } from "./use-discussion-shelves";
 
 /**
- * Board discussions, newest first, like the thread list: open ones on top,
- * then Snoozed and Settled shelves that open on tap. Long-press a row for
- * Settle, Snooze and Rename.
+ * Board discussions, newest first, like the thread list: pinned ones on top,
+ * then open ones, then Snoozed and Settled shelves that open on tap. Long-press
+ * a row for Settle, Snooze, Pin and Rename.
  */
 export function DiscussionList(props: {
   readonly state: KanbanBoardState;
   readonly nowMs: number;
   readonly bottomInset: number;
   readonly selectedId?: string | null;
+  readonly hideCards: boolean;
+  readonly unreadOnly: boolean;
   readonly onOpen: (discussionId: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const searchRef = useRef<TextInputInstance | null>(null);
-  const groups = discussionRows(props.state, props.nowMs, { query });
-  const total = groups.active.length + groups.snoozed.length + groups.settled.length;
+  const groups = discussionRows(props.state, props.nowMs, {
+    query,
+    hideCards: props.hideCards,
+    unreadOnly: props.unreadOnly,
+  });
+  const total =
+    groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const boardId = props.state.board.id;
   const shelves = useDiscussionShelves(boardId);
   const open = shelves.open;
@@ -82,7 +89,18 @@ export function DiscussionList(props: {
           />
         </View>
       ) : null}
-      {total === 0 ? <EmptyLine label={searching ? "No matches" : "No discussions"} /> : null}
+      {total === 0 ? (
+        <EmptyLine
+          label={
+            searching
+              ? "No matches"
+              : props.unreadOnly
+                ? "No unread discussions"
+                : "No discussions"
+          }
+        />
+      ) : null}
+      {rowList(groups.pinned)}
       {rowList(groups.active)}
       {(["snoozed", "settled"] as const).map((kind) => {
         const rows = groups[kind];
@@ -142,6 +160,7 @@ function menuActions(row: DiscussionRow): MenuAction[] {
   return discussionMenu({
     settled: row.settledAt !== null,
     snoozed: row.snoozedUntil !== null,
+    pinned: row.pinnedAt !== null,
     now: new Date(),
   }).map((item) => ({
     id: item.id,
@@ -166,6 +185,7 @@ function DiscussionItem(props: {
       : snoozeWakeLabel(row.snoozedUntil, { now: new Date(props.nowMs).toISOString() });
   const label = [
     row.title,
+    row.pinnedAt !== null ? "pinned" : null,
     row.unread > 0 ? `${row.unread} unread` : null,
     wake && `snoozed ${wake}`,
   ]
@@ -191,7 +211,7 @@ function DiscussionItem(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={label}
-          accessibilityHint="Long-press for settle, snooze and rename"
+          accessibilityHint="Long-press for settle, snooze, pin and rename"
           accessibilityState={{ selected: props.selected }}
           onPress={() => props.onOpen(row.id)}
           className={cn("min-h-16 gap-1 rounded-[12px] px-3 py-2.5", props.selected && "bg-card")}
@@ -207,6 +227,9 @@ function DiscussionItem(props: {
             >
               {row.title}
             </Text>
+            {row.pinnedAt !== null ? (
+              <SymbolView name="pin" size={12} tintColorClassName="accent-foreground-muted" />
+            ) : null}
             {row.unread > 0 ? <View className="size-1.5 rounded-full bg-primary" /> : null}
             <View className="flex-1" />
             {wake ? (
