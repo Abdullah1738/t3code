@@ -97,12 +97,16 @@ async function render(state = boardState()) {
   );
 }
 
+const isStageGrid = () => container.querySelector('[role="tablist"]') === null;
+
 beforeEach(async () => {
   localStorage.clear();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   // A wide board, so the stage grid is picked over the phone tabs.
   container = document.createElement("div");
+  // Wide enough that BoardColumns picks StageGrid over the phone tabs.
   container.style.width = "1400px";
+  container.style.height = "800px";
   document.body.append(container);
   root = createRoot(container);
   await render();
@@ -163,6 +167,8 @@ describe("stage columns", () => {
     root = createRoot(container);
     await render();
 
+    // The stage grid, not the phone tabs, must be the layout under test.
+    expect(isStageGrid()).toBe(true);
     expect(column("Working")).toBeNull();
     const rail = container.querySelector<HTMLButtonElement>('button[aria-label^="Show Working"]');
     expect(rail).not.toBeNull();
