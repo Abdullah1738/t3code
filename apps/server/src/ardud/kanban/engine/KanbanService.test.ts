@@ -38,6 +38,7 @@ interface FakeThread {
   readonly messages: Array<string>;
   running: boolean;
   stuck?: boolean;
+  archived: boolean;
 }
 
 const makeFake = Effect.gen(function* () {
@@ -61,6 +62,7 @@ const makeFake = Effect.gen(function* () {
               state: thread.stuck ? "needs-input" : thread.running ? "running" : "idle",
               updatedAt: "2026-10-25T13:00:00.000Z",
               prs: prs.get(threadId) ?? [],
+              archived: thread.archived,
             };
           }),
         ),
@@ -74,6 +76,7 @@ const makeFake = Effect.gen(function* () {
             model: input.model,
             messages: [input.text],
             running: false,
+            archived: false,
           });
           return [threadId, copy] as const;
         }),

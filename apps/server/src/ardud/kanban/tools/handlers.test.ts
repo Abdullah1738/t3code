@@ -83,6 +83,7 @@ const fakeThreads = () => {
           state: running.has(threadId) ? "running" : "idle",
           updatedAt: "2026-10-26T08:00:00.000Z",
           prs: [],
+          archived: false,
         }),
       lastFailure: () => Effect.succeed(null),
       launch: (input) =>
