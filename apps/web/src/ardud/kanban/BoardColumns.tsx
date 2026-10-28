@@ -515,6 +515,10 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   );
 }
 
+// A phone gets one card per row; a portrait iPad gets two or three. The min() keeps
+// a 320px phone from clipping a card that can't reach 17rem.
+const LIST_GRID = "grid grid-cols-[repeat(auto-fill,minmax(min(17rem,100%),1fr))] gap-2";
+
 /** Phone layout: Needs Owner pinned on top, then one stage at a time. */
 function StageList(props: ColumnsProps) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
@@ -534,9 +538,17 @@ function StageList(props: ColumnsProps) {
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-          {board.owner.cards.map((card) => (
-            <CardTile key={card.id} card={card} raised selected={false} onOpen={props.onOpenCard} />
-          ))}
+          <div className={LIST_GRID}>
+            {board.owner.cards.map((card) => (
+              <CardTile
+                key={card.id}
+                card={card}
+                raised
+                selected={false}
+                onOpen={props.onOpenCard}
+              />
+            ))}
+          </div>
         </div>
       ) : null}
       <div
@@ -554,7 +566,7 @@ function StageList(props: ColumnsProps) {
               aria-selected={selected}
               onClick={() => setPicked(column.stage)}
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-[0.9375rem]",
                 selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
               )}
             >
@@ -564,11 +576,13 @@ function StageList(props: ColumnsProps) {
           );
         })}
       </div>
-      {current
-        ? current.cards.map((card) => (
+      {current ? (
+        <div className={LIST_GRID}>
+          {current.cards.map((card) => (
             <CardTile key={card.id} card={card} selected={false} onOpen={props.onOpenCard} />
-          ))
-        : null}
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
