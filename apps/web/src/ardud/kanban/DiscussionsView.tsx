@@ -156,7 +156,8 @@ export function DiscussionsView(props: {
     Schema.Boolean,
   );
   const groups = discussionRows(state, props.nowMs, { query });
-  const total = groups.active.length + groups.snoozed.length + groups.settled.length;
+  const total =
+    groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const searching = query.trim().length > 0;
   const narrow = useMediaQuery("max-md");
   const drafting = props.discussionId === NEW_DISCUSSION;
@@ -197,7 +198,10 @@ export function DiscussionsView(props: {
                 {searching ? "No matches." : "No discussions yet."}
               </p>
             ) : null}
-            <ul className="flex flex-col gap-0.5">{renderRows(groups.active)}</ul>
+            <ul className="flex flex-col gap-0.5">
+              {renderRows(groups.pinned)}
+              {renderRows(groups.active)}
+            </ul>
             <ListGroup
               label="Snoozed"
               count={groups.snoozed.length}
