@@ -65,6 +65,7 @@ import {
   AppState,
   Keyboard,
   Platform,
+  Pressable,
   Text,
   useWindowDimensions,
   View,
@@ -1499,10 +1500,31 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
                         paddingBottom: composerBottomInset + 6,
                       }}
                     >
-                      <View className="min-h-12 justify-center rounded-3xl px-5 py-2">
-                        <Text numberOfLines={1} className="text-sm font-medium text-foreground">
+                      <View className="min-h-12 flex-row items-center justify-between gap-3 rounded-3xl px-5 py-2">
+                        <Text numberOfLines={1} className="shrink text-sm font-medium text-foreground">
                           Run by the {boardRun.boardName} board · view only
                         </Text>
+                        {boardRun.cardId !== null || boardRun.discussionId !== null ? (
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={
+                              boardRun.cardId !== null ? "Open card" : "Open discussion"
+                            }
+                            onPress={() =>
+                              navigation.dispatch(
+                                StackActions.push("KanbanRecord", {
+                                  kind: boardRun.cardId !== null ? "card" : "discussion",
+                                  boardId: boardRun.boardId,
+                                  id: boardRun.cardId ?? boardRun.discussionId ?? undefined,
+                                }),
+                              )
+                            }
+                          >
+                            <Text className="text-sm font-medium text-foreground">
+                              {boardRun.cardId !== null ? "Open card" : "Open discussion"}
+                            </Text>
+                          </Pressable>
+                        ) : null}
                       </View>
                     </View>
                   ) : (

@@ -2,7 +2,7 @@ import type {
   KanbanBoardSummary,
   KanbanCardDetail,
   KanbanMessage,
-  KanbanThreadLink,
+  KanbanThreadRow,
 } from "@t3tools/contracts";
 import {
   boardThreadIds,
@@ -64,24 +64,57 @@ export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined
 /** Every thread a board started, cards and evaluators alike, kept current by the list. */
 export function useKanbanBoardThreads(
   boardId: string,
-): ReadonlyArray<KanbanThreadLink> | undefined {
+): ReadonlyArray<KanbanThreadRow> | undefined {
   return useStore(kanbanClient().threads(boardId));
 }
 
-/** The board that started a thread, or undefined for threads a board did not start. */
-export function useKanbanBoardRunOf(
-  threadId: string,
-): { readonly boardId: string; readonly boardName: string } | undefined {
-  const boards = useStore(kanbanClient().boards);
-  return useMemo(() => {
-    if (boards === undefined) return undefined;
-    for (const entry of boards) {
-      if (entry.threadIds.includes(threadId as never)) {
-        return { boardId: entry.board.id, boardName: entry.board.name };
-      }
+/**
+ * The board that started a thread, with the card or discussion that owns the
+ * run, or undefined for threads a board did not start.
+ */
+export function useKanbanBoardRunOf(threadId: string):
+  | {
+      readonly boardId: string;
+      readonly boardName: string;
+      readonly cardId: string | null;
+      readonly discussionId: string | null;
     }
-    return undefined;
-  }, [boards, threadId]);
+  | undefined {
+  const boards = useStore(kanbanClient().boards);
+  const entry = useMemo(
+    () => boards?.find((board) => board.threadIds.includes(threadId as never)),
+    [boards, threadId],
+  );
+  const owner = useKanbanThreadOwner(entry?.board.id ?? "", threadId);
+  if (entry === undefined) return undefined;
+  return {
+    boardId: entry.board.id,
+    boardName: entry.board.name,
+    cardId: owner?.cardId ?? null,
+    discussionId: owner?.discussionId ?? null,
+  };
+}
+
+// Stands in for a board's thread rows when there is no board yet, so the hook
+// keeps its call order and reads nothing.
+const NO_THREAD_ROWS: SnapshotStore<ReadonlyArray<KanbanThreadRow>> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
+
+/**
+ * The owning card or discussion of a board's thread, from that board's thread
+ * rows. An empty board id reads nothing: the caller has no board yet.
+ */
+export function useKanbanThreadOwner(
+  boardId: string,
+  threadId: string,
+): { readonly cardId: string | null; readonly discussionId: string | null } | undefined {
+  const rows = useStore(boardId === "" ? NO_THREAD_ROWS : kanbanClient().threads(boardId));
+  const row = rows?.find((candidate) => candidate.threadId === threadId);
+  return row === undefined ? undefined : { cardId: row.cardId, discussionId: row.discussionId };
 }
 
 /** Threads the boards started, archived boards too, for thread lists to leave out. */

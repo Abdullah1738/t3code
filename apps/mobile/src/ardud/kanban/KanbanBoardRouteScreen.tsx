@@ -64,6 +64,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
           bottomInset={bottomInset}
           onOpenCard={openCard}
           onOpenGoal={nav.openGoal}
+          onOpenThread={nav.openThread}
         />
         {/* A drawer over the columns, so opening a card never reflows the board. */}
         {paneCard !== null ? (

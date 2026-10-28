@@ -8,7 +8,7 @@ import {
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanThreadLink } from "@t3tools/contracts";
+import type { KanbanThreadRow } from "@t3tools/contracts";
 import { Fragment, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
@@ -43,6 +43,7 @@ export function BoardView(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
   readonly onOpenGoal: (goalId: string) => void;
+  readonly onOpenThread: (threadId: string) => void;
 }) {
   const goals = activeGoals(props.state);
   const [goalId, setGoalId] = useState<string | null>(null);
@@ -50,6 +51,7 @@ export function BoardView(props: {
   const filter = goals.some((entry) => entry.goal.id === goalId) ? goalId : null;
   const [query, setQuery] = useState("");
   const [settled, setSettled] = useState<SettledFilter>("hide");
+  const [mode, setMode] = useState<BoardMode>("stages");
   const searchRef = useRef<TextInputInstance | null>(null);
   const board = stageBoard(props.state, props.nowMs, { goalId: filter, query, settled });
   const filterRow = (
@@ -98,21 +100,29 @@ export function BoardView(props: {
     </View>
   );
 
+  // Threads is one view per layout: the stage tabs (phone) or columns (wide)
+  // give way to it, so iPad widths reach it too.
   if (props.layout.kind === "tabs") {
     return (
       <TabsBoard
         board={board}
         state={props.state}
+        mode={mode}
+        onSelectMode={setMode}
         filterRow={filterRow}
         hideGoal={filter !== null}
         selectedCardId={props.selectedCardId}
         bottomInset={props.bottomInset}
         onOpenCard={props.onOpenCard}
+        onOpenThread={props.onOpenThread}
       />
     );
   }
   return (
     <ColumnsBoard
+      mode={mode}
+      onSelectMode={setMode}
+      state={props.state}
       board={board}
       goals={goals}
       layout={props.layout}
@@ -122,6 +132,7 @@ export function BoardView(props: {
       bottomInset={props.bottomInset}
       onOpenCard={props.onOpenCard}
       onOpenGoal={props.onOpenGoal}
+      onOpenThread={props.onOpenThread}
     />
   );
 }
@@ -129,17 +140,19 @@ export function BoardView(props: {
 function TabsBoard(props: {
   readonly board: StageBoard;
   readonly state: KanbanBoardState;
+  readonly mode: BoardMode;
+  readonly onSelectMode: (mode: BoardMode) => void;
   readonly filterRow: React.ReactNode;
   readonly hideGoal: boolean;
   readonly selectedCardId: string | null;
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onOpenThread: (threadId: string) => void;
 }) {
   const { board } = props;
   const tabs = boardTabs(board);
   // Chosen once on open; a stage emptying later doesn't move the owner off it.
   const [tab, setTab] = useState<BoardTab>(() => defaultBoardTab(tabs));
-  const [mode, setMode] = useState<"stages" | "threads">("stages");
   const [allOwner, setAllOwner] = useState(false);
   const owner = board.owner.cards;
   const shownOwner = allOwner ? owner : owner.slice(0, OWNER_PREVIEW);
@@ -178,94 +191,166 @@ function TabsBoard(props: {
           </View>
         ) : null}
       </View>
-      <UnderlineTabs
-        accessibilityLabel="View"
-        tabs={[
-          { value: "stages", label: "Stages" },
-          { value: "threads", label: "Threads" },
-        ]}
-        selected={mode}
-        onSelect={setMode}
-      />
-      {mode === "threads" ? (
-        <View className="px-4 pt-3">
-          <BoardThreadsList boardId={props.state.board.id} state={props.state} />
-        </View>
-      ) : null}
-      {mode === "stages" ? (
-        <UnderlineTabs accessibilityLabel="Stage" tabs={tabs} selected={tab} onSelect={setTab} />
-      ) : null}
-      {mode === "stages" ? (
-      <View className="gap-2 px-4 pt-3">
-        {tab === "shipped" ? (
-          <ShippedList
-            columns={board.shipped}
-            selectedCardId={props.selectedCardId}
-            onOpenCard={props.onOpenCard}
-          />
-        ) : (
-          <CardList
-            cards={board.active.find((column) => column.stage === tab)?.cards ?? []}
-            hideGoal={props.hideGoal}
-            selectedCardId={props.selectedCardId}
-            onOpenCard={props.onOpenCard}
-          />
-        )}
+      <View className="px-4 pt-3">
+        <ViewSwitch mode={props.mode} onSelect={props.onSelectMode} />
       </View>
-      ) : null}
+      {props.mode === "threads" ? (
+        <View className="px-4 pt-3">
+          <BoardThreadsList
+            boardId={props.state.board.id}
+            state={props.state}
+            onOpenThread={props.onOpenThread}
+          />
+        </View>
+      ) : (
+        <>
+          <UnderlineTabs accessibilityLabel="Stage" tabs={tabs} selected={tab} onSelect={setTab} />
+          <View className="gap-2 px-4 pt-3">
+            {tab === "shipped" ? (
+              <ShippedList
+                columns={board.shipped}
+                selectedCardId={props.selectedCardId}
+                onOpenCard={props.onOpenCard}
+              />
+            ) : (
+              <CardList
+                cards={board.active.find((column) => column.stage === tab)?.cards ?? []}
+                hideGoal={props.hideGoal}
+                selectedCardId={props.selectedCardId}
+                onOpenCard={props.onOpenCard}
+              />
+            )}
+          </View>
+        </>
+      )}
     </ScrollView>
   );
 }
 
+type BoardMode = "stages" | "threads";
+
+/** Stages and Threads, shared by every board layout. */
+function ViewSwitch(props: { readonly mode: BoardMode; readonly onSelect: (mode: BoardMode) => void }) {
+  return (
+    <UnderlineTabs
+      accessibilityLabel="View"
+      tabs={[
+        { value: "stages", label: "Stages" },
+        { value: "threads", label: "Threads" },
+      ]}
+      selected={props.mode}
+      onSelect={props.onSelect}
+    />
+  );
+}
+
 /**
- * The board's threads in two groups, cards and evaluators, the same split as
- * the web Threads view. Board threads are read-only on the phone too.
+ * The board's runs in two groups, Evaluators (purpose) and Cards (number and
+ * title). Running runs come first; ended history is collapsed. Each row opens
+ * its thread, which is read-only there because the board drives it.
  */
 function BoardThreadsList(props: {
   readonly boardId: string;
   readonly state: KanbanBoardState;
+  readonly onOpenThread: (threadId: string) => void;
 }) {
-  const threads = useKanbanBoardThreads(props.boardId);
-  if (threads === undefined) return null;
-  if (threads.length === 0) return <Text className="text-sm text-muted-foreground">No threads yet.</Text>;
-  const evaluators = threads.filter((link) => link.role === "evaluator");
-  const cardThreads = threads.filter((link) => link.role !== "evaluator");
-  const cards = props.state.cards;
-  const cardLabel = (link: KanbanThreadLink) => {
-    const card = link.cardId === null ? undefined : cards.get(link.cardId);
-    return card ? `#${card.number} ${card.title}` : (link.cardId ?? "Card");
-  };
+  const rows = useKanbanBoardThreads(props.boardId);
+  if (rows === undefined) return null;
+  if (rows.length === 0) return <Text className="text-sm text-muted-foreground">No threads yet.</Text>;
   return (
     <View className="gap-5">
-      <ThreadRows title="Evaluators" empty="No evaluator threads yet." links={evaluators} label={(link) => link.purpose ?? "evaluator"} />
-      <ThreadRows title="Cards" empty="No card threads yet." links={cardThreads} label={cardLabel} />
+      <ThreadGroup
+        title="Evaluators"
+        empty="No evaluator threads yet."
+        rows={rows.filter((row) => row.role === "evaluator")}
+        onOpenThread={props.onOpenThread}
+      />
+      <ThreadGroup
+        title="Cards"
+        empty="No card threads yet."
+        rows={rows.filter((row) => row.role !== "evaluator")}
+        onOpenThread={props.onOpenThread}
+      />
     </View>
   );
 }
 
-function ThreadRows(props: {
+function ThreadGroup(props: {
   readonly title: string;
   readonly empty: string;
-  readonly links: ReadonlyArray<KanbanThreadLink>;
-  readonly label: (link: KanbanThreadLink) => string;
+  readonly rows: ReadonlyArray<KanbanThreadRow>;
+  readonly onOpenThread: (threadId: string) => void;
 }) {
+  const running = props.rows.filter((row) => row.running);
+  const ended = props.rows.filter((row) => !row.running);
   return (
     <View className="gap-2">
       <Text className="text-sm font-medium text-muted-foreground">{props.title}</Text>
-      {props.links.length === 0 ? (
+      {props.rows.length === 0 ? (
         <Text className="text-sm text-muted-foreground">{props.empty}</Text>
       ) : (
-        props.links.map((link) => (
-          <View key={link.threadId} className="flex-row items-center justify-between gap-3 rounded-xl border border-border px-3 py-2">
-            <Text numberOfLines={1} className="flex-1 text-sm text-foreground">{props.label(link)}</Text>
-            <Text className="text-xs text-muted-foreground">
-              {link.role}
-              {link.endedAt === null ? " · running" : " · ended"}
-            </Text>
-          </View>
-        ))
+        <>
+          {running.map((row) => (
+            <ThreadRow key={row.threadId} row={row} onOpenThread={props.onOpenThread} />
+          ))}
+          {ended.length === 0 ? null : (
+            <EndedRows rows={ended} onOpenThread={props.onOpenThread} />
+          )}
+        </>
       )}
     </View>
+  );
+}
+
+/** Ended runs collapse behind a toggle so current runs stay on top. */
+function EndedRows(props: {
+  readonly rows: ReadonlyArray<KanbanThreadRow>;
+  readonly onOpenThread: (threadId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <View className="gap-2">
+      <LinkButton
+        label={open ? `Hide ended · ${props.rows.length}` : `Ended · ${props.rows.length}`}
+        expanded={open}
+        onPress={() => setOpen(!open)}
+      />
+      {open
+        ? props.rows.map((row) => (
+            <ThreadRow key={row.threadId} row={row} onOpenThread={props.onOpenThread} />
+          ))
+        : null}
+    </View>
+  );
+}
+
+function ThreadRow(props: {
+  readonly row: KanbanThreadRow;
+  readonly onOpenThread: (threadId: string) => void;
+}) {
+  const { row } = props;
+  const label =
+    row.role === "evaluator"
+      ? (row.purpose ?? "evaluator")
+      : row.cardNumber !== null
+        ? `#${row.cardNumber} ${row.cardTitle ?? ""}`.trim()
+        : "Card";
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${row.title ?? label}`}
+      onPress={() => props.onOpenThread(row.threadId)}
+      className="gap-1 rounded-xl border border-border px-3 py-2"
+    >
+      <Text numberOfLines={1} className="text-sm font-medium text-foreground">
+        {row.title ?? label}
+      </Text>
+      <Text numberOfLines={1} className="text-xs text-muted-foreground">
+        {row.running ? "running" : "ended"}
+        {row.model === null ? "" : ` · ${row.model.model}`}
+        {row.purpose === null || row.role !== "evaluator" ? "" : ` · ${row.purpose}`}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -321,12 +406,16 @@ function ColumnsBoard(props: {
   readonly board: StageBoard;
   readonly goals: ReadonlyArray<GoalSummary>;
   readonly layout: Extract<BoardLayout, { kind: "columns" }>;
+  readonly mode: BoardMode;
+  readonly onSelectMode: (mode: BoardMode) => void;
   readonly filterRow: React.ReactNode;
   readonly hideGoal: boolean;
   readonly selectedCardId: string | null;
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
   readonly onOpenGoal: (goalId: string) => void;
+  readonly onOpenThread: (threadId: string) => void;
+  readonly state: KanbanBoardState;
 }) {
   const { board, layout } = props;
   const columnStyle = { width: layout.column };
@@ -368,11 +457,13 @@ function ColumnsBoard(props: {
   return (
     <View className="flex-1 gap-3 pt-2">
       <View className="gap-2.5" style={{ paddingHorizontal: BOARD_PAD }}>
+        <ViewSwitch mode={props.mode} onSelect={props.onSelectMode} />
         {props.goals.length > 0 ? (
           <GoalStrip goals={props.goals} onOpenGoal={props.onOpenGoal} />
         ) : null}
         {props.filterRow}
       </View>
+      {props.mode === "threads" ? null : (
       <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
         {layout.scrolls ? (
           <ScrollView
@@ -411,6 +502,18 @@ function ColumnsBoard(props: {
           </ColumnScroll>
         </View>
       </View>
+      )}
+      {props.mode === "threads" ? (
+        <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}>
+          <View className="px-4 pt-1">
+            <BoardThreadsList
+              boardId={props.state.board.id}
+              state={props.state}
+              onOpenThread={props.onOpenThread}
+            />
+          </View>
+        </ScrollView>
+      ) : null}
     </View>
   );
 }
