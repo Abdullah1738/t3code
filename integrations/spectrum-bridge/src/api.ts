@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, validAppUrl, validFileName, validMimeType } from "./cli.ts";
+import { chatKey, GROUP_APP_REFUSAL, type ChatKey } from "./line.ts";
 import { isEffect, type Photon, type ReactionKind } from "./photon.ts";
 import type { Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
@@ -36,7 +37,7 @@ export const MAX_FILE_BODY = 28 * 1024 * 1024;
 const MAX_RESPONSE = 128 * 1024;
 const errors = {
   400: "Invalid request", 403: "Forbidden", 404: "Not found",
-  409: "Operation could not be completed", 410: "Expired", 413: "Request body too large",
+  409: "Operation could not be completed", 410: "Expired", 413: "Request body too large", 422: GROUP_APP_REFUSAL,
   502: "Tailnet publish failed", 503: "Bridge is not ready",
 } as const;
 class ApiError extends Error {
@@ -275,6 +276,8 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const { dedupeKey, sessionId } = body;
         const app = appContent(body);
         if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
+        const chat = pairedChat();
+        if (chat && chatKey.isGroup(chat as ChatKey)) throw new ApiError(422);
         const { id, created } = queueSession(store, "app", dedupeKey, sessionId, { text: "", app });
         return json({ id, created }, created ? 202 : 200);
       }

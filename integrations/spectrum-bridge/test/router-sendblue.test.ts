@@ -129,6 +129,14 @@ test("group batches name each sender, and guests carry their address", async () 
   setSystemTime(start);
 });
 
+test("group prompts say app cards are not available, owner and Moni keep the app line", async () => {
+  const group = sendblueContextPrompt(context("group"), false, []);
+  expect(group).toContain("app cards are not available in groups");
+  expect(group).not.toContain("App cards still work");
+  expect(sendblueContextPrompt(context("owner"), false, [])).toContain("App cards still work (`app`)");
+  expect(sendblueContextPrompt(context("dm"), false, [])).toContain("App cards still work (`app`)");
+});
+
 test("the owner's own chat keeps its text unprefixed", async () => {
   const start = Date.parse("2026-10-21T13:00:00Z");
   setSystemTime(start);
