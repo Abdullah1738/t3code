@@ -97,6 +97,20 @@ if args[0] in ("send", "app"):
     print(json.dumps(queue(os.environ.get("FAKE_BRIDGE_ACK_STATE") or "sent")))
 elif args[0] == "unshare":
     print(json.dumps({"app": args[2], "removed": True}))
+elif args[0] == "shares" and os.environ.get("FAKE_BRIDGE_SHARES_RAW") is not None:
+    print(os.environ["FAKE_BRIDGE_SHARES_RAW"])
+elif args[0] == "shares":
+    # Live shares are the ones shared and not unshared since; FAKE_BRIDGE_PERMANENT names stable-origin ones.
+    live = {}
+    with open(log) as f:
+        for call in map(json.loads, f):
+            if call[0] == "share":
+                live[call[2]] = True
+            elif call[0] == "unshare":
+                live.pop(call[2], None)
+    permanent = set(filter(None, os.environ.get("FAKE_BRIDGE_PERMANENT", "").split(",")))
+    print(json.dumps({"shares": [{"app": a, "url": "https://x/" + a + "/", "live": True, "permanent": a in permanent}
+                                 for a in live]}))
 elif args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -936,6 +950,58 @@ class UnshareTest(Base):
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
         self.assertIn("live shares", json.loads(p.stdout)["moni"])
         self.assertEqual(self.unshares(), [])
+
+    def test_stable_origin_link_is_never_retired_after_the_hour(self):
+        # A's link is on the stable origin (permanent): the URL Moni already has must keep working.
+        # B's is a quick tunnel and still goes an hour after its ride.
+        self.env["FAKE_BRIDGE_PERMANENT"] = f"ride-{A}"
+        self.ended(A)
+        self.ended(B)
+        for t in (30 + 3600, 30 + 7200, 30 + 30 * 86400):
+            self.run_check(t)
+        self.assertEqual(self.unshares(), [f"ride-{B}"])
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+
+    def test_unreadable_share_list_retires_nothing_after_the_hour(self):
+        self.ended(A)
+        for bad in (dict(FAKE_BRIDGE_FAIL="shares"), dict(FAKE_BRIDGE_SHARES_RAW="oops"),
+                    dict(FAKE_BRIDGE_SHARES_RAW='{"shares": null}')):
+            p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True, timeout=60,
+                               env=dict(self.env, RIDE_SHARE_NOW=str(30 + 3600), **bad))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("share list unreadable", p.stderr)
+            self.assertEqual(self.unshares(), [], bad)
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "once the list reads, the quick-tunnel link goes")
+
+    def test_share_cap_never_frees_a_stable_origin_link(self):
+        c = "cccccccc-0000-4000-8000-000000000001"
+        self.env["FAKE_BRIDGE_PERMANENT"] = f"ride-{A}"
+        self.ended(A)
+        self.ended(c)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), [f"ride-{c}"], "only the quick-tunnel link is freed")
+
+    def test_share_cap_with_only_stable_origin_links_fails_plainly(self):
+        self.env["FAKE_BRIDGE_PERMANENT"] = f"ride-{A}"
+        self.ended(A)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
+
+    def test_share_cap_frees_nothing_when_share_list_unreadable(self):
+        self.ended(A)
+        self.set_state(trip(B, "Accepted"), {})
+        for bad in (dict(FAKE_BRIDGE_FAIL="shares"), dict(FAKE_BRIDGE_SHARES_RAW="oops")):
+            p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1", **bad)
+            self.assertIn("live shares", json.loads(p.stdout)["moni"])
+            self.assertEqual(self.unshares(), [], bad)
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
 
 
 class PreviewRetryTest(Base):

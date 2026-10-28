@@ -1,0 +1,38 @@
+#!/bin/zsh -f
+# Every 5 min (launchd com.ardud.cards-health): does https://cards.abdullah.fund answer? If not while the bridge's
+# share server answers on 127.0.0.1:18793, the tunnel is restarted. Two failed runs in a row send one Telegram
+# alert, and the first good run after that says it's back. Does nothing until cards-tunnel-setup has run.
+curl=${CARDS_CURL:-/usr/bin/curl}
+lctl=${CARDS_LAUNCHCTL:-/bin/launchctl}
+notify=(${CARDS_NOTIFY:-$HOME/.bun/bin/bun} $HOME/.local/share/telegram-bridge/src/cli.ts notify)
+creds=${CARDS_CREDS:-$HOME/.cloudflared/cards-tunnel.json}
+host=${CARDS_HOST:-cards.abdullah.fund}
+port=${CARDS_PORT:-18793}
+state=$HOME/.local/state/cards-health
+[[ -f $creds ]] || exit 0
+mkdir -p "$state" || exit 1
+# The OpenCode server's inspector port leaks into children; bun can't bind it twice.
+unset BUN_INSPECT
+if "$curl" -fsS --max-time 15 -o /dev/null "https://$host/healthz"; then
+  print 0 > "$state/fails"
+  if [[ -f $state/alerted ]]; then
+    "${notify[@]}" --source Cards --severity info --text "Card links are back: https://$host answers again." \
+      --key "cards-up:$(date +%Y%m%d%H%M)" && rm -f "$state/alerted"
+  fi
+  exit 0
+fi
+fails=$(cat "$state/fails" 2>/dev/null); [[ $fails == <-> ]] || fails=0
+(( fails++ ))
+print $fails > "$state/fails"
+if "$curl" -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$port/healthz"; then
+  "$lctl" kickstart -k "gui/$(id -u)/com.ardud.cards-tunnel"
+  why="the tunnel; it was restarted"
+else
+  why="the bridge's share server on port $port isn't answering (spectrum-bridge)"
+fi
+if (( fails >= 2 )) && [[ ! -f $state/alerted ]]; then
+  "${notify[@]}" --source Cards --severity attention \
+    --text "Card links are down: https://$host doesn't answer ($why)." \
+    --key "cards-down:$(date +%Y%m%d%H)" && : > "$state/alerted"
+fi
+exit 0

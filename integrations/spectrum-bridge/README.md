@@ -111,12 +111,17 @@ under `~/.config/spectrum-bridge/`.
   existing mapping) and prints the URL; `unpublish --port N` removes one. Only
   ports in that range are ever created or removed.
 - Public links for people off the tailnet: `share --app SLUG [--days N]`
-  (default 7, max 30) serves only that app's folder from its own loopback
-  server through a Cloudflare quick tunnel (`cloudflared`, no account) and
-  prints the `trycloudflare.com` URL. The bridge owns the tunnels: at most 10
-  live, stopped at expiry, killed with the bridge, and re-created with a new
-  URL when the bridge starts again (`share-restarted` log). `unshare --app SLUG`
-  ends one; `shares` lists them. `share` and `publish --app` return
+  (default 7, max 30) serves only that app's folder. With `shareOrigin`
+  (`{"url": "https://cards.abdullah.fund", "port": 18793}` in config.json) every
+  share is `<url>/s/<random token>/` on one loopback server on that port, which
+  a named Cloudflare tunnel (`com.ardud.cards-tunnel`, from integrations/local-helpers) forwards to;
+  `/healthz` answers for its health check. The link stays the same across bridge
+  and tunnel restarts until it expires or `unshare` ends it; quick-tunnel shares
+  left from before move to the origin once (`share-moved` log). Without
+  `shareOrigin`, each share gets its own Cloudflare quick tunnel (`cloudflared`,
+  no account) and a `trycloudflare.com` URL: at most 10 live, killed with the
+  bridge and re-created with a new URL when it starts again (`share-restarted`
+  log). `unshare --app SLUG` ends one; `shares` lists them. `share` and `publish --app` return
   `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
   `og:image`, and served pages get relative `og:image`/`og:url` made absolute
   so link previews load.
