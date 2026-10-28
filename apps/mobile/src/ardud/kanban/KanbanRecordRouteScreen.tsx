@@ -1,22 +1,19 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import {
-  discussionSnoozed,
-  kanbanCopyLink,
-  type KanbanBoardState,
-} from "@t3tools/client-runtime/ardud/kanban";
+import { discussionSnoozed, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanDiscussion } from "@t3tools/contracts";
-import * as Clipboard from "expo-clipboard";
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
+import { IconButton } from "../../components/ui/IconButton";
 import type { AppBarAction, AppBarMenu } from "../../components/ui/AppBar.types";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
 import { useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
+import { copyLinkAction } from "./copyLink";
 import { Chat } from "./Chat";
 import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
 import {
@@ -157,17 +154,6 @@ function Shell(props: {
   );
 }
 
-/** Puts the same link text the web copy button uses on the clipboard. */
-function copyLinkAction(kind: "kanban-card" | "kanban-discussion", id: string, label: string) {
-  return {
-    accessibilityLabel: "Copy link",
-    icon: "link" as const,
-    onPress: () => {
-      void Clipboard.setStringAsync(kanbanCopyLink(kind, id, label));
-    },
-  };
-}
-
 /** Makes a new discussion titled from its first message. */
 const createDiscussion = async (boardId: string, firstText: string) =>
   (await kanbanClient().createDiscussion(boardId, requestTitle(firstText))).id;
@@ -297,6 +283,7 @@ function DiscussionsScreen(props: {
   const open = (id: string | null) =>
     wide ? setSelected({ id, key: id ?? `new-${Date.now()}` }) : nav.openDiscussion(id);
   const selectedId = selected?.id ?? null;
+  const splitDiscussion = selectedId === null ? undefined : props.state.discussions.get(selectedId);
 
   return (
     <Shell
@@ -325,6 +312,19 @@ function DiscussionsScreen(props: {
                 boardId={props.boardId}
                 state={props.state}
                 discussionId={selected.id}
+                header={
+                  splitDiscussion ? (
+                    <View className="flex-row justify-end px-4 pt-2">
+                      <IconButton
+                        {...copyLinkAction(
+                          "kanban-discussion",
+                          splitDiscussion.id,
+                          splitDiscussion.title,
+                        )}
+                      />
+                    </View>
+                  ) : undefined
+                }
                 ensureDiscussion={async (firstText) => {
                   const id = await createDiscussion(props.boardId, firstText);
                   setSelected((current) => (current ? { ...current, id } : current));
