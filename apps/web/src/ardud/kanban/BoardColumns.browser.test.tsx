@@ -99,6 +99,17 @@ async function render(state = boardState()) {
   );
 }
 
+/** The width a no-saved-width column starts from: its flex growth removed, as the handle measures it. */
+function naturalColumnWidth(column: HTMLElement): number {
+  const { flex, width } = column.style;
+  column.style.flex = "none";
+  column.style.width = "auto";
+  const measured = column.getBoundingClientRect().width;
+  column.style.flex = flex;
+  column.style.width = width;
+  return measured;
+}
+
 const isStageGrid = () => container.querySelector('[role="tablist"]') === null;
 
 beforeEach(async () => {
@@ -132,7 +143,7 @@ describe("stage columns", () => {
     const separator = handle("To-Do");
     expect(separator).not.toBeNull();
     const column = separator!.parentElement as HTMLElement;
-    const before = column.getBoundingClientRect().width;
+    const before = naturalColumnWidth(column);
 
     await act(() => {
       separator!.focus();
@@ -207,7 +218,7 @@ describe("pointer drag", () => {
   it("widens an unsaved column from its rendered width and saves once on release", async () => {
     const separator = handle("To-Do")!;
     const column = separator.parentElement as HTMLElement;
-    const startWidth = column.getBoundingClientRect().width;
+    const startWidth = naturalColumnWidth(column);
     const writes = vi.spyOn(Storage.prototype, "setItem");
 
     await act(() => pointer(separator, "pointerdown", 100));
