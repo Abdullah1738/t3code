@@ -150,7 +150,7 @@ class DockerHookTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), HOOK_SHA)
 
     def test_g_repair_runs_before_wait_images(self):
-        with patch.object(runs, 'GO_REPAIR', ':'):
+        with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'):
             script = remote_script('w', '.', ['true'], None, 'r')
         self.assertIn(DOCKER_REPAIR, script)
         self.assertLess(script.index(DOCKER_REPAIR), script.index('offbox-wait-images'))
