@@ -35,6 +35,7 @@ interface FakeThread {
   readonly model: ModelSelection;
   readonly messages: Array<string>;
   running: boolean;
+  stuck?: boolean;
 }
 
 const makeFake = Effect.gen(function* () {
@@ -55,7 +56,7 @@ const makeFake = Effect.gen(function* () {
               threadId,
               projectId: ProjectId.make("project-1"),
               title: thread.title,
-              state: thread.running ? "running" : "idle",
+              state: thread.stuck ? "needs-input" : thread.running ? "running" : "idle",
               updatedAt: "2026-10-25T13:00:00.000Z",
               prs: prs.get(threadId) ?? [],
             };
@@ -883,6 +884,112 @@ it.effect("a thread can't reword or replace a flag someone else set", () =>
       yield* kanban.flagCard(card.id, "Blocked on CI", self);
       yield* kanban.flagCard(card.id, null, self);
       assert.isNull((yield* kanban.card(card.id)).card.stalled);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+const nudgesTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map(
+      (all) =>
+        all
+          .get(threadId)!
+          .messages.filter((text) => text.includes("still in Working and your turn ended")).length,
+    ),
+  );
+
+const evaluatorNotesFor = (fake: Effect.Success<typeof makeFake>, text: string) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map(
+      (all) =>
+        [...all.values()]
+          .filter((thread) => thread.title.startsWith("Evaluator"))
+          .flatMap((thread) => thread.messages)
+          .filter((message) => message.includes(text)).length,
+    ),
+  );
+
+it.effect("a worker is nudged at every quiet turn end, then its evaluator takes over", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* setRunning(fake, thread, true);
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      yield* setRunning(fake, thread, false);
+      for (const expected of [1, 2, 3]) {
+        yield* kanban.turnEnded(thread);
+        assert.strictEqual(yield* nudgesTo(fake, thread), expected);
+      }
+      assert.strictEqual(yield* evaluatorNotesFor(fake, "nudges"), 0);
+      // The fourth quiet stop hands the card to its evaluator, without a nudge.
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 3);
+      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, thread);
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 3);
+      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
+      // Anything else on the card restarts the count.
+      yield* kanban.cardThread(card.id, "steer", "Finish the tests", owner);
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 4);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a worker that flags its own card tells the card's evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const self: KanbanActor = { _tag: "thread", threadId: thread };
+      yield* kanban.flagCard(card.id, "Env broken: no node modules", self);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "todo");
+      assert.strictEqual(after.stalled?.reason, "Env broken: no node modules");
+      assert.isNull(after.activeThreadId);
+      assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
+      assert.strictEqual(yield* evaluatorNotesFor(fake, "Env broken: no node modules"), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the tick nudges a quiet worker and interrupts one stuck on its own question", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* TestClock.adjust("29 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.stuck = true;
+        return all;
+      });
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.isTrue(fake.interrupted.includes(thread));
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      yield* kanban.tick;
+      assert.strictEqual(fake.interrupted.filter((id) => id === thread).length, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

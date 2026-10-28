@@ -1860,6 +1860,34 @@ const make = Effect.gen(function* () {
     }
   });
 
+  /** A stopped worker hears about its cards still in Working; after NUDGE_LIMIT nudges in a row the card's evaluator takes over. */
+  const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
+    threadId: ThreadId,
+    cards: ReadonlyArray<KanbanCard>,
+  ) {
+    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    const at = yield* nowIso;
+    const nudge: Array<KanbanCard> = [];
+    for (const card of cards) {
+      if (card.stage !== "working" || card.stalled !== null) continue;
+      const state = Rules.nudgeState(yield* store.cardEvents(card.id));
+      if (state === "nudge") nudge.push(card);
+      if (state !== "hand_off") continue;
+      yield* logEvent(card, system, "thread", { body: Rules.HANDOFF_NOTE });
+      yield* noteDiscussion(card, Briefs.workerStuckText(card, threadId)).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban worker hand-off note failed", { cardId: card.id, cause }),
+        ),
+      );
+    }
+    if (nudge.length === 0) return;
+    yield* threads.send({ threadId, text: Briefs.nudgeWorkText(nudge) }).pipe(Effect.ignore);
+    for (const card of nudge) {
+      yield* logEvent(card, system, "thread", { body: Rules.NUDGE_NOTE });
+      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+    }
+  });
+
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
   ) {
@@ -1964,12 +1992,12 @@ const make = Effect.gen(function* () {
         yield* kick;
         return;
       }
-      // A worker may be waiting on CI or a deploy, so it keeps its slot; the
-      // stalled sweep looks at idle Working cards. It hears once per card.
-      const unnudged = carried.filter((entry) => entry.nudgedAt === null);
-      if (unnudged.length === 0) return;
-      yield* threads.send({ threadId, text: Briefs.nudgeWorkText(unnudged) }).pipe(Effect.ignore);
-      for (const entry of unnudged) yield* saveCard({ ...entry, nudgedAt: at, updatedAt: at });
+      // A card can't sit in Working while its worker is stopped: every quiet
+      // turn end nudges it (see nudgeWorker).
+      const view = yield* threads.view(threadId);
+      // A repeated run event can arrive while the thread runs again.
+      if (view === null || view.state !== "idle") return;
+      yield* nudgeWorker(threadId, carried);
       return;
     }
     if (!card) return;
@@ -2061,6 +2089,24 @@ const make = Effect.gen(function* () {
           body: "Its thread is gone",
         });
         yield* saveCard(next);
+      }
+      // Backstop for a missed turn end, or a worker stuck on its own question.
+      for (const card of yield* store.cards(board.id)) {
+        const threadId = card.activeThreadId;
+        if (threadId === null || card.activeRole !== "work") continue;
+        const view = yield* threads.view(threadId);
+        if (view === null || !Rules.workerQuietDue(card, view, now)) continue;
+        if (view.state === "needs-input") {
+          // Its turn end after the interrupt brings the nudge.
+          yield* threads.interrupt(threadId, "Stuck on its own question; the board nudges it");
+          const at = yield* nowIso;
+          yield* logEvent(card, { _tag: "system", component: "dispatcher" }, "thread", {
+            body: "Interrupted: stuck on its own question",
+          });
+          yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+          continue;
+        }
+        yield* nudgeWorker(threadId, [card]);
       }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {
@@ -2832,6 +2878,13 @@ const make = Effect.gen(function* () {
           body: reason ?? "Cleared",
         });
         yield* saveCard(next);
+        if (selfFlag && reason !== null) {
+          yield* noteDiscussion(next, Briefs.workerFlaggedText(next, reason)).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban self-flag note failed", { cardId: next.id, cause }),
+            ),
+          );
+        }
         yield* kick;
         return next;
       }),

@@ -18,13 +18,18 @@ import {
   checkClaim,
   checkMove,
   discussionSettleDue,
+  HANDOFF_NOTE,
   isBlocked,
   MAX_BATCH,
   modelOnPool,
+  NUDGE_LIMIT,
+  NUDGE_NOTE,
+  nudgeState,
   planDispatch,
   poolKey,
   prsLanded,
   relatedCandidates,
+  workerQuietDue,
 } from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
@@ -717,5 +722,63 @@ describe("discussionSettleDue", () => {
     const d = discussion({ lastMessageAt: "2026-10-25T12:00:00.000Z" });
     expect(discussionSettleDue(d, null, START + 25 * H)).toBe(false);
     expect(discussionSettleDue(d, null, START + 37 * H)).toBe(true);
+  });
+});
+
+describe("nudgeState", () => {
+  const event = (body: string | null, kind = "thread") => ({
+    id: 0,
+    cardId: KanbanCardId.make("c1"),
+    at: "2026-10-25T00:00:00Z",
+    actor: { _tag: "system" as const, component: "dispatcher" as const },
+    kind,
+    fromStage: null,
+    toStage: null,
+    body,
+  });
+  const nudges = (count: number) => Array.from({ length: count }, () => event(NUDGE_NOTE));
+
+  it("nudges until the limit, then hands off once", () => {
+    expect(nudgeState([])).toBe("nudge");
+    expect(nudgeState(nudges(2))).toBe("nudge");
+    expect(nudgeState(nudges(NUDGE_LIMIT))).toBe("hand_off");
+    expect(nudgeState([...nudges(NUDGE_LIMIT), event(HANDOFF_NOTE)])).toBe("handed_off");
+  });
+
+  it("starts the count again after any other event", () => {
+    expect(nudgeState([...nudges(NUDGE_LIMIT), event("Steered: go on", "comment")])).toBe("nudge");
+  });
+});
+
+describe("workerQuietDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const START_ISO = "2026-10-25T00:00:00.000Z";
+  const working = card({
+    stage: "working",
+    activeRole: "work",
+    activeThreadId: ThreadId.make("t1"),
+    movedAt: START_ISO,
+  });
+  const at = (minutes: number) => START + minutes * 60 * 1000;
+  const view = (state: string) => ({ state, updatedAt: START_ISO });
+
+  it("is due for an idle or stuck worker after 30 minutes", () => {
+    expect(workerQuietDue(working, view("idle"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("idle"), at(29))).toBe(false);
+    expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
+  });
+
+  it("counts from the last nudge and skips stalled or review cards", () => {
+    const nudged = { ...working, nudgedAt: new Date(at(21)).toISOString() };
+    expect(workerQuietDue(nudged, view("idle"), at(31))).toBe(false);
+    expect(
+      workerQuietDue(
+        { ...working, stalled: { reason: "x", by: { _tag: "owner" }, at: START_ISO } },
+        view("idle"),
+        at(31),
+      ),
+    ).toBe(false);
+    expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
   });
 });
