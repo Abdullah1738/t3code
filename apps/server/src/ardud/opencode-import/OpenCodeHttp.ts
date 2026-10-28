@@ -92,6 +92,8 @@ export const OpenCodeMessage = Schema.Struct({
   text: Schema.optional(Schema.String),
   content: Schema.optional(Schema.Array(OpenCodePart)),
   error: Schema.optional(Schema.Struct({ message: Schema.optional(Schema.String) })),
+  /** ardud: why an assistant turn ended, e.g. "stop" for a normal finish. */
+  finish: Schema.optional(Schema.String),
   time: Schema.Struct({ created: Millis }),
 });
 export type OpenCodeMessage = typeof OpenCodeMessage.Type;
@@ -119,6 +121,10 @@ const decodeModelsSchema = Schema.decodeUnknownEffect(
   }),
 );
 const decodeModels = (input: unknown) => decodeModelsSchema(input);
+const decodeActiveSchema = Schema.decodeUnknownEffect(
+  Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unknown) }),
+);
+const decodeActive = (input: unknown) => decodeActiveSchema(input);
 
 const basic = (password: string) =>
   `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`;
@@ -151,6 +157,26 @@ const openCodeServerConfig = (
   }
   return undefined;
 };
+
+/**
+ * ardud: the OpenCode server the opencode provider is configured to use, when
+ * it runs as its own service. A server Robob starts itself has none here.
+ */
+export const configuredConnection = (
+  settings: ServerSettings.ServerSettingsService["Service"],
+): Effect.Effect<OpenCodeConnection | undefined> =>
+  settings.getSettings.pipe(
+    Effect.map((value) => {
+      const opencode = openCodeServerConfig(value.providerInstances);
+      return opencode === undefined
+        ? undefined
+        : {
+            baseUrl: opencode.serverUrl.replace(/\/+$/, ""),
+            authorization: basic(opencode.serverPassword),
+          };
+    }),
+    Effect.orElseSucceed(() => undefined),
+  );
 
 /**
  * The OpenCode server to read: the opencode provider's configured server URL
@@ -285,6 +311,12 @@ export const listRootSessions = (
           (options.updatedSince === undefined || session.time.updated >= options.updatedSince),
       ),
     ),
+  );
+
+/** ardud: ids of the sessions OpenCode is running a turn in right now. */
+export const listActiveSessionIds = (connection: OpenCodeConnection) =>
+  getJson(connection, "/api/session/active", "list active sessions", decodeActive).pipe(
+    Effect.map((active) => new Set(Object.keys(active.data))),
   );
 
 export const listProjects = (connection: OpenCodeConnection) =>
