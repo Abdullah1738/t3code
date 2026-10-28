@@ -2386,7 +2386,8 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
       );
       assert.isNull(after.activeThreadId);
       assert.isTrue(after.stalled?.reason.startsWith("Model refused") === true);
-      assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+      const launched = [...(yield* Ref.get(fake.threads)).values()].map((t) => [t.title, t.model.model]);
+      assert.strictEqual(launched.length, 0, `launched=${JSON.stringify(launched)} stalled=${JSON.stringify(after.stalled)}`);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
