@@ -39,6 +39,31 @@ const PROBE_TIMEOUT = "3 seconds";
 const SLACK_MS = 5_000;
 const RECENT_MESSAGE_LIMIT = 10;
 
+/**
+ * ardud: the restart note text for cut work. Running and finished OpenCode
+ * children are left out (a finished child's answer is quoted in one line); an
+ * unknown child gets its own hedged paragraph, since it may still report back;
+ * everything else is passed through from the upstream note unchanged.
+ */
+export const restartNoteParts = (
+  work: ReadonlyArray<{ readonly child?: { readonly threadId: string } }>,
+  checks: ReadonlyMap<string, ChildCheck>,
+) => {
+  const finished: Array<string> = [];
+  const unknown: Array<string> = [];
+  const rest: Array<number> = [];
+  work.forEach((entry, index) => {
+    const sessionId = childSessionId(entry.child?.threadId);
+    const check = sessionId === undefined ? undefined : checks.get(sessionId);
+    if (check === undefined) return rest.push(index);
+    if (check.state === "running") return;
+    if (check.state === "finished") return finished.push(check.result ?? "");
+    if (check.state === "unknown") return unknown.push(sessionId!);
+    return rest.push(index);
+  });
+  return { rest, finished, unknown };
+};
+
 /** The OpenCode session behind a native child's thread id, if it has one. */
 export const childSessionId = (threadId: string | null | undefined) =>
   threadId?.match(/native-thread:(ses_[A-Za-z0-9]+)/)?.[1];
