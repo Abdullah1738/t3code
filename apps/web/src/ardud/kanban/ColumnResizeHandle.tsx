@@ -77,7 +77,7 @@ export function ColumnResizeHandle(props: {
       onDoubleClick={props.onReset}
       onKeyDown={onKeyDown}
       className={cn(
-        "group absolute inset-y-0 z-10 w-2 cursor-col-resize select-none outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent)",
+        "group absolute inset-y-0 z-10 w-2 cursor-col-resize select-none outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
         props.edge === "right" ? "-right-1" : "-left-1",
       )}
       {...handlers}

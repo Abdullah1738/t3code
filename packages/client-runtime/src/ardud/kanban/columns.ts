@@ -1,5 +1,3 @@
-import { type KanbanStage } from "@t3tools/contracts";
-
 import { STAGE_LABELS } from "./viewModel.ts";
 
 /** Stage columns on the board, in display order: active stages, shipped, then Needs Owner. */

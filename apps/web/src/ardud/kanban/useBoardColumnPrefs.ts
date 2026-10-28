@@ -1,5 +1,4 @@
 import * as Schema from "effect/Schema";
-import { useCallback, useMemo } from "react";
 
 import {
   sanitizeBoardColumnPrefs,
@@ -19,12 +18,9 @@ const EMPTY: BoardColumnPrefs = { widths: {}, hidden: [], groupWidth: null };
 /** Per-board column prefs in localStorage, sanitized on every read. */
 export function useBoardColumnPrefs(boardId: string) {
   const [stored, setStored] = useLocalStorage(boardColumnsStorageKey(boardId), EMPTY, StoredPrefs);
-  const prefs = useMemo(() => sanitizeBoardColumnPrefs(stored), [stored]);
-  const update = useCallback(
-    (next: (prefs: BoardColumnPrefs) => BoardColumnPrefs) => {
-      setStored((current: unknown) => sanitizeBoardColumnPrefs(next(sanitizeBoardColumnPrefs(current))));
-    },
-    [setStored],
-  );
+  const prefs = sanitizeBoardColumnPrefs(stored);
+  const update = (next: (prefs: BoardColumnPrefs) => BoardColumnPrefs) => {
+    setStored((current: unknown) => sanitizeBoardColumnPrefs(next(sanitizeBoardColumnPrefs(current))));
+  };
   return [prefs, update] as const;
 }
