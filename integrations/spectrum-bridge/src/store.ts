@@ -116,6 +116,15 @@ export class Store {
       ON CONFLICT(id) DO NOTHING`).run(id, json(payload)).changes === 1;
   }
 
+  /** True when a message from one of these addresses ever arrived in this chat (group membership proof). */
+  hasInboundFrom(addresses: string[]): boolean {
+    const wanted = [...new Set(addresses.map(address => address.trim().toLowerCase()).filter(Boolean))];
+    if (wanted.length === 0) return false;
+    const marks = wanted.map(() => "?").join(", ");
+    return this.db.query(`SELECT 1 FROM inbound WHERE lower(trim(json_extract(payload, '$.sender'))) IN (${marks}) LIMIT 1`)
+      .get(...wanted) !== null;
+  }
+
   pendingInbound(): InboundRecord[] {
     return this.db.query<Omit<InboundRecord, "payload"> & { payload: string }, []>(
       "SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'processing') ORDER BY rowid",

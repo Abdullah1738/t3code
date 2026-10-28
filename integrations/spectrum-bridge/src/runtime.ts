@@ -287,6 +287,10 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         if (!caller) throw new HttpError(409, "No chat for this session");
         if (caller.info.kind !== "owner") throw new HttpError(403, "Only the owner's chat can do this");
       };
+      // An admin's own chat may post in groups the admin has written in; everything else cross-chat stays owner-only.
+      const adminCaller = caller !== undefined && caller.info.kind === "dm" && caller.context.roleOf(chatKey.target(caller.info.key)).role === "admin";
+      const adminGroup = (chat: Chat<P> | undefined) => adminCaller && caller !== undefined && chat !== undefined && chat.info.kind === "group"
+        && chat.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
       const live = () => { if (!options.enabled()) throw new HttpError(503, "Bridge is not ready"); };
       /** `--chat <slug>`: only the owner's agent may ask after someone else's location. */
       const locationTarget = (chat: unknown): ChatInfo | undefined => {
@@ -327,7 +331,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         }
         case "/send": {
           only(body, ["text", "to", "dedupeKey", "sessionId"]);
-          ownerOnly(false);
+          if (!adminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
           if (!text(body.text, 12_000) || !text(to, 100) || !text(dedupeKey, 200)) throw new HttpError(400, "Invalid request");
@@ -459,8 +463,8 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         }
         case "/chats": {
           only(body, ["sessionId"]);
-          ownerOnly(true);
-          return reply(200, { chats: registry.all().map(chat => ({
+          if (!adminCaller) ownerOnly(true);
+          return reply(200, { chats: (adminCaller ? registry.all().filter(chat => adminGroup(chat)) : registry.all()).map(chat => ({
             slug: chat.info.slug, title: chat.info.title, kind: chat.info.kind,
             ...(registry.lastActivity(chat) === undefined ? {} : { lastActivityAt: registry.lastActivity(chat) }),
           })) });

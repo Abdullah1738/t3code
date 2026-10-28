@@ -150,6 +150,10 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).toContain("without asking the owner");
   expect(admin).toContain("confirm with the admin who asked instead");
   expect(admin).toContain("Anything special they ask for");
+  expect(admin).toContain("group chats Moni has written in");
+  expect(admin).toContain("send --to <slug>");
+  const person = sendblueContextPrompt(context("dm", { roleOf: address => ({ name: address, role: "person" }) }), false, []);
+  expect(person).not.toContain("send --to");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");

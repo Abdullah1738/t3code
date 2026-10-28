@@ -343,7 +343,7 @@ describe("Sendblue socket API", () => {
     const fromMoni = { sessionId: "ses_moni" };
     expect((await post("/send", { text: "x", to: "owner", dedupeKey: "k", ...fromMoni })).status).toBe(403);
     expect((await post("/wake", { text: "x", chat: "owner", dedupeKey: "k", ...fromMoni })).status).toBe(403);
-    expect((await post("/chats", fromMoni)).status).toBe(403);
+    expect((await post("/chats", fromMoni)).body).toEqual({ chats: [] });
     expect((await post("/allow", { address: "+447000000002", name: "Sam", ...fromMoni })).status).toBe(403);
     expect((await post("/allow-group", { id: "grp-1", ...fromMoni })).status).toBe(403);
     expect((await post("/send", { text: "x", to: "moni", dedupeKey: "k" })).status).toBe(403);
@@ -380,6 +380,43 @@ describe("Sendblue socket API", () => {
     expect(calls).toEqual(["allow", "allow", "revoke", "share"]);
   });
 
+  test("an admin's chat can post in groups the admin has written in, and nowhere else", async () => {
+    const { post, chats, stateRoot } = api();
+    const family = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
+    family.store.acceptInbound("g-1", { id: "g-1", text: "hi", attachments: [], isAudioMessage: false, receivedAt: 2, sender: moni });
+    const work = chats.open(chatKey.group("GRP-Work-456"), "Work");
+    work.store.acceptInbound("g-2", { id: "g-2", text: "hi", attachments: [], isAudioMessage: false, receivedAt: 3, sender: "+447000000009" });
+    const fromMoni = { sessionId: "ses_moni" };
+
+    expect(await post("/chats", fromMoni)).toEqual({ status: 200, body: { chats: [
+      { slug: "group-family-trip-grp-al", title: "Family Trip", kind: "group", lastActivityAt: 2 },
+    ] } });
+    const send = { text: "x", to: "group-family-trip-grp-al", dedupeKey: "k", ...fromMoni };
+    expect((await post("/send", send)).status).toBe(202);
+    expect(family.store.pendingOutbox().map(row => row.text)).toEqual(["x"]);
+    expect((await post("/send", send)).status).toBe(200);
+    for (const to of [work.info.slug, "owner", "moni", "missing"]) {
+      expect((await post("/send", { text: "x", to, dedupeKey: "k2", ...fromMoni })).status).toBe(403);
+    }
+    expect(work.store.pendingOutbox()).toEqual([]);
+
+    // Membership is case- and space-insensitive, and any of Moni's addresses counts.
+    const club = chats.open(chatKey.group("GRP-Club-789"), "Club");
+    club.store.acceptInbound("g-3", { id: "g-3", text: "hi", attachments: [], isAudioMessage: false, receivedAt: 4, sender: " MONI@example.com" });
+    expect((await post("/send", { text: "y", to: club.info.slug, dedupeKey: "k3", ...fromMoni })).status).toBe(202);
+
+    // A known non-admin person who also wrote in Family Trip gets nothing.
+    const person = chats.open(chatKey.dm("+15555550188"));
+    person.store.set("route", { id: "ses_person", generation: 1 });
+    family.store.acceptInbound("g-4", { id: "g-4", text: "hi", attachments: [], isAudioMessage: false, receivedAt: 5, sender: "+15555550188" });
+    expect((await post("/send", { text: "x", to: "group-family-trip-grp-al", dedupeKey: "k4", sessionId: "ses_person" })).status).toBe(403);
+    expect((await post("/chats", { sessionId: "ses_person" })).status).toBe(403);
+
+    // Demotion takes effect at once: access.json is read live.
+    access.people[0]!.role = "person";
+    expect((await post("/send", { text: "x", to: "group-family-trip-grp-al", dedupeKey: "k5", ...fromMoni })).status).toBe(403);
+    expect(existsSync(join(stateRoot, "access.json"))).toBe(false);
+  });
   test("the owner chat can list chats, message one and pass decisions on", async () => {
     const { post, moniChat, stateRoot } = api();
     const listed = await post("/chats", { sessionId: "ses_owner" });

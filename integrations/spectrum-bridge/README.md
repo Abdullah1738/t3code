@@ -127,7 +127,7 @@ under `~/.config/spectrum-bridge/`.
   so link previews load.
 - In Sendblue mode, `app --to moni --session OWNER_SESSION --key KEY --url PUBLIC_HTTPS_URL --caption "Your ride"`
   queues a card in that chat, like `send --to`. Cross-chat sends require the
-  current owner's session, including when the recipient is an admin. Omit
+  current owner's session, including when the recipient is an admin. The one exception: an admin's own chat may `send --to` a group the admin has written in, and `chats` from that chat lists those groups. Omit
   `--to` to send to the session's own chat. Use a publicly reachable URL for
   Moni and other recipients (`share`, rather than the owner's tailnet-only
   `publish` URL). Reuse the key only for an identical card to the same recipient;
