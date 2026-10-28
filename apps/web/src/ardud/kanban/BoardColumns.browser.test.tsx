@@ -11,6 +11,8 @@ import {
 import type { KanbanCard, KanbanBoardSnapshot } from "@t3tools/contracts";
 
 import { BoardColumns } from "./BoardColumns";
+import "./tokens.css";
+import "./kanban.css";
 import { boardColumnsStorageKey } from "./useBoardColumnPrefs";
 
 const BOARD_ID = "board-test";
