@@ -29,6 +29,8 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+// ardud: the restart note checks OpenCode children before it says they were cancelled.
+import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -53,7 +55,6 @@ import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
-  restartCancelledBackgroundWorkNote,
 } from "./RestartBackgroundNote.ts";
 
 export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
@@ -973,10 +974,11 @@ export const layer: Layer.Layer<
         run,
         attempts: projection.attempts,
       });
+      // ardud: an OpenCode child still running or finished is not told as cancelled.
       const restartNote =
         restartCancelledWork.length === 0
           ? ""
-          : restartCancelledBackgroundWorkNote(restartCancelledWork);
+          : yield* restartNoteText(serverSettings, restartCancelledWork);
       const tokenCap = yield* handoffTokenCapConfig.pipe(
         Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
       );
