@@ -2113,6 +2113,79 @@ it.effect("adopting a discussion that already has an evaluator hands it to the s
   }),
 );
 
+const setArchived = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
+  Ref.update(fake.threads, (all) => {
+    all.get(threadId)!.archived = true;
+    return all;
+  });
+
+it.effect("an owner's new channel goes to the board's live evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, setup);
+      const all = [...(yield* Ref.get(fake.threads)).entries()];
+      assert.strictEqual(all.filter(([, view]) => view.title.startsWith("Evaluator")).length, 1);
+      assert.include(all.find(([id]) => id === setup)![1].messages.at(-1) ?? "", "Round fees up");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an archived evaluator is stopped and its discussion moves to a live one", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const opened = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+      assert.strictEqual(opened.evaluatorThreadId, setup);
+      const request = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Add a card",
+      });
+      yield* setArchived(fake, setup);
+
+      yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Still there?" }]);
+
+      assert.strictEqual((yield* kanban.discussion(opened.id)).evaluatorThreadId, request);
+      assert.include(fake.interrupted, setup);
+      const all = yield* Ref.get(fake.threads);
+      assert.isFalse(all.get(setup)!.messages.some((text) => text.includes("Still there?")));
+      assert.include(all.get(request)!.messages.at(-1) ?? "", "Still there?");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an archived evaluator with no live one is replaced", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: setup };
+      const opened = yield* kanban.createDiscussion(board.id, "Setup", evaluator);
+      yield* setArchived(fake, setup);
+
+      yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Still there?" }]);
+
+      const next = (yield* kanban.discussion(opened.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, setup);
+      assert.include(fake.interrupted, setup);
+      const all = yield* Ref.get(fake.threads);
+      assert.isFalse(all.get(setup)!.messages.some((text) => text.includes("Still there?")));
+      assert.include(all.get(next!)!.messages.join("\n"), "Still there?");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
