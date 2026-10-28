@@ -56,7 +56,7 @@ export const CardTile = memo(function CardTile(props: {
             kind={flagGlyph(card.flag)}
             className={card.flag.kind === "ask" ? "mt-0.75" : undefined}
           />
-          <span className={card.flag.kind === "ask" ? "line-clamp-3" : "truncate"}>
+          <span className={card.flag.kind === "ask" ? "line-clamp-3 wrap-break-word" : "truncate"}>
             {card.flag.label}
           </span>
         </span>
