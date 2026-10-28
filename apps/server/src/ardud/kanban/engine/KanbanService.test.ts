@@ -182,8 +182,8 @@ it.effect("walks the critical chain on the same review thread, switching models"
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
-      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "high" });
-      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
       yield* kanban.updateBoard(board.id, {
         reviewChains: [{ name: "Critical", steps: [sol, astra] }],
         defaultReviewChain: "Critical",
@@ -2255,7 +2255,7 @@ it.effect("updateBoard with a new evaluator model adds a 0-slot pool without res
         defaultProjectId: null,
       });
       yield* kanban.setPool(board.id, board.defaultCardModel, 2);
-      const newModel = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      const newModel = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
       yield* kanban.updateBoard(board.id, { evaluatorModel: newModel });
       const pools = (yield* kanban.snapshot(board.id)).pools;
       const added = pools.find((pool) => pool.key === Rules.poolKey(newModel));
@@ -2311,7 +2311,7 @@ it.effect("a board's picked models keep their options (variant) through creation
   }),
 );
 
-const astraHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+const astraHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
 const astraXhigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
 
 it.effect("refuses a model or variant the provider doesn't offer, and names what it offers", () =>
@@ -2322,7 +2322,7 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
       const refused = yield* kanban
         .createCard(board.id, { prompt: "x", title: "x", model: astraHigh }, owner)
         .pipe(Effect.flip);
-      assert.include(refused.detail, "it offers: xhigh");
+      assert.include(refused.detail, "has no \"high\" variant; it offers: xhigh");
 
       const accepted = yield* kanban.createCard(
         board.id,
@@ -2332,20 +2332,20 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
       const refusedEdit = yield* kanban
         .editCard(accepted.id, { model: astraHigh }, owner)
         .pipe(Effect.flip);
-      assert.include(refusedEdit.detail, "it offers: xhigh");
+      assert.include(refusedEdit.detail, "has no \"high\" variant; it offers: xhigh");
       yield* kanban.editCard(accepted.id, { model: astraXhigh }, owner);
 
       const poolRefused = yield* kanban
         .setPool(board.id, astraHigh, 1)
         .pipe(Effect.flip);
-      assert.include(poolRefused.detail, "it offers: xhigh");
+      assert.include(poolRefused.detail, "has no \"high\" variant; it offers: xhigh");
 
       const chainRefused = yield* kanban
         .updateBoard(board.id, {
           reviewChains: [{ name: "Critical", steps: [astraHigh] }],
         })
         .pipe(Effect.flip);
-      assert.include(chainRefused.detail, "it offers: xhigh");
+      assert.include(chainRefused.detail, "has no \"high\" variant; it offers: xhigh");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -2400,7 +2400,8 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
       const { kanban, board } = yield* toyBoard;
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
-      yield* kanban.move(created.id, "needs_review", owner);
+      const worker = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker }, { note: "done" });
       yield* kanban.dispatchNow;
       const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
       const before = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
