@@ -79,7 +79,9 @@ export const layer = Layer.effect(
       listed: Effect.gen(function* () {
         const providers = yield* registry.getProviders;
         const current = yield* settings.getSettings.pipe(
-          Effect.map((value) => ({ providerModelPreferences: value.providerModelPreferences })),
+          Effect.map((value) => ({
+            providerModelPreferences: value.providerModelPreferences ?? undefined,
+          })),
           Effect.catch(() => Effect.succeed(null)),
         );
         if (current === null) return null;
