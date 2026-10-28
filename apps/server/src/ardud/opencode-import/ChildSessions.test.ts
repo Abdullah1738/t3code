@@ -66,6 +66,12 @@ describe("checkChildren", () => {
           200,
           messages([
             {
+              id: "idle2",
+              type: "idle",
+              outcome: "succeeded",
+              time: { created: SINCE + 61_500 },
+            },
+            {
               id: "m2",
               type: "assistant",
               finish: "stop",
@@ -145,6 +151,12 @@ describe("checkChildren", () => {
           200,
           // OpenCode lists messages newest first.
           messages([
+            {
+              id: "idle3",
+              type: "idle",
+              outcome: "succeeded",
+              time: { created: SINCE + 9_500 },
+            },
             {
               id: "m2",
               type: "assistant",
