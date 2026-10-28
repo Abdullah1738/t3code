@@ -97,6 +97,8 @@ const discussion = (id: string, lastSeq: number, ownerRead: number): KanbanDiscu
   titleEditedAt: null,
   settledAt: null,
   snoozedUntil: null,
+  pinnedAt: null,
+  reopenedAt: null,
 });
 
 const thread = ThreadId.make("t1");

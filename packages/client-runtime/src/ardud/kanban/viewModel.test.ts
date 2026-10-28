@@ -130,6 +130,8 @@ function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
     titleEditedAt: null,
     settledAt: null,
     snoozedUntil: null,
+    pinnedAt: null,
+    reopenedAt: null,
   } as never;
 }
 
