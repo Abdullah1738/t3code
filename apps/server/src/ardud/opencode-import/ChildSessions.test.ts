@@ -98,19 +98,20 @@ describe("checkChildren", () => {
         return json(
           res,
           200,
+          // OpenCode lists messages newest first.
           messages([
-            {
-              id: "m1",
-              type: "user",
-              time: { created: SINCE + 1_000 },
-              content: [{ type: "text", text: "review this" }],
-            },
             {
               id: "m2",
               type: "assistant",
               finish: "stop",
               time: { created: SINCE + 2_000, completed: SINCE + 9_000 },
               content: [{ type: "text", text: "Done: 2 findings." }],
+            },
+            {
+              id: "m1",
+              type: "user",
+              time: { created: SINCE + 1_000 },
+              content: [{ type: "text", text: "review this" }],
             },
           ]),
         );
