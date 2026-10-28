@@ -2984,7 +2984,7 @@ it.effect("setPool refuses an unlisted model with slots and adds a listed one at
       const other = modelSelectionOf({ model: "opus/not-offered", instanceId: "opencode" });
       yield* Ref.set(
         listed,
-        new Map<string, ReadonlySet<string> | "missing">([
+        new Map<string, KanbanModels.ListedModelEntry>([
           [instance, new Set([board.defaultCardModel.model, haiku.model])],
         ]),
       );
@@ -3009,26 +3009,26 @@ it.effect("removePool refuses a pool in use or with slots, and drops an unused 0
         defaultProjectId: ProjectId.make("project-1"),
       });
       const instance = board.defaultCardModel.instanceId as string;
-      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", instanceId: "opencode" });
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", instanceId: "opencode" });
       yield* Ref.set(
         listed,
-        new Map<string, ReadonlySet<string> | "missing">([
-          [instance, new Set([board.defaultCardModel.model, haiku.model])],
+        new Map<string, KanbanModels.ListedModelEntry>([
+          [instance, new Set([board.defaultCardModel.model, sol.model])],
         ]),
       );
 
       const busy = yield* kanban.removePool(board.id, board.evaluatorModel).pipe(Effect.flip);
       assert.strictEqual(busy.code, "invalid");
 
-      yield* kanban.setPool(board.id, haiku, 1);
-      const withSlots = yield* kanban.removePool(board.id, haiku).pipe(Effect.flip);
+      yield* kanban.setPool(board.id, sol, 1);
+      const withSlots = yield* kanban.removePool(board.id, sol).pipe(Effect.flip);
       assert.strictEqual(withSlots.code, "invalid");
 
-      yield* kanban.setPool(board.id, haiku, 0);
-      const pools = yield* kanban.removePool(board.id, haiku);
-      assert.isFalse(pools.some((pool) => pool.key === Rules.poolKey(haiku)));
+      yield* kanban.setPool(board.id, sol, 0);
+      const pools = yield* kanban.removePool(board.id, sol);
+      assert.isFalse(pools.some((pool) => pool.key === Rules.poolKey(sol)));
       const snapshot = yield* kanban.snapshot(board.id);
-      assert.isFalse(snapshot.pools.some((pool) => pool.key === Rules.poolKey(haiku)));
+      assert.isFalse(snapshot.pools.some((pool) => pool.key === Rules.poolKey(sol)));
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );
