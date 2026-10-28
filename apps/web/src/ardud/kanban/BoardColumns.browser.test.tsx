@@ -208,7 +208,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await cdp().send("Emulation.setEmulatedMedia", { features: [] });
+  await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: false });
   await act(() => root.unmount());
   container.remove();
   localStorage.clear();
@@ -380,8 +380,11 @@ async function mountAt(width: number, height: number, pointerKind: "coarse" | "f
   await act(() => root.unmount());
   container.replaceChildren();
   await page.viewport(width, height);
-  await cdp().send("Emulation.setEmulatedMedia", {
-    features: [{ name: "pointer", value: pointerKind }],
+  // Headless Chromium ignores a `pointer` media feature override; touch emulation is
+  // what flips `(pointer: coarse)`.
+  await cdp().send("Emulation.setTouchEmulationEnabled", {
+    enabled: pointerKind === "coarse",
+    maxTouchPoints: 5,
   });
   // Like the board's <main>: a flex column with its start and top padding.
   Object.assign(container.style, {
