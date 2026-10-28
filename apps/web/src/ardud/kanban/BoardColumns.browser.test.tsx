@@ -2,7 +2,7 @@ import "../../index.css";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { page } from "vite-plus/test/browser";
+import { cdp, page } from "vite-plus/test/browser";
 
 import {
   boardStateFromSnapshot,
@@ -17,7 +17,11 @@ const BOARD_ID = "board-test";
 const NOW = Date.parse("2026-10-28T12:00:00.000Z");
 const model = { instanceId: "opencode", model: "opus/claude-opus-5-5" } as never;
 
-function card(number: number, stage: KanbanCard["stage"]): KanbanCard {
+function card(
+  number: number,
+  stage: KanbanCard["stage"],
+  patch: Partial<KanbanCard> = {},
+): KanbanCard {
   return {
     id: `card-${number}`,
     boardId: BOARD_ID,
@@ -55,14 +59,101 @@ function card(number: number, stage: KanbanCard["stage"]): KanbanCard {
     createdAt: "2026-10-27T09:00:00.000Z",
     updatedAt: "2026-10-27T09:00:00.000Z",
     movedAt: "2026-10-27T09:00:00.000Z",
+    ...patch,
   } as unknown as KanbanCard;
 }
 
 function boardState(): KanbanBoardState {
   const snapshot = {
     board: { id: BOARD_ID, name: "Test", stateSeq: 1 },
-    cards: [card(1, "todo"), card(2, "working"), card(3, "shipped" as never), card(4, "needs_owner")],
+    cards: [
+      card(1, "todo"),
+      card(2, "working"),
+      card(3, "shipped" as never),
+      card(4, "needs_owner"),
+    ],
     goals: [],
+    pools: [],
+    groups: [],
+    threads: [],
+    unread: [],
+  } as unknown as KanbanBoardSnapshot;
+  return boardStateFromSnapshot(snapshot);
+}
+
+const TITLES = [
+  "Board: wider busy columns, folded Shipped, iPad touch sizes",
+  "Fix OTP field focus on the login sheet",
+  "Morning brief card shows WHOOP numbers once they are scored",
+  "Retry the checkout when the delivery slot goes stale",
+  "Deduplicate watcher wakes that arrive within a minute of each other",
+];
+
+const prLink = (number: number): KanbanCard["links"][number] => ({
+  kind: "pr",
+  url: `https://github.com/pingdotgg/t3code/pull/${number}`,
+  label: "fix(web): the board keeps long pull request labels inside the card at every width",
+  state: "open",
+  checkedAt: null,
+});
+
+const subtasks = (done: number, total: number): KanbanCard["subtasks"] =>
+  Array.from({ length: total }, (_, index) => ({
+    id: `s${index + 1}`,
+    step: 1,
+    text: `Step ${index + 1}`,
+    owner: "work" as const,
+    state: index < done ? ("done" as const) : ("open" as const),
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  }));
+
+/** A busy board like the real one: a long To-Do, a few in flight, one question. */
+function toyState(): KanbanBoardState {
+  let number = 100;
+  const make = (
+    stage: KanbanCard["stage"],
+    count: number,
+    patch: (index: number) => Partial<KanbanCard> = () => ({}),
+  ) =>
+    Array.from({ length: count }, (_, index) => {
+      number += 1;
+      return card(number, stage, {
+        title: TITLES[number % TITLES.length]!,
+        priority: (number % 4) + 1,
+        movedAt: new Date(NOW - (number - 100) * 3_600_000).toISOString(),
+        ...patch(index),
+      });
+    });
+  const snapshot = {
+    board: { id: BOARD_ID, name: "Toy", stateSeq: 1 },
+    cards: [
+      ...make("todo", 30, (index) => (index % 4 === 0 ? { links: [prLink(1200 + index)] } : {})),
+      ...make("working", 6, (index) => ({
+        links: [prLink(1300 + index)],
+        subtasks: subtasks(index, 5),
+        goalId: "goal-ipad",
+      })),
+      ...make("needs_review", 1, () => ({ links: [prLink(1400)] })),
+      ...make("in_review", 2, (index) => ({ links: [prLink(1410 + index)] })),
+      ...make("completed", 5),
+      ...make("deployed", 2),
+      ...make("needs_owner", 1, () => ({
+        question: "Should the iPad board fold Shipped by default below 1400px?",
+      })),
+    ],
+    goals: [
+      {
+        id: "goal-ipad",
+        boardId: BOARD_ID,
+        name: "iPad board",
+        status: "active",
+        now: null,
+        story: [],
+        createdAt: "2026-10-20T00:00:00.000Z",
+      },
+    ],
     pools: [],
     groups: [],
     threads: [],
@@ -117,6 +208,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await cdp().send("Emulation.setEmulatedMedia", { features: [] });
   await act(() => root.unmount());
   container.remove();
   localStorage.clear();
@@ -146,7 +238,9 @@ describe("stage columns", () => {
 
   it("resets a column width on double-click and saves the reset", async () => {
     await act(() => {
-      handle("To-Do")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      handle("To-Do")!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
     });
     expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeDefined();
 
@@ -216,12 +310,19 @@ describe("pointer drag", () => {
 
     // Live: the rendered column follows the pointer, no save yet.
     expect(column.getBoundingClientRect().width).toBeCloseTo(startWidth + 60, 0);
-    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(0);
+    expect(
+      writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID)),
+    ).toHaveLength(0);
 
     await act(() => pointer(separator, "pointerup", 160));
 
-    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(startWidth + 60, 0);
-    expect(writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID))).toHaveLength(1);
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(
+      startWidth + 60,
+      0,
+    );
+    expect(
+      writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID)),
+    ).toHaveLength(1);
   });
 });
 
@@ -272,6 +373,124 @@ describe("group columns", () => {
   });
 });
 
+const SHIPPED_KEY = "t3code:kanban:board:shipped";
+
+/** Remount the toy board in a viewport of this size, with a touch or mouse pointer. */
+async function mountAt(width: number, height: number, pointerKind: "coarse" | "fine") {
+  await act(() => root.unmount());
+  container.replaceChildren();
+  await page.viewport(width, height);
+  await cdp().send("Emulation.setEmulatedMedia", {
+    features: [{ name: "pointer", value: pointerKind }],
+  });
+  // Like the board's <main>: a flex column with its start and top padding.
+  Object.assign(container.style, {
+    display: "flex",
+    flexDirection: "column",
+    boxSizing: "border-box",
+    width: `${width}px`,
+    height: `${height}px`,
+    paddingLeft: "20px",
+    paddingTop: "18px",
+  });
+  root = createRoot(container);
+  await render(toyState());
+  // The board picks its layout from its own measured width, a frame after mount.
+  await act(
+    () =>
+      new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve(null))),
+      ),
+  );
+}
+
+const rect = (element: Element) => element.getBoundingClientRect();
+
+const shortButtons = () =>
+  [...container.querySelectorAll("button")]
+    .filter((button) => rect(button).height < 44)
+    .map((button) => button.getAttribute("aria-label") ?? button.textContent);
+
+describe("iPad layout", () => {
+  it("lays a landscape touch board out as columns with Shipped folded", async () => {
+    await mountAt(1084, 900, "coarse");
+
+    expect(isStageGrid()).toBe(true);
+    for (const label of ["To-Do", "Working", "Needs Review", "In Review", "Needs Owner"]) {
+      expect(column(label), label).not.toBeNull();
+    }
+    expect(column("Shipped")).toBeNull();
+
+    // The review stages stack in one column, In Review under Needs Review.
+    const needsReview = rect(column("Needs Review")!);
+    const inReview = rect(column("In Review")!);
+    expect(inReview.left).toBeCloseTo(needsReview.left, 0);
+    expect(inReview.top).toBeGreaterThanOrEqual(needsReview.bottom);
+
+    // Nothing scrolls sideways: not the column strip, not any column's list.
+    const strip = column("To-Do")!.parentElement!;
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    for (const list of container.querySelectorAll<HTMLElement>(
+      "section[data-column] > div:last-child",
+    )) {
+      expect(list.scrollWidth, list.parentElement!.ariaLabel ?? "").toBeLessThanOrEqual(
+        list.clientWidth,
+      );
+    }
+
+    const folded = container.querySelector('button[aria-label="Show shipped cards"]');
+    expect(folded?.getAttribute("aria-expanded")).toBe("false");
+    expect(shortButtons()).toEqual([]);
+  });
+
+  it("opens folded Shipped on click and keeps it open after a reload", async () => {
+    await mountAt(1340, 1000, "coarse");
+    const folded = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show shipped cards"]',
+    );
+    expect(folded).not.toBeNull();
+
+    await act(() => folded!.click());
+
+    const fold = container.querySelector('button[aria-label="Fold shipped cards"]');
+    expect(fold?.getAttribute("aria-expanded")).toBe("true");
+    const shipped = column("Shipped")!;
+    expect(shipped.textContent).toContain("Completed");
+    const rows = [...shipped.querySelectorAll("button")].filter((button) => button !== fold);
+    expect(rows).toHaveLength(7);
+    for (const row of rows) expect(rect(row).height).toBeGreaterThanOrEqual(44);
+
+    await mountAt(1340, 1000, "coarse");
+    expect(column("Shipped")).not.toBeNull();
+    expect(readStored(SHIPPED_KEY)).toBe("open");
+  });
+
+  it("opens Shipped by default on a wide mouse board and keeps desktop sizes", async () => {
+    await mountAt(1500, 900, "fine");
+
+    expect(column("Shipped")).not.toBeNull();
+    expect(
+      container
+        .querySelector('button[aria-label="Fold shipped cards"]')
+        ?.getAttribute("aria-expanded"),
+    ).toBe("true");
+    const header = column("To-Do")!.querySelector(":scope > div:not([role='separator'])")!;
+    expect(getComputedStyle(header).fontSize).toBe("12px");
+  });
+
+  it("falls back to stage tabs on a portrait touch board", async () => {
+    await mountAt(1000, 900, "coarse");
+
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+    expect(column("Working")).toBeNull();
+    // The selected stage's cards sit side by side, not one per row.
+    const tiles = [...container.querySelectorAll('[role="tablist"] ~ div > button')];
+    expect(tiles.length).toBeGreaterThan(2);
+    expect(rect(tiles[1]!).top).toBeCloseTo(rect(tiles[0]!).top, 0);
+    expect(shortButtons()).toEqual([]);
+  });
+});
+
 describe("left-edge keyboard step", () => {
   it("widens Needs Owner from its rendered width on ArrowLeft", async () => {
     const separator = handle("Needs Owner")!;
@@ -284,6 +503,9 @@ describe("left-edge keyboard step", () => {
     });
 
     // The left edge widens when the handle moves left, so ArrowLeft adds 16px.
-    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.needs_owner).toBeCloseTo(before + 16, 0);
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.needs_owner).toBeCloseTo(
+      before + 16,
+      0,
+    );
   });
 });
