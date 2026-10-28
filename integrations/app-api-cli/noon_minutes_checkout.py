@@ -536,7 +536,7 @@ def review_manifest(lines, expected_skus, *, mismatch='MANIFEST_MISMATCH'):
 
 
 def review_snapshot(snapshot, *, expected_skus, expected_total_minor, required_preferences, card,
-                    driver_note=QUIET_NOTE):
+                    driver_note=QUIET_NOTE, allow_cvv=False):
     """Check exact review bindings. Parent still reviews all displayed fee rows.
 
     Preference codes must come from the observed response with known meanings.
@@ -562,7 +562,10 @@ def review_snapshot(snapshot, *, expected_skus, expected_total_minor, required_p
             and str(payment['network']).lower() == 'mastercard' and payment['token_ref'] == fingerprint(card.token)
             and payment['wallet_minor'] == 0 and payment['charge_minor'] == expected_total_minor
             and not payment['emi_selected'], 'PAYMENT_MISMATCH')
-    require(payment['cvv_required'] is False and payment['verify_device'] is False, 'PAYMENT_CHALLENGE_REQUIRED')
+    # noon asks for CVV on some carts; complete(cvv=...) encrypts it, so allow_cvv
+    # lets the caller accept that ask. verifyDevice challenges are never accepted.
+    cvv_ok = payment['cvv_required'] is False or (allow_cvv and payment['cvv_required'] is True)
+    require(cvv_ok and payment['verify_device'] is False, 'PAYMENT_CHALLENGE_REQUIRED')
     require(isinstance(required_preferences, (tuple, list)) and p['delivery_preferences'] is not None, 'PREFERENCES_REQUIRED')
     require(len(required_preferences) > 0, 'QUIET_PREFERENCE_MISMATCH')
     selected = {x['code']: x['value'] for x in p['delivery_preferences']}
@@ -600,11 +603,12 @@ class MinutesCheckout:
     on this instance. The durable journal must enforce that fence across restart.
     """
     def __init__(self, headers, account_home, *, request=native_request,
-                 header_provider=None, receipt=None, response_cookies=None):
+                 header_provider=None, receipt=None, response_cookies=None, home_provider=None):
         self._headers = _headers(headers)
         self._home = account_home
         self._request = request
         self._header_provider = header_provider
+        self._home_provider = home_provider
         self._receipt = receipt
         self._response_cookies = response_cookies
         self._mutation_fenced = False
@@ -622,6 +626,14 @@ class MinutesCheckout:
             deadline = tracking.operation_deadline(timeout)
         except tracking.NoonError:
             raise MinutesError('INVALID_TIMEOUT') from None
+        # A long basket can take over 120 s before its first write. With a
+        # home_provider, refresh the verified home first, never accepting a move.
+        if self._home_provider and isinstance(self._home, AccountHome) and time.time() - self._home.checked_at > 90:
+            fresh = self._home_provider(deadline)
+            require(isinstance(fresh, AccountHome) and fresh.service == 'minutes'
+                    and fresh.account_ref == self._home.account_ref
+                    and fresh.address_ref == self._home.address_ref, 'VERIFIED_ACCOUNT_CHANGED')
+            self._home = fresh
         require(isinstance(self._home, AccountHome) and self._home.service == 'minutes'
                 and 0 <= time.time() - self._home.checked_at <= 120, 'VERIFIED_ACCOUNT_REQUIRED')
         try:

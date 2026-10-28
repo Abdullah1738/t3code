@@ -278,7 +278,7 @@ def order_minutes(args):
     Journalled at-most-once per operation; a paid outcome requires the captured
     terminal payment triple, exact tracking and a registered order watcher.
     """
-    from commerce_minutes import MinutesFlow,readback_active_orders,telegram_3ds_notify
+    from commerce_minutes import MinutesFlow,readback_active_orders,telegram_3ds_notify,telegram_stall_notify
     import noon_minutes_checkout as minutes_transport
     items=input_items(args,id_argument='sku',id_key='sku',quantity_key='qty')
     auth=CommerceAuth().noon
@@ -311,7 +311,7 @@ def order_minutes(args):
         # Preparation never even loads the saved-card CVV. Read it only on the
         # explicitly invoked financial path, and never retain it in output.
         cvv=cvv_from_keychain() if args.cvv_from_keychain else None
-        placed=flow.place()
+        placed=flow.place(cvv_ready=cvv is not None)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
         with minutes_after_send(flow,sending=True):
             payment=flow.complete(cvv=cvv)
@@ -332,7 +332,7 @@ def order_minutes(args):
             journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
                                  amount_minor=flow.review.get('amount'))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
-        paid=flow.await_payment()
+        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
@@ -555,7 +555,7 @@ def await_payment_flow(args):
                 'tracking': tracking, 'watcher': registration['watcher'],
                 **order_watch_receipt.fields(registration), 'financial_send': False,
                 'financial_retry': False}
-    from commerce_minutes import MinutesFlow,telegram_3ds_notify
+    from commerce_minutes import MinutesFlow,telegram_3ds_notify,telegram_stall_notify
     flow=MinutesFlow.resume_payment(args.flow_id)
     already_paid=journal.payment_reported(args.flow_id)
     if already_paid:
@@ -564,8 +564,9 @@ def await_payment_flow(args):
               'already_observed':True}
     else:
         notify=None if args.no_notify else (lambda order,total:telegram_3ds_notify(order,total))
+        stall=None if args.no_notify else telegram_stall_notify
         with minutes_after_send(flow):
-            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60)
+            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall)
     with minutes_after_send(flow):
         print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
