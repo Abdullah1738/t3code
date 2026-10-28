@@ -1313,9 +1313,14 @@ const make = Effect.gen(function* () {
   const boardEvaluator = Effect.fn("KanbanService.boardEvaluator")(function* (
     boardId: KanbanBoard["id"],
   ) {
-    const open = yield* store.threadLinks({ boardId, open: true });
-    for (const link of open.toReversed().slice(0, 20)) {
-      if (link.role !== "evaluator" || link.cardId !== null) continue;
+    // Ended links stay sendable: a setup or request evaluator is ended at its
+    // turn's end but its thread still takes messages.
+    const links = yield* store.threadLinks({ boardId, open: false });
+    const boardLevel = links
+      .filter((link) => link.role === "evaluator" && link.cardId === null)
+      .toReversed()
+      .slice(0, 20);
+    for (const link of boardLevel) {
       if (yield* liveEvaluator(link.threadId)) return link.threadId;
     }
     return null;
@@ -3442,8 +3447,7 @@ const make = Effect.gen(function* () {
         const waiting = card !== null && card.stage === "needs_owner";
         const author = message.author;
         if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
-          const view = yield* threads.view(author.threadId);
-          if (view) {
+          if (yield* liveEvaluator(author.threadId)) {
             yield* deliver(discussion, author, message.authorName, author.threadId, note);
             return next;
           }
