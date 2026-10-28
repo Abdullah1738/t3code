@@ -9,6 +9,7 @@ import {
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanThreadRow } from "@t3tools/contracts";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
@@ -107,6 +108,7 @@ export function BoardView(props: {
       <TabsBoard
         board={board}
         state={props.state}
+        nowMs={props.nowMs}
         mode={mode}
         onSelectMode={setMode}
         filterRow={filterRow}
@@ -123,6 +125,7 @@ export function BoardView(props: {
       mode={mode}
       onSelectMode={setMode}
       state={props.state}
+      nowMs={props.nowMs}
       board={board}
       goals={goals}
       layout={props.layout}
@@ -140,6 +143,7 @@ export function BoardView(props: {
 function TabsBoard(props: {
   readonly board: StageBoard;
   readonly state: KanbanBoardState;
+  readonly nowMs: number;
   readonly mode: BoardMode;
   readonly onSelectMode: (mode: BoardMode) => void;
   readonly filterRow: React.ReactNode;
@@ -199,6 +203,7 @@ function TabsBoard(props: {
           <BoardThreadsList
             boardId={props.state.board.id}
             state={props.state}
+            nowMs={props.nowMs}
             onOpenThread={props.onOpenThread}
           />
         </View>
@@ -252,6 +257,7 @@ function ViewSwitch(props: { readonly mode: BoardMode; readonly onSelect: (mode:
 function BoardThreadsList(props: {
   readonly boardId: string;
   readonly state: KanbanBoardState;
+  readonly nowMs: number;
   readonly onOpenThread: (threadId: string) => void;
 }) {
   const rows = useKanbanBoardThreads(props.boardId);
@@ -263,12 +269,14 @@ function BoardThreadsList(props: {
         title="Evaluators"
         empty="No evaluator threads yet."
         rows={rows.filter((row) => row.role === "evaluator")}
+        nowMs={props.nowMs}
         onOpenThread={props.onOpenThread}
       />
       <ThreadGroup
         title="Cards"
         empty="No card threads yet."
         rows={rows.filter((row) => row.role !== "evaluator")}
+        nowMs={props.nowMs}
         onOpenThread={props.onOpenThread}
       />
     </View>
@@ -279,6 +287,7 @@ function ThreadGroup(props: {
   readonly title: string;
   readonly empty: string;
   readonly rows: ReadonlyArray<KanbanThreadRow>;
+  readonly nowMs: number;
   readonly onOpenThread: (threadId: string) => void;
 }) {
   const running = props.rows.filter((row) => row.running);
@@ -291,10 +300,10 @@ function ThreadGroup(props: {
       ) : (
         <>
           {running.map((row) => (
-            <ThreadRow key={row.threadId} row={row} onOpenThread={props.onOpenThread} />
+            <ThreadRow key={row.threadId} row={row} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
           ))}
           {ended.length === 0 ? null : (
-            <EndedRows rows={ended} onOpenThread={props.onOpenThread} />
+            <EndedRows rows={ended} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
           )}
         </>
       )}
@@ -305,6 +314,7 @@ function ThreadGroup(props: {
 /** Ended runs collapse behind a toggle so current runs stay on top. */
 function EndedRows(props: {
   readonly rows: ReadonlyArray<KanbanThreadRow>;
+  readonly nowMs: number;
   readonly onOpenThread: (threadId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -317,7 +327,7 @@ function EndedRows(props: {
       />
       {open
         ? props.rows.map((row) => (
-            <ThreadRow key={row.threadId} row={row} onOpenThread={props.onOpenThread} />
+            <ThreadRow key={row.threadId} row={row} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
           ))
         : null}
     </View>
@@ -326,29 +336,34 @@ function EndedRows(props: {
 
 function ThreadRow(props: {
   readonly row: KanbanThreadRow;
+  readonly nowMs: number;
   readonly onOpenThread: (threadId: string) => void;
 }) {
   const { row } = props;
-  const label =
+  // Card identity and purpose stay visible next to the title, so repeated
+  // evaluator runs and renamed or reused card threads can be told apart.
+  const identity =
     row.role === "evaluator"
-      ? (row.purpose ?? "evaluator")
+      ? `Evaluator · ${row.purpose ?? "run"}`
       : row.cardNumber !== null
-        ? `#${row.cardNumber} ${row.cardTitle ?? ""}`.trim()
+        ? `Card #${row.cardNumber}${row.cardTitle ? ` ${row.cardTitle}` : ""}`
         : "Card";
+  const activity = row.lastActivityAt === null ? null : ageView(row.lastActivityAt, props.nowMs);
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`Open ${row.title ?? label}`}
+      accessibilityLabel={`Open ${row.title ?? identity}`}
       onPress={() => props.onOpenThread(row.threadId)}
       className="gap-1 rounded-xl border border-border px-3 py-2"
     >
       <Text numberOfLines={1} className="text-sm font-medium text-foreground">
-        {row.title ?? label}
+        {row.title ?? identity}
       </Text>
       <Text numberOfLines={1} className="text-xs text-muted-foreground">
-        {row.running ? "running" : "ended"}
+        {identity}
         {row.model === null ? "" : ` · ${row.model.model}`}
-        {row.purpose === null || row.role !== "evaluator" ? "" : ` · ${row.purpose}`}
+        {activity === null ? "" : ` · ${activity.label} ago`}
+        {row.running ? " · running" : " · ended"}
       </Text>
     </Pressable>
   );
@@ -405,6 +420,7 @@ function Empty() {
 function ColumnsBoard(props: {
   readonly board: StageBoard;
   readonly goals: ReadonlyArray<GoalSummary>;
+  readonly nowMs: number;
   readonly layout: Extract<BoardLayout, { kind: "columns" }>;
   readonly mode: BoardMode;
   readonly onSelectMode: (mode: BoardMode) => void;
@@ -509,6 +525,7 @@ function ColumnsBoard(props: {
             <BoardThreadsList
               boardId={props.state.board.id}
               state={props.state}
+              nowMs={props.nowMs}
               onOpenThread={props.onOpenThread}
             />
           </View>
