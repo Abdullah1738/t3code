@@ -10,6 +10,7 @@ import {
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanThreadLink,
   type KanbanThreadRow,
   type KanbanWatchEvent,
   type KanbanWikiPage,
@@ -60,6 +61,8 @@ export interface KanbanClient {
   wiki(boardId: string): SnapshotStore<ReadonlyArray<KanbanWikiPage>>;
   /** Every thread the board started, cards and evaluators alike. */
   threads(boardId: string): SnapshotStore<ReadonlyArray<KanbanThreadRow>>;
+  /** A thread's owning card or discussion, or null for a thread a board did not start. */
+  owner(threadId: string): SnapshotStore<KanbanThreadLink | null>;
   /** The board's scripts, kept current by the board feed. */
   scripts(boardId: string): SnapshotStore<ReadonlyArray<KanbanScript>>;
   /** A script's recent runs, newest first, kept current by the board feed. */
@@ -584,6 +587,21 @@ export function createKanbanClient(
     };
   }, options);
 
+  // A thread's owning card or discussion, read by thread id so it resolves for any
+  // run, not only the ones in the capped Threads list.
+  const owners = createKeyedSnapshotStores<string, KanbanThreadLink | null>(
+    (threadId, emit, fail) => {
+      let closed = false;
+      transport.request(M.owner, { threadId: threadId as never }).then((link) => {
+        if (!closed) emit(link);
+      }, fail);
+      return () => {
+        closed = true;
+      };
+    },
+    options,
+  );
+
   // The Threads view stays current with the board: every feed snapshot (a
   // reconnect included) and every board change reads the rows again, so a run
   // that starts or finishes shows up without reopening the view.
@@ -726,6 +744,7 @@ export function createKanbanClient(
     card: (boardId, cardId) => card(`${boardId}\n${cardId}`),
     wiki,
     threads,
+    owner: (threadId: string) => owners(threadId),
     scripts,
     scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
 
