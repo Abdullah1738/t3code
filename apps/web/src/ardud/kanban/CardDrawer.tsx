@@ -231,7 +231,8 @@ export function CardDrawer(props: {
             </button>
           </p>
         ) : null}
-        <div className="flex min-h-0 flex-1 flex-col">
+        {/* The asks list gives way so the tab content, and Answer's Discussion, stay on screen. */}
+        <div className="flex min-h-48 flex-1 flex-col">
           {tab === "discussion" ? (
             <CardDiscussion
               boardId={boardId}
@@ -577,12 +578,12 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
     ) : null;
   }
   return (
-    <ul className="mb-3.5 flex flex-col gap-1 rounded-xl bg-(--m-warnband) py-1.5">
+    <ul className="mb-3.5 flex min-h-0 max-h-[30vh] flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl bg-(--m-warnband) py-1.5">
       {asks.map((ask) => (
         <li key={ask.id} className="flex items-start gap-2 px-3 py-1 text-sm leading-snug">
           <Glyph kind={ask.blocking ? "wait" : "ask"} className="mt-1" />
           <span className="min-w-0 flex-1">
-            <span className="block">{ask.text}</span>
+            <span className="line-clamp-3 break-words">{ask.text}</span>
             <span className="text-xs text-(--m-muted)">
               {ask.by} · {ask.age} · {ask.blocking ? "Card waits" : "Work goes on"}
             </span>
