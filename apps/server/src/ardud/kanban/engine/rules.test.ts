@@ -741,7 +741,7 @@ describe("workerQuietDue", () => {
   });
 
   it("counts from the last nudge and skips stalled or review cards", () => {
-    const nudged = { ...working, nudgedAt: new Date(at(21)).toISOString() };
+    const nudged = { ...working, nudgedAt: "2026-10-25T00:21:00.000Z" };
     expect(workerQuietDue(nudged, view("idle"), at(31))).toBe(false);
     expect(
       workerQuietDue(
