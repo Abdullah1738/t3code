@@ -3,8 +3,11 @@ import {
   AlarmClockOffIcon,
   ArrowLeftIcon,
   CircleCheckIcon,
+  ListFilterIcon,
   MoreHorizontalIcon,
   PencilIcon,
+  PinIcon,
+  PinOffIcon,
   SearchIcon,
   Undo2Icon,
   XIcon,
@@ -72,9 +75,13 @@ function updateDiscussion(boardId: string, discussionId: string, patch: Discussi
         ? patch.settled
           ? "Couldn't settle the discussion"
           : "Couldn't unsettle the discussion"
-        : patch.snoozedUntil === null
-          ? "Couldn't unsnooze the discussion"
-          : "Couldn't snooze the discussion";
+        : patch.pinned !== undefined
+          ? patch.pinned
+            ? "Couldn't pin the discussion"
+            : "Couldn't unpin the discussion"
+          : patch.snoozedUntil === null
+            ? "Couldn't unsnooze the discussion"
+            : "Couldn't snooze the discussion";
   return runAction(failure, () => kanban.updateDiscussion(boardId, discussionId, patch));
 }
 
@@ -401,6 +408,7 @@ function DiscussionListRow(props: {
           {row.snoozedUntil !== null ? (
             <AlarmClockIcon aria-label="Snoozed for" className="size-3" />
           ) : null}
+          {row.pinnedAt !== null ? <PinIcon aria-label="Pinned" className="size-3" /> : null}
           {when}
         </span>
         {row.preview ? (
@@ -429,6 +437,7 @@ function DiscussionMenu(props: {
     readonly title: string;
     readonly settledAt: string | null;
     readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
   };
   nowMs: number;
   open?: boolean;
@@ -442,6 +451,7 @@ function DiscussionMenu(props: {
   const { discussion } = props;
   const settled = discussion.settledAt !== null;
   const snoozed = !settled && discussionSnoozed(discussion, props.nowMs);
+  const pinned = discussion.pinnedAt !== null;
   const presets = open ? resolveSnoozePresets(new Date(), timestampFormat) : [];
   const canUpdate = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
   const updateNote = canUpdate ? undefined : "Your connection can't change discussions";
@@ -504,6 +514,17 @@ function DiscussionMenu(props: {
               </MenuItem>
             </MenuSubPopup>
           </MenuSub>
+        )}
+        {pinned ? (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: false })}>
+            <PinOffIcon />
+            Unpin
+          </MenuItem>
+        ) : (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: true })}>
+            <PinIcon />
+            Pin
+          </MenuItem>
         )}
         <MenuSeparator />
         <MenuItem disabled={!canUpdate} title={updateNote} onClick={props.onRename}>
