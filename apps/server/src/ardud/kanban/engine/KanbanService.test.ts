@@ -2415,12 +2415,19 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
-      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+      const moved = yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
         _tag: "thread",
         threadId: workThread,
       });
+      const afterMove = (yield* kanban.card(created.id)).card;
       yield* kanban.dispatchNow;
       const reviewCard = (yield* kanban.card(created.id)).card;
+      const threadsNow = [...(yield* Ref.get(fake.threads)).keys()];
+      assert.strictEqual(
+        reviewCard.activeThreadId === null,
+        false,
+        `move=${JSON.stringify(moved)} afterMove=${JSON.stringify({ stage: afterMove.stage, activeThreadId: afterMove.activeThreadId, reviewStep: afterMove.reviewStep, reviewChain: afterMove.reviewChain, stalled: afterMove.stalled })} threads=${threadsNow.join(",")} stage=${reviewCard.stage}`,
+      );
       const reviewThread = reviewCard.activeThreadId!;
       assert.strictEqual(
         reviewThread === null,
