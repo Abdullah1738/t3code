@@ -115,6 +115,9 @@ export class LineError extends Error {
   }
 }
 
+// Sendblue sends app cards one-to-one only; refusing at queue time keeps a group from getting a silent delivery failure.
+export const GROUP_APP_REFUSAL = "App cards don't work in group chats; send the link as text instead";
+
 export const chatKey = {
   dm: (address: string): ChatKey => `dm:${address}`,
   group: (groupId: string): ChatKey => `group:${groupId}`,

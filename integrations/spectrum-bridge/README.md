@@ -52,6 +52,7 @@ under `~/.config/spectrum-bridge/`.
   instead (the card's HTML file when it is published here, otherwise its link)
   and their row moves to state `fallback`. Secure form links never leave
   iMessage.
+- Group chats can't take app cards (Sendblue sends them one-to-one only); the bridge refuses them with HTTP 422 and the CLI prints why. Send the link as text there.
 - Sendblue app cards open in the iMessage app named by `cardApp` in
   config.json (`appName`, `extensionBundleId`, `teamId`, optional
   `appStoreId`), defaulting to Photon's Spectrum app. Photon mode always uses
