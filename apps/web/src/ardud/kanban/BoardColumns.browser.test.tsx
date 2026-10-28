@@ -118,6 +118,9 @@ afterEach(async () => {
 
 describe("stage columns", () => {
   it("resizes a column with the keyboard and saves it under the board key", async () => {
+    // aria-valuenow is read during render, before the first layout, so re-render once
+    // to show the measured width the keyboard will step from.
+    await render();
     const separator = handle("To-Do");
     expect(separator).not.toBeNull();
     const before = Number(separator!.getAttribute("aria-valuenow"));
@@ -148,14 +151,16 @@ describe("stage columns", () => {
   });
 
   it("hides a column as a rail and shows it again on click", async () => {
-    const section = column("Working");
-    expect(section).not.toBeNull();
+    expect(column("Working")).not.toBeNull();
 
-    // Hiding goes through the menu toggle; render the rail state directly from prefs.
+    // Hiding goes through the menu toggle; mount with the stored prefs, as a reload would.
+    await act(() => root.unmount());
+    container.replaceChildren();
     localStorage.setItem(
       boardColumnsStorageKey(BOARD_ID),
       JSON.stringify({ widths: {}, hidden: ["working"], groupWidth: null }),
     );
+    root = createRoot(container);
     await render();
 
     expect(column("Working")).toBeNull();

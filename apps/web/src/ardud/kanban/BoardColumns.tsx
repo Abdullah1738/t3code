@@ -257,9 +257,11 @@ function columnStyle(width: number | null): React.CSSProperties | undefined {
 }
 
 /** Measured DOM width of a column, used as the drag start when it has no saved width. */
-function measureColumn(key: BoardColumnKey): number {
+function measureColumn(key: string): number {
   const element = document.querySelector<HTMLElement>(`[data-column="${key}"]`);
-  return element?.getBoundingClientRect().width ?? BOARD_COLUMN_FALLBACK[key];
+  const measured = element?.getBoundingClientRect().width ?? 0;
+  // A column that isn't laid out yet (zero width) falls back to its default sizing.
+  return measured > 0 ? measured : (BOARD_COLUMN_FALLBACK[key as BoardColumnKey] ?? 200);
 }
 
 const BOARD_COLUMN_FALLBACK: Record<BoardColumnKey, number> = {
