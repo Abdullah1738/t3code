@@ -179,11 +179,12 @@ DOCKER_REPAIR = r'''(
       echo 'offbox: could not restore the docker hook' >&2
     rm -f "$_offbox_t"
   fi
-  if systemctl is-failed --quiet docker 2>/dev/null; then
+  # Every systemctl call is bounded: a stalled start must not hold up the user's command.
+  if timeout 10 systemctl is-failed --quiet docker 2>/dev/null; then
     echo 'offbox: docker had failed; restarting it' >&2
-    sudo -n systemctl reset-failed docker 2>/dev/null
-    sudo -n systemctl start docker ||
-      { echo 'offbox: docker still fails to start:' >&2; systemctl status docker --no-pager -n 5 >&2; }
+    sudo -n timeout 10 systemctl reset-failed docker 2>/dev/null
+    sudo -n timeout "${OFFBOX_DOCKER_TIMEOUT:-90}" systemctl start docker ||
+      { echo 'offbox: docker still fails to start (or timed out):' >&2; timeout 10 systemctl status docker --no-pager -n 5 >&2; }
   fi
 ) || true'''.replace('__HOOK_B64__', DOCKER_HOOK_B64)
 

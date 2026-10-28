@@ -19,15 +19,28 @@ FAKE_SYSTEMCTL = r'''#!/bin/bash
 echo "$*" >> "$CALLS"
 case "$1" in
   is-failed) grep -qx failed "$STATE" 2>/dev/null; exit $? ;;
-  start) if [ -n "$START_FAILS" ]; then exit 1; fi; echo active > "$STATE"; exit 0 ;;
+  start)
+    if [ -n "$HANG_START" ]; then exec sleep 1000; fi
+    if [ -n "$START_FAILS" ]; then exit 1; fi
+    echo active > "$STATE"; exit 0 ;;
   status) echo 'fake status' ;;
 esac
 exit 0
 '''
 
 
+# coreutils timeout (Linux boxes); this Mac has none, so the fixture always supplies this shim.
+FAKE_TIMEOUT = r'''#!/usr/bin/env python3
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+'''
+
+
 class DockerHookFixture:
-    def __init__(self, home, dropin=True, failed=False, sudo_ok=True, start_fails=False):
+    def __init__(self, home, dropin=True, failed=False, sudo_ok=True, start_fails=False, hang_start=False):
         self.home = Path(home)
         self.dropin = self.home / 'etc/systemd/system/docker.service.d'
         self.bindir = self.home / 'usr/local/bin'
@@ -44,12 +57,16 @@ class DockerHookFixture:
         self.bins.mkdir()
         self.tool('systemctl', FAKE_SYSTEMCTL)
         self.tool('sudo', '#!/bin/bash\nshift; exec "$@"\n' if sudo_ok else '#!/bin/bash\nexit 1\n')
+        self.tool('timeout', FAKE_TIMEOUT)
         self.script = DOCKER_REPAIR.replace('/etc/systemd/system/docker.service.d', str(self.dropin)).replace(
             '/usr/local/bin', str(self.bindir)) + '\necho USER_COMMAND\n'
         self.env = dict(os.environ, HOME=str(self.home), CALLS=str(self.calls), STATE=str(self.state),
                         PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin')
         if start_fails:
             self.env['START_FAILS'] = '1'
+        if hang_start:
+            self.env['HANG_START'] = '1'
+            self.env['OFFBOX_DOCKER_TIMEOUT'] = '1'
 
     def tool(self, name, body):
         path = self.bins / name
@@ -116,6 +133,17 @@ class DockerHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('USER_COMMAND', result.stdout)
             self.assertIn('docker still fails to start', result.stderr)
+
+    def test_h_hanging_docker_start_is_bounded_and_does_not_block_the_command(self):
+        import time
+        with tempfile.TemporaryDirectory() as home:
+            fx = DockerHookFixture(home, failed=True, hang_start=True)
+            started = time.monotonic()
+            result, _ = fx.run()
+            self.assertLess(time.monotonic() - started, 25, 'repair must give up on a stalled docker start')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('USER_COMMAND', result.stdout)
+            self.assertIn('docker still fails to start (or timed out)', result.stderr)
 
     def test_f_vendored_hook_matches_boat_hash(self):
         data = (SKILL / 'templates' / 'boat-sync-docker-firewall').read_bytes()
