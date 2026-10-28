@@ -47,7 +47,10 @@ export const ModelInput = Schema.Struct({
     describe(TrimmedNonEmptyString, 'Provider instance; leave out to use "opencode".'),
   ),
   variant: Schema.optional(
-    describe(TrimmedNonEmptyString, 'Thinking variant, e.g. "high" or "xhigh".'),
+    describe(
+      TrimmedNonEmptyString,
+      'Thinking variant, e.g. "xhigh". Each model offers its own set (orchestrator_capabilities lists them); one the model doesn\'t offer is refused with the list it does.',
+    ),
   ),
 });
 export type ModelInput = typeof ModelInput.Type;
@@ -476,12 +479,24 @@ const EvaluatorStart = tool(
     boardId: TrimmedNonEmptyString,
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
     text: Schema.optional(Schema.String),
+    /** For setup: an existing discussion on this board to use as the Setup discussion. */
+    discussionId: Schema.optional(TrimmedNonEmptyString),
   },
   { threadId: TrimmedNonEmptyString },
   { readonly: false },
 );
 
+const SetupDone = tool(
+  "setup_done",
+  "End board setup",
+  "Only the board's setup evaluator calls this, once the board's wiki and setup are complete. It lifts the setup hold: card work and review resume, and one line is posted in the Setup discussion.",
+  {},
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
+  SetupDone,
   BoardGet,
   CardSearch,
   CardGet,

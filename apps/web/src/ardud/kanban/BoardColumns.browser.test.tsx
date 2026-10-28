@@ -187,6 +187,7 @@ async function render(state = boardState()) {
         selectedCardId={undefined}
         onOpenCard={() => {}}
         onOpenGoal={() => {}}
+        onClearFilters={() => {}}
       />,
     ),
   );
@@ -352,6 +353,7 @@ describe("group columns", () => {
           selectedCardId={undefined}
           onOpenCard={() => {}}
           onOpenGoal={() => {}}
+          onClearFilters={() => {}}
         />,
       ),
     );

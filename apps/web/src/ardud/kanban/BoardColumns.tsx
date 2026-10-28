@@ -8,6 +8,7 @@ import {
   stageBoard,
   toggleColumn,
   type BoardColumnKey,
+  visibleCards,
   type BoardFilter,
   type CardView,
   type GroupBy,
@@ -36,6 +37,7 @@ export function BoardColumns(props: {
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
   onOpenGoal: (goalId: string) => void;
+  onClearFilters: () => void;
 }) {
   // The board's own width decides, not the screen's: an iPad with the sidebar open
   // is a wide screen with a narrow board.
@@ -52,9 +54,12 @@ export function BoardColumns(props: {
     });
   const { state, filter } = props;
   const goals = activeGoals(state);
-  const shownGoals = filter.goalId
-    ? goals.filter((entry) => entry.goal.id === filter.goalId)
-    : goals;
+  if (visibleCards(state, filter).length === 0) {
+    return <NoCardsMatch onClear={props.onClearFilters} />;
+  }
+  const picked = filter.goalIds ?? [];
+  const shownGoals =
+    picked.length > 0 ? goals.filter((entry) => picked.includes(entry.goal.id)) : goals;
 
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
@@ -465,6 +470,21 @@ function ShippedRow(props: {
       <Glyph kind={stageGlyph(props.card.stage)} className="mt-0.75" />
       <span className="line-clamp-2 wrap-break-word">{props.card.title}</span>
     </button>
+  );
+}
+
+function NoCardsMatch(props: { onClear: () => void }) {
+  return (
+    <div className="flex flex-col items-start gap-3 pe-5">
+      <p className="text-(--m-muted)">No cards match these filters.</p>
+      <button
+        type="button"
+        onClick={props.onClear}
+        className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
+        Clear filters
+      </button>
+    </div>
   );
 }
 

@@ -30,6 +30,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
   createdAt: at,
   archivedAt: null,
 });

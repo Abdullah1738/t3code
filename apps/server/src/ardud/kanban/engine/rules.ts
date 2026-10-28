@@ -245,6 +245,8 @@ export function planDispatch(
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
 ): ReadonlyArray<Dispatch> {
+  // A board's first setup holds all card work and review until the setup evaluator ends it.
+  if (board.setup?.status === "running") return [];
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
@@ -331,6 +333,8 @@ export interface ClaimContext {
  * outside the thread.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
+  // Same hold as planDispatch: no card work starts while the board's setup runs.
+  if (board.setup?.status === "running") return no("Setup is running");
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

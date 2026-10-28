@@ -10,6 +10,7 @@ import {
   type KanbanActor,
   type KanbanAnswer,
   type KanbanBlock,
+  type KanbanBoard,
   type KanbanCard,
   type KanbanDiscussion,
   type KanbanGoal,
@@ -98,6 +99,29 @@ function prLabel(url: string, label: string | null): string {
   return match ? `#${match[1]}` : "PR";
 }
 
+/** The banner every board view shows while the board's first setup runs; null otherwise. */
+export interface SetupBannerView {
+  readonly discussionId: string;
+  readonly label: string;
+}
+
+export function setupBanner(board: KanbanBoard): SetupBannerView | null {
+  if (board.setup?.status !== "running") return null;
+  return { discussionId: board.setup.discussionId, label: "Setup is ongoing · View setup" };
+}
+
+/**
+ * A card the board's running setup holds: it would otherwise start (todo or
+ * needs_review, not running, settled or backlog). Mirrors the waiting filter in
+ * planDispatch, so a card that's already running doesn't claim it is waiting.
+ */
+function setupHolds(card: KanbanCard, board: KanbanBoard): boolean {
+  if (board.setup?.status !== "running") return false;
+  if (card.settledAt !== null || card.activeThreadId !== null) return false;
+  if (card.stalled !== null || card.priority === KANBAN_BACKLOG) return false;
+  return card.stage === "todo" || card.stage === "needs_review";
+}
+
 export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: number): CardView {
   const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
   const pr = card.links.find((link) => link.kind === "pr");
@@ -115,6 +139,9 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
   } else if (card.priority === KANBAN_BACKLOG && !isDoneStage(card.stage)) {
     // Shown like a block: the card waits, here on the owner taking it out.
     flag = { kind: "blocked", label: "In the backlog" };
+  } else if (setupHolds(card, state.board)) {
+    // planDispatch starts no card work or review while a board's first setup runs.
+    flag = { kind: "blocked", label: "Setup is running" };
   } else {
     const blocker = isDoneStage(card.stage) ? undefined : kanbanHeldUpBy(card, state.cards);
     if (blocker !== undefined) {
@@ -208,10 +235,29 @@ export function subtaskSteps(card: Pick<KanbanCard, "subtasks">): ReadonlyArray<
 export type SettledFilter = "hide" | "only" | "include";
 
 export interface BoardFilter {
-  readonly goalId?: string | null;
+  /** Empty or missing: no narrowing. Values within a facet match any (OR); facets all match (AND). */
+  readonly priorities?: ReadonlyArray<number>;
+  /** Goal ids; "" matches cards with no goal. */
+  readonly goalIds?: ReadonlyArray<string>;
+  /** Project names; "" matches cards in no project. */
+  readonly projects?: ReadonlyArray<string>;
+  /** modelName() values; "" matches cards with no model. */
+  readonly models?: ReadonlyArray<string>;
   readonly query?: string;
   /** Settled cards: hidden by default. */
   readonly settled?: SettledFilter;
+}
+
+/** Whether a card passes the facet narrowing (not the query or settled). */
+function matchesFacets(card: KanbanCard, filter: BoardFilter): boolean {
+  if (filter.priorities?.length && !filter.priorities.includes(card.priority)) return false;
+  if (filter.goalIds?.length && !filter.goalIds.includes(card.goalId ?? "")) return false;
+  if (filter.projects?.length) {
+    const names = card.projects.length === 0 ? [""] : card.projects;
+    if (!names.some((name) => filter.projects?.includes(name))) return false;
+  }
+  if (filter.models?.length && !filter.models.includes(modelName(card.model))) return false;
+  return true;
 }
 
 /**
@@ -244,7 +290,7 @@ export function visibleCards(state: KanbanBoardState, filter: BoardFilter = {}):
   for (const card of state.cards.values()) {
     if (settled === "hide" && card.settledAt !== null) continue;
     if (settled === "only" && card.settledAt === null) continue;
-    if (filter.goalId != null && card.goalId !== filter.goalId) continue;
+    if (!matchesFacets(card, filter)) continue;
     if (filter.query && !cardMatches(card, filter.query)) continue;
     cards.push(card);
   }
@@ -553,9 +599,11 @@ export interface DiscussionRow {
   readonly settledAt: string | null;
   /** Set while the snooze still holds at the time the rows were built. */
   readonly snoozedUntil: string | null;
+  readonly pinnedAt: string | null;
 }
 
 export interface DiscussionGroups {
+  readonly pinned: ReadonlyArray<DiscussionRow>;
   readonly active: ReadonlyArray<DiscussionRow>;
   readonly snoozed: ReadonlyArray<DiscussionRow>;
   readonly settled: ReadonlyArray<DiscussionRow>;
@@ -572,16 +620,23 @@ export const discussionSnoozed = (
 };
 
 /**
- * Discussions newest first in three groups, like sidebar threads. Settled wins
- * over snoozed; a lapsed snooze counts as active. `query` matches the title and
- * the latest message preview.
+ * Discussions newest first in four groups, like sidebar threads. Settled wins
+ * over snoozed, snoozed over pinned, pinned over active; a lapsed snooze counts
+ * as active. `query` matches the title and the latest message preview.
+ * `hideCards` drops card discussions (board channels stay); `unreadOnly` keeps
+ * only discussions with unread messages. All filters combine.
  */
 export function discussionRows(
   state: KanbanBoardState,
   nowMs: number,
-  options: { readonly query?: string } = {},
+  options: {
+    readonly query?: string;
+    readonly hideCards?: boolean;
+    readonly unreadOnly?: boolean;
+  } = {},
 ): DiscussionGroups {
   const needle = options.query?.trim().toLowerCase() ?? "";
+  const pinned: DiscussionRow[] = [];
   const active: DiscussionRow[] = [];
   const snoozed: DiscussionRow[] = [];
   const settled: DiscussionRow[] = [];
@@ -599,21 +654,25 @@ export function discussionRows(
         at: discussion.lastMessageAt ?? discussion.createdAt,
         settledAt: discussion.settledAt,
         snoozedUntil: sleeping ? discussion.snoozedUntil : null,
+        pinnedAt: discussion.pinnedAt,
       } satisfies DiscussionRow;
     })
     .filter(
       (row) =>
-        !needle ||
-        row.title.toLowerCase().includes(needle) ||
-        row.preview.toLowerCase().includes(needle),
+        (!needle ||
+          row.title.toLowerCase().includes(needle) ||
+          row.preview.toLowerCase().includes(needle)) &&
+        !(options.hideCards && row.cardId !== null) &&
+        !(options.unreadOnly && row.unread === 0),
     )
     .sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
   for (const row of rows) {
     if (row.settledAt !== null) settled.push(row);
     else if (row.snoozedUntil !== null) snoozed.push(row);
+    else if (row.pinnedAt !== null) pinned.push(row);
     else active.push(row);
   }
-  return { active, snoozed, settled };
+  return { pinned, active, snoozed, settled };
 }
 
 /** The earliest snooze still holding, so a screen knows when to regroup. */

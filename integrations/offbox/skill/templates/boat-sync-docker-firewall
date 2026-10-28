@@ -1,0 +1,40 @@
+#!/bin/bash
+# Sync DOCKER-USER iptables chain with UFW allowed ports.
+# Called automatically when UFW rules change or Docker restarts.
+
+# Bail if DOCKER-USER chain does not exist (Docker not running yet)
+iptables -L DOCKER-USER -n &>/dev/null || exit 0
+
+# Flush existing per-port RETURN rules (keep ESTABLISHED/RELATED and final DROP)
+iptables -S DOCKER-USER | grep -- '--ctorigdstport' | while read -r rule; do
+  iptables $(echo "$rule" | sed 's/^-A/-D/')
+done
+
+# Re-add RETURN rules for every accepted UFW input rule, preserving source IPs.
+# UFW stores canonical iptables rules here, e.g.:
+#   -A ufw-user-input -p tcp --dport 3000 -s 10.77.0.1 -j ACCEPT
+#   -A ufw-user-input -p tcp --dport 3000 -j ACCEPT
+grep '^-A ufw-user-input ' /etc/ufw/user.rules | grep ' -j ACCEPT' | while read -r line; do
+  proto=$(printf '%s
+' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="-p"){print $(i+1); exit}}')
+  port=$(printf '%s
+' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="--dport"){print $(i+1); exit}}')
+  source=$(printf '%s
+' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="-s"){print $(i+1); exit}}')
+
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || continue
+  [[ "$port" =~ ^[0-9]+$ ]] || continue
+
+  source_args=()
+  if [[ -n "$source" ]]; then
+    source_args=(-s "$source")
+  fi
+
+  iptables -I DOCKER-USER 1 -p "$proto" "${source_args[@]}" -m conntrack --ctorigdstport "$port" --ctstate NEW -j RETURN
+done
+
+# Ensure the base rules are still in place
+iptables -C DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null   || iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+# Ensure final DROP exists (append only if missing)
+iptables -C DOCKER-USER -i eth0 -m conntrack --ctstate NEW -j DROP 2>/dev/null   || iptables -A DOCKER-USER -i eth0 -m conntrack --ctstate NEW -j DROP

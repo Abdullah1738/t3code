@@ -705,6 +705,15 @@ const handlers = {
     ),
   ),
 
+  setup_done: McpToolAccess.actsAsCaller(() =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
@@ -713,7 +722,11 @@ const handlers = {
         let purpose: EvaluatorPurpose;
         if (input.kind === "setup" || input.kind === "request") {
           if (!text) return yield* invalid(`A ${input.kind} evaluator needs text.`);
-          purpose = { kind: input.kind, text };
+          purpose = {
+            kind: input.kind,
+            text,
+            ...(input.kind === "setup" ? { discussionId: input.discussionId ?? null } : {}),
+          };
         } else {
           purpose = { kind: input.kind };
         }

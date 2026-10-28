@@ -1,6 +1,7 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createApi } from "../src/api.ts";
+import { GROUP_APP_REFUSAL } from "../src/line.ts";
 import type { Photon } from "../src/photon.ts";
 import { Shares } from "../src/share.ts";
 import { Store } from "../src/store.ts";
@@ -52,6 +53,16 @@ test("send, poll, and app queue session-bound conversation operations idempotent
     expect(await again.json()).toEqual({ id, created: false });
   }
   expect(h.store.pendingOutbox()).toHaveLength(3);
+});
+
+test("app cards are refused in a group chat with a reason, while send still queues there", async () => {
+  const h = setup();
+  h.state.chat = "group:GRP-1";
+  const refused = await h.post("/app", app);
+  expect(refused.status).toBe(422);
+  expect(await refused.json()).toEqual({ error: GROUP_APP_REFUSAL });
+  expect(h.store.pendingOutbox()).toEqual([]);
+  expect((await h.post("/send", send)).status).toBe(202);
 });
 
 test("optional send and app fields are omitted rather than stored as blanks", async () => {

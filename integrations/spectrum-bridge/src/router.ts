@@ -185,7 +185,8 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   // Turns nobody typed (wakes) carry no attachments and don't open Robob asks; guest wakes bring their own commands.
   if (!background) {
     lines.push("Files: images attach natively; other files (voice notes, PDFs, docs) are saved at the quoted paths. If you can't read them directly, work on them with tools (transcribe, extract text, convert).");
-    lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
+    if (chat.kind === "group") lines.push("Polls and app cards are not available in groups; ask in text and send links as text.");
+    else lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
   }
   lines.push("Links you create: for the owner's own chat use `publish --app SLUG` (tailnet only). For Moni, any group or anyone else use `share --app SLUG [--days N]` (public Cloudflare link, 7 days by default; `unshare --app SLUG` ends it). Every page you send needs <title>, og:title, og:description and og:image so link previews show; fix any metadataWarnings before sending the link.");
   if (chat.kind === "owner") lines.push("Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one; `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");

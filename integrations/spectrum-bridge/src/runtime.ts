@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { chatInfo, personFor, roleOf, slugFor } from "./access.ts";
 import { appContent } from "./api.ts";
 import type { Access, ChatContext, ChatInfo } from "./chats.ts";
-import { chatKey, LineError, type ChatKey, type Line } from "./line.ts";
+import { chatKey, GROUP_APP_REFUSAL, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
 import { TYPING_WINDOW_MS, type IngressSink } from "./sb-ingress.ts";
 import type { GuestDesk } from "./guest-desk.ts";
@@ -322,6 +322,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           }
           const target = registry.bySlugName(to);
           if (!target) throw new HttpError(404, "Unknown chat");
+          if (target.info.kind === "group") throw new HttpError(422, GROUP_APP_REFUSAL);
           const id = `app:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
           // Like send --to, this is an owner-authorized relay, not a reply in the recipient's session.

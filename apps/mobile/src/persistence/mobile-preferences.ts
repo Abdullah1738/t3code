@@ -1,3 +1,7 @@
+import {
+  sanitizeBoardFilterPrefs,
+  type BoardFilterPrefs,
+} from "@t3tools/client-runtime/ardud/kanban";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -47,6 +51,17 @@ const PullRequestListPreferences = Schema.Struct({
 });
 export type PullRequestListPreferences = typeof PullRequestListPreferences.Type;
 
+const KanbanBoardFilterPrefs = Schema.Struct({
+  priorities: Schema.Array(Schema.Number),
+  goalIds: Schema.Array(Schema.String),
+  projects: Schema.Array(Schema.String),
+  models: Schema.Array(Schema.String),
+  settled: Schema.Literals(["hide", "only", "include"]),
+});
+const KanbanBoardFilters = Schema.Record(Schema.String, KanbanBoardFilterPrefs);
+export type KanbanBoardFilters = typeof KanbanBoardFilters.Type;
+type KanbanBoardFilterPrefs = BoardFilterPrefs;
+
 const isThreadListFilters = Schema.is(ThreadListFilters);
 const isPullRequestListPreferences = Schema.is(PullRequestListPreferences);
 
@@ -89,6 +104,7 @@ export interface Preferences {
   readonly projectGroupingMode?: SidebarProjectGroupingMode;
   readonly planModeEnabled?: boolean;
   readonly workingShelfEnabled?: boolean;
+  readonly kanbanHideCardDiscussions?: boolean;
   readonly modelFavorites?: ReadonlyArray<{
     readonly provider: ProviderInstanceId;
     readonly model: string;
@@ -102,6 +118,8 @@ export interface Preferences {
   readonly kanbanDiscussionShelves?: Readonly<
     Record<string, { readonly snoozed?: boolean; readonly settled?: boolean }>
   >;
+  /** Board filter choices per board id, kept on this device. */
+  readonly kanbanBoardFilters?: KanbanBoardFilters;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -166,6 +184,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     projectGroupingMode?: SidebarProjectGroupingMode;
     planModeEnabled?: boolean;
     workingShelfEnabled?: boolean;
+    kanbanHideCardDiscussions?: boolean;
     modelFavorites?: Preferences["modelFavorites"];
     threadListSettledShelfExpanded?: boolean;
     threadListSnoozedShelfExpanded?: boolean;
@@ -173,6 +192,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListFilters?: ThreadListFilters;
     pullRequestListFilters?: PullRequestListPreferences;
     kanbanDiscussionShelves?: Preferences["kanbanDiscussionShelves"];
+    kanbanBoardFilters?: KanbanBoardFilters;
   } = {};
 
   if (typeof parsed.pullRequestHideTestFiles === "boolean") {
@@ -274,6 +294,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   if (typeof parsed.workingShelfEnabled === "boolean") {
     preferences.workingShelfEnabled = parsed.workingShelfEnabled;
   }
+  if (typeof parsed.kanbanHideCardDiscussions === "boolean") {
+    preferences.kanbanHideCardDiscussions = parsed.kanbanHideCardDiscussions;
+  }
   if (Array.isArray(parsed.modelFavorites)) {
     preferences.modelFavorites = parsed.modelFavorites.filter(
       (favorite) =>
@@ -302,6 +325,14 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (isKanbanDiscussionShelves(parsed.kanbanDiscussionShelves)) {
     preferences.kanbanDiscussionShelves = parsed.kanbanDiscussionShelves;
+  }
+  if (typeof parsed.kanbanBoardFilters === "object" && parsed.kanbanBoardFilters !== null) {
+    // Each board entry is sanitized on its own, so one malformed board can't drop the rest.
+    const boards: Record<string, KanbanBoardFilterPrefs> = {};
+    for (const [boardId, entry] of Object.entries(parsed.kanbanBoardFilters)) {
+      boards[boardId] = sanitizeBoardFilterPrefs(entry);
+    }
+    preferences.kanbanBoardFilters = boards;
   }
   return preferences;
 }

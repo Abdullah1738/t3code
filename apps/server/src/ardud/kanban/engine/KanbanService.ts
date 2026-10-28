@@ -55,9 +55,11 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
 import * as Asks from "./asks.ts";
+import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
 import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
@@ -339,6 +341,14 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
   ) => Effect.Effect<KanbanWikiPage, KanbanError>;
 
+  /**
+   * Ends a board's running setup: the owner's "End setup" (actor owner) or the
+   * setup evaluator's setup_done (actor evaluator, only its own thread).
+   */
+  readonly endSetup: (
+    boardId: KanbanBoard["id"],
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanBoard, KanbanError>;
   /** Starts an evaluator thread for a board job (setup, owner request, sweeps). */
   readonly startEvaluator: (
     boardId: KanbanBoard["id"],
@@ -511,6 +521,7 @@ const make = Effect.gen(function* () {
   const threads = yield* KanbanThreads;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const projects = yield* ProjectService.ProjectService;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const attachments = makeBoardAttachments(
     yield* ServerConfig.ServerConfig,
     yield* FileSystem.FileSystem,
@@ -585,6 +596,12 @@ const make = Effect.gen(function* () {
     return board;
   });
 
+  /** Fails before a board stores or starts a model/variant the provider doesn't offer. */
+  const checkModel = Effect.fn("KanbanService.checkModel")(function* (model: ModelSelection) {
+    const problem = modelProblem(yield* providerRegistry.getProviders, model);
+    if (problem !== null) return yield* failWith("invalid", problem);
+  });
+
   /**
    * Agents write model ids in many shapes ("opus/x" vs instance "opus" + "x"). Match the
    * request to one of the board's pools so the dispatcher can run it; a model with no pool
@@ -605,12 +622,14 @@ const make = Effect.gen(function* () {
         return suffix.length === 1 ? suffix[0] : undefined;
       })();
     if (!match) {
+      // A model the provider refuses is named as such, even when no pool exists for it.
+      yield* checkModel(model);
       return yield* failWith(
         "invalid",
         `no pool runs ${joined}; pools: ${pools.map((pool) => pool.model.model).join(", ") || "none"}`,
       );
     }
-    return {
+    const selected = {
       instanceId: match.model.instanceId,
       model: match.model.model,
       ...(model.options
@@ -619,6 +638,8 @@ const make = Effect.gen(function* () {
           ? { options: match.model.options }
           : {}),
     } satisfies ModelSelection;
+    yield* checkModel(selected);
+    return selected;
   });
 
   /** Each weighted model mapped to a pool, one entry per pool, highest weight first. */
@@ -1128,7 +1149,27 @@ const make = Effect.gen(function* () {
     if (board.defaultProjectId === null) {
       return yield* failWith("invalid", `board ${board.slug} has no default project`);
     }
+    if (purpose.kind === "setup" && board.setup?.status === "running") {
+      return yield* failWith("invalid", `board ${board.slug} is already in setup`);
+    }
     const at = yield* nowIso;
+    // The setup evaluator talks in a Setup discussion, so the owner has somewhere to read and reply.
+    // An existing discussion can be adopted as the Setup one (boards set up before this existed).
+    let setupDiscussion: KanbanDiscussion | null = null;
+    if (purpose.kind === "setup") {
+      if (purpose.discussionId) {
+        const existing = yield* discussionOf(KanbanDiscussionId.make(purpose.discussionId));
+        if (existing.boardId !== board.id) {
+          return yield* failWith("invalid", "the Setup discussion must be on this board");
+        }
+        setupDiscussion = existing;
+      } else {
+        setupDiscussion = yield* newDiscussion(board.id, "Setup", null, {
+          _tag: "system",
+          component: "setup",
+        });
+      }
+    }
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
     const threadId = yield* threads.launch({
@@ -1146,14 +1187,77 @@ const make = Effect.gen(function* () {
         role: "evaluator",
         purpose: Briefs.purposeKey(purpose),
         discussionId:
-          purpose.kind === "discussion" ? KanbanDiscussionId.make(purpose.discussionId) : null,
+          purpose.kind === "discussion"
+            ? KanbanDiscussionId.make(purpose.discussionId)
+            : (setupDiscussion?.id ?? null),
         model: board.evaluatorModel,
         startedAt: at,
         endedAt: null,
       },
       title,
     );
+    if (setupDiscussion) {
+      // The setup evaluator owns the Setup discussion even when an older evaluator
+      // already had it: owner replies and setup_done must reach this thread.
+      yield* saveDiscussion(
+        withParticipant(
+          { ...setupDiscussion, evaluatorThreadId: threadId },
+          { _tag: "evaluator", threadId },
+          "Evaluator",
+          {},
+        ),
+      );
+      const running: KanbanBoard = {
+        ...board,
+        setup: {
+          status: "running",
+          discussionId: setupDiscussion.id,
+          threadId,
+          startedAt: at,
+          finishedAt: null,
+        },
+      };
+      yield* store.putBoard(running);
+      yield* publish(board.id, { _tag: "board", board: running });
+    }
     return threadId;
+  });
+
+  /**
+   * Ends a running setup. Only the owner or the setup thread itself may end it.
+   * Card work resumes on the next dispatch tick (planDispatch reads setup status).
+   */
+  const endSetupUnlocked = Effect.fn("KanbanService.endSetupUnlocked")(function* (
+    boardId: KanbanBoard["id"],
+    actor: KanbanActor,
+  ) {
+    const board = yield* boardOf(boardId);
+    const setup = board.setup;
+    if (setup === null || setup.status !== "running") {
+      return yield* failWith("invalid", `board ${board.slug} has no setup running`);
+    }
+    const isSetupThread =
+      actor._tag === "evaluator" && actor.threadId === setup.threadId;
+    if (actor._tag !== "owner" && !isSetupThread) {
+      return yield* failWith("denied", "only the owner or the setup evaluator ends setup");
+    }
+    const at = yield* nowIso;
+    const done: KanbanBoard = {
+      ...board,
+      setup: { ...setup, status: "done", finishedAt: at },
+    };
+    yield* store.putBoard(done);
+    yield* publish(board.id, { _tag: "board", board: done });
+    const discussion = yield* discussionOf(setup.discussionId);
+    const author: KanbanActor = isSetupThread ? actor : { _tag: "system", component: "setup" };
+    yield* postUnlocked(
+      discussion.id,
+      author,
+      [{ _tag: "md", text: "Setup is done. Card work and review resume." }],
+      false,
+    );
+    yield* kick;
+    return done;
   });
 
   /** Live evaluators that asked on a card; a new card evaluator takes it over from them. */
@@ -1231,6 +1335,13 @@ const make = Effect.gen(function* () {
     yield* saveDiscussion(next);
     return next;
   });
+
+  /** A board note to the card's discussion evaluator; a failed note never breaks the caller. */
+  const noteDiscussion = (card: KanbanCard, text: string) =>
+    cardDiscussionUnlocked(card.id).pipe(
+      Effect.flatMap((discussion) => toEvaluator(discussion, text, true)),
+      Effect.asVoid,
+    );
 
   /** The move that put a card in needs_owner: who asked, and where the card was. */
   const askedBy = Effect.fn("KanbanService.askedBy")(function* (card: KanbanCard) {
@@ -1612,6 +1723,17 @@ const make = Effect.gen(function* () {
       yield* saveCard(next);
       return;
     }
+    const refused = modelProblem(yield* providerRegistry.getProviders, dispatch.model);
+    if (refused !== null) {
+      const reason = `Model refused: ${refused}`;
+      const next = { ...card, stalled: { reason, by: system, at }, updatedAt: at };
+      yield* logEvent(next, system, "flagged", { body: reason });
+      yield* saveCard(next);
+      yield* noteDiscussion(card, Briefs.modelRefusedText(card, refused)).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("kanban model note failed", { cause })),
+      );
+      return;
+    }
     const goal = yield* goalOf(card);
     // A fresh start leaves the old work thread to its cards in another pool.
     const existing = dispatch.fresh
@@ -1754,6 +1876,9 @@ const make = Effect.gen(function* () {
       const other = id === card?.id ? card : yield* store.card(id);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
+    // A run that failed (the provider refused the model or variant, or a route is gone)
+    // would only loop on a nudge, so the failure is read first and nothing is nudged.
+    const failure = yield* threads.lastFailure(threadId);
     // Discussions the thread evaluates, or is still typing or owing in after
     // being told something there (which the link and card don't name).
     for (const discussion of yield* store.discussions(link.boardId)) {
@@ -1773,7 +1898,16 @@ const make = Effect.gen(function* () {
         continue;
       }
       if (yield* isHome(discussion, threadId)) {
-        yield* settleParticipant(discussion, threadId);
+        // A failed run gets no discussion nudge: it would start another run on the same selection.
+        if (failure === null) yield* settleParticipant(discussion, threadId);
+        else if (participant && pending) {
+          yield* saveDiscussion(
+            withParticipant(discussion, participant.actor, participant.name, {
+              owes: null,
+              typingUntil: null,
+            }),
+          );
+        }
         continue;
       }
       // Told something here, not put in charge: its typing ends without a nudge.
@@ -1805,6 +1939,31 @@ const make = Effect.gen(function* () {
         yield* kick;
         return;
       }
+      if (failure !== null) {
+        const reason = `Run failed: ${failure.message}`;
+        for (const entry of carried) {
+          const next: KanbanCard = {
+            ...release(entry),
+            stage: "todo",
+            stalled: { reason, by: system, at },
+            nudgedAt: null,
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(next, system, "flagged", {
+            fromStage: entry.stage,
+            toStage: "todo",
+            body: reason,
+          });
+          yield* saveCard(next);
+          yield* noteDiscussion(
+            next,
+            Briefs.runFailedText(next, "work", failure.message, "todo"),
+          ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban run note failed", { cause })));
+        }
+        yield* kick;
+        return;
+      }
       // A worker may be waiting on CI or a deploy, so it keeps its slot; the
       // stalled sweep looks at idle Working cards. It hears once per card.
       const unnudged = carried.filter((entry) => entry.nudgedAt === null);
@@ -1815,6 +1974,29 @@ const make = Effect.gen(function* () {
     }
     if (!card) return;
     if (card.activeThreadId !== threadId) {
+      yield* kick;
+      return;
+    }
+    if (failure !== null) {
+      const reason = `Run failed: ${failure.message}`;
+      const next: KanbanCard = {
+        ...release(card),
+        stage: "needs_review",
+        stalled: { reason, by: system, at },
+        nudgedAt: null,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(next, system, "flagged", {
+        fromStage: card.stage,
+        toStage: next.stage,
+        body: reason,
+      });
+      yield* saveCard(next);
+      yield* noteDiscussion(
+        next,
+        Briefs.runFailedText(next, "review", failure.message, "needs_review"),
+      ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban run note failed", { cause })));
       yield* kick;
       return;
     }
@@ -2030,6 +2212,7 @@ const make = Effect.gen(function* () {
           reviewChains: [],
           defaultReviewChain: null,
           instructions: Defaults.DEFAULT_INSTRUCTIONS,
+          setup: null,
           createdAt: yield* nowIso,
           archivedAt: null,
         };
@@ -2044,6 +2227,12 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const next: KanbanBoard = { ...board, ...patch };
+        if (patch.managerModel) yield* checkModel(patch.managerModel);
+        if (patch.evaluatorModel) yield* checkModel(patch.evaluatorModel);
+        if (patch.defaultCardModel) yield* checkModel(patch.defaultCardModel);
+        for (const chain of patch.reviewChains ?? []) {
+          for (const step of chain.steps) yield* checkModel(step);
+        }
         const pools = missingPools(yield* store.pools(board.id), boardModels(next));
         yield* store.putBoardWithPools(next, pools);
         if (pools.length > 0) {
@@ -2870,6 +3059,7 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         yield* boardOf(boardId);
+        yield* checkModel(model);
         const key = Rules.poolKey(model);
         yield* store.putPool(boardId, { key, model, slots: Math.max(0, Math.round(slots)) });
         const pools = yield* store.pools(boardId);
@@ -3200,6 +3390,7 @@ const make = Effect.gen(function* () {
     markRead,
     wiki: (boardId) => read(store.wiki(boardId)),
     writeWiki,
+    endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
     startEvaluator: (boardId, purpose, text) =>
       guard(
         Effect.gen(function* () {

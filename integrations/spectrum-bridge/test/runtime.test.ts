@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApi } from "../src/api.ts";
 import type { Access } from "../src/chats.ts";
-import { chatKey, type Line, type LineInbound } from "../src/line.ts";
+import { chatKey, GROUP_APP_REFUSAL, type Line, type LineInbound } from "../src/line.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
@@ -120,6 +120,19 @@ describe("recipient app cards", () => {
     expect(moniChat.store.pendingOutbox()).toHaveLength(2);
     expect((await post({ ...body, to: "owner" })).status).toBe(202);
     expect(chats.owner.store.pendingOutbox()[0]!.id).not.toBe(first.body.id);
+  });
+
+  test("app cards are refused for group chats, with --to and without it", async () => {
+    const { chats, post } = api();
+    const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
+    group.store.set("route", { id: "ses_group", generation: 3 });
+    const refused = await post({ ...card, to: group.info.slug, dedupeKey: "ride-1", sessionId: "ses_owner@1" });
+    expect(refused.status).toBe(422);
+    expect(refused.body).toEqual({ error: GROUP_APP_REFUSAL } as never);
+    expect(group.store.pendingOutbox()).toEqual([]);
+    const direct = await post({ ...card, dedupeKey: "ride-2", sessionId: "ses_group@3" });
+    expect(direct.status).toBe(422);
+    expect(group.store.pendingOutbox()).toEqual([]);
   });
 
   test("without --to cards still bind to the calling chat and its generation", async () => {

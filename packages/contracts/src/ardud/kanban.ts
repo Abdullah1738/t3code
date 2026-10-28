@@ -464,6 +464,19 @@ export const KanbanBoardIconImage = Schema.String.check(
   Schema.isPattern(/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/),
 );
 
+/**
+ * A board's first setup: the setup evaluator backfills the wiki while card work
+ * is held. Null on boards that never ran one (existing rows decode as null).
+ */
+export const KanbanBoardSetup = Schema.Struct({
+  status: Schema.Literals(["running", "done"]),
+  discussionId: KanbanDiscussionId,
+  threadId: ThreadId,
+  startedAt: IsoDateTime,
+  finishedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanBoardSetup = typeof KanbanBoardSetup.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -480,6 +493,7 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   instructions: KanbanInstructions,
+  setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });

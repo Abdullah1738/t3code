@@ -9,7 +9,10 @@ type DiscussionPatch = Omit<KanbanDiscussionUpdateInput, "discussionId">;
 
 /** What a discussion's menu offers, from where it sits now. */
 export type DiscussionMenuItem =
-  | { readonly id: "settle" | "unsettle" | "unsnooze" | "rename"; readonly title: string }
+  | {
+      readonly id: "settle" | "unsettle" | "unsnooze" | "pin" | "unpin" | "rename";
+      readonly title: string;
+    }
   | {
       readonly id: "snooze";
       readonly title: string;
@@ -27,6 +30,7 @@ export const CUSTOM_SNOOZE = "snooze-custom";
 export function discussionMenu(input: {
   readonly settled: boolean;
   readonly snoozed: boolean;
+  readonly pinned: boolean;
   readonly now: Date;
 }): ReadonlyArray<DiscussionMenuItem> {
   const items: DiscussionMenuItem[] = [];
@@ -46,6 +50,8 @@ export function discussionMenu(input: {
         { id: CUSTOM_SNOOZE, title: "Custom…", subtitle: "Pick a date and time" },
       ],
     });
+  if (input.pinned) items.push({ id: "unpin", title: "Unpin" });
+  else items.push({ id: "pin", title: "Pin" });
   items.push({ id: "rename", title: "Rename" });
   return items;
 }
@@ -55,6 +61,8 @@ export const MENU_ICONS = {
   unsettle: "arrow.uturn.backward",
   snooze: "clock",
   unsnooze: "clock",
+  pin: "pin",
+  unpin: "pin.slash",
   rename: "square.and.pencil",
 } as const;
 
@@ -102,6 +110,12 @@ export function runDiscussionMenu(input: {
       return;
     case "unsnooze":
       void update(boardId, discussionId, { snoozedUntil: null }, "Could not unsnooze");
+      return;
+    case "pin":
+      void update(boardId, discussionId, { pinned: true }, "Could not pin");
+      return;
+    case "unpin":
+      void update(boardId, discussionId, { pinned: false }, "Could not unpin");
       return;
     case "rename":
       renameDiscussion(boardId, discussionId, input.title);

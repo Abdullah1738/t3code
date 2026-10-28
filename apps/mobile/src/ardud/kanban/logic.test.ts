@@ -8,9 +8,11 @@ import {
   choiceView,
   COLUMNS_MIN_WIDTH,
   defaultBoardTab,
+  filterActionId,
   kanbanLinkTarget,
   kanbanRecordState,
   nextTypingExpiry,
+  parseFilterAction,
   priorityFill,
   firstSendText,
   groupBlockRuns,
@@ -305,5 +307,27 @@ describe("groupBlockRuns", () => {
       { kind: "block", index: 3, block: blocks[3] },
       { kind: "attachments", index: 4, attachments: [photo] },
     ]);
+  });
+});
+
+describe("parseFilterAction", () => {
+  it("reads back every id filterActionId writes", () => {
+    const actions = [
+      { kind: "toggle", facet: "priorities", value: 2 },
+      { kind: "toggle", facet: "goalIds", value: "goal-1" },
+      { kind: "toggle", facet: "projects", value: "" },
+      { kind: "toggle", facet: "models", value: "Opus" },
+      { kind: "clear" },
+    ] as const;
+    for (const action of actions) {
+      expect(parseFilterAction(filterActionId(action))).toEqual(action);
+    }
+  });
+
+  it("rejects priorities outside 1-5 and unknown keys", () => {
+    expect(parseFilterAction("priority:9")).toBeNull();
+    expect(parseFilterAction("priority:x")).toBeNull();
+    expect(parseFilterAction("colour:red")).toBeNull();
+    expect(parseFilterAction("nothing")).toBeNull();
   });
 });

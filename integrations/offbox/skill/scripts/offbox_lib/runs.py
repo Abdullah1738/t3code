@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -22,6 +23,9 @@ ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVA
              "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
              "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "RUST_BACKTRACE", "CARGO_TERM_COLOR", "TERM")
 ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "SESSION", "COOKIE", "AUTH")
+# Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
+DOCKER_HOOK_B64 = base64.b64encode(
+    (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -162,6 +166,61 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     sudo -n rm -rf -- "$_offbox_dir" || _offbox_fail "cannot remove stale staging directory $_offbox_dir"
   done
 ) || { echo offbox-setup-failed >&2; exit 97; }'''
+
+# boat.dev (28 Oct 2026) runs /usr/local/bin/sync-docker-firewall after dockerd starts (docker.service.d drop-in).
+# Boxes resumed from older snapshots can lack it, and systemd then kills dockerd (203/EXEC). Never fails the run.
+DOCKER_REPAIR = r'''(
+  grep -qsF /usr/local/bin/sync-docker-firewall /etc/systemd/system/docker.service.d/*.conf || exit 0
+  if [ ! -x /usr/local/bin/sync-docker-firewall ]; then
+    echo 'offbox: restoring boat docker hook /usr/local/bin/sync-docker-firewall' >&2
+    _offbox_t=$(mktemp) || exit 0
+    printf '%s' '__HOOK_B64__' | base64 -d > "$_offbox_t" &&
+      sudo -n install -m 755 "$_offbox_t" /usr/local/bin/sync-docker-firewall ||
+      echo 'offbox: could not restore the docker hook' >&2
+    rm -f "$_offbox_t"
+  fi
+  # Every systemctl call is bounded: a stalled start must not hold up the user's command.
+  if timeout 10 systemctl is-failed --quiet docker 2>/dev/null; then
+    echo 'offbox: docker had failed; restarting it' >&2
+    sudo -n timeout 10 systemctl reset-failed docker 2>/dev/null
+    sudo -n timeout "${OFFBOX_DOCKER_TIMEOUT:-90}" systemctl start docker ||
+      { echo 'offbox: docker still fails to start (or timed out):' >&2; timeout 10 systemctl status docker --no-pager -n 5 >&2; }
+  fi
+) || true'''.replace('__HOOK_B64__', DOCKER_HOOK_B64)
+
+# A boat resume can bring back an /etc/ld.so.cache that lacks libraries installed on the box (libpq5 on
+# 28 Oct), so ctypes.util.find_library and psycopg fail. Rebuild the cache; never fails the run.
+LDCACHE_REPAIR = r'''(
+  [ -x /sbin/ldconfig ] || exit 0
+  _offbox_skip="$HOME/.offbox/ldcache-uncached"
+  _offbox_missing() (
+    for _offbox_lib in /usr/lib/lib*.so.* /usr/lib/*-linux-gnu/lib*.so.*; do
+      [ -L "$_offbox_lib" ] && [ -e "$_offbox_lib" ] && printf '%s\n' "${_offbox_lib##*/}"
+    done | LC_ALL=C grep -E '\.so\.[0-9]+$' | LC_ALL=C sort -u |
+      LC_ALL=C comm -13 <(LC_ALL=C /sbin/ldconfig -p 2>/dev/null | awk 'NR > 1 { print $1 }' | LC_ALL=C sort -u) - |
+      LC_ALL=C comm -23 - <(LC_ALL=C sort -u "$_offbox_skip" 2>/dev/null)
+  )
+  _offbox_before=$(_offbox_missing)
+  [ -n "$_offbox_before" ] || exit 0
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/tmp/offbox-ldcache.lock && flock -x -w 60 9 || exit 0
+    _offbox_before=$(_offbox_missing)
+    [ -n "$_offbox_before" ] || exit 0
+  fi
+  if ! sudo -n /sbin/ldconfig >/dev/null 2>&1; then
+    echo "offbox: linker cache lacks $(printf '%s\n' "$_offbox_before" | head -n 3 | tr '\n' ' ')and sudo -n ldconfig failed; put 'sudo ldconfig;' before your command" >&2
+    exit 0
+  fi
+  _offbox_after=$(_offbox_missing)
+  _offbox_fixed=$(LC_ALL=C comm -23 <(printf '%s\n' "$_offbox_before") <(printf '%s\n' "$_offbox_after"))
+  if [ -n "$_offbox_fixed" ]; then
+    echo "offbox: linker cache lacked $(printf '%s\n' "$_offbox_fixed" | head -n 3 | tr '\n' ' ')- ran ldconfig" >&2
+  fi
+  # Links ldconfig never caches (file name is not the library's soname) must not rerun it each time.
+  if [ -n "$_offbox_after" ]; then
+    mkdir -p "${_offbox_skip%/*}" && printf '%s\n' "$_offbox_after" >> "$_offbox_skip"
+  fi
+) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
@@ -348,6 +407,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              DOCKER_REPAIR,
+              LDCACHE_REPAIR,
               '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,

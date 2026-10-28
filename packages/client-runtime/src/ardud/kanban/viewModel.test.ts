@@ -245,6 +245,34 @@ describe("stageBoard", () => {
     expect(numbers("needs_review")).toEqual([6, 5]);
   });
 
+  it("says a card waits on setup while the board's setup runs, and not after it ends", () => {
+    const setup = (status: "running" | "done") => ({
+      status,
+      discussionId: "disc-setup",
+      threadId: "t-setup",
+      startedAt: "2026-10-25T09:00:00.000Z",
+      finishedAt: status === "done" ? "2026-10-25T10:00:00.000Z" : null,
+    });
+    const withSetup = (status: "running" | "done", cards: KanbanCard[]) => {
+      const snap = snapshot(cards);
+      return boardStateFromSnapshot({
+        ...snap,
+        board: { ...snap.board, setup: setup(status) },
+      } as KanbanBoardSnapshot);
+    };
+    const flagOf = (state: ReturnType<typeof withSetup>, n: number) =>
+      stageBoard(state, NOW)
+        .active.flatMap((column) => column.cards)
+        .find((c) => c.number === n)!.flag;
+
+    const waiting = card(1, { priority: 1 });
+    const running = card(2, { priority: 1, stage: "working", activeThreadId: "t-work" as never });
+    const duringSetup = withSetup("running", [waiting, running]);
+    expect(flagOf(duringSetup, 1)).toEqual({ kind: "blocked", label: "Setup is running" });
+    expect(flagOf(duringSetup, 2)).toBeNull();
+    expect(flagOf(withSetup("done", [waiting, running]), 1)).toBeNull();
+  });
+
   it("counts a card's subtasks, and flags one waiting on the evaluator's step", () => {
     const subtask = (
       id: string,
@@ -435,6 +463,55 @@ describe("discussions", () => {
       "later",
       "plain",
     ]);
+  });
+
+  it("puts pinned discussions in their own group and can hide card discussions", () => {
+    const named = (id: string, patch: Partial<KanbanDiscussion>) =>
+      ({ ...discussion(1, 1), id, title: id, ...patch }) as KanbanDiscussion;
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [
+      named("plain", {}),
+      named("pinned", { pinnedAt: "2026-10-25T10:00:00.000Z" }),
+      // Settled wins over a pin on the record.
+      named("parked-pinned", {
+        pinnedAt: "2026-10-25T10:00:00.000Z",
+        settledAt: "2026-10-25T11:30:00.000Z",
+      }),
+      named("snoozed-pinned", {
+        pinnedAt: "2026-10-25T10:00:00.000Z",
+        snoozedUntil: "2026-10-25T15:00:00.000Z",
+      }),
+      named("card-chat", { cardId: "card-1" as KanbanDiscussion["cardId"] }),
+      named("channel", { cardId: null }),
+    ]);
+    const ids = (rows: ReadonlyArray<{ id: string }>) => rows.map((row) => row.id).sort();
+    const groups = discussionRows(state, NOW);
+    expect(ids(groups.pinned)).toEqual(["pinned"]);
+    expect(ids(groups.settled)).toEqual(["parked-pinned"]);
+    expect(ids(groups.snoozed)).toEqual(["snoozed-pinned"]);
+    expect(ids(groups.active)).toEqual(["card-chat", "channel", "plain"]);
+
+    const hidden = discussionRows(state, NOW, { hideCards: true });
+    const visible = [
+      ...hidden.pinned,
+      ...hidden.active,
+      ...hidden.snoozed,
+      ...hidden.settled,
+    ].map((row) => row.id);
+    expect(visible).not.toContain("card-chat");
+    expect(visible).toContain("channel");
+    expect(ids(hidden.active)).toEqual(["channel", "plain"]);
+  });
+
+  it("keeps only unread discussions with unreadOnly", () => {
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [discussion(3, 1)]);
+    state = withDiscussions(state, [], [message(3, false, "Window?")]);
+    expect(discussionRows(state, NOW, { unreadOnly: true }).active.map((row) => row.id)).toEqual([
+      "disc-1",
+    ]);
+    state = withOwnerRead(state, "disc-1", 3);
+    expect(discussionRows(state, NOW, { unreadOnly: true }).active).toEqual([]);
   });
 
   it("searches discussions by title and latest message", () => {

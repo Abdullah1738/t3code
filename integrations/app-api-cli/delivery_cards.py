@@ -771,7 +771,7 @@ def sync(cfg, data, *, send=False):
     with statepath.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read(statepath)
-        recipient = settings.get('chat') or cfg['for']
+        recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
         public_slug = slug(cfg['app'], cfg['order'])
@@ -871,7 +871,7 @@ def sync(cfg, data, *, send=False):
 def repair_link(cfg, data):
     """Explicit replacement for a confirmed-sent link; never a progress ping."""
     settings = cfg.get('delivery_card', {})
-    recipient = settings.get('chat') or cfg.get('for')
+    recipient = settings.get('chat') or cfg.get('chat') or cfg.get('for')
     if recipient == 'owner' or settings.get('held') or settings.get('skip_send'):
         raise ValueError('public_sent_card_required')
     path = ROOT / 'cards' / (cfg['watcher'] + '.json')

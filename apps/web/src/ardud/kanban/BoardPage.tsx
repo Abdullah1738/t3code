@@ -1,27 +1,29 @@
-import {
-  ArchiveIcon,
-  ChevronDownIcon,
-  ListFilterIcon,
-  PlusIcon,
-  SearchIcon,
-  XIcon,
-} from "lucide-react";
+import { ArchiveIcon, ChevronDownIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+import * as Schema from "effect/Schema";
 import { useState } from "react";
 
 import {
-  activeGoals,
+  boardFilter,
+  clearFilters,
+  EMPTY_FILTER_PREFS,
+  sanitizeBoardFilterPrefs,
+  type BoardFilterPrefs,
   type GroupBy,
   type KanbanBoardState,
   type SettledFilter,
+  setupBanner,
 } from "@t3tools/client-runtime/ardud/kanban";
 
 import {
   Menu,
+  MenuItem,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { useLocalStorage } from "../../hooks/useLocalStorage";
+import { BoardFilterMenu } from "./BoardFilterMenu";
 import { SidebarInset } from "../../components/ui/sidebar";
 import {
   WorkspaceBreadcrumb,
@@ -40,7 +42,7 @@ import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
-import { kanban, kanbanErrorMessage, useBoardState, useFeed } from "./kanbanStore";
+import { kanban, kanbanErrorMessage, runAction, useBoardState, useFeed } from "./kanbanStore";
 import { KanbanLinksProvider } from "./links";
 import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
@@ -51,6 +53,16 @@ import "./kanban.css";
 
 /** Keys set to undefined are dropped from the URL. */
 type SearchPatch = { readonly [K in keyof BoardSearch]?: BoardSearch[K] | undefined };
+
+const BoardFilterPrefsSchema = Schema.Struct({
+  priorities: Schema.Array(Schema.Number),
+  goalIds: Schema.Array(Schema.String),
+  projects: Schema.Array(Schema.String),
+  models: Schema.Array(Schema.String),
+  settled: Schema.Literals(["hide", "only", "include"]),
+});
+
+const filterStorageKey = (boardId: string) => `t3code:ardud-boards:filters:${boardId}`;
 
 const GROUP_OPTIONS: ReadonlyArray<{ value: GroupBy; label: string }> = [
   { value: "stage", label: "Stage" },
@@ -71,7 +83,13 @@ export function BoardPage(props: {
   const view = search.view ?? "board";
   const nowMs = useNowMs();
   const [query, setQuery] = useState("");
-  const [settled, setSettled] = useState<SettledFilter>("hide");
+  const [storedPrefs, setPrefs] = useLocalStorage(
+    filterStorageKey(boardId),
+    EMPTY_FILTER_PREFS,
+    BoardFilterPrefsSchema,
+  );
+  const prefs = sanitizeBoardFilterPrefs(storedPrefs);
+  const setFilters = (next: BoardFilterPrefs) => setPrefs(next);
 
   const go = (patch: SearchPatch) => {
     const next: Record<string, unknown> = { ...search, ...patch };
@@ -87,6 +105,7 @@ export function BoardPage(props: {
   // The page behind an open drawer is out of reach, but only while one shows:
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
+  const setup = state ? setupBanner(state.board) : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -127,8 +146,8 @@ export function BoardPage(props: {
               go={go}
               query={query}
               onQuery={setQuery}
-              settled={settled}
-              onSettled={setSettled}
+              prefs={prefs}
+              onPrefs={setFilters}
             />
           ) : (
             <span className="flex-1" />
@@ -162,6 +181,21 @@ export function BoardPage(props: {
               ) : null
             ) : (
               <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
+                {setup ? (
+                  <SetupBanner
+                    label={setup.label}
+                    onView={() =>
+                      go({
+                        view: "discussions",
+                        discussion: setup.discussionId,
+                        card: undefined,
+                      })
+                    }
+                    onEnd={() =>
+                      void runAction("Couldn't end setup", () => kanban.endSetup(boardId))
+                    }
+                  />
+                ) : null}
                 {feed.failure ? (
                   <div
                     role="status"
@@ -184,7 +218,8 @@ export function BoardPage(props: {
                   state={state}
                   search={search}
                   query={query}
-                  settled={settled}
+                  prefs={prefs}
+                  onPrefs={setFilters}
                   nowMs={nowMs}
                   go={go}
                   openCard={openCard}
@@ -214,19 +249,15 @@ function BoardBody(props: {
   state: KanbanBoardState;
   search: BoardSearch;
   query: string;
-  settled: SettledFilter;
+  prefs: BoardFilterPrefs;
+  onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
 }) {
   const { state, search, nowMs, go } = props;
-  const query = props.query.trim();
-  const filter = {
-    ...(search.only ? { goalId: search.only } : {}),
-    ...(query ? { query } : {}),
-    settled: props.settled,
-  };
+  const filter = boardFilter(state, props.prefs, props.query.trim());
   switch (search.view ?? "board") {
     case "board":
       return (
@@ -237,6 +268,7 @@ function BoardBody(props: {
             nowMs={nowMs}
             group={search.group ?? "stage"}
             filter={filter}
+            onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
             selectedCardId={search.card}
             onOpenCard={props.openCard}
             onOpenGoal={props.openGoal}
@@ -303,13 +335,13 @@ function BoardControls(props: {
   go: (patch: SearchPatch) => void;
   query: string;
   onQuery: (query: string) => void;
-  settled: SettledFilter;
-  onSettled: (settled: SettledFilter) => void;
+  prefs: BoardFilterPrefs;
+  onPrefs: (prefs: BoardFilterPrefs) => void;
 }) {
   const narrow = useMediaQuery("max-md");
-  const goals = activeGoals(props.state);
-  const only = props.search.only ? props.state.goals.get(props.search.only) : undefined;
   const group = props.search.group ?? "stage";
+  const settled = props.prefs.settled;
+  const setSettled = (next: SettledFilter) => props.onPrefs({ ...props.prefs, settled: next });
   const setGroup = (next: GroupBy) => props.go({ group: next === "stage" ? undefined : next });
   return (
     <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -341,39 +373,12 @@ function BoardControls(props: {
         <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
       )}
       {group === "stage" ? <BoardColumnsMenu boardId={props.boardId} /> : null}
-      {goals.length > 0 ? (
-        <Menu>
-          <MenuTrigger
-            render={
-              <button
-                type="button"
-                className={cn(
-                  "inline-flex h-8 max-w-48 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
-                  only
-                    ? "bg-(--m-text) text-(--m-ground)"
-                    : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
-                )}
-              />
-            }
-          >
-            <ListFilterIcon className="size-3.5 shrink-0" aria-hidden />
-            <span className="truncate max-md:sr-only">{only?.name ?? "Filter"}</span>
-          </MenuTrigger>
-          <MenuPopup align="start" side="bottom">
-            <MenuRadioGroup
-              value={props.search.only ?? ""}
-              onValueChange={(value) => props.go({ only: value ? String(value) : undefined })}
-            >
-              <MenuRadioItem value="">All goals</MenuRadioItem>
-              {goals.map((entry) => (
-                <MenuRadioItem key={entry.goal.id} value={entry.goal.id}>
-                  {entry.goal.name}
-                </MenuRadioItem>
-              ))}
-            </MenuRadioGroup>
-          </MenuPopup>
-        </Menu>
-      ) : null}
+      <BoardFilterMenu
+        state={props.state}
+        prefs={props.prefs}
+        narrow={narrow}
+        onChange={props.onPrefs}
+      />
       <Menu>
         <MenuTrigger
           render={
@@ -382,7 +387,7 @@ function BoardControls(props: {
               aria-label="Settled cards"
               className={cn(
                 "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
-                props.settled !== "hide"
+                settled !== "hide"
                   ? "bg-(--m-text) text-(--m-ground)"
                   : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
               )}
@@ -390,14 +395,12 @@ function BoardControls(props: {
           }
         >
           <ArchiveIcon className="size-3.5 shrink-0" aria-hidden />
-          <span className="max-md:sr-only">
-            {props.settled === "only" ? "Settled only" : "Settled"}
-          </span>
+          <span className="max-md:sr-only">{settled === "only" ? "Settled only" : "Settled"}</span>
         </MenuTrigger>
         <MenuPopup align="start" side="bottom">
           <MenuRadioGroup
-            value={props.settled}
-            onValueChange={(value) => props.onSettled(value as SettledFilter)}
+            value={settled}
+            onValueChange={(value) => setSettled(value as SettledFilter)}
           >
             <MenuRadioItem value="hide">Hide settled</MenuRadioItem>
             <MenuRadioItem value="include">Show settled</MenuRadioItem>
@@ -454,6 +457,37 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
       >
         <XIcon className="size-3.5" />
       </button>
+    </div>
+  );
+}
+
+/** Every board view shows this while the board's first setup runs; the menu ends it for the owner. */
+function SetupBanner(props: { label: string; onView: () => void; onEnd: () => void }) {
+  return (
+    <div className="me-5 mb-3 flex items-center gap-2 rounded-xl bg-(--m-warnband) ps-3.5 pe-1.5 py-1.5 text-sm">
+      <button
+        type="button"
+        onClick={props.onView}
+        className="min-w-0 flex-1 truncate text-start font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
+        {props.label}
+      </button>
+      <Menu>
+        <MenuTrigger
+          render={
+            <button
+              type="button"
+              aria-label="Setup actions"
+              className="grid size-7 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+            />
+          }
+        >
+          <span aria-hidden>···</span>
+        </MenuTrigger>
+        <MenuPopup align="end" side="bottom">
+          <MenuItem onClick={props.onEnd}>End setup</MenuItem>
+        </MenuPopup>
+      </Menu>
     </div>
   );
 }

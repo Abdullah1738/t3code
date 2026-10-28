@@ -1,10 +1,20 @@
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { AsyncResult } from "effect/reactivity";
 import {
+  activeFilterCount,
   activeGoals,
+  boardFilter,
+  clearFilters,
+  filterFacets,
+  sanitizeBoardFilterPrefs,
+  setupBanner,
   stageBoard,
+  toggleFilterValue,
+  type BoardFilterPrefs,
   type CardView,
+  type SetupBannerView,
   type GoalSummary,
   type KanbanBoardState,
-  type SettledFilter,
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -12,8 +22,11 @@ import { Fragment, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
+import { Menu } from "../../components/ui/Menu";
 import { SearchField } from "../../components/ui/SearchField";
 import { cn } from "../../lib/cn";
+import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import { confirmAction } from "../common/hooks";
 import { ChoiceRow, LinkButton } from "../common/parts";
 import {
   BOARD_PAD,
@@ -22,11 +35,59 @@ import {
   boardTabs,
   COLUMN_GAP,
   defaultBoardTab,
+  filterActionId,
+  parseFilterAction,
+  type FilterAction,
 } from "./logic";
 import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts";
 
 // Needs Owner cards shown above the tabs before "All N" opens the rest.
 const OWNER_PREVIEW = 2;
+
+/**
+ * Shown on every board view while the board's first setup runs. The main action
+ * only opens the Setup discussion; ending setup is behind the actions menu and a
+ * confirmation, because it releases the board-wide hold.
+ */
+export function SetupStrip(props: {
+  readonly setup: SetupBannerView;
+  readonly onViewSetup: (discussionId: string) => void;
+  readonly onEndSetup: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  return (
+    <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
+      <LinkButton
+        label={props.setup.label}
+        accessibilityLabel={props.setup.label}
+        onPress={() => props.onViewSetup(props.setup.discussionId)}
+      />
+      <LinkButton
+        label="Setup actions"
+        accessibilityLabel="Setup actions"
+        expanded={menuOpen}
+        onPress={() => setMenuOpen((open) => !open)}
+      />
+      {menuOpen ? (
+        <LinkButton
+          label="End setup"
+          accessibilityLabel="End setup"
+          onPress={() => {
+            setMenuOpen(false);
+            confirmAction({
+              title: "End setup?",
+              message:
+                "Card work and review resume on this board. The setup evaluator's remaining work stops being held.",
+              confirmLabel: "End setup",
+              destructive: true,
+              onConfirm: props.onEndSetup,
+            });
+          }}
+        />
+      ) : null}
+    </View>
+  );
+}
 
 /**
  * The board: Needs Owner first, then the stages. A phone shows one stage at a
@@ -41,17 +102,46 @@ export function BoardView(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
   readonly onOpenGoal: (goalId: string) => void;
+  /** Opens the board's Setup discussion; shown only while setup runs. */
+  readonly onViewSetup: (discussionId: string) => void;
+  readonly onEndSetup: () => void;
 }) {
   const goals = activeGoals(props.state);
-  const [goalId, setGoalId] = useState<string | null>(null);
-  // A goal that finished or vanished stops filtering.
-  const filter = goals.some((entry) => entry.goal.id === goalId) ? goalId : null;
+  const boardId = props.state.board.id;
+  const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const storedFilters = AsyncResult.isSuccess(preferencesResult)
+    ? preferencesResult.value.kanbanBoardFilters
+    : undefined;
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const prefs = sanitizeBoardFilterPrefs(storedFilters?.[boardId]);
+  const setPrefs = (next: BoardFilterPrefs) =>
+    savePreferences({
+      transform: (current) => ({
+        kanbanBoardFilters: { ...current.kanbanBoardFilters, [boardId]: next },
+      }),
+    });
+  const setup = setupBanner(props.state.board);
   const [query, setQuery] = useState("");
-  const [settled, setSettled] = useState<SettledFilter>("hide");
   const searchRef = useRef<TextInputInstance | null>(null);
-  const board = stageBoard(props.state, props.nowMs, { goalId: filter, query, settled });
+  const filter = boardFilter(props.state, prefs, query.trim());
+  const pickedGoalIds = filter.goalIds ?? [];
+  const board = stageBoard(props.state, props.nowMs, filter);
+  const picked = activeFilterCount(prefs);
+  const menuActions = filterMenuActions(props.state, prefs);
+  const onFilterAction = (id: string) => {
+    const action = parseFilterAction(id);
+    if (action === null) return;
+    setPrefs(applyFilterAction(prefs, action));
+  };
   const filterRow = (
     <View className="gap-2.5">
+      {setup ? (
+        <SetupStrip
+          setup={setup}
+          onViewSetup={props.onViewSetup}
+          onEndSetup={props.onEndSetup}
+        />
+      ) : null}
       <View className="flex-row items-center gap-2">
         <SearchField
           inputRef={searchRef}
@@ -62,6 +152,31 @@ export function BoardView(props: {
           value={query}
           onChangeText={setQuery}
         />
+        <Menu
+          accessibilityLabel="Filter cards"
+          shouldOpenOnLongPress={false}
+          title="Filter"
+          actions={menuActions}
+          onPressAction={({ nativeEvent }) => onFilterAction(nativeEvent.event)}
+        >
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={picked > 0 ? `Filter, ${picked} picked` : "Filter"}
+            className={cn(
+              "min-h-11 justify-center rounded-full px-4",
+              picked > 0 ? "bg-foreground" : "bg-grouped-card",
+            )}
+          >
+            <Text
+              className={cn(
+                "text-[13px] font-t3-semibold",
+                picked > 0 ? "text-screen" : "text-foreground",
+              )}
+            >
+              {picked > 0 ? `Filter · ${picked}` : "Filter"}
+            </Text>
+          </Pressable>
+        </Menu>
       </View>
       <ChoiceRow
         accessibilityLabel="Settled cards"
@@ -70,20 +185,9 @@ export function BoardView(props: {
           { value: "include", label: "Show settled" },
           { value: "only", label: "Only settled" },
         ]}
-        selected={settled}
-        onSelect={setSettled}
+        selected={prefs.settled}
+        onSelect={(settled) => setPrefs({ ...prefs, settled })}
       />
-      {goals.length > 0 ? (
-        <ChoiceRow
-          accessibilityLabel="Goal"
-          options={[
-            { value: "", label: "All" },
-            ...goals.map((entry) => ({ value: entry.goal.id, label: entry.goal.name })),
-          ]}
-          selected={filter ?? ""}
-          onSelect={(value) => setGoalId(value === "" ? null : value)}
-        />
-      ) : null}
     </View>
   );
 
@@ -92,7 +196,7 @@ export function BoardView(props: {
       <TabsBoard
         board={board}
         filterRow={filterRow}
-        hideGoal={filter !== null}
+        hideGoal={pickedGoalIds.length > 0}
         selectedCardId={props.selectedCardId}
         bottomInset={props.bottomInset}
         onOpenCard={props.onOpenCard}
@@ -102,10 +206,14 @@ export function BoardView(props: {
   return (
     <ColumnsBoard
       board={board}
-      goals={goals}
+      goals={
+        pickedGoalIds.length > 0
+          ? goals.filter((entry) => pickedGoalIds.includes(entry.goal.id))
+          : goals
+      }
       layout={props.layout}
       filterRow={filterRow}
-      hideGoal={filter !== null}
+      hideGoal={pickedGoalIds.length > 0}
       selectedCardId={props.selectedCardId}
       bottomInset={props.bottomInset}
       onOpenCard={props.onOpenCard}
@@ -378,4 +486,40 @@ function GoalStrip(props: {
       ))}
     </ScrollView>
   );
+}
+
+/** Applies one menu pick to the saved prefs. "clear" keeps the settled choice. */
+function applyFilterAction(prefs: BoardFilterPrefs, action: FilterAction): BoardFilterPrefs {
+  if (action.kind === "clear") return clearFilters(prefs);
+  return toggleFilterValue(prefs, action.facet, action.value);
+}
+
+/**
+ * The native menu's entries: one checkable item per option in each facet, with
+ * its count, then "Clear filters" when anything is picked. Ids come from
+ * filterActionId so parseFilterAction reads them back.
+ */
+function filterMenuActions(state: KanbanBoardState, prefs: BoardFilterPrefs) {
+  const actions = filterFacets(state, prefs.settled).map((view) => ({
+    id: `group:${view.facet}`,
+    title: view.label,
+    subactions: view.options.map((option) => {
+      const value = view.facet === "priorities" ? Number(option.value) : option.value;
+      const checked = (prefs[view.facet] as ReadonlyArray<number | string>).includes(value);
+      return {
+        id: filterActionId(
+          view.facet === "priorities"
+            ? { kind: "toggle", facet: "priorities", value: Number(option.value) }
+            : { kind: "toggle", facet: view.facet, value: option.value },
+        ),
+        title: `${option.label} · ${option.count}`,
+        state: checked ? ("on" as const) : ("off" as const),
+        attributes: { keepsMenuPresented: true },
+      };
+    }),
+  }));
+  if (activeFilterCount(prefs) > 0) {
+    return [...actions, { id: filterActionId({ kind: "clear" }), title: "Clear filters" }];
+  }
+  return actions;
 }

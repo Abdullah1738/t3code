@@ -569,3 +569,65 @@ class MinutesOrderTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class OrderChatTests(unittest.TestCase):
+    def setUp(self):
+        temp=tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root=Path(temp.name)
+        self.bridge=self.root/'state.sqlite'
+        p=patch.dict('os.environ',{'SPECTRUM_BRIDGE_DB':str(self.bridge)})
+        p.start();self.addCleanup(p.stop)
+        import os as _os
+        _os.environ.pop('ORDER_WATCH_CHAT',None)  # patch.dict restores the original env on cleanup
+
+    def make_chat(self,slug):
+        store=self.root/'chats'/slug/'state.sqlite'
+        store.parent.mkdir(parents=True,exist_ok=True);store.touch()
+
+    def run_talabat(self,argv):
+        seen={}
+        def lane(args):
+            import os as _os
+            seen['chat']=_os.environ.get('ORDER_WATCH_CHAT')
+            return {'ok':True}
+        out=io.StringIO()
+        with patch.object(c,'purchase_talabat',side_effect=lane), \
+                patch.object(c,'card_preflight',return_value=None), \
+                contextlib.redirect_stdout(out):
+            code=c.main(argv)
+        return code,seen,out.getvalue()
+
+    def test_unknown_chat_refused_before_any_money_step(self):
+        boom=lambda *a,**k: (_ for _ in ()).throw(AssertionError('must not run'))
+        with patch.object(c,'card_preflight',side_effect=boom), patch.object(c,'purchase_talabat',side_effect=boom), \
+                patch.object(c,'require_moni_go',side_effect=boom), contextlib.redirect_stdout(io.StringIO()) as out:
+            code=c.main(['order','talabat','--branch','1','--item','1','--chat','nope'])
+        row=json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(code,2)
+        self.assertEqual((row['error'],row['chat'],row['financial_send'],row['financial_retry']),
+                         ('ORDER_CHAT_UNKNOWN','nope',False,False))
+
+    def test_chat_flag_exports_order_watch_chat_into_the_lane(self):
+        self.make_chat('group-sb_gro')
+        code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--chat','group-sb_gro'])
+        self.assertEqual((code,seen['chat']),(0,'group-sb_gro'))
+
+    def test_moni_chat_is_the_order_chat_for_a_moni_order(self):
+        self.make_chat('group-sb_gro')
+        with patch.object(c,'require_moni_go',return_value=None):
+            code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','moni',
+                                         '--moni-go','ok','--moni-chat','group-sb_gro'])
+        self.assertEqual((code,seen['chat']),(0,'group-sb_gro'))
+
+    def test_explicit_chat_wins_over_moni_chat(self):
+        self.make_chat('group-sb_gro');self.make_chat('moni')
+        with patch.object(c,'require_moni_go',return_value=None):
+            code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','moni',
+                                         '--moni-go','ok','--moni-chat','group-sb_gro','--chat','moni'])
+        self.assertEqual((code,seen['chat']),(0,'moni'))
+
+    def test_owner_order_without_chat_leaves_env_unset(self):
+        code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','owner'])
+        self.assertEqual((code,seen['chat']),(0,None))

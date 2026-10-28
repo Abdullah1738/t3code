@@ -16,6 +16,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
+import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
+import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
+
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { type ControlThreadState, stateFromShell } from "../../control/model.ts";
@@ -64,6 +67,10 @@ export interface KanbanSendInput {
  */
 export interface KanbanThreadsShape {
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
+  /** The root provider failure of the thread's latest executed run, if that run failed. */
+  readonly lastFailure: (
+    threadId: ThreadId,
+  ) => Effect.Effect<OrchestrationV2ProviderFailure | null>;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
   readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
@@ -104,6 +111,14 @@ const make = Effect.gen(function* () {
                       : pr.snapshot.state,
               })),
             },
+      ),
+      Effect.catchCause(() => Effect.succeed(null)),
+    );
+
+  const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
+    threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
+      Effect.map((records) =>
+        latestRootProviderFailure(latestExecutedRun(records.runs), records.turnItems),
       ),
       Effect.catchCause(() => Effect.succeed(null)),
     );
@@ -170,7 +185,7 @@ const make = Effect.gen(function* () {
     Effect.catchCause(() => Effect.void),
   );
 
-  return KanbanThreads.of({ view, launch, send, interrupt });
+  return KanbanThreads.of({ view, lastFailure, launch, send, interrupt });
 });
 
 export const layer = Layer.effect(KanbanThreads, make);
