@@ -35,6 +35,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { useNowMs } from "./useNowMs";
 import { BoardColumns } from "./BoardColumns";
+import { BoardColumnsMenu } from "./BoardColumnsMenu";
 import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
@@ -120,6 +121,7 @@ export function BoardPage(props: {
           </WorkspaceBreadcrumb>
           {view === "board" && state ? (
             <BoardControls
+              boardId={boardId}
               state={state}
               search={search}
               go={go}
@@ -295,6 +297,7 @@ function BoardBody(props: {
 }
 
 function BoardControls(props: {
+  boardId: string;
   state: KanbanBoardState;
   search: BoardSearch;
   go: (patch: SearchPatch) => void;
@@ -337,6 +340,7 @@ function BoardControls(props: {
       ) : (
         <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
       )}
+      {group === "stage" ? <BoardColumnsMenu boardId={props.boardId} /> : null}
       {goals.length > 0 ? (
         <Menu>
           <MenuTrigger
