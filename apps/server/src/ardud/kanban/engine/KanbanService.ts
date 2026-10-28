@@ -1154,10 +1154,22 @@ const make = Effect.gen(function* () {
     }
     const at = yield* nowIso;
     // The setup evaluator talks in a Setup discussion, so the owner has somewhere to read and reply.
-    const setupDiscussion =
-      purpose.kind === "setup"
-        ? yield* newDiscussion(board.id, "Setup", null, { _tag: "system", component: "setup" })
-        : null;
+    // An existing discussion can be adopted as the Setup one (boards set up before this existed).
+    let setupDiscussion: KanbanDiscussion | null = null;
+    if (purpose.kind === "setup") {
+      if (purpose.discussionId) {
+        const existing = yield* discussionOf(KanbanDiscussionId.make(purpose.discussionId));
+        if (existing.boardId !== board.id) {
+          return yield* failWith("invalid", "the Setup discussion must be on this board");
+        }
+        setupDiscussion = existing;
+      } else {
+        setupDiscussion = yield* newDiscussion(board.id, "Setup", null, {
+          _tag: "system",
+          component: "setup",
+        });
+      }
+    }
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
     const threadId = yield* threads.launch({

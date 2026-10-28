@@ -722,7 +722,11 @@ const handlers = {
         let purpose: EvaluatorPurpose;
         if (input.kind === "setup" || input.kind === "request") {
           if (!text) return yield* invalid(`A ${input.kind} evaluator needs text.`);
-          purpose = { kind: input.kind, text };
+          purpose = {
+            kind: input.kind,
+            text,
+            ...(input.kind === "setup" ? { discussionId: input.discussionId ?? null } : {}),
+          };
         } else {
           purpose = { kind: input.kind };
         }

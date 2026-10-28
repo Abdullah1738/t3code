@@ -479,6 +479,8 @@ const EvaluatorStart = tool(
     boardId: TrimmedNonEmptyString,
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
     text: Schema.optional(Schema.String),
+    /** For setup: an existing discussion on this board to use as the Setup discussion. */
+    discussionId: Schema.optional(TrimmedNonEmptyString),
   },
   { threadId: TrimmedNonEmptyString },
   { readonly: false },

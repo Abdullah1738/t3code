@@ -162,7 +162,7 @@ export type EvaluatorPurpose =
   | { readonly kind: "deployed" }
   | { readonly kind: "check" }
   | { readonly kind: "packets" }
-  | { readonly kind: "setup"; readonly text: string }
+  | { readonly kind: "setup"; readonly text: string; readonly discussionId?: string | null }
   | { readonly kind: "request"; readonly text: string };
 
 export const purposeKey = (purpose: EvaluatorPurpose) =>

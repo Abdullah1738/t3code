@@ -1774,6 +1774,48 @@ it.effect("setup_done ends a running setup; only its own thread or the owner may
   }),
 );
 
+it.effect("a setup can adopt an existing discussion as its Setup discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      // An older board discussion, opened before setup existed.
+      const existing = yield* kanban.createDiscussion(board.id, "Robob setup notes", owner);
+      const setup = yield* kanban.startEvaluator(board.id, {
+        kind: "setup",
+        text: "Set it up",
+        discussionId: existing.id,
+      });
+      const running = (yield* kanban.boards).find((b) => b.id === board.id)!;
+      assert.strictEqual(running.setup?.discussionId, existing.id);
+      assert.strictEqual(running.setup?.threadId, setup);
+      assert.strictEqual((yield* kanban.discussion(existing.id)).evaluatorThreadId, setup);
+      // It did not create a second Setup discussion.
+      assert.strictEqual((yield* kanban.discussions(board.id)).length, 1);
+      yield* kanban.endSetup(board.id, owner);
+
+      // A discussion from another board is refused.
+      const other = yield* kanban.ensureBoard({
+        slug: "other",
+        name: "Other",
+        defaultProjectId: ProjectId.make("project-other"),
+      });
+      const foreign = yield* kanban.createDiscussion(other.id, "Elsewhere", owner);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            kanban.startEvaluator(board.id, {
+              kind: "setup",
+              text: "Set it up",
+              discussionId: foreign.id,
+            }),
+          ),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
