@@ -47,7 +47,18 @@ const PullRequestListPreferences = Schema.Struct({
 });
 export type PullRequestListPreferences = typeof PullRequestListPreferences.Type;
 
+const KanbanBoardFilterPrefs = Schema.Struct({
+  priorities: Schema.Array(Schema.Number),
+  goalIds: Schema.Array(Schema.String),
+  projects: Schema.Array(Schema.String),
+  models: Schema.Array(Schema.String),
+  settled: Schema.Literals(["hide", "only", "include"]),
+});
+const KanbanBoardFilters = Schema.Record(Schema.String, KanbanBoardFilterPrefs);
+export type KanbanBoardFilters = typeof KanbanBoardFilters.Type;
+
 const isThreadListFilters = Schema.is(ThreadListFilters);
+const isKanbanBoardFilters = Schema.is(KanbanBoardFilters);
 const isPullRequestListPreferences = Schema.is(PullRequestListPreferences);
 
 export interface Preferences {
@@ -85,6 +96,8 @@ export interface Preferences {
   readonly threadListWorkingShelfExpanded?: boolean;
   readonly threadListFilters?: ThreadListFilters;
   readonly pullRequestListFilters?: PullRequestListPreferences;
+  /** Board filter choices per board id, kept on this device. */
+  readonly kanbanBoardFilters?: KanbanBoardFilters;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -155,6 +168,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListWorkingShelfExpanded?: boolean;
     threadListFilters?: ThreadListFilters;
     pullRequestListFilters?: PullRequestListPreferences;
+    kanbanBoardFilters?: KanbanBoardFilters;
   } = {};
 
   if (typeof parsed.pullRequestHideTestFiles === "boolean") {
@@ -281,6 +295,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (isPullRequestListPreferences(parsed.pullRequestListFilters)) {
     preferences.pullRequestListFilters = parsed.pullRequestListFilters;
+  }
+  if (isKanbanBoardFilters(parsed.kanbanBoardFilters)) {
+    preferences.kanbanBoardFilters = parsed.kanbanBoardFilters;
   }
   return preferences;
 }

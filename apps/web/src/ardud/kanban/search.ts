@@ -31,8 +31,6 @@ export interface BoardSearch {
   /** Goal page under the Goals view. */
   readonly goal?: string;
   readonly group?: GroupBy;
-  /** Goal filter on the board. */
-  readonly only?: string;
 }
 
 function text(value: unknown): string | undefined {
@@ -51,13 +49,11 @@ export function parseBoardSearch(raw: Record<string, unknown>): BoardSearch {
   const discussion = text(raw.discussion);
   const goal = text(raw.goal);
   const group = oneOf(raw.group, GROUPS);
-  const only = text(raw.only);
   return {
     ...(view && view !== "board" ? { view } : {}),
     ...(card ? { card } : {}),
     ...(discussion ? { discussion } : {}),
     ...(goal ? { goal } : {}),
     ...(group && group !== "stage" ? { group } : {}),
-    ...(only ? { only } : {}),
   };
 }
