@@ -26,14 +26,16 @@ class StepScriptTests(unittest.TestCase):
     def run_steps(self, steps):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
-            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'):
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                patch.object(runs, 'LDCACHE_REPAIR', ':'):
                 script = runs.remote_script('w/repo', 'sub', [], None, 'run-test', steps=steps)
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             p = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
             return p.returncode, p.stdout, p.stderr
 
     def test_script_has_one_marker_per_step_and_pipefail(self):
-        with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'):
+        with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                patch.object(runs, 'LDCACHE_REPAIR', ':'):
             script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['true', 'false | cat'])
         self.assertEqual(script.count('offbox step '), 2)
         self.assertEqual(script.count('set -o pipefail'), 2)

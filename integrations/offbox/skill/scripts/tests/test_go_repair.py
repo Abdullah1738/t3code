@@ -390,7 +390,7 @@ class GoRepairTests(unittest.TestCase):
             sudo.chmod(0o755)
             (home / 'w').mkdir()
             env = dict(os.environ, HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
-            with patch.object(runs, 'DOCKER_REPAIR', ':'):
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'):
                 script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test')
             script = script.replace(
                 '/tmp/offbox-go-repair.lock', str(home / 'repair.lock')).replace('/usr/local', str(home / 'usr/local'))
