@@ -4,6 +4,8 @@ import {
   activeGoals,
   groupCards,
   stageBoard,
+  toggleColumn,
+  type BoardColumnKey,
   type BoardFilter,
   type CardView,
   type GroupBy,
@@ -16,11 +18,14 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
 import { CardTile } from "./CardTile";
+import { ColumnResizeHandle, COLUMN_WIDTH_PROPERTY } from "./ColumnResizeHandle";
 import { GoalBar, Glyph, stageGlyph } from "./parts";
+import { useBoardColumnPrefs } from "./useBoardColumnPrefs";
 
 const HIDE_SCROLLBAR = "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden";
 
 export function BoardColumns(props: {
+  boardId: string;
   state: KanbanBoardState;
   nowMs: number;
   group: GroupBy;
@@ -85,54 +90,180 @@ const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 20 + 5 * 10;
 
 function StageGrid(props: ColumnsProps) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
+  const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
+  const widthOf = (key: BoardColumnKey) => prefs.widths[key] ?? null;
+  const setWidth = (key: BoardColumnKey, width: number) =>
+    updatePrefs((current) => ({ ...current, widths: { ...current.widths, [key]: width } }));
+  const resetWidth = (key: BoardColumnKey) =>
+    updatePrefs((current) => {
+      const { [key]: _removed, ...rest } = current.widths;
+      return { ...current, widths: rest };
+    });
+  const toggle = (key: BoardColumnKey) => updatePrefs((current) => toggleColumn(current, key));
+  const hidden = (key: BoardColumnKey) => prefs.hidden.includes(key);
+
+  const activeColumns = board.active.filter((column) => !hidden(column.stage));
+  const shippedHidden = hidden("shipped");
+  const ownerHidden = hidden("needs_owner");
+
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
       <div className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
-        {board.active.map((column) => (
-          <Column key={column.stage} column={column} className="min-w-32 flex-1">
-            {column.cards.map((card) => (
-              <CardTile
-                key={card.id}
-                card={card}
-                selected={card.id === props.selectedCardId}
-                onOpen={props.onOpenCard}
+        {board.active.map((column) =>
+          hidden(column.stage) ? (
+            <HiddenColumnRail
+              key={column.stage}
+              label={column.label}
+              count={column.cards.length}
+              onShow={() => toggle(column.stage)}
+            />
+          ) : (
+            <Column
+              key={column.stage}
+              column={column}
+              className={cn("min-w-32", widthOf(column.stage) === null ? "flex-1" : "shrink-0")}
+              style={columnStyle(widthOf(column.stage))}
+              handle={
+                <ColumnResizeHandle
+                  columnKey={column.stage}
+                  label={column.label}
+                  edge="right"
+                  width={widthOf(column.stage)}
+                  measure={() => measureColumn(column.stage)}
+                  onCommit={(width) => setWidth(column.stage, width)}
+                  onReset={() => resetWidth(column.stage)}
+                />
+              }
+            >
+              {column.cards.map((card) => (
+                <CardTile
+                  key={card.id}
+                  card={card}
+                  selected={card.id === props.selectedCardId}
+                  onOpen={props.onOpenCard}
+                />
+              ))}
+            </Column>
+          ),
+        )}
+        {shippedHidden ? (
+          <HiddenColumnRail
+            label="Shipped"
+            count={board.shipped.reduce((sum, column) => sum + column.cards.length, 0)}
+            onShow={() => toggle("shipped")}
+          />
+        ) : (
+          <ShippedColumn
+            board={board.shipped}
+            selectedCardId={props.selectedCardId}
+            onOpenCard={props.onOpenCard}
+            width={widthOf("shipped")}
+            handle={
+              <ColumnResizeHandle
+                columnKey="shipped"
+                label="Shipped"
+                edge="right"
+                width={widthOf("shipped")}
+                measure={() => measureColumn("shipped")}
+                onCommit={(width) => setWidth("shipped", width)}
+                onReset={() => resetWidth("shipped")}
               />
-            ))}
-          </Column>
-        ))}
-        <ShippedColumn
-          board={board.shipped}
-          selectedCardId={props.selectedCardId}
-          onOpenCard={props.onOpenCard}
-        />
+            }
+          />
+        )}
       </div>
       {/* A column like the others: header on the same line, its cards in a tinted well
           that grows with them, so an empty Needs Owner isn't a full-height band. */}
-      <section
-        aria-label={board.owner.label}
-        className="me-5 mb-4 flex min-h-0 w-56 shrink-0 flex-col gap-2 xl:w-64"
-      >
-        <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-        <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
-          {board.owner.cards.length === 0 ? (
-            <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
-          ) : (
-            board.owner.cards.map((card) => (
-              <CardTile
-                key={card.id}
-                card={card}
-                raised
-                selected={card.id === props.selectedCardId}
-                onOpen={props.onOpenCard}
-              />
-            ))
+      {ownerHidden ? (
+        <HiddenColumnRail
+          label={board.owner.label}
+          count={board.owner.cards.length}
+          onShow={() => toggle("needs_owner")}
+          className="me-5 mb-4"
+        />
+      ) : (
+        <section
+          aria-label={board.owner.label}
+          data-column="needs_owner"
+          className={cn(
+            "relative me-5 mb-4 flex min-h-0 shrink-0 flex-col gap-2",
+            widthOf("needs_owner") === null ? "w-56 xl:w-64" : "",
           )}
-        </div>
-      </section>
+          style={columnStyle(widthOf("needs_owner"))}
+        >
+          <ColumnResizeHandle
+            columnKey="needs_owner"
+            label={board.owner.label}
+            edge="left"
+            width={widthOf("needs_owner")}
+            measure={() => measureColumn("needs_owner")}
+            onCommit={(width) => setWidth("needs_owner", width)}
+            onReset={() => resetWidth("needs_owner")}
+          />
+          <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
+          <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
+            {board.owner.cards.length === 0 ? (
+              <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
+            ) : (
+              board.owner.cards.map((card) => (
+                <CardTile
+                  key={card.id}
+                  card={card}
+                  raised
+                  selected={card.id === props.selectedCardId}
+                  onOpen={props.onOpenCard}
+                />
+              ))
+            )}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
+
+/** Slim rail that stands in for a hidden column; clicking it shows the column again. */
+function HiddenColumnRail(props: {
+  label: string;
+  count: number;
+  onShow: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={props.onShow}
+      aria-label={`Show ${props.label} (${props.count})`}
+      className={cn(
+        "flex h-full min-h-24 w-8 shrink-0 flex-col items-center gap-2 rounded-xl bg-(--m-surface) py-3 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+        props.className,
+      )}
+    >
+      <span className="tabular-nums">{props.count}</span>
+      <span className="font-medium [writing-mode:vertical-rl]">{props.label}</span>
+    </button>
+  );
+}
+
+function columnStyle(width: number | null): React.CSSProperties | undefined {
+  return width === null ? undefined : { width: `var(${COLUMN_WIDTH_PROPERTY}, ${width}px)` };
+}
+
+/** Measured DOM width of a column, used as the drag start when it has no saved width. */
+function measureColumn(key: BoardColumnKey): number {
+  const element = document.querySelector<HTMLElement>(`[data-column="${key}"]`);
+  return element?.getBoundingClientRect().width ?? BOARD_COLUMN_FALLBACK[key];
+}
+
+const BOARD_COLUMN_FALLBACK: Record<BoardColumnKey, number> = {
+  todo: 200,
+  working: 200,
+  needs_review: 200,
+  in_review: 200,
+  shipped: 160,
+  needs_owner: 224,
+};
 
 function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
@@ -149,16 +280,21 @@ function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
 }
 
 function Column(props: {
-  column: { label: string; cards: ReadonlyArray<unknown> };
+  column: { stage?: string; label: string; cards: ReadonlyArray<unknown> };
   className?: string;
+  style?: React.CSSProperties;
+  handle?: React.ReactNode;
   summary?: string | null;
   children: React.ReactNode;
 }) {
   return (
     <section
       aria-label={props.column.label}
-      className={cn("flex min-h-0 flex-col gap-2", props.className)}
+      data-column={props.column.stage}
+      style={props.style}
+      className={cn("relative flex min-h-0 flex-col gap-2", props.className)}
     >
+      {props.handle}
       <ColumnHeader label={props.column.label} count={props.column.cards.length} />
       {props.summary ? (
         <p className="px-1 pb-1 text-xs leading-snug text-(--m-muted)">{props.summary}</p>
@@ -174,9 +310,20 @@ function ShippedColumn(props: {
   board: ReadonlyArray<StageColumn>;
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
+  width: number | null;
+  handle?: React.ReactNode;
 }) {
   return (
-    <section aria-label="Shipped" className="flex min-h-0 w-40 shrink-0 flex-col xl:w-44">
+    <section
+      aria-label="Shipped"
+      data-column="shipped"
+      style={columnStyle(props.width)}
+      className={cn(
+        "relative flex min-h-0 shrink-0 flex-col",
+        props.width === null && "w-40 xl:w-44",
+      )}
+    >
+      {props.handle}
       <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">
