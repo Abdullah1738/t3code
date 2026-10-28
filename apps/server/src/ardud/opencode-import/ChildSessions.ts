@@ -76,10 +76,15 @@ export const restartNoteParts = (
 export const childSessionId = (threadId: string | null | undefined) =>
   threadId?.match(/native-thread:(ses_[A-Za-z0-9]+)/)?.[1];
 
-/** The text of an assistant turn that finished cleanly after the child started. */
+/**
+ * The text of an assistant turn that completed cleanly after the child started.
+ * Requires `time.completed`: a turn still streaming, or one whose completion
+ * was never recorded, is not a result.
+ */
 const completedAnswer = (message: OpenCodeMessage, since: number): string | undefined => {
   if (message.type !== "assistant") return undefined;
   if (message.finish !== "stop" || message.error !== undefined) return undefined;
+  if (message.time.completed === undefined) return undefined;
   if (message.time.created < since - SLACK_MS) return undefined;
   const text = (message.content ?? [])
     .flatMap((part) => (part.type === "text" && part.text !== undefined ? [part.text] : []))
@@ -116,13 +121,9 @@ const checkOne = Effect.fn("ChildSessions.checkOne")(function* (
   // A session with no turn, or whose newest message predates the child, never ran it.
   if (newest === undefined || newest.time.created < child.since - SLACK_MS)
     return { state: "stopped" } satisfies ChildCheck;
-  const answered = messages.findLast(
-    (message) => completedAnswer(message, child.since) !== undefined,
-  );
-  const text = answered === undefined ? undefined : completedAnswer(answered, child.since);
-  if (newest.type === "assistant" && text !== undefined) {
-    return { state: "finished", result: text } satisfies ChildCheck;
-  }
+  // Only the newest turn decides: an older completed answer is not this child's finish.
+  const text = completedAnswer(newest, child.since);
+  if (text !== undefined) return { state: "finished", result: text } satisfies ChildCheck;
   return { state: "stopped" } satisfies ChildCheck;
 });
 
@@ -136,12 +137,19 @@ export const checkChildren = (
   children: ReadonlyArray<ChildRef>,
 ): Effect.Effect<ReadonlyMap<string, ChildCheck>> =>
   Effect.gen(function* () {
-    const connection = yield* configuredConnection(settings);
+    const configured = yield* configuredConnection(settings);
     const result = new Map<string, ChildCheck>();
-    if (connection === undefined) {
+    // ardud: only a confirmed local setup means "stopped without a probe". An
+    // unreadable or half-configured setup is unknown, never a cancellation claim.
+    if (configured.kind === "local") {
       for (const child of children) result.set(child.sessionId, { state: "stopped" });
       return result;
     }
+    if (configured.kind === "unknown") {
+      for (const child of children) result.set(child.sessionId, { state: "unknown" });
+      return result;
+    }
+    const connection = configured.connection;
     const active = yield* listActiveSessionIds(connection).pipe(
       Effect.timeoutOption(PROBE_TIMEOUT),
       Effect.map((value) => (Option.isSome(value) ? value.value : undefined)),

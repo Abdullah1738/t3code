@@ -280,6 +280,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         : yield* restartNoteText(settings, note.work).pipe(
             Effect.map((text) => (text === "" ? undefined : text)),
           );
+    // ardud: a settled parent whose only cut work is a confirmed-running child has no
+    // note to give. Dispatching would start a turn and claim the work stopped.
+    if (note.settled && noteText === undefined && note.work.length > 0) return;
     const text =
       noteText === undefined
         ? CONTINUE_PROMPT

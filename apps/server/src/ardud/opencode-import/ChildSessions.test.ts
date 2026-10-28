@@ -69,7 +69,7 @@ describe("checkChildren", () => {
               id: "m2",
               type: "assistant",
               finish: "stop",
-              time: { created: SINCE + 60_000 },
+              time: { created: SINCE + 60_000, completed: SINCE + 61_000 },
               content: [{ type: "text", text: "Review done: no findings." }],
             },
           ]),
@@ -84,6 +84,72 @@ describe("checkChildren", () => {
         state: "finished",
         result: "Review done: no findings.",
       });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("finishes a child whose completed answer follows the active list draining", async () => {
+    // Protocol shape: the session leaves the active list once it is idle, and
+    // the answer it left behind is complete with a finish and a completion time.
+    const server = await serve((req, res) => {
+      if (req.url === "/api/session/active") return json(res, 200, { data: {} });
+      if (req.url?.startsWith("/api/session/ses_h/message"))
+        return json(
+          res,
+          200,
+          messages([
+            {
+              id: "m1",
+              type: "user",
+              time: { created: SINCE + 1_000 },
+              content: [{ type: "text", text: "review this" }],
+            },
+            {
+              id: "m2",
+              type: "assistant",
+              finish: "stop",
+              time: { created: SINCE + 2_000, completed: SINCE + 9_000 },
+              content: [{ type: "text", text: "Done: 2 findings." }],
+            },
+          ]),
+        );
+      json(res, 500, {});
+    });
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_h", since: SINCE }]),
+      );
+      expect(result.get("ses_h")).toEqual({ state: "finished", result: "Done: 2 findings." });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("does not quote an answer that never recorded completion", async () => {
+    const server = await serve((req, res) => {
+      if (req.url === "/api/session/active") return json(res, 200, { data: {} });
+      if (req.url?.startsWith("/api/session/ses_i/message"))
+        return json(
+          res,
+          200,
+          messages([
+            {
+              id: "m4",
+              type: "assistant",
+              finish: "stop",
+              time: { created: SINCE + 60_000 },
+              content: [{ type: "text", text: "half written" }],
+            },
+          ]),
+        );
+      json(res, 500, {});
+    });
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_i", since: SINCE }]),
+      );
+      expect(result.get("ses_i")?.result).toBeUndefined();
     } finally {
       server.close();
     }

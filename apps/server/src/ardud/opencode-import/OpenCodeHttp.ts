@@ -94,7 +94,8 @@ export const OpenCodeMessage = Schema.Struct({
   error: Schema.optional(Schema.Struct({ message: Schema.optional(Schema.String) })),
   /** ardud: why an assistant turn ended, e.g. "stop" for a normal finish. */
   finish: Schema.optional(Schema.String),
-  time: Schema.Struct({ created: Millis }),
+  /** ardud: set once the turn has completed; a child result needs it. */
+  time: Schema.Struct({ created: Millis, completed: Schema.optional(Millis) }),
 });
 export type OpenCodeMessage = typeof OpenCodeMessage.Type;
 
@@ -162,20 +163,41 @@ const openCodeServerConfig = (
  * ardud: the OpenCode server the opencode provider is configured to use, when
  * it runs as its own service. A server Robob starts itself has none here.
  */
+export type ConfiguredConnection =
+  // ardud: confirmed local: settings read, no external OpenCode server configured.
+  | { readonly kind: "local" }
+  | { readonly kind: "external"; readonly connection: OpenCodeConnection }
+  // ardud: settings unreadable, timed out, or an external URL without a password.
+  | { readonly kind: "unknown" };
+
+const SETTINGS_READ_TIMEOUT = "2 seconds";
+
 export const configuredConnection = (
   settings: ServerSettings.ServerSettingsService["Service"],
-): Effect.Effect<OpenCodeConnection | undefined> =>
+): Effect.Effect<ConfiguredConnection> =>
   settings.getSettings.pipe(
-    Effect.map((value) => {
-      const opencode = openCodeServerConfig(value.providerInstances);
-      return opencode === undefined
-        ? undefined
-        : {
+    Effect.timeoutOption(SETTINGS_READ_TIMEOUT),
+    Effect.map((read): ConfiguredConnection => {
+      if (read._tag === "None") return { kind: "unknown" };
+      const instances = read.value.providerInstances;
+      const opencode = openCodeServerConfig(instances);
+      if (opencode !== undefined) {
+        return {
+          kind: "external",
+          connection: {
             baseUrl: opencode.serverUrl.replace(/\/+$/, ""),
             authorization: basic(opencode.serverPassword),
-          };
+          },
+        };
+      }
+      const hasUrlWithoutPassword = Object.values(instances).some(
+        (instance) =>
+          instance.driver === "opencode" &&
+          typeof (instance.config as Record<string, unknown> | undefined)?.serverUrl === "string",
+      );
+      return hasUrlWithoutPassword ? { kind: "unknown" } : { kind: "local" };
     }),
-    Effect.orElseSucceed(() => undefined),
+    Effect.orElseSucceed((): ConfiguredConnection => ({ kind: "unknown" })),
   );
 
 /**

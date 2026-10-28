@@ -1281,3 +1281,82 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
       );
     }),
 );
+
+// ardud: a settled completed parent whose only cut work is a child OpenCode still
+// runs must not get a new turn or a "stopped background work" notice.
+it.effect(
+  "does not dispatch for a settled parent whose only cut child is still running in OpenCode",
+  () =>
+    Effect.gen(function* () {
+      const NodeHttp = yield* Effect.promise(() => import("node:http"));
+      const server = NodeHttp.createServer((req, res) => {
+        if (req.url === "/api/session/active") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { ses_running: {} } }));
+          return;
+        }
+        res.writeHead(500);
+        res.end();
+      });
+      const url = yield* Effect.promise(
+        () =>
+          new Promise<string>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address();
+              resolve(
+                `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`,
+              );
+            });
+          }),
+      );
+      try {
+        const base = makeProjection();
+        const childWork = [
+          {
+            kind: "subagent" as const,
+            label: "Reviewer (id ses_running)",
+            id: "item:child",
+            child: {
+              threadId: "native-thread:ses_running" as never,
+              startedAt: DateTime.makeUnsafe("2026-10-28T10:00:00.000Z"),
+            },
+          },
+        ];
+        const projection = {
+          ...base,
+          runs: [{ ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork }],
+          providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const commands: Parameters<
+          ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
+        >[0][] = [];
+        yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+          Effect.provide(
+            Layer.merge(
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: () => Effect.succeed(projection),
+                recoverDelegatedTask: () => Effect.void,
+                dispatch: (command) => {
+                  commands.push(command);
+                  return Effect.succeed({} as never);
+                },
+              }),
+              ServerSettings.layerTest({
+                continueThreadsAfterServerUpdate: true,
+                providerInstances: {
+                  opencode: {
+                    driver: "opencode",
+                    enabled: true,
+                    config: { serverUrl: url, serverPassword: "pw" },
+                  },
+                },
+              } as never),
+            ),
+          ),
+        );
+        assert.lengthOf(commands, 0);
+      } finally {
+        server.close();
+      }
+    }),
+);
