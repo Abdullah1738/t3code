@@ -47,6 +47,10 @@ export function cancelledTurnItemWork(
           nativeId === undefined ? "" : ` (id ${nativeId})`,
         ),
         id: item.id,
+        // ardud: lets restart ask OpenCode whether this native child is still running.
+        ...(item.origin === "provider_native" && item.childThreadId !== null && item.startedAt !== null
+          ? { child: { threadId: item.childThreadId, startedAt: item.startedAt } }
+          : {}),
       };
     }
     case "command_execution":
