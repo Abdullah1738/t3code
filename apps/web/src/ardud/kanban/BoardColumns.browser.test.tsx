@@ -133,7 +133,7 @@ function toyState(): KanbanBoardState {
       ...make("working", 6, (index) => ({
         links: [prLink(1300 + index)],
         subtasks: subtasks(index, 5),
-        goalId: "goal-ipad",
+        goalId: "goal-ipad" as KanbanCard["goalId"],
       })),
       ...make("needs_review", 1, () => ({ links: [prLink(1400)] })),
       ...make("in_review", 2, (index) => ({ links: [prLink(1410 + index)] })),
