@@ -426,7 +426,7 @@ function ChoiceBlock(props: {
     const total = answers.length;
     return (
       <div className="flex flex-col gap-1.5">
-        <p className="font-medium">{block.question}</p>
+        <p className="text-sm leading-normal break-words whitespace-pre-wrap">{block.question}</p>
         {block.options.map((option) => {
           const votes = answers.filter((answer) => answer.choice.includes(option.id)).length;
           const share = total === 0 ? 0 : Math.round((votes / total) * 100);
@@ -458,7 +458,7 @@ function ChoiceBlock(props: {
 
   return (
     <div className="flex flex-col gap-1.5">
-      <p className="font-medium">{block.question}</p>
+      <p className="text-sm leading-normal break-words whitespace-pre-wrap">{block.question}</p>
       {block.options.map((option) => {
         const on = picked.includes(option.id);
         return (
