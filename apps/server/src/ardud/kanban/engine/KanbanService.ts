@@ -118,11 +118,12 @@ export interface CardPatch {
   readonly comment?: string | undefined;
 }
 
-/** The owner's changes to a discussion; `settled: false` and `snoozedUntil: null` undo. */
+/** The owner's changes to a discussion; `settled: false`, `snoozedUntil: null` and `pinned: false` undo. */
 export interface DiscussionPatch {
   readonly title?: string | undefined;
   readonly settled?: boolean | undefined;
   readonly snoozedUntil?: string | null | undefined;
+  readonly pinned?: boolean | undefined;
 }
 
 export interface GoalInput {
@@ -295,7 +296,7 @@ export interface KanbanServiceShape {
     title: string,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
-  /** Owner only: rename, settle or snooze a discussion. */
+  /** Owner only: rename, settle, snooze or pin a discussion. */
   readonly updateDiscussion: (
     discussionId: KanbanDiscussion["id"],
     patch: DiscussionPatch,
@@ -1054,6 +1055,8 @@ const make = Effect.gen(function* () {
       titleEditedAt: null,
       settledAt: null,
       snoozedUntil: null,
+      pinnedAt: null,
+      reopenedAt: null,
     };
     // The evaluator that opens a discussion is the one the owner's replies go to.
     const discussion = actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
@@ -1880,6 +1883,33 @@ const make = Effect.gen(function* () {
         }
         if (next !== discussion) yield* saveDiscussion(next);
       }
+      // Idle discussions settle themselves.
+      const idleNow = yield* nowIso;
+      let openLinks: ReadonlyArray<KanbanThreadLink> | null = null;
+      for (const discussion of yield* store.discussions(board.id)) {
+        const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
+        if (!Rules.discussionSettleDue(discussion, card, now)) continue;
+        openLinks ??= yield* store.threadLinks({ boardId: board.id, open: true });
+        const threadIds = [
+          discussion.evaluatorThreadId,
+          card?.activeThreadId ?? null,
+          ...openLinks
+            .filter(
+              (link) =>
+                link.discussionId === discussion.id ||
+                (discussion.cardId !== null && link.cardId === discussion.cardId),
+            )
+            .map((link) => link.threadId),
+        ];
+        let working = false;
+        for (const threadId of threadIds) {
+          if (threadId === null) continue;
+          const view = yield* threads.view(threadId);
+          if (view !== null && view.state !== "idle") working = true;
+        }
+        if (working) continue;
+        yield* saveDiscussion({ ...discussion, settledAt: idleNow, snoozedUntil: null });
+      }
       // Reviewed cards wait in review until their PRs land.
       const chains = board.reviewChains;
       for (const card of yield* store.cards(board.id)) {
@@ -2606,6 +2636,12 @@ const make = Effect.gen(function* () {
         const next = { ...card, settledAt: at, updatedAt: at };
         yield* logEvent(next, { _tag: "owner" }, "edited", { body: "Settled" });
         yield* saveCard(next);
+        if (card.discussionId !== null) {
+          const discussion = yield* store.discussion(card.discussionId);
+          if (discussion !== null && discussion.settledAt === null && discussion.pinnedAt === null) {
+            yield* saveDiscussion({ ...discussion, settledAt: at, snoozedUntil: null });
+          }
+        }
         return next;
       }),
     );
@@ -2796,6 +2832,12 @@ const make = Effect.gen(function* () {
           body: "Woken",
         });
         yield* saveCard(next);
+        if (card.settledAt !== null && card.discussionId !== null) {
+          const discussion = yield* store.discussion(card.discussionId);
+          if (discussion !== null && discussion.settledAt !== null) {
+            yield* saveDiscussion({ ...discussion, settledAt: null, reopenedAt: at });
+          }
+        }
         yield* evaluatorTurn(card, next, actor);
         yield* kick;
         return next;
@@ -2870,7 +2912,7 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         if (actor._tag !== "owner") {
-          return yield* failWith("denied", "only the owner renames, settles or snoozes");
+          return yield* failWith("denied", "only the owner renames, settles, snoozes or pins");
         }
         const discussion = yield* discussionOf(discussionId);
         const at = yield* nowIso;
@@ -2883,10 +2925,23 @@ const make = Effect.gen(function* () {
         if (patch.settled === true && typeof patch.snoozedUntil === "string") {
           return yield* failWith("invalid", "settle or snooze, not both");
         }
-        if (patch.settled === true) next = { ...next, settledAt: at, snoozedUntil: null };
-        else if (patch.settled === false) next = { ...next, settledAt: null };
-        if (patch.snoozedUntil === null) next = { ...next, snoozedUntil: null };
-        else if (patch.snoozedUntil !== undefined) {
+        if (patch.pinned === true && (patch.settled === true || typeof patch.snoozedUntil === "string")) {
+          return yield* failWith("invalid", "pin, settle or snooze one at a time");
+        }
+        if (patch.pinned === true) {
+          next = { ...next, pinnedAt: next.pinnedAt ?? at, settledAt: null, snoozedUntil: null };
+        } else if (patch.pinned === false && next.pinnedAt !== null) {
+          next = { ...next, pinnedAt: null, reopenedAt: at };
+        }
+        if (patch.settled === true) next = { ...next, settledAt: at, snoozedUntil: null, pinnedAt: null };
+        else if (patch.settled === false && next.settledAt !== null) {
+          next = { ...next, settledAt: null, reopenedAt: at };
+        }
+        if (patch.snoozedUntil === null) {
+          next = next.snoozedUntil === null
+            ? { ...next, snoozedUntil: null }
+            : { ...next, snoozedUntil: null, reopenedAt: at };
+        } else if (patch.snoozedUntil !== undefined) {
           const until = DateTime.make(patch.snoozedUntil);
           if (Option.isNone(until)) {
             return yield* failWith("invalid", "snoozedUntil is not a time");
@@ -2894,7 +2949,12 @@ const make = Effect.gen(function* () {
           if (DateTime.toEpochMillis(until.value) <= (yield* nowMillis)) {
             return yield* failWith("invalid", "snoozedUntil must be in the future");
           }
-          next = { ...next, snoozedUntil: DateTime.formatIso(until.value), settledAt: null };
+          next = {
+            ...next,
+            snoozedUntil: DateTime.formatIso(until.value),
+            settledAt: null,
+            pinnedAt: null,
+          };
         }
         if (next !== discussion) yield* saveDiscussion(next);
         return next;

@@ -1753,6 +1753,127 @@ it.effect("the owner settles and snoozes a discussion; someone else posting brin
   }),
 );
 
+it.effect("idle discussions settle themselves after a day", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = {
+        _tag: "evaluator",
+        threadId: yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set up" }),
+      };
+      const channel = yield* kanban.createDiscussion(board.id, "Channel", evaluator);
+      const pinned = yield* kanban.createDiscussion(board.id, "Pinned", evaluator);
+      const snoozed = yield* kanban.createDiscussion(board.id, "Snoozed", evaluator);
+      // Its own evaluator thread: the others share one, so a running thread
+      // there would hold them back too.
+      const busy: KanbanActor = {
+        _tag: "evaluator",
+        threadId: yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Busy" }),
+      };
+      const working = yield* kanban.createDiscussion(board.id, "Working", busy);
+      yield* kanban.updateDiscussion(pinned.id, { pinned: true }, owner);
+      yield* kanban.updateDiscussion(snoozed.id, { snoozedUntil: "2999-01-01T09:00:00.000Z" }, owner);
+
+      const card = yield* kanban.createCard(board.id, { prompt: "Ship", title: "Ship" }, owner);
+      const cardTalk = yield* kanban.cardDiscussion(card.id);
+
+      // The evaluator thread is running before the first idle day elapses, so
+      // its discussion must wait even though its quiet time has passed.
+      const runningThread = working.evaluatorThreadId;
+      assert.isNotNull(runningThread);
+      yield* setRunning(fake, runningThread, true);
+      yield* TestClock.adjust("25 hours");
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.discussion(channel.id)).settledAt);
+      assert.isNull((yield* kanban.discussion(pinned.id)).settledAt);
+      assert.isNull((yield* kanban.discussion(snoozed.id)).settledAt);
+      assert.isNull((yield* kanban.discussion(cardTalk.id)).settledAt);
+      assert.isNull((yield* kanban.discussion(working.id)).settledAt);
+      yield* setRunning(fake, runningThread, false);
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.discussion(working.id)).settledAt);
+
+      // A verified card's discussion settles on the tick after its card does.
+      yield* kanban.moveCard(card.id, "verified", "owner", owner);
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.discussion(cardTalk.id)).settledAt);
+
+      // Unsettling brings it back; the day starts again from there.
+      yield* kanban.updateDiscussion(channel.id, { settled: false }, owner);
+      yield* kanban.tick;
+      assert.isNull((yield* kanban.discussion(channel.id)).settledAt);
+      yield* TestClock.adjust("25 hours");
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.discussion(channel.id)).settledAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("settling a card settles its discussion; waking it brings it back", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "Ship", title: "Ship" }, owner);
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.moveCard(card.id, "verified", "owner", owner);
+      yield* kanban.settleCard(card.id);
+      assert.isNotNull((yield* kanban.discussion(talk.id)).settledAt);
+
+      yield* kanban.cardThread(card.id, "wake", "again", owner);
+      assert.isNull((yield* kanban.discussion(talk.id)).settledAt);
+
+      // A pinned discussion stays out when its card settles.
+      const keep = yield* kanban.createCard(board.id, { prompt: "Keep", title: "Keep" }, owner);
+      const pinnedTalk = yield* kanban.cardDiscussion(keep.id);
+      yield* kanban.updateDiscussion(pinnedTalk.id, { pinned: true }, owner);
+      yield* kanban.moveCard(keep.id, "verified", "owner", owner);
+      yield* kanban.settleCard(keep.id);
+      const stillPinned = yield* kanban.discussion(pinnedTalk.id);
+      assert.isNull(stillPinned.settledAt);
+      assert.isNotNull(stillPinned.pinnedAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("pinning a discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = {
+        _tag: "evaluator",
+        threadId: yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set up" }),
+      };
+      const talk = yield* kanban.createDiscussion(board.id, "Pin me", evaluator);
+      yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
+
+      let current = yield* kanban.updateDiscussion(talk.id, { pinned: true }, owner);
+      assert.isNotNull(current.pinnedAt);
+      assert.isNull(current.settledAt);
+
+      current = yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
+      assert.isNull(current.pinnedAt);
+      assert.isNotNull(current.settledAt);
+
+      current = yield* kanban.updateDiscussion(talk.id, { pinned: true }, owner);
+      current = yield* kanban.updateDiscussion(talk.id, { pinned: false }, owner);
+      assert.isNull(current.pinnedAt);
+      assert.isNotNull(current.reopenedAt);
+
+      const both = yield* kanban
+        .updateDiscussion(talk.id, { pinned: true, settled: true }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(both.code, "invalid");
+      const denied = yield* kanban
+        .updateDiscussion(talk.id, { pinned: true }, evaluator)
+        .pipe(Effect.flip);
+      assert.strictEqual(denied.code, "denied");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect(
   "an evaluator that only asked on a card stops typing there while it works elsewhere",
   () =>
