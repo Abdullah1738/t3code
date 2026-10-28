@@ -19,6 +19,19 @@ cards = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cards)
 
 D = "2026-10-28"
+
+# cards.py only sets pending_flag when the brief date is today (Dubai). Freeze its clock to the fixture day
+# so the held-flag assertion holds on any real date.
+from datetime import datetime as _real_datetime
+
+
+class _FrozenDatetime(_real_datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return _real_datetime(2026, 10, 28, 12, 0, tzinfo=tz)
+
+
+cards.datetime = _FrozenDatetime
 ready = {"stale": False, "rec_ok": True, "cur": {"sleep_date": D}, "prev": {}, "prev_ok": False,
          "ycyc": None, "hrv30": None, "rhr30": None}
 stale = dict(ready, stale=True)
