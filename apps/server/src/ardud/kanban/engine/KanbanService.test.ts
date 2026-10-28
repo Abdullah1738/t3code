@@ -2371,8 +2371,19 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
       });
       const stored = yield* store.card(created.id);
       yield* store.putCard({ ...stored!, model: astraHigh });
+      const seen = (yield* store.card(created.id))!;
+      const planned = Rules.planDispatch(
+        (yield* store.boards).find((b) => b.id === board.id)!,
+        yield* store.cards(board.id),
+        yield* store.pools(board.id),
+      );
       yield* kanban.dispatchNow;
       const after = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(
+        after.activeThreadId === null,
+        true,
+        `diag stored=${JSON.stringify(seen.model)} stage=${after.stage} stalled=${JSON.stringify(after.stalled)} plan=${JSON.stringify(planned.map((p) => [p.cardId, p.pool]))} pools=${JSON.stringify((yield* store.pools(board.id)).map((p) => [p.key, p.slots]))}`,
+      );
       assert.isNull(after.activeThreadId);
       assert.isTrue(after.stalled?.reason.startsWith("Model refused") === true);
       assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
