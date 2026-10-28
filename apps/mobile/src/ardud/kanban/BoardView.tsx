@@ -8,6 +8,7 @@ import {
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
+import type { KanbanThreadLink } from "@t3tools/contracts";
 import { Fragment, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
@@ -23,6 +24,7 @@ import {
   COLUMN_GAP,
   defaultBoardTab,
 } from "./logic";
+import { useKanbanBoardThreads } from "./kanbanStore";
 import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts";
 
 // Needs Owner cards shown above the tabs before "All N" opens the rest.
@@ -135,6 +137,7 @@ function TabsBoard(props: {
   const tabs = boardTabs(board);
   // Chosen once on open; a stage emptying later doesn't move the owner off it.
   const [tab, setTab] = useState<BoardTab>(() => defaultBoardTab(tabs));
+  const [mode, setMode] = useState<"stages" | "threads">("stages");
   const [allOwner, setAllOwner] = useState(false);
   const owner = board.owner.cards;
   const shownOwner = allOwner ? owner : owner.slice(0, OWNER_PREVIEW);
@@ -173,7 +176,24 @@ function TabsBoard(props: {
           </View>
         ) : null}
       </View>
-      <UnderlineTabs accessibilityLabel="Stage" tabs={tabs} selected={tab} onSelect={setTab} />
+      <UnderlineTabs
+        accessibilityLabel="View"
+        tabs={[
+          { value: "stages", label: "Stages" },
+          { value: "threads", label: "Threads" },
+        ]}
+        selected={mode}
+        onSelect={setMode}
+      />
+      {mode === "threads" ? (
+        <View className="px-4 pt-3">
+          <BoardThreadsList boardId={props.boardId} state={board} />
+        </View>
+      ) : null}
+      {mode === "stages" ? (
+        <UnderlineTabs accessibilityLabel="Stage" tabs={tabs} selected={tab} onSelect={setTab} />
+      ) : null}
+      {mode === "stages" ? (
       <View className="gap-2 px-4 pt-3">
         {tab === "shipped" ? (
           <ShippedList
@@ -190,7 +210,60 @@ function TabsBoard(props: {
           />
         )}
       </View>
+      ) : null}
     </ScrollView>
+  );
+}
+
+/**
+ * The board's threads in two groups, cards and evaluators, the same split as
+ * the web Threads view. Board threads are read-only on the phone too.
+ */
+function BoardThreadsList(props: {
+  readonly boardId: string;
+  readonly state: KanbanBoardState;
+}) {
+  const threads = useKanbanBoardThreads(props.boardId);
+  if (threads === undefined) return null;
+  if (threads.length === 0) return <Text className="text-sm text-muted-foreground">No threads yet.</Text>;
+  const evaluators = threads.filter((link) => link.role === "evaluator");
+  const cardThreads = threads.filter((link) => link.role !== "evaluator");
+  const cards = props.state.cards;
+  const cardLabel = (link: KanbanThreadLink) => {
+    const card = link.cardId === null ? undefined : cards.get(link.cardId);
+    return card ? `#${card.number} ${card.title}` : (link.cardId ?? "Card");
+  };
+  return (
+    <View className="gap-5">
+      <ThreadRows title="Evaluators" empty="No evaluator threads yet." links={evaluators} label={(link) => link.purpose ?? "evaluator"} />
+      <ThreadRows title="Cards" empty="No card threads yet." links={cardThreads} label={cardLabel} />
+    </View>
+  );
+}
+
+function ThreadRows(props: {
+  readonly title: string;
+  readonly empty: string;
+  readonly links: ReadonlyArray<KanbanThreadLink>;
+  readonly label: (link: KanbanThreadLink) => string;
+}) {
+  return (
+    <View className="gap-2">
+      <Text className="text-sm font-medium text-muted-foreground">{props.title}</Text>
+      {props.links.length === 0 ? (
+        <Text className="text-sm text-muted-foreground">{props.empty}</Text>
+      ) : (
+        props.links.map((link) => (
+          <View key={link.threadId} className="flex-row items-center justify-between gap-3 rounded-xl border border-border px-3 py-2">
+            <Text numberOfLines={1} className="flex-1 text-sm text-foreground">{props.label(link)}</Text>
+            <Text className="text-xs text-muted-foreground">
+              {link.role}
+              {link.endedAt === null ? " · running" : " · ended"}
+            </Text>
+          </View>
+        ))
+      )}
+    </View>
   );
 }
 
