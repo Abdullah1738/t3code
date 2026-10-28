@@ -112,12 +112,13 @@ export const KanbanBoardUpdateInput = Schema.Struct({
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
 
-/** Owner changes to a discussion. `settled: false` and `snoozedUntil: null` undo. */
+/** Owner changes to a discussion. `settled: false`, `snoozedUntil: null` and `pinned: false` undo. */
 export const KanbanDiscussionUpdateInput = Schema.Struct({
   discussionId: KanbanDiscussionId,
   title: Schema.optional(Schema.String),
   settled: Schema.optional(Schema.Boolean),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinned: Schema.optional(Schema.Boolean),
 });
 export type KanbanDiscussionUpdateInput = typeof KanbanDiscussionUpdateInput.Type;
 
