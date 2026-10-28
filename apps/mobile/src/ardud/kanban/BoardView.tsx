@@ -102,6 +102,7 @@ export function BoardView(props: {
     return (
       <TabsBoard
         board={board}
+        state={props.state}
         filterRow={filterRow}
         hideGoal={filter !== null}
         selectedCardId={props.selectedCardId}
@@ -127,6 +128,7 @@ export function BoardView(props: {
 
 function TabsBoard(props: {
   readonly board: StageBoard;
+  readonly state: KanbanBoardState;
   readonly filterRow: React.ReactNode;
   readonly hideGoal: boolean;
   readonly selectedCardId: string | null;
@@ -187,7 +189,7 @@ function TabsBoard(props: {
       />
       {mode === "threads" ? (
         <View className="px-4 pt-3">
-          <BoardThreadsList boardId={props.boardId} state={board} />
+          <BoardThreadsList boardId={props.state.board.id} state={props.state} />
         </View>
       ) : null}
       {mode === "stages" ? (

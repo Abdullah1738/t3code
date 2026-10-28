@@ -3028,7 +3028,7 @@ export default function ChatView(props: ChatViewProps) {
   // top-level parent thread.
   const showProviderSubagentBar = isProviderSubagent;
   // ardud: a board-run thread is read-only too; the board's Threads view is where to act.
-  const boardRun = useBoardRunOf(activeThreadId);
+  const boardRun = useBoardRunOf(activeThreadId ?? "");
   const showBoardRunBar = !showProviderSubagentBar && boardRun !== undefined;
   const composerMounted = !showProviderSubagentBar && !showBoardRunBar;
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;

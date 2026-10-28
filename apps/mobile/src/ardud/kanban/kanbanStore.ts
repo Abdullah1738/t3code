@@ -77,7 +77,7 @@ export function useKanbanBoardRunOf(
     if (boards === undefined) return undefined;
     for (const entry of boards) {
       if (entry.threadIds.includes(threadId as never)) {
-        return { boardId: entry.boardId, boardName: entry.board?.name ?? entry.boardId };
+        return { boardId: entry.board.id, boardName: entry.board.name };
       }
     }
     return undefined;
