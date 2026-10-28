@@ -18,19 +18,24 @@ import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { usePairedEnvironmentId } from "./environment";
 import { LinkButton } from "./parts";
 
+/** A board link resolves to the screen that shows it on the current board, or null when it isn't on that board. */
+export type KanbanLinkTarget = { readonly kind: "card" | "discussion"; readonly id: string };
+export type ResolveKanbanLink = (href: string) => KanbanLinkTarget | null;
+
 /**
  * Thread links open the thread's screen and board links open the card or
  * discussion (after `before`, e.g. closing a reader); others open outside.
+ * A board link that isn't on the current board stays inert.
  */
-function useOpenMarkdownLink(before?: () => void, boardId?: string) {
+function useOpenMarkdownLink(before?: () => void, resolveKanbanLink?: ResolveKanbanLink) {
   const navigation = useNavigation();
   const environmentId = usePairedEnvironmentId();
   return (href: string) => {
-    const kanban = parseKanbanLink(href);
-    if (kanban !== null && boardId !== undefined) {
+    if (parseKanbanLink(href) !== null) {
+      const target = resolveKanbanLink?.(href) ?? null;
+      if (target === null) return;
       before?.();
-      const kind = kanban.kind === "kanban-card" ? "card" : "discussion";
-      navigation.dispatch(StackActions.push("KanbanRecord", { kind, boardId, id: kanban.id }));
+      navigation.dispatch(StackActions.push("KanbanRecord", target));
       return;
     }
     const threadId = parseThreadLinkHref(href);
@@ -69,12 +74,12 @@ export function MarkdownText(props: {
   readonly text: string;
   readonly maxLines: number | null;
   readonly tone?: "screen" | "user";
-  readonly boardId?: string;
+  readonly resolveKanbanLink?: ResolveKanbanLink;
 }) {
   const textStyle = useTextStyle(props.tone ?? "screen");
   const [unfolded, setUnfolded] = useState(false);
   const [reading, setReading] = useState(false);
-  const openMarkdownLink = useOpenMarkdownLink(undefined, props.boardId);
+  const openMarkdownLink = useOpenMarkdownLink(undefined, props.resolveKanbanLink);
   const [height, setHeight] = useState<number | null>(null);
   const preview = useMemo(
     () =>
@@ -125,7 +130,7 @@ export function MarkdownText(props: {
       {reading ? (
         <MarkdownReader
           text={props.text}
-          boardId={props.boardId}
+          resolveKanbanLink={props.resolveKanbanLink}
           onClose={() => setReading(false)}
         />
       ) : null}
@@ -139,7 +144,7 @@ export function MarkdownText(props: {
  */
 function MarkdownReader(props: {
   readonly text: string;
-  readonly boardId?: string;
+  readonly resolveKanbanLink?: ResolveKanbanLink;
   readonly onClose: () => void;
 }) {
   return (
@@ -152,7 +157,11 @@ function MarkdownReader(props: {
       {/* Its own provider: the modal is a separate window whose insets follow
           rotation, where the board's would go stale. */}
       <SafeAreaProvider>
-        <MarkdownReaderBody text={props.text} boardId={props.boardId} onClose={props.onClose} />
+        <MarkdownReaderBody
+          text={props.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+          onClose={props.onClose}
+        />
       </SafeAreaProvider>
     </Modal>
   );
@@ -160,11 +169,11 @@ function MarkdownReader(props: {
 
 function MarkdownReaderBody(props: {
   readonly text: string;
-  readonly boardId?: string;
+  readonly resolveKanbanLink?: ResolveKanbanLink;
   readonly onClose: () => void;
 }) {
   const styles = useMarkdownPreviewStyles();
-  const openMarkdownLink = useOpenMarkdownLink(props.onClose, props.boardId);
+  const openMarkdownLink = useOpenMarkdownLink(props.onClose, props.resolveKanbanLink);
   const insets = useSafeAreaInsets();
   const chunks = useMemo(() => viewMarkdownChunks(props.text), [props.text]);
   return (

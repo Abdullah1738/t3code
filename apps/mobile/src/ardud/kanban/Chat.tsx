@@ -12,6 +12,7 @@ import {
   cardView,
   discussionPresence,
   ownerReadSeq,
+  parseKanbanLink,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
@@ -39,7 +40,7 @@ import { cn } from "../../lib/cn";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
-import { MarkdownText } from "../common/MarkdownText";
+import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
 import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
 import {
   cardGlyph,
@@ -276,6 +277,21 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
   return clock;
 }
 
+/**
+ * Links to this board's own cards and discussions open; anything else (another
+ * board's link, a missing record) stays inert, as on web.
+ */
+function resolveKanbanLinkFor(state: KanbanBoardState): ResolveKanbanLink {
+  return (href) => {
+    const link = parseKanbanLink(href);
+    if (link === null) return null;
+    if (link.kind === "kanban-card") {
+      return state.cards.has(link.id) ? { kind: "card", id: link.id } : null;
+    }
+    return state.discussions.has(link.id) ? { kind: "discussion", id: link.id } : null;
+  };
+}
+
 /** Marks what is on screen read while the screen is in front. */
 function useMarkRead(
   boardId: string,
@@ -316,6 +332,7 @@ function MessageView(props: {
       discussionId={props.discussionId}
       message={message}
       state={props.state}
+      resolveKanbanLink={resolveKanbanLinkFor(props.state)}
       nowMs={props.nowMs}
       onOpenCard={props.onOpenCard}
     />
@@ -353,6 +370,7 @@ function Blocks(props: {
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
@@ -373,6 +391,7 @@ function Blocks(props: {
 function BlockView(props: {
   readonly block: KanbanBlock;
   readonly boardId: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
@@ -387,11 +406,17 @@ function BlockView(props: {
           text={block.text}
           maxLines={MESSAGE_LINES}
           tone={props.message.author._tag === "owner" ? "user" : "screen"}
-          boardId={props.boardId}
+          resolveKanbanLink={props.resolveKanbanLink}
         />
       );
     case "collapse":
-      return <Collapse title={block.title} text={block.text} boardId={props.boardId} />;
+      return (
+        <Collapse
+          title={block.title}
+          text={block.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+        />
+      );
     case "html":
       return <HtmlBlock html={block.html} title={block.title} height={block.height} />;
     case "choice":
@@ -506,7 +531,7 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
 function Collapse(props: {
   readonly title: string;
   readonly text: string;
-  readonly boardId: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -527,7 +552,11 @@ function Collapse(props: {
       </Pressable>
       {open ? (
         <View className="px-3 pb-2.5">
-          <MarkdownText text={props.text} maxLines={null} boardId={props.boardId} />
+          <MarkdownText
+            text={props.text}
+            maxLines={null}
+            resolveKanbanLink={props.resolveKanbanLink}
+          />
         </View>
       ) : null}
     </View>
