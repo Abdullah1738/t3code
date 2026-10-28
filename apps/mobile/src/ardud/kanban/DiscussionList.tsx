@@ -16,7 +16,13 @@ import { SearchField } from "../../components/ui/SearchField";
 import { cn } from "../../lib/cn";
 import { LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
+import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
+import {
+  discussionMenu,
+  MENU_ICONS,
+  runDiscussionMenu,
+  snoozeDiscussion,
+} from "./discussionActions";
 import { kanbanClient } from "./kanbanStore";
 import { useDiscussionShelves } from "./use-discussion-shelves";
 
@@ -165,58 +171,68 @@ function DiscussionItem(props: {
   ]
     .filter(Boolean)
     .join(", ");
+  const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
   return (
-    <Menu
-      shouldOpenOnLongPress
-      title={row.title}
-      actions={menuActions(row)}
-      onPressAction={({ nativeEvent }) =>
-        runDiscussionMenu({
-          boardId: props.boardId,
-          discussionId: row.id,
-          title: row.title,
-          choice: nativeEvent.event,
-        })
-      }
-    >
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={label}
-        accessibilityHint="Long-press for settle, snooze and rename"
-        accessibilityState={{ selected: props.selected }}
-        onPress={() => props.onOpen(row.id)}
-        className={cn("min-h-16 gap-1 rounded-[12px] px-3 py-2.5", props.selected && "bg-card")}
+    <>
+      <Menu
+        shouldOpenOnLongPress
+        title={row.title}
+        actions={menuActions(row)}
+        onPressAction={({ nativeEvent }) =>
+          runDiscussionMenu({
+            boardId: props.boardId,
+            discussionId: row.id,
+            title: row.title,
+            choice: nativeEvent.event,
+            onCustomSnooze: () => setCustomSnoozeOpen(true),
+          })
+        }
       >
-        <View className="flex-row items-center gap-2">
-          <Text
-            numberOfLines={1}
-            className={cn(
-              "shrink text-[15px]",
-              settled ? "text-foreground-muted" : "text-foreground",
-              row.unread > 0 ? "font-t3-bold" : "font-t3-medium",
-            )}
-          >
-            {row.title}
-          </Text>
-          {row.unread > 0 ? <View className="size-1.5 rounded-full bg-primary" /> : null}
-          <View className="flex-1" />
-          {wake ? (
-            <View className="flex-row items-center gap-1">
-              <SymbolView name="clock" size={11} tintColorClassName="accent-foreground-muted" />
-              <Text className="text-[12px] text-foreground-muted">{wake}</Text>
-            </View>
-          ) : row.at ? (
-            <Text className="text-[12px] text-foreground-muted">
-              {clockLabel(row.at, props.nowMs)}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={label}
+          accessibilityHint="Long-press for settle, snooze and rename"
+          accessibilityState={{ selected: props.selected }}
+          onPress={() => props.onOpen(row.id)}
+          className={cn("min-h-16 gap-1 rounded-[12px] px-3 py-2.5", props.selected && "bg-card")}
+        >
+          <View className="flex-row items-center gap-2">
+            <Text
+              numberOfLines={1}
+              className={cn(
+                "shrink text-[15px]",
+                settled ? "text-foreground-muted" : "text-foreground",
+                row.unread > 0 ? "font-t3-bold" : "font-t3-medium",
+              )}
+            >
+              {row.title}
+            </Text>
+            {row.unread > 0 ? <View className="size-1.5 rounded-full bg-primary" /> : null}
+            <View className="flex-1" />
+            {wake ? (
+              <View className="flex-row items-center gap-1">
+                <SymbolView name="clock" size={11} tintColorClassName="accent-foreground-muted" />
+                <Text className="text-[12px] text-foreground-muted">{wake}</Text>
+              </View>
+            ) : row.at ? (
+              <Text className="text-[12px] text-foreground-muted">
+                {clockLabel(row.at, props.nowMs)}
+              </Text>
+            ) : null}
+          </View>
+          {row.preview ? (
+            <Text numberOfLines={1} className="text-[13px] text-foreground-muted">
+              {row.preview}
             </Text>
           ) : null}
-        </View>
-        {row.preview ? (
-          <Text numberOfLines={1} className="text-[13px] text-foreground-muted">
-            {row.preview}
-          </Text>
-        ) : null}
-      </Pressable>
-    </Menu>
+        </Pressable>
+      </Menu>
+      {customSnoozeOpen ? (
+        <CustomSnoozeSheet
+          onClose={() => setCustomSnoozeOpen(false)}
+          onSnooze={(snoozedUntil) => snoozeDiscussion(props.boardId, row.id, snoozedUntil)}
+        />
+      ) : null}
+    </>
   );
 }

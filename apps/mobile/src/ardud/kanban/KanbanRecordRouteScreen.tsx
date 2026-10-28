@@ -13,7 +13,13 @@ import { EmptyLine } from "../common/parts";
 import { useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
 import { Chat } from "./Chat";
-import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
+import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
+import {
+  discussionMenu,
+  MENU_ICONS,
+  runDiscussionMenu,
+  snoozeDiscussion,
+} from "./discussionActions";
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
@@ -158,11 +164,20 @@ function DiscussionScreen(props: {
     props.discussionId === null ? undefined : props.state.discussions.get(props.discussionId);
   const card = discussion?.cardId ? props.state.cards.get(discussion.cardId) : undefined;
   const title = props.discussionId === null ? "New discussion" : discussion?.title || "Discussion";
+  const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
   return (
     <Shell
       title={title}
       onBack={props.onBack}
-      menus={discussion ? [discussionOptions(props.boardId, discussion, props.nowMs)] : []}
+      menus={
+        discussion
+          ? [
+              discussionOptions(props.boardId, discussion, props.nowMs, () =>
+                setCustomSnoozeOpen(true),
+              ),
+            ]
+          : []
+      }
       actions={
         card
           ? [
@@ -188,6 +203,12 @@ function DiscussionScreen(props: {
         bottomInset={props.bottomInset}
         onOpenCard={nav.openCard}
       />
+      {customSnoozeOpen && discussion ? (
+        <CustomSnoozeSheet
+          onClose={() => setCustomSnoozeOpen(false)}
+          onSnooze={(snoozedUntil) => snoozeDiscussion(props.boardId, discussion.id, snoozedUntil)}
+        />
+      ) : null}
     </Shell>
   );
 }
@@ -197,9 +218,16 @@ function discussionOptions(
   boardId: string,
   discussion: KanbanDiscussion,
   nowMs: number,
+  onCustomSnooze: () => void,
 ): AppBarMenu {
   const run = (choice: string) =>
-    runDiscussionMenu({ boardId, discussionId: discussion.id, title: discussion.title, choice });
+    runDiscussionMenu({
+      boardId,
+      discussionId: discussion.id,
+      title: discussion.title,
+      choice,
+      onCustomSnooze,
+    });
   return {
     title: "Discussion options",
     icon: "ellipsis.circle",

@@ -21,6 +21,8 @@ export type DiscussionMenuItem =
     };
 
 export const SNOOZE_PREFIX = "snooze:";
+/** Snooze submenu choice that opens the date and time picker instead of a preset. */
+export const CUSTOM_SNOOZE = "snooze-custom";
 
 export function discussionMenu(input: {
   readonly settled: boolean;
@@ -35,11 +37,14 @@ export function discussionMenu(input: {
     items.push({
       id: "snooze",
       title: "Snooze",
-      presets: resolveSnoozePresets(input.now).map((preset) => ({
-        id: `${SNOOZE_PREFIX}${preset.snoozedUntil}`,
-        title: preset.label,
-        subtitle: preset.whenLabel,
-      })),
+      presets: [
+        ...resolveSnoozePresets(input.now).map((preset) => ({
+          id: `${SNOOZE_PREFIX}${preset.snoozedUntil}`,
+          title: preset.label,
+          subtitle: preset.whenLabel,
+        })),
+        { id: CUSTOM_SNOOZE, title: "Custom…", subtitle: "Pick a date and time" },
+      ],
     });
   items.push({ id: "rename", title: "Rename" });
   return items;
@@ -72,8 +77,13 @@ export function runDiscussionMenu(input: {
   readonly discussionId: string;
   readonly title: string;
   readonly choice: string;
+  readonly onCustomSnooze?: () => void;
 }): void {
   const { boardId, discussionId } = input;
+  if (input.choice === CUSTOM_SNOOZE) {
+    input.onCustomSnooze?.();
+    return;
+  }
   if (input.choice.startsWith(SNOOZE_PREFIX)) {
     void update(
       boardId,
@@ -96,6 +106,15 @@ export function runDiscussionMenu(input: {
     case "rename":
       renameDiscussion(boardId, discussionId, input.title);
   }
+}
+
+/** Snoozes a discussion until an ISO time, from a preset or the custom picker. */
+export function snoozeDiscussion(
+  boardId: string,
+  discussionId: string,
+  snoozedUntil: string,
+): void {
+  void update(boardId, discussionId, { snoozedUntil }, "Could not snooze");
 }
 
 export function renameDiscussion(boardId: string, discussionId: string, title: string): void {
