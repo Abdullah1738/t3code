@@ -2311,18 +2311,25 @@ it.effect("a board's picked models keep their options (variant) through creation
   }),
 );
 
-const astraHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+const astraHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
 const astraXhigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
 
 it.effect("refuses a model or variant the provider doesn't offer, and names what it offers", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const astraPool = yield* kanban.setPool(board.id, astraXhigh, 2);
+      assert.isDefined(astraPool);
       const refused = yield* kanban
         .createCard(board.id, { prompt: "x", title: "x", model: astraHigh }, owner)
         .pipe(Effect.flip);
-      assert.include(refused.detail, "has no \"high\" variant; it offers: xhigh");
+      assert.include(refused.detail, 'has no "high" variant; it offers: xhigh');
 
       const accepted = yield* kanban.createCard(
         board.id,
@@ -2332,20 +2339,18 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
       const refusedEdit = yield* kanban
         .editCard(accepted.id, { model: astraHigh }, owner)
         .pipe(Effect.flip);
-      assert.include(refusedEdit.detail, "has no \"high\" variant; it offers: xhigh");
+      assert.include(refusedEdit.detail, 'has no "high" variant; it offers: xhigh');
       yield* kanban.editCard(accepted.id, { model: astraXhigh }, owner);
 
-      const poolRefused = yield* kanban
-        .setPool(board.id, astraHigh, 1)
-        .pipe(Effect.flip);
-      assert.include(poolRefused.detail, "has no \"high\" variant; it offers: xhigh");
+      const poolRefused = yield* kanban.setPool(board.id, astraHigh, 1).pipe(Effect.flip);
+      assert.include(poolRefused.detail, 'has no "high" variant; it offers: xhigh');
 
       const chainRefused = yield* kanban
         .updateBoard(board.id, {
           reviewChains: [{ name: "Critical", steps: [astraHigh] }],
         })
         .pipe(Effect.flip);
-      assert.include(chainRefused.detail, "has no \"high\" variant; it offers: xhigh");
+      assert.include(chainRefused.detail, 'has no "high" variant; it offers: xhigh');
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -2357,12 +2362,12 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
       const { kanban, board } = yield* toyBoard;
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       const store = yield* KanbanStore.KanbanStore;
-      const card = yield* store.card(created.id);
-      yield* store.putCard({ ...card!, model: astraHigh });
+      const stored = yield* store.card(created.id);
+      yield* store.putCard({ ...stored!, model: astraHigh });
       yield* kanban.dispatchNow;
       const after = (yield* kanban.card(created.id)).card;
       assert.isNull(after.activeThreadId);
-      assert.isTrue(after.stalled?.reason.startsWith("Model refused"));
+      assert.isTrue(after.stalled?.reason.startsWith("Model refused") === true);
       assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -2400,10 +2405,14 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
       const { kanban, board } = yield* toyBoard;
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
-      const worker = (yield* kanban.card(created.id)).card.activeThreadId!;
-      yield* kanban.moveCard(created.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker }, { note: "done" });
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
       yield* kanban.dispatchNow;
       const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.notStrictEqual(reviewThread, workThread);
       const before = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
       fake.failures.set(reviewThread, {
         class: "provider_error",
@@ -2411,10 +2420,7 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
         message: "Variant unavailable",
       } as never);
       yield* kanban.turnEnded(reviewThread);
-      assert.strictEqual(
-        (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length,
-        before,
-      );
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length, before);
       const flagged = (yield* kanban.card(created.id)).card;
       assert.strictEqual(flagged.stage, "needs_review");
       assert.match(flagged.stalled?.reason ?? "", /^Run failed: /);
