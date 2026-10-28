@@ -1987,10 +1987,11 @@ it.effect("idle discussions settle themselves after a day", () =>
       const pinned = yield* kanban.createDiscussion(board.id, "Pinned", evaluator);
       const snoozed = yield* kanban.createDiscussion(board.id, "Snoozed", evaluator);
       // Its own evaluator thread: the others share one, so a running thread
-      // there would hold them back too.
+      // there would hold them back too. Not a second setup: a board refuses one
+      // while its setup is running.
       const busy: KanbanActor = {
         _tag: "evaluator",
-        threadId: yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Busy" }),
+        threadId: yield* kanban.startEvaluator(board.id, { kind: "request", text: "Busy" }),
       };
       const working = yield* kanban.createDiscussion(board.id, "Working", busy);
       yield* kanban.updateDiscussion(pinned.id, { pinned: true }, owner);
