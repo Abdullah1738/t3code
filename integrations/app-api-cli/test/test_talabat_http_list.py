@@ -45,6 +45,24 @@ class ListingTest(unittest.TestCase):
         self.assertEqual([c.args[1] for c in request.call_args_list], [0, 1])
         self.assertIsNone(result['pagination']['next_page'])
 
+    def test_whole_history_on_one_final_page_is_accepted(self):
+        with patch.object(listing, 'page_request', return_value=page(count=118, last=True, total=118)) as request:
+            result = listing.list_orders(pages=5, limit=375)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(len(result['orders']), 118)
+        self.assertFalse(result['truncated'])
+
+    def test_oversized_page_rejected_unless_complete_final_page_zero(self):
+        for kwargs, args in [({'count': 118, 'last': False, 'total': 200}, {}),
+                             ({'count': 118, 'last': True, 'total': 200}, {}),
+                             ({'start': 1, 'count': 118, 'last': True, 'total': 118}, {'page': 1}),
+                             ({'count': listing.MAX_SINGLE_PAGE_ROWS + 1, 'last': True,
+                               'total': listing.MAX_SINGLE_PAGE_ROWS + 1}, {})]:
+            with self.subTest(kwargs=kwargs, args=args), \
+                    patch.object(listing, 'page_request', return_value=page(**kwargs)):
+                with self.assertRaisesRegex(listing.http.TalabatError, 'SCHEMA_CHANGED'):
+                    listing.list_orders(**args)
+
     def test_nonzero_page_explicitly_omits_earlier(self):
         with patch.object(listing, 'page_request', return_value=page(76, 10, True)):
             result = listing.list_orders(page=1)
