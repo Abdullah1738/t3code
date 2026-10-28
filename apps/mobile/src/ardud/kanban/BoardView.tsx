@@ -26,6 +26,7 @@ import { Menu } from "../../components/ui/Menu";
 import { SearchField } from "../../components/ui/SearchField";
 import { cn } from "../../lib/cn";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import { confirmAction } from "../common/hooks";
 import { ChoiceRow, LinkButton } from "../common/parts";
 import {
   BOARD_PAD,
@@ -43,12 +44,17 @@ import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts
 // Needs Owner cards shown above the tabs before "All N" opens the rest.
 const OWNER_PREVIEW = 2;
 
-/** Shown on every board view while the board's first setup runs; the owner can end setup here. */
+/**
+ * Shown on every board view while the board's first setup runs. The main action
+ * only opens the Setup discussion; ending setup is behind the actions menu and a
+ * confirmation, because it releases the board-wide hold.
+ */
 export function SetupStrip(props: {
   readonly setup: SetupBannerView;
   readonly onViewSetup: (discussionId: string) => void;
   readonly onEndSetup: () => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   return (
     <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
       <LinkButton
@@ -56,7 +62,29 @@ export function SetupStrip(props: {
         accessibilityLabel={props.setup.label}
         onPress={() => props.onViewSetup(props.setup.discussionId)}
       />
-      <LinkButton label="End setup" onPress={props.onEndSetup} />
+      <LinkButton
+        label="Setup actions"
+        accessibilityLabel="Setup actions"
+        expanded={menuOpen}
+        onPress={() => setMenuOpen((open) => !open)}
+      />
+      {menuOpen ? (
+        <LinkButton
+          label="End setup"
+          accessibilityLabel="End setup"
+          onPress={() => {
+            setMenuOpen(false);
+            confirmAction({
+              title: "End setup?",
+              message:
+                "Card work and review resume on this board. The setup evaluator's remaining work stops being held.",
+              confirmLabel: "End setup",
+              destructive: true,
+              onConfirm: props.onEndSetup,
+            });
+          }}
+        />
+      ) : null}
     </View>
   );
 }
