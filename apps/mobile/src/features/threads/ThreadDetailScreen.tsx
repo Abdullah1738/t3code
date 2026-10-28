@@ -54,6 +54,7 @@ import {
 } from "@t3tools/client-runtime/state/thread-execution";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { useKanbanBoardRunOf } from "../../ardud/kanban/kanbanStore";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
@@ -64,6 +65,7 @@ import {
   AppState,
   Keyboard,
   Platform,
+  Text,
   useWindowDimensions,
   View,
   type GestureResponderEvent,
@@ -490,6 +492,8 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
   const agentsSegment = resolveSubagentPillSegment(turnSubagents);
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  // ardud: a board-run thread is read-only too; the bar points the owner at the board.
+  const boardRun = useKanbanBoardRunOf(String(props.selectedThread.id));
   const editingRunId = props.queuedRunEdit?.runId ?? null;
   useEffect(() => {
     if (editingRunId === null) return;
@@ -1485,6 +1489,21 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
                               }
                         }
                       />
+                    </View>
+                  ) : boardRun !== undefined ? (
+                    <View
+                      className="self-center px-3 pt-1.5"
+                      style={{
+                        width: "100%",
+                        maxWidth: contentMaxWidth,
+                        paddingBottom: composerBottomInset + 6,
+                      }}
+                    >
+                      <View className="min-h-12 justify-center rounded-3xl px-5 py-2">
+                        <Text numberOfLines={1} className="text-sm font-medium text-foreground">
+                          Run by the {boardRun.boardName} board · view only
+                        </Text>
+                      </View>
                     </View>
                   ) : (
                     <>

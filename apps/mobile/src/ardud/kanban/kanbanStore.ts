@@ -56,6 +56,22 @@ export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined
   return useMemo(() => boards?.filter((summary) => summary.board.archivedAt === null), [boards]);
 }
 
+/** The board that started a thread, or undefined for threads a board did not start. */
+export function useKanbanBoardRunOf(
+  threadId: string,
+): { readonly boardId: string; readonly boardName: string } | undefined {
+  const boards = useStore(kanbanClient().boards);
+  return useMemo(() => {
+    if (boards === undefined) return undefined;
+    for (const entry of boards) {
+      if (entry.threadIds.includes(threadId as never)) {
+        return { boardId: entry.boardId, boardName: entry.board?.name ?? entry.boardId };
+      }
+    }
+    return undefined;
+  }, [boards, threadId]);
+}
+
 /** Threads the boards started, archived boards too, for thread lists to leave out. */
 export function useKanbanBoardThreadIds(): ReadonlySet<string> {
   const boards = useStore(kanbanClient().boards);
