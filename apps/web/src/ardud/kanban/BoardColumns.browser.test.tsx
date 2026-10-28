@@ -1,6 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { page } from "vite-plus/test/browser";
 
 import {
   boardStateFromSnapshot,
@@ -100,6 +101,8 @@ async function render(state = boardState()) {
 const isStageGrid = () => container.querySelector('[role="tablist"]') === null;
 
 beforeEach(async () => {
+  // The stage grid needs a wide viewport; a narrow one picks the phone tabs.
+  await page.viewport(1400, 900);
   localStorage.clear();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   // A wide board, so the stage grid is picked over the phone tabs.
