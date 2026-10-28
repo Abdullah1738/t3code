@@ -624,7 +624,7 @@ function DiscussionMenu(props: {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   onRename: () => void;
-  onMarkRead?: () => void;
+  onMarkRead?: (() => void) | undefined;
 }) {
   const [ownOpen, setOwnOpen] = useState(false);
   const open = props.open ?? ownOpen;
