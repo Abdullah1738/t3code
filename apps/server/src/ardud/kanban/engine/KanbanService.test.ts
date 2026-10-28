@@ -2410,34 +2410,17 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      // The Standard review step's model needs a slot for the review thread to start.
-      yield* kanban.setPool(board.id, board.evaluatorModel, 1);
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
-      const moved = yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+      // The work turn ends first: its slot is on the card model, the same pool the review uses.
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
         _tag: "thread",
         threadId: workThread,
       });
-      const afterMove = (yield* kanban.card(created.id)).card;
-      const poolsNow = (yield* KanbanStore.KanbanStore.pipe(Effect.flatMap((st) => st.pools(board.id))));
-      const boardNow = (yield* KanbanStore.KanbanStore.pipe(Effect.flatMap((st) => st.boards))).find((b) => b.id === board.id);
-      const evalKey = Rules.poolKey(board.evaluatorModel);
-      const diag = `evalKey=${evalKey} pools=${JSON.stringify(poolsNow.map((p) => [p.key, p.slots]))} evaluatorModel=${JSON.stringify(boardNow?.evaluatorModel)} chains=${JSON.stringify(boardNow?.reviewChains.map((c) => c.name))}`;
       yield* kanban.dispatchNow;
-      const reviewCard = (yield* kanban.card(created.id)).card;
-      const threadsNow = [...(yield* Ref.get(fake.threads)).keys()];
-      assert.strictEqual(
-        reviewCard.activeThreadId === null,
-        false,
-        `${diag} move=${moved.stage} afterMove=${JSON.stringify({ stage: afterMove.stage, activeThreadId: afterMove.activeThreadId, reviewStep: afterMove.reviewStep, reviewChain: afterMove.reviewChain, stalled: afterMove.stalled })} threads=${threadsNow.join(",")} stage=${reviewCard.stage}`,
-      );
-      const reviewThread = reviewCard.activeThreadId!;
-      assert.strictEqual(
-        reviewThread === null,
-        false,
-        `no review thread: ${JSON.stringify({ stage: reviewCard.stage, role: reviewCard.activeRole, stalled: reviewCard.stalled, pool: reviewCard.activePool })}`,
-      );
+      const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
       assert.notStrictEqual(reviewThread, workThread);
       const before = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
       fake.failures.set(reviewThread, {
