@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import {
+  DEFAULT_GROUP_COLUMN_WIDTH,
   activeGoals,
   groupCards,
   stageBoard,
@@ -366,11 +367,33 @@ function ShippedRow(props: {
 
 function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const groups = groupCards(props.state, props.group, props.nowMs, props.filter);
+  const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
   if (groups.length === 0) return <p className="text-(--m-muted)">No cards.</p>;
+  const groupWidth = prefs.groupWidth ?? DEFAULT_GROUP_COLUMN_WIDTH;
+  // One width for every group column; the handle on each one edits the shared value.
+  const commitWidth = (width: number) =>
+    updatePrefs((current) => ({ ...current, groupWidth: width }));
   return (
     <div className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
       {groups.map((group) => (
-        <Column key={group.key} column={group} summary={group.summary} className="w-64 shrink-0">
+        <Column
+          key={group.key}
+          column={group}
+          summary={group.summary}
+          className="shrink-0"
+          style={{ width: `var(${COLUMN_WIDTH_PROPERTY}, ${groupWidth}px)` }}
+          handle={
+            <ColumnResizeHandle
+              columnKey="group"
+              label={group.label}
+              edge="right"
+              width={groupWidth}
+              measure={() => groupWidth}
+              onCommit={commitWidth}
+              onReset={() => updatePrefs((current) => ({ ...current, groupWidth: null }))}
+            />
+          }
+        >
           {group.cards.map((card) => (
             <CardTile
               key={card.id}

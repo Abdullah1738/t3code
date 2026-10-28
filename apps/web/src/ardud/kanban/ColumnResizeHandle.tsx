@@ -1,6 +1,6 @@
 import { type KeyboardEvent } from "react";
 
-import { clampColumnWidth, type BoardColumnKey } from "@t3tools/client-runtime/ardud/kanban";
+import { clampColumnWidth, clampGroupWidth, type BoardColumnKey } from "@t3tools/client-runtime/ardud/kanban";
 
 import { useResizeDrag } from "../../hooks/useResizeDrag";
 import { cn } from "../../lib/utils";
@@ -13,7 +13,8 @@ const KEY_STEP = 16;
  * width is saved once on release, so the board never re-renders per pointer move.
  */
 export function ColumnResizeHandle(props: {
-  columnKey: BoardColumnKey;
+  /** "group" for the shared width of non-stage grouping columns. */
+  columnKey: BoardColumnKey | "group";
   label: string;
   edge: "left" | "right";
   /** Current px width, or null when the column is still sized by default. */
@@ -23,6 +24,10 @@ export function ColumnResizeHandle(props: {
   onCommit: (width: number) => void;
   onReset: () => void;
 }) {
+  const clamp = (value: number) =>
+    props.columnKey === "group"
+      ? clampGroupWidth(value)
+      : clampColumnWidth(props.columnKey, value);
   const handlers = useResizeDrag<HTMLDivElement>((event) => {
     const host = event.currentTarget.parentElement;
     const startWidth = props.width ?? props.measure();
@@ -30,7 +35,7 @@ export function ColumnResizeHandle(props: {
       width: startWidth,
       edge: props.edge,
       resize(value) {
-        const next = clampColumnWidth(props.columnKey, value);
+        const next = clamp(value);
         host?.style.setProperty(COLUMN_WIDTH_PROPERTY, `${next}px`);
         return next;
       },
@@ -55,7 +60,7 @@ export function ColumnResizeHandle(props: {
     event.preventDefault();
     const base = props.width ?? props.measure();
     const flip = props.edge === "left" ? -1 : 1;
-    props.onCommit(clampColumnWidth(props.columnKey, base + delta * flip));
+    props.onCommit(clamp(base + delta * flip));
   };
 
   const current = props.width ?? props.measure();
