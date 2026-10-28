@@ -2420,13 +2420,17 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
         threadId: workThread,
       });
       const afterMove = (yield* kanban.card(created.id)).card;
+      const poolsNow = (yield* KanbanStore.KanbanStore.pipe(Effect.flatMap((st) => st.pools(board.id))));
+      const boardNow = (yield* KanbanStore.KanbanStore.pipe(Effect.flatMap((st) => st.boards))).find((b) => b.id === board.id);
+      const evalKey = Rules.poolKey(board.evaluatorModel);
+      const diag = `evalKey=${evalKey} pools=${JSON.stringify(poolsNow.map((p) => [p.key, p.slots]))} evaluatorModel=${JSON.stringify(boardNow?.evaluatorModel)} chains=${JSON.stringify(boardNow?.reviewChains.map((c) => c.name))}`;
       yield* kanban.dispatchNow;
       const reviewCard = (yield* kanban.card(created.id)).card;
       const threadsNow = [...(yield* Ref.get(fake.threads)).keys()];
       assert.strictEqual(
         reviewCard.activeThreadId === null,
         false,
-        `move=${JSON.stringify(moved)} afterMove=${JSON.stringify({ stage: afterMove.stage, activeThreadId: afterMove.activeThreadId, reviewStep: afterMove.reviewStep, reviewChain: afterMove.reviewChain, stalled: afterMove.stalled })} threads=${threadsNow.join(",")} stage=${reviewCard.stage}`,
+        `${diag} move=${moved.stage} afterMove=${JSON.stringify({ stage: afterMove.stage, activeThreadId: afterMove.activeThreadId, reviewStep: afterMove.reviewStep, reviewChain: afterMove.reviewChain, stalled: afterMove.stalled })} threads=${threadsNow.join(",")} stage=${reviewCard.stage}`,
       );
       const reviewThread = reviewCard.activeThreadId!;
       assert.strictEqual(
