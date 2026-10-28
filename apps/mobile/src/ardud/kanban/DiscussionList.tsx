@@ -18,6 +18,7 @@ import { LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
 import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
 import { kanbanClient } from "./kanbanStore";
+import { useDiscussionShelves } from "./use-discussion-shelves";
 
 /**
  * Board discussions, newest first, like the thread list: open ones on top,
@@ -32,11 +33,12 @@ export function DiscussionList(props: {
   readonly onOpen: (discussionId: string) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [open, setOpen] = useState({ snoozed: false, settled: false });
   const searchRef = useRef<TextInputInstance | null>(null);
   const groups = discussionRows(props.state, props.nowMs, { query });
   const total = groups.active.length + groups.snoozed.length + groups.settled.length;
   const boardId = props.state.board.id;
+  const shelves = useDiscussionShelves(boardId);
+  const open = shelves.open;
   useEffect(() => kanbanClient().watchPreviews(boardId), [boardId]);
   if (!props.state.discussionsLoaded && total === 0 && query === "") return <LoadingLine />;
   const searching = query.trim() !== "";
@@ -88,7 +90,7 @@ export function DiscussionList(props: {
               count={rows.length}
               expanded={expanded}
               tone={kind}
-              onToggle={() => setOpen((current) => ({ ...current, [kind]: !current[kind] }))}
+              onToggle={() => shelves.toggle(kind)}
             />
             {expanded ? rowList(rows) : null}
           </View>

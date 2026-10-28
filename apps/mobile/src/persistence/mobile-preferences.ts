@@ -50,6 +50,19 @@ export type PullRequestListPreferences = typeof PullRequestListPreferences.Type;
 const isThreadListFilters = Schema.is(ThreadListFilters);
 const isPullRequestListPreferences = Schema.is(PullRequestListPreferences);
 
+function isKanbanDiscussionShelves(
+  value: unknown,
+): value is NonNullable<Preferences["kanbanDiscussionShelves"]> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.values(value).every(
+    (shelves) =>
+      typeof shelves === "object" &&
+      shelves !== null &&
+      ("snoozed" in shelves ? typeof shelves.snoozed === "boolean" : true) &&
+      ("settled" in shelves ? typeof shelves.settled === "boolean" : true),
+  );
+}
+
 export interface Preferences {
   readonly pullRequestHideTestFiles?: boolean;
   readonly pullRequestMergeMethod?: PullRequestMergeMethod;
@@ -85,6 +98,10 @@ export interface Preferences {
   readonly threadListWorkingShelfExpanded?: boolean;
   readonly threadListFilters?: ThreadListFilters;
   readonly pullRequestListFilters?: PullRequestListPreferences;
+  /** Which Snoozed/Settled shelves are open, per board id. */
+  readonly kanbanDiscussionShelves?: Readonly<
+    Record<string, { readonly snoozed?: boolean; readonly settled?: boolean }>
+  >;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -155,6 +172,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListWorkingShelfExpanded?: boolean;
     threadListFilters?: ThreadListFilters;
     pullRequestListFilters?: PullRequestListPreferences;
+    kanbanDiscussionShelves?: Preferences["kanbanDiscussionShelves"];
   } = {};
 
   if (typeof parsed.pullRequestHideTestFiles === "boolean") {
@@ -281,6 +299,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (isPullRequestListPreferences(parsed.pullRequestListFilters)) {
     preferences.pullRequestListFilters = parsed.pullRequestListFilters;
+  }
+  if (isKanbanDiscussionShelves(parsed.kanbanDiscussionShelves)) {
+    preferences.kanbanDiscussionShelves = parsed.kanbanDiscussionShelves;
   }
   return preferences;
 }
