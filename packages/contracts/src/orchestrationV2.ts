@@ -2003,6 +2003,22 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
+  // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
+  restartCancelledBackgroundWork: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        kind: OrchestrationV2RestartCancelledBackgroundWork.fields.kind,
+        label: OrchestrationV2RestartCancelledBackgroundWork.fields.label,
+        id: OrchestrationV2RestartCancelledBackgroundWork.fields.id,
+        child: Schema.optional(
+          Schema.Struct({
+            threadId: ThreadId,
+            startedAt: Schema.DateTimeUtcFromString,
+          }),
+        ),
+      }),
+    ),
+  ),
 }));
 export type OrchestrationV2RunJson = typeof OrchestrationV2RunJson.Type;
 
