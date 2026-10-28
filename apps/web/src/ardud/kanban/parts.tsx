@@ -134,7 +134,7 @@ export function Chip(props: { children: ReactNode; className?: string }) {
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-chip) px-2.25 text-xs font-medium whitespace-nowrap text-(--m-text) pointer-coarse:h-6.5 pointer-coarse:px-2.75 pointer-coarse:text-[0.8125rem]",
+        "inline-flex h-5.5 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-chip) px-2.25 text-xs font-medium whitespace-nowrap text-(--m-text) pointer-coarse:h-6.5 pointer-coarse:px-2.75 pointer-coarse:text-sm",
         props.className,
       )}
     >
@@ -204,7 +204,7 @@ export function Seg<T extends string>(props: {
             aria-pressed={pressed}
             onClick={() => props.onChange(option.value)}
             className={cn(
-              "inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) focus-visible:ring-inset pointer-coarse:h-9 pointer-coarse:px-3.5 pointer-coarse:text-[0.9375rem]",
+              "inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) focus-visible:ring-inset pointer-coarse:h-9 pointer-coarse:px-3.5 pointer-coarse:text-base",
               pressed
                 ? "bg-(--m-raised) text-(--m-text)"
                 : "text-(--m-muted) hover:text-(--m-text)",

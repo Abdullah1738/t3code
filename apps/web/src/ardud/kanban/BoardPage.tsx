@@ -136,7 +136,7 @@ export function BoardPage(props: {
           <button
             type="button"
             onClick={() => go({ view: "discussions", discussion: NEW_DISCUSSION, card: undefined })}
-            className="inline-flex h-8.5 shrink-0 items-center gap-1.5 rounded-full bg-(--m-accent) ps-3 pe-3.5 text-sm font-medium text-(--m-accent-ink) max-md:px-2.25 outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) pointer-coarse:h-11 pointer-coarse:text-[0.9375rem]"
+            className="inline-flex h-8.5 shrink-0 items-center gap-1.5 rounded-full bg-(--m-accent) ps-3 pe-3.5 text-sm font-medium text-(--m-accent-ink) max-md:px-2.25 outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) pointer-coarse:h-11 pointer-coarse:text-base"
           >
             <PlusIcon className="size-4" aria-hidden />
             <span className="max-md:sr-only">New</span>
@@ -154,7 +154,7 @@ export function BoardPage(props: {
                   <button
                     type="button"
                     onClick={feed.retry}
-                    className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-[0.9375rem]"
+                    className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
                   >
                     Retry
                   </button>
@@ -320,7 +320,7 @@ function BoardControls(props: {
               <button
                 type="button"
                 aria-label="Group by"
-                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-[0.9375rem]"
+                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
               />
             }
           >
@@ -348,7 +348,7 @@ function BoardControls(props: {
               <button
                 type="button"
                 className={cn(
-                  "inline-flex h-8 max-w-48 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-[0.9375rem]",
+                  "inline-flex h-8 max-w-48 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
                   only
                     ? "bg-(--m-text) text-(--m-ground)"
                     : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
@@ -381,7 +381,7 @@ function BoardControls(props: {
               type="button"
               aria-label="Settled cards"
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-[0.9375rem]",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
                 props.settled !== "hide"
                   ? "bg-(--m-text) text-(--m-ground)"
                   : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",

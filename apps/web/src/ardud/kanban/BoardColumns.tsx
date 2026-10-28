@@ -278,7 +278,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
             )}
           >
             {board.owner.cards.length === 0 ? (
-              <p className="px-1.5 py-1 text-xs text-(--m-muted) pointer-coarse:text-[0.8125rem]">
+              <p className="px-1.5 py-1 text-xs text-(--m-muted) pointer-coarse:text-sm">
                 Nothing waiting on you
               </p>
             ) : (
@@ -312,7 +312,7 @@ function FoldedShipped(props: { board: ReadonlyArray<StageColumn>; onOpen: () =>
       {props.board.map((column) => (
         <span
           key={column.stage}
-          className="flex flex-col items-center gap-1.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-[0.8125rem]"
+          className="flex flex-col items-center gap-1.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-sm"
         >
           <Glyph kind={stageGlyph(column.stage)} />
           {column.cards.length}
@@ -353,7 +353,7 @@ function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
     <div
       className={cn(
-        "flex h-6 shrink-0 items-center justify-between px-1 text-xs pointer-coarse:h-8 pointer-coarse:text-[0.8125rem]",
+        "flex h-6 shrink-0 items-center justify-between px-1 text-xs pointer-coarse:h-8 pointer-coarse:text-sm",
         props.tone === "warn" ? "text-(--m-warning)" : "text-(--m-muted)",
       )}
     >
@@ -411,7 +411,7 @@ function ShippedColumn(props: {
       className={cn("relative flex min-h-0 shrink-0 flex-col", props.width === null && "w-60")}
     >
       {props.handle}
-      <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-11 pointer-coarse:text-[0.8125rem]">
+      <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-11 pointer-coarse:text-sm">
         <span className="font-medium">Shipped</span>
         <button
           type="button"
@@ -458,7 +458,7 @@ function ShippedRow(props: {
       onClick={() => props.onOpen(props.card.id)}
       aria-current={props.selected ? "true" : undefined}
       className={cn(
-        "grid grid-cols-[12px_1fr] items-start gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:py-2 pointer-coarse:text-[0.8125rem]",
+        "grid grid-cols-[12px_1fr] items-start gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:py-2 pointer-coarse:text-sm",
         props.selected && "text-(--m-text) ring-2 ring-inset ring-(--m-text)",
       )}
     >
@@ -566,7 +566,7 @@ function StageList(props: ColumnsProps) {
               aria-selected={selected}
               onClick={() => setPicked(column.stage)}
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-[0.9375rem]",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
                 selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
               )}
             >
