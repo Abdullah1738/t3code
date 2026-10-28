@@ -9,6 +9,22 @@ export const COLUMN_WIDTH_PROPERTY = "--col-w";
 const KEY_STEP = 16;
 
 /**
+ * The width a column would take with no saved width: an unsaved column is flex-1 and
+ * stretches to the scroller, so its rendered width is the whole row. Measure it with the
+ * flex growth removed. A saved column is already at its width, so its rect is the truth.
+ */
+function naturalWidth(host: HTMLElement, saved: number | null): number {
+  if (saved !== null) return host.getBoundingClientRect().width;
+  const previous = { width: host.style.width, flex: host.style.flex };
+  host.style.flex = "none";
+  host.style.width = "auto";
+  const measured = host.getBoundingClientRect().width;
+  host.style.width = previous.width;
+  host.style.flex = previous.flex;
+  return measured;
+}
+
+/**
  * Drag handle on a column edge. The column is pinned to its measured width for the
  * drag, live moves only rewrite --col-w (no React render per move), and the saved
  * width is committed once on release. The pre-drag inline style is restored on cancel.
@@ -34,9 +50,8 @@ export function ColumnResizeHandle(props: {
     const host = event.currentTarget.parentElement;
     if (!host) return null;
     const target = props.liveTarget?.(event.currentTarget) ?? host;
-    // The rendered width is the truth: a flex-1 column measures its real share.
-    const startWidth = host.getBoundingClientRect().width;
     const previous = { width: host.style.width, flex: host.style.flex };
+    const startWidth = naturalWidth(host, props.width);
     host.style.flex = "none";
     host.style.width = `var(${COLUMN_WIDTH_PROPERTY})`;
     target.style.setProperty(COLUMN_WIDTH_PROPERTY, `${startWidth}px`);
@@ -71,8 +86,7 @@ export function ColumnResizeHandle(props: {
     if (!host) return;
     event.preventDefault();
     const flip = props.edge === "left" ? -1 : 1;
-    // Step from the rendered width, so an unsaved column moves from where it really is.
-    props.onCommit(clamp(host.getBoundingClientRect().width + delta * flip));
+    props.onCommit(clamp(naturalWidth(host, props.width) + delta * flip));
   };
 
   return (

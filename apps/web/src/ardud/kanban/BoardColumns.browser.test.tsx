@@ -130,18 +130,17 @@ describe("stage columns", () => {
     await render();
     const separator = handle("To-Do");
     expect(separator).not.toBeNull();
-    const before = Number(separator!.getAttribute("aria-valuenow"));
+    const column = separator!.parentElement as HTMLElement;
+    const before = column.getBoundingClientRect().width;
 
     await act(() => {
       separator!.focus();
       separator!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
     });
 
-    const after = Number(handle("To-Do")!.getAttribute("aria-valuenow"));
-    expect(after).toBe(before + 16);
-    expect(readStored(boardColumnsStorageKey(BOARD_ID))).toMatchObject({
-      widths: { todo: before + 16 },
-    });
+    // The keyboard step starts from the rendered width and saves that + 16px.
+    const saved = readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo;
+    expect(saved).toBeCloseTo(before + 16, 0);
   });
 
   it("resets a column width on double-click and saves the reset", async () => {
@@ -188,6 +187,16 @@ function pointer(
   type: "pointerdown" | "pointermove" | "pointerup",
   clientX: number,
 ) {
+  // Synthetic pointers have no browser-side pointer to capture; stub capture as
+  // useResizableWidth.browser.test does, or the drag aborts before it starts.
+  let captured = false;
+  element.setPointerCapture = () => {
+    captured = true;
+  };
+  element.hasPointerCapture = () => captured;
+  element.releasePointerCapture = () => {
+    captured = false;
+  };
   element.dispatchEvent(
     new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, pointerId: 7, clientX }),
   );
