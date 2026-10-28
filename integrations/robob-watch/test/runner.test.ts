@@ -386,7 +386,7 @@ test("watchers from before relays that mention wa sends are listed and fire owne
   expect(listed).toContain("old-ek");
   expect(listed).toContain("Old EK ETA");
   expect(listed).not.toContain("old-plain");
-  expect(listed).toContain("tell only the owner");
+  expect(listed).toContain("relays (his words) are optional");
   writeFileSync(flag, "ETA 21:40");
   await runnerFor(2_500);
   const wake = readCalls().filter(call => call.args[0] === "wake" && call.args.includes("robob-watch old-ek")).at(-1)!;

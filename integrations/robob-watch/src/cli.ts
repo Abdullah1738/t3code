@@ -253,7 +253,7 @@ async function main(argv: string[]): Promise<void> {
         const s = loadState(w.id);
         console.log(`${w.id}  [${w.paused ? "paused" : s.status}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
       }
-      console.log("These list no relays, so their fires tell only the owner. To let one message someone, add it again with relays (the owner's words for each).");
+      console.log("These list no relays. Their fires can message anyone their check or context names; relays (his words) are optional, and add them to get his stops and the ETA throttle.");
       return;
     }
     case "runner": {
