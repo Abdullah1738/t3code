@@ -45,6 +45,20 @@ export function useBoardThreadIds(): ReadonlySet<string> {
   return boardThreadIds(useStore(kanban.boards));
 }
 
+/** The board that started a thread, or undefined for threads a board did not start. */
+export function useBoardRunOf(
+  threadId: string,
+): { readonly boardId: string; readonly boardName: string } | undefined {
+  const boards = useStore(kanban.boards);
+  if (boards === undefined) return undefined;
+  for (const entry of boards) {
+    if (entry.threadIds.includes(threadId as never)) {
+      return { boardId: entry.boardId, boardName: entry.board?.name ?? entry.boardId };
+    }
+  }
+  return undefined;
+}
+
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
   return useStore(kanban.board(boardId));
 }

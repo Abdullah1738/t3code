@@ -413,6 +413,8 @@ import {
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { MessagesTimeline, type MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
+import { BoardRunBar } from "./chat/BoardRunBar";
+import { useBoardRunOf } from "../ardud/kanban/kanbanStore";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
 import { resolveTimelineIsAtEnd } from "./chat/MessagesTimeline.logic";
 import {
@@ -3025,7 +3027,10 @@ export default function ChatView(props: ChatViewProps) {
   // composer and its strips. Its approvals and questions are asked on the
   // top-level parent thread.
   const showProviderSubagentBar = isProviderSubagent;
-  const composerMounted = !showProviderSubagentBar;
+  // ardud: a board-run thread is read-only too; the board's Threads view is where to act.
+  const boardRun = useBoardRunOf(activeThreadId);
+  const showBoardRunBar = !showProviderSubagentBar && boardRun !== undefined;
+  const composerMounted = !showProviderSubagentBar && !showBoardRunBar;
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;
   // Providers can report a dated id or alias (claude-haiku-4-5-20251001).
   const providerSubagentModelSlug = selectedProviderEntry
@@ -8232,6 +8237,12 @@ export default function ChatView(props: ChatViewProps) {
                                   ? () => onOpenRelatedThread(parentThreadLink.threadId)
                                   : null
                               }
+                            />
+                          ) : null}
+                          {showBoardRunBar && boardRun ? (
+                            <BoardRunBar
+                              boardName={boardRun.boardName}
+                              onOpenBoard={null}
                             />
                           ) : null}
                           {!composerMounted ? null : (
