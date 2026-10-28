@@ -97,32 +97,41 @@ class MinutesIntegrationTests(unittest.TestCase):
         self.assertEqual(kwargs['order'],'IAEGA123')
         self.assertEqual(result['payment_status'],'payment_pending')
 
-    def test_cvv_payment_chain_from_captured_responses_reaches_paid_triple(self):
-        """CVV-required payment: complete(cvv) then await_payment reaches the captured paid triple.
+    def test_cvv_required_basket_prepares_places_and_pays_with_mocked_cvv(self):
+        """Done-when path 1, through a normally constructed MinutesFlow.
 
-        Drives the real MinutesFlow.complete and await_payment through the Harness,
-        serving the captured order readback, payment config, complete and status bodies.
+        Real prepare_only() -> place(cvv_ready=True) -> complete(cvv) -> await_payment,
+        served by the Harness in the order the flow actually calls them. Nothing about
+        the review, refresh or place is stubbed. Only the journal, receipts and the
+        catalog (external) are patched.
         """
         from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
-        from test.test_noon_minutes_checkout import Harness
-        from unittest.mock import Mock
-        h=Harness([FIXTURE['order_get_pending'],FIXTURE['config'],FIXTURE['complete']['resp'],
-                   FIXTURE['status_confirmed']])
-        flow=object.__new__(c.MinutesFlow)
-        flow.flow_id='10000000-0000-4000-8000-00000000eeee'
-        flow.review={'order':ORDER,'amount':TOTAL_MINOR,'digest':'a'*64}
-        flow.current=c.m.Snapshot({'isCvvRequired':True,'paymentProviderCode':'NOON_PAY'},{},time.time())
-        flow.card=c.m.SavedCard('synthetic-token','xxxx5542','mastercard')
-        flow.client=h.client
-        flow.store=Mock();flow.expected=None;flow.cookies_in_ram=[];flow.intent=None
-        flow.opened=True
-        flow.client._receipt=h.receipt
-        flow.client._response_cookies=lambda *a,**k:True
-        with patch.object(c.j,'inspect',return_value={'state':'ACTIVE','operations':[]}), \
-                patch.object(c.j,'observe',return_value={'outcome':'RESPONSE_RECEIVED'}), \
-                patch.object(c.j,'consume',return_value=True), \
-                patch.object(c.MinutesFlow,'_before',lambda self,op,digest:True), \
+        from test.test_noon_minutes_checkout import Harness, HEADERS
+        from unittest.mock import patch as _patch
+        session=_session_wire(cvv_required=True)
+        t0=time.time()
+        h=Harness([
+            # prepare: session_get(empty), sync(filled), instructions, session_get refresh, payment_cards
+            _empty_session_wire(True), session, _quiet_session_wire(True), _quiet_session_wire(True), _saved_cards(),
+            # place: session_get (refresh), payment_cards (approve), order_get_active, place
+            _quiet_session_wire(True), _saved_cards(), FIXTURE['get_active']['resp'], FIXTURE['place']['resp'],
+            # complete: order_get, payment_config, complete, status
+            FIXTURE['order_get_pending'], FIXTURE['config'], FIXTURE['complete']['resp'],
+            FIXTURE['status_confirmed'],
+        ])
+        auth_snap=AuthSnapshot('minutes',h.home.account_ref,h.home.address_ref,t0,dict(HEADERS),
+            time.monotonic()+30)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(c.j,'ROOT',Path(temp).resolve()/'commerce'), \
+                patch.object(c.receipts,'ROOT',Path(temp).resolve()/'commerce'), \
+                patch.object(c.options,'read_options',return_value={'groups':[]}), \
+                patch.object(c.MinutesFlow,'validate_options',lambda self:None), \
                 patch('noon_cvv.encrypt',return_value={'encCvv':'synthetic-cipher','publicKeyName':'key_1'}) as enc:
+            flow=_real_flow(h,auth_snap,cvv_required=True,t0=t0)
+            prepared=flow.prepare_only()
+            self.assertTrue(prepared['review']['cvv_required'])
+            placed=flow.place(cvv_ready=True)
+            self.assertEqual(placed['order'],ORDER)
             flow.complete(cvv=b'123')
             enc.assert_called_once()
             paid=flow.await_payment(notify=lambda *_:None,sleep=lambda _:None,
@@ -150,6 +159,96 @@ class MinutesIntegrationTests(unittest.TestCase):
         self.assertEqual(flow.intent,{'secret':'synthetic-intent'})
         self.assertEqual(flow.review['placed_at'],'2026-10-10T13:18:29+04:00')
         self.assertEqual(flow.review['eta'],'2026-10-10T13:28:57+04:00')
+
+
+def _session_wire(cvv_required):
+    """A fixture-based cart session that satisfies approve()'s fee and arithmetic gates."""
+    import copy
+    from test.test_noon_minutes_checkout import fixture as _fixture
+    session=copy.deepcopy(_fixture())
+    session['isCvvRequired']=cvv_required
+    for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
+                'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee',
+                'orderLateNightFee'):
+        session[key]=0
+    # Captured basket figures (order_get_pending): subtotal 6.25 + delivery 8 + small-order 3 = 17.25.
+    session['orderSubtotal']=6.25
+    session['orderTotal']=17.25
+    session['orderPaymentAmount']=17.25
+    session['orderDeliveryFee']=8.0
+    session['orderSmallOrderFee']=3.0
+    # complete() requires the session's payment provider (captured session: NOON_PAY).
+    session['paymentProviderCode']='NOON_PAY'
+    # The real quiet codes the flow requires (select_quiet/approve); the fixture's
+    # synthetic codes are not these.
+    session['deliveryPreferences']=[
+        {'code':'dont_ring_the_bell','value':False,'title':'Do not ring bell'},
+        {'code':'leave_it_at_my_door','value':False,'title':'Leave at door'}]
+    session['driverNotes']=c.m.QUIET_NOTE
+    return session
+
+
+def _quiet_session_wire(cvv_required):
+    import copy
+    q=copy.deepcopy(_session_wire(cvv_required))
+    q['deliveryPreferences']=[
+        {'code':'dont_ring_the_bell','value':True,'title':'Do not ring bell'},
+        {'code':'leave_it_at_my_door','value':True,'title':'Leave at door'}]
+    return q
+
+
+def _empty_session_wire(cvv_required):
+    import copy
+    empty=copy.deepcopy(_session_wire(cvv_required))
+    empty['items']=[]
+    return empty
+
+
+def _saved_cards():
+    # The saved card's id is the same token the session's paymentToken fingerprints to.
+    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx5542','ccType':'mastercard',
+                     'isDefault':True,'isDeleted':False}]}
+
+
+def _real_flow(h, auth_snap, *, cvv_required, t0):
+    """A normally constructed MinutesFlow, with the transport served by the Harness.
+
+    Journal and receipts are patched by the caller. Only the auth lifecycle and the
+    options catalog are stubbed (both external to the flow under test). The auth
+    lifecycle hands out a fresh single-use snapshot for every call, as the real
+    lifecycle does (mutation_headers is single-use).
+    """
+    from unittest.mock import Mock
+    import copy as _copy
+    def fresh(*args,**kwargs):
+        return AuthSnapshot(auth_snap.service,auth_snap.account_ref,auth_snap.address_ref,
+            time.time(),dict(auth_snap.read_headers()),time.monotonic()+30)
+    auth=Mock()
+    auth.status.return_value={'maintenance_state':'none'}
+    auth.revalidate.side_effect=fresh
+    auth.reconcile.side_effect=fresh
+    auth.fresh_before_mutation.side_effect=fresh
+    flow=c.MinutesFlow.__new__(c.MinutesFlow)
+    flow.auth=auth
+    flow.snapshot=fresh()
+    flow.skus=[{'sku':'SYNTHETIC_SHAKE','qty':1,'modifiers':()}]
+    flow.catalog_queries={'SYNTHETIC_SHAKE':None}
+    flow.flow_id='10000000-0000-4000-8000-00000000f000'
+    flow.scope_hash='b'*64
+    flow.opened=False;flow.expected=None;flow.review=None;flow.current=None
+    flow.intent=None;flow.cookies_in_ram=[]
+    flow.cart_hash='a'*64
+    flow.store=Mock()
+    flow.card=None
+    flow._options_validated=True
+    # Receipt and cookie hooks are the flow's own (production wiring): each response
+    # is observed in the journal before the next send. The Harness only supplies the
+    # transport responses.
+    flow.client=c.m.MinutesCheckout(flow.snapshot.read_headers(),
+        c.AccountHome('minutes',auth_snap.account_ref,auth_snap.address_ref,t0),
+        request=h.request,receipt=flow._receipt,response_cookies=flow._cookies,
+        header_provider=flow._headers,home_provider=flow._fresh_home)
+    return flow
 
 
 def paid_projection(status='payment_confirmed',txn='CAPTURED',authorized=1725,captured=1725,
@@ -316,52 +415,36 @@ class PaymentAwaitTests(unittest.TestCase):
             flow._fresh_home(time.monotonic()+30)
 
     def test_place_after_300s_clock_advance_refreshes_home_and_places(self):
-        """Done-when path 2: 300 s between prepare and place still places.
+        """Done-when path 2, through a normally constructed MinutesFlow.
 
-        Real MinutesFlow place() through the Harness; time.time is advanced 300 s
-        after the home was verified. The home refresh (auth.revalidate) must run
-        before place_order, and place returns the captured order number.
+        Real prepare_only(), then time.time advances 300 s, then real place(). The
+        home verified at prepare time is 300 s old at place, so the client must
+        refresh it through the flow's home_provider (auth.revalidate) and then place.
         """
-        import copy
         from test.test_minutes_payment_chain import FIXTURE
-        from test.test_noon_minutes_checkout import HEADERS
-        from unittest.mock import Mock
-        from noon_checkout import AccountHome
-        session=copy.deepcopy(fixture())
-        session['isCvvRequired']=False
-        for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
-                    'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee',
-                    'orderLateNightFee'):
-            session[key]=0
-        session['orderDeliveryFee']=8.0
-        h=Harness([FIXTURE['get_active']['resp'],FIXTURE['place']['resp']])
+        from test.test_noon_minutes_checkout import Harness, HEADERS
+        from unittest.mock import patch as _patch
+        session=_session_wire(cvv_required=False)
         t0=time.time()
-        home=AccountHome('minutes',h.home.account_ref,h.home.address_ref,t0)
-        fresh_snap=AuthSnapshot('minutes',h.home.account_ref,h.home.address_ref,t0+300,
-            dict(HEADERS),time.monotonic()+30)
-        auth=Mock()
-        auth.status.return_value={'maintenance_state':'none'}
-        auth.revalidate.return_value=fresh_snap
-        auth.reconcile.return_value=fresh_snap
-        flow=object.__new__(c.MinutesFlow)
-        flow.flow_id='10000000-0000-4000-8000-00000000ffff'
-        flow.auth=auth
-        flow.snapshot=fresh_snap
-        flow.opened=True;flow.expected=None;flow.cookies_in_ram=[];flow.intent=None
-        flow.store=Mock();flow.skus=[];flow.cart_hash='a'*64
-        flow.current=c.m.Snapshot(session,c.m.project_session(session),t0)
-        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':False}
-        flow.client=c.m.MinutesCheckout(HEADERS,home,request=h.request,receipt=h.receipt,
-            response_cookies=h.response_cookies,home_provider=flow._fresh_home)
-        flow.refresh_cart_readback=Mock(return_value=flow.current.projection)
-        flow.approve=lambda:flow.review
-        with patch.object(c.j,'consume',return_value=True), \
-                patch.object(c.j,'observe',return_value={'outcome':'RESPONSE_RECEIVED'}), \
-                patch.object(c.MinutesFlow,'_before',lambda self,op,digest:True), \
-                patch.object(c.time,'time',return_value=t0+300):
-            placed=flow.place()
+        h=Harness([
+            _empty_session_wire(False), session, _quiet_session_wire(False), _quiet_session_wire(False), _saved_cards(),
+            _quiet_session_wire(False), _saved_cards(), FIXTURE['get_active']['resp'], FIXTURE['place']['resp'],
+        ])
+        auth_snap=AuthSnapshot('minutes',h.home.account_ref,h.home.address_ref,t0,dict(HEADERS),
+            time.monotonic()+30)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(c.j,'ROOT',Path(temp).resolve()/'commerce'), \
+                patch.object(c.receipts,'ROOT',Path(temp).resolve()/'commerce'), \
+                patch.object(c.options,'read_options',return_value={'groups':[]}), \
+                patch.object(c.MinutesFlow,'validate_options',lambda self:None):
+            flow=_real_flow(h,auth_snap,cvv_required=False,t0=t0)
+            flow.prepare_only()
+            self.assertEqual(flow.auth.revalidate.call_count,0)
+            # Advance the wall clock 300 s after the home was verified.
+            with _patch.object(c.time,'time',return_value=t0+300):
+                placed=flow.place()
         self.assertEqual(placed['order'],FIXTURE['place']['resp']['order_nr'])
-        self.assertGreaterEqual(auth.revalidate.call_count,1)
+        self.assertGreaterEqual(flow.auth.revalidate.call_count,1)
         self.assertEqual([x[0] for x in h.calls][-1],'place')
 
     def test_place_rechecks_cvv_after_refresh_and_places_with_cvv_ready(self):
