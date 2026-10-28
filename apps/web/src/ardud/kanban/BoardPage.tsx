@@ -287,7 +287,7 @@ function BoardBody(props: {
       );
     case "threads":
       return (
-        <div className="flex min-h-0 flex-1 flex-col pe-5">
+        <div className="min-h-0 flex-1 overflow-y-auto pe-5">
           <ThreadsView boardId={props.boardId} />
         </div>
       );

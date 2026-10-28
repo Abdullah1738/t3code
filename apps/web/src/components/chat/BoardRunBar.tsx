@@ -32,7 +32,11 @@ export function BoardRunBar(props: {
             <Link
               to="/boards/$boardId"
               params={{ boardId: props.boardId }}
-              search={owner.kind === "card" ? { card: owner.id } : { discussion: owner.id }}
+              search={
+                owner.kind === "card"
+                  ? { card: owner.id }
+                  : { view: "discussions", discussion: owner.id }
+              }
             />
           }
         >

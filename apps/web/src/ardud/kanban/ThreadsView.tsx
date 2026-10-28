@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import type { KanbanThreadRow } from "@t3tools/contracts";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useBoardThreads } from "./kanbanStore";
@@ -64,18 +65,28 @@ function ThreadGroup(props: {
 function ThreadRow(props: { row: KanbanThreadRow }) {
   const { row } = props;
   const environmentId = usePrimaryEnvironmentId();
-  const label =
+  // Card identity and purpose stay visible next to the title, so repeated
+  // evaluator runs and renamed or reused card threads can be told apart.
+  const identity =
     row.role === "evaluator"
-      ? (row.purpose ?? "evaluator")
+      ? `Evaluator · ${row.purpose ?? "run"}`
       : row.cardNumber !== null
-        ? `#${row.cardNumber} ${row.cardTitle ?? ""}`.trim()
+        ? `Card #${row.cardNumber}${row.cardTitle ? ` ${row.cardTitle}` : ""}`
         : "Card";
   const body = (
     <>
-      <span className="min-w-0 truncate">{row.title ?? label}</span>
+      <span className="flex min-w-0 flex-col">
+        <span className="min-w-0 truncate font-medium">{row.title ?? identity}</span>
+        <span className="text-(--m-muted) min-w-0 truncate text-xs">
+          {identity}
+          {row.model === null ? "" : ` · ${row.model.model}`}
+          {row.lastActivityAt === null
+            ? ""
+            : ` · ${ageView(row.lastActivityAt, Date.now())?.label ?? ""} ago`}
+        </span>
+      </span>
       <span className="text-(--m-muted) shrink-0 text-xs">
         {row.running ? "running" : "ended"}
-        {row.model === null ? "" : ` · ${row.model.model}`}
       </span>
     </>
   );

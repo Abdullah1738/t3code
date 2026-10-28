@@ -67,14 +67,20 @@ export function useBoardRunOf(threadId: string):
  * thread rows so the bar can link back to the record that owns the run.
  */
 export function useBoardRunRecord(
-  boardId: string,
   threadId: string,
 ): { readonly cardId: string | null; readonly discussionId: string | null } | undefined {
-  const rows = useStore(kanban.threads(boardId));
-  const row = rows?.find((entry) => entry.threadId === threadId);
-  if (row === undefined) return undefined;
-  return { cardId: row.cardId, discussionId: row.discussionId };
+  // Read by thread id, not from the capped Threads list, so an old run still links back.
+  const link = useStore(threadId === "" ? NO_OWNER : kanban.owner(threadId));
+  if (link === undefined || link === null) return undefined;
+  return { cardId: link.cardId, discussionId: link.discussionId };
 }
+
+const NO_OWNER: SnapshotStore<null> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
   return useStore(kanban.board(boardId));
