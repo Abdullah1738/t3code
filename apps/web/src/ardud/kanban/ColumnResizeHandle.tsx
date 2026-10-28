@@ -13,8 +13,8 @@ const KEY_STEP = 16;
  * width is saved once on release, so the board never re-renders per pointer move.
  */
 export function ColumnResizeHandle(props: {
-  /** "group" for the shared width of non-stage grouping columns. */
-  columnKey: BoardColumnKey | "group";
+  /** A stage key, or "group" for the shared width of non-stage grouping columns. */
+  columnKey: string;
   label: string;
   edge: "left" | "right";
   /** Current px width, or null when the column is still sized by default. */
@@ -27,7 +27,7 @@ export function ColumnResizeHandle(props: {
   const clamp = (value: number) =>
     props.columnKey === "group"
       ? clampGroupWidth(value)
-      : clampColumnWidth(props.columnKey, value);
+      : clampColumnWidth(props.columnKey as BoardColumnKey, value);
   const handlers = useResizeDrag<HTMLDivElement>((event) => {
     const host = event.currentTarget.parentElement;
     const startWidth = props.width ?? props.measure();

@@ -92,18 +92,23 @@ const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 20 + 5 * 10;
 function StageGrid(props: ColumnsProps) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
-  const widthOf = (key: BoardColumnKey) => prefs.widths[key] ?? null;
-  const setWidth = (key: BoardColumnKey, width: number) =>
-    updatePrefs((current) => ({ ...current, widths: { ...current.widths, [key]: width } }));
-  const resetWidth = (key: BoardColumnKey) =>
+  // Stage keys come from stageBoard; the columns here are always BoardColumnKeys.
+  const widthOf = (key: string) => prefs.widths[key as BoardColumnKey] ?? null;
+  const setWidth = (key: string, width: number) =>
+    updatePrefs((current) => ({
+      ...current,
+      widths: { ...current.widths, [key as BoardColumnKey]: width },
+    }));
+  const resetWidth = (key: string) =>
     updatePrefs((current) => {
-      const { [key]: _removed, ...rest } = current.widths;
-      return { ...current, widths: rest };
+      const widths = { ...current.widths };
+      delete widths[key as BoardColumnKey];
+      return { ...current, widths };
     });
-  const toggle = (key: BoardColumnKey) => updatePrefs((current) => toggleColumn(current, key));
-  const hidden = (key: BoardColumnKey) => prefs.hidden.includes(key);
+  const toggle = (key: string) =>
+    updatePrefs((current) => toggleColumn(current, key as BoardColumnKey));
+  const hidden = (key: string) => prefs.hidden.includes(key as BoardColumnKey);
 
-  const activeColumns = board.active.filter((column) => !hidden(column.stage));
   const shippedHidden = hidden("shipped");
   const ownerHidden = hidden("needs_owner");
 
@@ -283,7 +288,7 @@ function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
 function Column(props: {
   column: { stage?: string; label: string; cards: ReadonlyArray<unknown> };
   className?: string;
-  style?: React.CSSProperties;
+  style?: React.CSSProperties | undefined;
   handle?: React.ReactNode;
   summary?: string | null;
   children: React.ReactNode;
