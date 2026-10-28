@@ -145,67 +145,74 @@ export function CardDrawer(props: {
         aria-label={`Card ${card.number}`}
         className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[540px] flex-col bg-(--m-raised) px-5.5 pt-4 shadow-xl ring-1 ring-(--m-rule) outline-none"
       >
-        <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
-          <Pri priority={card.priority} />
-          <span className="tabular-nums">#{card.number}</span>
-          <span className="flex-1" />
-          <CopyLinkButton kind="kanban-card" id={card.id} label={`#${card.number} ${card.title}`} />
-          {card.activeThreadId ? (
-            <ThreadLink threadId={card.activeThreadId}>Open</ThreadLink>
-          ) : null}
-          {card.activeThreadId ? (
-            <QuietButton
-              onClick={() =>
-                void runAction("Couldn't stop the card", () => kanban.stopCard(card.id))
-              }
-            >
-              Stop
-            </QuietButton>
-          ) : null}
-          {card.stage === "verified" && card.settledAt === null ? (
+        {/* Header scrolls and shrinks first on short windows, so the tabs and tab content stay in the drawer. */}
+        <div className="flex min-h-0 shrink flex-col overflow-y-auto">
+          <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
+            <Pri priority={card.priority} />
+            <span className="tabular-nums">#{card.number}</span>
+            <span className="flex-1" />
+            <CopyLinkButton
+              kind="kanban-card"
+              id={card.id}
+              label={`#${card.number} ${card.title}`}
+            />
+            {card.activeThreadId ? (
+              <ThreadLink threadId={card.activeThreadId}>Open</ThreadLink>
+            ) : null}
+            {card.activeThreadId ? (
+              <QuietButton
+                onClick={() =>
+                  void runAction("Couldn't stop the card", () => kanban.stopCard(card.id))
+                }
+              >
+                Stop
+              </QuietButton>
+            ) : null}
+            {card.stage === "verified" && card.settledAt === null ? (
+              <button
+                type="button"
+                onClick={() =>
+                  void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
+                    (ok) => ok && props.onClose(),
+                  )
+                }
+                className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              >
+                Settle
+              </button>
+            ) : null}
             <button
               type="button"
-              onClick={() =>
-                void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
-                  (ok) => ok && props.onClose(),
-                )
-              }
-              className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              onClick={props.onClose}
+              aria-label="Close"
+              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >
-              Settle
+              <XIcon className="size-4" />
             </button>
+          </div>
+          <h2 className="mt-2.5 mb-1.5 text-xl leading-tight font-semibold tracking-tight text-balance">
+            {card.title}
+          </h2>
+          {card.description ? (
+            <CardDescription key={card.description} text={card.description} />
           ) : null}
-          <button
-            type="button"
-            onClick={props.onClose}
-            aria-label="Close"
-            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
-          >
-            <XIcon className="size-4" />
-          </button>
+          <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
+            <Chip>
+              <Glyph kind={stageGlyph(card.stage)} />
+              {view.stageLabel}
+            </Chip>
+            {view.goal ? <Chip>{view.goal.name}</Chip> : null}
+            {view.pr ? (
+              <LinkChip href={view.pr.url}>
+                <PrGlyph state={view.pr.state} />
+                {view.pr.label}
+              </LinkChip>
+            ) : null}
+            {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
+            <Chip>{view.model.name}</Chip>
+          </div>
+          <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         </div>
-        <h2 className="mt-2.5 mb-1.5 text-xl leading-tight font-semibold tracking-tight text-balance">
-          {card.title}
-        </h2>
-        {card.description ? (
-          <CardDescription key={card.description} text={card.description} />
-        ) : null}
-        <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
-          <Chip>
-            <Glyph kind={stageGlyph(card.stage)} />
-            {view.stageLabel}
-          </Chip>
-          {view.goal ? <Chip>{view.goal.name}</Chip> : null}
-          {view.pr ? (
-            <LinkChip href={view.pr.url}>
-              <PrGlyph state={view.pr.state} />
-              {view.pr.label}
-            </LinkChip>
-          ) : null}
-          {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
-          <Chip>{view.model.name}</Chip>
-        </div>
-        <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         <Tabs
           label="Card"
           value={tab}
