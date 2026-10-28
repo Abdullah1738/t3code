@@ -37,6 +37,7 @@ const threads = Layer.succeed(
     lastFailure: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
+    setModel: () => Effect.void,
     interrupt: () => Effect.void,
   }),
 );

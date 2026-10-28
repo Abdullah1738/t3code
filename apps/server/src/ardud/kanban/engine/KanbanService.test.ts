@@ -42,6 +42,8 @@ const makeFake = Effect.gen(function* () {
   const interrupted: Array<string> = [];
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   const failures = new Map<string, OrchestrationV2ProviderFailure>();
+  const sends: Array<{ threadId: string; model: ModelSelection | undefined }> = [];
+  const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
   let next = 0;
   const layer = Layer.succeed(
     KanbanThreads,
@@ -78,13 +80,16 @@ const makeFake = Effect.gen(function* () {
         Ref.update(threads, (all) => {
           const thread = all.get(input.threadId);
           if (thread) thread.messages.push(input.text);
+          sends.push({ threadId: input.threadId, model: input.model });
           return all;
         }),
+      setModel: (threadId, model) =>
+        Effect.sync(() => void modelSwitches.push({ threadId, model })),
       lastFailure: (threadId) => Effect.succeed(failures.get(threadId) ?? null),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
-  return { threads, layer, interrupted, prs, failures };
+  return { threads, layer, interrupted, prs, failures, sends, modelSwitches };
 });
 
 /** Board file storage (ServerConfig + FileSystem) that KanbanService now needs when built. */
@@ -2447,20 +2452,21 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
       });
       const astraPool = yield* kanban.setPool(board.id, astraXhigh, 2);
       assert.isDefined(astraPool);
-      const refused = yield* kanban
-        .createCard(board.id, { prompt: "x", title: "x", model: astraHigh }, owner)
-        .pipe(Effect.flip);
-      assert.include(refused.detail, 'has no "high" variant; it offers: xhigh');
+      // The pool's variant wins: a card asking for high on an xhigh pool runs at xhigh.
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "x", title: "x", model: astraHigh },
+        owner,
+      );
+      assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
 
       const accepted = yield* kanban.createCard(
         board.id,
         { prompt: "x", title: "x", model: astraXhigh },
         owner,
       );
-      const refusedEdit = yield* kanban
-        .editCard(accepted.id, { model: astraHigh }, owner)
-        .pipe(Effect.flip);
-      assert.include(refusedEdit.detail, 'has no "high" variant; it offers: xhigh');
+      const edited = yield* kanban.editCard(accepted.id, { model: astraHigh }, owner);
+      assert.strictEqual(edited.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
       yield* kanban.editCard(accepted.id, { model: astraXhigh }, owner);
 
       const poolRefused = yield* kanban.setPool(board.id, astraHigh, 1).pipe(Effect.flip);
@@ -2472,6 +2478,89 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
         })
         .pipe(Effect.flip);
       assert.include(chainRefused.detail, 'has no "high" variant; it offers: xhigh');
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the pool's variant wins on create and edit", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, astraXhigh, 1);
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "x", title: "x", model: astraHigh },
+        owner,
+      );
+      assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+      const edited = yield* kanban.editCard(
+        created.id,
+        { models: [{ model: astraHigh, weight: 1 }] },
+        owner,
+      );
+      assert.strictEqual(edited.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card model change switches its open work thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const started = (yield* kanban.card(card.id)).card;
+      assert.isNotNull(started.activeThreadId);
+      yield* kanban.setPool(board.id, haiku, 1);
+      yield* kanban.editCard(card.id, { model: haiku }, owner);
+      const switches = fake.modelSwitches.filter((s) => s.threadId === started.activeThreadId);
+      assert.strictEqual(switches.length, 1);
+      assert.strictEqual(switches[0]!.model.model, "opus/cc/claude-haiku-5-5");
+      yield* kanban.editCard(card.id, { priority: 2 }, owner);
+      assert.strictEqual(
+        fake.modelSwitches.filter((s) => s.threadId === started.activeThreadId).length,
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("steer carries the card's model to its thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "x", title: "x", model: astraXhigh }, owner);
+      yield* kanban.dispatchNow;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.cardThread(card.id, "steer", "go on", evaluator);
+      const last = fake.sends[fake.sends.length - 1];
+      assert.strictEqual(last?.model?.model, astraXhigh.model);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("ensureBoard refuses a default card model the provider doesn't offer", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const refused = yield* kanban
+        .ensureBoard({
+          slug: "bad-toy",
+          name: "Bad toy",
+          defaultProjectId: ProjectId.make("project-1"),
+          defaultCardModel: astraHigh,
+        })
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+      assert.include(refused.detail, "it offers: xhigh");
+      const boards = yield* kanban.boards;
+      assert.isFalse(boards.some((board) => board.slug === "bad-toy"));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
