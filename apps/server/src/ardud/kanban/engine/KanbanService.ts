@@ -349,7 +349,10 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     actor: KanbanActor,
   ) => Effect.Effect<KanbanBoard, KanbanError>;
-  /** Starts an evaluator thread for a board job (setup, owner request, sweeps). */
+  /**
+   * Starts an evaluator thread for a board job (setup, owner request, sweeps).
+   * A running sweep of the same kind is refused (conflict) and named.
+   */
   readonly startEvaluator: (
     boardId: KanbanBoard["id"],
     purpose: Briefs.EvaluatorPurpose,
@@ -1258,6 +1261,23 @@ const make = Effect.gen(function* () {
     );
     yield* kick;
     return done;
+  });
+
+  /**
+   * The thread of an open, non-idle sweep of this kind, or null. An open link
+   * whose thread went idle (e.g. after a restart) does not block a new sweep.
+   */
+  const runningSweep = Effect.fn("KanbanService.runningSweep")(function* (
+    boardId: KanbanBoard["id"],
+    kind: string,
+  ) {
+    const open = yield* store.threadLinks({ boardId, open: true });
+    for (const link of open.toReversed()) {
+      if (link.role !== "evaluator" || link.purpose !== kind || link.discussionId !== null) continue;
+      const view = yield* threads.view(link.threadId);
+      if (view && view.state !== "idle") return link.threadId;
+    }
+    return null;
   });
 
   /** Live evaluators that asked on a card; a new card evaluator takes it over from them. */
@@ -3432,6 +3452,20 @@ const make = Effect.gen(function* () {
       guard(
         Effect.gen(function* () {
           const board = yield* boardOf(boardId);
+          if (
+            purpose.kind === "stalled" ||
+            purpose.kind === "completed" ||
+            purpose.kind === "deployed" ||
+            purpose.kind === "check"
+          ) {
+            const running = yield* runningSweep(board.id, purpose.kind);
+            if (running) {
+              return yield* failWith(
+                "conflict",
+                `a ${purpose.kind} sweep is already running on this board (thread ${running}). Steer it with t3_thread_send, or hand one job to a new evaluator with kind "request" and text.`,
+              );
+            }
+          }
           return yield* startEvaluatorUnlocked(board, purpose, { text });
         }),
       ),

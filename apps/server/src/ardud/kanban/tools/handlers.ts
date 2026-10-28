@@ -730,7 +730,15 @@ const handlers = {
         } else {
           purpose = { kind: input.kind };
         }
-        return { threadId: yield* service.startEvaluator(KanbanBoardId.make(board.id), purpose) };
+        // A sweep's text is added to its brief; setup/request already carry it in purpose.
+        const sweepText = purpose.kind === "setup" || purpose.kind === "request" ? undefined : text;
+        return {
+          threadId: yield* service.startEvaluator(
+            KanbanBoardId.make(board.id),
+            purpose,
+            sweepText || undefined,
+          ),
+        };
       }),
     ),
   ),

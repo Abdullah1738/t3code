@@ -1788,6 +1788,38 @@ it.effect("new cards from a script share one packets evaluator", () =>
   }),
 );
 
+it.effect("a sweep gets its text, and a board runs one sweep of a kind at a time", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const stalled = yield* kanban.startEvaluator(board.id, { kind: "stalled" }, "Only card #7");
+      const launched = (yield* Ref.get(fake.threads)).get(stalled)!;
+      assert.include(launched.messages[0] ?? "", "Stalled sweep");
+      assert.include(launched.messages[0] ?? "", "Only card #7");
+
+      yield* setRunning(fake, stalled, true);
+      const refused = yield* kanban
+        .startEvaluator(board.id, { kind: "stalled" }, "Only card #8")
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, stalled);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+
+      yield* kanban.startEvaluator(board.id, { kind: "check" });
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+
+      yield* setRunning(fake, stalled, false);
+      yield* kanban.startEvaluator(board.id, { kind: "stalled" }, "Only card #9");
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 3);
+
+      yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at #7" });
+      yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at #7" });
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 5);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the owner's reply in an evaluator's discussion goes to that evaluator", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
