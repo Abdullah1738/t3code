@@ -2534,6 +2534,7 @@ it.effect("steer carries the card's model to its thread", () =>
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, astraXhigh, 1);
       const card = yield* kanban.createCard(board.id, { prompt: "x", title: "x", model: astraXhigh }, owner);
       yield* kanban.dispatchNow;
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
