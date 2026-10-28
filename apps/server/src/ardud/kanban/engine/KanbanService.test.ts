@@ -1396,7 +1396,7 @@ it.effect("another evaluator's change that hands a card's step to its evaluator 
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      yield* kanban.setPool(board.id, board.defaultCardModel, 8);
       const owner: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       const other: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval-other") };
       const reviewed = Effect.fn(function* (
