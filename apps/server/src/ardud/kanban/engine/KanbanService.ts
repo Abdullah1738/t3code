@@ -1793,6 +1793,11 @@ const make = Effect.gen(function* () {
       yield* kick;
       return;
     }
+    // Run updates repeat after a run ends (its checkpoint lands later), so an
+    // end heard while the thread runs again is an earlier turn's, such as the
+    // chain step before the one now running in this thread.
+    const view = yield* threads.view(threadId);
+    if (view !== null && view.state !== "idle") return;
     if (card.nudgedAt === null) {
       yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
       yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
@@ -2677,6 +2682,36 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * A reviewer that lost its slot mid-review (the dispatcher's no-verdict flag,
+   * or its own card_flag) still owns the step while nothing has moved the card
+   * since, so its verdict counts. A recorded verdict or any later move closes it.
+   */
+  const lateReviewer = Effect.fn("KanbanService.lateReviewer")(function* (
+    card: KanbanCard,
+    threadId: ThreadId,
+  ) {
+    if (
+      card.stage !== "needs_review" ||
+      card.activeThreadId !== null ||
+      card.reviewThreadId !== threadId ||
+      card.settledAt !== null
+    ) {
+      return false;
+    }
+    const events = yield* store.cardEvents(card.id);
+    const left = events.findLast(
+      (event) =>
+        event.fromStage !== null && event.toStage !== null && event.fromStage !== event.toStage,
+    );
+    return (
+      left?.kind === "flagged" &&
+      left.fromStage === "in_review" &&
+      (left.actor._tag === "system" ||
+        (left.actor._tag === "thread" && left.actor.threadId === threadId))
+    );
+  });
+
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings) =>
     guard(
       Effect.gen(function* () {
@@ -2685,7 +2720,9 @@ const make = Effect.gen(function* () {
           return yield* failWith("denied", "only a card's review thread records a review result");
         }
         const card = yield* cardOf(link.cardId);
-        if (card.activeThreadId !== threadId || card.stage !== "in_review") {
+        const live = card.activeThreadId === threadId && card.stage === "in_review";
+        const late = !live && (yield* lateReviewer(card, threadId));
+        if (!live && !late) {
           return yield* failWith(
             "conflict",
             `card #${card.number} is not in review with this thread`,
@@ -2709,6 +2746,9 @@ const make = Effect.gen(function* () {
         const moreWork = passed && Subtasks.workAfterReview({ subtasks });
         const next: KanbanCard = {
           ...release(card),
+          // The dispatcher's no-verdict flag is answered by the verdict; a
+          // reviewer's own flag stays for the evaluator.
+          stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
           subtasks,
           stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
           reviewStep: moreWork ? 0 : outcome.reviewStep,
