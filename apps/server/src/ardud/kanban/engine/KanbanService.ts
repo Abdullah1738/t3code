@@ -1303,6 +1303,24 @@ const make = Effect.gen(function* () {
     return ids;
   });
 
+  /** An evaluator that exists and is not archived. Archived ones are gone for routing. */
+  const liveEvaluator = Effect.fn("KanbanService.liveEvaluator")(function* (threadId: ThreadId) {
+    const view = yield* threads.view(threadId);
+    return !!view && !view.archived;
+  });
+
+  /** The newest live board-channel evaluator (no card), if any. */
+  const boardEvaluator = Effect.fn("KanbanService.boardEvaluator")(function* (
+    boardId: KanbanBoard["id"],
+  ) {
+    const open = yield* store.threadLinks({ boardId, open: true });
+    for (const link of open.toReversed().slice(0, 20)) {
+      if (link.role !== "evaluator" || link.cardId !== null) continue;
+      if (yield* liveEvaluator(link.threadId)) return link.threadId;
+    }
+    return null;
+  });
+
   /**
    * The discussion's evaluator gets the text: an existing one is steered,
    * otherwise one starts. A `note` owes no reply in the discussion.
