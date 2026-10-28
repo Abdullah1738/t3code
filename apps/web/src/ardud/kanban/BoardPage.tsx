@@ -450,7 +450,7 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
           props.onChange("");
           setOpen(false);
         }}
-        className="grid size-6 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        className="grid size-6 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:size-9"
       >
         <XIcon className="size-3.5" />
       </button>

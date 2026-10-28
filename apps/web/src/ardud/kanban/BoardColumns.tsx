@@ -65,7 +65,7 @@ export function BoardColumns(props: {
               key={entry.goal.id}
               type="button"
               onClick={() => props.onOpenGoal(entry.goal.id)}
-              className="grid min-w-56 flex-1 grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl bg-(--m-surface) px-3.5 py-2.5 text-left text-sm outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="grid min-w-56 flex-1 grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl bg-(--m-surface) px-3.5 py-2.5 text-left text-sm outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:py-3.5 pointer-coarse:text-base"
             >
               <span className="truncate font-medium">{entry.goal.name}</span>
               <GoalBar progress={entry.progress} />
@@ -353,7 +353,7 @@ function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
     <div
       className={cn(
-        "flex h-6 shrink-0 items-center justify-between px-1 text-xs",
+        "flex h-6 shrink-0 items-center justify-between px-1 text-xs pointer-coarse:h-8 pointer-coarse:text-[0.8125rem]",
         props.tone === "warn" ? "text-(--m-warning)" : "text-(--m-muted)",
       )}
     >
@@ -411,7 +411,7 @@ function ShippedColumn(props: {
       className={cn("relative flex min-h-0 shrink-0 flex-col", props.width === null && "w-60")}
     >
       {props.handle}
-      <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-8 pointer-coarse:text-[0.8125rem]">
+      <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-11 pointer-coarse:text-[0.8125rem]">
         <span className="font-medium">Shipped</span>
         <button
           type="button"
