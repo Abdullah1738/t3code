@@ -43,6 +43,7 @@ export type AndroidAnchoredMenuProps = {
 };
 
 export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
+  const { onPressAction } = props;
   const { scale, menuWidth: desiredMenuWidth } = useAndroidControlSizing();
   const [anchor, setAnchor] = useState<AnchorSnapshot | null>(null);
   const [path, setPath] = useState<readonly MenuAction[]>([]);
@@ -135,14 +136,16 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
         setPath((current) => [...current, action]);
         return;
       }
-      close();
+      // keepsMenuPresented leaves the menu open so a multi-select (filters) can toggle several items.
+      const keepsOpen = action.attributes?.keepsMenuPresented === true;
+      if (!keepsOpen) close();
       if (action.id !== undefined) {
-        props.onPressAction?.({
+        onPressAction?.({
           nativeEvent: { event: action.id },
         } as Parameters<NonNullable<MenuComponentProps["onPressAction"]>>[0]);
       }
     },
-    [close, props.onPressAction],
+    [close, onPressAction],
   );
 
   return (

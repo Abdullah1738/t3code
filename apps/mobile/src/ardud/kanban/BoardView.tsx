@@ -72,6 +72,7 @@ export function BoardView(props: {
   const [query, setQuery] = useState("");
   const searchRef = useRef<TextInputInstance | null>(null);
   const filter = boardFilter(props.state, prefs, query.trim());
+  const pickedGoalIds = filter.goalIds ?? [];
   const board = stageBoard(props.state, props.nowMs, filter);
   const picked = activeFilterCount(prefs);
   const menuActions = filterMenuActions(props.state, prefs);
@@ -147,7 +148,7 @@ export function BoardView(props: {
       <TabsBoard
         board={board}
         filterRow={filterRow}
-        hideGoal={prefs.goalIds.length > 0}
+        hideGoal={pickedGoalIds.length > 0}
         selectedCardId={props.selectedCardId}
         bottomInset={props.bottomInset}
         onOpenCard={props.onOpenCard}
@@ -158,13 +159,13 @@ export function BoardView(props: {
     <ColumnsBoard
       board={board}
       goals={
-        prefs.goalIds.length > 0
-          ? goals.filter((entry) => filter.goalIds?.includes(entry.goal.id))
+        pickedGoalIds.length > 0
+          ? goals.filter((entry) => pickedGoalIds.includes(entry.goal.id))
           : goals
       }
       layout={props.layout}
       filterRow={filterRow}
-      hideGoal={prefs.goalIds.length > 0}
+      hideGoal={pickedGoalIds.length > 0}
       selectedCardId={props.selectedCardId}
       bottomInset={props.bottomInset}
       onOpenCard={props.onOpenCard}

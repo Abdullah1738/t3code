@@ -134,8 +134,9 @@ export function filterFacets(state: KanbanBoardState, settled: SettledFilter): F
   const projects: FilterOption[] = [...projectCounts]
     .sort(byName)
     .map(([name, count]) => ({ value: name, label: name, count }));
-  // A "No project" option only means something once some card has a project.
-  if (projects.length > 0 && noProject > 0) {
+  // Kept at count 0 too: if the last unassigned card gets a project, a saved
+  // "No project" pick must still match something instead of silently clearing.
+  if (projects.length > 0) {
     projects.push({ value: "", label: "No project", count: noProject });
   }
 

@@ -64,7 +64,14 @@ export function BoardFilterMenu(props: {
         }
       >
         <ListFilterIcon className="size-3.5 shrink-0" aria-hidden />
-        <span className={cn("truncate", props.narrow ? "sr-only" : "")}>{label}</span>
+        {props.narrow ? (
+          <>
+            <span className="sr-only">Filter</span>
+            {count > 0 ? <span className="tabular-nums">{count}</span> : null}
+          </>
+        ) : (
+          <span className="truncate">{label}</span>
+        )}
       </MenuTrigger>
       <MenuPopup align="start" side="bottom" className="max-h-[70vh] overflow-y-auto">
         {facets.map((view) => (

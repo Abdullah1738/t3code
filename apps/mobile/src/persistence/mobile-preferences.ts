@@ -1,3 +1,4 @@
+import { sanitizeBoardFilterPrefs, type BoardFilterPrefs } from "@t3tools/client-runtime/ardud/kanban";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -56,9 +57,9 @@ const KanbanBoardFilterPrefs = Schema.Struct({
 });
 const KanbanBoardFilters = Schema.Record(Schema.String, KanbanBoardFilterPrefs);
 export type KanbanBoardFilters = typeof KanbanBoardFilters.Type;
+type KanbanBoardFilterPrefs = BoardFilterPrefs;
 
 const isThreadListFilters = Schema.is(ThreadListFilters);
-const isKanbanBoardFilters = Schema.is(KanbanBoardFilters);
 const isPullRequestListPreferences = Schema.is(PullRequestListPreferences);
 
 export interface Preferences {
@@ -296,8 +297,13 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   if (isPullRequestListPreferences(parsed.pullRequestListFilters)) {
     preferences.pullRequestListFilters = parsed.pullRequestListFilters;
   }
-  if (isKanbanBoardFilters(parsed.kanbanBoardFilters)) {
-    preferences.kanbanBoardFilters = parsed.kanbanBoardFilters;
+  if (typeof parsed.kanbanBoardFilters === "object" && parsed.kanbanBoardFilters !== null) {
+    // Each board entry is sanitized on its own, so one malformed board can't drop the rest.
+    const boards: Record<string, KanbanBoardFilterPrefs> = {};
+    for (const [boardId, entry] of Object.entries(parsed.kanbanBoardFilters)) {
+      boards[boardId] = sanitizeBoardFilterPrefs(entry);
+    }
+    preferences.kanbanBoardFilters = boards;
   }
   return preferences;
 }

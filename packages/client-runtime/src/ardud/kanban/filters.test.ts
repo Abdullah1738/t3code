@@ -143,6 +143,17 @@ describe("filters", () => {
     expect(facets).toEqual(["priorities"]);
   });
 
+  it("keeps No project at count 0 so a saved pick still matches", () => {
+    const allAssigned = snapshot([card(1, { projects: ["Web"] })]);
+    const state = boardStateFromSnapshot(allAssigned);
+    const project = filterFacets(state, "hide").find((view) => view.facet === "projects");
+    expect(project?.options.find((option) => option.value === "")?.count).toBe(0);
+
+    const prefs = { ...EMPTY_FILTER_PREFS, projects: [""] };
+    expect(boardFilter(state, prefs, "").projects).toEqual([""]);
+    expect(visibleCards(state, boardFilter(state, prefs, ""))).toEqual([]);
+  });
+
   it("toggles, clears and counts active values", () => {
     let prefs = toggleFilterValue(EMPTY_FILTER_PREFS, "priorities", 1);
     prefs = toggleFilterValue(prefs, "models", "Haiku");

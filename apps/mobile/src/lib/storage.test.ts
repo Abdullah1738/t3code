@@ -326,7 +326,18 @@ describe("mobile connection storage", () => {
       }),
       11,
     );
-    await expect(loadPreferences()).resolves.toEqual({});
+    // One malformed board is sanitized to its defaults; the others are kept.
+    await expect(loadPreferences()).resolves.toEqual({
+      kanbanBoardFilters: {
+        "board-robob": {
+          priorities: [1],
+          goalIds: [],
+          projects: [],
+          models: [],
+          settled: "hide",
+        },
+      },
+    });
   });
 
   it("reconciles fallback preferences after SQLite recovers", async () => {
