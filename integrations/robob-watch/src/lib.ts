@@ -498,6 +498,26 @@ function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at:
   return { ok: true, reason: `send to ${relay.name}; counted at ${iso(at)}` };
 }
 
+/** Wakes repeat the saved context on every fire; this is the start that carries the action, the rest is a pointer. */
+export const CONTEXT_PREVIEW = 280;
+
+export function contextPreview(w: Watcher): string {
+  const context = w.context || "";
+  if (!context) return "(none)";
+  if (context.length <= CONTEXT_PREVIEW) return context;
+  const head = context.slice(0, CONTEXT_PREVIEW);
+  const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("\n"));
+  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: \`robob-watch context ${w.id}\` (read them before acting on anything beyond the lines above).`;
+}
+
+/** The first fire of each Dubai day (or of the watcher's quiet-hours zone) carries the whole context; decided from state so a retried key keeps its text. */
+function firstFireToday(watcher: Watcher, state: State): boolean {
+  if (!state.last_fire_at) return true;
+  const zone = watcher.quiet?.time_zone ?? "Asia/Dubai";
+  const day = (at: string) => new Intl.DateTimeFormat("en-CA", { timeZone: zone }).format(new Date(at));
+  return day(state.last_fire_at) !== day(state.pending?.at ?? iso());
+}
+
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
   const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
   const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
@@ -513,7 +533,7 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     clip(event.trim(), MAX_EVENT),
     "",
     "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
-    watcher.context || "(none)",
+    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher),
     "",
     `Watcher ${watcher.id} (${fires}). ${after}`,
   ].join("\n");
@@ -578,7 +598,7 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
     `Then \`robob-watch resume ${watcher.id}\` to re-run it at once and \`robob-watch show ${watcher.id}\` to confirm. Only text the owner if you cannot fix it or something was missed; otherwise log it and end with NO_REPLY.`,
     "",
     "The watcher's own context (do not act on it now; it is for when it fires):",
-    clip(watcher.context || "(none)", 1_500),
+    contextPreview(watcher),
   ].join("\n");
 }
 

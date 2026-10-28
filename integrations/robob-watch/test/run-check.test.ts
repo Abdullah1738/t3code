@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clip, inQuiet, MAX_WAKE, normalize, runCheck, sameContact, sendNotes, wakeText } from "../src/lib.ts";
+import { clip, escalationText, inQuiet, MAX_WAKE, normalize, runCheck, sameContact, sendNotes, wakeText } from "../src/lib.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "robob-watch-runcheck-"));
 const watcher = (check: string) => normalize({ id: "rc", title: "rc", check, mode: "notify", context: "" });
@@ -23,6 +23,26 @@ test("the result never waits on a child that keeps its pipes open after the kill
   expect(result.timedOut).toBe(true);
   expect(result.ms).toBeLessThan(7_000);
 }, 15_000);
+
+test("a wake carries the start of its context, and the whole context only on the day's first fire", () => {
+  const context = `Tell the owner. ${"x ".repeat(1000)}`;
+  const w = normalize({ id: "ctx", title: "Ctx", check: "true", mode: "wake", context });
+  const base = { status: "active" as const, fires: 0, consecutive_failures: 0, failure_alerted: false };
+  const pointer = "Full rules: `robob-watch context ctx`";
+  const sameDay = wakeText(w, "event", { ...base, last_fire_at: "2026-10-28T06:00:00Z", pending: { key: "k", event: "event", at: "2026-10-28T08:00:00Z" } });
+  expect(sameDay).toContain(pointer);
+  expect(sameDay).not.toContain(context);
+  expect(sameDay.length).toBeLessThan(1_500);
+  // The cut lands at a space, so the preview never ends mid-word.
+  expect(sameDay).toContain("Tell the owner. x x");
+  const newDay = wakeText(w, "event", { ...base, last_fire_at: "2026-10-27T06:00:00Z", pending: { key: "k", event: "event", at: "2026-10-28T08:00:00Z" } });
+  expect(newDay).toContain(w.context);
+  expect(newDay).not.toContain(pointer);
+  expect(wakeText(w, "event", base)).toContain(w.context);
+  const escalation = escalationText(w, { ...base, consecutive_failures: 5, failing_since: "2026-10-28T06:00:00Z", last_error: "boom" }, 15);
+  expect(escalation).toContain(pointer);
+  expect(escalation.length).toBeLessThan(1_500);
+});
 
 test("quiet hours are validated and wrap past midnight", () => {
   const base = { id: "q", title: "q", check: "true", mode: "notify" as const };

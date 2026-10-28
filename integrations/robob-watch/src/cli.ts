@@ -16,6 +16,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                                          expires_at, max_fires, serial, triggers, quiet, trip, relays, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
+  robob-watch context ID                 full saved context (wakes carry only its start)
   robob-watch logs ID [-n 40]
   robob-watch test ID                    run the check once on a scratch copy of its state; no delivery
   robob-watch fire-test ID               deliver a clearly-marked test event through the watcher's mode
@@ -165,6 +166,11 @@ async function main(argv: string[]): Promise<void> {
       const w = need(positionals[0]);
       console.log(JSON.stringify({ watcher: w, state: loadState(w.id), dir: watcherDir(w.id) }, null, 2));
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
+      return;
+    }
+    case "context": {
+      const w = need(positionals[0]);
+      console.log(w.context || "(none)");
       return;
     }
     case "logs": {

@@ -168,6 +168,14 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(1);
 }, 30_000);
 
+test("context prints a watcher's saved context", () => {
+  expect(cli("add", "--id", "ctx", "--title", "Ctx", "--check", "true", "--mode", "notify", "--context", "line one\nline two", "--no-prime").exitCode).toBe(0);
+  const shown = cli("context", "ctx");
+  expect(shown.exitCode).toBe(0);
+  expect(shown.stdout.toString()).toBe("line one\nline two\n");
+  expect(cli("context", "nope").exitCode).toBe(1);
+});
+
 test("validation: wake watchers need context, interval has a floor, ids are strict", () => {
   expect(cli("add", "--id", "x", "--title", "t", "--check", "true").stderr.toString()).toContain("wake watchers need context");
   expect(cli("add", "--id", "x", "--title", "t", "--check", "true", "--mode", "notify", "--interval", "4").stderr.toString()).toContain("interval_s");

@@ -44,7 +44,7 @@ Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode,
 
 ## Writing the context (the important part)
 
-The context is all the woken agent knows. Write it for a fresh agent with no memory of this chat:
+The context is all the woken agent knows. Put what to do on a fire in its first 280 characters: later fires show only that start plus a `robob-watch context <id>` pointer. Write it for a fresh agent with no memory of this chat:
 
 1. **Owner's intent**: what they asked and why ("owner asked Nik on 27 Sep to order X for Y").
 2. **Background**: names, numbers, links, what has already been said and to whom.
@@ -106,7 +106,7 @@ Use `test` every time. Use `fire-test` only when the delivery path itself is in 
 
 ## What a fire looks like
 
-The woken turn starts with `[Watcher event from robob-watch <id>, not typed by the owner. ...]`, followed by the title, the event, the saved context and the fire count. It's not the owner talking: don't treat it as an answer to anything, and follow the saved context.
+The woken turn starts with `[Watcher event from robob-watch <id>, not typed by the owner. ...]`, followed by the title, the event, the saved context and the fire count. Wakes show the first 280 characters of the context plus a `robob-watch context <id>` pointer, except the day's first fire, which carries the whole context. It's not the owner talking: don't treat it as an answer to anything, and follow the saved context.
 
 ## Quiet by default: NO_REPLY, activity log, digest
 
