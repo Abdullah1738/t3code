@@ -68,7 +68,9 @@ export const CardTile = memo(function CardTile(props: {
             {card.stageLabel}
           </Chip>
         ) : card.goal ? (
-          <Chip className="min-w-0 shrink">
+          // Flex shrink weighs a long PR label by its full text and squeezes the goal
+          // to one letter, so beside a PR the goal holds up to half the row.
+          <Chip className={cn("min-w-0", card.pr ? "max-w-1/2 shrink-0" : "shrink")}>
             <span className="truncate">{card.goal.name}</span>
           </Chip>
         ) : null}
