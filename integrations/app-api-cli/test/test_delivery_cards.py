@@ -516,6 +516,12 @@ class CardTests(unittest.TestCase):
         self.assertEqual(refused[refused.index('--key') + 1], sent[sent.index('--key') + 1])
         self.assertTrue(self.card_state()['no_to'])
 
+    def test_top_level_chat_gets_the_public_link_without_card_chat(self):
+        cfg = {**self.cfg,'for':'owner','chat':'group-sb_gro','delivery_card':{'ready':True}}
+        self.assertEqual(c.sync(cfg,self.data,send=True)['status'],'sent')
+        sent = next(a for a in self.calls if a[0]=='send')
+        self.assertEqual(sent[sent.index('--to')+1],'group-sb_gro')
+
     def test_group_card_chat_gets_the_public_link(self):
         cfg = {**self.cfg,'for':'owner','delivery_card':{'ready':True,'chat':'group-sb_gro'}}
         self.assertEqual(c.sync(cfg,self.data,send=True)['status'],'sent')

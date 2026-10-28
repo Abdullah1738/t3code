@@ -901,6 +901,9 @@ def recipient_argument(parser):
     parser.add_argument('--for',dest='recipient',choices=order_watch_receipt.RECIPIENTS,default='owner',
         help='who ordered; moni = order-watch texts her the placement (once per order) and routes arrival texts to her. '
              'Label as "Store: items" for that text')
+    parser.add_argument('--chat',default=None,metavar='SLUG',
+        help='bridge chat the order was placed from, e.g. group-sb_gro; the delivery card and arrival texts go there. '
+             'Default: the iMessage chat folder this runs in, else owner/Moni')
 
 
 def talabat_arguments(parser):
@@ -1037,6 +1040,16 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Checked before any network call or money step. --chat wins; a Moni order's
+    # --moni-chat (where she gave the go) is the order's chat too.
+    chat=getattr(args,'chat',None) or (getattr(args,'moni_chat',None) if getattr(args,'recipient','owner')=='moni' else None)
+    if chat:
+        import delivery_cards
+        if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,99}',chat) or not delivery_cards.chat_store(chat).exists():
+            print(json.dumps({'ok':False,'error':'ORDER_CHAT_UNKNOWN','chat':chat,
+                              'financial_send':False,'financial_retry':False}))
+            return 2
+        os.environ['ORDER_WATCH_CHAT']=chat
     try:
         declined=card_preflight(args)
         if declined:

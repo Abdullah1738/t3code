@@ -283,6 +283,37 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(t.transition(self.result('preparing'), state, cfg, time.time()), [])
         self.assertTrue(state['delay_sent'])
 
+    def test_group_chat_gets_arrival_only_wakes_like_moni(self):
+        at = time.time()
+        group = dict(self.cfg(), **{'for': 'owner', 'eta': None, 'chat': 'group-sb_gro'})
+        state = {'primed': True, 'status': 'out for delivery'}
+        self.assertEqual(t.transition({'status': 'nearby', 'errors': []}, state, group, at), [])
+        self.assertEqual(state['status'], 'nearby')
+        cand = dict(self.cfg(), **{'for': 'owner', 'chat': 'group-sb_gro'})
+        state = {'primed': True, 'delay_sent': True}
+        result = self.result()
+        result['candidate'] = {'stage': 'nearby', 'evidence': 'App says nearby'}
+        self.assertEqual(t.transition(result, state, cand, at), [])
+        eta = dict(self.cfg(), **{'for': 'owner', 'chat': 'group-sb_gro', 'eta': '2000-01-01T00:00:00+04:00'})
+        state = {'primed': True, 'status': 'preparing'}
+        self.assertEqual(t.transition(self.result('preparing'), state, eta, at), [])
+        self.assertTrue(state['delay_sent'])
+        delivered = dict(self.cfg(), **{'for': 'owner', 'chat': 'group-sb_gro'})
+        state = {'primed': True, 'status': 'nearby'}
+        self.assertEqual(t.transition({'status': 'delivered', 'errors': []}, state, delivered, time.time()),
+                         [{'kind': 'stage_change', 'status': 'delivered'}])
+
+    def test_legacy_card_chat_only_also_counts_as_group(self):
+        cfg = dict(self.cfg(), **{'for': 'owner', 'eta': None, 'delivery_card': {'chat': 'group-sb_gro'}})
+        state = {'primed': True, 'status': 'out for delivery'}
+        self.assertEqual(t.transition({'status': 'nearby', 'errors': []}, state, cfg, time.time()), [])
+
+    def test_owner_chat_keeps_progress_wakes(self):
+        cfg = dict(self.cfg(), **{'for': 'owner', 'eta': None, 'chat': 'owner'})
+        state = {'primed': True, 'status': 'out for delivery'}
+        self.assertEqual(t.transition({'status': 'nearby', 'errors': []}, state, cfg, time.time()),
+                         [{'kind': 'stage_change', 'status': 'nearby'}])
+
     def test_moni_progress_candidate_is_not_a_wake(self):
         cfg = dict(self.cfg(), **{'for': 'moni'})
         state = {'primed': True, 'delay_sent': True}
