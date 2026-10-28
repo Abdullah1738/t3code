@@ -2371,19 +2371,8 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
       });
       const stored = yield* store.card(created.id);
       yield* store.putCard({ ...stored!, model: astraHigh });
-      const seen = (yield* store.card(created.id))!;
-      const planned = Rules.planDispatch(
-        (yield* store.boards).find((b) => b.id === board.id)!,
-        yield* store.cards(board.id),
-        yield* store.pools(board.id),
-      );
       yield* kanban.dispatchNow;
       const after = (yield* kanban.card(created.id)).card;
-      assert.strictEqual(
-        after.activeThreadId === null,
-        true,
-        `diag stored=${JSON.stringify(seen.model)} stage=${after.stage} stalled=${JSON.stringify(after.stalled)} plan=${JSON.stringify(planned.map((p) => [p.cardId, p.pool]))} pools=${JSON.stringify((yield* store.pools(board.id)).map((p) => [p.key, p.slots]))}`,
-      );
       assert.isNull(after.activeThreadId);
       assert.isTrue(after.stalled?.reason.startsWith("Model refused") === true);
       // The refusal starts only the discussion evaluator's note; no work or review thread.
@@ -2428,12 +2417,12 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
-      // The work turn ends first: its slot is on the card model, the same pool the review uses.
-      yield* kanban.turnEnded(workThread);
+      // The work turn ends after the move, which frees the slot the move held.
       yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
         _tag: "thread",
         threadId: workThread,
       });
+      yield* kanban.turnEnded(workThread);
       yield* kanban.dispatchNow;
       const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
       assert.notStrictEqual(reviewThread, workThread);
