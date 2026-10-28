@@ -9,7 +9,9 @@ State: ~/.local/state/otp-watch/seen.json (message keys already processed).
 Log:   ~/.local/state/otp-watch/otp-watch.log
 """
 import email
+import email.parser
 import email.policy
+import email.utils
 import hashlib
 import html
 import json
@@ -179,6 +181,16 @@ def magic_link(subject, text):
     return bool(m)
 
 
+def is_repo_notification(sender_email, raw):
+    """GitHub/Linear notification mail quotes PR titles, CI logs and comments that look like
+    sign-in mail; real account mail from both has no notification headers, so it still alerts."""
+    hdrs = email.parser.Parser(policy=email.policy.compat32).parsestr(raw or "", headersonly=True)
+    addr = (sender_email or email.utils.parseaddr(str(hdrs.get("From", "")))[1]).strip().lower()
+    if addr == "notifications@github.com" or hdrs.get("X-GitHub-Reason") is not None:
+        return True
+    return addr == "notifications@linear.app" and hdrs.get("List-Unsubscribe") is not None
+
+
 def notify(key, text):
     r = run([BUN, TG_CLI, "notify", "--source", "Email OTP", "--severity", "attention",
              "--text", text, "--key", key], timeout=30)
@@ -234,10 +246,12 @@ def scan_account(seen, acct, boxes, bootstrap):
                 subject = env.get("subject") or ""
                 sender = (env.get("from") or [{}])[0]
                 sender_s = sender.get("name") or sender.get("email") or "?"
+                raw = ""
                 try:
                     rr = mail_oauth.himalaya_heal(["message", "read", "-a", acct, "-m", box,
                                                   env["id"], "--raw"], timeout=45)
-                    text = body_text(rr.stdout) if rr.returncode == 0 else ""
+                    raw = rr.stdout if rr.returncode == 0 else ""
+                    text = body_text(raw) if raw else ""
                 except Exception as e:
                     log(f"{acct}/{box}: read failed {e}")
                     text = ""
@@ -248,6 +262,9 @@ def scan_account(seen, acct, boxes, bootstrap):
                     msg = f"OTP {code}\nFrom: {sender_s}\nSubject: {subject}\nTo: {where}"
                 elif magic_link(subject, text):
                     msg = f"Sign-in link email (no code)\nFrom: {sender_s}\nSubject: {subject}\nTo: {where}"
+                if msg and is_repo_notification(sender.get("email") or "", raw):
+                    log(f"suppressed repo notification {acct}/{box} subj={subject[:60]!r}")
+                    msg = None
                 if msg:
                     if notify(f"otp:{key}", msg[:900]):
                         log(f"notified {acct}/{box} subj={subject[:60]!r}")
