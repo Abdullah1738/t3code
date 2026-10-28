@@ -1360,3 +1360,76 @@ it.effect(
       }
     }),
 );
+
+// ardud: a failed OpenCode probe is unknown, so the prompt is hedged and the headline
+// must not claim the work stopped.
+it.effect("hedges a failed OpenCode probe and keeps the stopped headline off it", () =>
+  Effect.gen(function* () {
+    const NodeHttp = yield* Effect.promise(() => import("node:http"));
+    const server = NodeHttp.createServer((_req, res) => {
+      res.writeHead(503);
+      res.end();
+    });
+    const url = yield* Effect.promise(
+      () =>
+        new Promise<string>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            resolve(`http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`);
+          });
+        }),
+    );
+    try {
+      const base = makeProjection();
+      const childWork = [
+        {
+          kind: "subagent" as const,
+          label: "Reviewer (id ses_flaky)",
+          id: "item:flaky",
+          child: {
+            threadId: "native-thread:ses_flaky" as never,
+            startedAt: DateTime.makeUnsafe("2026-10-28T10:00:00.000Z"),
+          },
+        },
+      ];
+      const projection = {
+        ...base,
+        runs: [{ ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork }],
+        providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const commands: Parameters<
+        ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
+      >[0][] = [];
+      yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+        Effect.provide(
+          Layer.merge(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: () => Effect.succeed(projection),
+              recoverDelegatedTask: () => Effect.void,
+              dispatch: (command) => {
+                commands.push(command);
+                return Effect.succeed({} as never);
+              },
+            }),
+            ServerSettings.layerTest({
+              continueThreadsAfterServerUpdate: true,
+              providerInstances: {
+                opencode: {
+                  driver: "opencode",
+                  enabled: true,
+                  config: { serverUrl: url, serverPassword: "pw" },
+                },
+              },
+            } as never),
+          ),
+        ),
+      );
+      assert.lengthOf(commands, 1);
+      const dispatched = commands[0] as { text: string; notification: { summary: string } };
+      assert.include(dispatched.text, "could not be checked");
+      assert.notInclude(dispatched.notification.summary, "stopped background work");
+    } finally {
+      server.close();
+    }
+  }),
+);

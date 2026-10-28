@@ -117,13 +117,16 @@ const checkOne = Effect.fn("ChildSessions.checkOne")(function* (
     return { state: "unknown" } satisfies ChildCheck;
   if (read.value.kind === "gone") return { state: "stopped" } satisfies ChildCheck;
   const { messages } = read.value.value;
-  const newest = messages.at(-1);
-  // A session with no turn, or whose newest message predates the child, never ran it.
-  if (newest === undefined || newest.time.created < child.since - SLACK_MS)
-    return { state: "stopped" } satisfies ChildCheck;
-  // Only the newest turn decides: an older completed answer is not this child's finish.
-  const text = completedAnswer(newest, child.since);
-  if (text !== undefined) return { state: "finished", result: text } satisfies ChildCheck;
+  // Newest first from OpenCode's read path; the newest idle entry records how the run ended.
+  const newestIdle = messages.findLast((message) => message.type === "idle");
+  // A session with no post-start turn never ran this child.
+  const postStart = messages.filter((message) => message.time.created >= child.since - SLACK_MS);
+  if (postStart.length === 0) return { state: "stopped" } satisfies ChildCheck;
+  // The result is the newest completed assistant turn after the child started.
+  const answer = postStart.findLast((message) => completedAnswer(message, child.since) !== undefined);
+  const text = answer === undefined ? undefined : completedAnswer(answer, child.since);
+  if (newestIdle?.outcome === "succeeded" && text !== undefined)
+    return { state: "finished", result: text } satisfies ChildCheck;
   return { state: "stopped" } satisfies ChildCheck;
 });
 
@@ -178,7 +181,7 @@ export const checkChildren = (
  * children are left out, a finished child's answer is quoted in one line, and
  * an unknown child gets a hedged paragraph, since it may still report back.
  */
-export const restartNoteText = Effect.fn("ChildSessions.restartNoteText")(function* (
+export const restartNoteSummary = Effect.fn("ChildSessions.restartNoteSummary")(function* (
   settings: ServerSettings.ServerSettingsService["Service"],
   work: ReadonlyArray<OrchestrationV2RestartCancelledBackgroundWork>,
 ) {
@@ -188,7 +191,8 @@ export const restartNoteText = Effect.fn("ChildSessions.restartNoteText")(functi
       ? []
       : [{ sessionId, since: DateTime.toEpochMillis(entry.child.startedAt) }];
   });
-  if (refs.length === 0) return restartCancelledBackgroundWorkNote(work);
+  if (refs.length === 0)
+    return { text: restartCancelledBackgroundWorkNote(work), claimsCancelled: work.length > 0 };
   const checks = yield* checkChildren(settings, refs);
   const parts = restartNoteParts(work, checks);
   const lines: Array<string> = [];
@@ -196,14 +200,18 @@ export const restartNoteText = Effect.fn("ChildSessions.restartNoteText")(functi
   if (rest.length > 0) lines.push(restartCancelledBackgroundWorkNote(rest));
   for (const finished of parts.finished) {
     const first = finished.result.split("\n")[0]!.trim().slice(0, 200);
-    lines.push(
-      `- finished while the server restarted, already reported back: ${first}`,
-    );
+    lines.push(`- finished while the server restarted, already reported back: ${first}`);
   }
   if (parts.unknown.length > 0) {
     lines.push(
       "Some background work could not be checked after the restart. It may still be running and report back by itself; don't call it again just to check. Resume one only once you know it stopped without a result.",
     );
   }
-  return lines.join("\n\n");
+  return { text: lines.join("\n\n"), claimsCancelled: rest.length > 0 };
 });
+
+/** The note text alone, for callers that only need the prompt. */
+export const restartNoteText = (
+  settings: ServerSettings.ServerSettingsService["Service"],
+  work: ReadonlyArray<OrchestrationV2RestartCancelledBackgroundWork>,
+) => restartNoteSummary(settings, work).pipe(Effect.map((summary) => summary.text));

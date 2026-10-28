@@ -96,6 +96,8 @@ export const OpenCodeMessage = Schema.Struct({
   finish: Schema.optional(Schema.String),
   /** ardud: set once the turn has completed; a child result needs it. */
   time: Schema.Struct({ created: Millis, completed: Schema.optional(Millis) }),
+  /** ardud: an idle message records how the run ended, e.g. "succeeded". */
+  outcome: Schema.optional(Schema.String),
 });
 export type OpenCodeMessage = typeof OpenCodeMessage.Type;
 

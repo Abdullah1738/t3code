@@ -89,6 +89,51 @@ describe("checkChildren", () => {
     }
   });
 
+  it("finishes a child when the newest idle message reports a successful outcome", async () => {
+    // Recorded REST shape: the message list ends with an idle entry carrying the outcome.
+    const server = await serve((req, res) => {
+      if (req.url === "/api/session/active") return json(res, 200, { data: {} });
+      if (req.url?.startsWith("/api/session/ses_j/message"))
+        return json(
+          res,
+          200,
+          messages([
+            {
+              id: "idle1",
+              type: "idle",
+              outcome: "succeeded",
+              time: { created: SINCE + 9_500 },
+            },
+            {
+              id: "m5",
+              type: "assistant",
+              finish: "stop",
+              time: { created: SINCE + 2_000, completed: SINCE + 9_000 },
+              content: [{ type: "text", text: "Idle then answer: 3 findings." }],
+            },
+            {
+              id: "m6",
+              type: "user",
+              time: { created: SINCE + 1_000 },
+              content: [{ type: "text", text: "review this" }],
+            },
+          ]),
+        );
+      json(res, 500, {});
+    });
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_j", since: SINCE }]),
+      );
+      expect(result.get("ses_j")).toEqual({
+        state: "finished",
+        result: "Idle then answer: 3 findings.",
+      });
+    } finally {
+      server.close();
+    }
+  });
+
   it("finishes a child whose completed answer follows the active list draining", async () => {
     // Protocol shape: the session leaves the active list once it is idle, and
     // the answer it left behind is complete with a finish and a completion time.
