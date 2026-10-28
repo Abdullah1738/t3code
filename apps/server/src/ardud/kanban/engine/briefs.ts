@@ -5,6 +5,7 @@ import {
   type KanbanCard,
   type KanbanGoal,
   type KanbanReviewChain,
+  type KanbanStage,
 } from "@t3tools/contracts";
 
 import { MAX_BATCH } from "./rules.ts";
@@ -229,7 +230,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     "- Backlog: priority 5 is never picked up, and a card with a thread is paused there until it leaves. Move a card into the backlog, or out of it, only when the owner asks.",
     "- Threads: card_thread steer|stop|wake. Every message to a thread is a steer. Threads only talk to each other through you.",
     "- Capacity: pool_set changes how many threads run per model. Lowering never kills work by itself; stop threads to fit if needed.",
-    "- Models: give a card several models with weights (models on card_create or card_edit) when the routing below says so. It starts on the highest-weight model whose pool has room, equal weights at random, and its thread keeps that model.",
+    "- Models: give a card several models with weights (models on card_create or card_edit) when the routing below says so. It starts on the highest-weight model whose pool has room, equal weights at random, and its thread keeps that model. A model or variant the provider doesn't offer is refused when you set it, and the error lists what it does offer; pick the closest one yourself. If a card's run fails, it is flagged stalled and you get a note: fix it, clear the flag, and say what you changed.",
     "- Goals: goal_set keeps a goal's Now (current status) and its numbered Story for a non-technical reader.",
     "- Discussions: discussion_create opens a channel, discussion_post writes to any discussion (markdown, collapse, html, choice, card blocks).",
     LINKS_LINE,
@@ -289,6 +290,17 @@ export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
   return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, ask with card_ask. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
 };
+
+export const runFailedText = (
+  card: KanbanCard,
+  role: "work" | "review",
+  message: string,
+  stage: KanbanStage,
+) =>
+  `Card #${card.number}'s ${role} run failed: "${message}". The card is flagged stalled and back in ${stage}; its thread is released. Fix the cause. If the provider refused the model or variant, card_edit the model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain). Then clear the flag with card_flag stalled false and say in the card's discussion what you changed.`;
+
+export const modelRefusedText = (card: KanbanCard, problem: string) =>
+  `Card #${card.number} was not started: ${problem} It is flagged stalled. card_edit its model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain), clear the flag with card_flag stalled false, and say in the card's discussion what you changed.`;
 
 export const nudgeReviewText = (card: KanbanCard) =>
   `Card #${card.number}: record your verdict with card_review_result (clear or findings).`;

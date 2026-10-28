@@ -55,9 +55,11 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
 import * as Asks from "./asks.ts";
+import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
 import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
@@ -511,6 +513,7 @@ const make = Effect.gen(function* () {
   const threads = yield* KanbanThreads;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const projects = yield* ProjectService.ProjectService;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const attachments = makeBoardAttachments(
     yield* ServerConfig.ServerConfig,
     yield* FileSystem.FileSystem,
@@ -585,6 +588,12 @@ const make = Effect.gen(function* () {
     return board;
   });
 
+  /** Fails before a board stores or starts a model/variant the provider doesn't offer. */
+  const checkModel = Effect.fn("KanbanService.checkModel")(function* (model: ModelSelection) {
+    const problem = modelProblem(yield* providerRegistry.getProviders, model);
+    if (problem !== null) return yield* failWith("invalid", problem);
+  });
+
   /**
    * Agents write model ids in many shapes ("opus/x" vs instance "opus" + "x"). Match the
    * request to one of the board's pools so the dispatcher can run it; a model with no pool
@@ -610,7 +619,7 @@ const make = Effect.gen(function* () {
         `no pool runs ${joined}; pools: ${pools.map((pool) => pool.model.model).join(", ") || "none"}`,
       );
     }
-    return {
+    const selected = {
       instanceId: match.model.instanceId,
       model: match.model.model,
       ...(model.options
@@ -619,6 +628,8 @@ const make = Effect.gen(function* () {
           ? { options: match.model.options }
           : {}),
     } satisfies ModelSelection;
+    yield* checkModel(selected);
+    return selected;
   });
 
   /** Each weighted model mapped to a pool, one entry per pool, highest weight first. */
@@ -1232,6 +1243,13 @@ const make = Effect.gen(function* () {
     return next;
   });
 
+  /** A board note to the card's discussion evaluator; a failed note never breaks the caller. */
+  const noteDiscussion = (card: KanbanCard, text: string) =>
+    cardDiscussionUnlocked(card.id).pipe(
+      Effect.flatMap((discussion) => toEvaluator(discussion, text, true)),
+      Effect.asVoid,
+    );
+
   /** The move that put a card in needs_owner: who asked, and where the card was. */
   const askedBy = Effect.fn("KanbanService.askedBy")(function* (card: KanbanCard) {
     const events = yield* store.cardEvents(card.id);
@@ -1612,6 +1630,17 @@ const make = Effect.gen(function* () {
       yield* saveCard(next);
       return;
     }
+    const refused = modelProblem(yield* providerRegistry.getProviders, dispatch.model);
+    if (refused !== null) {
+      const reason = `Model refused: ${refused}`;
+      const next = { ...card, stalled: { reason, by: system, at }, updatedAt: at };
+      yield* logEvent(next, system, "flagged", { body: reason });
+      yield* saveCard(next);
+      yield* noteDiscussion(card, Briefs.modelRefusedText(card, refused)).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("kanban model note failed", { cause })),
+      );
+      return;
+    }
     const goal = yield* goalOf(card);
     // A fresh start leaves the old work thread to its cards in another pool.
     const existing = dispatch.fresh
@@ -1794,6 +1823,9 @@ const make = Effect.gen(function* () {
       return;
     }
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    // A run that failed (the provider refused the model or variant, or a route is gone)
+    // would only loop on a nudge, so the card is flagged for the evaluator instead.
+    const failure = yield* threads.lastFailure(threadId);
     if (link.role === "work") {
       // The turn is over, so a slot held for a next card is free again.
       if ((yield* Ref.get(holds)).has(threadId)) {
@@ -1802,6 +1834,31 @@ const make = Effect.gen(function* () {
       }
       const carried = yield* Effect.forEach(yield* store.cardsByThread(threadId), syncPrs);
       if (carried.length === 0) {
+        yield* kick;
+        return;
+      }
+      if (failure !== null) {
+        const reason = `Run failed: ${failure.message}`;
+        for (const entry of carried) {
+          const next: KanbanCard = {
+            ...release(entry),
+            stage: "todo",
+            stalled: { reason, by: system, at },
+            nudgedAt: null,
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(next, system, "flagged", {
+            fromStage: entry.stage,
+            toStage: "todo",
+            body: reason,
+          });
+          yield* saveCard(next);
+          yield* noteDiscussion(
+            next,
+            Briefs.runFailedText(next, "work", failure.message, "todo"),
+          ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban run note failed", { cause })));
+        }
         yield* kick;
         return;
       }
@@ -1815,6 +1872,29 @@ const make = Effect.gen(function* () {
     }
     if (!card) return;
     if (card.activeThreadId !== threadId) {
+      yield* kick;
+      return;
+    }
+    if (failure !== null) {
+      const reason = `Run failed: ${failure.message}`;
+      const next: KanbanCard = {
+        ...release(card),
+        stage: "needs_review",
+        stalled: { reason, by: system, at },
+        nudgedAt: null,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(next, system, "flagged", {
+        fromStage: card.stage,
+        toStage: next.stage,
+        body: reason,
+      });
+      yield* saveCard(next);
+      yield* noteDiscussion(
+        next,
+        Briefs.runFailedText(next, "review", failure.message, "needs_review"),
+      ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban run note failed", { cause })));
       yield* kick;
       return;
     }
@@ -2044,6 +2124,12 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const next: KanbanBoard = { ...board, ...patch };
+        if (patch.managerModel) yield* checkModel(patch.managerModel);
+        if (patch.evaluatorModel) yield* checkModel(patch.evaluatorModel);
+        if (patch.defaultCardModel) yield* checkModel(patch.defaultCardModel);
+        for (const chain of patch.reviewChains ?? []) {
+          for (const step of chain.steps) yield* checkModel(step);
+        }
         const pools = missingPools(yield* store.pools(board.id), boardModels(next));
         yield* store.putBoardWithPools(next, pools);
         if (pools.length > 0) {
@@ -2870,6 +2956,7 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         yield* boardOf(boardId);
+        yield* checkModel(model);
         const key = Rules.poolKey(model);
         yield* store.putPool(boardId, { key, model, slots: Math.max(0, Math.round(slots)) });
         const pools = yield* store.pools(boardId);

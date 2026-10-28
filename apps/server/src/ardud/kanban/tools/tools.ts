@@ -47,7 +47,10 @@ export const ModelInput = Schema.Struct({
     describe(TrimmedNonEmptyString, 'Provider instance; leave out to use "opencode".'),
   ),
   variant: Schema.optional(
-    describe(TrimmedNonEmptyString, 'Thinking variant, e.g. "high" or "xhigh".'),
+    describe(
+      TrimmedNonEmptyString,
+      'Thinking variant, e.g. "xhigh". Each model offers its own set (orchestrator_capabilities lists them); one the model doesn\'t offer is refused with the list it does.',
+    ),
   ),
 });
 export type ModelInput = typeof ModelInput.Type;
