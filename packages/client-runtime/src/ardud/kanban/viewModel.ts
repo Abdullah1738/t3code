@@ -553,9 +553,11 @@ export interface DiscussionRow {
   readonly settledAt: string | null;
   /** Set while the snooze still holds at the time the rows were built. */
   readonly snoozedUntil: string | null;
+  readonly pinnedAt: string | null;
 }
 
 export interface DiscussionGroups {
+  readonly pinned: ReadonlyArray<DiscussionRow>;
   readonly active: ReadonlyArray<DiscussionRow>;
   readonly snoozed: ReadonlyArray<DiscussionRow>;
   readonly settled: ReadonlyArray<DiscussionRow>;
@@ -572,16 +574,23 @@ export const discussionSnoozed = (
 };
 
 /**
- * Discussions newest first in three groups, like sidebar threads. Settled wins
- * over snoozed; a lapsed snooze counts as active. `query` matches the title and
- * the latest message preview.
+ * Discussions newest first in four groups, like sidebar threads. Settled wins
+ * over snoozed, snoozed over pinned, pinned over active; a lapsed snooze counts
+ * as active. `query` matches the title and the latest message preview.
+ * `hideCards` drops card discussions (board channels stay); `unreadOnly` keeps
+ * only discussions with unread messages. All filters combine.
  */
 export function discussionRows(
   state: KanbanBoardState,
   nowMs: number,
-  options: { readonly query?: string } = {},
+  options: {
+    readonly query?: string;
+    readonly hideCards?: boolean;
+    readonly unreadOnly?: boolean;
+  } = {},
 ): DiscussionGroups {
   const needle = options.query?.trim().toLowerCase() ?? "";
+  const pinned: DiscussionRow[] = [];
   const active: DiscussionRow[] = [];
   const snoozed: DiscussionRow[] = [];
   const settled: DiscussionRow[] = [];
@@ -599,21 +608,25 @@ export function discussionRows(
         at: discussion.lastMessageAt ?? discussion.createdAt,
         settledAt: discussion.settledAt,
         snoozedUntil: sleeping ? discussion.snoozedUntil : null,
+        pinnedAt: discussion.pinnedAt,
       } satisfies DiscussionRow;
     })
     .filter(
       (row) =>
-        !needle ||
-        row.title.toLowerCase().includes(needle) ||
-        row.preview.toLowerCase().includes(needle),
+        (!needle ||
+          row.title.toLowerCase().includes(needle) ||
+          row.preview.toLowerCase().includes(needle)) &&
+        !(options.hideCards && row.cardId !== null) &&
+        !(options.unreadOnly && row.unread === 0),
     )
     .sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
   for (const row of rows) {
     if (row.settledAt !== null) settled.push(row);
     else if (row.snoozedUntil !== null) snoozed.push(row);
+    else if (row.pinnedAt !== null) pinned.push(row);
     else active.push(row);
   }
-  return { active, snoozed, settled };
+  return { pinned, active, snoozed, settled };
 }
 
 /** The earliest snooze still holding, so a screen knows when to regroup. */
