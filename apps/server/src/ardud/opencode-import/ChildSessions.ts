@@ -26,7 +26,7 @@ export type ChildCheckState = "running" | "finished" | "stopped" | "unknown";
 
 export interface ChildCheck {
   readonly state: ChildCheckState;
-  /** The child's last answer, for a finished one. */
+  /** The child's last answer, for a finished one that has a quotable answer. */
   readonly result?: string;
 }
 
@@ -52,7 +52,7 @@ export const restartNoteParts = (
   work: ReadonlyArray<Pick<OrchestrationV2RestartCancelledBackgroundWork, "child">>,
   checks: ReadonlyMap<string, ChildCheck>,
 ) => {
-  const finished: Array<{ readonly index: number; readonly result: string }> = [];
+  const finished: Array<{ readonly index: number; readonly result: string | undefined }> = [];
   const unknown: Array<number> = [];
   const rest: Array<number> = [];
   work.forEach((entry, index) => {
@@ -60,7 +60,7 @@ export const restartNoteParts = (
     const check = sessionId === undefined ? undefined : checks.get(sessionId);
     if (check?.state === "running") return;
     if (check?.state === "finished") {
-      finished.push({ index, result: check.result ?? "" });
+      finished.push({ index, result: check.result });
       return;
     }
     if (check?.state === "unknown") {
@@ -116,18 +116,23 @@ const checkOne = Effect.fn("ChildSessions.checkOne")(function* (
   if (Option.isNone(read) || read.value.kind === "failed")
     return { state: "unknown" } satisfies ChildCheck;
   if (read.value.kind === "gone") return { state: "stopped" } satisfies ChildCheck;
+  // The list reads newest first here. Only the actual newest message decides: a
+  // success followed by newer messages belongs to an execution lost without an idle.
   const { messages } = read.value.value;
-  // Newest first from OpenCode's read path; the newest idle entry records how the run ended.
-  const newestIdle = messages.findLast((message) => message.type === "idle");
-  // A session with no post-start turn never ran this child.
-  const postStart = messages.filter((message) => message.time.created >= child.since - SLACK_MS);
-  if (postStart.length === 0) return { state: "stopped" } satisfies ChildCheck;
-  // The result is the newest completed assistant turn after the child started.
-  const answer = postStart.findLast((message) => completedAnswer(message, child.since) !== undefined);
+  const newest = messages.at(-1);
+  if (newest === undefined || newest.type !== "idle") return { state: "stopped" } satisfies ChildCheck;
+  if (newest.time.created < child.since - SLACK_MS) return { state: "stopped" } satisfies ChildCheck;
+  if (newest.outcome !== "succeeded") return { state: "stopped" } satisfies ChildCheck;
+  // The result is the newest completed assistant turn before that idle and after the child
+  // started. It is optional: a successful child without a quotable answer is still finished.
+  const beforeIdle = messages.slice(0, -1);
+  const answer = beforeIdle.findLast(
+    (message) => completedAnswer(message, child.since) !== undefined,
+  );
   const text = answer === undefined ? undefined : completedAnswer(answer, child.since);
-  if (newestIdle?.outcome === "succeeded" && text !== undefined)
-    return { state: "finished", result: text } satisfies ChildCheck;
-  return { state: "stopped" } satisfies ChildCheck;
+  return text === undefined
+    ? ({ state: "finished" } satisfies ChildCheck)
+    : ({ state: "finished", result: text } satisfies ChildCheck);
 });
 
 /**
@@ -199,8 +204,13 @@ export const restartNoteSummary = Effect.fn("ChildSessions.restartNoteSummary")(
   const rest = parts.rest.map((index) => work[index]!);
   if (rest.length > 0) lines.push(restartCancelledBackgroundWorkNote(rest));
   for (const finished of parts.finished) {
-    const first = finished.result.split("\n")[0]!.trim().slice(0, 200);
-    lines.push(`- finished while the server restarted, already reported back: ${first}`);
+    // Without a quotable answer there is nothing to quote, but the child still finished.
+    const first = finished.result?.split("\n")[0]?.trim().slice(0, 200) ?? "";
+    lines.push(
+      first === ""
+        ? "- a background task finished while the server restarted and already reported back; don't rerun it."
+        : `- finished while the server restarted, already reported back: ${first}`,
+    );
   }
   if (parts.unknown.length > 0) {
     lines.push(

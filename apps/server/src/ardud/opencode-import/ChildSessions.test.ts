@@ -307,3 +307,119 @@ describe("checkChildren", () => {
     expect(result.get("ses_g")).toEqual({ state: "stopped" });
   });
 });
+
+describe("checkChildren idle outcome", () => {
+  // A list newest first, the way OpenCode returns it.
+  const listing = (path: string, rows: ReadonlyArray<Record<string, unknown>>) =>
+    (req: NodeHttp.IncomingMessage, res: NodeHttp.ServerResponse) => {
+      if (req.url === "/api/session/active") return json(res, 200, { data: {} });
+      if (req.url?.startsWith(`/api/session/${path}/message`)) return json(res, 200, messages(rows));
+      json(res, 500, {});
+    };
+
+  it("stops a child whose successful idle is older than newer messages with no idle", async () => {
+    // A success from before the child started, then a new answer and no idle after it.
+    const server = await serve(
+      listing("ses_stale", [
+        {
+          id: "new-answer",
+          type: "assistant",
+          finish: "stop",
+          time: { created: SINCE + 30_000, completed: SINCE + 31_000 },
+          content: [{ type: "text", text: "new execution answer" }],
+        },
+        {
+          id: "old-idle",
+          type: "idle",
+          outcome: "succeeded",
+          time: { created: SINCE - 3_600_000 },
+        },
+      ]),
+    );
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_stale", since: SINCE }]),
+      );
+      expect(result.get("ses_stale")).toEqual({ state: "stopped" });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("stops a child whose newest execution failed after an earlier successful idle", async () => {
+    const server = await serve(
+      listing("ses_failed", [
+        {
+          id: "failed-idle",
+          type: "idle",
+          outcome: "failed",
+          time: { created: SINCE + 40_000 },
+        },
+        {
+          id: "earlier-answer",
+          type: "assistant",
+          finish: "stop",
+          time: { created: SINCE + 2_000, completed: SINCE + 3_000 },
+          content: [{ type: "text", text: "earlier execution" }],
+        },
+      ]),
+    );
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_failed", since: SINCE }]),
+      );
+      expect(result.get("ses_failed")).toEqual({ state: "stopped" });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("finishes a child whose successful idle has no quotable answer, without a result", async () => {
+    const server = await serve(
+      listing("ses_noquote", [
+        {
+          id: "ok-idle",
+          type: "idle",
+          outcome: "succeeded",
+          time: { created: SINCE + 9_500 },
+        },
+      ]),
+    );
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_noquote", since: SINCE }]),
+      );
+      expect(result.get("ses_noquote")).toEqual({ state: "finished" });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("finishes a child whose successful idle answer has empty text", async () => {
+    const server = await serve(
+      listing("ses_empty", [
+        {
+          id: "ok-idle2",
+          type: "idle",
+          outcome: "succeeded",
+          time: { created: SINCE + 9_500 },
+        },
+        {
+          id: "blank",
+          type: "assistant",
+          finish: "stop",
+          time: { created: SINCE + 2_000, completed: SINCE + 9_000 },
+          content: [{ type: "text", text: "   " }],
+        },
+      ]),
+    );
+    try {
+      const result = await Effect.runPromise(
+        checkChildren(settingsFor(server.url), [{ sessionId: "ses_empty", since: SINCE }]),
+      );
+      expect(result.get("ses_empty")).toEqual({ state: "finished" });
+    } finally {
+      server.close();
+    }
+  });
+});
