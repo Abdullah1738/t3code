@@ -1,4 +1,5 @@
 import { useState } from "react";
+import * as Schema from "effect/Schema";
 
 import {
   DEFAULT_GROUP_COLUMN_WIDTH,
@@ -15,6 +16,7 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanStage } from "@t3tools/contracts";
 
+import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
@@ -39,7 +41,11 @@ export function BoardColumns(props: {
   // is a wide screen with a narrow board.
   const [width, setWidth] = useState<number | null>(null);
   const narrowScreen = useMediaQuery("max-md");
-  const narrow = width === null ? narrowScreen : width < STAGE_GRID_MIN_WIDTH;
+  const coarse = useMediaQuery({ pointer: "coarse" });
+  const gridMinWidth = coarse ? STAGE_GRID_MIN_WIDTH_COARSE : STAGE_GRID_MIN_WIDTH_FINE;
+  const narrow = width === null ? narrowScreen : width < gridMinWidth;
+  // Shipped opens by default only on a wide board; a saved choice always wins.
+  const wide = width !== null && width >= SHIPPED_OPEN_MIN_WIDTH;
   const measure = (element: HTMLDivElement) =>
     observeResize(element, ([entry]) => {
       if (entry) setWidth(entry.contentRect.width);
@@ -74,7 +80,7 @@ export function BoardColumns(props: {
         narrow ? (
           <StageList {...props} />
         ) : (
-          <StageGrid {...props} />
+          <StageGrid {...props} wide={wide} />
         )
       ) : (
         <GroupGrid {...props} group={props.group} />
@@ -85,11 +91,15 @@ export function BoardColumns(props: {
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
 
-// Four stage columns at their narrowest, the shipped column, Needs Owner with its
-// right margin, and the gaps.
-const STAGE_GRID_MIN_WIDTH = 4 * 128 + 160 + 224 + 20 + 5 * 10;
+// The stage grid's narrowest widths: two work columns, the review stack, the folded
+// shipped strip, Needs Owner with its right margin, and the gaps. Touch sizes are wider.
+const STAGE_GRID_MIN_WIDTH_FINE = 2 * 208 + 176 + 56 + 256 + 20 + 4 * 10; // 964
+const STAGE_GRID_MIN_WIDTH_COARSE = 2 * 224 + 208 + 56 + 272 + 20 + 4 * 10; // 1044
+const SHIPPED_OPEN_MIN_WIDTH = 1400;
+const SHIPPED_KEY = "t3code:kanban:board:shipped";
+const SHIPPED_SCHEMA = Schema.NullOr(Schema.Literals(["open", "folded"]));
 
-function StageGrid(props: ColumnsProps) {
+function StageGrid(props: ColumnsProps & { wide: boolean }) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
   // Stage keys come from stageBoard; the columns here are always BoardColumnKeys.
@@ -115,7 +125,9 @@ function StageGrid(props: ColumnsProps) {
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
-      <div className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
+      <div
+        className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
+      >
         {board.active.map((column) =>
           hidden(column.stage) ? (
             <HiddenColumnRail
@@ -205,7 +217,12 @@ function StageGrid(props: ColumnsProps) {
             onReset={() => resetWidth("needs_owner")}
           />
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
-          <div className={cn("flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2", HIDE_SCROLLBAR)}>
+          <div
+            className={cn(
+              "flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2",
+              HIDE_SCROLLBAR,
+            )}
+          >
             {board.owner.cards.length === 0 ? (
               <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
             ) : (
@@ -253,7 +270,6 @@ function columnStyle(width: number | null): React.CSSProperties | undefined {
   return width === null ? undefined : { width: `var(${COLUMN_WIDTH_PROPERTY}, ${width}px)` };
 }
 
-
 function ColumnHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
     <div
@@ -288,7 +304,12 @@ function Column(props: {
       {props.summary ? (
         <p className="px-1 pb-1 text-xs leading-snug text-(--m-muted)">{props.summary}</p>
       ) : null}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
+      <div
+        className={cn(
+          "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden pb-3",
+          HIDE_SCROLLBAR,
+        )}
+      >
         {props.children}
       </div>
     </section>
@@ -313,7 +334,12 @@ function ShippedColumn(props: {
       )}
     >
       {props.handle}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3", HIDE_SCROLLBAR)}>
+      <div
+        className={cn(
+          "flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3",
+          HIDE_SCROLLBAR,
+        )}
+      >
         {props.board.map((column) => (
           <div key={column.stage} className="flex flex-col gap-1 pb-2">
             <ColumnHeader label={column.label} count={column.cards.length} />
@@ -362,7 +388,10 @@ function GroupGrid(props: ColumnsProps & { group: Exclude<GroupBy, "stage"> }) {
   const commitWidth = (width: number) =>
     updatePrefs((current) => ({ ...current, groupWidth: width }));
   return (
-    <div data-group-grid className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}>
+    <div
+      data-group-grid
+      className={cn("flex min-h-0 flex-1 gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
+    >
       {groups.map((group) => (
         <Column
           key={group.key}
@@ -407,7 +436,12 @@ function StageList(props: ColumnsProps) {
   const current = columns.find((column) => column.stage === stage) ?? columns[0];
 
   return (
-    <div className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden pe-4 pb-4", HIDE_SCROLLBAR)}>
+    <div
+      className={cn(
+        "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden pe-4 pb-4",
+        HIDE_SCROLLBAR,
+      )}
+    >
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
           <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
