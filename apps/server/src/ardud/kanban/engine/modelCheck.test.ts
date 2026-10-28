@@ -50,9 +50,10 @@ it("skips descriptor checks when the model has no descriptors", () => {
 });
 
 it("refuses a boolean value for a select option whose choice ids are 'true' and 'false'", () => {
+  const base = opencodeTestProvider();
   const boolSelect = [
     {
-      ...opencodeTestProvider(),
+      ...base,
       models: [
         {
           slug: "opus/x",
@@ -63,7 +64,7 @@ it("refuses a boolean value for a select option whose choice ids are 'true' and 
               {
                 id: "flag",
                 label: "Flag",
-                type: "select",
+                type: "select" as const,
                 options: [
                   { id: "true", label: "true" },
                   { id: "false", label: "false" },
@@ -73,7 +74,7 @@ it("refuses a boolean value for a select option whose choice ids are 'true' and 
           },
         },
       ],
-    },
+    } satisfies typeof base,
   ];
   const selection = ModelSelection.make({
     instanceId: ProviderInstanceId.make("opencode"),
