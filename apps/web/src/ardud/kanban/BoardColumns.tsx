@@ -102,6 +102,7 @@ const SHIPPED_SCHEMA = Schema.NullOr(Schema.Literals(["open", "folded"]));
 function StageGrid(props: ColumnsProps & { wide: boolean }) {
   const board = stageBoard(props.state, props.nowMs, props.filter);
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
+  const [shipped, setShipped] = useLocalStorage(SHIPPED_KEY, null, SHIPPED_SCHEMA);
   // Stage keys come from stageBoard; the columns here are always BoardColumnKeys.
   const widthOf = (key: string) => prefs.widths[key as BoardColumnKey] ?? null;
   const setWidth = (key: string, width: number) =>
@@ -118,64 +119,115 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
   const toggle = (key: string) =>
     updatePrefs((current) => toggleColumn(current, key as BoardColumnKey));
   const hidden = (key: string) => prefs.hidden.includes(key as BoardColumnKey);
+  const shippedOpen = shipped === null ? props.wide : shipped === "open";
 
   const shippedHidden = hidden("shipped");
   const ownerHidden = hidden("needs_owner");
+  const stageColumn = (stage: KanbanStage) => board.active.find((column) => column.stage === stage);
 
+  // Work columns take the spare width; the review stack shares one column. A saved drag
+  // width still wins over the layout's default for that column.
+  const workColumn = (stage: KanbanStage) => {
+    const column = stageColumn(stage);
+    if (!column) return null;
+    if (hidden(stage)) {
+      return (
+        <HiddenColumnRail
+          key={stage}
+          label={column.label}
+          count={column.cards.length}
+          onShow={() => toggle(stage)}
+        />
+      );
+    }
+    const saved = widthOf(stage);
+    return (
+      <Column
+        key={stage}
+        column={column}
+        className={cn(
+          "min-w-52 pointer-coarse:min-w-56",
+          saved === null ? "flex-[1.4]" : "shrink-0",
+        )}
+        style={columnStyle(saved)}
+        handle={
+          <ColumnResizeHandle
+            columnKey={stage}
+            label={column.label}
+            edge="right"
+            width={saved}
+            onCommit={(width) => setWidth(stage, width)}
+            onReset={() => resetWidth(stage)}
+          />
+        }
+      >
+        {column.cards.map((card) => (
+          <CardTile
+            key={card.id}
+            card={card}
+            selected={card.id === props.selectedCardId}
+            onOpen={props.onOpenCard}
+          />
+        ))}
+      </Column>
+    );
+  };
+
+  const reviewColumn = (stage: KanbanStage) => {
+    const column = stageColumn(stage);
+    if (!column) return null;
+    if (hidden(stage)) {
+      return (
+        <HiddenColumnRail
+          key={stage}
+          label={column.label}
+          count={column.cards.length}
+          onShow={() => toggle(stage)}
+        />
+      );
+    }
+    return (
+      <Column key={stage} column={column} className="min-h-0 shrink">
+        {column.cards.map((card) => (
+          <CardTile
+            key={card.id}
+            card={card}
+            selected={card.id === props.selectedCardId}
+            onOpen={props.onOpenCard}
+          />
+        ))}
+      </Column>
+    );
+  };
+
+  const reviewNeedsRoom = !hidden("needs_review") || !hidden("in_review");
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
       <div
         className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
       >
-        {board.active.map((column) =>
-          hidden(column.stage) ? (
-            <HiddenColumnRail
-              key={column.stage}
-              label={column.label}
-              count={column.cards.length}
-              onShow={() => toggle(column.stage)}
-            />
-          ) : (
-            <Column
-              key={column.stage}
-              column={column}
-              className={cn("min-w-32", widthOf(column.stage) === null ? "flex-1" : "shrink-0")}
-              style={columnStyle(widthOf(column.stage))}
-              handle={
-                <ColumnResizeHandle
-                  columnKey={column.stage}
-                  label={column.label}
-                  edge="right"
-                  width={widthOf(column.stage)}
-                  onCommit={(width) => setWidth(column.stage, width)}
-                  onReset={() => resetWidth(column.stage)}
-                />
-              }
-            >
-              {column.cards.map((card) => (
-                <CardTile
-                  key={card.id}
-                  card={card}
-                  selected={card.id === props.selectedCardId}
-                  onOpen={props.onOpenCard}
-                />
-              ))}
-            </Column>
-          ),
-        )}
+        {workColumn("todo")}
+        {workColumn("working")}
+        {reviewNeedsRoom ? (
+          <div className="flex min-h-0 min-w-44 flex-1 flex-col gap-3 pointer-coarse:min-w-52">
+            {reviewColumn("needs_review")}
+            {reviewColumn("in_review")}
+          </div>
+        ) : null}
         {shippedHidden ? (
           <HiddenColumnRail
             label="Shipped"
             count={board.shipped.reduce((sum, column) => sum + column.cards.length, 0)}
             onShow={() => toggle("shipped")}
           />
-        ) : (
+        ) : shippedOpen ? (
           <ShippedColumn
             board={board.shipped}
             selectedCardId={props.selectedCardId}
             onOpenCard={props.onOpenCard}
             width={widthOf("shipped")}
+            onFold={() => setShipped("folded")}
             handle={
               <ColumnResizeHandle
                 columnKey="shipped"
@@ -187,6 +239,8 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
               />
             }
           />
+        ) : (
+          <FoldedShipped board={board.shipped} onOpen={() => setShipped("open")} />
         )}
       </div>
       {/* A column like the others: header on the same line, its cards in a tinted well
@@ -204,7 +258,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
           data-column="needs_owner"
           className={cn(
             "relative me-5 mb-4 flex min-h-0 shrink-0 flex-col gap-2",
-            widthOf("needs_owner") === null ? "w-56 xl:w-64" : "",
+            widthOf("needs_owner") === null ? "w-64 pointer-coarse:w-68" : "",
           )}
           style={columnStyle(widthOf("needs_owner"))}
         >
@@ -224,7 +278,9 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
             )}
           >
             {board.owner.cards.length === 0 ? (
-              <p className="px-1.5 py-1 text-xs text-(--m-muted)">Nothing waiting on you</p>
+              <p className="px-1.5 py-1 text-xs text-(--m-muted) pointer-coarse:text-[0.8125rem]">
+                Nothing waiting on you
+              </p>
             ) : (
               board.owner.cards.map((card) => (
                 <CardTile
@@ -240,6 +296,29 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         </section>
       )}
     </div>
+  );
+}
+
+/** Folded shipped strip: one button, the stage glyph and count per stage, top to bottom. */
+function FoldedShipped(props: { board: ReadonlyArray<StageColumn>; onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-expanded={false}
+      aria-label="Show shipped cards"
+      onClick={props.onOpen}
+      className="flex w-14 shrink-0 flex-col items-center gap-4 rounded-xl bg-(--m-surface) py-3 outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+    >
+      {props.board.map((column) => (
+        <span
+          key={column.stage}
+          className="flex flex-col items-center gap-1.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-[0.8125rem]"
+        >
+          <Glyph kind={stageGlyph(column.stage)} />
+          {column.cards.length}
+        </span>
+      ))}
+    </button>
   );
 }
 
@@ -322,18 +401,28 @@ function ShippedColumn(props: {
   onOpenCard: (cardId: string) => void;
   width: number | null;
   handle?: React.ReactNode;
+  onFold: () => void;
 }) {
   return (
     <section
       aria-label="Shipped"
       data-column="shipped"
       style={columnStyle(props.width)}
-      className={cn(
-        "relative flex min-h-0 shrink-0 flex-col",
-        props.width === null && "w-40 xl:w-44",
-      )}
+      className={cn("relative flex min-h-0 shrink-0 flex-col", props.width === null && "w-60")}
     >
       {props.handle}
+      <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-8 pointer-coarse:text-[0.8125rem]">
+        <span className="font-medium">Shipped</span>
+        <button
+          type="button"
+          aria-expanded={true}
+          aria-label="Fold shipped cards"
+          onClick={props.onFold}
+          className="inline-flex h-5 items-center rounded-full px-2 font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-3.5"
+        >
+          Fold
+        </button>
+      </div>
       <div
         className={cn(
           "flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden pb-3",
@@ -369,12 +458,12 @@ function ShippedRow(props: {
       onClick={() => props.onOpen(props.card.id)}
       aria-current={props.selected ? "true" : undefined}
       className={cn(
-        "grid grid-cols-[12px_1fr] items-center gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+        "grid grid-cols-[12px_1fr] items-start gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:py-2 pointer-coarse:text-[0.8125rem]",
         props.selected && "text-(--m-text) ring-2 ring-inset ring-(--m-text)",
       )}
     >
-      <Glyph kind={stageGlyph(props.card.stage)} />
-      <span className="truncate">{props.card.title}</span>
+      <Glyph kind={stageGlyph(props.card.stage)} className="mt-0.75" />
+      <span className="line-clamp-2 wrap-break-word">{props.card.title}</span>
     </button>
   );
 }
