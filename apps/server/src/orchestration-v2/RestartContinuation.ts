@@ -24,9 +24,10 @@ import {
   cancelledBeforeStart,
   isRestartNoteSource,
   neverStarted,
-  restartCancelledBackgroundWorkNote,
   restartContinuationNote,
 } from "./RestartBackgroundNote.ts";
+// ardud: the restart note checks OpenCode children before it says they were cancelled.
+import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 
 const CONTINUE_PROMPT = "Continue where you left off.";
 
@@ -272,8 +273,13 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       projection.providerTurns,
       projection.attempts,
     );
+    // ardud: an OpenCode child still running or finished is not told as cancelled.
     const noteText =
-      note.work.length === 0 ? undefined : restartCancelledBackgroundWorkNote(note.work);
+      note.work.length === 0
+        ? undefined
+        : yield* restartNoteText(settings, note.work).pipe(
+            Effect.map((text) => (text === "" ? undefined : text)),
+          );
     const text =
       noteText === undefined
         ? CONTINUE_PROMPT
