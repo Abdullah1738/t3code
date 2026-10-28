@@ -315,6 +315,55 @@ class PaymentAwaitTests(unittest.TestCase):
         with self.assertRaisesRegex(c.j.JournalError,'MINUTES_ACCOUNT_HOME_CHANGED'):
             flow._fresh_home(time.monotonic()+30)
 
+    def test_place_after_300s_clock_advance_refreshes_home_and_places(self):
+        """Done-when path 2: 300 s between prepare and place still places.
+
+        Real MinutesFlow place() through the Harness; time.time is advanced 300 s
+        after the home was verified. The home refresh (auth.revalidate) must run
+        before place_order, and place returns the captured order number.
+        """
+        import copy
+        from test.test_minutes_payment_chain import FIXTURE
+        from test.test_noon_minutes_checkout import HEADERS
+        from unittest.mock import Mock
+        from noon_checkout import AccountHome
+        session=copy.deepcopy(fixture())
+        session['isCvvRequired']=False
+        for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
+                    'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee',
+                    'orderLateNightFee'):
+            session[key]=0
+        session['orderDeliveryFee']=8.0
+        h=Harness([FIXTURE['get_active']['resp'],FIXTURE['place']['resp']])
+        t0=time.time()
+        home=AccountHome('minutes',h.home.account_ref,h.home.address_ref,t0)
+        fresh_snap=AuthSnapshot('minutes',h.home.account_ref,h.home.address_ref,t0+300,
+            dict(HEADERS),time.monotonic()+30)
+        auth=Mock()
+        auth.status.return_value={'maintenance_state':'none'}
+        auth.revalidate.return_value=fresh_snap
+        auth.reconcile.return_value=fresh_snap
+        flow=object.__new__(c.MinutesFlow)
+        flow.flow_id='10000000-0000-4000-8000-00000000ffff'
+        flow.auth=auth
+        flow.snapshot=fresh_snap
+        flow.opened=True;flow.expected=None;flow.cookies_in_ram=[];flow.intent=None
+        flow.store=Mock();flow.skus=[];flow.cart_hash='a'*64
+        flow.current=c.m.Snapshot(session,c.m.project_session(session),t0)
+        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':False}
+        flow.client=c.m.MinutesCheckout(HEADERS,home,request=h.request,receipt=h.receipt,
+            response_cookies=h.response_cookies,home_provider=flow._fresh_home)
+        flow.refresh_cart_readback=Mock(return_value=flow.current.projection)
+        flow.approve=lambda:flow.review
+        with patch.object(c.j,'consume',return_value=True), \
+                patch.object(c.j,'observe',return_value={'outcome':'RESPONSE_RECEIVED'}), \
+                patch.object(c.MinutesFlow,'_before',lambda self,op,digest:True), \
+                patch.object(c.time,'time',return_value=t0+300):
+            placed=flow.place()
+        self.assertEqual(placed['order'],FIXTURE['place']['resp']['order_nr'])
+        self.assertGreaterEqual(auth.revalidate.call_count,1)
+        self.assertEqual([x[0] for x in h.calls][-1],'place')
+
     def test_place_rechecks_cvv_after_refresh_and_places_with_cvv_ready(self):
         from unittest.mock import Mock
         flow=object.__new__(c.MinutesFlow)
