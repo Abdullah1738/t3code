@@ -99,6 +99,14 @@ export const planChangedText = (card: KanbanCard) =>
     subtaskLines(card) ?? "It has no subtasks now.",
   );
 
+/** The same, when another evaluator's change put the card on this step. */
+export const evaluatorStepFromOtherText = (card: KanbanCard, by: string) =>
+  lines(
+    evaluatorStepText(card),
+    "",
+    `Another evaluator (thread ${by}) moved the card on to this step. Read the card's events first, so nothing outward is done twice.`,
+  );
+
 /** Sent to the card discussion's evaluator when the step a card is on becomes its own. */
 export const evaluatorStepText = (card: KanbanCard) =>
   lines(

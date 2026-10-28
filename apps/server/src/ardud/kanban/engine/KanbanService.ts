@@ -1373,7 +1373,7 @@ const make = Effect.gen(function* () {
    * A card whose step became the evaluator's (a new card waiting on its packet,
    * a review, an owner's move or a worker's last subtask) tells the card
    * discussion's evaluator, which
-   * would otherwise never hear of it. An evaluator's own change needs no note.
+   * would otherwise never hear of it. A change by the card's own discussion evaluator needs no note. Another evaluator's (one carrying a review back from its own card) reaches the discussion's live evaluator, but never starts one.
    * The wake is keyed on the step's subtasks alone, so a card moving between
    * waiting stages (in_review to completed when its PRs land) isn't told twice.
    */
@@ -1390,8 +1390,21 @@ const make = Effect.gen(function* () {
           ? Subtasks.subtaskIds(kanbanStepSubtasks(card))
           : null;
       const now = turn(after);
-      if (actor._tag === "evaluator" || now === null) return;
+      if (now === null) return;
       if (before !== null && now === turn(before)) return;
+      if (actor._tag === "evaluator") {
+        // An evaluator's change never starts an evaluator: one is already on the card.
+        if (before === null || after.discussionId === null) return;
+        // Part of a step its evaluator already heard about got done: nothing new.
+        const told = turn(before) === null ? null : new Set(kanbanStepSubtasks(before).map((subtask) => subtask.id));
+        if (told !== null && kanbanStepSubtasks(after).every((subtask) => told.has(subtask.id))) return;
+        const discussion = yield* store.discussion(after.discussionId);
+        const own = discussion?.evaluatorThreadId ?? null;
+        if (discussion === null || own === null || own === actor.threadId) return;
+        if (!(yield* threads.view(own))) return;
+        yield* toEvaluator(discussion, Briefs.evaluatorStepFromOtherText(after, actor.threadId), true);
+        return;
+      }
       const text = Briefs.evaluatorStepText(after);
       if (before === null) {
         // New cards share one packets evaluator, so a script making twenty
@@ -2692,6 +2705,7 @@ const make = Effect.gen(function* () {
           yield* logEvent(next, actor, "comment", { body: patch.comment.trim() });
         const saved = yield* pauseIfBacklog(card, next, actor, at);
         yield* saveCard(saved);
+        yield* evaluatorTurn(card, saved, actor);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });
         }
