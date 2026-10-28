@@ -484,7 +484,17 @@ const EvaluatorStart = tool(
   { readonly: false },
 );
 
+const SetupDone = tool(
+  "setup_done",
+  "End board setup",
+  "Only the board's setup evaluator calls this, once the board's wiki and setup are complete. It lifts the setup hold: card work and review resume, and one line is posted in the Setup discussion.",
+  {},
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
+  SetupDone,
   BoardGet,
   CardSearch,
   CardGet,

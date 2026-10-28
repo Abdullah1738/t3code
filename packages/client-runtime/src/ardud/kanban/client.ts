@@ -2,6 +2,7 @@ import { Atom } from "effect/reactivity";
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
+  type KanbanBoard,
   type KanbanBoardSummary,
   type KanbanBoardUpdateInput,
   type KanbanCardDetail,
@@ -78,6 +79,8 @@ export interface KanbanClient {
   cardDiscussion(boardId: string, cardId: string): Promise<KanbanDiscussion>;
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
+  /** Owner ends the board's running setup; card work resumes. */
+  endSetup(boardId: KanbanBoard["id"]): Promise<void>;
   createDiscussion(boardId: string, title: string): Promise<KanbanDiscussion>;
   /** Owner rename, settle or snooze; the board feed brings the result. */
   updateDiscussion(
@@ -727,6 +730,9 @@ export function createKanbanClient(
     },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);
+    },
+    async endSetup(boardId) {
+      await transport.request(M.setupEnd, { boardId: boardId as never });
     },
     async createDiscussion(boardId, title) {
       const discussion = await transport.request(M.discussionCreate, {

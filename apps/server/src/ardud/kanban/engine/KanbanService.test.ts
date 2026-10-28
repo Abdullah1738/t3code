@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -1721,6 +1722,54 @@ it.effect("the owner's reply in an evaluator's discussion goes to that evaluator
       const cardTalk = yield* kanban.cardDiscussion(card.id);
       yield* kanban.post(cardTalk.id, evaluator, [{ _tag: "md", text: "A note on #1" }]);
       assert.isNull((yield* kanban.discussion(cardTalk.id)).evaluatorThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("setup_done ends a running setup; only its own thread or the owner may end it", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const setup = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const running = (yield* kanban.boards).find((b) => b.id === board.id)!;
+      assert.strictEqual(running.setup?.status, "running");
+      assert.strictEqual(running.setup?.threadId, setup);
+      const setupDiscussionId = running.setup!.discussionId;
+
+      // A second setup while one runs is refused.
+      const again = yield* Effect.exit(
+        kanban.startEvaluator(board.id, { kind: "setup", text: "Again" }),
+      );
+      assert.isTrue(Exit.isFailure(again));
+
+      // Another evaluator can't end it.
+      const other: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("t-other") };
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(kanban.endSetup(board.id, other))));
+      assert.strictEqual(
+        (yield* kanban.boards).find((b) => b.id === board.id)!.setup?.status,
+        "running",
+      );
+
+      // The setup thread ends it; a line lands in the Setup discussion.
+      const done = yield* kanban.endSetup(board.id, { _tag: "evaluator", threadId: setup });
+      assert.strictEqual(done.setup?.status, "done");
+      assert.isNotNull(done.setup?.finishedAt);
+      const messages = yield* kanban.messages(setupDiscussionId);
+      assert.include(messages.at(-1)?.blocks.map((b) => ("text" in b ? b.text : "")).join(""), "Setup is done");
+
+      // Ending again is refused: nothing is running.
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(kanban.endSetup(board.id, owner))));
+
+      // A fresh setup can start after the first one ends.
+      const next = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Round two" });
+      assert.isString(next);
+      // The owner can end a running setup too.
+      yield* kanban.endSetup(board.id, owner);
+      assert.strictEqual(
+        (yield* kanban.boards).find((b) => b.id === board.id)!.setup?.status,
+        "done",
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

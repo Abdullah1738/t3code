@@ -705,6 +705,15 @@ const handlers = {
     ),
   ),
 
+  setup_done: McpToolAccess.actsAsCaller(() =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {

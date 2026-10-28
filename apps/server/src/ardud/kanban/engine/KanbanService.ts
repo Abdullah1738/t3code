@@ -341,6 +341,14 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
   ) => Effect.Effect<KanbanWikiPage, KanbanError>;
 
+  /**
+   * Ends a board's running setup: the owner's "End setup" (actor owner) or the
+   * setup evaluator's setup_done (actor evaluator, only its own thread).
+   */
+  readonly endSetup: (
+    boardId: KanbanBoard["id"],
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanBoard, KanbanError>;
   /** Starts an evaluator thread for a board job (setup, owner request, sweeps). */
   readonly startEvaluator: (
     boardId: KanbanBoard["id"],
@@ -1192,6 +1200,43 @@ const make = Effect.gen(function* () {
       yield* publish(board.id, { _tag: "board", board: running });
     }
     return threadId;
+  });
+
+  /**
+   * Ends a running setup. Only the owner or the setup thread itself may end it.
+   * Card work resumes on the next dispatch tick (planDispatch reads setup status).
+   */
+  const endSetupUnlocked = Effect.fn("KanbanService.endSetupUnlocked")(function* (
+    boardId: KanbanBoard["id"],
+    actor: KanbanActor,
+  ) {
+    const board = yield* boardOf(boardId);
+    const setup = board.setup;
+    if (setup === null || setup.status !== "running") {
+      return yield* failWith("invalid", `board ${board.slug} has no setup running`);
+    }
+    const isSetupThread =
+      actor._tag === "evaluator" && actor.threadId === setup.threadId;
+    if (actor._tag !== "owner" && !isSetupThread) {
+      return yield* failWith("denied", "only the owner or the setup evaluator ends setup");
+    }
+    const at = yield* nowIso;
+    const done: KanbanBoard = {
+      ...board,
+      setup: { ...setup, status: "done", finishedAt: at },
+    };
+    yield* store.putBoard(done);
+    yield* publish(board.id, { _tag: "board", board: done });
+    const discussion = yield* discussionOf(setup.discussionId);
+    const author: KanbanActor = isSetupThread ? actor : { _tag: "system", component: "setup" };
+    yield* postUnlocked(
+      discussion.id,
+      author,
+      [{ _tag: "md", text: "Setup is done. Card work and review resume." }],
+      false,
+    );
+    yield* kick;
+    return done;
   });
 
   /** Live evaluators that asked on a card; a new card evaluator takes it over from them. */
@@ -3323,6 +3368,7 @@ const make = Effect.gen(function* () {
     markRead,
     wiki: (boardId) => read(store.wiki(boardId)),
     writeWiki,
+    endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
     startEvaluator: (boardId, purpose, text) =>
       guard(
         Effect.gen(function* () {
