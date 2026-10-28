@@ -2361,6 +2361,8 @@ it.effect("a card stored with an invalid model is not started and is flagged", (
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      // A pool for the bad model lets dispatch pick the card, so the refusal is what stops it.
+      yield* kanban.setPool(board.id, astraHigh, 1);
       const store = yield* KanbanStore.KanbanStore;
       const stored = yield* store.card(created.id);
       yield* store.putCard({ ...stored!, model: astraHigh });
@@ -2403,6 +2405,8 @@ it.effect("a review run that fails is flagged needs_review and never nudged", ()
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
+      // The Standard review step's model needs a slot for the review thread to start.
+      yield* kanban.setPool(board.id, board.evaluatorModel, 1);
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
