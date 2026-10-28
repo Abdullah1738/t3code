@@ -18,6 +18,7 @@ import {
 import {
   askViews,
   canSendChoice,
+  cardSteps,
   discussionPresence,
   discussionRows,
   goalPage,
@@ -354,6 +355,121 @@ describe("groupCards", () => {
       ["Ungrouped", 1],
     ]);
     expect(groupCards(state, "goal", NOW).map((g) => g.label)).toEqual(["PBV2", "No goal"]);
+  });
+});
+
+describe("cardSteps", () => {
+  const completed = (number: number, movedAt: string) =>
+    card(number, { stage: "completed", movedAt });
+
+  it("steps through a stage column in board order and stops at the ends", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        completed(1, "2026-10-25T09:00:00.000Z"),
+        completed(2, "2026-10-25T10:00:00.000Z"),
+        completed(3, "2026-10-25T11:00:00.000Z"),
+      ]),
+    );
+    const steps = (id: string) => cardSteps(state, NOW, {}, "stage", id);
+    // Newest first: 3, 2, 1.
+    expect(steps("card-3")).toMatchObject({ previous: null, next: "card-2" });
+    expect(steps("card-2")).toMatchObject({ previous: "card-3", next: "card-1" });
+    expect(steps("card-1")).toMatchObject({ previous: "card-2", next: null });
+  });
+
+  it("steps a Needs Owner card through Needs Owner, and a Working card with an open ask through Working", () => {
+    const ask = {
+      id: "q1",
+      text: "Which window?",
+      blocking: false,
+      by: { _tag: "thread", threadId: "t1" } as never,
+      at: "2026-10-25T10:00:00.000Z",
+      closedAt: null,
+    };
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "needs_owner", question: "Window?", priority: 2 }),
+        card(2, { stage: "needs_owner", question: "Scope?", priority: 2 }),
+        card(3, { stage: "working", asks: [ask] as never }),
+        card(4, { stage: "working" }),
+      ]),
+    );
+    expect(cardSteps(state, NOW, {}, "stage", "card-1")).toMatchObject({
+      previous: null,
+      next: "card-2",
+    });
+    expect(cardSteps(state, NOW, {}, "stage", "card-3")).toMatchObject({
+      previous: null,
+      next: "card-4",
+    });
+  });
+
+  it("skips cards the filter hides, and gives null for an unknown card", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "todo", title: "alpha" }),
+        card(2, { stage: "todo", title: "beta" }),
+        card(3, { stage: "todo", title: "alpha two" }),
+      ]),
+    );
+    const steps = cardSteps(state, NOW, { query: "alpha" }, "stage", "card-1");
+    expect(steps.next).toBe("card-3");
+    expect(cardSteps(state, NOW, { query: "alpha" }, "stage", "card-2")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+    expect(cardSteps(state, NOW, {}, "stage", "card-99")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+  });
+
+  it("steps within a card's goal group only when grouped by goal", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "todo", goalId: "goal-a" as never }),
+        card(2, { stage: "todo", goalId: "goal-a" as never }),
+        card(3, { stage: "todo" }),
+      ]),
+    );
+    const steps = cardSteps(state, NOW, {}, "goal", "card-2");
+    expect(steps.previous !== null || steps.next !== null).toBe(true);
+    expect([steps.previous, steps.next]).not.toContain("card-3");
+    expect(cardSteps(state, NOW, {}, "goal", "card-3")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+  });
+
+  it("opens the next open Verified card after settling, and closes when none is left", () => {
+    const verified = (number: number, movedAt: string, settledAt: string | null = null) =>
+      card(number, { stage: "verified", movedAt, settledAt: settledAt as never });
+    // Newest first: A (12:00), B (11:00), C (10:00).
+    const state = boardStateFromSnapshot(
+      snapshot([
+        verified(1, "2026-10-25T12:00:00.000Z"),
+        verified(2, "2026-10-25T11:00:00.000Z"),
+        verified(3, "2026-10-25T10:00:00.000Z"),
+      ]),
+    );
+    expect(cardSteps(state, NOW, {}, "stage", "card-2").afterSettle).toBe("card-3");
+    expect(cardSteps(state, NOW, {}, "stage", "card-3").afterSettle).toBe("card-2");
+
+    const lone = boardStateFromSnapshot(snapshot([verified(1, "2026-10-25T12:00:00.000Z")]));
+    expect(cardSteps(lone, NOW, {}, "stage", "card-1").afterSettle).toBeNull();
+
+    const withSettled = boardStateFromSnapshot(
+      snapshot([
+        verified(1, "2026-10-25T12:00:00.000Z"),
+        verified(2, "2026-10-25T11:00:00.000Z", "2026-10-25T11:30:00.000Z"),
+        verified(3, "2026-10-25T10:00:00.000Z"),
+      ]),
+    );
+    expect(cardSteps(withSettled, NOW, { settled: "include" }, "stage", "card-1").afterSettle).toBe(
+      "card-3",
+    );
+
+    expect(cardSteps(state, NOW, {}, "goal", "card-2").afterSettle).toBeNull();
   });
 });
 

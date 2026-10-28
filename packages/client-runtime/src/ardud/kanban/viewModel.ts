@@ -477,6 +477,44 @@ export function groupCards(
     }));
 }
 
+export interface CardSteps {
+  readonly previous: string | null;
+  readonly next: string | null;
+  /** The Verified card to open after settling this one; null closes. */
+  readonly afterSettle: string | null;
+}
+
+/**
+ * Neighbours of a card in the column it sits in, as the board shows it. A card in
+ * several groups steps through the first group that holds it.
+ */
+export function cardSteps(
+  state: KanbanBoardState,
+  nowMs: number,
+  filter: BoardFilter,
+  group: GroupBy,
+  cardId: string,
+): CardSteps {
+  const board = group === "stage" ? stageBoard(state, nowMs, filter) : null;
+  const lanes: ReadonlyArray<ReadonlyArray<CardView>> = board
+    ? [...board.active, ...board.shipped, board.owner].map((column) => column.cards)
+    : groupCards(state, group, nowMs, filter).map((g) => g.cards);
+  const lane = lanes.find((cards) => cards.some((view) => view.id === cardId)) ?? [];
+  const index = lane.findIndex((view) => view.id === cardId);
+  const at = (i: number) => (index >= 0 && i >= 0 && i < lane.length ? lane[i]!.id : null);
+
+  let afterSettle: string | null = null;
+  if (board) {
+    const verified = board.shipped.find((column) => column.stage === "verified");
+    const open = (verified?.cards ?? []).filter((view) => view.card.settledAt === null);
+    const openAt = open.findIndex((view) => view.id === cardId);
+    afterSettle =
+      openAt >= 0 ? (open[openAt + 1]?.id ?? open[openAt - 1]?.id ?? null) : (open[0]?.id ?? null);
+  }
+
+  return { previous: at(index - 1), next: at(index + 1), afterSettle };
+}
+
 export interface GoalProgress {
   readonly verified: number;
   /** Completed or deployed, not yet verified. */
