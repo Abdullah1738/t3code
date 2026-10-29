@@ -168,6 +168,25 @@ describe("applyReviewResult", () => {
     expect(applyReviewResult(merged, 2, "clear").stage).toBe("completed");
     expect(prsLanded(card())).toBe(true);
   });
+
+  it("a PR link the work thread never linked is context and holds nothing", () => {
+    const context = (url: string, state: "open" | "merged" | null) => ({
+      kind: "pr" as const,
+      url,
+      label: null,
+      state,
+      checkedAt: null,
+    });
+    expect(prsLanded(card({ links: [context("u", null)] }))).toBe(true);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "open")] }))).toBe(false);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "merged")] }))).toBe(true);
+    const nullStatePr = card({
+      stage: "in_review",
+      reviewStep: 1,
+      links: [context("u", null)],
+    });
+    expect(applyReviewResult(nullStatePr, 2, "clear").stage).toBe("completed");
+  });
 });
 
 describe("planDispatch", () => {

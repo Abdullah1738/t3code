@@ -74,7 +74,7 @@ export const KanbanLink = Schema.Struct({
   kind: KanbanLinkKind,
   url: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String),
-  /** PR state as last checked; null for links that have none. */
+  /** PR state as last checked on the work thread (syncPrs); null for other links, including PRs attached only as context. */
   state: Schema.NullOr(Schema.Literals(["open", "draft", "merged", "closed"])),
   checkedAt: Schema.NullOr(IsoDateTime),
 });
@@ -682,6 +682,8 @@ export const KanbanThreadState = Schema.Struct({
   threadId: ThreadId,
   title: Schema.String,
   running: Schema.Boolean,
+  /** Waiting on its own built-in question, which nobody sees; running is false then. */
+  needsInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   lastActivityAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;

@@ -12,7 +12,13 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentAuthorizationError,
 } from "../auth.ts";
-import { IsoDateTime, NonNegativeInt, ProjectId, ThreadId } from "../baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlock,
@@ -98,6 +104,8 @@ export const KanbanCardPatchInput = Schema.Struct({
   stage: Schema.optional(KanbanStage),
   /** Clears the stalled flag when false. */
   stalled: Schema.optional(Schema.Boolean),
+  /** Links to take off, by URL. */
+  removeLinks: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   comment: Schema.optional(Schema.String),
 });
 export type KanbanCardPatchInput = typeof KanbanCardPatchInput.Type;

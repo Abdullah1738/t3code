@@ -112,7 +112,7 @@ class SummaryAndHintTests(unittest.TestCase):
 
 class CliStepTests(Isolated):
 
-    def run_cli(self, argv, code, log_text=''):
+    def run_cli(self, argv, code, log_text='', recorded=None):
         a = cli.build_parser().parse_args(['run'] + argv)
 
         def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0)):
@@ -122,7 +122,7 @@ class CliStepTests(Isolated):
 
         err = io.StringIO()
         with patch.object(runs.Runner, 'start', fake_start), patch.object(runs, 'follow', fake_follow), \
-                contextlib.redirect_stderr(err):
+                patch.object(runs, 'recorded_exit', return_value=recorded), contextlib.redirect_stderr(err):
             rc = cli.cmd_run(a, self.me)
         return rc, err.getvalue().strip().splitlines()
 
@@ -144,6 +144,19 @@ class CliStepTests(Isolated):
         rc, lines = self.run_cli(['go', 'test', './...'], 0)
         self.assertEqual(rc, 0)
         self.assertFalse(any('offbox steps' in x for x in lines))
+
+    def test_lost_step_run_with_every_step_reported_takes_steps_code(self):
+        steps = ['--step', 'a', '--step', 'b']
+        rc, lines = self.run_cli(steps, None, 'offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines[-1], 'offbox: remote exit 0')
+        rc, lines = self.run_cli(steps, None, 'offbox step 1 rc=0: a\noffbox step 2 rc=3: b\n')
+        self.assertEqual(rc, 3)
+
+    def test_lost_step_run_with_missing_step_line_stays_90(self):
+        rc, lines = self.run_cli(['--step', 'a', '--step', 'b'], None, 'offbox step 1 rc=0: a\n')
+        self.assertEqual(rc, 90)
+        self.assertTrue(any('remote exit unknown' in ln for ln in lines))
 
     def test_setup_97_maps_to_infra_90(self):
         rc, lines = self.run_cli(['--no-fallback', 'go', 'test', './...'], 97,

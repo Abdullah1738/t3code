@@ -568,6 +568,7 @@ const handlers = {
               ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
               : {}),
             links: input.links,
+            removeLinks: input.removeLinks,
             blockedBy,
             ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
             subtasks: input.subtasks,

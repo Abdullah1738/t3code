@@ -251,10 +251,15 @@ def _wait_locked(r, echo):
 
 
 def _wait_run(r, echo):
-    from .runs import do_pulls, finish, follow
+    from .runs import do_pulls, finish, follow, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo)
+    if code is None:
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
+        if code is not None:
+            print(f"offbox: boat lost track of the remote process after it ended; exit {code} taken from {how}",
+                  file=sys.stderr)
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
         con = db()

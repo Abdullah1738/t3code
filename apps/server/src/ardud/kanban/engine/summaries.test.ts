@@ -174,7 +174,13 @@ describe("board summaries", () => {
     ]);
     const started = {
       _tag: "thread" as const,
-      thread: { threadId: thread, title: "#1 work", running: true, lastActivityAt: at },
+      thread: {
+        threadId: thread,
+        title: "#1 work",
+        running: true,
+        needsInput: false,
+        lastActivityAt: at,
+      },
     };
     expect(applyChange(tallies, "b1", started)).toBe(true);
     expect(applyChange(tallies, "b1", started)).toBe(false);
@@ -199,7 +205,13 @@ describe("board summaries", () => {
     const second = ThreadId.make("t2");
     applyChange(tallies, "b1", {
       _tag: "thread",
-      thread: { threadId: second, title: "#2 work", running: true, lastActivityAt: at },
+      thread: {
+        threadId: second,
+        title: "#2 work",
+        running: true,
+        needsInput: false,
+        lastActivityAt: at,
+      },
     });
     applyChange(tallies, "b2", { _tag: "board", board: board("b2", "Renamed") });
     expect(shape(false)).toEqual([

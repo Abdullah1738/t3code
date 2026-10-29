@@ -8,12 +8,14 @@ import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-from . import api, lease, pool, ssh_sync
+from . import api, lease, node_version, pool, ssh_sync
+from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event, new_id, now, say)
 
 BG_TTL_S = 6 * 3600
@@ -368,6 +370,56 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+def exit_recording_command(script: str, run_id: str) -> str:
+    """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
+    so a run boat later reports as lost still has its real status on the box."""
+    f = f'"$HOME/.offbox/exit/{run_id}.rc"'
+    outer = "\n".join([
+        'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
+        'find "$HOME/.offbox/exit" -name "*.rc" -mtime +2 -delete 2>/dev/null',
+        'bash -lc "$0"',
+        '__offbox_rc=$?',
+        f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        'exit "$__offbox_rc"',
+    ])
+    return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
+
+
+def recorded_exit(box_id: str, run_id: str) -> int | None:
+    """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
+    try:
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=20)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return int(p.stdout.decode(errors="replace").strip())
+    except ValueError:
+        return None
+
+
+def steps_exit(log_path: Path | None, planned: int) -> int | None:
+    """For --step runs: the first nonzero step rc (else 0), but only when every planned step reported."""
+    if planned <= 0:
+        return None
+    res = dict(step_results(log_path))
+    if not all(n in res for n in range(1, planned + 1)):
+        return None
+    return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
+
+
+def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int) -> tuple[int | None, str]:
+    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines."""
+    code = recorded_exit(box_id, run_id)
+    if code is not None:
+        return code, "the box's exit file"
+    code = steps_exit(log_path, planned)
+    if code is not None:
+        return code, "the step results"
+    return None, ""
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote") -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -401,7 +453,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None) -> str:
+                  steps: list[str] | None = None, node: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -412,6 +464,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,
+              node,
               cmd]
     return "\n".join(lines)
 
@@ -460,6 +513,7 @@ class Runner:
         rdir = row["remote_dir"]
         self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                     docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+        prune.run(con, self.box, rdir)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
@@ -479,11 +533,17 @@ class Runner:
         tw.join()
         if err:
             raise err[0]
-        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None)
+        try:
+            w = node_version.want(self.root, self.cwd)
+            node_block = node_version.block(w) if w else ""
+        except Exception:
+            node_block = ""
+        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
+                               node=node_block)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, "bash -lc " + shlex.quote(script))
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
         except api.ApiError as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
@@ -679,6 +739,10 @@ def _run_remote(a, rn) -> int:
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGHUP, old_hup)
+    if code is None:
+        code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
+        if code is not None:
+            say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

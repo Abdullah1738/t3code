@@ -101,7 +101,9 @@ export function ChipLink(props: {
   readonly glyph?: GlyphKind | null;
   readonly size?: "small" | "large";
   readonly accessibilityLabel?: string;
+  readonly accessibilityHint?: string;
   readonly onPress?: (() => void) | undefined;
+  readonly onLongPress?: (() => void) | undefined;
 }) {
   const chip = <KChip label={props.label} glyph={props.glyph} size={props.size} />;
   if (!props.onPress) return chip;
@@ -109,8 +111,10 @@ export function ChipLink(props: {
     <Pressable
       accessibilityRole="link"
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityHint={props.accessibilityHint}
       hitSlop={6}
       onPress={props.onPress}
+      onLongPress={props.onLongPress}
     >
       {chip}
     </Pressable>
