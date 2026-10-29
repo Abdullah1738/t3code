@@ -3037,13 +3037,15 @@ const make = Effect.gen(function* () {
           const threadId = card.activeThreadId ?? card.workThreadId;
           if (threadId === null)
             return yield* failWith("invalid", `card #${card.number} has no thread`);
-          // A released sibling still points at the shared thread; that thread runs the model
-          // of the cards it still carries (a switch moved it), so take theirs, not its own.
-          const live = card.activeThreadId === null ? yield* store.cardsByThread(threadId) : [];
+          // A released sibling still points at the shared thread. The thread runs its own
+          // current model (a switch moved it, and it survives every card's release), so a
+          // steer sends that rather than the sibling's stale one.
+          const threadModel =
+            card.activeThreadId === null ? yield* threads.model(threadId) : null;
           const model =
             card.activeRole === "review"
               ? Rules.nextModel(yield* boardOf(card.boardId), card)
-              : (live[0]?.model ?? card.model);
+              : (threadModel ?? card.model);
           yield* threads.send({ threadId, text, model });
           yield* logEvent(card, actor, "thread", { body: `Steered: ${text}` });
           return card;

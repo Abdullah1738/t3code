@@ -48,6 +48,12 @@ const makeFake = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      model: (threadId) =>
+        Effect.sync(() => {
+          const switched = modelSwitches.filter((s) => s.threadId === threadId).at(-1);
+          if (switched) return switched.model;
+          return null;
+        }),
       view: (threadId) =>
         Ref.get(threads).pipe(
           Effect.map((all): KanbanThreadView | null => {
@@ -2585,6 +2591,12 @@ it.effect("steer through a released sibling keeps the thread on the switched mod
       assert.strictEqual((yield* kanban.card(b.card.id)).card.stage, "needs_review");
       yield* kanban.editCard(a.id, { model: haiku }, owner);
       yield* kanban.cardThread(b.card.id, "steer", "go on", owner);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.threadId, thread);
+      // A is released too, so the thread has no active card left; it still runs Haiku.
+      const aThread: KanbanActor = { _tag: "thread", threadId: thread! };
+      yield* kanban.moveCard(a.id, "needs_review", "cardThread", aThread, { note: "done" });
+      yield* kanban.cardThread(b.card.id, "steer", "again", owner);
       assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
       assert.strictEqual(fake.sends[fake.sends.length - 1]?.threadId, thread);
     }).pipe(Effect.provide(testLayer(fake.layer)));

@@ -68,6 +68,8 @@ export interface KanbanSendInput {
  */
 export interface KanbanThreadsShape {
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
+  /** The model the thread runs now, or null when the thread is gone. */
+  readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
   readonly lastFailure: (
     threadId: ThreadId,
@@ -114,6 +116,14 @@ const make = Effect.gen(function* () {
                       : pr.snapshot.state,
               })),
             },
+      ),
+      Effect.catchCause(() => Effect.succeed(null)),
+    );
+
+  const model: KanbanThreadsShape["model"] = (threadId) =>
+    threads.getThreadShell(threadId).pipe(
+      Effect.map((shell) =>
+        shell === null || shell.deletedAt !== null ? null : shell.modelSelection,
       ),
       Effect.catchCause(() => Effect.succeed(null)),
     );
@@ -220,7 +230,7 @@ const make = Effect.gen(function* () {
     Effect.catchCause(() => Effect.void),
   );
 
-  return KanbanThreads.of({ view, lastFailure, launch, send, setModel, interrupt });
+  return KanbanThreads.of({ view, model, lastFailure, launch, send, setModel, interrupt });
 });
 
 export const layer = Layer.effect(KanbanThreads, make);

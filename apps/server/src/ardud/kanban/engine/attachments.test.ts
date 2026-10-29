@@ -63,6 +63,7 @@ const makeFake = Effect.gen(function* () {
           return all;
         }),
       lastFailure: () => Effect.succeed(null),
+      model: () => Effect.succeed(null),
       setModel: () => Effect.void,
       interrupt: () => Effect.void,
     }),
