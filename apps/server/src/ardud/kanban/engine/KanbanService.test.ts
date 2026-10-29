@@ -2007,6 +2007,115 @@ it.effect("another evaluator's change that hands a card's step to its evaluator 
   }),
 );
 
+it.effect(
+  "an owner's answer sends a reviewed card back to waiting, a mid-review one to review",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const created = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Fee rounding",
+            title: "Fee rounding",
+            reviewChain: "Critical",
+            subtasks: [
+              { text: "Write the PR", owner: "work" },
+              { text: "Review", owner: "review" },
+              { text: "Merge and release", owner: "evaluator" },
+            ],
+          },
+          evaluator,
+        );
+        yield* kanban.dispatchNow;
+        const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+        fake.prs.set(workThread, [
+          { url: "https://github.com/o/r/pull/9", title: "PR", state: "open" },
+        ]);
+        const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+        yield* kanban.markSubtask(created.id, "s1", "done", null, worker, "work");
+        yield* kanban.moveCard(created.id, "needs_review", "cardThread", worker);
+        yield* kanban.dispatchNow;
+        const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+        yield* kanban.reviewResult(reviewThread, "clear", []);
+        yield* kanban.dispatchNow;
+
+        // Asked mid-review (step 2 running): the answer reruns that step.
+        const midway = yield* kanban.askOwner(
+          created.id,
+          { question: "Hold the release?", blocking: true, options: ["Yes", "No"] },
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(midway.stage, "needs_owner");
+        assert.strictEqual(midway.reviewStep, 1);
+        let talk = yield* kanban.cardDiscussion(created.id);
+        yield* kanban.answer(
+          talk.id,
+          midway.asks.at(-1)!.seq!,
+          midway.asks.at(-1)!.id,
+          ["o2"],
+          owner,
+        );
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "needs_review");
+        yield* kanban.dispatchNow;
+        const rerun = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(rerun.stage, "in_review");
+        assert.isNotNull(rerun.activeThreadId);
+        yield* kanban.reviewResult(rerun.activeThreadId!, "clear", []);
+        const reviewed = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(reviewed.stage, "in_review");
+        assert.isNull(reviewed.activeThreadId);
+        assert.strictEqual(reviewed.reviewStep, 2);
+
+        // Asked after the chain passed: the answer leaves it waiting, no reviewer woken.
+        const reviewMessages = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
+        const waiting = yield* kanban.askOwner(
+          created.id,
+          { question: "Release it?", blocking: true, options: ["Ship it", "Hold"] },
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(waiting.stage, "needs_owner");
+        talk = yield* kanban.cardDiscussion(created.id);
+        yield* kanban.answer(
+          talk.id,
+          waiting.asks.at(-1)!.seq!,
+          waiting.asks.at(-1)!.id,
+          ["o1"],
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const back = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(back.stage, "in_review");
+        assert.isNull(back.activeThreadId);
+        assert.strictEqual(back.reviewStep, 2);
+        assert.strictEqual(
+          (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length,
+          reviewMessages,
+          "the reviewer isn't woken for a step it passed",
+        );
+        const others = [...(yield* Ref.get(fake.threads)).entries()].filter(
+          ([id]) => id !== workThread && id !== reviewThread,
+        );
+        assert.isTrue(
+          others.some(([, thread]) => thread.messages.some((text) => text.includes("Ship it"))),
+          "the evaluator hears the answer",
+        );
+
+        // Its PR lands: the evaluator's step is next.
+        fake.prs.set(workThread, [
+          { url: "https://github.com/o/r/pull/9", title: "PR", state: "merged" },
+        ]);
+        yield* kanban.tick;
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "completed");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("the owner's own question and a pick on an evaluator's go where they belong", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

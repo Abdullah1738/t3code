@@ -1800,7 +1800,17 @@ const make = Effect.gen(function* () {
       const asked = yield* askedBy(card);
       const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
       const back = asked?.fromStage ?? "todo";
-      const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
+      // A card asked about mid-review reruns its step; one whose chain already
+      // passed was only waiting (on its PRs or the evaluator) and goes back to
+      // waiting, so the last reviewer isn't woken for a step it cleared.
+      const reviewed =
+        back === "in_review" &&
+        Rules.reviewFinished(
+          card,
+          Rules.chainFor(yield* boardOf(card.boardId), card)?.steps.length ?? 1,
+        );
+      const stage =
+        back === "working" ? "todo" : back === "in_review" && !reviewed ? "needs_review" : back;
       const workThread = card.workThreadId;
       const wake =
         workThread !== null &&
