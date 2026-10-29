@@ -13,14 +13,14 @@ const poll = { title: "Lunch?", options: ["Pizza", "Sushi"], dedupeKey: "poll-1"
 const app = { url: "https://apps.test/tracker/", caption: "Tracker", subcaption: "Today", trailingCaption: "3",
   trailingSubcaption: "left", summary: "Open tracker", dedupeKey: "app-1", sessionId: "current" };
 
-function setup() {
+function setup(options: Partial<Parameters<typeof createApi>[0]> = {}) {
   setSystemTime(Date.parse("2026-09-10T00:00:00Z"));
   const store = new Store(":memory:");
   stores.push(store);
   const state = { enabled: true, chat: "iMessage;-;+15555550123" as string | undefined, health: {} as Record<string, unknown> };
   const photon: Pick<Photon, "react"> = { async react() { throw new Error("Unexpected reaction"); } };
   const api = createApi({ store, photon, router: () => undefined, chatGuid: () => state.chat, enabled: () => state.enabled,
-    health: () => state.health });
+    health: () => state.health, ...options });
   const post = (path: string, body: unknown) => api(new Request(`http://bridge${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }));
@@ -53,6 +53,26 @@ test("send, poll, and app queue session-bound conversation operations idempotent
     expect(await again.json()).toEqual({ id, created: false });
   }
   expect(h.store.pendingOutbox()).toHaveLength(3);
+});
+
+test("a rule-breaking /send gets one 422 and queues nothing; the retry queues", async () => {
+  const logged: string[] = [];
+  const h = setup({
+    replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined,
+    log: (event, code) => logged.push(`${event}:${code ?? ""}`),
+  });
+  const bad = { ...send, text: "Giardia again?", dedupeKey: "bad-1" };
+  const bounced = await h.post("/send", bad);
+  expect(bounced.status).toBe(422);
+  expect(await bounced.json()).toEqual({ error: 'Nothing was sent: this chat banned "giardia". Rewrite and send again.' });
+  expect(h.store.pendingOutbox()).toHaveLength(0);
+  expect(logged).toEqual(["reply-bounced:banned"]);
+
+  // Same turn, second try: the bounce window still holds, so the check is skipped and the send queues.
+  const retry = await h.post("/send", { ...bad, text: "Got it, here is the answer.", dedupeKey: "bad-2" });
+  expect(retry.status).toBe(202);
+  expect(h.store.pendingOutbox()).toHaveLength(1);
+  expect(logged).toEqual(["reply-bounced:banned"]);
 });
 
 test("app cards are refused in a group chat with a reason, while send still queues there", async () => {

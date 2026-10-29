@@ -6,6 +6,7 @@ import type { Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
   validToken } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
+import { mayBounce, noteBounce, noteSent } from "./replyCheck.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import type { OutboxApp, OutboxOperation, Store } from "./store.ts";
 
@@ -25,6 +26,10 @@ type Options = {
   };
   /** Public Cloudflare links for the apps; absent in per-chat APIs that the Sendblue socket fronts. */
   shares?: Shares;
+  /** Standing chat-rule check on agent sends; absent where no rules apply. */
+  replyCheck?: (text: string) => { rule: string; reason: string } | undefined;
+  /** Receives rule names only, never message text. */
+  log?: (event: string, code?: string) => void;
 };
 
 type SavedSecretRequest = { spec: string; result: { token: string; url: string; expiresAt: number } };
@@ -136,7 +141,7 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
     // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
@@ -234,9 +239,17 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const { text, effect, subject, dedupeKey, sessionId } = body;
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
+        const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
+        const hit = replyCheck?.(text);
+        if (hit && mayBounce(store, turnKey)) {
+          noteBounce(store, turnKey);
+          log?.("reply-bounced", hit.rule);
+          return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
+        }
         const { id, created } = queueSession(store, "send", dedupeKey, sessionId, {
           text, ...(effect === undefined ? {} : { effect }), ...(subject === undefined ? {} : { subject: subject as string }),
         });
+        if (created) noteSent(store, turnKey, text);
         return json({ id, created }, created ? 202 : 200);
       }
 
