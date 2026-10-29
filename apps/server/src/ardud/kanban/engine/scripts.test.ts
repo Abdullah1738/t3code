@@ -84,6 +84,23 @@ describe("board scripts", () => {
     expect(parsed.text).toBe('checked 3 repos\n{"other": 1}');
   });
 
+  it("decodes the subtask, handback and move commands", () => {
+    const parsed = parseOutput(
+      [
+        '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged abc1234"}',
+        '{"kanban":"handback","card":1,"subtask":"s2","note":"deploy failed: exit 1"}',
+        '{"kanban":"move","card":1,"to":"deployed","note":"landed"}',
+        '{"kanban":"move","card":1,"to":"working"}',
+      ].join("\n"),
+    );
+    expect(parsed.commands.map((command) => command.kanban)).toEqual([
+      "subtask",
+      "handback",
+      "move",
+    ]);
+    expect(parsed.errors).toHaveLength(1);
+  });
+
   it("finds a card the script already made", () => {
     const cards = [
       card({

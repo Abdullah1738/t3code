@@ -6,11 +6,16 @@ import {
   KanbanAnswer,
   KanbanBoard,
   KanbanCardEvent,
+  kanbanAwaitsMerge,
   kanbanBlocking,
   kanbanBoardIcon,
+  kanbanEvaluatorStep,
   kanbanHeldUpBy,
+  kanbanScriptStep,
+  kanbanWaitsOnEvaluator,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
+  KanbanSubtask,
   KanbanThreadLink,
   type KanbanCard,
 } from "./kanban.ts";
@@ -258,5 +263,87 @@ describe("KanbanThreadLink", () => {
       endedAt: null,
     });
     expect(decoded.paused).toBeNull();
+  });
+});
+
+const scriptSubtask = (
+  id: string,
+  step: number,
+  text: string,
+  owner: "script" | "evaluator" | "work",
+  state: "open" | "done" = "open",
+) => ({
+  id,
+  step,
+  text,
+  owner,
+  ...(owner === "script" ? { script: "land" } : {}),
+  state,
+  note: null,
+  doneBy: null,
+  doneAt: null,
+});
+
+describe("board script steps", () => {
+  it("a script-only step is the script's, and a mixed one still wakes the evaluator", () => {
+    const scriptOnly = { subtasks: [scriptSubtask("s1", 1, "Merge the PR", "script")] };
+    expect(kanbanScriptStep(scriptOnly)).toBe(true);
+    expect(kanbanEvaluatorStep(scriptOnly)).toBe(false);
+
+    const mixed = {
+      subtasks: [
+        scriptSubtask("s1", 1, "Merge the PR", "script"),
+        scriptSubtask("s2", 1, "Tell the reporter", "evaluator"),
+      ],
+    };
+    expect(kanbanScriptStep(mixed)).toBe(false);
+    expect(kanbanEvaluatorStep(mixed)).toBe(true);
+  });
+
+  it("an evaluator-only step, or evaluator plus script, wakes the evaluator", () => {
+    expect(
+      kanbanEvaluatorStep({ subtasks: [scriptSubtask("s1", 1, "Tell", "evaluator")] }),
+    ).toBe(true);
+    expect(
+      kanbanEvaluatorStep({
+        subtasks: [
+          scriptSubtask("s1", 1, "Merge", "evaluator"),
+          scriptSubtask("s2", 1, "Deploy", "script"),
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("a todo card on a script-only step is left to its script", () => {
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: null,
+        subtasks: [scriptSubtask("s1", 1, "Merge the PR", "script")],
+      }),
+    ).toBe(true);
+  });
+
+  it("a completed card with an open script merge subtask awaits its merge", () => {
+    expect(
+      kanbanAwaitsMerge({
+        stage: "completed",
+        subtasks: [scriptSubtask("s3", 3, "Merge the PR", "script")],
+      }),
+    ).toBe(true);
+  });
+
+  it("a subtask saved without a script name still decodes", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanSubtask)({
+      id: "s1",
+      step: 1,
+      text: "Write the PR",
+      owner: "work",
+      state: "open",
+      note: null,
+      doneBy: null,
+      doneAt: null,
+    });
+    expect(decoded.script).toBeUndefined();
   });
 });

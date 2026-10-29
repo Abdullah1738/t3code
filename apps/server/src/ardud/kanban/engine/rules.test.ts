@@ -132,6 +132,19 @@ describe("checkMove", () => {
       checkMove("owner", card({ stage: "verified", settledAt: "2026-10-25T01:00:00Z" }), "todo").ok,
     ).toBe(false);
   });
+
+  it("lets a script move a card only to completed, deployed or verified, off a quiet stage", () => {
+    expect(checkMove("script", card({ stage: "todo" }), "deployed").ok).toBe(true);
+    expect(checkMove("script", card({ stage: "completed" }), "verified").ok).toBe(true);
+    expect(checkMove("script", card({ stage: "todo" }), "todo").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "needs_review" }), "needs_review").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "completed" }), "needs_review").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "completed" }), "needs_owner").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "working" }), "completed").ok).toBe(false);
+    expect(
+      checkMove("script", card({ stage: "completed", settledAt: "2026-10-25T01:00:00Z" }), "verified").ok,
+    ).toBe(false);
+  });
 });
 
 describe("reviewGate", () => {
@@ -238,6 +251,25 @@ describe("planDispatch", () => {
       setup: { ...setupRunning.setup!, status: "done", finishedAt: "2026-10-28T01:00:00Z" },
     };
     expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
+  });
+
+  it("leaves a todo card alone while its step is a board script's", () => {
+    const scriptStep = card({
+      subtasks: [
+        {
+          id: "s1",
+          step: 1,
+          text: "Merge the PR",
+          owner: "script",
+          script: "land",
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    });
+    expect(planDispatch(board, [scriptStep], pools([[opus, 2]]))).toEqual([]);
   });
 
   it("takes reviews before work and todo by priority", () => {

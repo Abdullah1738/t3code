@@ -2,7 +2,9 @@ import { kanbanEvaluatorStep, kanbanOpenStep, kanbanStepSubtasks } from "@t3tool
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  checkHandBack,
   checkMark,
+  handBack,
   markSubtask,
   PACKET_SUBTASK,
   passReview,
@@ -196,5 +198,117 @@ describe("withPacketStep", () => {
       [3, "evaluator"],
     ]);
     expect(plan.subtasks[0]?.text).toBe(PACKET_SUBTASK);
+  });
+});
+
+describe("board script subtasks", () => {
+  const scriptFlow = [
+    { text: "Merge the PR", owner: "script" as const, script: "land" },
+    { text: "Deploy", owner: "script" as const, script: "land", step: 2 },
+    { text: "Tell the reporter", owner: "evaluator" as const, step: 3 },
+  ];
+  const scriptCard = () => {
+    const plan = planSubtasks([], scriptFlow);
+    if (!plan.ok) throw new Error(plan.reason);
+    return { number: 1, subtasks: plan.subtasks };
+  };
+
+  it("keeps a trimmed script name on a script subtask and refuses it on another owner", () => {
+    const plan = planSubtasks([], [{ text: "Merge", owner: "script", script: "  land  " }]);
+    expect(plan.ok && plan.subtasks[0]?.script).toBe("land");
+    const refused = planSubtasks([], [{ text: "Merge", owner: "work", script: "land" }]);
+    expect(refused.ok).toBe(false);
+  });
+
+  it("drops the script name when an edit leaves it out", () => {
+    const first = planSubtasks([], [{ text: "Merge", owner: "script", script: "land" }]);
+    if (!first.ok) throw new Error(first.reason);
+    const edited = planSubtasks(
+      first.subtasks,
+      [{ id: "s1", text: "Merge", owner: "script" }],
+      first.subtaskSeq,
+    );
+    if (!edited.ok) throw new Error(edited.reason);
+    expect(edited.subtasks[0]).not.toHaveProperty("script");
+  });
+
+  it("lets a script tick its own subtask, named or not, and refuses another script's", () => {
+    const card = scriptCard();
+    expect(checkMark(card, "s1", "done", "script", null, "land")).toEqual({ ok: true });
+    expect(checkMark(card, "s1", "done", "script", null, "other")).toEqual({
+      ok: false,
+      reason: 'subtask s1 is for the script "land"',
+    });
+    const unnamed = planSubtasks([], [{ text: "Anything", owner: "script" }]);
+    if (!unnamed.ok) throw new Error(unnamed.reason);
+    expect(checkMark({ number: 2, subtasks: unnamed.subtasks }, "s1", "done", "script", null, "any")).toEqual({
+      ok: true,
+    });
+  });
+
+  it("refuses a script on an evaluator's subtask and on reopening one", () => {
+    const card = {
+      number: 3,
+      subtasks: [
+        { id: "s1", step: 1, text: "Tell", owner: "evaluator", script: undefined, state: "open", note: null, doneBy: null, doneAt: null },
+      ] as const,
+    };
+    expect(checkMark(card, "s1", "done", "script", null, "land").ok).toBe(false);
+    const done = scriptCard();
+    const marked = { ...done, subtasks: done.subtasks.map((subtask, index) => (index === 0 ? { ...subtask, state: "done" as const } : subtask)) };
+    expect(checkMark(marked, "s1", "open", "script", null, "land")).toEqual({
+      ok: false,
+      reason: "only an evaluator reopens a subtask",
+    });
+  });
+
+  it("checkHandBack refuses a blank note, a non-script subtask, a done one, another name and a later step", () => {
+    const card = scriptCard();
+    expect(checkHandBack(card, "s1", "land", "  ")).toEqual({
+      ok: false,
+      reason: "say what failed or didn't match",
+    });
+    const evaluatorCard = {
+      number: 4,
+      subtasks: [
+        { id: "s1", step: 1, text: "Tell", owner: "evaluator", state: "open", note: null, doneBy: null, doneAt: null },
+      ] as const,
+    };
+    expect(checkHandBack(evaluatorCard, "s1", "land", "x")).toEqual({
+      ok: false,
+      reason: "subtask s1 isn't a script's",
+    });
+    const finished = {
+      ...card,
+      subtasks: card.subtasks.map((subtask) => (subtask.id === "s1" ? { ...subtask, state: "done" as const } : subtask)),
+    };
+    expect(checkHandBack(finished, "s1", "land", "x")).toEqual({
+      ok: false,
+      reason: "subtask s1 is already done",
+    });
+    expect(checkHandBack(card, "s1", "other", "x")).toEqual({
+      ok: false,
+      reason: 'subtask s1 is for the script "land"',
+    });
+    expect(checkHandBack(card, "s2", "land", "x")).toEqual({
+      ok: false,
+      reason: "subtask s2 is in step 2; finish step 1 first",
+    });
+  });
+
+  it("handBack makes the subtask the evaluator's, open, with the note", () => {
+    const card = scriptCard();
+    const handed = handBack(card.subtasks, "s1", "deploy failed: exit 1");
+    expect(handed[0]).toMatchObject({
+      owner: "evaluator",
+      state: "open",
+      note: "deploy failed: exit 1",
+    });
+    expect(handed[0]).not.toHaveProperty("script");
+  });
+
+  it("subtaskLines shows a named script as script \"land\"", () => {
+    const lines = subtaskLines(scriptCard());
+    expect(lines).toContain('- s1 step 1, script "land" (now): Merge the PR');
   });
 });
