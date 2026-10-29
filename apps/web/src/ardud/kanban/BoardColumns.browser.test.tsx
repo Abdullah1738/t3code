@@ -613,30 +613,38 @@ describe("review stack at the iPad width", () => {
     },
   );
 
-  it("drops the review stack and its resize handle when both stages are hidden", async () => {
-    localStorage.setItem(
-      boardColumnsStorageKey(BOARD_ID),
-      JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
-    );
-    // The container pads 20px, so 1084px leaves a 1064px board: over the 1044px threshold.
-    await mountAt(1084, 900, "coarse");
+  it.each([
+    // The thresholds: 964 fine, 1044 coarse. The container pads 20px, so the board is
+    // 20px narrower than the viewport.
+    ["fine", 984],
+    ["coarse", 1064],
+  ] as const)(
+    "drops the review stack with both stages hidden on a %s pointer (board over threshold)",
+    async (pointerKind, viewportWidth) => {
+      localStorage.setItem(
+        boardColumnsStorageKey(BOARD_ID),
+        JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
+      );
+      await mountAt(viewportWidth, 900, pointerKind);
 
-    expect(isStageGrid()).toBe(true);
-    expect(container.querySelector("[data-review-stack]")).toBeNull();
-    expect(container.querySelector('[aria-label="Resize Review"]')).toBeNull();
-    expect(container.querySelector('button[aria-label^="Show Needs Review"]')).not.toBeNull();
-    expect(container.querySelector('button[aria-label^="Show In Review"]')).not.toBeNull();
+      expect(isStageGrid()).toBe(true);
+      expect(container.querySelector("[data-review-stack]")).toBeNull();
+      expect(container.querySelector('[aria-label="Resize Review"]')).toBeNull();
+      expect(container.querySelector('button[aria-label^="Show Needs Review"]')).not.toBeNull();
+      expect(container.querySelector('button[aria-label^="Show In Review"]')).not.toBeNull();
 
-    const strip = container.querySelector<HTMLElement>(".overflow-x-auto")!;
-    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
-    const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
-    const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
-    const visibleShipped = shipped ?? folded;
-    expect(visibleShipped).not.toBeNull();
-    expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
-      strip.getBoundingClientRect().right + 1,
-    );
-  });
+      // The stage strip is the To-Do column's parent, not the goal strip above the board.
+      const strip = column("To-Do")!.parentElement as HTMLElement;
+      expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+      const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
+      const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
+      const visibleShipped = shipped ?? folded;
+      expect(visibleShipped).not.toBeNull();
+      expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
+        strip.getBoundingClientRect().right + 1,
+      );
+    },
+  );
 });
 
 describe("saved widths", () => {

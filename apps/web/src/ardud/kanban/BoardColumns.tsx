@@ -188,10 +188,10 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         type="button"
         onClick={() => toggle(stage)}
         aria-label={`Show ${column.label} (${column.cards.length})`}
-        className="flex shrink-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-sm"
+        className="flex min-w-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-sm"
       >
-        <span className="font-medium">{column.label}</span>
-        <span className="tabular-nums">{column.cards.length} hidden · show</span>
+        <span className="min-w-0 truncate font-medium">{column.label}</span>
+        <span className="shrink-0 tabular-nums">{column.cards.length} hidden · show</span>
       </button>
     );
   };
@@ -240,7 +240,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         {workColumn("working")}
         {reviewStages.length === 0 ? (
           // Both review stages hidden: no stack, no resize handle, just the two restore controls.
-          <div className="flex shrink-0 flex-col gap-2">
+          <div className="flex w-44 shrink-0 flex-col gap-2 pointer-coarse:w-52">
             {reviewRestore("needs_review")}
             {reviewRestore("in_review")}
           </div>
