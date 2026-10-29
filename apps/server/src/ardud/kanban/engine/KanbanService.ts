@@ -2501,8 +2501,19 @@ const make = Effect.gen(function* () {
         if (patch.managerModel) yield* checkModel(patch.managerModel);
         if (patch.evaluatorModel) yield* checkModel(patch.evaluatorModel);
         if (patch.defaultCardModel) yield* checkModel(patch.defaultCardModel);
+        // Only steps that differ from the stored chain are checked. A step already saved
+        // (even if its model has since left the catalog) must not block fixing another step.
         for (const chain of patch.reviewChains ?? []) {
-          for (const step of chain.steps) yield* checkModel(step);
+          const stored = board.reviewChains.find((c) => c.name === chain.name);
+          for (const [index, step] of chain.steps.entries()) {
+            const previous = stored?.steps[index];
+            const unchanged =
+              previous !== undefined &&
+              previous.instanceId === step.instanceId &&
+              previous.model === step.model &&
+              JSON.stringify(previous.options ?? []) === JSON.stringify(step.options ?? []);
+            if (!unchanged) yield* checkModel(step);
+          }
         }
         const pools = missingPools(yield* store.pools(board.id), boardModels(next));
         yield* store.putBoardWithPools(next, pools);
