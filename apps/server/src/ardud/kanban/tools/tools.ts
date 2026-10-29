@@ -169,7 +169,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review: the card completes only when they are merged or closed.",
+  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card.",
   {
     card: Schema.optional(CardRef),
     description: Schema.optional(Schema.String),
@@ -343,7 +343,7 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL; blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
   {
     card: CardRef,
     title: Schema.optional(Schema.String),
@@ -361,6 +361,7 @@ const CardEdit = tool(
     models: Schema.optional(WeightedModels),
     projectId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     links: Schema.optional(Schema.Array(LinkInput)),
+    removeLinks: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
     blockedBy: Schema.optional(Schema.Array(CardRef)),
     reviewChain: Schema.optional(Schema.NullOr(Schema.String)),
     subtasks: Schema.optional(SubtasksInput),

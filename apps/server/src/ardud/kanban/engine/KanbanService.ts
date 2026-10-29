@@ -114,8 +114,10 @@ export interface CardPatch {
   /** Weighted models to start on; wins over `model`. */
   readonly models?: ReadonlyArray<KanbanCardModel> | undefined;
   readonly projectId?: ProjectId | null | undefined;
-  /** Added or relabelled by URL; existing links stay. */
+  /** Added or relabelled by URL. */
   readonly links?: ReadonlyArray<NewLink> | undefined;
+  /** Taken off by URL before `links` is applied, so both together replace a link. */
+  readonly removeLinks?: ReadonlyArray<string> | undefined;
   readonly blockedBy?: ReadonlyArray<KanbanCard["id"]> | undefined;
   readonly reviewChain?: string | null | undefined;
   /** The whole plan: listed ids keep their state, open ones left out go, done ones stay. */
@@ -2813,6 +2815,13 @@ const make = Effect.gen(function* () {
           ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
+        const removeUrls = (patch.removeLinks ?? []).map((url) => url.trim());
+        for (const url of removeUrls) {
+          if (!card.links.some((link) => link.url === url))
+            return yield* failWith("invalid", `card #${card.number} has no link ${url}`);
+        }
+        const keptLinks = card.links.filter((link) => !removeUrls.includes(link.url));
+        const links = patch.links ? mergeLinks(keptLinks, patch.links) : keptLinks;
         const next: KanbanCard = {
           ...card,
           title: patch.title?.trim() || card.title,
@@ -2826,7 +2835,7 @@ const make = Effect.gen(function* () {
           model,
           models: models ? (models.length > 1 ? models : []) : patch.model ? [] : card.models,
           projectId: patch.projectId === undefined ? card.projectId : patch.projectId,
-          links: patch.links ? mergeLinks(card.links, patch.links) : card.links,
+          links,
           blockedBy: patch.blockedBy ?? card.blockedBy,
           reviewChain: patch.reviewChain === undefined ? card.reviewChain : patch.reviewChain,
           updatedAt: at,
@@ -2835,7 +2844,7 @@ const make = Effect.gen(function* () {
           .filter(([key, value]) => key !== "comment" && value !== undefined)
           .map(([key]) => key);
         if (changed.length > 0)
-          yield* logEvent(next, actor, patch.links ? "linked" : "edited", {
+          yield* logEvent(next, actor, patch.links || patch.removeLinks ? "linked" : "edited", {
             body: changed.join(", "),
           });
         if (patch.comment?.trim())

@@ -74,7 +74,7 @@ export const KanbanLink = Schema.Struct({
   kind: KanbanLinkKind,
   url: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String),
-  /** PR state as last checked; null for links that have none. */
+  /** PR state as last checked on the work thread (syncPrs); null for other links, including PRs attached only as context. */
   state: Schema.NullOr(Schema.Literals(["open", "draft", "merged", "closed"])),
   checkedAt: Schema.NullOr(IsoDateTime),
 });

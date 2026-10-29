@@ -113,10 +113,14 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
-/** Every PR link merged or closed. A card with no PR has nothing to wait for. */
+/**
+ * Every PR the work thread linked is merged or closed. Only those get a state
+ * (syncPrs); a PR link without one is context and holds nothing. A card with
+ * no PR has nothing to wait for.
+ */
 export function prsLanded(card: KanbanCard): boolean {
   return card.links
-    .filter((link) => link.kind === "pr")
+    .filter((link) => link.kind === "pr" && link.state !== null)
     .every((link) => link.state === "merged" || link.state === "closed");
 }
 

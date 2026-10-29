@@ -1454,6 +1454,76 @@ it.effect("a thread's new card waits for an evaluator's packet; the owner's goes
   }),
 );
 
+it.effect("links come off by URL, and both together replace one", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const A = "https://github.com/o/r/pull/1";
+      const B = "https://github.com/o/r/pull/2";
+      const C = "https://github.com/o/r/pull/3";
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Links", title: "Links", links: [{ url: A }, { url: B }] },
+        owner,
+      );
+      const afterRemove = yield* kanban.editCard(created.id, { removeLinks: [A] }, owner);
+      assert.deepStrictEqual(afterRemove.links.map((link) => link.url), [B]);
+      const replaced = yield* kanban.editCard(
+        created.id,
+        { removeLinks: [B], links: [{ url: C }] },
+        owner,
+      );
+      assert.deepStrictEqual(replaced.links.map((link) => link.url), [C]);
+      const refused = yield* kanban
+        .editCard(created.id, { removeLinks: ["https://example.com/nope"] }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+      const unchanged = (yield* kanban.card(created.id)).card;
+      assert.deepStrictEqual(unchanged.links.map((link) => link.url), [C]);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a context PR doesn't hold a reviewed card once its own PR lands", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const plan = [
+        { text: "Write the PR", owner: "work" as const },
+        { text: "Review", owner: "review" as const },
+      ];
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Context", title: "Context", subtasks: plan },
+        evaluator,
+      );
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const pr = "https://github.com/o/r/pull/50";
+      const contract = "https://github.com/o/broker/pull/62";
+      fake.prs.set(workThread, [{ url: pr, title: "Own", state: "open" }]);
+      const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+      yield* kanban.editCard(
+        card.id,
+        { links: [{ url: contract, label: "contract" }] },
+        evaluator,
+      );
+      yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+      yield* kanban.dispatchNow;
+      yield* kanban.reviewResult((yield* kanban.card(card.id)).card.activeThreadId!, "clear", []);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "in_review");
+      fake.prs.set(workThread, [{ url: pr, title: "Own", state: "merged" }]);
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "completed");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("an evaluator hears once when a reviewed card waits on it for its PRs", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
