@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from . import api, lease, node_version, pool, ssh_sync
+from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event, new_id, now, say)
 
 BG_TTL_S = 6 * 3600
@@ -461,6 +462,7 @@ class Runner:
         rdir = row["remote_dir"]
         self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                     docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+        prune.run(con, self.box, rdir)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()

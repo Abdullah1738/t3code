@@ -79,7 +79,9 @@ offbox local --list ; offbox local --clear
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
   at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
-  directories remain separate per local repo path. Dependencies are warm on whichever box you receive.
+  directories remain separate per local repo path. Dependencies are warm on whichever box you receive. Old
+  checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
+  last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
   Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–8) and
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
