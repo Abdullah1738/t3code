@@ -96,6 +96,32 @@ class ScriptTests(Isolated):
             self.assertTrue((h / "w/c-cccccc").is_symlink())
             self.assertTrue(target.is_dir())
 
+    def test_blocked_dir_check_is_killed_at_budget_and_dir_survives_reuse(self):
+        # Round-3 race: the directory test itself blocks (a FIFO with no writer makes `[ -d ]`-style checks hang
+        # in the kernel path). The parent's ssh timeout returns control; a later run then reuses the checkout.
+        # The blocked child must be gone at the budget, so the reused dir is never renamed.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+            h = Path(home)
+            (h / "w/a-aaaaaa").mkdir(parents=True)
+            (h / "w/a-aaaaaa/f").write_text("x")
+            # The stall is inside the group child (the check plus mv): a stub mv that blocks, as a hung
+            # filesystem call would. Its pid is recorded so the test can prove the group was killed.
+            pidf = h / "mv.pid"
+            stall = Path(bindir) / "mv"
+            stall.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
+            stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
+            with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"):
+                body = prune.script(["w/a-aaaaaa"])
+            p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
+                               capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa"])
+            # Checkout reuse after the caller gave up: the dir is still the live checkout and was never renamed.
+            self.assertTrue((h / "w/a-aaaaaa/f").read_text() == "x")
+            pid = int(pidf.read_text().strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)  # the blocked child is dead before the box can be reused
+
     def test_stalled_mv_is_killed_and_reaped_before_script_returns(self):
         # Blocked-mv + SSH-timeout + checkout-reuse: a mv that stalls past the budget must be dead before
         # the script returns, so the caller can't release the box while a rename is still pending.
