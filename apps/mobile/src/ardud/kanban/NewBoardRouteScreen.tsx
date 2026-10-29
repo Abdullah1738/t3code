@@ -1,13 +1,20 @@
 import { useNavigation } from "@react-navigation/native";
-import type { ModelSelection, ProjectId } from "@t3tools/contracts";
+import {
+  KANBAN_BOARD_ICONS,
+  type KanbanBoardIcon,
+  type KanbanBoardId,
+  type ModelSelection,
+  type ProjectId,
+} from "@t3tools/contracts";
 import { useMemo, useState } from "react";
-import { ScrollView, TextInput, View } from "react-native";
+import { Pressable, ScrollView, TextInput, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { usePairedEnvironmentId } from "../common/environment";
+import { THEMED } from "./BoardIcon";
 import { kanbanClient, useKanbanBoards } from "./kanbanStore";
 
 /** Same rule as the web dialog: the slug is the name, lowercased with dashes. */
@@ -20,9 +27,9 @@ export function slugOf(name: string): string {
 }
 
 /**
- * New board on the phone: name and slug, project, the setup evaluator's model and
- * notes. Start setup creates the board, starts the setup evaluator on the picked
- * model and opens its Setup discussion. Nothing is created until then.
+ * New board on the phone: name and slug, optional icon, project, the setup
+ * evaluator's model and notes. Start setup creates the board, saves the icon,
+ * starts the setup evaluator on the picked model and opens its Setup discussion.
  */
 export function NewBoardRouteScreen() {
   const navigation = useNavigation();
@@ -34,11 +41,17 @@ export function NewBoardRouteScreen() {
 
   const [name, setName] = useState("");
   const [slugEdit, setSlugEdit] = useState<string | null>(null);
+  const [icon, setIcon] = useState<KanbanBoardIcon | null>(null);
   const [projectId, setProjectId] = useState<ProjectId | null>(null);
   const [model, setModel] = useState<ModelSelection | null>(null);
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The board this form created, kept so a retry resumes it instead of creating another.
+  const [pending, setPending] = useState<{
+    boardId: KanbanBoardId;
+    discussionId: string | null;
+  } | null>(null);
 
   const slug = slugEdit ?? slugOf(name);
   const modelGroups = useMemo(
@@ -50,32 +63,40 @@ export function NewBoardRouteScreen() {
 
   const start = async () => {
     if (!canStart || model === null || projectId === null) return;
-    // Refuse a taken slug before anything is created or changed. The server refuses it too.
-    if (boards.some((summary) => summary.board.slug === slug)) {
+    // A pending board already owns its slug, so a retry skips the duplicate check.
+    if (pending === null && boards.some((summary) => summary.board.slug === slug)) {
       setError(`A board with the slug "${slug}" already exists. Pick another name.`);
       return;
     }
     setBusy(true);
     setError(null);
+    // Resume the pending board by id; a later failure keeps the id so the retry lands on it.
+    let boardId: KanbanBoardId | null = pending?.boardId ?? null;
+    let discussionId: string | null = pending?.discussionId ?? null;
     try {
       const client = kanbanClient();
-      const created = await client.createBoard({
-        slug,
-        name: name.trim(),
-        defaultProjectId: projectId,
-        evaluatorModel: model,
-      });
-      const started = await client.startSetup(created.id, {
-        evaluatorModel: model,
-        ...(notes.trim() ? { text: notes.trim() } : {}),
-      });
+      if (boardId === null) {
+        const created = await client.createBoard({
+          slug,
+          name: name.trim(),
+          defaultProjectId: projectId,
+          evaluatorModel: model,
+        });
+        boardId = created.id;
+        setPending({ boardId, discussionId: null });
+      }
+      if (icon) await client.updateBoard({ boardId, icon });
+      if (discussionId === null) {
+        const started = await client.startSetup(boardId, {
+          evaluatorModel: model,
+          ...(notes.trim() ? { text: notes.trim() } : {}),
+        });
+        discussionId = started.discussionId;
+        setPending({ boardId, discussionId });
+      }
       // The board opens first, then its Setup discussion stacks on top, as nav.openDiscussion does.
-      navigation.navigate("KanbanBoard", { boardId: created.id });
-      navigation.navigate("KanbanRecord", {
-        kind: "discussion",
-        boardId: created.id,
-        id: started.discussionId,
-      });
+      navigation.navigate("KanbanBoard", { boardId });
+      navigation.navigate("KanbanRecord", { kind: "discussion", boardId, id: discussionId });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Couldn't start setup");
     } finally {
@@ -89,6 +110,7 @@ export function NewBoardRouteScreen() {
         <Text className="text-sm text-foreground-muted">Name</Text>
         <TextInput
           value={name}
+          editable={pending === null}
           onChangeText={setName}
           placeholder="Robob"
           placeholderTextColorClassName="accent-placeholder"
@@ -99,16 +121,42 @@ export function NewBoardRouteScreen() {
         <Text className="text-sm text-foreground-muted">Slug</Text>
         <TextInput
           value={slug}
+          editable={pending === null}
           onChangeText={(value) => setSlugEdit(slugOf(value))}
           autoCapitalize="none"
           className="rounded-lg border border-input-border bg-input px-3 py-2 text-base text-foreground"
         />
+      </View>
+      <Text className="text-sm text-foreground-muted">Icon (optional)</Text>
+      <View className="flex-row flex-wrap gap-2">
+        {KANBAN_BOARD_ICONS.map((entry) => {
+          const Icon = THEMED[entry];
+          const selected = icon === entry;
+          return (
+            <Pressable
+              key={entry}
+              accessibilityRole="button"
+              accessibilityLabel={entry}
+              accessibilityState={{ selected }}
+              disabled={pending !== null}
+              onPress={() => setIcon(selected ? null : entry)}
+              className={
+                selected
+                  ? "size-11 items-center justify-center rounded-lg bg-primary"
+                  : "size-11 items-center justify-center rounded-lg bg-input"
+              }
+            >
+              <Icon size={20} />
+            </Pressable>
+          );
+        })}
       </View>
       <Text className="text-sm text-foreground-muted">Project</Text>
       {projects.map((project) => (
         <Button
           key={project.id}
           label={project.title}
+          disabled={pending !== null}
           tone={projectId === project.id ? "primary" : "secondary"}
           onPress={() => setProjectId(project.id)}
         />
