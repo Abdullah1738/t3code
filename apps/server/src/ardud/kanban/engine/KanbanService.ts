@@ -2182,6 +2182,7 @@ const make = Effect.gen(function* () {
         threadId,
         title: view?.title ?? link.purpose ?? link.role,
         running: false,
+        needsInput: false,
         lastActivityAt: at,
       },
     });
