@@ -17,6 +17,13 @@ Messages mutate while streaming, so only settled messages are projected
 SETTLE_SECS). A message is re-projected when its time_updated changes; facts
 pointing at replaced rows are re-linked.
 
+A session is rescanned when its time_updated changes OR its message count or max
+seq changes (session_v2.time_updated does not move when messages are appended,
+so the fingerprint in opencode_sync_progress is what catches them). That table
+starts empty, so the first runs rescan every session once. This is resumable:
+each finished session is recorded as it completes, and --deadline still stops
+between sessions.
+
 Messages already present in memory from the v1 import (turn_id=<msg_id>, not in
 the sync ledger) are adopted as legacy rows and left alone unless they change.
 
@@ -37,7 +44,7 @@ import zlib
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
 RAW_DB = os.environ.get("OPENCODE_RAW_DB", os.path.join(HOME, ".local/share/memory-system/data/opencode_raw.db"))
-SRC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+SRC_DB = os.environ.get("OPENCODE_DB", os.path.join(HOME, ".local/share/opencode/opencode.db"))
 SOURCE = "opencode"
 SETTLE_SECS = 600
 IMAGE_MIN_LEN = 256
@@ -242,6 +249,9 @@ class Sync:
             CREATE TABLE IF NOT EXISTS opencode_sync_sessions(
               session_id TEXT PRIMARY KEY, native INTEGER, time_updated INTEGER,
               synced_at INTEGER);
+            CREATE TABLE IF NOT EXISTS opencode_sync_progress(
+              session_id TEXT PRIMARY KEY, max_seq INTEGER NOT NULL,
+              msg_count INTEGER NOT NULL);
         """)
         self.mem.commit()
         self.att = Attachments(self.mem)
@@ -255,11 +265,22 @@ class Sync:
         self.src.commit()
         known = dict(self.mem.execute(
             "SELECT session_id, time_updated FROM opencode_sync_sessions").fetchall())
+        # session_v2.time_updated does not move when messages are appended, so
+        # the (max seq, message count) fingerprint is what catches new messages
+        src_fp = {sid: (mx, n) for sid, mx, n in self.src.execute(
+            "SELECT session_id, MAX(seq), COUNT(*) FROM session_message GROUP BY session_id")
+            .fetchall()}
+        self.src.commit()
+        have_fp = {sid: (mx, n) for sid, mx, n in self.mem.execute(
+            "SELECT session_id, max_seq, msg_count FROM opencode_sync_progress").fetchall()}
         out = []
         for r in rows:
             d = dict(zip(cols, r))
-            if known.get(d["id"]) == d["time_updated"] and not self.args.full:
+            fp = src_fp.get(d["id"], (0, 0))
+            if (known.get(d["id"]) == d["time_updated"] and have_fp.get(d["id"]) == fp
+                    and not self.args.full):
                 continue
+            d["_fp"] = fp
             out.append(d)
         return out
 
@@ -281,10 +302,9 @@ class Sync:
     def sync_session(self, sess):
         sid = sess["id"]
         native = is_native(sess.get("metadata"))
+        fp = sess.get("_fp") or (0, 0)
         if not native:
-            with_retry(self.mem, lambda: self.mem.execute(
-                "INSERT OR REPLACE INTO opencode_sync_sessions VALUES (?,?,?,?)",
-                (sid, 0, sess["time_updated"], int(time.time()))))
+            with_retry(self.mem, lambda: self._stamp(sid, 0, sess["time_updated"], fp))
             return
         self.stats["sessions"] += 1
         ledger = dict((m, (tu, p, lg)) for m, tu, p, lg in self.mem.execute(
@@ -330,9 +350,18 @@ class Sync:
             "INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
             (sid, sess["time_updated"], zlib.compress(srow, 6))))
         stamp = sess["time_updated"] if all_settled else -1
-        with_retry(self.mem, lambda: self.mem.execute(
+        with_retry(self.mem, lambda: self._stamp(sid, 1, stamp, fp))
+
+    def _stamp(self, sid, native, stamp, fp):
+        # Caller holds BEGIN IMMEDIATE. A -1 stamp (unsettled message) writes no
+        # progress row, so the session is retried on the next run.
+        self.mem.execute(
             "INSERT OR REPLACE INTO opencode_sync_sessions VALUES (?,?,?,?)",
-            (sid, 1, stamp, int(time.time()))))
+            (sid, native, stamp, int(time.time())))
+        if stamp != -1:
+            self.mem.execute(
+                "INSERT OR REPLACE INTO opencode_sync_progress VALUES (?,?,?)",
+                (sid, fp[0], fp[1]))
 
     def _project_chunk(self, sid, sess, chunk):
         m = self.mem
