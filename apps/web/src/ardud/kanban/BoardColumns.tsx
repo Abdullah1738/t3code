@@ -178,16 +178,21 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
 
   // A hidden review stage's rail sits beside the stack, not in it: a full-height rail
   // inside the stack would squeeze the visible stage to nothing.
-  const reviewRail = (stage: KanbanStage) => {
+  // A hidden review stage is restored from inside the shared stack, so it never adds a
+  // rail beside the stack and never widens the row.
+  const reviewRestore = (stage: KanbanStage) => {
     const column = stageColumn(stage);
     if (!column || !hidden(stage)) return null;
     return (
-      <HiddenColumnRail
-        key={stage}
-        label={column.label}
-        count={column.cards.length}
-        onShow={() => toggle(stage)}
-      />
+      <button
+        type="button"
+        onClick={() => toggle(stage)}
+        aria-label={`Show ${column.label} (${column.cards.length})`}
+        className="flex shrink-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-[0.8125rem]"
+      >
+        <span className="font-medium">{column.label}</span>
+        <span className="tabular-nums">{column.cards.length} hidden · show</span>
+      </button>
     );
   };
 
@@ -233,8 +238,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       >
         {workColumn("todo")}
         {workColumn("working")}
-        {reviewRail("needs_review")}
-        {reviewStages.length > 0 ? (
+        {reviewStages.length > 0 || hidden("needs_review") || hidden("in_review") ? (
           <div
             data-review-stack
             className={cn(
@@ -251,11 +255,12 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
               onCommit={setReviewWidth}
               onReset={resetReviewWidth}
             />
+            {reviewRestore("needs_review")}
             {reviewColumn("needs_review")}
+            {reviewRestore("in_review")}
             {reviewColumn("in_review")}
           </div>
         ) : null}
-        {reviewRail("in_review")}
         {shippedHidden ? (
           <HiddenColumnRail
             label="Shipped"
