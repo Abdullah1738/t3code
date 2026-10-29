@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, lease, pool, ssh_sync
+from . import api, lease, node_version, pool, ssh_sync
 from .common import (EXIT_BUSY, EXIT_INFRA, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event, new_id, now, say)
 
 BG_TTL_S = 6 * 3600
@@ -401,7 +401,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None) -> str:
+                  steps: list[str] | None = None, node: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -412,6 +412,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,
+              node,
               cmd]
     return "\n".join(lines)
 
@@ -479,7 +480,13 @@ class Runner:
         tw.join()
         if err:
             raise err[0]
-        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None)
+        try:
+            w = node_version.want(self.root, self.cwd)
+            node_block = node_version.block(w) if w else ""
+        except Exception:
+            node_block = ""
+        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
+                               node=node_block)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:

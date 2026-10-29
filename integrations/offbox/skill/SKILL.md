@@ -92,8 +92,9 @@ offbox local --list ; offbox local --clear
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
 - Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
   times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
+- Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`.
-  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (Node 24 + warm npm cache,
+  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
