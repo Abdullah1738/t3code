@@ -22,6 +22,7 @@ import {
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
   type KanbanCard,
+  type KanbanSubtask,
   type KanbanCardEvent,
   type KanbanCardModel,
   type KanbanChange,
@@ -3074,7 +3075,7 @@ const make = Effect.gen(function* () {
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
     const plan = Subtasks.planSubtasks([], input.subtasks ?? []);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
-    yield* checkScriptNames(input.boardId, plan.subtasks);
+    yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
       boardId,
