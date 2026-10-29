@@ -1454,7 +1454,7 @@ const make = Effect.gen(function* () {
         const discussion = yield* store.discussion(after.discussionId);
         const own = discussion?.evaluatorThreadId ?? null;
         if (discussion === null || own === null || own === actor.threadId) return;
-        if (!(yield* threads.view(own))) return;
+        if (!(yield* liveEvaluator(own))) return;
         yield* toEvaluator(discussion, Briefs.evaluatorStepFromOtherText(after, actor.threadId), true);
         return;
       }
