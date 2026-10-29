@@ -2502,9 +2502,13 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
+        // The thread's live model comes first: a switch moves the thread even after every
+        // card that carried the switch is released, and the held slot follows it.
+        const live = yield* threads.model(threadId);
         const model = input.model
           ? yield* poolModel(thread.board.id, input.model)
-          : (thread.carried[0]?.model ??
+          : (live ??
+            thread.carried[0]?.model ??
             thread.link.model ??
             (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.model ??
             thread.board.defaultCardModel);
