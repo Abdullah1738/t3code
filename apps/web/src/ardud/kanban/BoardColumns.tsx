@@ -238,7 +238,13 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       >
         {workColumn("todo")}
         {workColumn("working")}
-        {reviewStages.length > 0 || hidden("needs_review") || hidden("in_review") ? (
+        {reviewStages.length === 0 ? (
+          // Both review stages hidden: no stack, no resize handle, just the two restore controls.
+          <div className="flex shrink-0 flex-col gap-2">
+            {reviewRestore("needs_review")}
+            {reviewRestore("in_review")}
+          </div>
+        ) : (
           <div
             data-review-stack
             className={cn(
@@ -260,7 +266,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
             {reviewRestore("in_review")}
             {reviewColumn("in_review")}
           </div>
-        ) : null}
+        )}
         {shippedHidden ? (
           <HiddenColumnRail
             label="Shipped"
