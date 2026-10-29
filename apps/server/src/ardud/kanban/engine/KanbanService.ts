@@ -415,6 +415,8 @@ export interface KanbanServiceShape {
   readonly tick: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
   readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
+  /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
+  readonly notifyThreadChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Background worker: runs queued dispatch kicks and turn ends; never returns. */
   readonly worker: Effect.Effect<never>;
 }
@@ -3905,6 +3907,25 @@ const make = Effect.gen(function* () {
     tick: guard(tickUnlocked()),
     notifyTurnEnded: (threadId) =>
       Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
+    notifyThreadChanged: (threadId) =>
+      read(
+        Effect.gen(function* () {
+          const link = yield* store.threadLink(threadId);
+          if (!link) return;
+          const view = yield* threads.view(threadId);
+          if (!view) return;
+          yield* publish(link.boardId, {
+            _tag: "thread",
+            thread: {
+              threadId,
+              title: view.title,
+              running: view.state !== "idle" && view.state !== "needs-input",
+              needsInput: view.state === "needs-input",
+              lastActivityAt: view.updatedAt,
+            },
+          });
+        }),
+      ),
     worker: Queue.take(jobs).pipe(Effect.flatMap(runJob), Effect.forever),
   });
 });

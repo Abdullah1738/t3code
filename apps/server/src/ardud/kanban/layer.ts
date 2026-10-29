@@ -41,9 +41,13 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     );
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) =>
-        event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status)
-          ? service.notifyTurnEnded(event.threadId)
-          : Effect.void,
+        event.type !== "run.updated"
+          ? Effect.void
+          : TERMINAL_RUN_STATUSES.has(event.payload.status)
+            ? service.notifyTurnEnded(event.threadId)
+            : service
+                .notifyThreadChanged(event.threadId)
+                .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change"))),
       ).pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
       ),

@@ -1143,6 +1143,56 @@ it.effect("a thread stuck on its own question shows as needing input, not runnin
   }),
 );
 
+it.effect("announces a mid-turn question so the board stops showing the thread as running", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const stuckAnnounced = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) =>
+            change._tag === "thread" &&
+            change.thread.threadId === thread &&
+            change.thread.needsInput === true,
+        ),
+      );
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.stuck = true;
+        return all;
+      });
+      yield* kanban.notifyThreadChanged(thread);
+      const announced = yield* stuckAnnounced;
+      assert.isTrue(Option.isSome(announced));
+      if (Option.isSome(announced) && announced.value.change._tag === "thread") {
+        assert.isFalse(announced.value.change.thread.running);
+      }
+
+      // Answering the question clears the ask glyph on the next change.
+      const resumed = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) =>
+            change._tag === "thread" &&
+            change.thread.threadId === thread &&
+            change.thread.needsInput === false &&
+            change.thread.running === true,
+        ),
+      );
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.stuck = false;
+        return all;
+      });
+      yield* setRunning(fake, thread, true);
+      yield* kanban.notifyThreadChanged(thread);
+      assert.isTrue(Option.isSome(yield* resumed));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a work thread's own cards are the ones it took and still has", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
