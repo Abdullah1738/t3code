@@ -1,9 +1,16 @@
-import { KANBAN_DONE_STAGES, type KanbanCard, type KanbanGroup } from "@t3tools/contracts";
+import {
+  KANBAN_DONE_STAGES,
+  type KanbanCard,
+  type KanbanGoal,
+  type KanbanGroup,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 export const SCRIBE_EVERY_MS = 10 * 60_000;
 const MAX_CARDS = 400;
 const MAX_GROUPS = 20;
+const MAX_GOAL_CARDS = 40;
+const MAX_NO_GOAL_CARDS = 300;
 
 export const ScribeGroupsOutput = Schema.Struct({
   groups: Schema.Array(
@@ -17,6 +24,14 @@ export const ScribeGroupsOutput = Schema.Struct({
 });
 export type ScribeGroupsOutput = typeof ScribeGroupsOutput.Type;
 
+export const ScribeGoalsOutput = Schema.Struct({
+  assign: Schema.Array(Schema.Struct({ card: Schema.Number, goal: Schema.String })),
+  goals: Schema.Array(
+    Schema.Struct({ id: Schema.String, now: Schema.String, story: Schema.NullOr(Schema.String) }),
+  ),
+});
+export type ScribeGoalsOutput = typeof ScribeGoalsOutput.Type;
+
 const isOpen = (card: KanbanCard) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
@@ -27,6 +42,36 @@ const oneLine = (text: string, max: number) => {
 
 const openCards = (cards: ReadonlyArray<KanbanCard>) =>
   cards.filter(isOpen).toSorted((a, b) => a.number - b.number);
+
+/** Numbers of a goal's cards that finished after its last story line (or after it was made). */
+export function finishedSince(goal: KanbanGoal, cards: ReadonlyArray<KanbanCard>): Array<number> {
+  const since = Date.parse(goal.story.at(-1)?.at ?? goal.createdAt);
+  return cards
+    .filter(
+      (card) =>
+        card.goalId === goal.id &&
+        KANBAN_DONE_STAGES.has(card.stage) &&
+        Date.parse(card.movedAt) > since,
+    )
+    .map((card) => card.number)
+    .toSorted((a, b) => a - b);
+}
+
+/** "" when the board has no active goal, so the pass is skipped. */
+export function goalsFingerprint(
+  cards: ReadonlyArray<KanbanCard>,
+  goals: ReadonlyArray<KanbanGoal>,
+): string {
+  const active = new Set(goals.filter((goal) => goal.status === "active").map((goal) => goal.id as string));
+  if (active.size === 0) return "";
+  const lines = [...active];
+  for (const card of cards) {
+    if (!isOpen(card)) continue;
+    if (card.goalId !== null && !active.has(card.goalId as string)) continue;
+    lines.push(`${card.number}:${card.stage}:${card.goalId ?? "-"}`);
+  }
+  return lines.sort().join("\n");
+}
 
 /** Changes when an open card is added, finished or renamed; "" when none are open. */
 export function groupsFingerprint(cards: ReadonlyArray<KanbanCard>): string {
@@ -111,4 +156,96 @@ export function toGroups(
     });
   }
   return kept;
+}
+
+export function goalsPrompt(
+  cards: ReadonlyArray<KanbanCard>,
+  goals: ReadonlyArray<KanbanGoal>,
+): string {
+  const open = openCards(cards);
+  const active = goals.filter((goal) => goal.status === "active");
+  const goalBlocks = active.flatMap((goal) => {
+    const own = open
+      .filter((card) => card.goalId === goal.id)
+      .slice(-MAX_GOAL_CARDS)
+      .map(
+        (card) => `#${card.number} | ${oneLine(card.title, 120)} | ${card.stage}`,
+      );
+    const finished = finishedSince(goal, cards).map((number) => `#${number}`).join(", ") || "(none)";
+    return [
+      "",
+      `Goal ${goal.id}: ${goal.name}`,
+      `Now: ${goal.now?.text ?? "(none)"}`,
+      "Cards (number | title | stage):",
+      ...(own.length > 0 ? own : ["(none)"]),
+      `Finished since the last story line: ${finished}`,
+    ];
+  });
+  const noGoal = open
+    .filter((card) => card.goalId === null)
+    .slice(-MAX_NO_GOAL_CARDS)
+    .map(
+      (card) =>
+        `#${card.number} | ${oneLine(card.title, 120)} | ${card.projects.join(", ") || "-"}`,
+    );
+  return [
+    "You keep a work board's goals current for a reader who isn't technical.",
+    "Rules:",
+    "- assign: put an open card that has no goal into one of the goals below only when it clearly serves that goal. Leave it out when unsure.",
+    "- now: for every goal, one or two plain sentences on where it stands: what landed, what is being worked on, what is left, anything waiting on the owner. Keep facts from its current Now that are still true.",
+    '- story: one plain sentence about what finished, only for a goal with cards under "Finished since the last story line"; otherwise null.',
+    'Reply as JSON: {"assign": [{"card": 12, "goal": "goal id"}], "goals": [{"id": "goal id", "now": "...", "story": null}]}',
+    ...goalBlocks,
+    "",
+    "Open cards with no goal (number | title | projects):",
+    ...(noGoal.length > 0 ? noGoal : ["(none)"]),
+  ].join("\n");
+}
+
+export function toGoalUpdates(
+  output: ScribeGoalsOutput,
+  cards: ReadonlyArray<KanbanCard>,
+  goals: ReadonlyArray<KanbanGoal>,
+): {
+  readonly assign: Array<{ readonly cardId: KanbanCard["id"]; readonly goalId: KanbanGoal["id"] }>;
+  readonly goals: Array<{
+    readonly id: KanbanGoal["id"];
+    readonly now: string;
+    readonly story: string | null;
+  }>;
+} {
+  const active = new Map(
+    goals.filter((goal) => goal.status === "active").map((goal) => [goal.id as string, goal]),
+  );
+  const byNumber = new Map<number, KanbanCard>();
+  for (const card of openCards(cards)) byNumber.set(card.number, card);
+
+  const assign: Array<{ readonly cardId: KanbanCard["id"]; readonly goalId: KanbanGoal["id"] }> =
+    [];
+  const assigned = new Set<string>();
+  for (const entry of output.assign) {
+    const card = byNumber.get(entry.card);
+    if (!card || card.goalId !== null || assigned.has(card.id as string)) continue;
+    if (!active.has(entry.goal)) continue;
+    assigned.add(card.id as string);
+    assign.push({ cardId: card.id, goalId: entry.goal as KanbanGoal["id"] });
+  }
+
+  const updates: Array<{
+    readonly id: KanbanGoal["id"];
+    readonly now: string;
+    readonly story: string | null;
+  }> = [];
+  const seen = new Set<string>();
+  for (const entry of output.goals) {
+    const goal = active.get(entry.id);
+    if (!goal || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const now = entry.now.trim().slice(0, 600);
+    const text = entry.story?.trim() ?? "";
+    const story = text !== "" && finishedSince(goal, cards).length > 0 ? text : null;
+    if (now === "" && story === null) continue;
+    updates.push({ id: goal.id, now, story });
+  }
+  return { assign, goals: updates };
 }

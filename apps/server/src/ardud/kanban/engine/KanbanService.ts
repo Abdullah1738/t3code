@@ -435,6 +435,8 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+// A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
+const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
 const DISCUSSION_TITLE_MAX = 80;
 /** Past this many messages a discussion has long had the owner's first one. */
@@ -600,6 +602,9 @@ const make = Effect.gen(function* () {
   // Per board: the open-card fingerprint of the scribe's last attempt, when it started,
   // and whether that attempt grouped the board. A failed attempt is retried after the
   // cooldown even when the cards did not change.
+  const goalsScribed = yield* Ref.make<
+    ReadonlyMap<KanbanBoardId, { readonly fingerprint: string; readonly at: number }>
+  >(new Map());
   const scribed = yield* Ref.make<
     ReadonlyMap<
       KanbanBoardId,
@@ -1077,6 +1082,62 @@ const make = Effect.gen(function* () {
   const forkGroups = (boardId: KanbanBoardId) =>
     writeGroups(boardId).pipe(
       Effect.catchCause((cause) => Effect.logWarning("kanban scribe failed", { boardId, cause })),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
+  // The scribe also keeps each active goal's Now current and adds Story lines when its
+  // cards finish. It never moves a card that already has a goal.
+  const writeGoals = Effect.fn("KanbanService.writeGoals")(function* (boardId: KanbanBoardId) {
+    const generateJson = textGeneration.generateJson;
+    if (!generateJson) return;
+    const board = yield* boardOf(boardId);
+    if (board.defaultProjectId === null) return;
+    const project = yield* projects.getById(board.defaultProjectId);
+    if (Option.isNone(project)) return;
+    const output = yield* generateJson({
+      cwd: project.value.workspaceRoot,
+      prompt: Scribe.goalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId)),
+      outputSchema: Scribe.ScribeGoalsOutput,
+      modelSelection: board.managerModel,
+    });
+    yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const cards = yield* store.cards(boardId);
+        const goals = yield* store.goals(boardId);
+        const updates = Scribe.toGoalUpdates(output, cards, goals);
+        const at = yield* nowIso;
+        const nowMs = yield* nowMillis;
+        const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+        for (const { cardId, goalId } of updates.assign) {
+          const card = cards.find((entry) => entry.id === cardId);
+          const goal = goals.find((entry) => entry.id === goalId);
+          if (!card || !goal || card.goalId !== null) continue;
+          const next: KanbanCard = { ...card, goalId, updatedAt: at };
+          yield* saveCard(next);
+          yield* logEvent(next, scribe, "edited", { body: `Scribe put it in goal "${goal.name}"` });
+        }
+        for (const update of updates.goals) {
+          const goal = goals.find((entry) => entry.id === update.id);
+          if (!goal) continue;
+          const keepNow =
+            update.now === "" ||
+            (goal.now !== null && nowMs - Date.parse(goal.now.at) < SCRIBE_KEEPS_NOW_MS);
+          if (keepNow && update.story === null) continue;
+          const next: KanbanGoal = {
+            ...goal,
+            now: keepNow ? goal.now : { text: update.now, at },
+            story: update.story === null ? goal.story : [...goal.story, { at, text: update.story }],
+          };
+          yield* store.putGoal(next);
+          yield* publish(boardId, { _tag: "goal", goal: next });
+        }
+      }),
+    );
+  });
+  const forkGoals = (boardId: KanbanBoardId) =>
+    writeGoals(boardId).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("kanban goal scribe failed", { boardId, cause })),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2283,6 +2344,21 @@ const make = Effect.gen(function* () {
           new Map(all).set(board.id, { fingerprint, at: now, done: false }),
         );
         yield* forkGroups(board.id);
+      }
+      const goalsPrint = Scribe.goalsFingerprint(
+        yield* store.cards(board.id),
+        yield* store.goals(board.id),
+      );
+      const lastGoals = (yield* Ref.get(goalsScribed)).get(board.id);
+      if (
+        goalsPrint !== "" &&
+        goalsPrint !== lastGoals?.fingerprint &&
+        (lastGoals === undefined || now - lastGoals.at >= Scribe.SCRIBE_EVERY_MS)
+      ) {
+        yield* Ref.update(goalsScribed, (all) =>
+          new Map(all).set(board.id, { fingerprint: goalsPrint, at: now }),
+        );
+        yield* forkGoals(board.id);
       }
       // A card whose thread was deleted goes back to its queue for a new one.
       for (const card of yield* store.cards(board.id)) {

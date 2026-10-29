@@ -1,7 +1,27 @@
-import type { KanbanCard, KanbanGroup } from "@t3tools/contracts";
+import type { KanbanCard, KanbanGoal, KanbanGroup } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
-import { groupsFingerprint, groupsPrompt, toGroups } from "./scribe.ts";
+import {
+  finishedSince,
+  goalsFingerprint,
+  goalsPrompt,
+  groupsFingerprint,
+  groupsPrompt,
+  toGoalUpdates,
+  toGroups,
+} from "./scribe.ts";
+
+const goal = (patch: Partial<KanbanGoal> = {}) =>
+  ({
+    id: "goal-a",
+    boardId: "board-toy",
+    name: "Login",
+    status: "active",
+    now: null,
+    story: [],
+    createdAt: "2026-10-25T10:00:00.000Z",
+    ...patch,
+  }) as unknown as KanbanGoal;
 
 const card = (number: number, patch: Partial<KanbanCard> = {}) =>
   ({
@@ -69,5 +89,54 @@ describe("scribe", () => {
     expect(prompt).toContain("#1 | Card 1 | - |");
     expect(prompt).toContain("grp-auth | Auth |  | #1");
     expect(prompt).not.toContain("#6 |");
+  });
+
+  it("finishedSince counts a goal's cards that finished after its last story line", () => {
+    const cards = [
+      card(1, { goalId: "goal-a", stage: "completed", movedAt: "2026-10-25T11:00:00.000Z" }),
+      card(2, { goalId: "goal-a", stage: "working", movedAt: "2026-10-25T11:00:00.000Z" }),
+      card(3, { goalId: "goal-a", stage: "verified", movedAt: "2026-10-25T09:00:00.000Z" }),
+    ] as unknown as KanbanCard[];
+    expect(finishedSince(goal(), cards)).toEqual([1]);
+    expect(
+      finishedSince(goal({ story: [{ at: "2026-10-25T12:00:00.000Z", text: "x" }] }), cards),
+    ).toEqual([]);
+  });
+
+  it("toGoalUpdates assigns only goal-less open cards to active goals and drops a story with nothing finished", () => {
+    const cards = [
+      card(1, { goalId: "goal-a", stage: "working", movedAt: "2026-10-25T11:00:00.000Z" }),
+      card(2),
+      card(3, { goalId: "goal-b" }),
+      card(4, { stage: "completed" }),
+    ] as unknown as KanbanCard[];
+    const goals = [goal(), goal({ id: "goal-b", name: "Old", status: "done" })];
+    const updates = toGoalUpdates(
+      {
+        assign: [
+          { card: 2, goal: "goal-a" },
+          { card: 2, goal: "goal-a" },
+          { card: 3, goal: "goal-a" },
+          { card: 4, goal: "goal-a" },
+          { card: 9, goal: "goal-a" },
+          { card: 2, goal: "goal-b" },
+        ],
+        goals: [
+          { id: "goal-a", now: " In progress. ", story: "Login landed." },
+          { id: "goal-b", now: "x", story: null },
+        ],
+      },
+      cards,
+      goals,
+    );
+    expect(updates.assign).toEqual([{ cardId: "card-2", goalId: "goal-a" }]);
+    expect(updates.goals).toEqual([{ id: "goal-a", now: "In progress.", story: null }]);
+  });
+
+  it("goalsFingerprint is empty without an active goal", () => {
+    expect(goalsFingerprint([card(1)] as unknown as KanbanCard[], [goal({ status: "done" })])).toBe(
+      "",
+    );
+    expect(goalsFingerprint([card(1)] as unknown as KanbanCard[], [goal()])).not.toBe("");
   });
 });

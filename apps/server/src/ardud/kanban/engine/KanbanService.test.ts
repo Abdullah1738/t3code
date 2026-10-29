@@ -2537,6 +2537,8 @@ it.effect("an owner's channel gets a title from his first message, unless he nam
 
 class ModelDown extends Data.TaggedError("ModelDown")<{}> {}
 
+const groupAsks = (asked: ReadonlyArray<string>) => asked.filter((prompt) => prompt.startsWith("You group"));
+
 const scribeLayer = (
   fake: Layer.Layer<KanbanThreads>,
   asked: Array<string>,
@@ -2555,7 +2557,16 @@ const scribeLayer = (
           Effect.gen(function* () {
             asked.push(input.prompt);
             if (calls) yield* Queue.offer(calls, input.prompt);
-            if (asked.length <= failures) return yield* Effect.fail(new ModelDown());
+            if (input.prompt.startsWith("You keep a work board's goals")) {
+              const id = /Goal (\S+):/.exec(input.prompt)?.[1] ?? "";
+              return {
+                assign: [{ card: 2, goal: id }],
+                goals: [{ id, now: "Two login cards in progress.", story: "Should be dropped." }],
+              };
+            }
+            if (asked.filter((prompt) => prompt.startsWith("You group")).length <= failures) {
+              return yield* Effect.fail(new ModelDown());
+            }
             return { groups: [{ id: null, name: "Login", summary: "Sign-in work.", cards: [1, 2] }] };
           })) as never,
       }),
@@ -2597,12 +2608,12 @@ it.effect("the scribe groups a board's open cards when they change, at most ever
       assert.lengthOf(groups, 1);
       assert.strictEqual(groups[0]?.name, "Login");
       assert.deepStrictEqual(groups[0]?.cardIds, [first.id, second.id]);
-      assert.lengthOf(asked, 1);
-      assert.include(asked[0] ?? "", "#1 |");
+      assert.lengthOf(groupAsks(asked), 1);
+      assert.include(groupAsks(asked)[0] ?? "", "#1 |");
 
       // Nothing changed: no new run.
       yield* kanban.tick;
-      assert.lengthOf(asked, 1);
+      assert.lengthOf(groupAsks(asked), 1);
 
       // A new card changes the fingerprint, but the last run was under 10 minutes ago.
       yield* kanban.createCard(
@@ -2611,13 +2622,13 @@ it.effect("the scribe groups a board's open cards when they change, at most ever
         owner,
       );
       yield* kanban.tick;
-      assert.lengthOf(asked, 1);
+      assert.lengthOf(groupAsks(asked), 1);
 
       yield* TestClock.adjust("10 minutes");
       const secondRun = yield* (yield* grouped).pipe(Effect.forkScoped);
       yield* kanban.tick;
       assert.isTrue(Option.isSome(yield* Fiber.join(secondRun)));
-      assert.lengthOf(asked, 2);
+      assert.lengthOf(groupAsks(asked), 2);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
   }),
 );
@@ -2647,12 +2658,12 @@ it.effect("a failed scribe run is retried after the cooldown, even with cards un
       // The first model call fails: no groups land and the board is not marked done.
       yield* kanban.tick;
       yield* Queue.take(calls);
-      assert.lengthOf(asked, 1);
+      assert.lengthOf(groupAsks(asked), 1);
       assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 0);
 
       // Cards unchanged, under the cooldown: no retry.
       yield* kanban.tick;
-      assert.lengthOf(asked, 1);
+      assert.lengthOf(groupAsks(asked), 1);
 
       // Cooldown passed, cards unchanged: the failed attempt is retried and succeeds.
       yield* TestClock.adjust("10 minutes");
@@ -2660,14 +2671,48 @@ it.effect("a failed scribe run is retried after the cooldown, even with cards un
       yield* kanban.tick;
       yield* Queue.take(calls);
       assert.isTrue(Option.isSome(yield* Fiber.join(retried)));
-      assert.lengthOf(asked, 2);
+      assert.lengthOf(groupAsks(asked), 2);
       assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 1);
 
       // Success with unchanged cards: no further runs.
       yield* TestClock.adjust("10 minutes");
       yield* kanban.tick;
-      assert.lengthOf(asked, 2);
+      assert.lengthOf(groupAsks(asked), 2);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 1, calls)));
+  }),
+);
+
+it.effect("the scribe puts a goal-less card in a matching goal and writes the goal's Now", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const login = yield* kanban.setGoal(board.id, { name: "Login" });
+      const changed = Stream.runHead(
+        Stream.filter(yield* kanban.changes, ({ change }) => change._tag === "goal"),
+      );
+      const first = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in page", goalId: login.id },
+        owner,
+      );
+      const second = yield* kanban.createCard(
+        board.id,
+        { prompt: "B", title: "Login errors", description: "Sign-in errors" },
+        owner,
+      );
+
+      const run = yield* (yield* changed).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* Fiber.join(run)));
+
+      assert.strictEqual((yield* kanban.card(second.id)).card.goalId, login.id);
+      assert.strictEqual((yield* kanban.card(first.id)).card.goalId, login.id);
+      const goal = (yield* kanban.snapshot(board.id)).goals.find((entry) => entry.id === login.id);
+      assert.strictEqual(goal?.now?.text, "Two login cards in progress.");
+      assert.lengthOf(goal?.story ?? [], 0);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
   }),
 );
 
