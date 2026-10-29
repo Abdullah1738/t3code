@@ -317,12 +317,11 @@ export class RobobBackend implements ChatBackend {
     if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
     for (const step of steps) {
       const finish = this.finished.get(step.id);
-      // Only a step OpenCode finished with `stop` is proven tool-free; any other finish (an
-      // error, or a step still unfinished) may have run tools first, so it stays unknown.
-      const stepEvidence = finish === "tool-calls" ? "ran" : finish === "stop" ? "none" : "unknown";
-      // Run-level evidence (set in markRunEvidence) and the step's own finish both count: `ran` from either wins.
-      step.toolEvidence = step.toolEvidence === "ran" || stepEvidence === "ran" ? "ran"
-        : step.toolEvidence === "unknown" || stepEvidence === "unknown" ? "unknown" : "none";
+      // A step's own finish can prove that tools ran (`tool-calls`), but it can't prove that none did:
+      // an unresolved step (the synthetic error record) or an `error` finish says nothing. So only
+      // `ran` is merged here. The run-level answer from markRunEvidence stays authoritative otherwise.
+      if (finish === "tool-calls") step.toolEvidence = "ran";
+      else if (step.toolEvidence === undefined) step.toolEvidence = "unknown";
       if (step.finish === "stop" && finish !== undefined) step.answer = finish === "stop";
     }
     return records;

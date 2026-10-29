@@ -43,7 +43,7 @@ export const OPENCODE_DB = join(homedir(), ".local/share/opencode/opencode.db");
 export type RunToolEvidence = "ran" | "none" | "unknown";
 export type RunEvidence = (sessionId: string, sinceMs: number) => RunToolEvidence;
 
-export function opencodeRunEvidence(path = OPENCODE_DB, limit = 200): RunEvidence {
+export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvidence {
   let db: Database | undefined;
   let inode: number | undefined;
   const close = () => {
@@ -51,7 +51,8 @@ export function opencodeRunEvidence(path = OPENCODE_DB, limit = 200): RunEvidenc
     db = undefined;
   };
   return (sessionId, sinceMs) => {
-    if (!/^ses_[A-Za-z0-9]+$/.test(sessionId) || !Number.isFinite(sinceMs)) return "unknown";
+    // The id is only ever a bound parameter; the check just rejects anything that isn't an OpenCode session id.
+    if (!/^ses_[A-Za-z0-9_]+$/.test(sessionId) || !Number.isFinite(sinceMs)) return "unknown";
     try {
       const current = statSync(path).ino;
       if (db && current !== inode) close();
@@ -59,18 +60,37 @@ export function opencodeRunEvidence(path = OPENCODE_DB, limit = 200): RunEvidenc
         db = new Database(path, { readonly: true });
         inode = current;
       }
-      const rows = db.query<{ finish: unknown }, [string, number, number]>(
-        "SELECT json_extract(data, '$.finish') AS finish FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
-      ).all(sessionId, sinceMs, limit);
-      if (rows.length === 0) return "unknown";
-      if (rows.some(row => row.finish === "tool-calls")) return "ran";
-      if (rows.every(row => row.finish === "stop")) return "none";
-      return "unknown";
+      // One row past the cap tells a truncated scan from a complete one. A truncated scan can
+      // never prove a run tool-free, so it is `unknown` whatever the rows it did read say.
+      const rows = db.query<{ finish: unknown; content: unknown }, [string, number, number]>(
+        "SELECT json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
+      ).all(sessionId, sinceMs, maxRows + 1);
+      if (rows.some(stepRan)) return "ran";
+      // `none` needs a complete scan: a truncated one may hide a tool row past the cap.
+      if (rows.length === 0 || rows.length > maxRows) return "unknown";
+      return rows.every(row => row.finish === "stop" || stepIsEmpty(row)) ? "none" : "unknown";
     } catch {
       close();
       return "unknown";
     }
   };
+}
+
+/** A step called a tool: OpenCode marks the step `tool-calls`, or the step's content carries a tool part (even one that errored). */
+function stepRan(row: { finish: unknown; content: unknown }): boolean {
+  if (row.finish === "tool-calls") return true;
+  if (typeof row.content === "string") {
+    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch { return true; }
+  }
+  return Array.isArray(row.content) && row.content.some(part => (part as { type?: unknown })?.type === "tool");
+}
+
+/** An empty step: no content at all, so it proves nothing was called. Used for a provider error with no output. */
+function stepIsEmpty(row: { content: unknown }): boolean {
+  if (typeof row.content === "string") {
+    try { return (JSON.parse(row.content) as unknown[]).length === 0; } catch { return false; }
+  }
+  return Array.isArray(row.content) && row.content.length === 0;
 }
 
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
