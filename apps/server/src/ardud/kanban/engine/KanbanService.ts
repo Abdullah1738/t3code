@@ -1195,14 +1195,7 @@ const make = Effect.gen(function* () {
   // Every message of the Goal ideas discussion, oldest first: a long run of replies must
   // not hide an earlier proposal from the duplicate check or the 24-hour gate.
   const ideaMessages = Effect.fn("KanbanService.ideaMessages")(function* (discussionId: KanbanDiscussionId) {
-    const all: Array<KanbanMessage> = [];
-    let afterSeq = 0;
-    for (;;) {
-      const page = yield* store.messages(discussionId, { afterSeq, limit: 200 });
-      all.push(...page);
-      if (page.length < 200) return all;
-      afterSeq = page[page.length - 1]!.seq;
-    }
+    return yield* store.allMessages(discussionId);
   });
   const writeProposals = Effect.fn("KanbanService.writeProposals")(function* (boardId: KanbanBoardId) {
     const generateJson = textGeneration.generateJson;

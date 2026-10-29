@@ -2801,12 +2801,12 @@ it.effect("an unanswered proposal still blocks a new one after 20+ replies, with
       yield* kanban.tick;
       assert.isTrue(Option.isSome(yield* posted));
       const ideas = (yield* kanban.discussions(board.id)).find((entry) => entry.title === "Goal ideas")!;
-      for (let index = 0; index < 25; index++) {
+      for (let index = 0; index < 205; index++) {
         yield* kanban.post(ideas.id, owner, [{ _tag: "md", text: `reply ${index}` }]);
       }
       yield* kanban.tick;
       assert.lengthOf(asked.filter((prompt) => prompt.startsWith("You suggest goals")), 1);
-      assert.lengthOf(yield* kanban.messages(ideas.id, { limit: 100 }), 26);
+      assert.lengthOf(yield* kanban.messages(ideas.id, { limit: 300 }), 206);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
   }),
 );
@@ -2826,13 +2826,13 @@ it.effect("a skipped proposal is not proposed again after 100+ replies", () =>
       const ideas = (yield* kanban.discussions(board.id)).find((entry) => entry.title === "Goal ideas")!;
       const [first] = yield* kanban.messages(ideas.id);
       yield* kanban.answer(ideas.id, first!.seq, "goal-1", ["skip"], owner);
-      for (let index = 0; index < 105; index++) {
+      for (let index = 0; index < 205; index++) {
         yield* kanban.post(ideas.id, owner, [{ _tag: "md", text: `reply ${index}` }]);
       }
       yield* TestClock.adjust("25 hours");
       yield* kanban.tick;
       // The skipped Search proposal is still in the history: it is not posted again.
-      const messages = yield* kanban.messages(ideas.id, { limit: 200 });
+      const messages = yield* kanban.messages(ideas.id, { limit: 300 });
       const choices = messages.flatMap((message) => message.blocks.filter((block) => block._tag === "choice"));
       assert.lengthOf(choices, 1);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
