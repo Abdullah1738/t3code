@@ -15,17 +15,12 @@ import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
 import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
 
 /**
- * Events that change a thread's live state (a pending question opening or
- * resolving) without a run status change. A native answer resolves the request
- * with no run update at all, so these must reach the board too.
+ * Events that change a thread's live state. A native question opens and resolves
+ * as a runtime request, and a native answer resolves it with no run update, so
+ * the request event must reach the board. Node and turn-item updates fire for every
+ * streamed paragraph; forwarding them would reread the whole board on each one.
  */
-const THREAD_STATE_EVENTS = new Set<string>([
-  "run.updated",
-  "runtime-request.updated",
-  "node.updated",
-  "turn-item.updated",
-  "provider-session.updated",
-]);
+const THREAD_STATE_EVENTS = new Set<string>(["run.updated", "runtime-request.updated"]);
 
 /** Which board action a domain event triggers, if any. Exported so the route is tested itself. */
 export const boardEventRoute = (

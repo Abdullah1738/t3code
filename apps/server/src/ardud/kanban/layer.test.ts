@@ -19,17 +19,12 @@ describe("boardEventRoute", () => {
   });
 
   it("re-announces thread state when a question opens or resolves without a run update", () => {
-    for (const type of [
-      "runtime-request.updated",
-      "node.updated",
-      "turn-item.updated",
-      "provider-session.updated",
-    ]) {
-      assert.strictEqual(boardEventRoute(event(type)), "threadChanged", type);
-    }
+    assert.strictEqual(boardEventRoute(event("runtime-request.updated")), "threadChanged");
   });
 
-  it("ignores events that do not change a thread's live state", () => {
-    assert.isNull(boardEventRoute(event("message.updated")));
+  it("ignores streamed output, which would reread the whole board on every paragraph", () => {
+    for (const type of ["node.updated", "turn-item.updated", "provider-session.updated", "message.updated"]) {
+      assert.isNull(boardEventRoute(event(type)), type);
+    }
   });
 });
