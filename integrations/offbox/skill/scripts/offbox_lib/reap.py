@@ -9,6 +9,9 @@ from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_
                      iso_ts, now, say)
 from .identity import thread_get
 
+# The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
+REAP_BUDGET_S = 100
+
 
 def _protected(con) -> set[str]:
     ids = {r[0] for r in con.execute("SELECT box_id FROM bases")}
@@ -20,7 +23,7 @@ def reap(dry: bool = False) -> list[str]:
     actions: list[str] = []
     con = db()
     try:
-        with file_lock("reap", timeout=5):
+        with file_lock("reap", timeout=5), api.budget(REAP_BUDGET_S):
             return _reap(con, dry, actions)
     except OffboxError as e:
         if "timed out waiting for lock" in str(e):

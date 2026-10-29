@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import os
@@ -56,9 +57,37 @@ def _never_delivered(status: int, code: str, msg: str) -> bool:
     return status in (502, 503) and code == "sandbox_direct_failed" and bool(_PRE_DELIVERY.match(msg or ""))
 
 
+# A time budget for a bounded maintenance pass (the reaper's upkeep). While set, every request's timeout is capped
+# to the time left and retries stop once it is spent, so the pass cannot outrun its caller's limit.
+_DEADLINE: float | None = None
+
+
+@contextlib.contextmanager
+def budget(seconds: float):
+    """Nested budgets never extend the outer one: the earlier deadline wins."""
+    global _DEADLINE
+    prev = _DEADLINE
+    mine = time.time() + seconds
+    _DEADLINE = mine if prev is None else min(prev, mine)
+    try:
+        yield
+    finally:
+        _DEADLINE = prev
+
+
+def left() -> float | None:
+    return None if _DEADLINE is None else _DEADLINE - time.time()
+
+
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable)."""
+    if _DEADLINE is not None:
+        room = _DEADLINE - time.time()
+        if room <= 0:
+            raise OffboxError(f"boat API budget spent before {method} {path}")
+        timeout = min(timeout, max(1.0, room))
+        retries = 0
     url = API + path
     h = {"Authorization": "Bearer " + _key(), "Content-Type": "application/json", "Accept": "application/json"}
     h.update(headers or {})
@@ -257,6 +286,8 @@ def latest_snapshot(box_id: str) -> dict | None:
 
 
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7) -> dict:
+    if _DEADLINE is not None:
+        timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
     while True:
         s = get(box_id)

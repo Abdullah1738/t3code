@@ -265,13 +265,21 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
     return s, "fresh", None, sz
 
 
+# A recipe fallback runs inside a lease bring-up (harness ~6 min). Past this it is cancelled, not waited for: the
+# TTL keeper would otherwise keep the box alive and billing while the pool lock is held.
+RECIPE_TIMEOUT_S = 15 * 60
+
+
 def run_recipe(box_id: str, name: str) -> None:
-    """Build a template's environment on this box (the script `offbox template build` runs). Best effort."""
+    """Build a template's environment on this box (the script `offbox template build` runs). Best effort: a
+    recipe that fails or times out is reported and the lease is not used as ready (see _bring_up)."""
     from . import bases
     from .common import LOGS_DIR
     from .runs import follow
     t = now()
     log_path = LOGS_DIR / f"recipe-{name}-{box_id}.log"
+    pid = None
+    code = None
     try:
         # The box lock keeps the reaper from idle-stopping the box while the recipe runs.
         with file_lock("box-" + box_id, timeout=60):
@@ -279,13 +287,40 @@ def run_recipe(box_id: str, name: str) -> None:
             ssh_sync.put_file(box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700")
             bases.template_uploads(name, box_id)
             r = api.cmd_start(box_id, "bash -lc " + shlex.quote("bash ~/.offbox/recipe.sh"))
-            code = follow(box_id, r["processId"], log_path, echo=False)
-    except Exception as e:  # noqa: BLE001 - best effort: the run still gets a working (if colder) box
+            pid = r["processId"]
+            code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001 - reported below; the caller decides what a failed recipe means
         code = f"error: {e}"
     touch(box_id)
     event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
+    if code == "timeout":
+        try:
+            if pid is not None:
+                api.cmd_kill(box_id, pid)
+        except OffboxError as e:
+            say(f"warning: could not stop the recipe process on {box_id}: {e}")
+        raise OffboxError(f"recipe {name} did not finish within {RECIPE_TIMEOUT_S // 60} min on {box_id}; "
+                          "its process was stopped, the lease is not ready")
     if code != 0:
         say(f"warning: {name} recipe did not finish on {box_id} ({code}); log {log_path}")
+
+
+def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
+    """follow() in a helper thread, returning 'timeout' if the deadline passes first."""
+    import threading
+    from .runs import follow
+    result: dict = {}
+
+    def run():
+        try:
+            result["code"] = follow(box_id, pid, log_path, echo=False)
+        except Exception as e:  # noqa: BLE001
+            result["code"] = f"error: {e}"
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout_s)
+    return "timeout" if th.is_alive() else result.get("code")
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:

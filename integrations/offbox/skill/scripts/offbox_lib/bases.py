@@ -131,26 +131,65 @@ def _slots_left(allowance: dict) -> int:
     return int(included) - int(allowance.get("used") or 0)
 
 
+# Saves that boat accepted (or that we sent) but whose wait ended before boat reported them ready. boat may already
+# count them as used, and it may not yet, so they are counted against the free slots until they show up as saved
+# or the record is older than _PENDING_S. Shared across processes through the kv table, under _SLOT_LOCK.
+_SLOT_LOCK = "saved-slots"
+_PENDING_S = 6 * 3600
+
+
+def _pending_load(con) -> dict:
+    p = kv_get(con, "saved_pending") or {}
+    return {k: v for k, v in p.items() if now() - v.get("ts", 0) < _PENDING_S}
+
+
+def _pending_put(con, sname: str, box_id: str | None) -> None:
+    p = _pending_load(con)
+    if box_id is None:
+        p.pop(sname, None)
+    else:
+        p[sname] = {"box": box_id, "ts": now()}
+    kv_set(con, "saved_pending", p)
+
+
 def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[dict] | None = None,
                allowance: dict | None = None, timeout: float = 300) -> bool:
     """Save box_id as boat saved snapshot sname and record it. Only replaces a snapshot of that name or uses a
-    free included slot: never one that costs money. Never raises."""
+    free included slot: never one that costs money. Never raises.
+
+    With snaps=None the allowance is read fresh under _SLOT_LOCK, so concurrent callers (reaper, template builds,
+    base saves in other processes) see each other's accepted saves and serialize their checks."""
     try:
-        if snaps is None:
-            snaps, allowance = api.saved_list()
-        if not any(s.get("name") == sname for s in snaps) and _slots_left(allowance or {}) <= 0:
-            say(f"note: no free saved-snapshot slot for {table[:-1]} {name}; the reaper keeps its box alive instead")
-            event(con, box_id, "saved_no_slot", f"{name} {sname}")
-            return False
-        api.save(box_id, sname)
-        deadline = now() + timeout
-        while True:
-            snap = api.saved_get(sname) or {}
-            if snap.get("status") == "ready" and snap.get("sourceSandboxId") in (None, box_id):
-                break
-            if snap.get("status") == "failed" or now() > deadline:
-                raise OffboxError(f"saved snapshot {sname}: {snap.get('status')} {snap.get('error') or ''}")
-            time.sleep(2)
+        with file_lock(_SLOT_LOCK, timeout=max(60, timeout)):
+            if snaps is None:
+                snaps, allowance = api.saved_list()
+            ready_names = {s.get("name") for s in snaps if s.get("status") == "ready"}
+            pending = {k for k in _pending_load(con) if k not in ready_names and k != sname}
+            used = int((allowance or {}).get("used") or 0) + len(pending)
+            left = int((allowance or {}).get("included") or (allowance or {}).get("free") or 0) - used
+            if not any(s.get("name") == sname for s in snaps) and left <= 0:
+                say(f"note: no free saved-snapshot slot for {table[:-1]} {name}; the reaper keeps its box alive instead")
+                event(con, box_id, "saved_no_slot", f"{name} {sname}")
+                return False
+            _pending_put(con, sname, box_id)
+            try:
+                api.save(box_id, sname)
+            except OffboxError:
+                _pending_put(con, sname, None)  # boat refused: nothing was taken
+                raise
+            deadline = now() + timeout
+            while True:
+                snap = api.saved_get(sname) or {}
+                if snap.get("status") == "ready" and snap.get("sourceSandboxId") in (None, box_id):
+                    _pending_put(con, sname, None)
+                    break
+                if snap.get("status") == "failed":
+                    _pending_put(con, sname, None)
+                    raise OffboxError(f"saved snapshot {sname}: failed {snap.get('error') or ''}")
+                if now() > deadline:
+                    # Still counted as pending (see _pending_load) until boat reports it or it ages out.
+                    raise OffboxError(f"saved snapshot {sname}: still {snap.get('status') or 'pending'} after {int(timeout)}s")
+                time.sleep(2)
     except OffboxError as e:
         say(f"warning: could not keep {table[:-1]} {name} as saved snapshot {sname}: {e}")
         event(con, box_id, "saved_failed", f"{name} {sname}: {e}")
@@ -377,12 +416,26 @@ def _reread(con, rows):
     return [(t, r) for t, r in out if r is not None]
 
 
+UPKEEP_BUDGET_S = 60  # the monitor gives the whole reap pass 120 s; upkeep stays well inside that
+
+
 def upkeep(con, live: dict, dry: bool, actions: list[str], act) -> None:
-    """Keep templates and bases past boat's 14-day data limit: adopt/save saved snapshots (hourly), mark the ones
-    boat already deleted, rebuild expired templates, and resume+stop unsaved boxes before day 14."""
+    """Never raises: bounded by UPKEEP_BUDGET_S (every boat call and wait inside is capped to what is left)."""
+    try:
+        with api.budget(UPKEEP_BUDGET_S):
+            _upkeep(con, live, dry, actions, act)
+    except OffboxError as e:
+        actions.append(f"upkeep stopped: {e}")
+        event(con, None, "upkeep_failed", str(e)[:300])
+    except Exception as e:  # noqa: BLE001 - the reaper must survive any boat/parse surprise; next pass retries
+        actions.append(f"upkeep error: {type(e).__name__}: {e}")
+        event(con, None, "upkeep_failed", f"{type(e).__name__}: {e}"[:300])
+
+
+def _upkeep(con, live: dict, dry: bool, actions: list[str], act) -> None:
     from .common import KEEPALIVE_S
-    # The monitor gives a reap pass 120 s: a few slow steps per pass, the next pass (5 min) does the rest.
-    saves, refreshes = 2, 2
+    # At most 1 save and 1 refresh per pass, and only while the budget lasts.
+    saves, refreshes = 1, 1
     rows = [("templates", r) for r in con.execute("SELECT * FROM templates")]
     rows += [("bases", r) for r in con.execute("SELECT * FROM bases")]
     if not rows:
