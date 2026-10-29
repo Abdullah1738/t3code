@@ -4,6 +4,7 @@ import { useState } from "react";
 import {
   KANBAN_BOARD_ICONS,
   type KanbanBoardIcon,
+  type KanbanBoardId,
   type ModelSelection,
   type ProjectId,
 } from "@t3tools/contracts";
@@ -68,6 +69,11 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
   const [model, setModel] = useState<ModelSelection | null>(null);
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
+  // The board this form created, kept so a retry resumes it instead of creating another.
+  const [pending, setPending] = useState<{
+    boardId: KanbanBoardId;
+    discussionId: string | null;
+  } | null>(null);
 
   const entries = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings, projectId),
@@ -95,40 +101,55 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
     setProjectId(null);
     setModel(null);
     setNotes("");
+    setPending(null);
   };
 
   const start = async () => {
     if (!canStart || model === null) return;
     // Refuse a taken slug before anything is created or changed. The server refuses it too.
-    if (boards.some((summary) => summary.board.slug === effectiveSlug)) {
+    // A pending board already owns its slug, so a retry skips this check.
+    if (pending === null && boards.some((summary) => summary.board.slug === effectiveSlug)) {
       await runAction("Couldn't create the board", async () => {
         throw new Error(`A board with the slug "${effectiveSlug}" already exists. Pick another name.`);
       });
       return;
     }
     setBusy(true);
-    await runAction("Couldn't start setup", async () => {
-      const created = await kanban.createBoard({
-        slug: effectiveSlug,
-        name: name.trim(),
-        defaultProjectId: projectId,
-        evaluatorModel: model,
-      });
-      if (icon) await kanban.updateBoard({ boardId: created.id, icon });
-      const started = await kanban.startSetup(created.id, {
-        evaluatorModel: model,
-        ...(notes.trim() ? { text: notes.trim() } : {}),
-      });
-      props.onOpenChange(false);
-      reset();
-      await navigate({
-        to: "/boards/$boardId",
-        params: { boardId: created.id },
-        // The board opens on its columns by default, so the discussions view is named explicitly.
-        search: { view: "discussions", discussion: started.discussionId },
-      });
+    // A board this form already created is resumed by id, never looked up by slug: a retry after
+    // a later icon or setup failure must not create or adopt another board.
+    let boardId = pending?.boardId ?? null;
+    let discussionId = pending?.discussionId ?? null;
+    const ok = await runAction("Couldn't start setup", async () => {
+      if (boardId === null) {
+        const created = await kanban.createBoard({
+          slug: effectiveSlug,
+          name: name.trim(),
+          defaultProjectId: projectId,
+          evaluatorModel: model,
+        });
+        boardId = created.id;
+        setPending({ boardId, discussionId: null });
+      }
+      if (icon) await kanban.updateBoard({ boardId, icon });
+      if (discussionId === null) {
+        const started = await kanban.startSetup(boardId, {
+          evaluatorModel: model,
+          ...(notes.trim() ? { text: notes.trim() } : {}),
+        });
+        discussionId = started.discussionId;
+        setPending({ boardId, discussionId });
+      }
     });
     setBusy(false);
+    if (!ok || boardId === null || discussionId === null) return;
+    props.onOpenChange(false);
+    reset();
+    await navigate({
+      to: "/boards/$boardId",
+      params: { boardId },
+      // The board opens on its columns by default, so the discussions view is named explicitly.
+      search: { view: "discussions", discussion: discussionId },
+    });
   };
 
   return (
@@ -145,6 +166,7 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
             <span>Name</span>
             <Input
               value={name}
+              disabled={pending !== null}
               onChange={(event) => setName(event.target.value)}
               placeholder="Robob"
             />
@@ -153,6 +175,7 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
             <span>Slug</span>
             <Input
               value={effectiveSlug}
+              disabled={pending !== null}
               onChange={(event) => {
                 setSlugTouched(true);
                 setSlug(slugOf(event.target.value));
@@ -188,6 +211,7 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
             <span>Project</span>
             <select
               className="rounded-md border bg-background px-2 py-1.5"
+              disabled={pending !== null}
               value={projectId ?? ""}
               onChange={(event) =>
                 setProjectId(event.target.value ? (event.target.value as ProjectId) : null)
