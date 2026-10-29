@@ -98,6 +98,31 @@ test("an accepted rule-breaking send replays as 200 after the turn changes, and 
   expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
 });
 
+test("a stale, null or invalid route is 409 with no bounce or log, and does not consume the live send's bounce", async () => {
+  const logged: string[] = [];
+  const h = setup({
+    replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined,
+    log: event => logged.push(event),
+  });
+  const bad = (sessionId: string, dedupeKey: string) => ({ ...send, text: "Giardia again?", sessionId, dedupeKey });
+  // Live route is current@5 (setup). Refused sessions: an old generation, a wrong id, and a null route.
+  for (const sessionId of ["current@4", "old@5", "current@9"]) {
+    const res = await h.post("/send", bad(sessionId, `stale-${sessionId}`));
+    expect(res.status).toBe(409);
+  }
+  h.store.set("route", null);
+  expect((await h.post("/send", bad("current@5", "null-route"))).status).toBe(409);
+  // No bounce state, no log, and nothing queued from the refused requests.
+  expect(h.store.get<unknown>("reply-bounce")).toBeUndefined();
+  expect(logged).toEqual([]);
+  expect(h.store.pendingOutbox()).toHaveLength(0);
+  // The next live send still gets its own bounce, so the refused ones did not use it up.
+  h.store.set("route", { id: "current", generation: 5 });
+  const live = await h.post("/send", bad("current@5", "live-1"));
+  expect(live.status).toBe(422);
+  expect(logged).toEqual(["reply-bounced"]);
+});
+
 test("app cards are refused in a group chat with a reason, while send still queues there", async () => {
   const h = setup();
   h.state.chat = "group:GRP-1";
