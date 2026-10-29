@@ -282,7 +282,10 @@ export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">):
   card.stage === "completed" &&
   card.subtasks.some(
     (subtask) =>
-      subtask.state === "open" && subtask.owner === "evaluator" && /\bmerge\b/i.test(subtask.text),
+      subtask.state === "open" &&
+      subtask.owner === "evaluator" &&
+      // The merge action names ardud/main; later checks that just mention "merge" don't.
+      /\bmerge\b[^;.]*\binto ardud\/main\b/i.test(subtask.text),
   );
 
 /**

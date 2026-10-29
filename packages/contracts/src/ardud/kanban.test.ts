@@ -121,6 +121,20 @@ describe("kanbanHeldUpBy", () => {
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 
+  it("releases a waiter once the merge is done, even with a post-install check still open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [
+        evaluatorSubtask(mergeText, "done"),
+        evaluatorSubtask(
+          "After the next Robob install: check a dependent waits until its blocker's merge subtask is done.",
+        ),
+      ],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
   it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {
     const blocker = card("b", {
       stage: "completed",
