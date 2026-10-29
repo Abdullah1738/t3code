@@ -135,6 +135,20 @@ describe("kanbanHeldUpBy", () => {
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 
+  it("holds a waiter on the other merge action forms on the board", () => {
+    for (const text of [
+      "Bring any prefs.md rule text to Abdullah first; merge; deploy robob-watch",
+      "merge router.ts into ardud/main",
+    ]) {
+      const blocker = card("b", {
+        stage: "completed",
+        workThreadId: "thread-b" as never,
+        subtasks: [evaluatorSubtask(text)],
+      });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+    }
+  });
+
   it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {
     const blocker = card("b", {
       stage: "completed",

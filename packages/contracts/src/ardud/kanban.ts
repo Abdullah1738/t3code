@@ -284,8 +284,9 @@ export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">):
     (subtask) =>
       subtask.state === "open" &&
       subtask.owner === "evaluator" &&
-      // The merge action names ardud/main; later checks that just mention "merge" don't.
-      /\bmerge\b[^;.]*\binto ardud\/main\b/i.test(subtask.text),
+      // A merge action starts a clause ("merge router.ts into ...", "...; merge; deploy ...");
+      // a check that only mentions a merge ("blocker's merge subtask") doesn't.
+      /(?:^|[;:,.]\s*|\b(?:and|then)\s+)merge\b/i.test(subtask.text),
   );
 
 /**
