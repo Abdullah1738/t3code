@@ -2603,10 +2603,10 @@ const outage = {
 } as never;
 const probe = { ok: false, calls: 0 };
 /** Everything but the service, so a test can start a second service on the same store. */
-const probeDeps = (fake: Layer.Layer<KanbanThreads>) =>
+const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
   fake.pipe(
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(failPosts ? failingPostStore.pipe(Layer.provide(KanbanStore.layer)) : KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(
       Layer.mock(TextGeneration.TextGeneration)({
@@ -2833,7 +2833,7 @@ it.effect("a paused link gets exactly one wake when its probe passes", () =>
       yield* kanban.probeOutages;
       const after = (yield* Ref.get(fake.threads)).get(threadId)!.messages.length;
       assert.strictEqual(after - before, 1);
-    }).pipe(Effect.provide(failingPostProbeLayer(fake.layer)));
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
 
@@ -4830,10 +4830,7 @@ it.effect("a rejected wake after an announced recovery does not post recovery tw
 );
 
 const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
-  KanbanService.layer.pipe(
-    Layer.provideMerge(probeDeps(fake)),
-    Layer.provideMerge(failingPostStore),
-  );
+  KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake, true)));
 
 // Fails the next `postFailures.remaining` writes of a "provider-watch" outage post.
 const postFailures = { remaining: 0 };
@@ -4850,4 +4847,4 @@ const failingPostStore = Layer.effect(
           : real.putMessage(message),
     };
   }),
-).pipe(Layer.provide(KanbanStore.layer));
+);
