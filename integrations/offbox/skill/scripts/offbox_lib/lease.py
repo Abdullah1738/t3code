@@ -388,39 +388,58 @@ def keep_images(box_id: str) -> None:
         event(db(), box_id, "keep_images_failed", str(e)[:300])
 
 
+_HOLDS_DDL = ("CREATE TABLE IF NOT EXISTS prune_holds ("
+              "box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL)")
+
+
+def ensure_holds(con) -> None:
+    """Create the prune_holds table if this database predates it. common.db() builds only the old schema, and
+    capacity.schema() is not guaranteed to have run first, so every hold path makes the table itself."""
+    con.execute(_HOLDS_DDL)
+
+
 def clear_prune_hold(con, box_id: str) -> None:
-    """Release a box's prune hold. Call only once no remote process can still run there: the box is stopped
-    or deleted. Never by time alone. Callers outside a box-locked, fresh-confirmed path must use
-    release_if_confirmed instead."""
+    """Release a box's prune hold. Call only once no remote process can still run there: the box is deleted.
+    Never by time alone. Callers outside a box-locked, fresh-confirmed path must use release_if_confirmed."""
+    ensure_holds(con)
     con.execute("DELETE FROM prune_holds WHERE box_id=?", (box_id,))
     con.commit()
 
 
+def _release_locked(con, box_id: str, run_id: str | None = None) -> bool:
+    """The confirmation and release, for a caller that already holds 'box-<id>'. Not reentrant: never call it
+    without the lock held. Clears the hold only if no run is active and boat reports the box stopped or gone,
+    re-read now, not from an earlier snapshot. run_id, when given, limits the clear to that run's hold."""
+    if active_runs(con, box_id):
+        return False
+    s = api.get(box_id)
+    if s is not None and s.get("state") not in api.STOPPED_STATES:
+        return False
+    ensure_holds(con)
+    if run_id is None:
+        con.execute("DELETE FROM prune_holds WHERE box_id=?", (box_id,))
+    else:
+        con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+    con.commit()
+    return True
+
+
 def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
-    """Clear the box's prune hold only when, under the box lock, boat confirms it stopped or gone and no run is
-    active. A snapshot taken earlier is not enough: the box may have been resumed and started a new prune since.
-    run_id, when given, limits the clear to the hold that run took, so a newer hold is never removed."""
+    """For a caller that does NOT hold the box lock: take it (no wait), then confirm and release. A busy lock keeps
+    the hold, since a run may be allocating the box right now."""
     try:
         with file_lock('box-' + box_id, timeout=0):
-            if active_runs(con, box_id):
-                return False
-            s = api.get(box_id)
-            gone = s is None or s.get("state") in api.STOPPED_STATES
-            if not gone:
-                return False
-            if run_id is None:
-                con.execute("DELETE FROM prune_holds WHERE box_id=?", (box_id,))
-            else:
-                con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
-            con.commit()
-            return True
+            return _release_locked(con, box_id, run_id)
     except OffboxError:
-        return False  # the lock is busy: a run may be allocating this box; keep the hold
+        return False
 
 
-def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True) -> bool:
+def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False) -> bool:
+    """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
+    released with _release_locked, since the lock is not reentrant."""
     if images:
         keep_images(box_id)
+    release = _release_locked if locked else release_if_confirmed
     try:
         api.stop(box_id)
         if wait:
@@ -429,15 +448,16 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
         if e.status == 404:
             con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
             con.commit()
-            release_if_confirmed(con, box_id)  # the box is gone: confirmed under the lock, then released
+            # The lease is marked deleted now, so the reaper will not visit this box again: release in this call.
+            release(con, box_id)
             return False
         raise
     ssh_sync.close_master(box_id)
     con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
     con.commit()
-    # Clear the hold only under the box lock, after boat confirms the box is stopped; a stop merely accepted,
-    # or a box resumed in the meantime, keeps its hold.
-    release_if_confirmed(con, box_id)
+    # Clear the hold only after boat confirms the box is stopped; a stop merely accepted, or a box resumed in the
+    # meantime, keeps its hold.
+    release(con, box_id)
     event(con, box_id, "stop", reason)
     return True
 

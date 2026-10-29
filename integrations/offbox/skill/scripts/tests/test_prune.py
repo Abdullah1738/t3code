@@ -73,7 +73,18 @@ class StaleDirsTests(Isolated):
         self.assertEqual(prune.stale_dirs(self.con, "bx", "w/none-000000"), [])
 
 
-class ScriptTests(Isolated):
+class NoNetwork(Isolated):
+    """Base for every offline test in this file: any real boat request or Keychain read fails the test at once,
+    so a missing mock cannot quietly reach Boat or stall without credentials."""
+
+    def setUp(self):
+        super().setUp()
+        def _no_boat(method, path, *a, **kw):
+            raise AssertionError(f"offline test reached boat: {method} {path}")
+        self.stack.enter_context(patch.object(api, "call", side_effect=_no_boat))
+
+
+class ScriptTests(NoNetwork):
     def test_script_moves_real_dirs_only_in_bash(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
             h = Path(home)
@@ -161,7 +172,7 @@ def _kill_group_quietly(pid: int) -> None:
         pass
 
 
-class RunTests(Isolated):
+class RunTests(NoNetwork):
     def fake_ssh(self, home, bindir, calls, exc=None):
         def ssh(box_id, cmd, input=None, timeout=None):
             calls.append((box_id, cmd))
@@ -623,7 +634,7 @@ class RunTests(Isolated):
         self.assertEqual(len(self.calls), before + 0, "no candidates left in the same generation: no ssh")
 
 
-class ReleaseTests(Isolated):
+class ReleaseTests(NoNetwork):
     """Round-8 coverage: a hold is released only after a locked, fresh confirmation; a settled dir is re-offered
     once its checkout is recreated and used again; stop_all and the reaper follow the same rule."""
 
@@ -687,6 +698,39 @@ class ReleaseTests(Isolated):
             spend.stop_all("test")
         self.assertEqual(self._held(), 1, "a stop accepted but not yet confirmed keeps the hold")
 
+    def test_stop_all_on_pre_upgrade_db_stops_every_box(self):
+        # Round-9 P1: a database created before prune_holds. common.db() runs only the old SCHEMA; nothing calls
+        # capacity.schema(). The first box's release must not raise and abort the loop, so all three boxes stop.
+        from offbox_lib import spend
+        from offbox_lib import common as common_mod
+        import sqlite3
+        old = sqlite3.connect(":memory:")
+        old.row_factory = sqlite3.Row
+        old.executescript(common_mod.SCHEMA)  # the old schema only: no prune_holds, no capacity.schema
+        self.assertFalse(old.execute("SELECT 1 FROM sqlite_master WHERE name='prune_holds'").fetchone())
+        for box in ("b1", "b2", "b3"):
+            old.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source) "
+                        "VALUES (?,'o9','/r9','rk','w/x-aaaaaa','running','small',?,NULL)", (box, common.now()))
+        old.commit()
+        states = {"b1": "ready", "b2": "ready", "b3": "ready"}
+        stopped = []
+
+        def stop(box_id):
+            stopped.append(box_id)
+            return {}
+
+        def get(box_id):
+            return {"state": "archived"} if box_id in stopped else {"state": states[box_id]}
+
+        with patch.object(spend, "db", return_value=old), \
+                patch.object(spend.api, "list_boxes", return_value=[{"id": b, "state": "ready"} for b in states]), \
+                patch.object(spend.api, "stop", side_effect=stop), \
+                patch.object(api, "get", side_effect=get), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n = spend.stop_all("cap")
+        self.assertEqual(sorted(stopped), ["b1", "b2", "b3"], "every box must be stopped, not just the first")
+        self.assertEqual(n, 3)
+
     def test_stop_all_failed_stop_keeps_hold(self):
         from offbox_lib import spend
         from offbox_lib.common import OffboxError
@@ -713,7 +757,7 @@ class ReleaseTests(Isolated):
         self.assertEqual(self._held(), 0)
 
     # --- settled generation (P2) -------------------------------------------------------------------------------------
-class HoldClearTests(Isolated):
+class HoldClearTests(NoNetwork):
     """The hold is cleared only when a box is certainly stopped or gone. Each path is driven through the real
     lease/reap functions, with only the boat API faked."""
 
@@ -741,13 +785,43 @@ class HoldClearTests(Isolated):
             lease.stop_box(self.con, "bx", "test", wait=False, images=False)
         self.assertEqual(self._held(), 0, "a box boat reports archived has no remote process left")
 
-    def test_stop_box_404_clears_hold(self):
+    def test_stop_box_404_clears_hold_through_locked_caller(self):
+        # The real caller path: reap.act / misc.release / bases.save hold box-<id> when they call stop_box. Here the
+        # test takes that lock itself, then calls stop_box with locked=True, exactly as those callers do.
         from offbox_lib import lease
+        from offbox_lib.common import file_lock
         self._hold()
-        with patch.object(lease, "keep_images"), \
-                patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        with file_lock("box-bx", timeout=5), \
+                patch.object(lease, "keep_images"), \
+                patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
+                patch.object(lease.api, "get", return_value=None):  # boat: the box is gone
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
         self.assertEqual(self._held(), 0, "a box that is already gone has no remote process left")
+        state = self.con.execute("SELECT state FROM leases WHERE box_id='bx'").fetchone()[0]
+        self.assertEqual(state, "deleted", "the lease is deleted, so the reaper will not revisit the box")
+
+    def test_stop_box_locked_caller_releases_after_confirmed_stop(self):
+        # Locked caller, confirmed stop: the hold is released, with no reentrant lock attempt.
+        from offbox_lib import lease
+        from offbox_lib.common import file_lock
+        self._hold()
+        with file_lock("box-bx", timeout=5), \
+                patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
+                patch.object(lease.api, "get", return_value={"state": "archived"}), \
+                patch.object(lease.ssh_sync, "close_master"):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
+        self.assertEqual(self._held(), 0)
+
+    def test_stop_box_locked_caller_keeps_hold_while_stop_pending(self):
+        from offbox_lib import lease
+        from offbox_lib.common import file_lock
+        self._hold()
+        with file_lock("box-bx", timeout=5), \
+                patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
+                patch.object(lease.api, "get", return_value={"state": "ready"}), \
+                patch.object(lease.ssh_sync, "close_master"):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
+        self.assertEqual(self._held(), 1, "a stop accepted but not confirmed keeps the hold")
 
     def test_delete_box_clears_hold(self):
         from offbox_lib import lease
@@ -760,9 +834,10 @@ class HoldClearTests(Isolated):
     def test_reaper_forgets_gone_box_and_clears_hold(self):
         from offbox_lib import reap
         self._hold()
-        # boat no longer lists the box: the reaper's forget path must release the hold.
+        # boat no longer lists the box: the reaper's forget path releases the hold, after a fresh confirmation (mocked).
         with patch.object(reap.api, "list_boxes", return_value=[]), \
-                patch.object(reap, "thread_get", return_value=("ok", None)):
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", return_value=None):
             reap.reap(dry=False)  # any error here must fail the test, not be swallowed
         self.assertEqual(self._held(), 0)
 
@@ -809,7 +884,7 @@ class HoldClearTests(Isolated):
             self.assertFalse((h / ".offbox/done/rbusy").exists(), "a busy script must not write the done marker")
 
 
-class RunnerHookTests(Isolated):
+class RunnerHookTests(NoNetwork):
     def test_prune_runs_after_record_and_before_push(self):
         order = []
         rn = runs.Runner(cli.build_parser().parse_args(["run", "--", "go", "test", "./..."]), self.me)

@@ -74,7 +74,11 @@ def _compute(con) -> dict:
 
 
 def stop_all(reason: str) -> int:
+    from .lease import ensure_holds
     con = db()
+    # A database from before prune_holds has no such table; the release below would raise on the first box and
+    # abort the loop mid-stop. Create it before the loop, so every box is stopped.
+    ensure_holds(con)
     n = 0
     for b in api.list_boxes():
         if b.get("state") in api.LIVE_STATES or b.get("state") in api.STARTING_STATES:

@@ -119,7 +119,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             # Docker boxes get boat-ttl grace so this reaper's stop (which archives images first) wins.
             lease.ensure_ttl(bid, max(60, int(idle_limit-idle)) + (300 if docker else 0), b)
         if state in api.LIVE_STATES and idle > idle_limit:
-            act(bid, "stop", f"idle {int(idle // 60)}m", lambda bid=bid: lease.stop_box(con, bid, "reap: idle"))
+            act(bid, "stop", f"idle {int(idle // 60)}m",
+                lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True))  # act() holds box-<id>
     # Templates/bases: make sure they are stopped (they are free when stopped).
     for bid in protected:
         b = live.get(bid)

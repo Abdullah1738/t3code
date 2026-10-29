@@ -103,7 +103,7 @@ def _release_one(con, r, delete):
             print(f"deleted {r['box_id']}")
         else:
             if r["state"] == "running":
-                lease.stop_box(con, r["box_id"], "release")
+                lease.stop_box(con, r["box_id"], "release", locked=True)  # called under box-<id> (see the loop)
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 

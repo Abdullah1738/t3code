@@ -58,7 +58,7 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
             _wait_snapshot_after(src, t)
         else:
             say(f"stopping the lease {src} to capture its disk (next offbox run resumes it)")
-            lease.stop_box(con, src, "save", wait=True)
+            lease.stop_box(con, src, "save", wait=True, locked=True)  # _save runs under box-<id> (see save())
     elif s.get("state") == "archiving":
         api.wait_state(src, api.STOPPED_STATES, timeout=900)
     say(f"forking {src} -> new base {full} (one start; free once stopped)")
