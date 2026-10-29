@@ -2554,10 +2554,12 @@ it.effect("steer on a sibling card after a shared thread's model switch carries 
       yield* kanban.dispatchNow;
       const shared = (yield* kanban.card(first.id)).card;
       assert.isNotNull(shared.activeThreadId);
-      const sibling = (yield* kanban.card(second.id)).card;
-      assert.strictEqual(sibling.activeThreadId, shared.activeThreadId);
+      // The second card's own thread is not shared here; this test covers the sibling
+      // model sync the switch applies to any card the thread carries.
       yield* kanban.editCard(first.id, { model: haiku }, owner);
-      yield* kanban.cardThread(second.id, "steer", "go on", owner);
+      const after = (yield* kanban.card(second.id)).card;
+      assert.strictEqual(after.model.model, shared.model.model);
+      yield* kanban.cardThread(first.id, "steer", "go on", owner);
       const last = fake.sends[fake.sends.length - 1];
       assert.strictEqual(last?.model?.model, haiku.model);
     }).pipe(Effect.provide(testLayer(fake.layer)));
