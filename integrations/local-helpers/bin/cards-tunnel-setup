@@ -1,0 +1,20 @@
+#!/bin/zsh -f
+# One time, after Abdullah ran `cloudflared tunnel login` and picked abdullah.fund (that writes
+# ~/.cloudflared/cert.pem): creates the named tunnel (credentials in ~/.cloudflared/cards-tunnel.json), points
+# cards.abdullah.fund at it and starts com.ardud.cards-tunnel. Running it again only re-checks DNS and restarts.
+cf=${CARDS_CLOUDFLARED:-/opt/homebrew/bin/cloudflared}
+lctl=${CARDS_LAUNCHCTL:-/bin/launchctl}
+creds=${CARDS_CREDS:-$HOME/.cloudflared/cards-tunnel.json}
+host=${CARDS_HOST:-cards.abdullah.fund}
+[[ -f $HOME/.cloudflared/cert.pem ]] || {
+  print -u2 "cards-tunnel-setup: no ~/.cloudflared/cert.pem. Abdullah runs 'cloudflared tunnel login' and picks abdullah.fund first."
+  exit 2
+}
+if [[ ! -f $creds ]]; then
+  "$cf" tunnel create --credentials-file "$creds" robob-cards || exit 1
+  chmod 600 "$creds"
+fi
+tid=$(/usr/bin/python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["TunnelID"])' "$creds") || exit 1
+"$cf" tunnel route dns "$tid" "$host" || exit 1
+"$lctl" kickstart -k "gui/$(id -u)/com.ardud.cards-tunnel" || exit 1
+print "cards-tunnel-setup: tunnel $tid serves https://$host"

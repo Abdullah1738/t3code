@@ -24,9 +24,10 @@ import {
   cancelledBeforeStart,
   isRestartNoteSource,
   neverStarted,
-  restartCancelledBackgroundWorkNote,
   restartContinuationNote,
 } from "./RestartBackgroundNote.ts";
+// ardud: the restart note checks OpenCode children before it says they were cancelled.
+import { restartNoteSummary } from "../ardud/opencode-import/ChildSessions.ts";
 
 const CONTINUE_PROMPT = "Continue where you left off.";
 
@@ -272,8 +273,22 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       projection.providerTurns,
       projection.attempts,
     );
-    const noteText =
-      note.work.length === 0 ? undefined : restartCancelledBackgroundWorkNote(note.work);
+    // ardud: an OpenCode child still running or finished is not told as cancelled.
+    const summary =
+      note.work.length === 0
+        ? undefined
+        : yield* restartNoteSummary(settings, note.work).pipe(
+            Effect.map((value) => ({
+              ...value,
+              text: value.text === "" ? undefined : value.text,
+            })),
+          );
+    const noteText = summary?.text;
+    // ardud: a settled parent whose only cut work is a confirmed-running child has no
+    // note to give. Dispatching would start a turn and claim the work stopped.
+    if (note.settled && noteText === undefined && note.work.length > 0) return;
+    // ardud: the headline claims "stopped" only when the note kept cancelled work.
+    const noteSaysCancelled = summary?.claimsCancelled === true;
     const text =
       noteText === undefined
         ? CONTINUE_PROMPT
@@ -290,7 +305,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         notification: {
           source: { kind: "system" },
           outcome: "updated",
-          summary: note.settled
+          // ardud: the headline claims "stopped" only when the note itself says work was cancelled;
+          // a checked-running, finished or unknown OpenCode child must not get that claim.
+          summary: note.settled && noteSaysCancelled
             ? "T3 Code restarted and stopped background work"
             : "T3 Code restarted and resumed this turn",
           detail: text,

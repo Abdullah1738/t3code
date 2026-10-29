@@ -30,6 +30,7 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
     model: { instanceId: "opencode" as never, model: "opus/claude-opus-5-5" },
     models: [],
     subtasks: [],
+    subtaskSeq: 0,
     projectId: null,
     links: [],
     blockedBy: blockedBy as never,

@@ -55,12 +55,14 @@ export const KANBAN_WS_METHODS = {
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
+  setupEnd: "kanban.setup.end",
   cardPatch: "kanban.card.patch",
   cardSettle: "kanban.card.settle",
   cardStop: "kanban.card.stop",
   cardAsk: "kanban.card.ask",
   cardDiscussion: "kanban.card.discussion",
   poolSet: "kanban.pool.set",
+  poolRemove: "kanban.pool.remove",
   discussionCreate: "kanban.discussion.create",
   discussionRead: "kanban.discussion.read",
   discussionUpdate: "kanban.discussion.update",
@@ -115,12 +117,13 @@ export const KanbanBoardUpdateInput = Schema.Struct({
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
 
-/** Owner changes to a discussion. `settled: false` and `snoozedUntil: null` undo. */
+/** Owner changes to a discussion. `settled: false`, `snoozedUntil: null` and `pinned: false` undo. */
 export const KanbanDiscussionUpdateInput = Schema.Struct({
   discussionId: KanbanDiscussionId,
   title: Schema.optional(Schema.String),
   settled: Schema.optional(Schema.Boolean),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinned: Schema.optional(Schema.Boolean),
 });
 export type KanbanDiscussionUpdateInput = typeof KanbanDiscussionUpdateInput.Type;
 
@@ -171,10 +174,14 @@ export const KanbanRpcs = RpcGroup.make(
       slug: Schema.String,
       name: Schema.String,
       defaultProjectId: Schema.NullOr(ProjectId),
+      managerModel: Schema.optional(ModelSelection),
+      evaluatorModel: Schema.optional(ModelSelection),
+      defaultCardModel: Schema.optional(ModelSelection),
     }),
     KanbanBoard,
   ),
   call(M.boardUpdate, KanbanBoardUpdateInput, KanbanBoard),
+  call(M.setupEnd, Schema.Struct({ boardId: KanbanBoardId }), KanbanBoard),
   call(M.cardPatch, KanbanCardPatchInput, KanbanCard),
   call(M.cardSettle, CardRef, KanbanCard),
   call(M.cardStop, CardRef, KanbanCard),
@@ -193,6 +200,11 @@ export const KanbanRpcs = RpcGroup.make(
   call(
     M.poolSet,
     Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection, slots: NonNegativeInt }),
+    Schema.Array(KanbanPool),
+  ),
+  call(
+    M.poolRemove,
+    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection }),
     Schema.Array(KanbanPool),
   ),
   call(
@@ -255,12 +267,14 @@ export const KANBAN_READ_SCOPES = {
 export const KANBAN_GUARDED_SCOPES = {
   [M.boardCreate]: AuthOrchestrationOperateScope,
   [M.boardUpdate]: AuthOrchestrationOperateScope,
+  [M.setupEnd]: AuthOrchestrationOperateScope,
   [M.cardPatch]: AuthOrchestrationOperateScope,
   [M.cardSettle]: AuthOrchestrationOperateScope,
   [M.cardStop]: AuthOrchestrationOperateScope,
   [M.cardAsk]: AuthOrchestrationOperateScope,
   [M.cardDiscussion]: AuthOrchestrationOperateScope,
   [M.poolSet]: AuthOrchestrationOperateScope,
+  [M.poolRemove]: AuthOrchestrationOperateScope,
   [M.discussionCreate]: AuthOrchestrationOperateScope,
   [M.discussionRead]: AuthOrchestrationOperateScope,
   [M.discussionUpdate]: AuthOrchestrationOperateScope,

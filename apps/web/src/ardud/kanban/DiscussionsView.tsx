@@ -3,8 +3,11 @@ import {
   AlarmClockOffIcon,
   ArrowLeftIcon,
   CircleCheckIcon,
+  ListFilterIcon,
   MoreHorizontalIcon,
   PencilIcon,
+  PinIcon,
+  PinOffIcon,
   SearchIcon,
   Undo2Icon,
   XIcon,
@@ -22,13 +25,18 @@ import {
   linkLabels,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanDiscussion, KanbanDiscussionUpdateInput } from "@t3tools/contracts";
+import {
+  KANBAN_WS_METHODS,
+  type KanbanDiscussion,
+  type KanbanDiscussionUpdateInput,
+} from "@t3tools/contracts";
 
 import { requestCustomSnooze } from "../../components/CustomSnoozeDialog";
 import { resolveSnoozePresets, snoozeWakeLabel } from "../../components/Sidebar.snooze";
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import {
   Menu,
+  MenuCheckboxItem,
   MenuItem,
   MenuPopup,
   MenuSeparator,
@@ -44,7 +52,8 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useClientSettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { Chat, Composer } from "./Chat";
-import { kanban, runAction } from "./kanbanStore";
+import { composerTitleSource } from "./composerAttachments";
+import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { CopyLinkButton } from "./links";
 import { Avatar, UnreadDot } from "./parts";
 
@@ -53,6 +62,7 @@ export const NEW_DISCUSSION = "new";
 
 const SNOOZED_EXPANDED_KEY = "t3code:kanban:discussions:snoozed-expanded";
 const SETTLED_EXPANDED_KEY = "t3code:kanban:discussions:settled-expanded";
+const HIDE_CARDS_KEY = "t3code:kanban:discussions:hide-cards";
 
 const ROUND_BUTTON =
   "grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) data-popup-open:bg-(--m-chip) data-popup-open:text-(--m-text)";
@@ -67,9 +77,13 @@ function updateDiscussion(boardId: string, discussionId: string, patch: Discussi
         ? patch.settled
           ? "Couldn't settle the discussion"
           : "Couldn't unsettle the discussion"
-        : patch.snoozedUntil === null
-          ? "Couldn't unsnooze the discussion"
-          : "Couldn't snooze the discussion";
+        : patch.pinned !== undefined
+          ? patch.pinned
+            ? "Couldn't pin the discussion"
+            : "Couldn't unpin the discussion"
+          : patch.snoozedUntil === null
+            ? "Couldn't unsnooze the discussion"
+            : "Couldn't snooze the discussion";
   return runAction(failure, () => kanban.updateDiscussion(boardId, discussionId, patch));
 }
 
@@ -82,6 +96,7 @@ function DraftRoom(props: {
   // Created but the first post failed: the retry goes into that discussion
   // instead of creating another.
   const created = useRef<string | null>(null);
+  const canCreate = useKanbanPermission(KANBAN_WS_METHODS.discussionCreate);
   return (
     <div className="flex min-h-0 min-w-0 flex-col pe-5 md:px-6">
       <div className="flex h-9 shrink-0 items-center gap-3">
@@ -91,12 +106,24 @@ function DraftRoom(props: {
       <div className="flex min-h-0 w-full max-w-160 flex-1 flex-col justify-end">
         <Composer
           placeholder="What do you need?"
-          onSend={async (text) => {
+          attachments
+          blockedReason={canCreate ? null : "Your connection can't start discussions"}
+          onSend={async (blocks) => {
+            const text = blocks.find((block) => block._tag === "md")?.text ?? "";
+            const firstFile = blocks.find((block) => block._tag === "attachment");
             created.current ??= (
-              await kanban.createDiscussion(props.boardId, requestTitle(text))
+              await kanban.createDiscussion(
+                props.boardId,
+                requestTitle(
+                  composerTitleSource(
+                    text,
+                    firstFile?._tag === "attachment" ? [firstFile.attachment.name] : [],
+                  ),
+                ),
+              )
             ).id;
             const discussionId = created.current;
-            await kanban.post(props.boardId, discussionId, [{ _tag: "md", text }]);
+            await kanban.post(props.boardId, discussionId, blocks);
             created.current = null;
             props.onOpenDiscussion(discussionId);
           }}
@@ -137,8 +164,12 @@ export function DiscussionsView(props: {
     false,
     Schema.Boolean,
   );
-  const groups = discussionRows(state, props.nowMs, { query });
-  const total = groups.active.length + groups.snoozed.length + groups.settled.length;
+  const [hideCards, setHideCards] = useLocalStorage(HIDE_CARDS_KEY, false, Schema.Boolean);
+  // Not saved: a reload shows every discussion again.
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const groups = discussionRows(state, props.nowMs, { query, hideCards, unreadOnly });
+  const total =
+    groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const searching = query.trim().length > 0;
   const narrow = useMediaQuery("max-md");
   const drafting = props.discussionId === NEW_DISCUSSION;
@@ -171,15 +202,47 @@ export function DiscussionsView(props: {
         <div className="flex min-h-0 flex-col gap-1 pe-2.5 md:border-e md:border-(--m-rule)">
           <div className="flex h-9 shrink-0 items-center ps-2.5">
             <h2 className="text-base font-semibold">Discussions</h2>
+            <span className="flex-1" />
+            <Menu>
+              <MenuTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label="Discussion filters"
+                    className={cn(ROUND_BUTTON, (hideCards || unreadOnly) && "text-(--m-text)")}
+                  />
+                }
+              >
+                <ListFilterIcon className="size-4" />
+              </MenuTrigger>
+              <MenuPopup side="bottom" align="end">
+                <MenuCheckboxItem
+                  checked={!hideCards}
+                  onCheckedChange={(next) => setHideCards(!next)}
+                >
+                  Card discussions
+                </MenuCheckboxItem>
+                <MenuCheckboxItem checked={unreadOnly} onCheckedChange={setUnreadOnly}>
+                  Unread only
+                </MenuCheckboxItem>
+              </MenuPopup>
+            </Menu>
           </div>
           <SearchField value={query} onChange={setQuery} />
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3">
             {!state.discussionsLoaded && total === 0 ? null : total === 0 ? (
               <p className="px-2.5 py-2 text-sm text-(--m-muted)">
-                {searching ? "No matches." : "No discussions yet."}
+                {searching
+                  ? "No matches."
+                  : unreadOnly
+                    ? "No unread discussions."
+                    : "No discussions yet."}
               </p>
             ) : null}
-            <ul className="flex flex-col gap-0.5">{renderRows(groups.active)}</ul>
+            <ul className="flex flex-col gap-0.5">
+              {renderRows(groups.pinned)}
+              {renderRows(groups.active)}
+            </ul>
             <ListGroup
               label="Snoozed"
               count={groups.snoozed.length}
@@ -379,6 +442,7 @@ function DiscussionListRow(props: {
           {row.snoozedUntil !== null ? (
             <AlarmClockIcon aria-label="Snoozed for" className="size-3" />
           ) : null}
+          {row.pinnedAt !== null ? <PinIcon aria-label="Pinned" className="size-3" /> : null}
           {when}
         </span>
         {row.preview ? (
@@ -407,6 +471,7 @@ function DiscussionMenu(props: {
     readonly title: string;
     readonly settledAt: string | null;
     readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
   };
   nowMs: number;
   open?: boolean;
@@ -420,7 +485,10 @@ function DiscussionMenu(props: {
   const { discussion } = props;
   const settled = discussion.settledAt !== null;
   const snoozed = !settled && discussionSnoozed(discussion, props.nowMs);
+  const pinned = discussion.pinnedAt !== null;
   const presets = open ? resolveSnoozePresets(new Date(), timestampFormat) : [];
+  const canUpdate = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
+  const updateNote = canUpdate ? undefined : "Your connection can't change discussions";
   const update = (patch: DiscussionPatch) =>
     void updateDiscussion(props.boardId, discussion.id, patch);
   return (
@@ -438,24 +506,24 @@ function DiscussionMenu(props: {
       </MenuTrigger>
       <MenuPopup side="bottom" align="end">
         {settled ? (
-          <MenuItem onClick={() => update({ settled: false })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: false })}>
             <Undo2Icon />
             Unsettle
           </MenuItem>
         ) : (
-          <MenuItem onClick={() => update({ settled: true })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: true })}>
             <CircleCheckIcon />
             Settle
           </MenuItem>
         )}
         {snoozed ? (
-          <MenuItem onClick={() => update({ snoozedUntil: null })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ snoozedUntil: null })}>
             <AlarmClockOffIcon />
             Unsnooze
           </MenuItem>
         ) : (
           <MenuSub>
-            <MenuSubTrigger>
+            <MenuSubTrigger disabled={!canUpdate} title={updateNote}>
               <AlarmClockIcon />
               Snooze
             </MenuSubTrigger>
@@ -481,8 +549,19 @@ function DiscussionMenu(props: {
             </MenuSubPopup>
           </MenuSub>
         )}
+        {pinned ? (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: false })}>
+            <PinOffIcon />
+            Unpin
+          </MenuItem>
+        ) : (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: true })}>
+            <PinIcon />
+            Pin
+          </MenuItem>
+        )}
         <MenuSeparator />
-        <MenuItem onClick={props.onRename}>
+        <MenuItem disabled={!canUpdate} title={updateNote} onClick={props.onRename}>
           <PencilIcon />
           Rename
         </MenuItem>
@@ -512,6 +591,7 @@ function RoomTitle(props: {
   onEditingChange: (editing: boolean) => void;
   onSave: (title: string) => Promise<boolean>;
 }) {
+  const canRename = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
   if (!props.editing) {
     return (
       <h3 className="flex min-w-0 flex-1">
@@ -520,6 +600,7 @@ function RoomTitle(props: {
             render={
               <button
                 type="button"
+                disabled={!canRename}
                 onClick={() => props.onEditingChange(true)}
                 className="-ms-1.5 min-w-0 truncate rounded-lg px-1.5 py-0.5 text-left text-base font-medium outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               />
@@ -527,7 +608,9 @@ function RoomTitle(props: {
           >
             {props.discussion.title}
           </TooltipTrigger>
-          <TooltipPopup>Rename</TooltipPopup>
+          <TooltipPopup>
+            {canRename ? "Rename" : "Your connection can't rename discussions"}
+          </TooltipPopup>
         </Tooltip>
       </h3>
     );

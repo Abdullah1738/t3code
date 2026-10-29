@@ -785,11 +785,26 @@ def unshare(uuid):
     return res
 
 
+def permanent_apps():
+    """Slugs whose public link is a stable-origin link (bridge `shares`, permanent: true). Automatic
+    cleanup never retires those: the URL already sent would break, and sharing again mints a new one.
+    None when the bridge's list can't be read, so the caller retires nothing."""
+    try:
+        records = bridge("shares", timeout=10).get("shares")
+    except Exception:
+        return None
+    if not isinstance(records, list):
+        return None
+    return {r["app"] for r in records
+            if isinstance(r, dict) and isinstance(r.get("app"), str) and r.get("permanent") is True}
+
+
 def free_ended_shares(exclude=None):
     """The bridge's live-share cap is hit: every trip Uber confirmed ended loses its public link now,
     without the hour's grace. The trip Uber shows right now keeps its link whatever its card says,
     and when Uber can't be read nothing goes: a card frozen as "never confirmed" may be that trip.
-    Returns how many the bridge really removed."""
+    A stable-origin link is never retired, and when the bridge's share list can't be read nothing
+    goes either. Returns how many the bridge really removed."""
     try:
         d = uber_status()
     except Exception:
@@ -797,10 +812,13 @@ def free_ended_shares(exclude=None):
     if not isinstance(d, dict) or not d.get("ok"):
         return 0
     live = str(((d.get("result") or {}).get("trip") or {}).get("uuid") or "").lower()
+    permanent = permanent_apps()
+    if permanent is None:
+        return 0
     freed, now = 0, time.time()
     for p in sorted(journal_dir().glob("*.json")):
         uuid = p.stem
-        if uuid in (exclude, live) or not UUID_RE.match(uuid):
+        if uuid in (exclude, live) or not UUID_RE.match(uuid) or slug(uuid) in permanent:
             continue
         try:
             # Under the trip's own lock, so a send re-sharing it can't race the unshare. A trip

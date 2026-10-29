@@ -6,6 +6,7 @@ import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncom
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
 import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
+import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
@@ -184,10 +185,12 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   // Turns nobody typed (wakes) carry no attachments and don't open Robob asks; guest wakes bring their own commands.
   if (!background) {
     lines.push("Files: images attach natively; other files (voice notes, PDFs, docs) are saved at the quoted paths. If you can't read them directly, work on them with tools (transcribe, extract text, convert).");
-    lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
+    if (chat.kind === "group") lines.push("Polls and app cards are not available in groups; ask in text and send links as text.");
+    else lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
   }
   lines.push("Links you create: for the owner's own chat use `publish --app SLUG` (tailnet only). For Moni, any group or anyone else use `share --app SLUG [--days N]` (public Cloudflare link, 7 days by default; `unshare --app SLUG` ends it). Every page you send needs <title>, og:title, og:description and og:image so link previews show; fix any metadataWarnings before sending the link.");
   if (chat.kind === "owner") lines.push("Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one; `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");
+  else if (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin") lines.push(`Groups: \`chats --session CURRENT_SESSION_ID\` lists the group chats ${chat.title} has written in; \`send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...\` posts in one of them when ${chat.title} asks. Other chats can't be reached from here; for the owner use ask-owner.`);
   if (chat.kind === "owner" && background) lines.push("Strangers who text the line are never answered by you directly; follow the bridge's own note.");
   // 27 Oct: Moni's blank-card report went from her chat straight to a fix agent and a deploy, with no card and no review.
   if (!background) {

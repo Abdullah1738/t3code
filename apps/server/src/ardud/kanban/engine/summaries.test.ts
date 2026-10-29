@@ -30,6 +30,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
   createdAt: at,
   archivedAt: null,
 });
@@ -48,6 +49,7 @@ const card = (id: string, patch: Partial<KanbanCard> = {}): KanbanCard => ({
   model: opus,
   models: [],
   subtasks: [],
+  subtaskSeq: 0,
   projectId: null,
   links: [],
   blockedBy: [],
@@ -96,6 +98,8 @@ const discussion = (id: string, lastSeq: number, ownerRead: number): KanbanDiscu
   titleEditedAt: null,
   settledAt: null,
   snoozedUntil: null,
+  pinnedAt: null,
+  reopenedAt: null,
 });
 
 const thread = ThreadId.make("t1");

@@ -1,20 +1,31 @@
-import { useIsFocused } from "@react-navigation/native";
-import type { KanbanBlock, KanbanMessage, KanbanParticipant } from "@t3tools/contracts";
+import { useIsFocused, useNavigation } from "@react-navigation/native";
+import type {
+  EnvironmentId,
+  KanbanBlock,
+  KanbanMessage,
+  KanbanParticipant,
+} from "@t3tools/contracts";
+import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import {
   avatarOf,
+  canSendChoice,
   cardView,
   discussionPresence,
   ownerReadSeq,
+  parseKanbanLink,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { Image } from "expo-image";
 import {
   type ComponentRef,
+  createContext,
   Fragment,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -29,9 +40,35 @@ import { cn } from "../../lib/cn";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
-import { MarkdownText } from "../common/MarkdownText";
+import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
 import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
-import { cardGlyph, choiceView, isLoadableImageUrl, nextTypingExpiry, toggleChoice } from "./logic";
+import {
+  cardGlyph,
+  choiceView,
+  firstSendText,
+  groupBlockRuns,
+  isLoadableImageUrl,
+  nextTypingExpiry,
+  kanbanLinkTarget,
+  sendBlocks,
+  toggleChoice,
+  type StoredAttachment,
+} from "./logic";
+import { usePairedEnvironmentId } from "../common/environment";
+import { ComposerAttachmentButton } from "../../features/threads/ComposerAttachmentButton";
+import {
+  pickComposerFiles,
+  pickComposerMedia,
+  type DraftComposerAttachment,
+} from "../../lib/composerImages";
+import { releaseUnusedComposerAttachmentFiles } from "../../state/use-composer-drafts";
+import {
+  prepareTurnAttachments,
+  releasePendingAttachmentUploads,
+} from "../../lib/attachmentUpload";
+import { useServerConfigs } from "../../state/entities";
+import { useAssetUrl } from "../../state/assets";
+import * as Dialog from "../../components/ui/Dialog";
 import { Avatar, Glyph } from "./parts";
 
 // Agent posts fold past this many lines and open in place or in a reader.
@@ -40,6 +77,27 @@ const HTML_DEFAULT_HEIGHT = 240;
 const HTML_MAX_HEIGHT = 480;
 // How close to the end counts as reading the newest message.
 const FOLLOW_SLACK = 80;
+/** Space kept between a focused answer field and the list's bottom edge. */
+const ANSWER_CLEARANCE = 12;
+
+/**
+ * Lets an answer field keep itself above the keyboard without the list jumping
+ * to the newest message. Null outside the list, where nothing needs revealing.
+ */
+interface AnswerScroll {
+  /** A field gained focus: its own row becomes the one to keep visible. */
+  readonly focus: (row: AnswerRow) => void;
+  /** A field lost focus or unmounted; clears the target only if it is still this row. */
+  readonly blur: (row: AnswerRow) => void;
+  /** The focused field's content grew or the list resized; re-reveal while it's focused. */
+  readonly reveal: () => void;
+  /** Whether some question's answer field currently holds focus. */
+  readonly isFocused: () => boolean;
+}
+
+type AnswerRow = ComponentRef<typeof View>;
+
+const AnswerScrollContext = createContext<AnswerScroll | null>(null);
 
 /**
  * One discussion: messages oldest first, who has seen your last message, who
@@ -74,80 +132,125 @@ export function Chat(props: {
   useMarkRead(boardId, discussionId, state, messages);
 
   const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
+  const frame = useRef<ComponentRef<typeof View>>(null);
   const following = useRef(props.startAtEnd ?? true);
   const placed = useRef(false);
+  const scrollY = useRef(0);
+  // The one focused answer field's row, or null. Only a field's own focus sets
+  // it, and only that same row clears it, so other questions can't move it.
+  const answerRow = useRef<AnswerRow | null>(null);
   const followToEnd = () => {
     following.current = true;
     scroll.current?.scrollToEnd({ animated: true });
   };
 
+  // Scrolls only as far as the focused field's bottom edge needs, so the
+  // list stays where the owner is reading. Every callback reads refs only, so
+  // one stable object serves the whole list.
+  const answerScroll = useMemo<AnswerScroll>(() => {
+    const reveal = () => {
+      const row = answerRow.current;
+      const box = frame.current;
+      if (row === null || box === null) return;
+      row.measureInWindow((_x, rowY, _width, rowHeight) => {
+        box.measureInWindow((_bx, boxY, _boxWidth, boxHeight) => {
+          const overflow = rowY + rowHeight - (boxY + boxHeight) + ANSWER_CLEARANCE;
+          if (overflow <= 0) return;
+          scroll.current?.scrollTo({ y: Math.max(0, scrollY.current + overflow), animated: true });
+        });
+      });
+    };
+    return {
+      focus: (row) => {
+        answerRow.current = row;
+        reveal();
+      },
+      blur: (row) => {
+        if (answerRow.current === row) answerRow.current = null;
+      },
+      reveal,
+      isFocused: () => answerRow.current !== null,
+    };
+  }, []);
+
   return (
     <View className="flex-1">
-      <ScrollView
-        ref={scroll}
-        className="flex-1"
-        contentContainerClassName="gap-3 px-4 pb-4 pt-2"
-        keyboardShouldPersistTaps="handled"
-        keyboardDismissMode="interactive"
-        scrollEventThrottle={64}
-        onScroll={(event) => {
-          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
-          following.current =
-            contentOffset.y + layoutMeasurement.height >= contentSize.height - FOLLOW_SLACK;
-        }}
-        onContentSizeChange={() => {
-          if (!following.current) return;
-          scroll.current?.scrollToEnd({ animated: placed.current });
-          placed.current = true;
-        }}
-        // The keyboard shrinks the list without changing its content; keep
-        // the newest message above the composer.
-        onLayout={() => {
-          if (following.current && placed.current) scroll.current?.scrollToEnd({ animated: false });
-        }}
-      >
-        {props.header}
-        <FeedError what="the discussion" feed={feed} nowMs={props.nowMs} />
-        {discussionId !== null && messages === undefined && !feed.failure ? <LoadingLine /> : null}
-        {messages?.map((message) => (
-          <Fragment key={message.seq}>
-            <MessageView
-              boardId={boardId}
-              discussionId={discussionId}
-              message={message}
-              state={state}
-              nowMs={props.nowMs}
-              onOpenCard={props.onOpenCard}
-            />
-            {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
-              <View
-                accessible
-                accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
-                className="-mt-1.5 flex-row justify-end gap-[3px]"
-              >
-                {presence.seenBy.map((face) => (
-                  <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
-                ))}
-              </View>
+      <View ref={frame} className="flex-1" onLayout={answerScroll.reveal}>
+        <ScrollView
+          ref={scroll}
+          className="flex-1"
+          contentContainerClassName="gap-3 px-4 pb-4 pt-2"
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
+          scrollEventThrottle={64}
+          onScroll={(event) => {
+            const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+            scrollY.current = contentOffset.y;
+            following.current =
+              contentOffset.y + layoutMeasurement.height >= contentSize.height - FOLLOW_SLACK;
+          }}
+          onContentSizeChange={() => {
+            // A focused answer keeps its own place; following the newest message would push it out of view.
+            if (answerScroll.isFocused()) return answerScroll.reveal();
+            if (!following.current) return;
+            scroll.current?.scrollToEnd({ animated: placed.current });
+            placed.current = true;
+          }}
+          // The keyboard shrinks the list without changing its content; keep
+          // the newest message above the composer.
+          onLayout={() => {
+            if (following.current && placed.current && !answerScroll.isFocused()) {
+              scroll.current?.scrollToEnd({ animated: false });
+            }
+          }}
+        >
+          <AnswerScrollContext.Provider value={answerScroll}>
+            {props.header}
+            <FeedError what="the discussion" feed={feed} nowMs={props.nowMs} />
+            {discussionId !== null && messages === undefined && !feed.failure ? (
+              <LoadingLine />
             ) : null}
-          </Fragment>
-        ))}
-        {presence?.typing.map((face) => (
-          <View
-            key={face.key}
-            accessible
-            accessibilityLabel={`${face.name} is typing`}
-            className="flex-row items-center gap-2.5"
-          >
-            <Avatar kind={face.kind} letter={face.letter} />
-            <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-              <View className="size-1.5 rounded-full bg-foreground-muted" />
-            </View>
-          </View>
-        ))}
-      </ScrollView>
+            {messages?.map((message) => (
+              <Fragment key={message.seq}>
+                <MessageView
+                  boardId={boardId}
+                  discussionId={discussionId}
+                  message={message}
+                  state={state}
+                  nowMs={props.nowMs}
+                  onOpenCard={props.onOpenCard}
+                />
+                {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
+                  <View
+                    accessible
+                    accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
+                    className="-mt-1.5 flex-row justify-end gap-[3px]"
+                  >
+                    {presence.seenBy.map((face) => (
+                      <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
+                    ))}
+                  </View>
+                ) : null}
+              </Fragment>
+            ))}
+            {presence?.typing.map((face) => (
+              <View
+                key={face.key}
+                accessible
+                accessibilityLabel={`${face.name} is typing`}
+                className="flex-row items-center gap-2.5"
+              >
+                <Avatar kind={face.kind} letter={face.letter} />
+                <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                  <View className="size-1.5 rounded-full bg-foreground-muted" />
+                </View>
+              </View>
+            ))}
+          </AnswerScrollContext.Provider>
+        </ScrollView>
+      </View>
       <Composer
         boardId={boardId}
         discussionId={discussionId}
@@ -173,6 +276,17 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
     };
   }, [participants]);
   return clock;
+}
+
+/**
+ * Links to this board's own cards and discussions open; anything else (another
+ * board's link, a missing record) stays inert, as on web.
+ */
+function resolveKanbanLinkFor(boardId: string, state: KanbanBoardState): ResolveKanbanLink {
+  return (href) => {
+    const link = parseKanbanLink(href);
+    return link === null ? null : kanbanLinkTarget(link, boardId, state);
+  };
 }
 
 /** Marks what is on screen read while the screen is in front. */
@@ -215,6 +329,7 @@ function MessageView(props: {
       discussionId={props.discussionId}
       message={message}
       state={props.state}
+      resolveKanbanLink={resolveKanbanLinkFor(props.boardId, props.state)}
       nowMs={props.nowMs}
       onOpenCard={props.onOpenCard}
     />
@@ -252,22 +367,28 @@ function Blocks(props: {
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
-  return props.message.blocks.map((block, index) => (
-    <BlockView
-      // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
-      key={index}
-      block={block}
-      {...props}
-    />
-  ));
+  return groupBlockRuns(props.message.blocks).map((run) =>
+    run.kind === "attachments" ? (
+      <AttachmentRun key={run.index} attachments={run.attachments} />
+    ) : (
+      <BlockView
+        // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
+        key={run.index}
+        block={run.block}
+        {...props}
+      />
+    ),
+  );
 }
 
 function BlockView(props: {
   readonly block: KanbanBlock;
   readonly boardId: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
@@ -282,10 +403,17 @@ function BlockView(props: {
           text={block.text}
           maxLines={MESSAGE_LINES}
           tone={props.message.author._tag === "owner" ? "user" : "screen"}
+          resolveKanbanLink={props.resolveKanbanLink}
         />
       );
     case "collapse":
-      return <Collapse title={block.title} text={block.text} />;
+      return (
+        <Collapse
+          title={block.title}
+          text={block.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+        />
+      );
     case "html":
       return <HtmlBlock html={block.html} title={block.title} height={block.height} />;
     case "choice":
@@ -308,10 +436,100 @@ function BlockView(props: {
       );
     case "image":
       return <ImageBlock url={block.url} alt={block.alt} />;
+    // Attachment runs render through AttachmentRun in Blocks.
+    case "attachment":
+      return <AttachmentRun attachments={[block.attachment]} />;
   }
 }
 
-function Collapse(props: { readonly title: string; readonly text: string }) {
+/** Consecutive attachments share one wrapping row. */
+function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
+  return (
+    <View className="flex-row flex-wrap gap-2">
+      {props.attachments.map((attachment) => (
+        <StoredAttachmentView key={attachment.id} attachment={attachment} />
+      ))}
+    </View>
+  );
+}
+
+function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) {
+  const { attachment } = props;
+  const navigation = useNavigation();
+  const environmentId = usePairedEnvironmentId();
+  const isImage = attachment.type === "image";
+  const resource = {
+    _tag: "attachment" as const,
+    attachmentId: attachment.id,
+    fileName: attachment.name,
+    mimeType: attachment.mimeType,
+  };
+  const uri = useAssetUrl(environmentId, resource);
+  const [preview, setPreview] = useState<FilePreviewSource | null>(null);
+  if (environmentId === null) return null;
+  if (isImage) {
+    return (
+      <>
+        <Pressable
+          accessibilityRole="imagebutton"
+          accessibilityLabel={`Open ${attachment.name}`}
+          onPress={() =>
+            uri !== null &&
+            setPreview({
+              kind: "image",
+              environmentId,
+              resource,
+              name: attachment.name,
+            })
+          }
+          className="size-24 overflow-hidden rounded-[12px] bg-secondary"
+        >
+          {uri !== null ? (
+            <Image
+              source={{ uri }}
+              cachePolicy="memory-disk"
+              contentFit="cover"
+              style={{ width: "100%", height: "100%" }}
+              accessibilityIgnoresInvertColors
+            />
+          ) : null}
+        </Pressable>
+        <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
+      </>
+    );
+  }
+  // Files open on the attachment screen, which previews any type and shares the original.
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${attachment.name}`}
+      accessibilityValue={{ text: formatAttachmentSize(attachment.sizeBytes) }}
+      onPress={() =>
+        navigation.navigate("ThreadAttachment", {
+          environmentId: String(environmentId),
+          attachmentId: attachment.id,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          sizeBytes: String(attachment.sizeBytes),
+        })
+      }
+      className="min-h-10 max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen px-3 py-2"
+    >
+      <Text numberOfLines={1} className="shrink text-[14px] font-t3-medium text-foreground">
+        {attachment.name}
+      </Text>
+      <Text className="text-[12px] text-foreground-muted">
+        {formatAttachmentSize(attachment.sizeBytes)}
+      </Text>
+    </Pressable>
+  );
+}
+
+function Collapse(props: {
+  readonly title: string;
+  readonly text: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <View className="rounded-[12px] bg-screen">
@@ -331,7 +549,11 @@ function Collapse(props: { readonly title: string; readonly text: string }) {
       </Pressable>
       {open ? (
         <View className="px-3 pb-2.5">
-          <MarkdownText text={props.text} maxLines={null} />
+          <MarkdownText
+            text={props.text}
+            maxLines={null}
+            resolveKanbanLink={props.resolveKanbanLink}
+          />
         </View>
       ) : null}
     </View>
@@ -380,6 +602,20 @@ function ChoiceBlock(props: {
 }) {
   const { block, message } = props;
   const action = useBoardAction();
+  const answerScroll = useContext(AnswerScrollContext);
+  const answerRowRef = useRef<AnswerRow | null>(null);
+  // The row this field registered on focus. Kept apart from answerRowRef because
+  // React detaches that ref before unmount cleanup runs.
+  const focusedRowRef = useRef<AnswerRow | null>(null);
+  // Unmounting while focused must not leave the list pinned to this row.
+  useEffect(
+    () => () => {
+      const row = focusedRowRef.current;
+      focusedRowRef.current = null;
+      if (row !== null) answerScroll?.blur(row);
+    },
+    [answerScroll],
+  );
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
@@ -390,35 +626,59 @@ function ChoiceBlock(props: {
       ?.at ?? null;
   const current = draft !== null && draft.against === ownAt ? draft : null;
   const mine = current?.choice ?? view.mine;
+  const text = current?.text ?? "";
   const poll = block.style === "poll";
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
-  const locked = !poll && (view.mine.length > 0 || current?.sent === true);
+  const locked =
+    !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
+  const canSend = canSendChoice(block, mine, text);
+  // Sending from the field removes it while ChoiceBlock stays mounted, and
+  // React Native doesn't reliably deliver onBlur for a removed input.
+  useEffect(() => {
+    if (!locked) return;
+    const row = focusedRowRef.current;
+    focusedRowRef.current = null;
+    if (row !== null) answerScroll?.blur(row);
+  }, [locked, answerScroll]);
 
-  const send = (choice: ReadonlyArray<string>) => {
+  const send = (choice: ReadonlyArray<string>, words: string) => {
     const discussionId = props.discussionId;
-    if (discussionId === null || choice.length === 0) return;
+    if (discussionId === null || !canSendChoice(block, choice, words)) return;
     const against = ownAt;
-    setDraft({ choice, against, sent: true });
+    setDraft({ choice, text: words, against, sent: true });
     void action
       .run("Couldn't send the answer", () =>
-        kanbanClient().answer(props.boardId, discussionId, message.seq, block.id, [...choice]),
+        kanbanClient().answer(
+          props.boardId,
+          discussionId,
+          message.seq,
+          block.id,
+          [...choice],
+          words.trim() || null,
+        ),
       )
       .then((ok) => {
-        // A failed multi pick keeps what was ticked so Send can try again.
-        if (!ok) setDraft(multiPick ? { choice, against, sent: false } : null);
+        // A failed answer keeps what was ticked and typed so it can be sent again.
+        if (!ok) {
+          const keep = multiPick || words.trim() !== "";
+          setDraft(keep ? { choice, text: words, against, sent: false } : null);
+        }
       });
   };
+
+  const setWords = (words: string) =>
+    setDraft({ choice: mine, text: words, against: ownAt, sent: false });
 
   const pick = (optionId: string) => {
     if (locked) return;
     const next = toggleChoice(mine, optionId, block.multi);
     if (multiPick) {
-      setDraft({ choice: next, against: ownAt, sent: false });
+      setDraft({ choice: next, text, against: ownAt, sent: false });
       return;
     }
-    send(next);
+    send(next, "");
   };
 
   return (
@@ -471,27 +731,84 @@ function ChoiceBlock(props: {
           );
         })}
       </View>
+      {!poll && !locked ? (
+        <View
+          ref={answerRowRef}
+          className="min-h-10 flex-row items-end gap-2 rounded-[12px] border-[1.5px] border-transparent bg-screen py-1.5 pl-3 pr-1.5"
+        >
+          <AppTextInput
+            multiline
+            accessibilityLabel="Your own answer"
+            value={text}
+            onChangeText={setWords}
+            onFocus={() => {
+              const row = answerRowRef.current;
+              if (row === null) return;
+              focusedRowRef.current = row;
+              answerScroll?.focus(row);
+            }}
+            onBlur={() => {
+              const row = focusedRowRef.current;
+              focusedRowRef.current = null;
+              if (row !== null) answerScroll?.blur(row);
+            }}
+            onContentSizeChange={() => answerScroll?.reveal()}
+            editable={!action.pending}
+            placeholder="Your own answer"
+            placeholderTextColorClassName="accent-foreground-muted"
+            className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
+          />
+          {!multiPick ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Send your answer"
+              accessibilityState={{ disabled: !canSend || action.pending }}
+              disabled={!canSend || action.pending}
+              onPress={() => send([], text)}
+              className={cn(
+                "size-8 items-center justify-center rounded-full",
+                !canSend || action.pending ? "bg-secondary" : "bg-foreground",
+              )}
+            >
+              <SymbolView
+                name="arrow.up"
+                size={15}
+                tintColorClassName={
+                  !canSend || action.pending ? "accent-icon-muted" : "accent-screen"
+                }
+                type="monochrome"
+              />
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
+      {locked && view.mineText !== null ? (
+        <View className="min-h-10 flex-row items-center gap-2.5 rounded-[12px] border-[1.5px] border-primary bg-screen px-3 py-2">
+          <View className="size-4 rounded-[5px] border-[5px] border-primary" />
+          <Text className="flex-1 text-[14px] text-foreground">{view.mineText}</Text>
+        </View>
+      ) : null}
       {locked ? (
         <Text className="text-[12px] text-foreground-muted">
-          {view.mine.length > 0 ? "Answer sent" : "Sending…"}
+          {view.mine.length > 0 || view.mineText !== null ? "Answer sent" : "Sending…"}
         </Text>
       ) : null}
       {multiPick && !locked ? (
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send answer"
-          accessibilityState={{ disabled: mine.length === 0 || action.pending }}
-          disabled={mine.length === 0 || action.pending}
-          onPress={() => send(mine)}
+          accessibilityState={{ disabled: !canSend || action.pending }}
+          disabled={!canSend || action.pending}
+          onPress={() => send(mine, text)}
           className={cn(
             "h-9 self-start justify-center rounded-full px-4",
-            mine.length === 0 || action.pending ? "bg-secondary" : "bg-foreground",
+            !canSend || action.pending ? "bg-secondary" : "bg-foreground",
           )}
         >
           <Text
             className={cn(
               "text-[14px] font-t3-medium",
-              mine.length === 0 || action.pending ? "text-foreground-muted" : "text-screen",
+              !canSend || action.pending ? "text-foreground-muted" : "text-screen",
             )}
           >
             Send
@@ -504,6 +821,7 @@ function ChoiceBlock(props: {
 
 interface ChoiceDraft {
   readonly choice: ReadonlyArray<string>;
+  readonly text: string;
   readonly against: string | null;
   readonly sent: boolean;
 }
@@ -564,6 +882,25 @@ function ImageBlock(props: { readonly url: string; readonly alt: string | null }
   );
 }
 
+/**
+ * A picked file and its upload. The upload belongs to the chip: removing the chip or unmounting
+ * the composer aborts it, and a server id that comes back afterwards is released again.
+ */
+interface ComposerDraft {
+  readonly local: DraftComposerAttachment;
+  readonly uploaded: StoredAttachment | null;
+  readonly failed: boolean;
+  readonly controller: AbortController;
+}
+
+/**
+ * One composer's lifetime. Pickers and uploads capture it before they start; once it is retired
+ * (unmount, or the discussion switched) their late results are released rather than applied.
+ */
+interface ComposerScope {
+  live: boolean;
+}
+
 function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
@@ -572,28 +909,193 @@ function Composer(props: {
   readonly onSent: () => void;
 }) {
   const [text, setText] = useState("");
+  const [drafts, setDrafts] = useState<ReadonlyArray<ComposerDraft>>([]);
   // iOS keeps a grown multiline input tall after its value is cleared; a new one starts short.
   const [field, setField] = useState(0);
   const action = useBoardAction();
-  const empty = text.trim().length === 0;
+  const environmentId = usePairedEnvironmentId();
+  const configs = useServerConfigs();
+  const capabilities =
+    environmentId === null ? undefined : configs.get(environmentId)?.environment.capabilities;
+  const canAttach = capabilities?.attachmentUploads === true;
+  const maxFileBytes = capabilities?.fileAttachments?.maxUploadBytes;
+  const uploading = drafts.some((draft) => draft.uploaded === null && !draft.failed);
+  const failing = drafts.some((draft) => draft.failed);
+  const empty = text.trim().length === 0 && drafts.length === 0;
+  // A failed upload must be retried or removed first; sending around it would post a partial set.
+  const blocked = empty || action.pending || uploading || failing;
+
+  // Live drafts and the in-flight send batch, read by the unmount cleanup, which runs once.
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+  // Files of a send whose post has not settled yet. They are out of `drafts` by then, so the
+  // unmount cleanup reads them here; they are released only after the post settles.
+  const sendingRef = useRef<ReadonlyArray<ComposerDraft>>([]);
+  const environmentRef = useRef(environmentId);
+  environmentRef.current = environmentId;
+  const scope = useRef<ComposerScope>({ live: true });
+  useEffect(() => {
+    const current = scope.current;
+    current.live = true;
+    return () => {
+      current.live = false;
+      const id = environmentRef.current;
+      for (const draft of draftsRef.current) draft.controller.abort();
+      const uploads = draftsRef.current.flatMap((draft) =>
+        draft.uploaded === null ? [] : [draft.uploaded.id],
+      );
+      if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
+      void releaseUnusedComposerAttachmentFiles(draftsRef.current.map((draft) => draft.local));
+    };
+  }, []);
+
+  const patch = (id: string, change: (draft: ComposerDraft) => ComposerDraft) =>
+    setDrafts((current) => current.map((draft) => (draft.local.id === id ? change(draft) : draft)));
+
+  const startUpload = (draft: ComposerDraft, environment: EnvironmentId, owner: ComposerScope) => {
+    const { local, controller } = draft;
+    void prepareTurnAttachments({
+      environmentId: environment,
+      attachments: [local],
+      supportsImageUploads: true,
+      signal: controller.signal,
+    })
+      .then((result) => {
+        const stored = result.status === "ready" ? result.attachments[0] : undefined;
+        const storedId = stored !== undefined && "id" in stored ? stored.id : undefined;
+        if (stored === undefined || storedId === undefined) throw new Error("Upload cancelled.");
+        if (controller.signal.aborted || !owner.live) {
+          // Removed or unmounted while uploading: the server copy has no owner, so drop it.
+          void releasePendingAttachmentUploads(environment, [storedId]);
+          return;
+        }
+        patch(local.id, (current) => ({ ...current, uploaded: stored as StoredAttachment }));
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || !owner.live) return;
+        patch(local.id, (current) => ({ ...current, failed: true }));
+        Dialog.alert("Couldn't attach file", error instanceof Error ? error.message : "Try again.");
+      });
+  };
+
+  const addPicked = (
+    picked: ReadonlyArray<DraftComposerAttachment>,
+    owner: ComposerScope,
+    environment: EnvironmentId,
+  ) => {
+    // The picker finished after the composer was retired: its copies have no owner, so drop them
+    // and do not start uploads for them.
+    if (!owner.live) {
+      void releaseUnusedComposerAttachmentFiles(picked);
+      return;
+    }
+    if (picked.length === 0) return;
+    const fresh = picked.map((local) => ({
+      local,
+      uploaded: null,
+      failed: false,
+      controller: new AbortController(),
+    }));
+    setDrafts((current) => [...current, ...fresh]);
+    for (const draft of fresh) startUpload(draft, environment, owner);
+  };
+
+  const pick = async (kind: "media" | "files") => {
+    const owner = scope.current;
+    const environment = environmentId;
+    if (environment === null) return;
+    const result =
+      kind === "files"
+        ? await pickComposerFiles({ existingCount: drafts.length, maxBytes: maxFileBytes })
+        : await pickComposerMedia({ existingCount: drafts.length, maxVideoBytes: maxFileBytes });
+    addPicked("files" in result ? result.files : result.attachments, owner, environment);
+    if (result.error && owner.live) Dialog.alert("Could not attach file", result.error);
+  };
+
+  const retry = (id: string) => {
+    const draft = drafts.find((candidate) => candidate.local.id === id);
+    if (draft === undefined || environmentId === null) return;
+    const fresh = { ...draft, failed: false, controller: new AbortController() };
+    setDrafts((current) => current.map((other) => (other.local.id === id ? fresh : other)));
+    startUpload(fresh, environmentId, scope.current);
+  };
+
+  const removeDraft = (id: string) => {
+    const removed = drafts.find((draft) => draft.local.id === id);
+    if (removed === undefined) return;
+    removed.controller.abort();
+    setDrafts((current) => current.filter((draft) => draft.local.id !== id));
+    if (removed.uploaded !== null && environmentId !== null) {
+      void releasePendingAttachmentUploads(environmentId, [removed.uploaded.id]);
+    }
+    void releaseUnusedComposerAttachmentFiles([removed.local]);
+  };
+
   const send = () => {
+    if (blocked) return;
     const body = text.trim();
-    if (body === "" || action.pending) return;
+    const sending = drafts;
+    const stored = sending.flatMap((draft) => (draft.uploaded ? [draft.uploaded] : []));
+    const owner = scope.current;
+    sendingRef.current = sending;
     setText("");
+    setDrafts([]);
     setField((key) => key + 1);
     void action
       .run("Couldn't send", async () => {
-        const discussionId = props.discussionId ?? (await props.ensureDiscussion(body));
-        await kanbanClient().post(props.boardId, discussionId, [{ _tag: "md", text: body }]);
+        const discussionId =
+          props.discussionId ?? (await props.ensureDiscussion(firstSendText(body, stored)));
+        await kanbanClient().post(props.boardId, discussionId, sendBlocks(body, stored));
       })
       .then((sent) => {
-        if (sent) props.onSent();
-        else setText((current) => (current === "" ? body : current));
+        sendingRef.current = [];
+        if (sent) {
+          // Sent: the local copies are kept only while a draft or queued send still needs them.
+          void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
+          if (owner.live) props.onSent();
+          return;
+        }
+        if (!owner.live) {
+          // The composer is gone, so nothing can restore the batch: release its files and uploads.
+          for (const draft of sending) draft.controller.abort();
+          const ids = sending.flatMap((draft) =>
+            draft.uploaded === null ? [] : [draft.uploaded.id],
+          );
+          if (environmentRef.current !== null && ids.length > 0) {
+            void releasePendingAttachmentUploads(environmentRef.current, ids);
+          }
+          void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
+          return;
+        }
+        // A failed send gives the text and files back so the owner can send again.
+        setText((current) => (current === "" ? body : current));
+        setDrafts((current) => [...sending, ...current]);
       });
   };
+
   return (
-    <View className="bg-screen px-3 pt-2" style={{ paddingBottom: props.bottomInset }}>
-      <View className="flex-row items-end gap-1.5 rounded-[22px] bg-card py-1.5 pl-4 pr-1.5">
+    <View className="gap-2 bg-screen px-3 pt-2" style={{ paddingBottom: props.bottomInset }}>
+      {drafts.length > 0 ? (
+        <View className="flex-row flex-wrap gap-2">
+          {drafts.map((draft) => (
+            <DraftChip
+              key={draft.local.id}
+              draft={draft}
+              onRetry={() => retry(draft.local.id)}
+              onRemove={() => removeDraft(draft.local.id)}
+            />
+          ))}
+        </View>
+      ) : null}
+      <View className="flex-row items-end gap-1.5 rounded-[22px] bg-card py-1.5 pl-1.5 pr-1.5">
+        {canAttach ? (
+          <ComposerAttachmentButton
+            disabled={action.pending}
+            supportsFiles={capabilities?.fileAttachments !== undefined}
+            onPickMedia={() => pick("media")}
+            onPickFiles={() => pick("files")}
+          />
+        ) : null}
         <AppTextInput
           key={field}
           // The new input after a send takes the focus back, so the keyboard stays up.
@@ -609,22 +1111,83 @@ function Composer(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send"
-          accessibilityState={{ disabled: empty || action.pending }}
-          disabled={empty || action.pending}
+          accessibilityState={{ disabled: blocked }}
+          disabled={blocked}
           onPress={send}
           className={cn(
-            "size-8 items-center justify-center rounded-full",
-            empty || action.pending ? "bg-secondary" : "bg-foreground",
+            "mr-1 size-8 items-center justify-center rounded-full",
+            blocked ? "bg-secondary" : "bg-foreground",
           )}
         >
           <SymbolView
             name="arrow.up"
             size={15}
-            tintColorClassName={empty || action.pending ? "accent-icon-muted" : "accent-screen"}
+            tintColorClassName={blocked ? "accent-icon-muted" : "accent-screen"}
             type="monochrome"
           />
         </Pressable>
       </View>
+    </View>
+  );
+}
+
+/**
+ * A picked file as a removable chip: a thumbnail for pictures, the name and size otherwise. A
+ * failed upload stays as a chip that can be retried, so it is never silently dropped.
+ */
+function DraftChip(props: {
+  readonly draft: ComposerDraft;
+  readonly onRetry: () => void;
+  readonly onRemove: () => void;
+}) {
+  const { local } = props.draft;
+  const uploading = props.draft.uploaded === null && !props.draft.failed;
+  const previewUri = "previewUri" in local ? local.previewUri : null;
+  return (
+    <View className="max-w-full flex-row items-center gap-2 rounded-[12px] bg-screen py-1.5 pl-1.5 pr-1">
+      {previewUri ? (
+        <Image
+          source={{ uri: previewUri }}
+          contentFit="cover"
+          style={{ width: 36, height: 36, borderRadius: 8 }}
+          accessibilityIgnoresInvertColors
+        />
+      ) : null}
+      <View className="min-w-0 shrink">
+        <Text numberOfLines={1} className="text-[13px] font-t3-medium text-foreground">
+          {local.name}
+        </Text>
+        <Text className="text-[11px] text-foreground-muted">
+          {props.draft.failed
+            ? "Failed"
+            : uploading
+              ? "Uploading…"
+              : formatAttachmentSize(local.sizeBytes)}
+        </Text>
+      </View>
+      {props.draft.failed ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Retry ${local.name}`}
+          onPress={props.onRetry}
+          className="h-7 justify-center rounded-full px-2"
+        >
+          <Text className="text-[12px] font-t3-medium text-foreground">Retry</Text>
+        </Pressable>
+      ) : null}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Remove ${local.name}`}
+        onPress={props.onRemove}
+        className="size-7 items-center justify-center rounded-full"
+      >
+        <SymbolView
+          name="xmark"
+          size={11}
+          tintColorClassName="accent-icon-muted"
+          type="monochrome"
+        />
+      </Pressable>
     </View>
   );
 }

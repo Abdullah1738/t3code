@@ -20,6 +20,7 @@ import { FeedError, LoadingLine } from "../common/FeedError";
 import { ActionButton, EmptyLine } from "../common/parts";
 import { confirmAction, useBoardAction } from "../common/hooks";
 import { Chat } from "./Chat";
+import { copyLinkAction } from "./copyLink";
 import { kanbanClient, useKanbanCard, useKanbanCardFeed } from "./kanbanStore";
 import { cardGlyph, prGlyph, stageGlyph } from "./logic";
 import { ChipLink, DetailRow, FlagLine, Glyph, KChip, PriorityBars, UnderlineTabs } from "./parts";
@@ -172,7 +173,13 @@ function CardHeader(props: {
           {card.description}
         </Text>
       ) : null}
-      <CardActions card={card} />
+      <View className="flex-row flex-wrap gap-2">
+        <ActionButton
+          label="Copy link"
+          onPress={copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`).onPress}
+        />
+        <CardActions card={card} />
+      </View>
     </View>
   );
 }

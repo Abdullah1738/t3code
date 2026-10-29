@@ -11,8 +11,8 @@ then install.
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
 | `libexec/qcard/` | `~/.local/libexec/qcard/` | `qcard` |
 | `juno-proxy/` | `~/.local/share/juno-proxy/` | `com.abdullah.juno-proxy`: HTTP/CONNECT proxy and `/proxy.pac` on the Tailscale IP, port 8118, so tailnet devices reach Juno hosts through this Mac's VPN |
-| `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents |
-| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less) |
+| `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents; `cards-tunnel`, `cards-health` and `cards-tunnel-setup` for the card links |
+| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less), `com.ardud.cards-tunnel` (the named Cloudflare tunnel for cards.abdullah.fund), `com.ardud.cards-health` (every 5 min: restarts the tunnel when the public link stops answering, Telegram after two misses and when it's back) |
 
 `install.zsh` also keeps two links in `~/.local/bin`: `wa` and `mailsend`
 point at the deployed robob-watch helpers (deploy robob-watch first). It
@@ -63,3 +63,9 @@ Nothing is sent unless that file was written.
 Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
+
+Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.fund/s/<token>/` from
+127.0.0.1:18793 (its config.json `shareOrigin`). `cards-tunnel` runs the named Cloudflare tunnel that forwards
+there; both agents idle until the tunnel exists. One time, after Abdullah ran `cloudflared tunnel login` and
+picked abdullah.fund: `~/.local/bin/cards-tunnel-setup` creates the tunnel (credentials in
+`~/.cloudflared/cards-tunnel.json`, never in this repo), points the DNS name at it and starts it.

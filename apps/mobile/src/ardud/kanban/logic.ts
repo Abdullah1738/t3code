@@ -1,11 +1,13 @@
 import type {
+  ChatFileAttachment,
+  ChatImageAttachment,
   KanbanAnswer,
   KanbanBlock,
   KanbanLink,
   KanbanParticipant,
   KanbanStage,
 } from "@t3tools/contracts";
-import type { StageBoard } from "@t3tools/client-runtime/ardud/kanban";
+import { ownerChoiceAnswer, type StageBoard } from "@t3tools/client-runtime/ardud/kanban";
 
 /** Completed, Deployed and Verified share one Shipped tab. */
 export type BoardTab = "todo" | "working" | "needs_review" | "in_review" | "shipped";
@@ -128,12 +130,20 @@ export interface ChoiceOptionView {
 export function choiceView(
   block: ChoiceBlock,
   answers: ReadonlyArray<KanbanAnswer>,
-): { readonly options: ChoiceOptionView[]; readonly answered: number; readonly mine: string[] } {
+): {
+  readonly options: ChoiceOptionView[];
+  readonly answered: number;
+  readonly mine: string[];
+  /** The owner's own words on this block, or null when he wrote none. */
+  readonly mineText: string | null;
+} {
   const own = answers.filter((answer) => answer.blockId === block.id);
-  const mine = own.find((answer) => answer.by._tag === "owner")?.choice ?? [];
+  const ownerAnswer = ownerChoiceAnswer(block, answers);
+  const mine = ownerAnswer?.choice ?? [];
   return {
     answered: own.length,
     mine: [...mine],
+    mineText: ownerAnswer?.text ?? null,
     options: block.options.map((option) => {
       const count = own.filter((answer) => answer.choice.includes(option.id)).length;
       return {
@@ -213,4 +223,116 @@ export function kanbanRecordState(
   const id = params?.id?.trim() || null;
   if (id === null && (kind === "card" || kind === "goal")) return null;
   return { kind, boardId, id };
+}
+
+/**
+ * Where a board link opens, as the record params the pushed screen reads: the
+ * card or discussion on this board. A link to another board, or to a record
+ * that isn't on this board, opens nothing (null).
+ */
+export function kanbanLinkTarget(
+  link: { readonly kind: string; readonly id: string },
+  boardId: string,
+  board: {
+    readonly cards: ReadonlyMap<string, unknown>;
+    readonly discussions: ReadonlyMap<string, unknown>;
+  },
+): { readonly kind: "card" | "discussion"; readonly boardId: string; readonly id: string } | null {
+  if (link.kind === "kanban-card") {
+    return board.cards.has(link.id) ? { kind: "card", boardId, id: link.id } : null;
+  }
+  if (link.kind === "kanban-discussion") {
+    return board.discussions.has(link.id) ? { kind: "discussion", boardId, id: link.id } : null;
+  }
+  return null;
+}
+
+/** An attachment the server has stored, as a block refers to it. */
+export type StoredAttachment = ChatImageAttachment | ChatFileAttachment;
+
+/** The blocks one send posts: the text first (when there is any), then each attachment in order. */
+export function sendBlocks(
+  text: string,
+  attachments: ReadonlyArray<StoredAttachment>,
+): KanbanBlock[] {
+  const body = text.trim();
+  return [
+    ...(body === "" ? [] : [{ _tag: "md" as const, text: body }]),
+    ...attachments.map((attachment) => ({ _tag: "attachment" as const, attachment })),
+  ];
+}
+
+/** What a new discussion is titled from: the text, else the first file's name, else nothing. */
+export function firstSendText(
+  text: string,
+  attachments: ReadonlyArray<{ readonly name: string }>,
+): string {
+  const body = text.trim();
+  return body !== "" ? body : (attachments[0]?.name ?? "");
+}
+
+export type BlockRun =
+  | { readonly kind: "block"; readonly index: number; readonly block: KanbanBlock }
+  | {
+      readonly kind: "attachments";
+      readonly index: number;
+      readonly attachments: ReadonlyArray<StoredAttachment>;
+    };
+
+/** Consecutive attachment blocks share one wrapping row; every other block stands alone. */
+export function groupBlockRuns(blocks: ReadonlyArray<KanbanBlock>): BlockRun[] {
+  const runs: BlockRun[] = [];
+  blocks.forEach((block, index) => {
+    if (block._tag !== "attachment") {
+      runs.push({ kind: "block", index, block });
+      return;
+    }
+    const last = runs.at(-1);
+    if (last?.kind === "attachments") {
+      runs[runs.length - 1] = { ...last, attachments: [...last.attachments, block.attachment] };
+    } else {
+      runs.push({ kind: "attachments", index, attachments: [block.attachment] });
+    }
+  });
+  return runs;
+}
+
+/**
+ * A native filter-menu action id. Facet values are the same strings the menu
+ * was built from: priorities are numbers, the rest are goal ids, project and
+ * model names; "" marks the "No ..." option.
+ */
+export type FilterAction =
+  | { readonly kind: "toggle"; readonly facet: "priorities"; readonly value: number }
+  | {
+      readonly kind: "toggle";
+      readonly facet: "goalIds" | "projects" | "models";
+      readonly value: string;
+    }
+  | { readonly kind: "clear" };
+
+export function filterActionId(action: FilterAction): string {
+  if (action.kind === "clear") return "clear";
+  const key = { priorities: "priority", goalIds: "goal", projects: "project", models: "model" }[
+    action.facet
+  ];
+  return `${key}:${action.value}`;
+}
+
+export function parseFilterAction(id: string): FilterAction | null {
+  if (id === "clear") return { kind: "clear" };
+  const separator = id.indexOf(":");
+  if (separator < 0) return null;
+  const key = id.slice(0, separator);
+  const value = id.slice(separator + 1);
+  if (key === "priority") {
+    const priority = Number(value);
+    return Number.isInteger(priority) && priority >= 1 && priority <= 5
+      ? { kind: "toggle", facet: "priorities", value: priority }
+      : null;
+  }
+  if (key === "goal") return { kind: "toggle", facet: "goalIds", value };
+  if (key === "project") return { kind: "toggle", facet: "projects", value };
+  if (key === "model") return { kind: "toggle", facet: "models", value };
+  return null;
 }

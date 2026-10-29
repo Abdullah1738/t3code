@@ -8,6 +8,7 @@ import {
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanDiscussion,
   type KanbanGroup,
   type KanbanPool,
   type KanbanStage,
@@ -119,6 +120,48 @@ export function prsLanded(card: KanbanCard): boolean {
     .every((link) => link.state === "merged" || link.state === "closed");
 }
 
+export const DISCUSSION_IDLE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A discussion settles itself after a quiet day unless it is pinned, snoozed, being replied to, or its card is still open.
+ * The caller checks threads.
+ */
+export function discussionSettleDue(
+  discussion: KanbanDiscussion,
+  card: KanbanCard | null,
+  nowMs: number,
+): boolean {
+  if (discussion.archivedAt !== null || discussion.settledAt !== null) return false;
+  if (discussion.pinnedAt !== null) return false;
+  if (discussion.snoozedUntil !== null && Date.parse(discussion.snoozedUntil) > nowMs) return false;
+  if (discussion.participants.some((participant) => participant.typingUntil !== null)) return false;
+  if (card !== null && card.stage !== "verified") return false;
+  const quietSince = Math.max(
+    Date.parse(discussion.lastMessageAt ?? discussion.createdAt),
+    discussion.reopenedAt === null ? 0 : Date.parse(discussion.reopenedAt),
+    discussion.snoozedUntil === null ? 0 : Date.parse(discussion.snoozedUntil),
+  );
+  return nowMs - quietSince >= DISCUSSION_IDLE_MS;
+}
+
+export const WORKER_QUIET_MS = 30 * 60 * 1000;
+
+/** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
+export function workerQuietDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly updatedAt: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle" && view.state !== "needs-input") return false;
+  const since = Math.max(
+    Date.parse(view.updatedAt),
+    Date.parse(card.movedAt),
+    card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+  );
+  return nowMs - since >= WORKER_QUIET_MS;
+}
+
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
 export const isBlocked = (
   card: KanbanCard,
@@ -220,6 +263,8 @@ export function planDispatch(
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
 ): ReadonlyArray<Dispatch> {
+  // A board's first setup holds all card work and review until the setup evaluator ends it.
+  if (board.setup?.status === "running") return [];
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
@@ -306,6 +351,8 @@ export interface ClaimContext {
  * outside the thread.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
+  // Same hold as planDispatch: no card work starts while the board's setup runs.
+  if (board.setup?.status === "running") return no("Setup is running");
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

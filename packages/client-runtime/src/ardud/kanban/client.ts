@@ -1,3 +1,4 @@
+import { Atom } from "effect/reactivity";
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
@@ -35,7 +36,11 @@ import {
   type KanbanBoardState,
 } from "./boardState.ts";
 import { mergeBoardList } from "./threads.ts";
-import { isKanbanServerError, type KanbanTransport } from "./transport.ts";
+import {
+  isKanbanServerError,
+  type KanbanRequestTag,
+  type KanbanTransport,
+} from "./transport.ts";
 import { mergeMessages } from "./viewModel.ts";
 
 /**
@@ -67,6 +72,8 @@ export interface KanbanClient {
   scripts(boardId: string): SnapshotStore<ReadonlyArray<KanbanScript>>;
   /** A script's recent runs, newest first, kept current by the board feed. */
   scriptRuns(boardId: string, scriptId: string): SnapshotStore<ReadonlyArray<KanbanScriptRun>>;
+  /** Whether the connection's grants allow a kanban write, read as an atom to gate its control. */
+  permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
 
   patchCard(input: KanbanCardPatchInput): Promise<void>;
   settleCard(cardId: string): Promise<void>;
@@ -76,7 +83,10 @@ export interface KanbanClient {
   /** The card's discussion, created on first use. */
   cardDiscussion(boardId: string, cardId: string): Promise<KanbanDiscussion>;
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
+  removePool(boardId: string, model: ModelSelection): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
+  /** Owner ends the board's running setup; card work resumes. */
+  endSetup(boardId: string): Promise<void>;
   createDiscussion(boardId: string, title: string): Promise<KanbanDiscussion>;
   /** Owner rename, settle or snooze; the board feed brings the result. */
   updateDiscussion(
@@ -747,6 +757,7 @@ export function createKanbanClient(
     owner: (threadId: string) => owners(threadId),
     scripts,
     scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
+    permission: (tag) => transport.permission(tag),
 
     async patchCard(input) {
       await transport.request(M.cardPatch, input);
@@ -768,8 +779,14 @@ export function createKanbanClient(
     async setPool(boardId, model, slots) {
       await transport.request(M.poolSet, { boardId: boardId as never, model, slots });
     },
+    async removePool(boardId, model) {
+      await transport.request(M.poolRemove, { boardId: boardId as never, model });
+    },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);
+    },
+    async endSetup(boardId) {
+      await transport.request(M.setupEnd, { boardId: boardId as never });
     },
     async createDiscussion(boardId, title) {
       const discussion = await transport.request(M.discussionCreate, {

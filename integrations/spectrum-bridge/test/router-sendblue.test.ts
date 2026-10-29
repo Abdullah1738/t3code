@@ -129,6 +129,14 @@ test("group batches name each sender, and guests carry their address", async () 
   setSystemTime(start);
 });
 
+test("group prompts say app cards are not available, owner and Moni keep the app line", async () => {
+  const group = sendblueContextPrompt(context("group"), false, []);
+  expect(group).toContain("app cards are not available in groups");
+  expect(group).not.toContain("App cards still work");
+  expect(sendblueContextPrompt(context("owner"), false, [])).toContain("App cards still work (`app`)");
+  expect(sendblueContextPrompt(context("dm"), false, [])).toContain("App cards still work (`app`)");
+});
+
 test("the owner's own chat keeps its text unprefixed", async () => {
   const start = Date.parse("2026-10-21T13:00:00Z");
   setSystemTime(start);
@@ -150,6 +158,10 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).toContain("without asking the owner");
   expect(admin).toContain("confirm with the admin who asked instead");
   expect(admin).toContain("Anything special they ask for");
+  expect(admin).toContain("group chats Moni has written in");
+  expect(admin).toContain("send --to <slug>");
+  const person = sendblueContextPrompt(context("dm", { roleOf: address => ({ name: address, role: "person" }) }), false, []);
+  expect(person).not.toContain("send --to");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");

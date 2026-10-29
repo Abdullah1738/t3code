@@ -510,8 +510,8 @@ async function sendCommand(command: Command): Promise<unknown> {
             return;
           }
           if (!ok) {
-            // Only the daemon's sanitized error field may be surfaced, never the raw body.
-            const detail = !queued && data && typeof data === "object" && !Array.isArray(data) && "error" in data && typeof data.error === "string"
+            // Only the daemon's sanitized error field may be surfaced, never the raw body. 403/404/422 carry fixed refusal reasons, never a queued body.
+            const detail = (!queued || status === 403 || status === 404 || status === 422) && data && typeof data === "object" && !Array.isArray(data) && "error" in data && typeof data.error === "string"
               ? data.error.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 512) : "";
             reject(new CliError(`Bridge request failed (HTTP ${status})${detail ? `: ${detail}` : ""}`));
             return;

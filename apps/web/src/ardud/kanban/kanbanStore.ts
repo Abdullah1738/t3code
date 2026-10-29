@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import { useSyncExternalStore } from "react";
 
 import type {
@@ -13,6 +14,7 @@ import {
   boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
+  type KanbanRequestTag,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { FeedFailure, SnapshotStore } from "@t3tools/client-runtime/ardud/common";
@@ -105,15 +107,25 @@ export function useBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow>
   return useStore(kanban.threads(boardId));
 }
 
+/**
+ * Whether this connection's grants allow a kanban write. The server still
+ * checks every call; this only decides whether the control is offered.
+ */
+export function useKanbanPermission(tag: KanbanRequestTag): boolean {
+  return useAtomValue(kanban.permission(tag));
+}
+
 export function useScripts(boardId: string): ReadonlyArray<KanbanScript> | undefined {
   return useStore(kanban.scripts(boardId));
 }
 
-export function useScriptRuns(
+/** A script's runs with the read's failure and retry, so a failed read can say so. */
+export function useScriptRunsFeed(
   boardId: string,
   scriptId: string,
-): ReadonlyArray<KanbanScriptRun> | undefined {
-  return useStore(kanban.scriptRuns(boardId, scriptId));
+): { readonly runs: ReadonlyArray<KanbanScriptRun> | undefined; readonly feed: FeedState } {
+  const store = kanban.scriptRuns(boardId, scriptId);
+  return { runs: useStore(store), feed: useFeed(store) };
 }
 
 export interface FeedState {

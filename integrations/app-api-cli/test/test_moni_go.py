@@ -464,5 +464,443 @@ class CliGateTests(unittest.TestCase):
         self.assertEqual(purchase.call_count, 2)
 
 
+def _bridge_payload(text, sender, minutes_ago, *, audio=False):
+    at = int((NOW - dt.timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    # The bridge writes sentAt (her send time) alongside receivedAt; tests use the real shape.
+    return {'text': text, 'sender': sender, 'isAudioMessage': audio, 'receivedAt': at, 'sentAt': at}
+
+
+class GroupChatGoTests(unittest.TestCase):
+    """Her go counts in her 1:1 and any group chat; only her addresses count in a group."""
+
+    def setUp(self):
+        self.root = _tempfile.mkdtemp(prefix='moni-chats-test-')
+        self.env = patch.dict(_os.environ, {'MONI_BRIDGE_CHATS_DIR': self.root}, clear=False)
+        self.env.start()
+        _os.environ.pop('MONI_BRIDGE_DB', None)
+        self.addCleanup(self.env.stop)
+
+    def chat(self, slug, *rows):
+        d = _os.path.join(self.root, slug)
+        _os.makedirs(d, exist_ok=True)
+        path = _os.path.join(d, 'state.sqlite')
+        if _os.path.exists(path):
+            _os.unlink(path)
+        con = sqlite3.connect(path)
+        con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+        for i, (payload) in enumerate(rows, 1):
+            con.execute('insert into inbound values (?, ?, ?)', (f'{slug}-{i}', json.dumps(payload), 'done'))
+        con.commit()
+        con.close()
+        return path
+
+    def verify(self, go, *, chat=None, runner=None):
+        return moni_go.verify(go, now=NOW, runner=runner or history(), chat=chat)
+
+    def test_go_in_group_counts_by_default(self):
+        self.chat('moni')
+        self.chat('group-sb_gro', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        got = self.verify('Order pls')
+        self.assertEqual(got['text'], 'Order pls')
+
+    def test_abdullah_in_group_is_ignored(self):
+        self.chat('moni')
+        self.chat('group-sb_gro', _bridge_payload('order pls', '+971585134795', 3),
+                  _bridge_payload('wait', '+971585134795', 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('order pls')
+        self.chat('group-sb_gro', _bridge_payload('order pls', moni_go.MONI_NUMBER, 5),
+                  _bridge_payload('cancel', '+971585134795', 2))
+        self.assertEqual(self.verify('order pls')['text'], 'order pls')
+
+    def test_go_in_1to1_then_cancel_in_group_is_cancelled(self):
+        self.chat('moni', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        self.chat('group-sb_gro', _bridge_payload('nvm leave it', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_go_in_group_then_cancel_in_1to1_is_cancelled(self):
+        self.chat('moni', _bridge_payload('nvm leave it', moni_go.MONI_NUMBER, 2))
+        self.chat('group-sb_gro', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_chat_reads_only_moni_and_that_group(self):
+        self.chat('moni')
+        self.chat('group-test', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        self.chat('group-other', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        self.assertEqual(self.verify('Order pls', chat='group-test')['text'], 'Order pls')
+        self.chat('group-test')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('Order pls', chat='group-test')
+
+    def test_invalid_chat_slug_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_CHAT_INVALID'):
+            self.verify('Order pls', chat='../x')
+
+    def test_missing_chat_dir_is_unverifiable(self):
+        self.chat('moni')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.verify('Order pls', chat='group-missing')
+
+    def test_broken_group_db_is_unverifiable(self):
+        self.chat('moni')
+        d = _os.path.join(self.root, 'group-broken')
+        _os.makedirs(d)
+        with open(_os.path.join(d, 'state.sqlite'), 'w') as f:
+            f.write('not a database')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.verify('Order pls')
+
+    def test_legacy_env_db_in_group_dir_applies_sender_filter(self):
+        path = self.chat('group-sb_gro', _bridge_payload('order pls', '+971585134795', 3),
+                         _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        with patch.dict(_os.environ, {'MONI_BRIDGE_DB': path}):
+            got = self.verify('Order pls')
+        self.assertEqual(got['text'], 'Order pls')
+        self.assertEqual(moni_go.read_bridge(path)[0]['text'], 'Order pls')
+        self.assertEqual(len(moni_go.read_bridge(path)), 1)
+
+    def test_lithuanian_and_attachment_tapbacks_never_start_an_order(self):
+        self.chat('moni', _bridge_payload('Labai patiko \u201eOrder pls\u201c', moni_go.MONI_NUMBER, 3),
+                  _bridge_payload('Loved an image', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('Order pls')
+
+    def test_tapback_can_call_off_a_go(self):
+        self.chat('moni', _bridge_payload('yes order it', moni_go.MONI_NUMBER, 5))
+        self.chat('group-sb_gro', _bridge_payload('Pasijuokta i\u0161 \u201envm\u201c', moni_go.MONI_NUMBER, 2))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it')
+
+    def test_cli_check_accepts_chat_flag(self):
+        self.chat('moni')
+        self.chat('group-test', _bridge_payload('Order pls', moni_go.MONI_NUMBER, 2))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = moni_go.main(['check', '--go', 'Order pls', '--chat', 'group-test'], runner=history(), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out.getvalue())['ok'])
+
+    def test_commerce_passes_moni_chat_to_verify(self):
+        with patch.object(c, 'purchase_talabat', return_value={'ok': True}), \
+                patch.object(moni_go, 'verify', return_value={'message_id': 1}) as verify:
+            code = c.main(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+                           '--moni-go', 'Order pls', '--moni-chat', 'group-sb_gro'])
+        self.assertEqual(code, 0)
+        verify.assert_called_once_with('Order pls', chat='group-sb_gro')
+
+
+class DelayedSourceOrderTests(unittest.TestCase):
+    """Bridge rows sent at one time can be ingested later; cross-source order must not trust receipt time."""
+
+    def sent(self, row_id, text, sent_ago, recv_ago, *, group=None, sender=moni_go.MONI_NUMBER):
+        at = lambda m: int((NOW - dt.timedelta(minutes=m)).timestamp() * 1000)
+        payload = {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                   'receivedAt': at(recv_ago), 'sentAt': at(sent_ago), 'source': 'typed', 'sender': sender}
+        return (row_id, payload, 'done'), group
+
+    def recv_only(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db):
+        root = _tempfile.mkdtemp(prefix='moni-delay-test-')
+        dbs = {}
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            dbs[name] = path
+        paths = list(dbs.values())
+        return moni_go.verify(go, now=NOW, runner=history(), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_group_go_sent_before_her_1to1_cancel_is_called_off_even_if_received_later(self):
+        go, _ = self.sent('G1', 'yes order it', sent_ago=5, recv_ago=1)
+        cancel, _ = self.sent('P1', 'nvm', sent_ago=2, recv_ago=2)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [go], 'moni': [cancel]})
+
+    def test_1to1_go_sent_before_group_cancel_is_called_off_even_if_received_later(self):
+        go, _ = self.sent('P1', 'yes order it', sent_ago=5, recv_ago=1)
+        cancel, _ = self.sent('G1', 'nvm', sent_ago=2, recv_ago=2)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'moni': [go], 'group-sb_gro': [cancel]})
+
+    def test_cancel_sent_clearly_before_the_go_does_not_count_across_groups(self):
+        cancel, _ = self.sent('G1', 'nvm', sent_ago=20, recv_ago=1)
+        go, _ = self.sent('G2', 'yes order it', sent_ago=5, recv_ago=5)
+        got = self.run_case('yes order it', {'moni': [], 'group-a': [cancel], 'group-b': [go]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_ambiguous_cross_group_order_fails_closed(self):
+        # No sentAt on either row: ordering is only receipt time, so a close cancel may really follow the go.
+        go = self.recv_only('G1', 'yes order it', 5)
+        cancel = self.recv_only('G2', 'nvm', 4)
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [], 'group-a': [go], 'group-b': [cancel]})
+
+    def test_missing_sent_time_falls_back_to_received(self):
+        at = int((NOW - dt.timedelta(minutes=3)).timestamp() * 1000)
+        row = ('R1', {'id': 'R1', 'text': 'yes order it', 'isAudioMessage': False, 'attachments': [],
+                      'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+        self.assertEqual(self.run_case('yes order it', {'moni': [row]})['text'], 'yes order it')
+
+
+class ReceiptGapOrderTests(unittest.TestCase):
+    """Receipt-only rows are upper bounds on send time: a cross-DB cancel is ordered only when provable.
+
+    A timed row (sentAt) keeps its send time; a receipt-only row was sent no later than its receipt.
+    Gaps here are well past 15 minutes, so a fixed skew window would wrongly trust the receipt order.
+    """
+
+    def timed(self, row_id, text, sent_ago, *, sender=moni_go.MONI_NUMBER):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': sender}, 'done')
+
+    def recv(self, row_id, text, recv_ago, *, sender=moni_go.MONI_NUMBER):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': sender}, 'done')
+
+    def run_case(self, go, rows_by_db):
+        root = _tempfile.mkdtemp(prefix='moni-gap-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_both_receipt_only_20_min_apart_fails_closed_group_then_1to1(self):
+        # Go received 1 min ago could have been sent before the cancel received 20 min ago.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 1)],
+                                           'moni': [self.recv('P1', 'nvm', 20)]})
+
+    def test_both_receipt_only_20_min_apart_fails_closed_1to1_then_group(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.recv('P1', 'yes order it', 1)],
+                                           'group-sb_gro': [self.recv('G1', 'nvm', 20)]})
+
+    def test_both_receipt_only_20_min_apart_fails_closed_group_then_group(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-a': [self.recv('G1', 'yes order it', 1)],
+                                           'group-b': [self.recv('G2', 'nvm', 20)]})
+
+    def test_timed_go_with_receipt_only_cancel_received_long_after_fails_closed(self):
+        # Go sent 20 min ago; the cancel was received 1 min ago but may have been sent 19 min ago, after it.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'yes order it', 20)],
+                                           'group-sb_gro': [self.recv('G1', 'nvm', 1)]})
+
+    def test_receipt_only_go_with_timed_cancel_sent_long_before_fails_closed(self):
+        # Cancel sent 20 min ago; the go was received 1 min ago, so it may have been sent after the cancel.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 1)],
+                                           'moni': [self.timed('P1', 'nvm', 20)]})
+
+    def test_receipt_only_cancel_received_before_timed_go_was_sent_is_provably_earlier(self):
+        # The cancel was sent no later than 30 min ago; the go was sent 5 min ago, so the go stands.
+        got = self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'nvm', 30)],
+                                             'moni': [self.timed('P1', 'yes order it', 5)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_receipt_only_go_received_before_timed_cancel_was_sent_is_called_off(self):
+        # The go was sent no later than 30 min ago, before the cancel sent 5 min ago: a real cancel after the go.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [self.recv('G1', 'yes order it', 30)],
+                                           'moni': [self.timed('P1', 'nvm', 5)]})
+
+    def test_both_timed_across_dbs_use_sent_order(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'group-sb_gro': [self.timed('G1', 'yes order it', 20)],
+                                           'moni': [self.timed('P1', 'nvm', 2)]})
+        got = self.run_case('yes order it', {'group-sb_gro': [self.timed('G1', 'nvm', 20)],
+                                             'moni': [self.timed('P1', 'yes order it', 2)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+
+class ReplacedGoOrderTests(unittest.TestCase):
+    """A short repeat of her go must not restart an order whose earlier go is unprovably ordered."""
+
+    def timed(self, row_id, text, sent_ago, *, group=None):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-replace-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_short_repeat_in_chat_45_does_not_restart_an_ambiguous_group_go(self):
+        # Receipt-only group go 'ok psl' (received 5 min ago) vs her 1:1 cancel (received 20 min ago): unprovable.
+        # A repeat 'ok psl' in chat 45 one minute ago must not make the order stand.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'group-sb_gro': [self.recv('G1', 'ok psl', 5)],
+                                     'moni': [self.recv('P1', 'nvm', 20)]},
+                          chat_45=[msg('ok psl', 1, mid=900)])
+
+    def test_short_repeat_in_timed_group_does_not_restart_an_ambiguous_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'group-sb_gro': [self.recv('G1', 'ok psl', 5)],
+                                     'moni': [self.recv('P1', 'nvm', 20)],
+                                     'group-other': [self.timed('G2', 'ok psl', 1)]})
+
+    def test_repeat_after_a_provably_earlier_cancel_still_stands(self):
+        # The cancel was sent before the first go: nothing unprovable, so the repeat is the go that stands.
+        got = self.run_case('ok psl', {'group-sb_gro': [self.timed('G1', 'ok psl', 5)],
+                                       'moni': [self.timed('P1', 'nvm', 30)]},
+                            chat_45=[msg('ok psl', 1, mid=900)])
+        self.assertEqual(got['text'], 'ok psl')
+
+
+class ReplacementClearanceTests(unittest.TestCase):
+    """Uncertainty from a replaced go is cleared only by a clear final go provably sent after the cancel."""
+
+    def timed(self, row_id, text, sent_ago):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-clear-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_fresh_timed_go_in_chat_45_clears_the_earlier_uncertain_group_go(self):
+        got = self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                             'group-sb_gro': [self.recv('G1', 'yes order it', 5)]},
+                            chat_45=[msg('yes order it', 1, mid=900)])
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_fresh_timed_go_in_another_group_clears_the_earlier_uncertain_group_go(self):
+        got = self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                             'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                             'group-other': [self.timed('G2', 'yes order it', 1)]})
+        self.assertEqual(got['text'], 'yes order it')
+
+    def test_unclear_final_repeat_keeps_the_uncertainty(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('ok psl', {'moni': [self.timed('P1', 'nvm', 20)],
+                                     'group-sb_gro': [self.recv('G1', 'ok psl', 5)]},
+                          chat_45=[msg('ok psl', 1, mid=900)])
+
+    def test_final_repeat_with_only_receipt_time_cannot_prove_it_is_after_the_cancel(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                           'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                           'group-other': [self.recv('G2', 'yes order it', 1)]})
+
+    def test_fresh_go_not_proven_after_a_cancel_keeps_the_uncertainty(self):
+        # The cancel was sent after the fresh go's send time (both timed, cancel later): the cancel wins anyway.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.run_case('yes order it', {'moni': [self.timed('P1', 'nvm', 1)],
+                                           'group-sb_gro': [self.recv('G1', 'yes order it', 5)],
+                                           'group-other': [self.timed('G2', 'yes order it', 3)]})
+
+
+class MyselfClearanceTests(unittest.TestCase):
+    """'ok order it myself' is her ordering it herself, so it must not clear an unresolved cancel."""
+
+    def timed(self, row_id, text, sent_ago):
+        at = int((NOW - dt.timedelta(minutes=sent_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'sentAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def recv(self, row_id, text, recv_ago):
+        at = int((NOW - dt.timedelta(minutes=recv_ago)).timestamp() * 1000)
+        return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                         'receivedAt': at, 'source': 'typed', 'sender': moni_go.MONI_NUMBER}, 'done')
+
+    def run_case(self, go, rows_by_db, chat_45=()):
+        root = _tempfile.mkdtemp(prefix='moni-myself-test-')
+        paths = []
+        for name, rows in rows_by_db.items():
+            d = _os.path.join(root, name)
+            _os.makedirs(d)
+            path = _os.path.join(d, 'state.sqlite')
+            con = sqlite3.connect(path)
+            con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+            for row_id, payload, state in rows:
+                con.execute('insert into inbound values (?, ?, ?)', (row_id, json.dumps(payload), state))
+            con.commit()
+            con.close()
+            paths.append(path)
+        return moni_go.verify(go, now=NOW, runner=history(*chat_45), bridge=lambda: moni_go.read_bridges(paths))
+
+    def test_myself_repeat_in_chat_45_does_not_clear_the_uncertain_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                       'group-sb_gro': [self.recv('G1', 'order it', 5)]},
+                          chat_45=[msg('ok order it myself', 1, mid=900)])
+
+    def test_myself_repeat_in_timed_group_does_not_clear_the_uncertain_group_go(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                       'group-sb_gro': [self.recv('G1', 'order it', 5)],
+                                       'group-other': [self.timed('G2', 'ok order it myself', 1)]})
+
+    def test_ok_order_it_still_clears_the_uncertain_group_go_in_chat_45(self):
+        got = self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                         'group-sb_gro': [self.recv('G1', 'order it', 5)]},
+                            chat_45=[msg('ok order it', 1, mid=900)])
+        self.assertEqual(got['text'], 'ok order it')
+
+    def test_ok_order_it_still_clears_the_uncertain_group_go_in_a_timed_group(self):
+        got = self.run_case('order it', {'moni': [self.timed('P1', 'nvm', 20)],
+                                         'group-sb_gro': [self.recv('G1', 'order it', 5)],
+                                         'group-other': [self.timed('G2', 'ok order it', 1)]})
+        self.assertEqual(got['text'], 'ok order it')
+
+
 if __name__ == '__main__':
     unittest.main()

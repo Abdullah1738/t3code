@@ -437,7 +437,16 @@ const handlers = {
         );
         if (discussion.lastSeq > 0)
           yield* service.markRead(discussion.id, caller.actor, discussion.lastSeq);
-        return { discussion, messages };
+        // Agents open attachments by path; the id alone is not enough to read the file.
+        const withPaths = messages.map((message) => ({
+          ...message,
+          blocks: message.blocks.map((block) =>
+            block._tag === "attachment"
+              ? { ...block, path: service.attachmentPath(block.attachment) }
+              : block,
+          ),
+        }));
+        return { discussion, messages: withPaths };
       }),
     ),
   ),
@@ -614,6 +623,15 @@ const handlers = {
     ),
   ),
 
+  pool_remove: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { pools: yield* service.removePool(board.id, modelOf(input.model)) };
+      }),
+    ),
+  ),
+
   goal_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
@@ -696,6 +714,15 @@ const handlers = {
     ),
   ),
 
+  setup_done: McpToolAccess.actsAsCaller(() =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
@@ -704,11 +731,23 @@ const handlers = {
         let purpose: EvaluatorPurpose;
         if (input.kind === "setup" || input.kind === "request") {
           if (!text) return yield* invalid(`A ${input.kind} evaluator needs text.`);
-          purpose = { kind: input.kind, text };
+          purpose = {
+            kind: input.kind,
+            text,
+            ...(input.kind === "setup" ? { discussionId: input.discussionId ?? null } : {}),
+          };
         } else {
           purpose = { kind: input.kind };
         }
-        return { threadId: yield* service.startEvaluator(KanbanBoardId.make(board.id), purpose) };
+        // A sweep's text is added to its brief; setup/request already carry it in purpose.
+        const sweepText = purpose.kind === "setup" || purpose.kind === "request" ? undefined : text;
+        return {
+          threadId: yield* service.startEvaluator(
+            KanbanBoardId.make(board.id),
+            purpose,
+            sweepText || undefined,
+          ),
+        };
       }),
     ),
   ),

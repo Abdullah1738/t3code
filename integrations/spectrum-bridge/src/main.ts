@@ -178,7 +178,8 @@ async function main(): Promise<void> {
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
-  const shares = new Shares({ store, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  const shares = new Shares({ store, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
+    origin: config.shareOrigin });
   process.once("exit", () => shares.killAll());
   void shares.restore().catch(() => log("share-sweep-failed"));
   api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid, shares,

@@ -25,9 +25,16 @@ commerce item-options minutes --sku SKU --query "product name"
 noon-search --minutes "grenade white chocolate"      # pick the exact SKU
 commerce order minutes --sku SKU --quantity 1 \
     --cvv-from-keychain --label "minutes <item> x1 (CLI E2E test)"
-commerce await-payment FLOW_UUID [--minutes 4] [--no-notify]   # crash-resume status wait
+commerce await-payment FLOW_UUID [--minutes 10] [--no-notify]  # crash-resume status wait (default wait 10 min)
 commerce track-exact noon minutes ORDER_ID
 ```
+
+Noon can ask for the CVV on a cart (`isCvvRequired`). Such a cart is refused
+at prepare unless `--cvv-from-keychain` is given; with it, the CVV is encrypted
+and the flow places and pays. Without it, place fails `MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN`
+before anything is sent. Always pass `--cvv-from-keychain` for Minutes orders.
+Account/address verification is refreshed live for long baskets (>90 s), so a
+slow basket no longer dies at 120 s.
 
 `--cvv-from-keychain` reads the saved-card CVV from Keychain
 (`robob-card` / `Marriott.card_cvc`) into process RAM through a captured
@@ -87,9 +94,12 @@ argument, file, journal entry or log line.
    is_3ds_failure:false}`.
 8. **3DS wait.** The challenge is out-of-band (owner approves in the ENBD X
    app). On `payment_pending` the flow immediately sends the owner one
-   Telegram attention ping (key `minutes-cli-3ds-<order_nr>`, ~2 min window),
-   then polls `POST …/paymentintent/status` `{"clientSecret":…}` every 5 s for
-   up to 4 min. Observed transitions: `payment_pending/CREATED` →
+   Telegram attention ping ("this is ours: approve noon Minutes AED X in ENBD X
+   now (order …)", source `Noon payment`, key `minutes-cli-3ds-<order_nr>`).
+   It then polls `POST …/paymentintent/status` `{"clientSecret":…}` every 5 s
+   for up to 10 min. If still unpaid after 300 s, a second alert fires once
+   (key `minutes-cli-stall-<order_nr>`) telling the owner to approve in ENBD X
+   or to check noon > Orders before ordering again. Observed transitions: `payment_pending/CREATED` →
    `payment_ready_to_redirect/3DS_ENROLL_INITIATED` →
    `payment_confirmed/CAPTURED`.
 9. **Paid signal.** Exactly `status:"payment_confirmed"` AND
@@ -113,6 +123,21 @@ status-only wait after a crash (rebuilds the intent from order/get; no
 mutation is possible on that path).
 
 ## Releasing a fenced never-paid flow
+
+## Building and editing a basket (no temp scripts)
+
+1. `commerce cart minutes show` prints the cart as items-file rows plus
+   `cart_hash`. It is read-only.
+2. Edit the rows in a JSON file (`{"sku","qty","modifiers":[...]}`, option codes
+   from `commerce item-options minutes --sku SKU --query NAME`).
+3. `commerce cart minutes set --items-file F --expect-hash HASH` replaces the
+   whole cart with one journalled sync. It refuses if the cart changed since
+   `show`, if there is an active order, or if the cart has bundle/deal lines. It
+   never orders or pays.
+4. `commerce order minutes --items-file F --use-current-cart --prepare-only`
+   orders the cart already on the server, but only when it matches `F` exactly
+   (`MINUTES_CURRENT_CART_MISMATCH` otherwise). Nothing is synced. Drop
+   `--prepare-only` only for the paid order.
 
 For a closed **cart-only** preparation, `commerce clear-cart minutes --flow UUID`
 can remove the unchanged cart. First use `abandon-flow` to close eligible
@@ -159,17 +184,39 @@ commerce reconcile-order FLOW_UUID --close-failed
 
 Reads only, on the flow's bound account: order/get with echoed orderNr and
 `statusCode` `failed`/`cancelled`, `orderTotal` 0, the order absent from
-order/get-active, and a successful paymentintent/status read with authorized and
-captured 0, not `payment_confirmed` and no capture/authorization/settle/refund
-transaction status. It refuses within 15 minutes of the place (3DS window), on any
-unobserved send, a payment-success receipt or observation, prepay/preauthorize
-history, a changed journal or receipts, or a failed/missing intent read. The close
-is terminal (`MINUTES_CLOSED_FAILED_UNCAPTURED`, state `RELEASED`): the reservation
-stays counted, the order ID stays owned, nothing is resent and no retry is
-authorized. It records "uncaptured at check", not a bank-side void: a pending
-hold can still show on the card until the bank drops it. First live use: flow
-95df7e79 / IAEGAR1482ANIBCZKA (intent `payment_ready_to_redirect`,
-`3DS_ENROLL_INITIATED`, 0 authorized/captured).
+order/get-active, and a successful paymentintent/status read that is terminal:
+state `payment_failed`, payment status `payment_failed`/`payment_error`, no
+redirect, error code empty or `0`, authorized and captured 0, and a transaction
+status listed in `TERMINAL_NO_CAPTURE_TXNS` (`commerce_minutes_disposition.py`,
+mirrored as `MINUTES_TERMINAL_NO_CAPTURE_TXNS` in `commerce_journal.py`, which
+re-checks the evidence). It refuses within 15 minutes of the latest place or
+payment send (3DS window), on any unobserved send, a payment-success receipt or
+observation, prepay/preauthorize history, a changed journal or receipts, or a
+failed/missing intent read. The close is terminal
+(`MINUTES_CLOSED_FAILED_UNCAPTURED`, state `RELEASED`): the reservation stays
+counted, the order ID stays owned, nothing is resent and no retry is authorized.
+It records "uncaptured at check", not a bank-side void.
+
+When `--close-failed` refuses (for example the intent is still in its 3DS or
+redirect state), and Abdullah has checked his card and confirmed nothing was
+charged, close it with the owner attestation:
+
+```
+commerce reconcile-order FLOW_UUID --owner-attest-no-charge --attested-by owner --evidence "<what Abdullah checked, when>"
+```
+
+It runs the same fresh reads (order failed/cancelled, inactive, total 0, intent
+not paid, no capture or authorization) and refuses on any other shape. It is
+terminal (`OWNER_ATTESTED_UNCHARGED`): the reservation and order ownership stay
+recorded, nothing is resent or retried, and it is not provider proof of no charge.
+
+Both allowlists are empty: no transaction status noon finalises as a non-capture
+has been captured yet, so today the close refuses every real failed order with
+`MINUTES_FAILED_CLOSE_INTENT_NOT_UNCAPTURED` and the flow stays fenced. Add a
+status only from a captured live fixture, in separately reviewed work. The first
+live use (flow 95df7e79 / IAEGAR1482ANIBCZKA, 27 Oct, before this check) closed
+an intent still at `payment_ready_to_redirect` / `3DS_ENROLL_INITIATED`, which
+the current gate refuses; noon showed that order failed and nothing was charged.
 
 ## Deviations from the capture (deliberate, benign)
 
@@ -181,10 +228,17 @@ hold can still show on the card until the bank drops it. First live use: flow
   Server responses were identical in practice.
 - `payment_intent_status` binds the expected total and reference; the raw
   app client does not (it trusts the body). Stricter is intentional.
+- Quiet toggles are per cart. The lane sets every quiet code noon offers
+  (`dont_ring_the_bell`, `leave_it_at_my_door`) and refuses only when neither is
+  offered. A cart offering just `dont_ring_the_bell` (seen 2026-10-27, Moni's
+  18-line basket) still places with the quiet note; the review and the
+  `quiet_notice` field report `quiet_codes_not_offered`. The driver-note check
+  ignores curly quotes, whitespace runs and case; `--driver-note-extra TEXT`
+  (1-200 chars, no newlines) is appended after the quiet note and is part of the
+  scope digest only when given.
 - Live-only findings (2026-10-10 replay, absent from the phone capture):
   the session now exposes a third delivery preference code
-  `delivery_instructions` (left untouched; only the two quiet codes are
-  set); a just-paid order reports track status `ready_for_pickup`
+  `delivery_instructions` (left untouched; only the quiet codes are set); a just-paid order reports track status `ready_for_pickup`
   ("Packing your order") before `confirmed`/`picked_up` — mapped to
   `preparing`; and a dead failed order's paymentintent/status read returns
   HTTP 400 (treated as closure corroboration in `release-flow`, never as

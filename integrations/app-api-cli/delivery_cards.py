@@ -714,6 +714,16 @@ def attempt(holder, field, save):
         return 'sent'
 
 
+
+def public_url(url):
+    """A link people off the tailnet can open: https on a public host (the bridge's share origin or a
+    quick tunnel), never the tailnet (.ts.net), loopback or a bare IP."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    return (parsed.scheme == 'https' and '.' in host and not host.endswith('.ts.net')
+            and not re.fullmatch(r'[0-9.]+|[0-9a-f:]+', host) and host not in ('localhost',))
+
+
 def bridge(args, timeout=12):
     env = {k: v for k, v in os.environ.items() if k not in ('BUN_INSPECT', 'BUN_OPTIONS', 'NODE_OPTIONS')}
     p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
@@ -733,6 +743,9 @@ def prune_completed_shares():
             continue
         shared = by_app.get(state.get('slug'))
         if not shared or shared.get('url') != state.get('url'):
+            continue
+        # A stable-origin link is permanent: retiring it would break the URL already sent. Only an explicit unshare ends it.
+        if shared.get('permanent'):
             continue
         bridge(['unshare', '--app', state['slug']], timeout=2)
         state['unshared'] = True
@@ -758,7 +771,7 @@ def sync(cfg, data, *, send=False):
     with statepath.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read(statepath)
-        recipient = settings.get('chat') or cfg['for']
+        recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
         public_slug = slug(cfg['app'], cfg['order'])
@@ -812,7 +825,7 @@ def sync(cfg, data, *, send=False):
                         url = published.get('url')
                         if not isinstance(url, str) or not url.startswith('https://'):
                             raise ValueError('card_publish_bad_ack')
-                        if recipient != 'owner' and not urlparse(url).hostname.endswith('.trycloudflare.com'):
+                        if recipient != 'owner' and not public_url(url):
                             raise ValueError('public_card_url_required')
                         state['url'] = url
                         atomic(statepath, state)
@@ -858,7 +871,7 @@ def sync(cfg, data, *, send=False):
 def repair_link(cfg, data):
     """Explicit replacement for a confirmed-sent link; never a progress ping."""
     settings = cfg.get('delivery_card', {})
-    recipient = settings.get('chat') or cfg.get('for')
+    recipient = settings.get('chat') or cfg.get('chat') or cfg.get('for')
     if recipient == 'owner' or settings.get('held') or settings.get('skip_send'):
         raise ValueError('public_sent_card_required')
     path = ROOT / 'cards' / (cfg['watcher'] + '.json')
@@ -874,7 +887,7 @@ def repair_link(cfg, data):
             url = current.get('url') if current else None
             if not url:
                 url = bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))],timeout=65).get('url')
-            if not isinstance(url,str) or not (urlparse(url).hostname or '').endswith('.trycloudflare.com'):
+            if not isinstance(url,str) or not public_url(url):
                 raise ValueError('public_card_url_required')
             if url == state['url']:
                 state['link_health'] = 'ok'; atomic(path,state)

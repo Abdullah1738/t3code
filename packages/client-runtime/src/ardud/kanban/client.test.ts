@@ -5,10 +5,11 @@ import type {
   KanbanScriptRun,
   KanbanWatchEvent,
 } from "@t3tools/contracts";
+import { Atom, AtomRegistry } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { createKanbanClient } from "./client.ts";
-import { KanbanOfflineError, type KanbanTransport } from "./transport.ts";
+import { KanbanOfflineError, type KanbanRequestTag, type KanbanTransport } from "./transport.ts";
 
 interface Pending {
   readonly tag: string;
@@ -18,7 +19,7 @@ interface Pending {
 }
 
 /** A transport whose requests wait until the test answers them. */
-function fakeTransport() {
+function fakeTransport(denied: ReadonlySet<string> = new Set()) {
   const pending: Pending[] = [];
   let push: ((event: KanbanWatchEvent) => void) | null = null;
   let fail: ((error: unknown) => void) | null = null;
@@ -26,6 +27,7 @@ function fakeTransport() {
   const lists: Array<(list: ReadonlyArray<KanbanBoardListEntry>) => void> = [];
   const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
+    permission: (tag) => Atom.make(() => !denied.has(tag)),
     stream(tag, _input, onValue, onError) {
       streams += 1;
       if (tag === "kanban.boards") {
@@ -91,6 +93,8 @@ function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
     titleEditedAt: null,
     settledAt: null,
     snoozedUntil: null,
+    pinnedAt: null,
+    reopenedAt: null,
   } as never;
 }
 
@@ -140,6 +144,15 @@ const vote = {
 } as never;
 
 describe("createKanbanClient", () => {
+  it("reports a denied grant as false, so its control is disabled", () => {
+    const fake = fakeTransport(new Set(["kanban.pool.set"]));
+    const client = createKanbanClient(fake.transport);
+    const registry = AtomRegistry.make();
+    const read = (tag: KanbanRequestTag) => registry.get(client.permission(tag));
+    expect(read("kanban.pool.set")).toBe(false);
+    expect(read("kanban.board.update")).toBe(true);
+  });
+
   it("keeps a read the server has not applied yet when the list comes back stale", async () => {
     const fake = fakeTransport();
     const client = createKanbanClient(fake.transport);

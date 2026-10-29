@@ -193,7 +193,9 @@ def capabilities():
             'place':'live_order_created','payment':'live_confirmed_e2e_paid_order_2026_10_10',
             'tracking':'exact_native','rejected_auth_renewal_proven':False,
              'multi_item_baskets':True,'multi_item_cart_live_verified':True,
-             'multi_item_purchase_live_verified':True},
+             'multi_item_purchase_live_verified':True,
+             'cart_edit':'cart minutes show | cart minutes set --items-file F --expect-hash H (journalled whole-cart replace, never orders)',
+             'order_current_cart':'order minutes --items-file F --use-current-cart (orders the server cart only when it matches F exactly)'},
         'noon.main':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
             'place':'live_order_created','payment':'frictionless_saved_card_live_paid_2026_10_10',
             'tracking':'exact_shipment_manifest','multi_item_baskets':True,
@@ -259,13 +261,24 @@ def prepared_result(flow, prepared):
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 
+QUIET_NOT_OFFERED_NOTICE=("noon didn't offer leave at door for this cart; don't ring bell is on "
+                          "and the driver note asks to leave it at the door")
+
+
+def quiet_notice(review):
+    """Tell the requester when noon offered no leave-at-door toggle for this cart."""
+    if isinstance(review,dict) and review.get('quiet_codes_not_offered'):
+        return QUIET_NOT_OFFERED_NOTICE
+    return None
+
+
 def order_minutes(args):
     """Full paid Minutes E2E: guard, sync, quiet, review, place, pay, 3DS wait, track.
 
     Journalled at-most-once per operation; a paid outcome requires the captured
     terminal payment triple, exact tracking and a registered order watcher.
     """
-    from commerce_minutes import MinutesFlow,readback_active_orders,telegram_3ds_notify
+    from commerce_minutes import MinutesFlow,readback_active_orders,telegram_3ds_notify,telegram_stall_notify
     import noon_minutes_checkout as minutes_transport
     items=input_items(args,id_argument='sku',id_key='sku',quantity_key='qty')
     auth=CommerceAuth().noon
@@ -274,23 +287,31 @@ def order_minutes(args):
         print(json.dumps({'phase':'active_order_blocker',
                           'active_orders':guard.projection['active']}),flush=True)
         journal.fail('MINUTES_ACTIVE_ORDER_PRESENT')
+    extra=getattr(args,'driver_note_extra',None)
+    use_current=bool(getattr(args,'use_current_cart',False))
     if args.resume_flow:
-        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth)
+        flow=MinutesFlow.resume_active(args.resume_flow,items=items,auth=auth,driver_note_extra=extra,
+                                       use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
     else:
-        flow=MinutesFlow(items=items,auth=auth)
+        flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra,use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
     try:
         prepared=flow.prepare_only()
         verified=prepared_result(flow,prepared)
         review=prepared['review']
         print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
+        notice=quiet_notice(review)
+        # The final result carries the same notice as the prepare-only result.
+        if notice:
+            verified={**verified,'quiet_notice':notice}
+            print(json.dumps({'flow_id':flow.flow_id,'phase':'quiet_notice','quiet_notice':notice}),flush=True)
         if args.prepare_only:
             return verified
         # Preparation never even loads the saved-card CVV. Read it only on the
         # explicitly invoked financial path, and never retain it in output.
         cvv=cvv_from_keychain() if args.cvv_from_keychain else None
-        placed=flow.place()
+        placed=flow.place(cvv_ready=cvv is not None)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
         with minutes_after_send(flow,sending=True):
             payment=flow.complete(cvv=cvv)
@@ -311,7 +332,7 @@ def order_minutes(args):
             journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
                                  amount_minor=flow.review.get('amount'))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
-        paid=flow.await_payment()
+        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
@@ -323,6 +344,7 @@ def order_minutes(args):
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':placed['order'],
         'items':items,
+        **({'quiet_notice':notice} if notice else {}),
         'payable_minor':review['payable_minor'],
         'paid':{'payment_status':paid['payment_status'],
                 'transaction_status':paid['transaction_status'],
@@ -533,7 +555,7 @@ def await_payment_flow(args):
                 'tracking': tracking, 'watcher': registration['watcher'],
                 **order_watch_receipt.fields(registration), 'financial_send': False,
                 'financial_retry': False}
-    from commerce_minutes import MinutesFlow,telegram_3ds_notify
+    from commerce_minutes import MinutesFlow,telegram_3ds_notify,telegram_stall_notify
     flow=MinutesFlow.resume_payment(args.flow_id)
     already_paid=journal.payment_reported(args.flow_id)
     if already_paid:
@@ -542,8 +564,9 @@ def await_payment_flow(args):
               'already_observed':True}
     else:
         notify=None if args.no_notify else (lambda order,total:telegram_3ds_notify(order,total))
+        stall=None if args.no_notify else telegram_stall_notify
         with minutes_after_send(flow):
-            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60)
+            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall)
     with minutes_after_send(flow):
         print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
@@ -817,6 +840,8 @@ def basket_arguments(parser, flag):
     parser.add_argument('--moni-go',default=None,metavar='HER_WORDS',
         help="required with --for moni unless --prepare-only: Moni's own go, quoted from her chat (checked against "
              'her messages in the last 45 min; fails closed with MONI_GO_NOT_FOUND)')
+    parser.add_argument('--moni-chat',default=None,metavar='SLUG',
+        help='bridge chat where she gave the go, e.g. group-sb_gro; default: her 1:1 plus every group chat')
 
 
 def require_moni_go(args):
@@ -828,7 +853,8 @@ def require_moni_go(args):
     placing=args.command=='test-talabat-shops' or args.command=='order'
     if not placing or getattr(args,'recipient','owner')!='moni' or getattr(args,'prepare_only',False):return None
     import moni_go
-    return moni_go.verify(getattr(args,'moni_go',None) or '')
+    chat=getattr(args,'moni_chat',None)
+    return moni_go.verify(getattr(args,'moni_go',None) or '', **({'chat':chat} if chat else {}))
 
 
 def card_preflight(args):
@@ -875,6 +901,9 @@ def recipient_argument(parser):
     parser.add_argument('--for',dest='recipient',choices=order_watch_receipt.RECIPIENTS,default='owner',
         help='who ordered; moni = order-watch texts her the placement (once per order) and routes arrival texts to her. '
              'Label as "Store: items" for that text')
+    parser.add_argument('--chat',default=None,metavar='SLUG',
+        help='bridge chat the order was placed from, e.g. group-sb_gro; the delivery card and arrival texts go there. '
+             'Default: the iMessage chat folder this runs in, else owner/Moni')
 
 
 def talabat_arguments(parser):
@@ -901,6 +930,15 @@ def main(argv=None):
     options.add_argument('vertical',choices=('minutes',))
     options.add_argument('--sku',required=True)
     options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
+    cart=commands.add_parser('cart',help='Read or replace the whole Minutes cart; never orders')
+    cart.add_argument('vertical',choices=('minutes',))
+    cart.add_argument('action',choices=('show','set','reconcile'))
+    cart.add_argument('--flow',dest='flow_id',default=None,metavar='FLOW_UUID',
+        help='reconcile: the flow whose consumed cart send has no receipt; closes it only after an exact readback')
+    cart.add_argument('--items-file',dest='items_file',default=None,metavar='PATH',
+        help='set: the full basket (JSON array or {"items":[...]}), same format as order minutes')
+    cart.add_argument('--expect-hash',dest='expect_hash',default=None,metavar='HASH',
+        help='set: cart_hash from the last cart minutes show; refused if the cart changed since')
     clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only noon flow')
     clear.add_argument('vertical',choices=('minutes','main','supermall'))
     clear.add_argument('--flow',dest='flow_id',required=True)
@@ -933,7 +971,8 @@ def main(argv=None):
         help='Minutes: terminal close when noon reports the exact order failed/cancelled, inactive, '
              'zero total and its payment intent uncaptured; never retries')
     disposition.add_argument('--owner-attest-no-charge',action='store_true',
-        help='terminal Talabat close using explicit owner evidence plus fresh exact provider checks; never retries')
+        help='terminal close of a Talabat flow, or a noon Minutes flow whose payment noon reports failed, '
+             'on explicit owner evidence plus fresh exact provider checks; never retries')
     disposition.add_argument('--evidence',metavar='TEXT',
         help='owner no-charge statement and source/context, retained in the private journal')
     disposition.add_argument('--attested-by',choices=('owner',))
@@ -956,9 +995,13 @@ def main(argv=None):
     basket_arguments(minutes_order,'--sku')
     minutes_order.add_argument('--cvv-from-keychain',action='store_true',
         help='read the saved-card CVV from Keychain robob-card into RAM (required when the session demands CVV)')
+    minutes_order.add_argument('--use-current-cart',dest='use_current_cart',action='store_true',
+        help='order the cart already on the server when it matches the basket file exactly; nothing is synced')
     minutes_order.add_argument('--label',default='Noon Minutes order')
     minutes_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE preparation flow (exact cart readback; nothing re-sent)')
+    minutes_order.add_argument('--driver-note-extra',default=None,metavar='TEXT',
+        help='optional extra driver note (1-200 chars, no newlines) added after the quiet note')
     nownow_order=order_commands.add_parser('nownow',
         help='Authorized NowNow paid order E2E: guard, session, validate, saved-card, quiet, place, tracking')
     basket_arguments(nownow_order,'--product-code')
@@ -997,6 +1040,16 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Checked before any network call or money step. --chat wins; a Moni order's
+    # --moni-chat (where she gave the go) is the order's chat too.
+    chat=getattr(args,'chat',None) or (getattr(args,'moni_chat',None) if getattr(args,'recipient','owner')=='moni' else None)
+    if chat:
+        import delivery_cards
+        if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,99}',chat) or not delivery_cards.chat_store(chat).exists():
+            print(json.dumps({'ok':False,'error':'ORDER_CHAT_UNKNOWN','chat':chat,
+                              'financial_send':False,'financial_retry':False}))
+            return 2
+        os.environ['ORDER_WATCH_CHAT']=chat
     try:
         declined=card_preflight(args)
         if declined:
@@ -1009,6 +1062,22 @@ def main(argv=None):
             from noon_minutes_options import read_options
             result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
                     **read_options(args.sku,query=args.query)}
+        elif args.command=='cart':
+            from commerce_minutes_cart import show as cart_show,set_cart as cart_set
+            from commerce_basket_input import read_items
+            if args.action=='show':
+                result=cart_show(auth=CommerceAuth().noon)
+            elif args.action=='reconcile':
+                if args.flow_id is None or args.expect_hash is None or args.items_file is None:
+                    journal.fail('MINUTES_CART_RECONCILE_REQUIRES_FLOW_ITEMS_AND_EXPECT_HASH')
+                from commerce_minutes_cart import reconcile as cart_reconcile
+                result=cart_reconcile(args.flow_id,rows=read_items(args.items_file),expect_hash=args.expect_hash,
+                                      auth=CommerceAuth().noon)
+            else:
+                if args.items_file is None or args.expect_hash is None:
+                    journal.fail('MINUTES_CART_SET_REQUIRES_ITEMS_FILE_AND_EXPECT_HASH')
+                result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon,
+                                items_file=args.items_file)
         elif args.command=='clear-cart':
             if args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart
@@ -1068,7 +1137,12 @@ def main(argv=None):
             elif args.separate_order is not None or args.separate_order_after is not None or args.legacy_rejection_evidence is not None:
                 journal.fail('DUPLICATE_CLOSURE_FLAG_REQUIRED')
             elif args.owner_attest_no_charge:
-                result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
+                owner_binding=journal.binding(args.flow_id)
+                if owner_binding['app']=='noon' and owner_binding['vertical']=='minutes':
+                    from commerce_minutes_disposition import owner_attest_failed
+                    result=owner_attest_failed(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
+                else:
+                    result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
             elif args.evidence is not None or args.attested_by is not None:
                 journal.fail('OWNER_ATTESTATION_FLAG_REQUIRED')
             else:
@@ -1099,6 +1173,10 @@ def main(argv=None):
         if isinstance(exc,(OptionsError,CatalogError)):
             print(json.dumps({'ok':False,'error':exc.code,'details':exc.details,
                               'financial_send':False,'financial_retry':False}))
+            return 1
+        from commerce_minutes_cart import OutcomeUnverified
+        if isinstance(exc,OutcomeUnverified):
+            print(json.dumps({'ok':False,'error':exc.code,**exc.details,'financial_retry':False}))
             return 1
         code=str(exc)
         preparation=re.fullmatch(r'PREPARATION_FAILED:(quote_(?:initial|initial_quiet|selected|selected_quiet|final_quiet)):([A-Z][A-Z0-9_]{1,99})',code)

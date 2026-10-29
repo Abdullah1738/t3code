@@ -8,12 +8,34 @@ import {
   choiceView,
   COLUMNS_MIN_WIDTH,
   defaultBoardTab,
+  filterActionId,
+  kanbanLinkTarget,
   kanbanRecordState,
   nextTypingExpiry,
+  parseFilterAction,
   priorityFill,
+  firstSendText,
+  groupBlockRuns,
   requestTitle,
+  sendBlocks,
   toggleChoice,
+  type StoredAttachment,
 } from "./logic";
+
+const photo: StoredAttachment = {
+  type: "image",
+  id: "att-photo",
+  name: "shot.png",
+  mimeType: "image/png",
+  sizeBytes: 10,
+};
+const pdf: StoredAttachment = {
+  type: "file",
+  id: "att-pdf",
+  name: "spec.pdf",
+  mimeType: "application/pdf",
+  sizeBytes: 20,
+};
 
 const column = (stage: string, count: number) => ({
   stage,
@@ -90,8 +112,12 @@ const pick: Extract<KanbanBlock, { _tag: "choice" }> = {
   multi: false,
 };
 
-const answer = (by: KanbanAnswer["by"], choice: string[], blockId = "window"): KanbanAnswer =>
-  ({ blockId, by, choice, text: null, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
+const answer = (
+  by: KanbanAnswer["by"],
+  choice: string[],
+  blockId = "window",
+  text: string | null = null,
+): KanbanAnswer => ({ blockId, by, choice, text, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
 
 describe("choiceView", () => {
   it("shares out the answers to this block and marks the owner's", () => {
@@ -111,6 +137,26 @@ describe("choiceView", () => {
 
   it("shows zero for every option before anyone answers", () => {
     expect(choiceView(pick, []).options.map((option) => option.percent)).toEqual([0, 0]);
+  });
+
+  it("returns the owner's own words for a words-only answer", () => {
+    const view = choiceView(pick, [answer({ _tag: "owner" }, [], "window", "after nine")]);
+    expect(view.mine).toEqual([]);
+    expect(view.mineText).toBe("after nine");
+    expect(view.answered).toBe(1);
+  });
+
+  it("ignores other people's words and words on other blocks", () => {
+    const view = choiceView(pick, [
+      answer({ _tag: "evaluator", threadId: "t1" } as never, ["tonight"], "window", "not mine"),
+      answer({ _tag: "owner" }, ["sunday"], "other-block", "elsewhere"),
+    ]);
+    expect(view.mineText).toBeNull();
+    expect(view.mine).toEqual([]);
+  });
+
+  it("returns null words when the owner only picked options", () => {
+    expect(choiceView(pick, [answer({ _tag: "owner" }, ["tonight"])]).mineText).toBeNull();
   });
 });
 
@@ -159,6 +205,36 @@ describe("requestTitle", () => {
   });
 });
 
+describe("kanbanLinkTarget", () => {
+  const board = {
+    cards: new Map([["c1", {}]]),
+    discussions: new Map([["d1", {}]]),
+  };
+
+  it("opens a card or discussion on this board with the board id the record needs", () => {
+    const card = kanbanLinkTarget({ kind: "kanban-card", id: "c1" }, "b", board);
+    expect(card).toEqual({ kind: "card", boardId: "b", id: "c1" });
+    expect(kanbanRecordState(card ?? undefined)).toEqual({
+      kind: "card",
+      boardId: "b",
+      id: "c1",
+    });
+    const discussion = kanbanLinkTarget({ kind: "kanban-discussion", id: "d1" }, "b", board);
+    expect(discussion).toEqual({ kind: "discussion", boardId: "b", id: "d1" });
+    expect(kanbanRecordState(discussion ?? undefined)).toEqual({
+      kind: "discussion",
+      boardId: "b",
+      id: "d1",
+    });
+  });
+
+  it("leaves a reference that isn't on this board inert", () => {
+    expect(kanbanLinkTarget({ kind: "kanban-card", id: "other" }, "b", board)).toBeNull();
+    expect(kanbanLinkTarget({ kind: "kanban-discussion", id: "other" }, "b", board)).toBeNull();
+    expect(kanbanLinkTarget({ kind: "kanban-goal", id: "c1" }, "b", board)).toBeNull();
+  });
+});
+
 describe("kanbanRecordState", () => {
   it("needs a board, and an id for cards and goals", () => {
     expect(kanbanRecordState({ kind: "card", boardId: "b", id: "c1" })).toEqual({
@@ -174,5 +250,84 @@ describe("kanbanRecordState", () => {
     expect(kanbanRecordState({ kind: "card", boardId: "b" })).toBeNull();
     expect(kanbanRecordState({ kind: "room", boardId: "b", id: "x" })).toBeNull();
     expect(kanbanRecordState({ kind: "goal", id: "g" })).toBeNull();
+  });
+});
+
+describe("sendBlocks", () => {
+  it("posts only the text when there are no files", () => {
+    expect(sendBlocks("  hello  ", [])).toEqual([{ _tag: "md", text: "hello" }]);
+  });
+
+  it("posts only the attachments when there is no text", () => {
+    expect(sendBlocks("   ", [photo, pdf])).toEqual([
+      { _tag: "attachment", attachment: photo },
+      { _tag: "attachment", attachment: pdf },
+    ]);
+  });
+
+  it("puts the text first, then the files in order", () => {
+    expect(sendBlocks("see these", [pdf, photo])).toEqual([
+      { _tag: "md", text: "see these" },
+      { _tag: "attachment", attachment: pdf },
+      { _tag: "attachment", attachment: photo },
+    ]);
+  });
+
+  it("posts nothing for an empty send", () => {
+    expect(sendBlocks("", [])).toEqual([]);
+  });
+});
+
+describe("firstSendText", () => {
+  it("titles a discussion from its text", () => {
+    expect(firstSendText(" plan ", [pdf])).toBe("plan");
+  });
+
+  it("falls back to the first file's name when there is no text", () => {
+    expect(firstSendText("", [pdf, photo])).toBe("spec.pdf");
+  });
+
+  it("is empty when there is neither text nor a file", () => {
+    expect(firstSendText("  ", [])).toBe("");
+  });
+});
+
+describe("groupBlockRuns", () => {
+  it("wraps consecutive attachments into one run and leaves other blocks alone", () => {
+    const blocks = [
+      { _tag: "md" as const, text: "hi" },
+      { _tag: "attachment" as const, attachment: photo },
+      { _tag: "attachment" as const, attachment: pdf },
+      { _tag: "md" as const, text: "after" },
+      { _tag: "attachment" as const, attachment: photo },
+    ];
+    expect(groupBlockRuns(blocks)).toEqual([
+      { kind: "block", index: 0, block: blocks[0] },
+      { kind: "attachments", index: 1, attachments: [photo, pdf] },
+      { kind: "block", index: 3, block: blocks[3] },
+      { kind: "attachments", index: 4, attachments: [photo] },
+    ]);
+  });
+});
+
+describe("parseFilterAction", () => {
+  it("reads back every id filterActionId writes", () => {
+    const actions = [
+      { kind: "toggle", facet: "priorities", value: 2 },
+      { kind: "toggle", facet: "goalIds", value: "goal-1" },
+      { kind: "toggle", facet: "projects", value: "" },
+      { kind: "toggle", facet: "models", value: "Opus" },
+      { kind: "clear" },
+    ] as const;
+    for (const action of actions) {
+      expect(parseFilterAction(filterActionId(action))).toEqual(action);
+    }
+  });
+
+  it("rejects priorities outside 1-5 and unknown keys", () => {
+    expect(parseFilterAction("priority:9")).toBeNull();
+    expect(parseFilterAction("priority:x")).toBeNull();
+    expect(parseFilterAction("colour:red")).toBeNull();
+    expect(parseFilterAction("nothing")).toBeNull();
   });
 });

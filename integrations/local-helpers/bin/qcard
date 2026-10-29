@@ -55,8 +55,16 @@ def clean(days=14):
     cut, gone = time.time() - days * 86400, []
     if not os.path.isdir(APPS):
         return gone
+    # Any card the bridge still lists as shared stays, live or not: a share that is down during a restart keeps its
+    # permanent link, and its files must survive so the link recovers. If the list can't be read, delete nothing.
+    try:
+        shared = {s["app"] for s in bridge("shares").get("shares", [])}
+    except SystemExit:
+        return gone
     for d in os.listdir(APPS):
         p = os.path.join(APPS, d)
+        if d in shared:
+            continue
         if d.startswith("q-") and os.path.isdir(p) and os.path.getmtime(p) < cut:
             shutil.rmtree(p, ignore_errors=True)
             gone.append(d)

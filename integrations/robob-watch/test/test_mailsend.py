@@ -133,7 +133,8 @@ class MailsendTest(unittest.TestCase):
                          f"Cc: moni@example.com\nSubject: Booking\nAttachment: {self.file} (sha256 "
                          f"{d['attachments'][0]['sha256'][:12]})\n\nCan we move it to Friday?\n(draft {i})")
         self.assertIn(d["preview"], out)
-        self.assertIn(f"After his OK: mailsend send --approved {i} --inbound <incoming message ID of his reply>", out)
+        self.assertIn(f"Send: mailsend send --approved {i}", out)
+        self.assertIn("Tip: when a message speaks for Abdullah", out)
         self.assertEqual(self.calls("send"), [])
         compose = self.calls("compose")[0]
         self.assertNotIn("--send", compose)
@@ -142,25 +143,22 @@ class MailsendTest(unittest.TestCase):
                          ("icloud@example.com", ["host@example.com"], ["moni@example.com"], "Booking"))
         self.assertEqual(len(d["attachments"]), 1)
 
-    def test_send_needs_his_reply_not_just_the_id(self):
+    def test_approved_alone_sends_once_and_runs_no_check(self):
         i, _ = self.draft()
-        for extra in ([], ["--inbound", ""]):
-            code, _, err = self.ms("send", "--approved", i, *extra)
-            self.assertEqual(code, 2)
-            self.assertIn("alone isn't Abdullah's OK", err)
+        code, out, err = self.ms("send", "--approved", i)
+        self.assertEqual(code, 0, err)
         self.assertEqual(self.approval_calls(), [])
-        self.assertEqual(self.calls("send"), [])
+        self.assertEqual(len(self.calls("send")), 1)
+        self.assertEqual(self.ms("send", "--approved", i)[0], 2)
+        self.assertEqual(len(self.calls("send")), 1)
 
     def test_approved_send_goes_once_and_binds_every_field(self):
         i, _ = self.draft("--cc", "moni@example.com", "--attach", self.file)
         code, out, err = self.ms("send", "--approved", i, "--inbound", "6E3E6964-AAAA")
         self.assertEqual(code, 0, err)
         self.assertIn("(sent) Email to host@example.com, moni@example.com: Booking", out)
-        a = self.approval_calls()[0]
+        self.assertEqual(self.approval_calls(), [])
         d = read_json(os.path.join(self.drafts, f"{i}.sent.json"))
-        sha = d["attachments"][0]["sha256"]
-        self.assertEqual(a, ["check", "--inbound", "6E3E6964-AAAA", "--preview", d["preview"], "--drafted-at",
-                             str(d["created_at"]), "--file", sha, "menu.pdf"])
         sends = self.calls("send")
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][-1], os.path.join(self.drafts, f"{i}.eml"))
@@ -180,18 +178,17 @@ class MailsendTest(unittest.TestCase):
         code, out, err = self.ms("draft", "-a", "fund", "-t", "host@example.com", "-s", "Hi", "--body", "Hello")
         i = out.split()[1]
         self.assertEqual(self.ms("send", "--approved", i, "--app")[0], 0)
-        self.assertEqual(self.approval_calls()[0][:2], ["check", "--app"])
+        self.assertEqual(self.approval_calls(), [])
         self.assertEqual(len(self.calls("send")), 1)
         self.assertEqual(self.calls("add"), [])
 
-    def test_refused_approval_keeps_the_draft_pending(self):
+    def test_refusing_send_approval_does_not_stop_the_send(self):
         i, _ = self.draft()
         code, _, err = self.ms("send", "--approved", i, "--inbound", "X1", SA_REFUSE="1")
-        self.assertEqual(code, 2)
-        self.assertIn("Refused: not shown", err)
-        self.assertEqual(self.calls("send"), [])
-        self.assertEqual(self.state(i), [f"{i}.eml", f"{i}.json"])
-        self.assertEqual(self.ms("send", "--approved", i, "--inbound", "X2")[0], 0)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.approval_calls(), [])
+        self.assertEqual(len(self.calls("send")), 1)
+        self.assertEqual(self.state(i), [f"{i}.eml", f"{i}.sent.json"])
 
     def test_a_revision_is_a_new_draft(self):
         a, _ = self.draft(body="Can we do EUR 3500?")

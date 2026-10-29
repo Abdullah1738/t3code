@@ -19,6 +19,7 @@ import {
   KanbanScriptId,
   KanbanScriptTrigger,
   KanbanStage,
+  ModelSelection,
   ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -81,16 +82,19 @@ const query = Effect.fn("KanbanHttp.query")(function* (name: string) {
 
 const Text = Schema.optional(Schema.String);
 
-const CreateBoardBody = Schema.Struct({
-  slug: Schema.String,
-  name: Schema.String,
-  projectId: Schema.optional(Schema.NullOr(Schema.String)),
-});
-
 const ModelBody = Schema.Struct({
   model: Schema.String,
   instanceId: Text,
   variant: Text,
+});
+
+const CreateBoardBody = Schema.Struct({
+  slug: Schema.String,
+  name: Schema.String,
+  projectId: Schema.optional(Schema.NullOr(Schema.String)),
+  managerModel: Schema.optional(ModelSelection),
+  evaluatorModel: Schema.optional(ModelSelection),
+  defaultCardModel: Schema.optional(ModelSelection),
 });
 
 const CreateCardBody = Schema.Struct({
@@ -237,6 +241,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           slug: input.slug,
           name: input.name,
           defaultProjectId: projectId,
+          ...(input.managerModel ? { managerModel: input.managerModel } : {}),
+          ...(input.evaluatorModel ? { evaluatorModel: input.evaluatorModel } : {}),
+          ...(input.defaultCardModel ? { defaultCardModel: input.defaultCardModel } : {}),
         });
         if (projectId && board.defaultProjectId !== projectId) {
           return yield* service.updateBoard(board.id, { defaultProjectId: projectId });
@@ -396,7 +403,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           input.kind === "setup" || input.kind === "request"
             ? { kind: input.kind, text: input.text ?? "" }
             : { kind: input.kind };
-        const threadId = yield* service.startEvaluator(board.id, purpose, input.text);
+        // setup/request already carry their text in purpose; only sweeps pass it separately.
+        const sweepText = input.kind === "setup" || input.kind === "request" ? undefined : input.text;
+        const threadId = yield* service.startEvaluator(board.id, purpose, sweepText);
         return { threadId };
       }),
     );

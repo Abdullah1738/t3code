@@ -117,10 +117,9 @@ def exact_failed_evidence(auth, order, *, timeout=25):
 
 def telegram_3ds_notify(order,total_minor):
     """One attention ping for the owner's out-of-band ENBD 3DS approval."""
-    text=(f"Noon Minutes CLI test order {order} AED {m.wire_amount(total_minor):g} needs ENBD 3DS "
-          "approval: open ENBD X app notification / Activity and approve. ~2 min window.")
+    text=f"this is ours: approve noon Minutes AED {m.wire_amount(total_minor):.2f} in ENBD X now (order {order})"
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
-    command=[*TELEGRAM_CLI,'--source','Minutes CLI build','--severity','attention',
+    command=[*TELEGRAM_CLI,'--source','Noon payment','--severity','attention',
              '--text',text,'--key',f'minutes-cli-3ds-{order}']
     # The card is already sent: a lost alert is reported, never a reason to stop watching it.
     try:
@@ -133,6 +132,27 @@ def telegram_3ds_notify(order,total_minor):
     return {'notified':True,'key':f'minutes-cli-3ds-{order}'}
 
 
+STALL_SECONDS=300
+
+
+def telegram_stall_notify(order,total_minor):
+    """Second alert when the sent payment is still unconfirmed after STALL_SECONDS."""
+    text=(f"noon Minutes AED {m.wire_amount(total_minor):.2f} still not confirmed after 5 min. If ENBD X has "
+          "a prompt, approve it. No prompt: check noon > Orders before ordering in the app, "
+          "this one can still go through.")
+    env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
+    command=[*TELEGRAM_CLI,'--source','Noon payment','--severity','attention',
+             '--text',text,'--key',f'minutes-cli-stall-{order}']
+    try:
+        sent=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            timeout=60).returncode==0
+    except (OSError,subprocess.TimeoutExpired):
+        sent=False
+    if not sent:
+        return {'notified':False,'key':f'minutes-cli-stall-{order}','error':'MINUTES_STALL_NOTIFY_FAILED'}
+    return {'notified':True,'key':f'minutes-cli-stall-{order}'}
+
+
 def _rows(rows):
     """items-file rows {sku,qty,...}: 'modifiers' defaults to () (contract
     keeps modifiers optional); everything else validated by m._skus()."""
@@ -142,6 +162,8 @@ def _rows(rows):
     for row in rows:
         if isinstance(row,dict):
             row=dict(row)
+            # 'title' is display-only (cart minutes show prints it); the order path ignores it.
+            row.pop('title',None)
             query=row.pop('catalog_query',None)
             m.require(query is None or isinstance(query,str) and 0 < len(query.strip()) <= 200,
                       'INVALID_CATALOG_QUERY')
@@ -150,8 +172,31 @@ def _rows(rows):
     return out
 
 
+def _driver_note_extra(extra):
+    """Normalized extra driver note (None when absent). Validation is shared with quiet_note."""
+    if extra is None:
+        return None
+    m.quiet_note(extra)
+    return extra.strip()
+
+
+def _scope_hash(skus, home, extra, use_current_cart=False):
+    """Scope digest; optional keys are included only when set, so existing flows keep their digest."""
+    scope={'skus':skus,'home':home,'card':'5542','quiet':True,'extras':False}
+    if extra is not None:
+        scope['note']=extra
+    if use_current_cart:
+        scope['use_current_cart']=True
+    return j.digest(scope)
+
+
 class MinutesFlow:
-    def __init__(self, *, skus=None, items=None, auth=None):
+    # Default driver note; instances built without __init__ (resume paths) keep the quiet note.
+    driver_note=m.QUIET_NOTE
+    # Instances built without __init__ (resume and test paths) keep the old refusal.
+    use_current_cart=False
+
+    def __init__(self, *, skus=None, items=None, auth=None, driver_note_extra=None, use_current_cart=False):
         # Lane-native validation strictly BEFORE any auth/network work.
         if skus is not None and items is not None:
             j.fail('MINUTES_ITEMS_CONFLICT')
@@ -160,13 +205,15 @@ class MinutesFlow:
         if not self.skus:
             j.fail('MINUTES_SKUS_REQUIRED')
         m.require(all(x['qty'] > 0 for x in self.skus), 'INVALID_QUANTITY')
+        self.driver_note_extra=_driver_note_extra(driver_note_extra)
+        self.driver_note=m.quiet_note(self.driver_note_extra)
         self.catalog_queries={row['sku']:row.get('catalog_query') for row in rows}
         self.auth=auth or NoonAuthLifecycle()
         self.snapshot=self.auth.fresh_before_mutation('minutes')
         j.require_account_available('noon',self.snapshot.account_ref)
         self.flow_id=str(uuid.uuid4())
-        self.scope_hash=j.digest({'skus':self.skus,'home':self.snapshot.address_ref,
-                                  'card':'5542','quiet':True,'extras':False})
+        self.use_current_cart=bool(use_current_cart)
+        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra,self.use_current_cart)
         self.opened=False
         self.expected=None
         self.review=None
@@ -178,7 +225,18 @@ class MinutesFlow:
             account_hash=self.snapshot.account_ref,scope_hash=self.scope_hash)
         self.client=m.MinutesCheckout(self.snapshot.read_headers(),
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
-            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies)
+            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
+            home_provider=self._fresh_home)
+
+    def _fresh_home(self,deadline):
+        """Re-verify account/address for a long flow; the client checks 120 s age per call."""
+        status=self.auth.status('minutes')
+        snap=(self.auth.reconcile('minutes') if status['maintenance_state']!='none'
+              else self.auth.revalidate('minutes',deadline=deadline))
+        if snap.account_ref!=self.snapshot.account_ref or snap.address_ref!=self.snapshot.address_ref:
+            j.fail('MINUTES_ACCOUNT_HOME_CHANGED')
+        self.snapshot=snap
+        return AccountHome('minutes',snap.account_ref,snap.address_ref,snap.checked_at)
 
     def _headers(self,operation,deadline):
         status=self.auth.status('minutes')
@@ -243,6 +301,11 @@ class MinutesFlow:
         return self.current.projection
 
     def fill_empty(self):
+        if self.use_current_cart and self.current is not None and self.current.projection['lines']:
+            # Adopt the cart already on the server: it must match the basket exactly, and nothing is sent.
+            m.review_manifest(self.current.projection['lines'],self.skus,mismatch='MINUTES_CURRENT_CART_MISMATCH')
+            self.adopted_current_cart=True
+            return self.current.projection
         if self.current is None or self.current.projection['lines']:
             j.fail('EXISTING_MINUTES_CART_MUST_NOT_BE_REPLACED')
         if not getattr(self,'_options_validated',False):
@@ -276,7 +339,7 @@ class MinutesFlow:
         return self.current.projection
 
     @classmethod
-    def resume_exact_sync(cls, flow_id, *, skus=None, items=None, auth=None):
+    def resume_exact_sync(cls, flow_id, *, skus=None, items=None, auth=None, driver_note_extra=None):
         """Recover only our recorded Minutes sync using exact native readback."""
         if skus is not None and items is not None:
             j.fail('MINUTES_ITEMS_CONFLICT')
@@ -290,8 +353,9 @@ class MinutesFlow:
         self.current=readback_session(self.auth)
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
         self.flow_id=flow_id;self.skus=normalized
-        self.scope_hash=j.digest({'skus':self.skus,'home':self.snapshot.address_ref,
-                                  'card':'5542','quiet':True,'extras':False})
+        self.driver_note_extra=_driver_note_extra(driver_note_extra)
+        self.driver_note=m.quiet_note(self.driver_note_extra)
+        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra)
         if self.scope_hash!=binding['scope_hash'] or self.snapshot.account_ref!=binding['account_hash']:
             j.fail('MINUTES_RECOVERY_SCOPE_MISMATCH')
         m.review_manifest(self.current.projection['lines'],self.skus,
@@ -304,11 +368,12 @@ class MinutesFlow:
         self.store=receipts.load(**binding)
         self.client=m.MinutesCheckout(self.snapshot.read_headers(),
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
-            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies)
+            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
+            home_provider=self._fresh_home)
         return self
 
     @classmethod
-    def resume_active(cls, flow_id, *, skus=None, items=None, auth=None):
+    def resume_active(cls, flow_id, *, skus=None, items=None, auth=None, driver_note_extra=None, use_current_cart=False):
         """Continue an ACTIVE preparation flow from exact native readback.
 
         Only for flows whose consumed operations are non-financial (cart/
@@ -332,8 +397,10 @@ class MinutesFlow:
         self.current=readback_session(self.auth)
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
         self.flow_id=flow_id;self.skus=normalized
-        self.scope_hash=j.digest({'skus':self.skus,'home':self.snapshot.address_ref,
-                                  'card':'5542','quiet':True,'extras':False})
+        self.driver_note_extra=_driver_note_extra(driver_note_extra)
+        self.driver_note=m.quiet_note(self.driver_note_extra)
+        self.use_current_cart=bool(use_current_cart)
+        self.scope_hash=_scope_hash(self.skus,self.snapshot.address_ref,self.driver_note_extra,self.use_current_cart)
         if self.scope_hash!=binding['scope_hash'] or self.snapshot.account_ref!=binding['account_hash']:
             j.fail('MINUTES_RECOVERY_SCOPE_MISMATCH')
         m.review_manifest(self.current.projection['lines'],self.skus,
@@ -344,19 +411,21 @@ class MinutesFlow:
         self.store=receipts.load(**binding)
         self.client=m.MinutesCheckout(self.snapshot.read_headers(),
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
-            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies)
+            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
+            home_provider=self._fresh_home)
         return self
 
     def select_quiet(self):
         # The captured app sets exactly these two codes; noon may expose other
         # non-quiet codes (e.g. delivery_instructions) that stay untouched.
-        required={'dont_ring_the_bell','leave_it_at_my_door'}
+        # Turn on every quiet toggle noon offers for this cart; none offered still refuses.
         observed=self.current.projection['delivery_preferences']
         codes={x['code'] for x in observed} if observed else set()
-        if not required <= codes:
+        offered=[code for code in m.QUIET_CODES if code in codes]
+        if not offered:
             j.fail('QUIET_CODES_UNSUPPORTED')
-        body={'deliveryPreferences':{code:True for code in sorted(required)},
-              'driverNotes':m.QUIET_NOTE,'save':False}
+        body={'deliveryPreferences':{code:True for code in offered},
+              'driverNotes':self.driver_note,'save':False}
         self._expect('instructions',body)
         self.current=self.client.set_delivery_instructions(preferences=body['deliveryPreferences'],
             driver_notes=body['driverNotes'],save=False,before_send=self._before,timeout=25)
@@ -374,13 +443,20 @@ class MinutesFlow:
                 or p['total_minor']<=0
                 or any(fees[k] for k in ('orderGiftBagFee','orderPaymentFee','orderCodFee'))):
             j.fail('MINUTES_FEE_ARITHMETIC_OR_EXTRAS')
+        offered_codes={x['code'] for x in (p['delivery_preferences'] or [])}
+        required=tuple(code for code in m.QUIET_CODES if code in offered_codes)
+        not_offered=[code for code in m.QUIET_CODES if code not in offered_codes]
         digest=m.review_snapshot(snapshot,expected_skus=self.skus,expected_total_minor=p['total_minor'],
-            required_preferences=('dont_ring_the_bell','leave_it_at_my_door'),card=card)
-        self.review={'digest':digest,'amount':p['total_minor']}
+            required_preferences=required,card=card,driver_note=self.driver_note,allow_cvv=True)
+        self.review={'digest':digest,'amount':p['total_minor'],
+                     'cvv_required':p['payment']['cvv_required'] is True}
         self.card=card
         _,gifts=m.review_manifest(p['lines'],self.skus)
         return {'payable_minor':p['total_minor'],'subtotal_minor':p['subtotal_minor'],'fees':fees,
                 'card_last4':'5542','home':'Banyantree2104','quiet':True,'review_hash':digest,
+                'quiet_codes_set':list(required),'quiet_codes_not_offered':not_offered,
+                'driver_note':self.driver_note,
+                'cvv_required':self.review['cvv_required'],
                 'provider_added_freebies':[{'sku':x['sku'],'title':x['title'],
                     'quantity':x['quantity'],'price_minor':0} for x in gifts]}
 
@@ -410,13 +486,19 @@ class MinutesFlow:
         return {'flow_id': self.flow_id, 'review': review, 'prepared_only': True,
                 'readback': dict(self.current.projection)}
 
-    def place(self):
+    def place(self,*,cvv_ready=False):
         if self.review is None:j.fail('MINUTES_REVIEW_REQUIRED')
+        # A CVV-asking cart needs the CVV in hand before place: complete() runs after
+        # place, so a missing CVV would leave a placed, unpaid order.
+        if self.review.get('cvv_required') and not cvv_ready:
+            j.fail('MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')
         approved=dict(self.review)
         self.refresh_cart_readback()
         self.approve()
         if self.review!=approved:
             j.fail('MINUTES_REVIEW_CHANGED_BEFORE_PLACE')
+        if self.review.get('cvv_required') and not cvv_ready:
+            j.fail('MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')
         self._guard_active_orders()
         self._expect('place',{'total':m.wire_amount(self.review['amount'])})
         result=self.client.place_order(total_minor=self.review['amount'],before_send=self._before,timeout=25)
@@ -439,6 +521,7 @@ class MinutesFlow:
                 or any(x['kind']=='payment' for x in state['operations'])):
             j.fail('MINUTES_PAYMENT_ALREADY_CONSUMED_OR_ORDER_MISSING')
         self=object.__new__(cls);self.auth=auth or NoonAuthLifecycle()
+        self.driver_note=m.quiet_note()
         self.current=readback_session(self.auth)
         self.card_recovered=True
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
@@ -453,7 +536,8 @@ class MinutesFlow:
         self.review={'digest':placed.review_sha256,'amount':placed.payable_minor,'order':placed.order_id}
         self.client=m.MinutesCheckout(self.snapshot.read_headers(),
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
-            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies)
+            header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
+            home_provider=self._fresh_home)
         self.card=m.saved_card_5542(self.client.payment_cards(timeout=25).wire)
         if (self.current.projection['payment']['token_ref']!=m.fingerprint(self.card.token)
                 or self.current.projection['total_minor']!=self.review['amount']):
@@ -504,7 +588,7 @@ class MinutesFlow:
         return telegram_3ds_notify(self.review['order'],self.review['amount'])
 
     def await_payment(self,*,notify=None,poll_seconds=5.0,wait_seconds=240.0,
-                      sleep=time.sleep,clock=time.monotonic):
+                      sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS):
         """Poll the payment intent through the out-of-band 3DS window.
 
         notify(order,total_minor) runs exactly once before the first poll.
@@ -521,7 +605,9 @@ class MinutesFlow:
             secret=status.wire['paymentIntentToken']
             self.intent={'secret':secret}
         if notify is not None:notify(order,self.review['amount'])
-        deadline=clock()+wait_seconds
+        started=clock()
+        deadline=started+wait_seconds
+        stalled=False
         polls=0
         last=None
         latest=None
@@ -560,6 +646,9 @@ class MinutesFlow:
                 # still counts); with none the caller still gets the full unpaid shape.
                 return {'paid':False,'payment_status':None,'transaction_status':None,**(latest or {}),
                         'polls':polls,'timed_out':True,'state':'payment_window_elapsed'}
+            if stall is not None and not stalled and clock()-started>=stall_seconds:
+                stalled=True
+                stall(order,self.review['amount'])
             sleep(poll_seconds)
 
     def _payment_receipt(self,state,p):
@@ -626,6 +715,7 @@ class MinutesFlow:
                        for x in state['operations'])):
             j.fail('MINUTES_PAYMENT_RESUME_STATE_INVALID')
         self=object.__new__(cls);self.auth=auth or NoonAuthLifecycle()
+        self.driver_note=m.quiet_note()
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
         if self.snapshot.account_ref!=binding['account_hash']:j.fail('MINUTES_RECOVERY_ACCOUNT_CHANGED')
         self.flow_id=flow_id;self.scope_hash=binding['scope_hash'];self.opened=True
@@ -637,5 +727,5 @@ class MinutesFlow:
         self.review={'digest':placed.review_sha256,'amount':placed.payable_minor,'order':placed.order_id}
         self.client=m.MinutesCheckout(self.snapshot.read_headers(),
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
-            header_provider=self._headers,response_cookies=self._cookies)
+            header_provider=self._headers,response_cookies=self._cookies,home_provider=self._fresh_home)
         return self

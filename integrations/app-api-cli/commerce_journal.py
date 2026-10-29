@@ -545,6 +545,9 @@ def close_marketplace_uncharged(flow_id, *, evidence, expected_local):
 
 
 MINUTES_FAILED_CLOSE_MIN_AGE = 15 * 60
+# Mirrors commerce_minutes_disposition.TERMINAL_NO_CAPTURE_TXNS. Empty until a real
+# terminal non-capture transaction status is observed; the journal re-checks evidence.
+MINUTES_TERMINAL_NO_CAPTURE_TXNS = ()
 MINUTES_CLOSED_FAILED_UNCAPTURED = 'MINUTES_CLOSED_FAILED_UNCAPTURED'
 
 
@@ -562,11 +565,13 @@ def _minutes_failed_close_shape(db, flow, now):
                   "('PAYMENT_REPORTED_SUCCESS','EXACT_ORDER_CONFIRMED','TRACKER_REGISTERED')",
                   (flow['id'],)).fetchone():
         fail('MINUTES_FAILED_CLOSE_SUCCESS_ALREADY_OBSERVED')
-    placed = db.execute("SELECT MIN(o.observed_at) AS t FROM observations o JOIN operations p "
-                        "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
-                        "AND p.kind='place' AND o.order_id=?", (flow['id'], flow['order_id'])).fetchone()['t']
-    # A just-sent payment can still be inside its 3DS window; give noon time to settle it.
-    if placed is None or now - placed < MINUTES_FAILED_CLOSE_MIN_AGE:
+    # Grace runs from the latest financial send, not place: a payment sent minutes ago can
+    # still be inside its 3DS window even when the order itself was placed long ago.
+    last_send = db.execute("SELECT MAX(o.observed_at) AS t FROM observations o JOIN operations p "
+                           "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
+                           "AND p.kind IN ('place','payment') AND o.order_id=?",
+                           (flow['id'], flow['order_id'])).fetchone()['t']
+    if last_send is None or now - last_send < MINUTES_FAILED_CLOSE_MIN_AGE:
         fail('MINUTES_FAILED_CLOSE_TOO_EARLY')
     return ops
 
@@ -588,7 +593,10 @@ def close_minutes_failed_uncaptured(flow_id, *, evidence, expected_local, now=No
             or evidence.get('uncaptured_at_check') is not True or evidence.get('order_active') is not False
             or evidence.get('authorized_minor') != 0 or evidence.get('captured_minor') != 0
             or evidence.get('order_total_minor') != 0 or evidence.get('currency') != 'AED'
-            or evidence.get('order_status') not in ('failed', 'cancelled')):
+            or evidence.get('order_status') not in ('failed', 'cancelled')
+            or evidence.get('intent_status') not in ('payment_failed', 'payment_error')
+            or evidence.get('intent_transaction_status') not in MINUTES_TERMINAL_NO_CAPTURE_TXNS
+            or evidence.get('redirect_required') is True):
         fail('MINUTES_FAILED_CLOSE_EVIDENCE_REQUIRED')
     now = time.time() if now is None else now
     with _db() as db:
@@ -608,6 +616,58 @@ def close_minutes_failed_uncaptured(flow_id, *, evidence, expected_local, now=No
     return {'state': 'RELEASED', 'outcome': MINUTES_CLOSED_FAILED_UNCAPTURED,
             'account_fence_lifted': True, 'reservation_minor_retained': flow['reserved_minor'],
             'retry_allowed': False}
+
+
+def close_minutes_owner_attested_uncharged(flow_id, *, evidence, attested_by, provider_evidence,
+                                           expected_local, now=None):
+    """Owner-attested terminal close of a noon-failed Minutes flow.
+
+    Only the owner's card check plus fresh failed/inactive/zero/no-money-moved reads
+    (validated by commerce_minutes_disposition before this call). Frees the account
+    slot; the reservation, order ownership and consumed operations stay recorded, and
+    the terminal state cannot be observed, resumed or retried.
+    """
+    validate_owner_attestation(evidence=evidence, attested_by=attested_by)
+    if (type(provider_evidence) is not dict or not provider_evidence
+            or provider_evidence.get('authorized_minor') != 0 or provider_evidence.get('captured_minor') != 0
+            or provider_evidence.get('order_active') is not False
+            or provider_evidence.get('order_total_minor') != 0
+            or provider_evidence.get('currency') != 'AED'
+            or provider_evidence.get('order_status') not in ('failed', 'cancelled')
+            or not provider_evidence.get('order') or not provider_evidence.get('account_hash')
+            or type(provider_evidence.get('amount_minor')) is not int):
+        fail('MINUTES_OWNER_ATTEST_EVIDENCE_REQUIRED')
+    now = time.time() if now is None else now
+    evidence_hash = digest(provider_evidence)
+    provider_json = json.dumps({k: v for k, v in provider_evidence.items() if k != 'account_hash'},
+                               sort_keys=True, separators=(',', ':'), allow_nan=False, default=str)
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = _minutes_failed_close_shape(db, flow, now)
+        if (flow['order_id'] != provider_evidence['order']
+                or flow['account_hash'] != provider_evidence['account_hash']
+                or flow['reserved_minor'] != provider_evidence['amount_minor']
+                or flow['state'] != expected_local['state']
+                or flow['reserved_minor'] != expected_local['reserved_minor']
+                or sorted(ops, key=lambda o: o['name']) !=
+                   sorted(expected_local['operations'], key=lambda o: o['name'])):
+            fail('MINUTES_OWNER_ATTEST_CHANGED')
+        payment = next((o['name'] for o in ops if o['kind'] == 'payment'), None)
+        operation = payment or next(o['name'] for o in ops if o['kind'] == 'place')
+        audit_hash = digest({'flow_id': flow_id, 'order_id': flow['order_id'],
+                             'reserved_minor': flow['reserved_minor'], 'attested_by': attested_by,
+                             'evidence': evidence, 'attested_at': now,
+                             'provider_evidence_hash': evidence_hash})
+        db.execute('INSERT INTO owner_attestations VALUES (?,?,?,?,?,?,?,?)',
+                   (flow_id, flow['order_id'], flow['reserved_minor'], attested_by, evidence, now,
+                    provider_json, audit_hash))
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+                   'VALUES (?,?,?,?,?,?)', (flow_id, operation, OWNER_ATTESTED_UNCHARGED, audit_hash,
+                                            flow['order_id'], now))
+        db.execute('UPDATE flows SET state=? WHERE id=?', (OWNER_ATTESTED_UNCHARGED, flow_id))
+    return {'state': OWNER_ATTESTED_UNCHARGED, 'account_fence_lifted': True,
+            'attested_at': now, 'evidence_hash': audit_hash,
+            'reservation_minor_retained': flow['reserved_minor'], 'retry_allowed': False}
 
 
 def complete(flow_id):

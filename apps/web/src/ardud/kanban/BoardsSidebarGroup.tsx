@@ -1,6 +1,7 @@
 import { Link, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
-import { memo } from "react";
+import { CircleHelpIcon, MessageCircleIcon } from "lucide-react";
+import { memo, type ReactNode } from "react";
 
 import type { KanbanBoardSummary } from "@t3tools/contracts";
 
@@ -69,6 +70,29 @@ export function BoardsSidebarGroup() {
   );
 }
 
+/** Icon and count for one pending kind; zero renders nothing. */
+function BoardBadge(props: {
+  icon: ReactNode;
+  count: number;
+  label: string;
+  tone?: "warn";
+}) {
+  if (props.count <= 0) return null;
+  return (
+    <span
+      role="img"
+      aria-label={props.label}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-0.5 text-2xs font-semibold tabular-nums",
+        props.tone === "warn" ? "text-(--m-warning)" : "text-sidebar-muted-foreground",
+      )}
+    >
+      {props.icon}
+      <span aria-hidden>{props.count}</span>
+    </span>
+  );
+}
+
 const BoardRow = memo(function BoardRow(props: {
   summary: KanbanBoardSummary;
   open: boolean;
@@ -95,7 +119,17 @@ const BoardRow = memo(function BoardRow(props: {
       >
         <BoardIcon board={board} className="text-sidebar-muted-foreground" />
         <span className="min-w-0 flex-1 truncate">{board.name}</span>
-        <Count count={needsOwner} tone="warn" label={`${needsOwner} need you`} />
+        <BoardBadge
+          icon={<MessageCircleIcon aria-hidden className="size-3" />}
+          count={unread}
+          label={`${unread} unread messages`}
+        />
+        <BoardBadge
+          icon={<CircleHelpIcon aria-hidden className="size-3" />}
+          count={needsOwner}
+          label={`${needsOwner} questions for you`}
+          tone="warn"
+        />
       </Link>
       {open
         ? BOARD_VIEWS.map((entry) => {

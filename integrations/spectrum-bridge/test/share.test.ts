@@ -76,7 +76,7 @@ describe("Shares", () => {
       expect([path, response.status]).toEqual([path, 404]);
       expect(await response.text()).not.toContain("PRIVATE");
     }
-    expect(shares.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: clock + 7 * DAY, live: true }]);
+    expect(shares.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: clock + 7 * DAY, live: true, permanent: false }]);
   });
 
   test("reuses a live share and only ever extends its expiry", async () => {
@@ -176,6 +176,169 @@ describe("Shares", () => {
     await shares.share("trip");
     shares.killAll();
     expect(tunnels[0]!.dead).toBe(true);
+  });
+});
+
+describe("Shares on a stable origin", () => {
+  const ORIGIN = "https://cards.example.test";
+  let port: number;
+  let onOrigin: Shares;
+  const makeOrigin = () => new Shares({ store, appsRoot, startTunnel: fakeTunnel, now: () => clock, origin: { url: ORIGIN, port },
+    log: (event, code) => events.push(code ? `${event} ${code}` : event) });
+  const local = (url: string) => url.replace(ORIGIN, `http://127.0.0.1:${port}`);
+  beforeEach(async () => {
+    const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    port = probe.port!;
+    await probe.stop(true);
+    onOrigin = makeOrigin();
+  });
+  afterEach(async () => { await onOrigin.stopAll(); });
+
+  test("a share is an unguessable path on the origin, serving only that app, with no tunnel of its own", async () => {
+    await app("trip", PAGE.replace("</title>", "</title><script>fetch('data.json')</script>"));
+    await fs.writeFile(join(appsRoot, "trip", "data.json"), "{\"ok\":true}");
+    const result = await onOrigin.share("trip");
+    expect(result.url).toMatch(/^https:\/\/cards\.example\.test\/s\/[A-Za-z0-9_-]{22}\/$/);
+    expect(result).toMatchObject({ created: true, metadataWarnings: [] });
+    expect(tunnels).toHaveLength(0);
+    const page = await fetch(local(result.url), { headers: { "x-forwarded-host": "cards.example.test" } });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain(`content="${result.url}cover.png"`);
+    expect(await (await fetch(local(result.url) + "data.json")).json()).toEqual({ ok: true });
+    const bare = await fetch(local(result.url).slice(0, -1), { redirect: "manual" });
+    expect([bare.status, bare.headers.get("location")]).toEqual([308, new URL(result.url).pathname]);
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    for (const path of [`/s/${token}/_secret/`, `/s/${token}/../other.html`, `/s/${token}/..%2fother.html`, `/s/${token}/.env`,
+      "/s/AAAAAAAAAAAAAAAAAAAAAA/", "/trip/", "/", "/other.html", `/s/${token.slice(1)}/`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
+    expect(await (await fetch(`http://127.0.0.1:${port}/healthz`)).text()).toBe("ok\n");
+    expect(onOrigin.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: Number.MAX_SAFE_INTEGER, live: true, permanent: true }]);
+  });
+
+  test("the link stays the same across bridge restarts and never expires, and has no 10-share cap", async () => {
+    const first = await onOrigin.share("trip", 2);
+    clock += 400 * DAY;
+    expect(await onOrigin.share("trip", 1)).toMatchObject({ url: first.url, created: false });
+    await onOrigin.stopAll();
+    onOrigin = makeOrigin();
+    await onOrigin.restore();
+    expect(onOrigin.list().map(share => [share.app, share.url, share.live])).toEqual([["trip", first.url, true]]);
+    expect((await fetch(local(first.url))).status).toBe(200);
+    for (let i = 0; i < MAX_LIVE_SHARES + 2; i++) { await app(`a${i}`); expect((await onOrigin.share(`a${i}`)).created).toBe(true); }
+    expect(tunnels).toHaveLength(0);
+    expect(events).toEqual([]);
+  });
+
+  test("an unshared link stops working and re-sharing gives a new token; an origin link never expires on its own", async () => {
+    const first = await onOrigin.share("trip");
+    clock += 400 * DAY;
+    await onOrigin.sweep();
+    expect((await fetch(local(first.url))).status).toBe(200);
+    expect(events).toEqual([]);
+    await onOrigin.unshare("trip");
+    expect((await fetch(local(first.url))).status).toBe(404);
+    const second = await onOrigin.share("trip");
+    expect(second.url).not.toBe(first.url);
+    await onOrigin.unshare("trip");
+    expect((await fetch(local(second.url))).status).toBe(404);
+  });
+
+  test("a symlink swap of an app's index can't retarget its link to another app's files", async () => {
+    await app("other");
+    await fs.writeFile(join(appsRoot, "other", "private.txt"), "PRIVATE");
+    const result = await onOrigin.share("trip");
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    await fs.rm(join(appsRoot, "trip", "index.html"));
+    await fs.symlink(join(appsRoot, "other", "index.html"), join(appsRoot, "trip", "index.html"));
+    // The swapped index resolves outside the app's directory, so neither the page nor other's files are served.
+    for (const path of [`/s/${token}/`, `/s/${token}/private.txt`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
+  });
+
+  test("/healthz fails when a live origin share's page is gone, and that share reports not live", async () => {
+    const result = await onOrigin.share("trip");
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
+    await fs.rm(join(appsRoot, "trip", "index.html"));
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+    expect([health.status, await health.text()]).toEqual([503, "broken shares: trip\n"]);
+    expect(onOrigin.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: Number.MAX_SAFE_INTEGER, live: false, permanent: true }]);
+    expect((await fetch(local(result.url))).status).toBe(404);
+  });
+
+  test("a missing page keeps its link: the sweep doesn't drop it, and restoring the page recovers the same URL", async () => {
+    const result = await onOrigin.share("trip");
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
+    await onOrigin.sweep();
+    expect(events).toEqual([]);
+    expect(onOrigin.list()).toEqual([{ app: "trip", url: result.url, startedAt: clock, expiresAt: Number.MAX_SAFE_INTEGER, live: false, permanent: true }]);
+    expect((await fetch(local(result.url))).status).toBe(404);
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(503);
+    await fs.rename(join(appsRoot, "trip-away"), join(appsRoot, "trip"));
+    expect((await fetch(local(result.url))).status).toBe(200);
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
+    expect((await onOrigin.share("trip")).url).toBe(result.url);
+  });
+
+  test("a whole-folder swap to a symlink outside the apps folder can't be served through the token", async () => {
+    const outside = join(base, "outside");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(join(outside, "private.txt"), "PRIVATE");
+    await fs.writeFile(join(outside, "index.html"), PAGE);
+    const result = await onOrigin.share("trip");
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
+    await fs.symlink(outside, join(appsRoot, "trip"));
+    for (const path of [`/s/${token}/`, `/s/${token}/private.txt`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
+    expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(503);
+  });
+
+  test("a whole-folder swap to a sibling app can't be served through the token", async () => {
+    await app("other");
+    await fs.writeFile(join(appsRoot, "other", "private.txt"), "PRIVATE");
+    const result = await onOrigin.share("trip");
+    const token = new URL(result.url).pathname.split("/")[2]!;
+    await fs.rename(join(appsRoot, "trip"), join(appsRoot, "trip-away"));
+    await fs.symlink(join(appsRoot, "other"), join(appsRoot, "trip"));
+    for (const path of [`/s/${token}/`, `/s/${token}/private.txt`]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      expect([path, response.status]).toEqual([path, 404]);
+      expect(await response.text()).not.toContain("PRIVATE");
+    }
+  });
+
+  test("quick-tunnel shares from before move to the origin once, and then never expire", async () => {
+    const old = await shares.share("trip", 3);
+    await shares.stopAll();
+    await onOrigin.restore();
+    const moved = onOrigin.list()[0]!;
+    expect(moved.url).toMatch(/^https:\/\/cards\.example\.test\/s\//);
+    expect(moved).toMatchObject({ app: "trip", startedAt: clock, expiresAt: Number.MAX_SAFE_INTEGER, live: true });
+    expect(old.expiresAt).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    expect(events).toEqual([`share-moved trip ${old.url} ${moved.url}`]);
+    expect(tunnels).toHaveLength(1);
+    await onOrigin.sweep();
+    expect(onOrigin.list()[0]!.url).toBe(moved.url);
+  });
+
+  test("a share fails instead of handing out a dead link when the origin port is taken", async () => {
+    const squatter = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response("other") });
+    try {
+      const error = await onOrigin.share("trip").catch(e => e);
+      expect(error).toMatchObject({ status: 502 });
+      expect(store.get("share:trip")).toBeUndefined();
+      expect(events).toEqual([`share-origin-failed ${port}`]);
+    } finally { await squatter.stop(true); }
+    expect((await onOrigin.share("trip")).created).toBe(true);
   });
 });
 

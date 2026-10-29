@@ -170,7 +170,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
-  const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
+    origin: config.shareOrigin });
   process.once("exit", () => shares.killAll());
   void shares.restore().catch(() => log("share-sweep-failed"));
   const post = socketPost(telegramBridgeSocket);

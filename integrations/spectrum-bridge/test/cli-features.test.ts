@@ -114,6 +114,13 @@ describe("send, poll, and app commands", () => {
       status = 409;
       reply = { error: "PRIVATE" };
       expect(await run()).toEqual({ stdout: "", stderr: `${JSON.stringify({ error: "Bridge request failed (HTTP 409)" })}\n`, exitCode: 1 });
+      status = 422;
+      reply = { error: "App cards don't work in group chats; send the link as text instead" };
+      expect(await run()).toEqual({ stdout: "", stderr: `${JSON.stringify({ error: "Bridge request failed (HTTP 422): App cards don't work in group chats; send the link as text instead" })}\n`, exitCode: 1 });
+      // 403/404 carry the daemon's fixed refusal reason, so the CLI shows it.
+      status = 403;
+      reply = { error: "Only the owner's chat can do this" };
+      expect(await run()).toEqual({ stdout: "", stderr: `${JSON.stringify({ error: "Bridge request failed (HTTP 403): Only the owner's chat can do this" })}\n`, exitCode: 1 });
       expect(requests[0]).toEqual({ path: "/poll", body: { title: "T", options: ["a", "b"], dedupeKey: "k-1", sessionId: "s-1" } });
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));

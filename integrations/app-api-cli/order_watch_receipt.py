@@ -49,7 +49,8 @@ def parse(stdout, returncode, recipient, tracker_id):
     exit_ok = returncode == 0 or (returncode == NOTICE_FAILED_EXIT and recipient == 'moni')
     return exit_ok, {'for': recipient, 'tracker_id': tracker_id, 'watcher_registered': True,
                      'moni_notified': notified, 'moni_notice_failed': notified.startswith('failed'),
-                     'moni_notice_held': notified.startswith('held'), 'delivery_card': row.get('delivery_card')}
+                     'moni_notice_held': notified.startswith('held'), 'delivery_card': row.get('delivery_card'),
+                     'chat': row.get('chat')}
 
 
 def fields(registration):
@@ -57,4 +58,4 @@ def fields(registration):
     registration = registration if isinstance(registration, dict) else {}
     return {key: registration.get(key) for key in
             ('for', 'tracker_id', 'watcher_registered', 'moni_notified', 'moni_notice_failed',
-              'moni_notice_held', 'delivery_card')}
+              'moni_notice_held', 'delivery_card', 'chat')}

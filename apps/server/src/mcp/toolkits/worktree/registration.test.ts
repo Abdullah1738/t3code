@@ -61,7 +61,7 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   Layer.mock(ThreadSearch.ThreadSearch)({}),
   // ardud: missions board
-  Layer.mock(KanbanService)({}),
+  Layer.mock(KanbanService)({ attachmentPath: () => null }),
   // ardud schedules: blocked-run retry tool
   SqlitePersistence.layerMemory,
 );

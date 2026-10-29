@@ -1,0 +1,14 @@
+#!/bin/zsh -f
+# The named Cloudflare tunnel behind cards.abdullah.fund (launchd com.ardud.cards-tunnel keeps it up). It forwards
+# to the bridge's share server on 127.0.0.1:18793 (spectrum-bridge config.json shareOrigin). Until
+# cards-tunnel-setup has made ~/.cloudflared/cards-tunnel.json it exits 0, so launchd doesn't restart it.
+cf=${CARDS_CLOUDFLARED:-/opt/homebrew/bin/cloudflared}
+creds=${CARDS_CREDS:-$HOME/.cloudflared/cards-tunnel.json}
+port=${CARDS_PORT:-18793}
+if [[ ! -f $creds ]]; then
+  print -u2 "cards-tunnel: not set up yet ($creds missing); run cards-tunnel-setup"
+  exit 0
+fi
+tid=$(/usr/bin/python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["TunnelID"])' "$creds") || exit 1
+exec "$cf" tunnel --no-autoupdate --metrics 127.0.0.1:0 run --credentials-file "$creds" \
+  --url "http://127.0.0.1:$port" "$tid"

@@ -66,6 +66,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["ensureBoard"]>[0]) =>
       service.ensureBoard(input),
     [M.boardUpdate]: updateBoard,
+    [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
+      service.endSetup(input.boardId, OWNER),
     [M.cardPatch]: patchCard,
     [M.cardSettle]: (input: { readonly cardId: Parameters<KanbanServiceShape["settleCard"]>[0] }) =>
       service.settleCard(input.cardId),
@@ -84,6 +86,10 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
       readonly slots: number;
     }) => service.setPool(input.boardId, input.model, input.slots),
+    [M.poolRemove]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
+      readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
+    }) => service.removePool(input.boardId, input.model),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;

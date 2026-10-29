@@ -98,7 +98,7 @@ class AddNoticeTests(unittest.TestCase):
         code, row = self.add()
         self.assertEqual(code, 0)
         self.assertEqual(row, {'tracker_id': 'order-talabat-3999000111', 'watcher_registered': True,
-                               'moni_notified': 'sent', 'delivery_card': None})
+                               'moni_notified': 'sent', 'delivery_card': None, 'chat': 'moni'})
         self.assertEqual(len(self.sends), 1)
         args = self.sends[0]
         self.assertNotIn('imsg', args)
@@ -136,15 +136,111 @@ class AddNoticeTests(unittest.TestCase):
         self.assertNotIn('actually arrive', context)
         self.assertNotIn('--asked', context)
 
+    def make_chat(self, slug):
+        store = self.bridge_dir_for_chats() / slug / 'state.sqlite'
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.touch()
+        return store
+
+    def bridge_dir_for_chats(self):
+        return self.bridge_db.parent / 'chats'
+
     def test_card_chat_accepts_bridge_group_slugs(self):
+        self.make_chat('group-sb_gro')
         with mock.patch.object(t, 'card_enrollment', return_value=True), \
                 mock.patch.object(t.delivery_cards, 'safe_sync', return_value={'status': 'not_sent'}):
             code, _ = self.add('--card-chat', 'group-sb_gro', '--no-card-send', who='owner', order='3999000555')
         self.assertEqual(code, 0)
         cfg = t.read(self.root / 'state' / 'orders' / 'order-talabat-3999000555.json')
         self.assertEqual(cfg['delivery_card']['chat'], 'group-sb_gro')
+        self.assertEqual(cfg['chat'], 'group-sb_gro')
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             t.main(['add', '--app', 'talabat', '--order', '3999000666', '--card-chat', 'Group Chat'])
+
+    def registered_context(self, order):
+        add = next(a for a in self.robob_calls if a[:2] == ['robob-watch', 'add'] and a[a.index('--id') + 1] == f'order-talabat-{order}')
+        return add[add.index('--context') + 1], add[add.index('--title') + 1]
+
+    def add_capture(self, *extra, order, who='owner'):
+        """Like add(), but also returns the stdout warning lines."""
+        argv = ['add', '--app', 'talabat', '--order', order, '--for', who, '--label', 'Gillette heads', *extra]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = t.main(argv)
+        return code, out.getvalue().splitlines()
+
+    def test_group_chat_by_flag_routes_card_and_arrival_texts_there(self):
+        self.make_chat('group-sb_gro')
+        code, row = self.add('--chat', 'group-sb_gro', who='owner', order='4680620841', label='Gillette heads')
+        self.assertEqual(code, 0)
+        cfg = t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620841.json')
+        self.assertEqual(cfg['chat'], 'group-sb_gro')
+        self.assertEqual(row['chat'], 'group-sb_gro')
+        context, title = self.registered_context('4680620841')
+        self.assertIn('send --to group-sb_gro', context)
+        self.assertIn('--key order-talabat-4680620841-<event>', context)
+        self.assertNotIn('Reply in the owner iMessage session', context)
+        self.assertLessEqual(len(context), 6000)
+        self.assertIn('in group-sb_gro', title)
+
+    def test_chat_from_env_applies_to_registration(self):
+        self.make_chat('group-sb_gro')
+        with mock.patch.dict(_os.environ, {'ORDER_WATCH_CHAT': 'group-sb_gro'}):
+            code, row = self.add(who='owner', order='4680620842')
+        self.assertEqual((code, row['chat']), (0, 'group-sb_gro'))
+
+    def test_chat_from_cwd_chat_folder(self):
+        self.make_chat('group-sb_gro')
+        folder = self.root / 'imessage' / 'group-sb_gro' / '2026-10-28'
+        folder.mkdir(parents=True)
+        session = folder / 'session-x'
+        session.mkdir()
+        before = _os.getcwd()
+        self.addCleanup(_os.chdir, before)
+        patcher = mock.patch.dict(_os.environ, {'ORDER_WATCH_IMESSAGE_CHATS': str(self.root / 'imessage')})
+        patcher.start(); self.addCleanup(patcher.stop)
+        _os.chdir(session)
+        code, row = self.add(who='owner', order='4680620843')
+        self.assertEqual((code, row['chat']), (0, 'group-sb_gro'))
+
+    def test_cwd_chat_without_store_falls_back_to_owner_with_warning(self):
+        folder = self.root / 'imessage' / 'ghost-sb_gro' / '2026-10-28' / 'session-y'
+        folder.mkdir(parents=True)
+        before = _os.getcwd()
+        self.addCleanup(_os.chdir, before)
+        patcher = mock.patch.dict(_os.environ, {'ORDER_WATCH_IMESSAGE_CHATS': str(self.root / 'imessage')})
+        patcher.start(); self.addCleanup(patcher.stop)
+        _os.chdir(folder)
+        code, lines = self.add_capture(order='4680620844')
+        self.assertEqual(code, 0)
+        self.assertIn(json.dumps({'warning': 'chat_unknown_using_default', 'chat': 'ghost-sb_gro'}), lines)
+        self.assertEqual(t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620844.json')['chat'], 'owner')
+
+    def test_unknown_flag_chat_warns_and_registers_on_default(self):
+        code, lines = self.add_capture('--chat', 'nobody-sb_gro', order='4680620845')
+        self.assertEqual(code, 0)
+        self.assertIn(json.dumps({'warning': 'chat_unknown_using_default', 'chat': 'nobody-sb_gro'}), lines)
+        self.assertEqual(t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620845.json')['chat'], 'owner')
+
+    def test_re_add_with_different_chat_keeps_first_chat(self):
+        self.make_chat('group-sb_gro')
+        self.make_chat('other-sb_gro')
+        self.add('--chat', 'group-sb_gro', who='owner', order='4680620846')
+        code, lines = self.add_capture('--chat', 'other-sb_gro', order='4680620846')
+        self.assertEqual(code, 0)
+        self.assertIn(json.dumps({'warning': 'chat_kept_from_existing_registration', 'chat': 'group-sb_gro'}), lines)
+        self.assertEqual(t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620846.json')['chat'], 'group-sb_gro')
+
+    def test_plain_owner_and_moni_chats_keep_their_text(self):
+        self.add(who='owner', order='4680620847')
+        context, title = self.registered_context('4680620847')
+        self.assertIn('Reply in the owner iMessage session', context)
+        self.assertNotIn('delivery (owner in', title)
+        self.assertEqual(t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620847.json')['chat'], 'owner')
+        self.add(order='4680620848')
+        cfg = t.read(self.root / 'state' / 'orders' / 'order-talabat-4680620848.json')
+        self.assertEqual(cfg['chat'], 'moni')
+        context, _ = self.registered_context('4680620848')
+        self.assertIn('spectrum-bridge/src/cli.ts send --to moni', context)
 
     def test_custom_and_skipped_text(self):
         code, row = self.add('--placed-text', 'Got you the boba, about 30 min', order='3999000333')
@@ -364,12 +460,19 @@ class PlacementTextTests(unittest.TestCase):
 
 
 class ReceiptParseTests(unittest.TestCase):
+    def test_chat_key_comes_through_parse_and_fields(self):
+        out = '{"tracker_id": "w", "watcher_registered": true, "moni_notified": "skipped", "chat": "group-sb_gro"}\n'
+        ok, row = receipt.parse(out, 0, 'owner', 'w')
+        self.assertTrue(ok)
+        self.assertEqual(row['chat'], 'group-sb_gro')
+        self.assertEqual(receipt.fields(row)['chat'], 'group-sb_gro')
+
     def test_parse_receipt_and_exit_codes(self):
         out = 'noise\n{"watcher": "w", "current": {}}\n{"tracker_id": "w", "watcher_registered": true, "moni_notified": "sent"}\n'
         self.assertEqual(receipt.parse(out, 0, 'moni', 'w'),
                          (True, {'for': 'moni', 'tracker_id': 'w', 'watcher_registered': True,
                                  'moni_notified': 'sent', 'moni_notice_failed': False,
-                                  'moni_notice_held': False, 'delivery_card': None}))
+                                  'moni_notice_held': False, 'delivery_card': None, 'chat': None}))
         ok, row = receipt.parse(out.replace('"sent"', '"failed:bridge_exit_1"').encode(), 3, 'moni', 'w')
         self.assertTrue(ok)
         self.assertTrue(row['moni_notice_failed'])

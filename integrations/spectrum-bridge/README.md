@@ -52,6 +52,7 @@ under `~/.config/spectrum-bridge/`.
   instead (the card's HTML file when it is published here, otherwise its link)
   and their row moves to state `fallback`. Secure form links never leave
   iMessage.
+- Group chats can't take app cards (Sendblue sends them one-to-one only); the bridge refuses them with HTTP 422 and the CLI prints why. Send the link as text there.
 - Sendblue app cards open in the iMessage app named by `cardApp` in
   config.json (`appName`, `extensionBundleId`, `teamId`, optional
   `appStoreId`), defaulting to Photon's Spectrum app. Photon mode always uses
@@ -111,18 +112,23 @@ under `~/.config/spectrum-bridge/`.
   existing mapping) and prints the URL; `unpublish --port N` removes one. Only
   ports in that range are ever created or removed.
 - Public links for people off the tailnet: `share --app SLUG [--days N]`
-  (default 7, max 30) serves only that app's folder from its own loopback
-  server through a Cloudflare quick tunnel (`cloudflared`, no account) and
-  prints the `trycloudflare.com` URL. The bridge owns the tunnels: at most 10
-  live, stopped at expiry, killed with the bridge, and re-created with a new
-  URL when the bridge starts again (`share-restarted` log). `unshare --app SLUG`
-  ends one; `shares` lists them. `share` and `publish --app` return
+  (default 7, max 30) serves only that app's folder. With `shareOrigin`
+  (`{"url": "https://cards.abdullah.fund", "port": 18793}` in config.json) every
+  share is `<url>/s/<random token>/` on one loopback server on that port, which
+  a named Cloudflare tunnel (`com.ardud.cards-tunnel`, from integrations/local-helpers) forwards to;
+  `/healthz` answers for its health check. The link stays the same across bridge
+  and tunnel restarts until it expires or `unshare` ends it; quick-tunnel shares
+  left from before move to the origin once (`share-moved` log). Without
+  `shareOrigin`, each share gets its own Cloudflare quick tunnel (`cloudflared`,
+  no account) and a `trycloudflare.com` URL: at most 10 live, killed with the
+  bridge and re-created with a new URL when it starts again (`share-restarted`
+  log). `unshare --app SLUG` ends one; `shares` lists them. `share` and `publish --app` return
   `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
   `og:image`, and served pages get relative `og:image`/`og:url` made absolute
   so link previews load.
 - In Sendblue mode, `app --to moni --session OWNER_SESSION --key KEY --url PUBLIC_HTTPS_URL --caption "Your ride"`
   queues a card in that chat, like `send --to`. Cross-chat sends require the
-  current owner's session, including when the recipient is an admin. Omit
+  current owner's session, including when the recipient is an admin. The one exception: an admin's own chat may `send --to` a group the admin has written in, and `chats` from that chat lists those groups. Omit
   `--to` to send to the session's own chat. Use a publicly reachable URL for
   Moni and other recipients (`share`, rather than the owner's tailnet-only
   `publish` URL). Reuse the key only for an identical card to the same recipient;

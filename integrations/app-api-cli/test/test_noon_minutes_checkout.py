@@ -305,6 +305,87 @@ class ProjectionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(m.MinutesError):
                 self.review(self.snapshot(data))
 
+    def review_quiet(self, data, required, note=m.QUIET_NOTE):
+        return m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
+            expected_total_minor=2050,required_preferences=required,
+            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),driver_note=note)
+
+    def test_only_dont_ring_bell_offered_passes_with_note(self):
+        data=fixture();data['deliveryPreferences']=[{'code':'dont_ring_the_bell','value':True,'title':'Do not ring bell'}]
+        self.assertRegex(self.review_quiet(data,('dont_ring_the_bell',)),r'^[a-f0-9]{64}$')
+
+    def test_offered_toggle_not_true_refuses(self):
+        data=fixture();data['deliveryPreferences']=[{'code':'dont_ring_the_bell','value':True,'title':None},
+                                                    {'code':'leave_it_at_my_door','value':False,'title':None}]
+        with self.assertRaisesRegex(m.MinutesError,'QUIET_PREFERENCE_MISMATCH'):
+            self.review_quiet(data,('dont_ring_the_bell','leave_it_at_my_door'))
+
+    def test_empty_required_preferences_refuses(self):
+        with self.assertRaisesRegex(m.MinutesError,'QUIET_PREFERENCE_MISMATCH'):
+            self.review_quiet(fixture(),())
+
+    def test_driver_note_tolerates_curly_quotes_and_whitespace(self):
+        data=fixture();data['driverNotes']="Leave at door. Don\u2019t ring bell.  Don't  call. "
+        self.assertRegex(self.review_quiet(data,('synthetic_quiet',)),r'^[a-f0-9]{64}$')
+
+    def test_driver_note_ring_bell_still_refuses(self):
+        data=fixture();data['driverNotes']='Ring bell'
+        with self.assertRaisesRegex(m.MinutesError,'QUIET_NOTES_MISMATCH'):
+            self.review_quiet(data,('synthetic_quiet',))
+
+    def test_extra_note_passes_only_when_included(self):
+        extra=m.quiet_note('Gate code 1234')
+        data=fixture();data['driverNotes']=extra
+        self.assertRegex(self.review_quiet(data,('synthetic_quiet',),note=extra),r'^[a-f0-9]{64}$')
+        with self.assertRaisesRegex(m.MinutesError,'QUIET_NOTES_MISMATCH'):
+            self.review_quiet(data,('synthetic_quiet',))
+
+    def test_quiet_note_extra_validation(self):
+        self.assertEqual(m.quiet_note(),m.QUIET_NOTE)
+        self.assertEqual(m.quiet_note('  Gate 1 '),m.QUIET_NOTE+' Gate 1')
+        for bad in ('', '   ', 'x'*201, 'a\nb', 'a\rb', 5):
+            with self.subTest(bad=bad), self.assertRaisesRegex(m.MinutesError,'DRIVER_NOTE_INVALID'):
+                m.quiet_note(bad)
+
+    def test_cvv_ask_refused_by_default_and_allowed_only_when_asked(self):
+        data=fixture();data['isCvvRequired']=True
+        with self.assertRaisesRegex(m.MinutesError,'PAYMENT_CHALLENGE_REQUIRED'):
+            self.review(self.snapshot(data))
+        digest=m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
+            expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
+            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=True)
+        self.assertRegex(digest,r'^[a-f0-9]{64}$')
+
+    def test_verify_device_and_unknown_cvv_flag_always_refuse(self):
+        for key,value,allow in [('verifyDevice',True,False),('verifyDevice',True,True),
+                                ('isCvvRequired',None,True),('isCvvRequired',None,False)]:
+            data=fixture();data[key]=value
+            with self.subTest(key=key,value=value,allow=allow), self.assertRaises(m.MinutesError):
+                m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
+                    expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
+                    card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=allow)
+
+    def test_home_provider_refreshes_old_home_and_refuses_address_move(self):
+        h=Harness([fixture()])
+        old=AccountHome('minutes',h.home.account_ref,h.home.address_ref,time.time()-200)
+        calls=[]
+        def provider(deadline):
+            calls.append(deadline)
+            return AccountHome('minutes',h.home.account_ref,h.home.address_ref,time.time())
+        client=m.MinutesCheckout(HEADERS,old,request=h.request,receipt=h.receipt,
+            response_cookies=h.response_cookies,home_provider=provider)
+        client.get_session(before_send=h.reserve)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(len(h.calls),1)
+        h2=Harness([fixture()])
+        old2=AccountHome('minutes',h2.home.account_ref,h2.home.address_ref,time.time()-200)
+        moved=AccountHome('minutes',h2.home.account_ref,fingerprint('moved-address'),time.time())
+        client2=m.MinutesCheckout(HEADERS,old2,request=h2.request,receipt=h2.receipt,
+            response_cookies=h2.response_cookies,home_provider=lambda deadline:moved)
+        with self.assertRaisesRegex(m.MinutesError,'VERIFIED_ACCOUNT_CHANGED'):
+            client2.get_session(before_send=h2.reserve)
+        self.assertEqual(h2.calls,[])
+
     def test_unexpected_cart_item_never_ignored(self):
         data=fixture();data['items'].append(dict(data['items'][0],sku='UNOWNED_SKU'))
         snapshot=self.snapshot(data)

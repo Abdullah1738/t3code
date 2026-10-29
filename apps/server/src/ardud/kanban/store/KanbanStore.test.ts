@@ -36,6 +36,7 @@ const board: KanbanBoard = {
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
+  setup: null,
   archivedAt: null,
 };
 
@@ -53,6 +54,7 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   model,
   models: [],
   subtasks: [],
+  subtaskSeq: 0,
   projectId: null,
   links: [],
   blockedBy: [],
@@ -143,6 +145,33 @@ it.layer(TestLayer)("kanban store", (it) => {
       yield* store.putScriptRun({ ...runRecord, endedAt: at, exitCode: 0, output: "ok" });
       const runs = yield* store.scriptRuns(KanbanScriptId.make("script-1"), 5);
       assert.deepStrictEqual(runs, [{ ...runRecord, endedAt: at, exitCode: 0, output: "ok" }]);
+    }),
+  );
+});
+
+it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
+  it.effect("rolls the board back when a pool in the same write fails", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const fresh = { ...board, id: KanbanBoardId.make("board-rollback"), slug: "rollback" };
+      const good = { key: "opencode/opus/a", model, slots: 0 };
+      // A negative slot count fails NonNegativeInt on encode, after the board row is written.
+      const bad = { key: "opencode/opus/b", model, slots: -1 };
+      const exit = yield* Effect.exit(store.putBoardWithPools(fresh, [good, bad]));
+      assert.strictEqual(exit._tag, "Failure");
+      assert.notInclude((yield* store.boards).map((entry) => entry.id), fresh.id);
+      assert.deepStrictEqual(yield* store.pools(fresh.id), []);
+    }),
+  );
+
+  it.effect("writes the board and its pools together when all of them succeed", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const fresh = { ...board, id: KanbanBoardId.make("board-together"), slug: "together" };
+      const pool = { key: "opencode/opus/c", model, slots: 0 };
+      yield* store.putBoardWithPools(fresh, [pool]);
+      assert.include((yield* store.boards).map((entry) => entry.id), fresh.id);
+      assert.deepStrictEqual(yield* store.pools(fresh.id), [pool]);
     }),
   );
 });

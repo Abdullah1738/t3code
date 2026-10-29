@@ -144,16 +144,20 @@ export function createAppsHandler(root: string, secrets?: AppsSecrets): (request
  * other apps, dotfiles or listings. `root` is already resolved, so a later symlink swap cannot widen it.
  */
 export function createShareHandler(root: string): (request: Request) => Promise<Response> {
-  return async request => {
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      return new Response("Method not allowed", { status: 405, headers: { ...headers, Allow: "GET, HEAD" } });
-    }
-    const pathname = new URL(request.url).pathname;
-    if (pathname === "/_secret" || pathname.startsWith(SECRET_PREFIX)) return notFound();
-    const file = await resolveAppFile(root, pathname);
-    return file ? fileResponse(request, file) : notFound();
-  };
+  return request => serveAppFile(request, root, new URL(request.url).pathname);
 }
+
+/** One shared app's file for `pathname` (relative to that app's directory `root`), or 404/405. */
+export async function serveAppFile(request: Request, root: string, pathname: string): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method not allowed", { status: 405, headers: { ...headers, Allow: "GET, HEAD" } });
+  }
+  if (pathname === "/_secret" || pathname.startsWith(SECRET_PREFIX)) return notFound();
+  const file = await resolveAppFile(root, pathname);
+  return file ? fileResponse(request, file) : notFound();
+}
+
+export const notFoundResponse = notFound;
 
 /** Loopback-only static server for owner-built mini apps; public exposure is the tailnet proxy's job. */
 export function startAppsServer(root: string, port: number, secrets?: AppsSecrets): { port: number; stop(): Promise<void> } {

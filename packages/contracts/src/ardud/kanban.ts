@@ -15,6 +15,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "../baseSchemas.ts";
+import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
 import { ModelSelection } from "../modelSelection.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
@@ -158,6 +159,8 @@ export const KanbanCard = Schema.Struct({
   prompt: Schema.String,
   /** The card's flow, step by step: the work, its review and what comes after. */
   subtasks: Schema.Array(KanbanSubtask).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  /** Highest subtask number ever handed out on this card, so a dropped id is never reused. */
+  subtaskSeq: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   stage: KanbanStage,
   priority: KanbanPriority,
   goalId: Schema.NullOr(KanbanGoalId),
@@ -461,6 +464,19 @@ export const KanbanBoardIconImage = Schema.String.check(
   Schema.isPattern(/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/),
 );
 
+/**
+ * A board's first setup: the setup evaluator backfills the wiki while card work
+ * is held. Null on boards that never ran one (existing rows decode as null).
+ */
+export const KanbanBoardSetup = Schema.Struct({
+  status: Schema.Literals(["running", "done"]),
+  discussionId: KanbanDiscussionId,
+  threadId: ThreadId,
+  startedAt: IsoDateTime,
+  finishedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanBoardSetup = typeof KanbanBoardSetup.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -477,6 +493,7 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   instructions: KanbanInstructions,
+  setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });
@@ -507,6 +524,10 @@ export const KanbanBlock = Schema.Union([
   }),
   Schema.TaggedStruct("card", { cardId: KanbanCardId }),
   Schema.TaggedStruct("image", { url: TrimmedNonEmptyString, alt: Schema.NullOr(Schema.String) }),
+  /** A file uploaded through the attachment store; the board keeps it under its own id. */
+  Schema.TaggedStruct("attachment", {
+    attachment: Schema.Union([ChatImageAttachment, ChatFileAttachment]),
+  }),
 ]);
 export type KanbanBlock = typeof KanbanBlock.Type;
 
@@ -563,6 +584,10 @@ export const KanbanDiscussion = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** Hidden until then, or until someone else posts. */
   snoozedUntil: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The owner pinned it: listed first and never settled automatically. */
+  pinnedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** When the owner last brought it back (unsettle, unsnooze or unpin); the idle day before auto-settle restarts here. */
+  reopenedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanDiscussion = typeof KanbanDiscussion.Type;
 
@@ -570,6 +595,8 @@ export const KanbanScriptTrigger = Schema.Union([
   Schema.TaggedStruct("schedule", {
     everyMs: Schema.NullOr(PositiveInt),
     cron: Schema.NullOr(Schema.String),
+    /** The zone a cron line runs in (the server's), filled on read; null when unknown. */
+    timeZone: Schema.optional(Schema.NullOr(Schema.String)),
   }),
   Schema.TaggedStruct("event", {
     event: Schema.Literals(["card.created", "card.moved", "message.posted"]),

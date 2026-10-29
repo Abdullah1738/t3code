@@ -11,12 +11,19 @@ import {
   type ScriptRunTone,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanScript, KanbanScriptRun } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS, type KanbanScript, type KanbanScriptRun } from "@t3tools/contracts";
 
 import { Button } from "../../components/ui/button";
 import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
-import { kanban, runAction, useScriptRuns, useScripts } from "./kanbanStore";
+import {
+  kanban,
+  kanbanErrorMessage,
+  runAction,
+  useKanbanPermission,
+  useScriptRunsFeed,
+  useScripts,
+} from "./kanbanStore";
 import { Glyph, type GlyphKind } from "./parts";
 
 const TONE_GLYPH: Record<ScriptRunTone, GlyphKind> = {
@@ -37,10 +44,13 @@ const startLabel = (startedAt: string, nowMs: number) => {
 
 function ScriptSwitch(props: { script: KanbanScript }) {
   const { script } = props;
+  const canToggle = useKanbanPermission(KANBAN_WS_METHODS.scriptEnable);
   return (
     <Switch
       size="sm"
       checked={script.enabled}
+      disabled={!canToggle}
+      title={canToggle ? undefined : "Your connection can't change scripts"}
       aria-label={`${script.name} on`}
       onCheckedChange={(enabled) =>
         void runAction("Couldn't change the script", () =>
@@ -107,7 +117,8 @@ export function ScriptsView(props: { boardId: string; nowMs: number }) {
 
 function ScriptDetail(props: { boardId: string; script: KanbanScript; nowMs: number }) {
   const { script } = props;
-  const runs = useScriptRuns(props.boardId, script.id);
+  const { runs, feed } = useScriptRunsFeed(props.boardId, script.id);
+  const canRun = useKanbanPermission(KANBAN_WS_METHODS.scriptRun);
   const [runId, setRunId] = useState<number | undefined>(undefined);
   const running = scriptState(script).tone === "running";
   const shown = runs?.find((run) => run.id === runId) ?? runs?.[0];
@@ -121,7 +132,8 @@ function ScriptDetail(props: { boardId: string; script: KanbanScript; nowMs: num
         <Button
           variant="outline"
           size="sm"
-          disabled={running}
+          disabled={running || !canRun}
+          title={canRun ? undefined : "Your connection can't run scripts"}
           onClick={() =>
             void runAction("Couldn't run the script", () => kanban.runScript(script.id))
           }
@@ -131,7 +143,23 @@ function ScriptDetail(props: { boardId: string; script: KanbanScript; nowMs: num
         </Button>
         <ScriptSwitch script={script} />
       </header>
-      {runs === undefined ? null : runs.length === 0 ? (
+      {runs === undefined ? (
+        feed.failure ? (
+          <div className="flex flex-col items-start gap-3">
+            <p className="font-medium">Couldn't load the runs.</p>
+            <p className="text-sm text-(--m-muted)">
+              {kanbanErrorMessage(feed.failure.error)}
+            </p>
+            <button
+              type="button"
+              onClick={feed.retry}
+              className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null
+      ) : runs.length === 0 ? (
         <p className="text-sm text-(--m-muted)">Not run yet.</p>
       ) : (
         <div className="grid gap-3.5 md:grid-cols-[200px_minmax(0,1fr)]">
