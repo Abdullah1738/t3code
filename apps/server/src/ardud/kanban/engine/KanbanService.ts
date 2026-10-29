@@ -2811,27 +2811,32 @@ const make = Effect.gen(function* () {
   const probeOutagesNow = Effect.fn("KanbanService.probeOutages")(function* () {
     // Nothing down and the links already read once since start: skip the read.
     if ((yield* Ref.get(down)).size === 0 && (yield* Ref.get(scanned))) return;
-    const paused = yield* lock.withPermits(1)(seedDown.pipe(Effect.andThen(pausedLinks)));
-    const models = new Map<string, ModelSelection>();
-    for (const { link, board } of paused) {
-      if (link.paused === null) continue;
-      const model = link.model ?? board.evaluatorModel;
-      models.set(Rules.poolKey(model), model);
-    }
-    // A key whose threads all came back on their own is up again. A key with paused
-    // links but no state (after a restart) is marked down now, so dispatch holds
-    // it while the probe below is in flight.
     const seededAt = yield* nowMillis;
-    yield* Ref.update(down, (map) => {
-      const next = new Map([...map].filter(([key]) => models.has(key)));
-      for (const key of models.keys()) {
-        if (!next.has(key)) {
-          // nextAt is now: the loop below probes it right away.
-          next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: seededAt });
+    // Snapshot and reconcile under one lock hold: a turnEnded between the two would
+    // record an outage the snapshot misses, and the filter would drop it.
+    const models = yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        yield* seedDown;
+        const found = new Map<string, ModelSelection>();
+        for (const { link, board } of yield* pausedLinks) {
+          const model = link.model ?? board.evaluatorModel;
+          found.set(Rules.poolKey(model), model);
         }
-      }
-      return next;
-    });
+        // A key whose threads all came back on their own is up again. A key with paused
+        // links but no state is marked down now, so dispatch holds it while the probe
+        // below is in flight.
+        yield* Ref.update(down, (map) => {
+          const next = new Map([...map].filter(([key]) => found.has(key)));
+          for (const key of found.keys()) {
+            // nextAt is now: the loop below probes it right away.
+            if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: seededAt });
+          }
+          return next;
+        });
+        return found;
+      }),
+    );
+    // Outages recorded from here on add their own keys and wait for the next run.
     for (const [key, model] of models) {
       const now = yield* nowMillis;
       // No state after a restart: probe right away.

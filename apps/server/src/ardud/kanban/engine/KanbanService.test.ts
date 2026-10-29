@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
@@ -2915,6 +2916,71 @@ it.effect("a paused one-shot evaluator resumed by hand stays resumed after its r
       yield* kanban.probeOutages;
       assert.strictEqual(probe.calls, 0);
       assert.strictEqual((yield* Ref.get(fake.threads)).get(threadId)!.messages.length, before);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("an outage recorded while a probe run is under way stays down and is woken later", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      yield* kanban.setPool(board.id, sol, 3);
+      const first = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
+      const second = yield* kanban.createCard(
+        board.id,
+        { prompt: "b", title: "b", model: sol },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const firstThread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const secondThread = (yield* kanban.card(second.id)).card.activeThreadId!;
+      fake.failures.set(firstThread, outage);
+      yield* kanban.turnEnded(firstThread);
+      yield* TestClock.adjust("5 minutes");
+      // Hold the probe run at its first clock read, record the second outage, then let it go.
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const clock = yield* Clock.Clock;
+      let held = false;
+      const holdingClock: Clock.Clock = {
+        ...clock,
+        currentTimeMillis: Effect.gen(function* () {
+          if (!held) {
+            held = true;
+            yield* Deferred.succeed(reached, undefined);
+            yield* Deferred.await(release);
+          }
+          return yield* clock.currentTimeMillis;
+        }),
+      };
+      probe.ok = true;
+      const probing = yield* kanban.probeOutages.pipe(
+        Effect.provideService(Clock.Clock, holdingClock),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(reached);
+      fake.failures.set(secondThread, outage);
+      yield* kanban.turnEnded(secondThread);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(probing);
+      assert.isNull((yield* kanban.caller(firstThread))?.paused ?? null);
+      assert.isNotNull((yield* kanban.caller(secondThread))?.paused ?? null);
+      const waiting = yield* kanban.createCard(
+        board.id,
+        { prompt: "c", title: "c", model: sol },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(waiting.id)).card.stage, "todo");
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(secondThread))?.paused ?? null);
     }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
