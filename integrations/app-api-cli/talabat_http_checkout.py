@@ -671,6 +671,17 @@ def payment_body(observation, quote):
     return body
 
 
+# Exact processor diagnostics seen on payment/status Error, mapped to fixed
+# reasons. 20051 (16-18 Oct) and 20179 (29 Oct, Checkout.com "Lifecycle":
+# issuer/scheme refused the card data) are both card refusals.
+PROCESSOR_DECLINES = {
+    '20051 - Insufficient funds, please try again with another card.':
+        'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
+    '20179 - Transaction was declined, please try again with another card.':
+        'PAYMENT_DECLINED_BY_ISSUER_NO_RETRY',
+}
+
+
 @dataclass(frozen=True, repr=False)
 class PaymentResult:
     state: str
@@ -783,11 +794,13 @@ def parse_async_status(status, data, context):
             elif errors or signal == 'error':
                 state, reason = 'PAYMENT_ERROR_REPORTED', 'NO_ROLLBACK_OR_RETRY_ASSUMED'
                 # Native v2 now returns Error plus duplicate error/errors maps.
-                # Recognize only the observed processor diagnostic, never expose
+                # Recognize only observed processor diagnostics, never expose
                 # arbitrary exception text or treat a decline as no-charge proof.
-                if signal == 'error' and errors and all(error.get('exception') ==
-                        '20051 - Insufficient funds, please try again with another card.' for error in errors):
-                    reason = 'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'
+                exceptions = {error.get('exception') for error in errors
+                              if type(error.get('exception')) is str}
+                if (signal == 'error' and errors and len(exceptions) == 1
+                        and all(type(error.get('exception')) is str for error in errors)):
+                    reason = PROCESSOR_DECLINES.get(exceptions.pop(), reason)
             elif status == 200 and signal == 'success':
                 state, reason = 'PAYMENT_REPORTED_SUCCESS', 'EXACT_TRANSACTION_ASYNC_STATUS_SUCCESS'
             elif status == 200 and (signal is None or signal == 'pending'):
