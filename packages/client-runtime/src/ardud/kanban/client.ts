@@ -2,6 +2,7 @@ import { Atom } from "effect/reactivity";
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
+  type KanbanBoard,
   type KanbanBoardSummary,
   type KanbanBoardUpdateInput,
   type KanbanCardDetail,
@@ -85,6 +86,18 @@ export interface KanbanClient {
   setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
   removePool(boardId: string, model: ModelSelection): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
+  /** Owner's New board: creates the board with its project and evaluator model. */
+  createBoard(input: {
+    slug: string;
+    name: string;
+    defaultProjectId: string | null;
+    evaluatorModel?: ModelSelection | undefined;
+  }): Promise<KanbanBoard>;
+  /** Owner's Start setup: saves the picked evaluator model and returns the Setup discussion id. */
+  startSetup(
+    boardId: string,
+    input: { evaluatorModel: ModelSelection; text?: string | undefined },
+  ): Promise<{ discussionId: string }>;
   /** Owner ends the board's running setup; card work resumes. */
   endSetup(boardId: string): Promise<void>;
   createDiscussion(boardId: string, title: string): Promise<KanbanDiscussion>;
@@ -784,6 +797,21 @@ export function createKanbanClient(
     },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);
+    },
+    async createBoard(input) {
+      return await transport.request(M.boardCreate, {
+        slug: input.slug,
+        name: input.name,
+        defaultProjectId: input.defaultProjectId as never,
+        ...(input.evaluatorModel ? { evaluatorModel: input.evaluatorModel } : {}),
+      });
+    },
+    async startSetup(boardId, input) {
+      return await transport.request(M.setupStart, {
+        boardId: boardId as never,
+        evaluatorModel: input.evaluatorModel,
+        ...(input.text ? { text: input.text } : {}),
+      });
     },
     async endSetup(boardId) {
       await transport.request(M.setupEnd, { boardId: boardId as never });
