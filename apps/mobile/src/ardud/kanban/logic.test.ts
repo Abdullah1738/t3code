@@ -91,7 +91,7 @@ const pick: Extract<KanbanBlock, { _tag: "choice" }> = {
 };
 
 const answer = (by: KanbanAnswer["by"], choice: string[], blockId = "window"): KanbanAnswer =>
-  ({ blockId, by, choice, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
+  ({ blockId, by, choice, text: null, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
 
 describe("choiceView", () => {
   it("shares out the answers to this block and marks the owner's", () => {
