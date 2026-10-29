@@ -4,9 +4,11 @@ import { useState } from "react";
 
 import {
   boardFilter,
+  cardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
   sanitizeBoardFilterPrefs,
+  type BoardFilter,
   type BoardFilterPrefs,
   type GroupBy,
   type KanbanBoardState,
@@ -75,7 +77,7 @@ const GROUP_OPTIONS: ReadonlyArray<{ value: GroupBy; label: string }> = [
 export function BoardPage(props: {
   boardId: string;
   search: BoardSearch;
-  onSearch: (next: BoardSearch) => void;
+  onSearch: (next: BoardSearch, options?: { readonly replace?: boolean }) => void;
 }) {
   const { boardId, search, onSearch } = props;
   const state = useBoardState(boardId);
@@ -90,11 +92,12 @@ export function BoardPage(props: {
   );
   const prefs = sanitizeBoardFilterPrefs(storedPrefs);
   const setFilters = (next: BoardFilterPrefs) => setPrefs(next);
+  const filter = state ? boardFilter(state, prefs, query.trim()) : null;
 
-  const go = (patch: SearchPatch) => {
+  const go = (patch: SearchPatch, options?: { readonly replace?: boolean }) => {
     const next: Record<string, unknown> = { ...search, ...patch };
     for (const key of Object.keys(next)) if (next[key] === undefined) delete next[key];
-    onSearch(next as BoardSearch);
+    onSearch(next as BoardSearch, options);
   };
   const openCard = (card: string) => {
     noteDrawerOpener();
@@ -106,6 +109,11 @@ export function BoardPage(props: {
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
   const setup = state ? setupBanner(state.board) : null;
+  const stepCard = (card: string) => go({ card }, { replace: true });
+  const steps =
+    view === "board" && state && filter && drawerOpen && search.card
+      ? cardSteps(state, nowMs, filter, search.group ?? "stage", search.card)
+      : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -217,7 +225,7 @@ export function BoardPage(props: {
                   boardId={boardId}
                   state={state}
                   search={search}
-                  query={query}
+                  filter={filter ?? {}}
                   prefs={prefs}
                   onPrefs={setFilters}
                   nowMs={nowMs}
@@ -233,6 +241,8 @@ export function BoardPage(props: {
                 boardId={boardId}
                 cardId={search.card}
                 state={state}
+                steps={steps}
+                onStepCard={stepCard}
                 onClose={closeCard}
                 onOpenCard={openCard}
               />
@@ -248,7 +258,7 @@ function BoardBody(props: {
   boardId: string;
   state: KanbanBoardState;
   search: BoardSearch;
-  query: string;
+  filter: BoardFilter;
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
@@ -256,8 +266,7 @@ function BoardBody(props: {
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
 }) {
-  const { state, search, nowMs, go } = props;
-  const filter = boardFilter(state, props.prefs, props.query.trim());
+  const { state, search, nowMs, go, filter } = props;
   switch (search.view ?? "board") {
     case "board":
       return (

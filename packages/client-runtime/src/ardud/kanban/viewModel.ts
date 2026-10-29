@@ -495,23 +495,23 @@ export function cardSteps(
   group: GroupBy,
   cardId: string,
 ): CardSteps {
-  const board = group === "stage" ? stageBoard(state, nowMs, filter) : null;
-  const lanes: ReadonlyArray<ReadonlyArray<CardView>> = board
-    ? [...board.active, ...board.shipped, board.owner].map((column) => column.cards)
-    : groupCards(state, group, nowMs, filter).map((g) => g.cards);
-  const lane = lanes.find((cards) => cards.some((view) => view.id === cardId)) ?? [];
-  const index = lane.findIndex((view) => view.id === cardId);
-  const at = (i: number) => (index >= 0 && i >= 0 && i < lane.length ? lane[i]!.id : null);
-
+  let lanes: ReadonlyArray<ReadonlyArray<CardView>>;
   let afterSettle: string | null = null;
-  if (board) {
+  if (group === "stage") {
+    const board = stageBoard(state, nowMs, filter);
+    lanes = [...board.active, ...board.shipped, board.owner].map((column) => column.cards);
     const verified = board.shipped.find((column) => column.stage === "verified");
     const open = (verified?.cards ?? []).filter((view) => view.card.settledAt === null);
     const openAt = open.findIndex((view) => view.id === cardId);
     afterSettle =
       openAt >= 0 ? (open[openAt + 1]?.id ?? open[openAt - 1]?.id ?? null) : (open[0]?.id ?? null);
+  } else {
+    lanes = groupCards(state, group, nowMs, filter).map((g) => g.cards);
   }
 
+  const lane = lanes.find((cards) => cards.some((view) => view.id === cardId)) ?? [];
+  const index = lane.findIndex((view) => view.id === cardId);
+  const at = (i: number) => (index >= 0 && i >= 0 && i < lane.length ? lane[i]!.id : null);
   return { previous: at(index - 1), next: at(index + 1), afterSettle };
 }
 
