@@ -14,11 +14,13 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KanbanScriptId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
   type KanbanBlock,
+  type KanbanScript,
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
   type ServerProvider,
@@ -5209,5 +5211,65 @@ it.effect("setPool 0 pauses an existing pool whose model left a non-empty provid
       const pools = yield* kanban.setPool(board.id, retired, 0);
       assert.isTrue(pools.some((pool) => pool.key === Rules.poolKey(retired) && pool.slots === 0));
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed), catalogWithout)));
+  }),
+);
+
+it.effect("a script's step leaves the evaluator alone until the script is done", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const store = yield* KanbanStore.KanbanStore;
+      const scriptId = KanbanScriptId.make("script-land");
+      const script: KanbanScript = {
+        id: scriptId,
+        boardId: board.id,
+        name: "land",
+        path: "/tmp/land.sh",
+        trigger: { _tag: "manual" },
+        enabled: true,
+        createdBy: owner,
+        createdAt: "2026-10-29T00:00:00Z",
+        lastRun: null,
+      };
+      yield* store.putScript(script);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const scriptActor: KanbanActor = { _tag: "script", scriptId };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Fix the fee",
+          title: "Fee",
+          subtasks: [
+            { text: "Write the PR", owner: "work" },
+            { text: "Review", owner: "review" },
+            { text: "Merge the PR", owner: "script", script: "land", step: 3 },
+            { text: "Tell the reporter", owner: "evaluator", step: 4 },
+          ],
+        },
+        evaluator,
+      );
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+      yield* kanban.markSubtask(card.id, "s1", "done", "PR #4", worker, "work");
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+      yield* kanban.dispatchNow;
+      const reviewThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* kanban.reviewResult(reviewThread, "clear", []);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "completed");
+
+      const told = [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+        thread.messages.some((text) => text.includes("waiting on your subtasks")),
+      );
+      assert.strictEqual(told.length, 0);
+
+      yield* kanban.markSubtask(card.id, "s3", "done", "merged abc1234", scriptActor, "script");
+      const wakes = [...(yield* Ref.get(fake.threads)).values()].flatMap((thread) =>
+        thread.messages.filter((text) => text.includes("waiting on your subtasks: s4")),
+      );
+      assert.strictEqual(wakes.length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
