@@ -2703,7 +2703,11 @@ const make = Effect.gen(function* () {
       // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
       for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
         if (link.role !== "evaluator") continue;
-        const view = yield* threads.view(link.threadId);
+        // A failed read skips this thread and keeps its ask record, so a blip
+        // can't make the next healthy tick ask again inside the hour.
+        const read = yield* Effect.result(threads.find(link.threadId));
+        if (read._tag === "Failure") continue;
+        const view = read.success;
         if (view?.state !== "running" || view.runStartedAt === null) {
           yield* Ref.update(statusAsked, (all) => {
             if (!all.has(link.threadId)) return all;

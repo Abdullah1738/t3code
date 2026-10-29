@@ -1162,6 +1162,26 @@ it.effect("a worker that flags its own card tells the card's evaluator", () =>
   }),
 );
 
+it.effect("a failed read does not forget a status ask, so the next tick does not repeat it", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Busy" });
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("46 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+      fake.failReads.left = 1;
+      yield* kanban.tick;
+      assert.strictEqual(fake.failReads.left, 0, "the injected read failure was consumed");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const statusAsksTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
   Ref.get(fake.threads).pipe(
     Effect.map(
