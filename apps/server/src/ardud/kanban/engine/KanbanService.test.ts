@@ -4198,6 +4198,22 @@ it.effect("pausing a pool at a variant the provider doesn't offer keeps the pool
   }),
 );
 
+it.effect("pausing a pool at a different offered variant stores the requested variant", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, opusXhigh, 2);
+      const paused = yield* kanban.setPool(board.id, opusHigh, 0);
+      const pool = paused.find((candidate) => candidate.key === Rules.poolKey(opusXhigh));
+      assert.strictEqual(pool?.slots, 0);
+      assert.strictEqual(pool?.model.options?.find((o) => o.id === "variant")?.value, "high");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the pool's variant wins on create and edit", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
