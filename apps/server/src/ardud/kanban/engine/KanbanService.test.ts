@@ -2616,6 +2616,36 @@ it.effect("a work run that dies on an outage is paused, not flagged or nudged", 
   }),
 );
 
+it.effect("an outage after a card_edit model switch holds the thread's live model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      yield* kanban.setPool(board.id, sol, 3);
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.editCard(created.id, { model: sol }, owner);
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      const paused = yield* kanban.caller(workThread);
+      assert.strictEqual(paused?.model?.model, "opus/cx/gpt-6.1-sol");
+      // Sol is down; the card's old model still takes work.
+      const onSol = yield* kanban.createCard(
+        board.id,
+        { prompt: "s", title: "s", model: sol },
+        owner,
+      );
+      const plain = yield* kanban.createCard(board.id, { prompt: "p", title: "p" }, owner);
+      yield* kanban.dispatchNow;
+      assert.isNull((yield* kanban.card(onSol.id)).card.activeThreadId);
+      assert.isNotNull((yield* kanban.card(plain.id)).card.activeThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a down pool takes no new card; a weighted card starts on its other model", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

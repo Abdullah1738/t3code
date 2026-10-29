@@ -2411,7 +2411,11 @@ const make = Effect.gen(function* () {
     // probeOutages to wake it on the same model.
     const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
     if (outage !== null) {
-      const model = link.model ?? (yield* boardOf(link.boardId)).evaluatorModel;
+      // A card_edit switches the open thread's model without touching its link.
+      const model =
+        (yield* threads.model(threadId)) ??
+        link.model ??
+        (yield* boardOf(link.boardId)).evaluatorModel;
       yield* pauseThread(link, model, outage.message);
     }
     else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
