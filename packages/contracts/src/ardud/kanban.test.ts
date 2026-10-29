@@ -134,9 +134,11 @@ describe("own answers", () => {
 });
 });
 
+const decodeThreadLink = Schema.decodeUnknownSync(KanbanThreadLink);
+
 describe("KanbanThreadLink", () => {
   it("decodes a link written before pauses existed as not paused", () => {
-    const decoded = Schema.decodeUnknownSync(KanbanThreadLink)({
+    const decoded = decodeThreadLink({
       threadId: "thread-1",
       boardId: "board-1",
       cardId: null,
