@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 
 // Card #14: a real send or draft refuses under a test run; a stub injected by the test still works.
-// Every spawn strips the ambient env, so the guard is tested without ROBOB_TEST leaking from the caller.
+// Every spawn strips the ambient env and sets ROBOB_TEST itself, so the guard is tested without relying on the caller's env.
 const helpers = join(import.meta.dir, "../helpers");
 const bare = (extra: Record<string, string> = {}) => ({
   PATH: "/usr/bin:/bin",

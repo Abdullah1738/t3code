@@ -9,7 +9,7 @@ HELPER = os.path.join(HERE, "..", "helpers", "mailsend")
 
 def run_ms(*args, **extra):
     # Start from a clean env (no inherited test markers) so each case controls the guard itself.
-    env = {"HOME": HERE, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", **extra}
+    env = {"HOME": HERE, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "ROBOB_TEST": "1", **extra}
     return subprocess.run(["/usr/bin/python3", HELPER, *args], env=env, capture_output=True, text=True, timeout=30)
 
 
