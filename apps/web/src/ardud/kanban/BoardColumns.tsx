@@ -101,6 +101,7 @@ type ColumnsProps = Parameters<typeof BoardColumns>[0];
 const STAGE_GRID_MIN_WIDTH_FINE = 2 * 208 + 176 + 56 + 256 + 20 + 4 * 10; // 964
 const STAGE_GRID_MIN_WIDTH_COARSE = 2 * 224 + 208 + 56 + 272 + 20 + 4 * 10; // 1044
 const SHIPPED_OPEN_MIN_WIDTH = 1400;
+const REVIEW_STAGES = ["needs_review", "in_review"] as const;
 const SHIPPED_KEY = "t3code:kanban:board:shipped";
 const SHIPPED_SCHEMA = Schema.NullOr(Schema.Literals(["open", "folded"]));
 
@@ -150,10 +151,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       <Column
         key={stage}
         column={column}
-        className={cn(
-          "min-w-52 pointer-coarse:min-w-56",
-          saved === null ? "flex-[1.4]" : "shrink-0",
-        )}
+        className={saved === null ? "min-w-52 flex-[1.4] pointer-coarse:min-w-56" : "shrink-0"}
         style={columnStyle(saved)}
         handle={
           <ColumnResizeHandle
@@ -210,7 +208,23 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
     );
   };
 
-  const reviewNeedsRoom = !hidden("needs_review") || !hidden("in_review");
+  const reviewStages = REVIEW_STAGES.filter((stage) => !hidden(stage));
+  // Both review stages share one column, so the stack takes the wider saved width.
+  const reviewSaved = reviewStages.reduce<number | null>((widest, stage) => {
+    const saved = widthOf(stage);
+    return saved === null ? widest : Math.max(widest ?? 0, saved);
+  }, null);
+  const setReviewWidth = (width: number) =>
+    updatePrefs((current) => ({
+      ...current,
+      widths: { ...current.widths, needs_review: width, in_review: width },
+    }));
+  const resetReviewWidth = () =>
+    updatePrefs((current) => {
+      const widths = { ...current.widths };
+      for (const stage of REVIEW_STAGES) delete widths[stage];
+      return { ...current, widths };
+    });
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
       {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
@@ -220,8 +234,23 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         {workColumn("todo")}
         {workColumn("working")}
         {reviewRail("needs_review")}
-        {reviewNeedsRoom ? (
-          <div className="flex min-h-0 min-w-44 flex-1 flex-col gap-3 pointer-coarse:min-w-52">
+        {reviewStages.length > 0 ? (
+          <div
+            data-review-stack
+            className={cn(
+              "relative flex min-h-0 flex-col gap-3",
+              reviewSaved === null ? "min-w-44 flex-1 pointer-coarse:min-w-52" : "shrink-0",
+            )}
+            style={columnStyle(reviewSaved)}
+          >
+            <ColumnResizeHandle
+              columnKey="needs_review"
+              label="Review"
+              edge="right"
+              width={reviewSaved}
+              onCommit={setReviewWidth}
+              onReset={resetReviewWidth}
+            />
             {reviewColumn("needs_review")}
             {reviewColumn("in_review")}
           </div>

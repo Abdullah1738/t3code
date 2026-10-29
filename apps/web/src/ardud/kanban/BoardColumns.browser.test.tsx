@@ -531,6 +531,49 @@ describe("review stack", () => {
   }
 });
 
+describe("saved widths", () => {
+  const saveWidths = (widths: Record<string, number>) =>
+    localStorage.setItem(
+      boardColumnsStorageKey(BOARD_ID),
+      JSON.stringify({ widths, hidden: [], groupWidth: null }),
+    );
+
+  it("keeps saved work widths below the layout default after a reload", async () => {
+    saveWidths({ todo: 160, working: 150 });
+    await mountAt(1500, 900, "fine");
+
+    expect(rect(column("To-Do")!).width).toBeCloseTo(160, 0);
+    expect(rect(column("Working")!).width).toBeCloseTo(150, 0);
+  });
+
+  it("keeps saved review widths after a reload", async () => {
+    saveWidths({ needs_review: 480, in_review: 480 });
+    await mountAt(1500, 900, "fine");
+
+    expect(rect(column("Needs Review")!).width).toBeCloseTo(480, 0);
+    expect(rect(column("In Review")!).width).toBeCloseTo(480, 0);
+  });
+
+  it("saves a review stack resize to both review stages and keeps it after a reload", async () => {
+    await mountAt(1500, 900, "fine");
+    const before = rect(column("Needs Review")!).width;
+
+    await act(() => {
+      handle("Review")!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
+    });
+
+    const { widths } = readStored(boardColumnsStorageKey(BOARD_ID));
+    expect(widths.needs_review).toBeCloseTo(before + 16, 0);
+    expect(widths.in_review).toBe(widths.needs_review);
+
+    await mountAt(1500, 900, "fine");
+    expect(rect(column("Needs Review")!).width).toBeCloseTo(before + 16, 0);
+    expect(rect(column("In Review")!).width).toBeCloseTo(before + 16, 0);
+  });
+});
+
 describe("left-edge keyboard step", () => {
   it("widens Needs Owner from its rendered width on ArrowLeft", async () => {
     const separator = handle("Needs Owner")!;
