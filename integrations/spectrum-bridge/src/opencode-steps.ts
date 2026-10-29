@@ -34,6 +34,89 @@ export const OPENCODE_DB = join(homedir(), ".local/share/opencode/opencode.db");
  * locked, schema change) leaves every id unknown, which keeps the router's
  * old rule: only a run's last word goes out.
  */
+/**
+ * Whether a native OpenCode run called any tool, read from its session's step rows. A run is
+ * `ran` when any step finished `tool-calls`, `none` only when every step finished `stop` (and
+ * there was at least one step), and `unknown` for anything else, including a read failure.
+ * Only bounded reads: one session, rows from `sinceMs` on, at most `limit` rows.
+ */
+export type RunToolEvidence = "ran" | "none" | "unknown";
+export type RunEvidence = (sessionId: string, sinceMs: number) => RunToolEvidence;
+
+export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvidence {
+  let db: Database | undefined;
+  let inode: number | undefined;
+  const close = () => {
+    try { db?.close(); } catch { /* already gone */ }
+    db = undefined;
+  };
+  return (sessionId, sinceMs) => {
+    // The id is only ever a bound parameter; the check just rejects anything that isn't an OpenCode session id.
+    if (!/^ses_[A-Za-z0-9_]+$/.test(sessionId) || !Number.isFinite(sinceMs)) return "unknown";
+    try {
+      const current = statSync(path).ino;
+      if (db && current !== inode) close();
+      if (!db) {
+        db = new Database(path, { readonly: true });
+        inode = current;
+      }
+      // One row past the cap tells a truncated scan from a complete one. A truncated scan can
+      // never prove a run tool-free, so it is `unknown` whatever the rows it did read say.
+      // Assistant steps and the session's idle markers, in order. OpenCode writes an `idle` row
+      // once the execution has settled, and that is the only durable proof the run is over: a
+      // step's own finish is written before the execution knows whether it will go on.
+      const rows = db.query<{ type: string; finish: unknown; content: unknown; retry: unknown; outcome: unknown }, [string, number, number]>(
+        "SELECT type, json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content, json_extract(data, '$.retry') AS retry, json_extract(data, '$.outcome') AS outcome FROM session_message WHERE session_id = ? AND type IN ('assistant', 'idle') AND time_created >= ? ORDER BY seq LIMIT ?",
+      ).all(sessionId, sinceMs, maxRows + 1);
+      const steps = rows.filter(row => row.type === "assistant");
+      if (steps.some(stepRan)) return "ran";
+      // `none` needs a complete scan (a truncated one may hide a tool row past the cap), the run's
+      // own idle marker, and every step terminal with fully known, no-tool content.
+      if (steps.length === 0 || rows.length > maxRows) return "unknown";
+      const idle = rows.findIndex(row => row.type === "idle");
+      if (idle < 0 || typeof rows[idle]!.outcome !== "string") return "unknown";
+      if (rows.slice(idle + 1).some(row => row.type === "assistant")) return "unknown";
+      return steps.every(stepIsTerminalNoTool) ? "none" : "unknown";
+    } catch {
+      close();
+      return "unknown";
+    }
+  };
+}
+
+/** A step called a tool: OpenCode marks the step `tool-calls`, or the step's content carries a tool part (even one that errored). */
+function stepRan(row: { finish: unknown; content: unknown }): boolean {
+  if (row.finish === "tool-calls") return true;
+  if (typeof row.content === "string") {
+    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch { return true; }
+  }
+  return Array.isArray(row.content) && row.content.some(part => (part as { type?: unknown })?.type === "tool");
+}
+
+/** Content parts a step can carry without calling a tool. Any other part type is not proven tool-free. */
+const NO_TOOL_PARTS = new Set(["text", "reasoning"]);
+
+/**
+ * A step that settled without calling a tool. It must be terminal (OpenCode wrote a `stop` or
+ * `error` finish; an unfinished step may still be executing) and its content, read in full, may
+ * hold only text or reasoning. A failed first call with no output has empty content.
+ *
+ * A terminal finish alone does not prove the execution stopped: OpenCode can record a pending
+ * native retry (`retry`) on an `error` step and then carry on running the same execution. So a
+ * step with a retry is unsettled, and so is any row that is not a plain terminal finish.
+ */
+function stepIsTerminalNoTool(row: { finish: unknown; content: unknown; retry: unknown }): boolean {
+  if (row.finish !== "stop" && row.finish !== "error") return false;
+  if (row.retry !== null && row.retry !== undefined) return false;
+  const parts = typeof row.content === "string" ? parseParts(row.content) : row.content;
+  if (!Array.isArray(parts)) return false;
+  return parts.every(part => NO_TOOL_PARTS.has(String((part as { type?: unknown })?.type)));
+}
+
+function parseParts(text: string): unknown {
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
   let db: Database | undefined;
   let inode: number | undefined;

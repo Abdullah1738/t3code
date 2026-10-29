@@ -3,7 +3,7 @@ import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
-import { nativeMessageId, opencodeFinishes, type StepFinishes } from "./opencode-steps.ts";
+import { nativeMessageId, opencodeFinishes, opencodeRunEvidence, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
 import { imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
@@ -120,6 +120,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   title?: string;
   /** How each assistant step ended, read from OpenCode (see opencode-steps.ts). */
   finishes?: StepFinishes;
+  /** Whether a native run called tools (see opencode-steps.ts opencodeRunEvidence). */
+  runEvidence?: RunEvidence;
 }
 
 const CHATS_DIR = "chats";
@@ -132,6 +134,7 @@ export class RobobBackend implements ChatBackend {
   private readonly directories: ThreadDirectories;
   private readonly native = new Map<string, string>();
   private readonly finishes: StepFinishes;
+  private readonly runEvidence: RunEvidence;
   /** A step's finish never changes once written, so each is looked up once. */
   private readonly finished = new Map<string, string>();
 
@@ -142,6 +145,7 @@ export class RobobBackend implements ChatBackend {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
+    this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
   }
 
   /** Thread id for a stored route id. `ses_` ids resolve through the OpenCode import mapping. */
@@ -152,6 +156,17 @@ export class RobobBackend implements ChatBackend {
     const { thread } = await this.client.byNative(id);
     this.native.set(id, thread.threadId);
     return thread.threadId;
+  }
+
+  /** Whether the run started at `sinceMs` called tools, from OpenCode's step rows (see markRunEvidence). Unproven is `unknown`. */
+  async runToolEvidence(id: string, _directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown"> {
+    if (!Number.isFinite(sinceMs)) return "unknown";
+    try {
+      const { thread } = await this.client.thread(await this.resolve(id));
+      return thread.nativeSessionId ? this.runEvidence(thread.nativeSessionId, sinceMs) : "unknown";
+    } catch {
+      return "unknown";
+    }
   }
 
   /** Robob threads can reset their agent's context in place (t3_context_reset). Imported `ses_` routes move to a new chat instead. */
@@ -260,10 +275,25 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
     const records = recordsFromThread(thread, messages);
+    this.markRunEvidence(thread, records);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
     const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
     return this.markAnswers(records.slice(start));
+  }
+
+  /**
+   * Robob's messages carry no tool activity, so whether the latest run called tools comes from
+   * OpenCode's own step rows for the thread's native session. The run's last record carries the
+   * answer, since a tool-only run has no text record at all. Only that run is looked up.
+   */
+  private markRunEvidence(thread: ThreadDetail, records: MessageRecord[]): void {
+    const run = thread.run ?? thread.recentRuns.at(-1);
+    if (!run || !thread.nativeSessionId) return;
+    const sinceMs = Date.parse(run.requestedAt ?? run.startedAt ?? "");
+    if (!Number.isFinite(sinceMs)) return;
+    const evidence = this.runEvidence(thread.nativeSessionId, sinceMs);
+    for (const record of records) if (record.type === "assistant") record.toolEvidence = evidence;
   }
 
   /**
@@ -278,14 +308,21 @@ export class RobobBackend implements ChatBackend {
       const native = record.type === "assistant" ? nativeMessageId(record.id) : undefined;
       if (native) record.nativeMessage = native;
     }
-    const steps = records.filter((record): record is Extract<MessageRecord, { type: "assistant" }> => record.type === "assistant" && record.finish === "stop");
+    // Every assistant step is looked up, not only the ones that look like answers: a
+    // step's finish is the only way to tell that it called tools (`tool-calls`).
+    const steps = records.filter((record): record is Extract<MessageRecord, { type: "assistant" }> => record.type === "assistant");
     // Clear before working out what's missing, so this page's steps are looked up again rather than lost.
     if (this.finished.size > 5_000) this.finished.clear();
     const missing = steps.map(step => step.id).filter(id => !this.finished.has(id));
     if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
     for (const step of steps) {
       const finish = this.finished.get(step.id);
-      if (finish !== undefined) step.answer = finish === "stop";
+      // A step's own finish can prove that tools ran (`tool-calls`), but it can't prove that none did:
+      // an unresolved step (the synthetic error record) or an `error` finish says nothing. So only
+      // `ran` is merged here. The run-level answer from markRunEvidence stays authoritative otherwise.
+      if (finish === "tool-calls") step.toolEvidence = "ran";
+      else if (step.toolEvidence === undefined) step.toolEvidence = "unknown";
+      if (step.finish === "stop" && finish !== undefined) step.answer = finish === "stop";
     }
     return records;
   }
