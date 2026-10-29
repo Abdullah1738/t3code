@@ -163,6 +163,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     except lease.ArchivingSkip as e:
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create below still runs when under cap.
+                        if row['state'] != 'running':
+                            stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
                         say(f"skipping pool box {row['box_id']}: {e}")
                         continue
                     except OffboxError as e:

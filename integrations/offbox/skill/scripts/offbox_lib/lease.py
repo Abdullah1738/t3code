@@ -289,6 +289,13 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     st = s.get("state")
+    if st == "archiving":
+        if skip_archiving:
+            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
+        say(f"{box_id} is stopping; waiting to resume it")
+        s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
+        st = s.get("state")
+    # After the archiving wait: a box that came back live still gets the size check below.
     have = s.get("type") or row["size"]
     want = have
     if st in api.LIVE_STATES and _bigger(size, have):
@@ -300,13 +307,15 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
         api.stop(box_id)
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
-        st = s.get("state")
-    if st == "archiving":
         if skip_archiving:
-            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
-        say(f"{box_id} is stopping; waiting to resume it")
-        s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
+            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
+            # bigger size once boat reports it archived.
+            ssh_sync.close_master(box_id)
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+            con.commit()
+            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+            raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
+        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
         st = s.get("state")
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,

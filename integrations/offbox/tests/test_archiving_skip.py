@@ -118,5 +118,56 @@ class ArchivingSkipTests(Isolated):
         self.assertIn('idle', seen['want'])
 
 
+    def test_archiving_stopped_member_does_not_use_up_the_stopped_try(self):
+        # Review round 1: two stopped members, the first still archiving, the second archived and healthy.
+        self.box('arch', 'stopped', used=200, member=True)
+        self.box('cold', 'stopped', used=100, member=True)
+        boats = FakeBoats({'arch': ['archiving'], 'cold': ['archived']})
+        with patch.object(api, 'get', side_effect=boats.get), \
+                patch.object(api, 'wait_state', side_effect=AssertionError('pool must not wait on archiving')), \
+                patch.object(api, 'resume', return_value={}) as resume, \
+                patch.object(lease, 'acquire_private', side_effect=AssertionError('pool is full; no create')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'cold')
+            self.assertEqual(resume.call_args.args[0], 'cold')
+        finally:
+            pool.release_guard(got)
+
+    def test_pool_resize_starts_the_stop_and_moves_on_without_waiting(self):
+        # Review round 1: a live large box picked for --size xlarge must not wait for its stop under the pool lock.
+        self.box('big', 'running', used=200, member=True)
+        self.box('cold', 'stopped', used=100, member=True)
+        boats = FakeBoats({'big': ['idle'], 'cold': ['archived']})
+        with patch.object(api, 'get', side_effect=boats.get), \
+                patch.object(api, 'wait_state', side_effect=AssertionError('no wait under the pool lock')), \
+                patch.object(api, 'stop', return_value={}) as stop, \
+                patch.object(api, 'resume', return_value={}) as resume, \
+                patch.object(lease, 'acquire_private', side_effect=AssertionError('pool is full; no create')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = pool.acquire(self.me, size='xlarge')
+        try:
+            stop.assert_called_once_with('big')
+            self.assertEqual(got['box_id'], 'cold')
+            self.assertEqual(resume.call_args.args[2], 'xlarge')
+            self.assertEqual(self.row('big')['state'], 'stopped')  # a later pass resumes it once archived
+        finally:
+            pool.release_guard(got)
+
+    def test_direct_archiving_to_idle_still_grows_to_the_requested_size(self):
+        # Review round 1: archiving -> idle on a large box with --size xlarge stops and resumes it at xlarge.
+        self.box('arch', 'running', used=200)
+        boats = FakeBoats({'arch': ['archiving', 'archiving', 'idle', 'archived']})
+        with patch.object(api, 'get', side_effect=boats.get), patch.object(api.time, 'sleep'), \
+                patch.object(api, 'stop', return_value={}) as stop, \
+                patch.object(api, 'resume', return_value={}) as resume, \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = lease._reuse(self.con, self.row('arch'), 'xlarge')
+        stop.assert_called_once_with('arch')
+        self.assertEqual(resume.call_args.args[2], 'xlarge')
+        self.assertEqual(got['size'], 'xlarge')
+
+
 if __name__ == '__main__':
     unittest.main()
