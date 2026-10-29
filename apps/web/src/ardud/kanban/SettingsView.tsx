@@ -134,7 +134,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
               <Switch
                 size="sm"
                 checked={pool.slots > 0}
-                disabled={blocked}
+                // An unlisted pool can always be paused (switch off); switching it on is refused.
+                disabled={!canPool || (unlisted && pool.slots === 0)}
                 title={blockedReason}
                 aria-label={`${pool.name} pool on`}
                 onCheckedChange={(on) =>
@@ -232,6 +233,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       <Section title="Review">
         {board.reviewChains.map((chain, chainIndex) => {
           const isDefault = chain.name === board.defaultReviewChain;
+          // Each step edit sends the whole chain list in one updateBoard. The server validates
+          // every step on every write, so the write is only atomic if it carries every change.
           const saveStep = (index: number, next: ModelSelection) =>
             update({
               reviewChains: board.reviewChains.map((c, ci) =>
