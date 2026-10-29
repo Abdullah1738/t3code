@@ -60,6 +60,19 @@ def uses_docker(cmd: str, repo_root: str) -> bool:
     return False
 
 
+TYPECHECK_CMD = re.compile(r"\btsc(-rs)?\b|\btypecheck\b")
+
+
+def typecheck_size(cmd: str, repo_root: str, size: str | None) -> str | None:
+    """Type-check runs in JS/TS repos get xlarge: large boxes get OOM-killed (exit 137) on the Robob server
+    typecheck. An explicit size always wins; only repos with a package.json are affected."""
+    if size:
+        return size
+    if TYPECHECK_CMD.search(cmd or "") and os.path.isfile(os.path.join(repo_root or "", "package.json")):
+        return "xlarge"
+    return None
+
+
 def docker_recent(con, box_id: str | None = None, within: int = 7200, repo_root: str | None = None,
                   thread: str | None = None) -> bool:
     """Docker ran lately on this box (its stop archives images and its next boot reloads them, so stop it less),

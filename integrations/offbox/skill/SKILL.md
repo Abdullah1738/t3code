@@ -100,6 +100,7 @@ offbox local --list ; offbox local --clear
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
   the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
