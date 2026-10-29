@@ -567,12 +567,12 @@ describe("review stack", () => {
 
       expect(isStageGrid()).toBe(true);
       expect(column(hiddenLabel)).toBeNull();
-      const rail = container.querySelector<HTMLElement>(
+      const restore = container.querySelector<HTMLElement>(
         `button[aria-label^="Show ${hiddenLabel}"]`,
       );
-      expect(rail).not.toBeNull();
-      // The rail stands in the column strip beside the stack, not inside it.
-      expect(rail!.parentElement).toBe(column("To-Do")!.parentElement);
+      expect(restore).not.toBeNull();
+      // The restore control sits inside the shared review stack, not in the column strip.
+      expect(restore!.parentElement).toBe(column(shownLabel)!.parentElement);
 
       const shown = column(shownLabel)!;
       const list = shown.querySelector<HTMLElement>(":scope > div:last-child")!;
@@ -582,6 +582,30 @@ describe("review stack", () => {
       // Every card of the visible stage shows; nothing is squeezed into a sliver.
       expect(list.clientHeight).toBeGreaterThanOrEqual(list.scrollHeight - 1);
       expect(list.querySelectorAll("button").length).toBeGreaterThan(0);
+    },
+  );
+});
+
+describe("review stack at the iPad width", () => {
+  it.each(["needs_review", "in_review"] as const)(
+    "keeps the stage grid inside the board with %s hidden at 1084px touch",
+    async (hiddenStage) => {
+      localStorage.setItem(
+        boardColumnsStorageKey(BOARD_ID),
+        JSON.stringify({ widths: {}, hidden: [hiddenStage], groupWidth: null }),
+      );
+      await mountAt(1084, 900, "coarse");
+
+      expect(isStageGrid()).toBe(true);
+      const strip = container.querySelector<HTMLElement>(".overflow-x-auto")!;
+      expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+      const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
+      const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
+      const visibleShipped = shipped ?? folded;
+      expect(visibleShipped).not.toBeNull();
+      expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
+        strip.getBoundingClientRect().right + 1,
+      );
     },
   );
 });
