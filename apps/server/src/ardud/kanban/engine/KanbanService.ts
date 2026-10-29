@@ -618,6 +618,8 @@ const make = Effect.gen(function* () {
     >
   >(new Map());
   const proposalsChecked = yield* Ref.make<ReadonlyMap<KanbanBoardId, number>>(new Map());
+  // Boards with a goal-ideas model call still running: a second one would post the same proposal.
+  const proposalsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -1190,6 +1192,18 @@ const make = Effect.gen(function* () {
         .at(-1) ?? null
     );
   });
+  // Every message of the Goal ideas discussion, oldest first: a long run of replies must
+  // not hide an earlier proposal from the duplicate check or the 24-hour gate.
+  const ideaMessages = Effect.fn("KanbanService.ideaMessages")(function* (discussionId: KanbanDiscussionId) {
+    const all: Array<KanbanMessage> = [];
+    let afterSeq = 0;
+    for (;;) {
+      const page = yield* store.messages(discussionId, { afterSeq, limit: 200 });
+      all.push(...page);
+      if (page.length < 200) return all;
+      afterSeq = page[page.length - 1]!.seq;
+    }
+  });
   const writeProposals = Effect.fn("KanbanService.writeProposals")(function* (boardId: KanbanBoardId) {
     const generateJson = textGeneration.generateJson;
     if (!generateJson) return;
@@ -1198,7 +1212,7 @@ const make = Effect.gen(function* () {
     const project = yield* projects.getById(board.defaultProjectId);
     if (Option.isNone(project)) return;
     const ideas = yield* ideasDiscussion(boardId);
-    const past = ideas === null ? [] : Scribe.pastProposals(yield* store.messages(ideas.id, { limit: 100 }));
+    const past = ideas === null ? [] : Scribe.pastProposals(yield* ideaMessages(ideas.id));
     const output = yield* generateJson({
       cwd: project.value.workspaceRoot,
       prompt: Scribe.proposalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId), past),
@@ -1207,16 +1221,19 @@ const make = Effect.gen(function* () {
     });
     yield* lock.withPermits(1)(
       Effect.gen(function* () {
-        const proposals = Scribe.toProposals(
-          output,
-          yield* store.cards(boardId),
-          yield* store.goals(boardId),
-          past,
-        );
+        // The model call ran without the lock: re-read the history and the due check now, so a
+        // proposal that landed meanwhile is respected.
+        const current = yield* ideasDiscussion(boardId);
+        const currentMessages = current === null ? [] : yield* ideaMessages(current.id);
+        const currentPast = Scribe.pastProposals(currentMessages);
+        const cards = yield* store.cards(boardId);
+        const goals = yield* store.goals(boardId);
+        const last = currentMessages.filter((message) => message.author._tag === "system").at(-1) ?? null;
+        if (!Scribe.proposalDue(cards, goals, last, yield* nowMillis)) return;
+        const proposals = Scribe.toProposals(output, cards, goals, currentPast);
         if (proposals.length === 0) return;
         const discussion =
-          (yield* ideasDiscussion(boardId)) ??
-          (yield* newDiscussion(boardId, Scribe.GOAL_IDEAS_TITLE, null, scribeActor));
+          current ?? (yield* newDiscussion(boardId, Scribe.GOAL_IDEAS_TITLE, null, scribeActor));
         yield* postUnlocked(discussion.id, scribeActor, Scribe.proposalBlocks(proposals), false);
       }),
     );
@@ -1224,6 +1241,7 @@ const make = Effect.gen(function* () {
   const forkProposals = (boardId: KanbanBoardId) =>
     writeProposals(boardId).pipe(
       Effect.catchCause((cause) => Effect.logWarning("kanban goal ideas failed", { boardId, cause })),
+      Effect.ensuring(Ref.update(proposalsRunning, (all) => new Set([...all].filter((id) => id !== boardId)))),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2450,17 +2468,19 @@ const make = Effect.gen(function* () {
       }
       // Goal ideas: checked every PROPOSAL_CHECK_MS per board, asked only when due.
       const checked = (yield* Ref.get(proposalsChecked)).get(board.id);
-      if (checked === undefined || now - checked >= Scribe.PROPOSAL_CHECK_MS) {
+      const running = (yield* Ref.get(proposalsRunning)).has(board.id);
+      if (!running && (checked === undefined || now - checked >= Scribe.PROPOSAL_CHECK_MS)) {
         yield* Ref.update(proposalsChecked, (all) => new Map(all).set(board.id, now));
         const ideas = yield* ideasDiscussion(board.id);
         const last =
           ideas === null
             ? null
-            : ((yield* store.messages(ideas.id, { limit: 20 })).filter(
-                (message) => message.author._tag === "system",
-              ).at(-1) ?? null);
-        if (Scribe.proposalDue(yield* store.cards(board.id), yield* store.goals(board.id), last, now))
+            : ((yield* ideaMessages(ideas.id)).filter((message) => message.author._tag === "system").at(-1) ??
+              null);
+        if (Scribe.proposalDue(yield* store.cards(board.id), yield* store.goals(board.id), last, now)) {
+          yield* Ref.update(proposalsRunning, (all) => new Set(all).add(board.id));
           yield* forkProposals(board.id);
+        }
       }
       // A card whose thread was deleted goes back to its queue for a new one.
       for (const card of yield* store.cards(board.id)) {

@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Data from "effect/Data";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -2638,6 +2639,7 @@ const scribeLayer = (
   failures = 0,
   calls?: Queue.Queue<string>,
   goalFailures = 0,
+  proposalHold?: Deferred.Deferred<void>,
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
@@ -2652,6 +2654,7 @@ const scribeLayer = (
             asked.push(input.prompt);
             if (calls) yield* Queue.offer(calls, input.prompt);
             if (input.prompt.startsWith("You suggest goals")) {
+              if (proposalHold) yield* Deferred.await(proposalHold);
               return { proposals: [{ name: "Search", summary: "People find things.", cards: [1, 2, 3] }] };
             }
             if (input.prompt.startsWith("You keep a work board's goals")) {
@@ -2772,6 +2775,91 @@ it.effect("the scribe proposes a goal in Goal ideas, once, and his answer goes t
         ),
       );
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+const threeLoginCards = (kanban: Effect.Success<typeof KanbanService.KanbanService>, boardId: string) =>
+  Effect.forEach(
+    [
+      ["A", "Login form"],
+      ["B", "Login button"],
+      ["C", "Login errors"],
+    ],
+    ([prompt, title]) => kanban.createCard(boardId as never, { prompt: prompt!, title: title!, description: "Sign-in" }, owner),
+  );
+
+it.effect("an unanswered proposal still blocks a new one after 20+ replies, with no time passing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const posted = Stream.runHead(
+        Stream.filter(yield* kanban.changes, ({ change }) => change._tag === "message"),
+      );
+      yield* threeLoginCards(kanban, board.id);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* posted));
+      const ideas = (yield* kanban.discussions(board.id)).find((entry) => entry.title === "Goal ideas")!;
+      for (let index = 0; index < 25; index++) {
+        yield* kanban.post(ideas.id, owner, [{ _tag: "md", text: `reply ${index}` }]);
+      }
+      yield* kanban.tick;
+      assert.lengthOf(asked.filter((prompt) => prompt.startsWith("You suggest goals")), 1);
+      assert.lengthOf(yield* kanban.messages(ideas.id, { limit: 100 }), 26);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("a skipped proposal is not proposed again after 100+ replies", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const posted = Stream.runHead(
+        Stream.filter(yield* kanban.changes, ({ change }) => change._tag === "message"),
+      );
+      yield* threeLoginCards(kanban, board.id);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* posted));
+      const ideas = (yield* kanban.discussions(board.id)).find((entry) => entry.title === "Goal ideas")!;
+      const [first] = yield* kanban.messages(ideas.id);
+      yield* kanban.answer(ideas.id, first!.seq, "goal-1", ["skip"], owner);
+      for (let index = 0; index < 105; index++) {
+        yield* kanban.post(ideas.id, owner, [{ _tag: "md", text: `reply ${index}` }]);
+      }
+      yield* TestClock.adjust("25 hours");
+      yield* kanban.tick;
+      // The skipped Search proposal is still in the history: it is not posted again.
+      const messages = yield* kanban.messages(ideas.id, { limit: 200 });
+      const choices = messages.flatMap((message) => message.blocks.filter((block) => block._tag === "choice"));
+      assert.lengthOf(choices, 1);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("two overlapping proposal runs post the same proposal only once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    const hold = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* threeLoginCards(kanban, board.id);
+      yield* kanban.tick;
+      // The first run is still waiting on the model; a later tick must not start another.
+      yield* TestClock.adjust("30 minutes");
+      yield* kanban.tick;
+      yield* TestClock.adjust("30 minutes");
+      yield* kanban.tick;
+      yield* Deferred.succeed(hold, undefined);
+      yield* TestClock.adjust("1 second");
+      const ideas = (yield* kanban.discussions(board.id)).find((entry) => entry.title === "Goal ideas");
+      assert.isTrue(ideas !== undefined);
+      assert.lengthOf(yield* kanban.messages(ideas!.id), 1);
+      assert.lengthOf(asked.filter((prompt) => prompt.startsWith("You suggest goals")), 1);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 0, undefined, 0, hold)));
   }),
 );
 
