@@ -22,7 +22,7 @@ const goal = (patch: Record<string, unknown> = {}) =>
     ...patch,
   }) as unknown as KanbanGoal;
 
-const card = (number: number, patch: Partial<KanbanCard> = {}) =>
+const card = (number: number, patch: Record<string, unknown> = {}) =>
   ({
     id: "card-" + number,
     number,
