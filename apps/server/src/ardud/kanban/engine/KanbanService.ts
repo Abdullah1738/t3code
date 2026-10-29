@@ -2280,7 +2280,7 @@ const make = Effect.gen(function* () {
       projects: input.projects ?? [],
       model:
         models[0]?.model ??
-        (input.model ? yield* poolModel(boardId, input.model) : board.defaultCardModel),
+        (yield* poolModel(boardId, input.model ?? board.defaultCardModel)),
       // One model needs no list.
       models: models.length > 1 ? models : [],
       projectId: input.projectId ?? null,
@@ -2662,6 +2662,17 @@ const make = Effect.gen(function* () {
           saved.activeRole === "work" &&
           !modelSelectionsEqual(card.model, saved.model)
         ) {
+          // The thread now runs the new model's pool; its slot follows, so the pool
+          // counts and the one-slot limit stay right.
+          const newPool = Rules.poolKey(saved.model);
+          if (saved.activePool !== newPool) {
+            for (const other of yield* store.cardsByThread(saved.activeThreadId)) {
+              yield* saveCard({ ...other, activePool: newPool });
+            }
+            if ((yield* Ref.get(holds)).has(saved.activeThreadId)) {
+              yield* hold(saved.activeThreadId, saved.boardId, newPool);
+            }
+          }
           // An open work thread runs the card's model; switch it now, not on its next wake.
           yield* threads
             .setModel(saved.activeThreadId, saved.model)

@@ -2504,6 +2504,40 @@ it.effect("the pool's variant wins on create and edit", () =>
   }),
 );
 
+it.effect("the pool's variant wins for a create without an explicit model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      // The board default is a valid high, but its pool runs xhigh: the pool wins.
+      const defaultHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      yield* kanban.setPool(board.id, astraXhigh, 1);
+      yield* kanban.updateBoard(board.id, { defaultCardModel: defaultHigh }).pipe(Effect.ignore);
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card model change moves its open thread to the new pool's slot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      yield* kanban.setPool(board.id, haiku, 1);
+      const card = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const started = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(started.activePool, Rules.poolKey(board.defaultCardModel));
+      yield* kanban.editCard(card.id, { model: haiku }, owner);
+      const moved = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(moved.activePool, Rules.poolKey(haiku));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a card model change switches its open work thread", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
