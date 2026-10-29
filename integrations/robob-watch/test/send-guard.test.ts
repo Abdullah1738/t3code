@@ -1,0 +1,62 @@
+import { expect, test } from "bun:test";
+import { join } from "node:path";
+
+// Card #14: a real send or draft refuses under a test run; a stub injected by the test still works.
+// Every spawn strips the ambient env, so the guard is tested without ROBOB_TEST leaking from the caller.
+const helpers = join(import.meta.dir, "../helpers");
+const bare = (extra: Record<string, string> = {}) => ({
+  PATH: "/usr/bin:/bin",
+  LANG: "en_US.UTF-8",
+  HOME: join(import.meta.dir, ".."),
+  ...extra,
+});
+
+test("wa send refuses a real send under ROBOB_TEST without touching wacli", () => {
+  const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "send", "971500000002", "hi"], {
+    env: bare({ ROBOB_TEST: "1" }),
+  });
+  expect(r.exitCode).toBe(2);
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
+
+test("wa draft refuses under NODE_ENV=test (bun test)", () => {
+  const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "draft", "971500000002", "hi"], {
+    env: bare({ NODE_ENV: "test" }),
+  });
+  expect(r.exitCode).toBe(2);
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
+
+test("wa sendfile refuses under PYTEST_CURRENT_TEST", () => {
+  const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "sendfile", "971500000002", "/etc/hosts"], {
+    env: bare({ PYTEST_CURRENT_TEST: "x" }),
+  });
+  expect(r.exitCode).toBe(2);
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
+
+test("wa send still runs its stubbed wacli under a test run", () => {
+  const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "send", "971500000002", "hi"], {
+    env: bare({ ROBOB_TEST: "1", WA_WACLI: "/usr/bin/false" }),
+  });
+  // The guard let it through: the stub (false) ran and failed, so the refusal text is absent.
+  expect(r.stderr.toString()).not.toContain("refused: test run");
+});
+
+// ride-card and convo-card look up their card before they reach the bridge, so call bridge() directly.
+const bridgeGuard = (file: string) => {
+  const code = `from importlib.machinery import SourceFileLoader; m = SourceFileLoader("h", ${JSON.stringify(file)}).load_module(); m.bridge("send", "--text", "x")`;
+  return Bun.spawnSync(["/usr/bin/python3", "-c", code], { env: bare({ ROBOB_TEST: "1" }) });
+};
+
+test("ride-card bridge() refuses a real send under a test run", () => {
+  const r = bridgeGuard(join(helpers, "ride-card/ride_card.py"));
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
+
+test("convo-card bridge() refuses a real send under a test run", () => {
+  const r = bridgeGuard(join(helpers, "convo-card/convo_card.py"));
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
