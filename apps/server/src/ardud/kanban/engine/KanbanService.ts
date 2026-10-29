@@ -921,7 +921,7 @@ const make = Effect.gen(function* () {
     });
     yield* saveCard(next);
     for (const ask of dropped) {
-      if (ask.by._tag !== "evaluator" || !(yield* threads.view(ask.by.threadId))) continue;
+      if (ask.by._tag !== "evaluator" || !(yield* liveEvaluator(ask.by.threadId))) continue;
       yield* threads
         .send({
           threadId: ask.by.threadId,
@@ -1343,10 +1343,33 @@ const make = Effect.gen(function* () {
     const ids: ThreadId[] = [];
     for (const ask of card.asks) {
       if (ask.by._tag !== "evaluator" || ids.includes(ask.by.threadId)) continue;
-      if (!(yield* threads.view(ask.by.threadId))) continue;
+      if (!(yield* liveEvaluator(ask.by.threadId))) continue;
       ids.push(ask.by.threadId);
     }
     return ids;
+  });
+
+  /** An evaluator that exists and is not archived. Archived ones are gone for routing. */
+  const liveEvaluator = Effect.fn("KanbanService.liveEvaluator")(function* (threadId: ThreadId) {
+    const view = yield* threads.view(threadId);
+    return !!view && !view.archived;
+  });
+
+  /** The newest live board-channel evaluator (no card), if any. */
+  const boardEvaluator = Effect.fn("KanbanService.boardEvaluator")(function* (
+    boardId: KanbanBoard["id"],
+  ) {
+    // Ended links stay sendable: a setup or request evaluator is ended at its
+    // turn's end but its thread still takes messages.
+    const links = yield* store.threadLinks({ boardId, open: false });
+    const boardLevel = links
+      .filter((link) => link.role === "evaluator" && link.cardId === null)
+      .toReversed()
+      .slice(0, 20);
+    for (const link of boardLevel) {
+      if (yield* liveEvaluator(link.threadId)) return link.threadId;
+    }
+    return null;
   });
 
   /**
@@ -1361,12 +1384,32 @@ const make = Effect.gen(function* () {
     const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
     if (discussion.evaluatorThreadId !== null) {
       const view = yield* threads.view(discussion.evaluatorThreadId);
-      if (view) {
+      if (view && !view.archived) {
         return yield* deliver(
           discussion,
           actorOf(discussion.evaluatorThreadId),
           "Evaluator",
           discussion.evaluatorThreadId,
+          text,
+          note,
+        );
+      }
+      if (view) {
+        yield* threads.interrupt(
+          discussion.evaluatorThreadId,
+          `Replaced as evaluator of "${discussion.title}"`,
+        );
+      }
+    }
+    // Board channels share the board's live evaluator; card discussions start their own.
+    if (discussion.cardId === null) {
+      const live = yield* boardEvaluator(discussion.boardId);
+      if (live !== null) {
+        return yield* deliver(
+          withParticipant({ ...discussion, evaluatorThreadId: live }, actorOf(live), "Evaluator", {}),
+          actorOf(live),
+          "Evaluator",
+          live,
           text,
           note,
         );
@@ -1457,7 +1500,7 @@ const make = Effect.gen(function* () {
         const discussion = yield* store.discussion(after.discussionId);
         const own = discussion?.evaluatorThreadId ?? null;
         if (discussion === null || own === null || own === actor.threadId) return;
-        if (!(yield* threads.view(own))) return;
+        if (!(yield* liveEvaluator(own))) return;
         yield* toEvaluator(discussion, Briefs.evaluatorStepFromOtherText(after, actor.threadId), true);
         return;
       }
@@ -1468,7 +1511,7 @@ const make = Effect.gen(function* () {
         const open = yield* store.threadLinks({ boardId: after.boardId, open: true });
         for (const link of open.toReversed()) {
           if (link.role !== "evaluator" || link.purpose !== "packets") continue;
-          if (!(yield* threads.view(link.threadId))) continue;
+          if (!(yield* liveEvaluator(link.threadId))) continue;
           yield* threads.send({ threadId: link.threadId, text });
           return;
         }
@@ -1552,7 +1595,7 @@ const make = Effect.gen(function* () {
         told.add(workThread);
       }
       if (asker?._tag === "evaluator" && !told.has(asker.threadId)) {
-        if (yield* threads.view(asker.threadId)) {
+        if (yield* liveEvaluator(asker.threadId)) {
           current = yield* deliver(current, asker, "Evaluator", asker.threadId, text, note);
           told.add(asker.threadId);
         } else {
@@ -1578,7 +1621,7 @@ const make = Effect.gen(function* () {
         const live =
           by._tag === "thread"
             ? by.threadId === next.activeThreadId
-            : (yield* threads.view(by.threadId)) !== null;
+            : yield* liveEvaluator(by.threadId);
         if (live) {
           current = yield* deliver(current, by, role, by.threadId, text, note);
           told.add(by.threadId);
@@ -3450,7 +3493,7 @@ const make = Effect.gen(function* () {
           const by = ask.by;
           if (by._tag === "thread" && by.threadId === card.activeThreadId) {
             yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, note);
-          } else if (by._tag === "evaluator" && (yield* threads.view(by.threadId))) {
+          } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
             yield* deliver(discussion, by, "Evaluator", by.threadId, note);
           } else {
             yield* toEvaluator(
@@ -3464,8 +3507,7 @@ const make = Effect.gen(function* () {
         const waiting = card !== null && card.stage === "needs_owner";
         const author = message.author;
         if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
-          const view = yield* threads.view(author.threadId);
-          if (view) {
+          if (yield* liveEvaluator(author.threadId)) {
             yield* deliver(discussion, author, message.authorName, author.threadId, note);
             return next;
           }

@@ -48,6 +48,7 @@ const makeFake = Effect.gen(function* () {
               state: "idle",
               updatedAt: "2026-10-27T10:00:00.000Z",
               prs: [],
+              archived: false,
             };
           }),
         ),
