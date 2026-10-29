@@ -2725,6 +2725,7 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
   Effect.gen(function* () {
     const fake = yield* makeFake;
     const asked: Array<string> = [];
+    const calls = yield* Queue.unbounded<string>();
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const login = yield* kanban.setGoal(board.id, { name: "Login" });
@@ -2733,8 +2734,14 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
         { prompt: "A", title: "Login form", description: "Sign-in page", goalId: login.id },
         owner,
       );
+      const goalChange = Effect.gen(function* () {
+        const changes = yield* kanban.changes;
+        return Stream.runHead(Stream.filter(changes, ({ change }) => change._tag === "goal"));
+      });
+
       // The first goal call fails; no Now lands and the attempt is not marked done.
       yield* kanban.tick;
+      yield* Queue.take(calls);
       assert.lengthOf(goalAsks(asked), 1);
       assert.strictEqual((yield* kanban.snapshot(board.id)).goals[0]?.now, null);
 
@@ -2744,13 +2751,16 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
 
       // Cooldown passed, cards unchanged: the failed pass is retried and writes the Now.
       yield* TestClock.adjust("10 minutes");
+      const written = yield* (yield* goalChange).pipe(Effect.forkScoped);
       yield* kanban.tick;
+      yield* Queue.take(calls);
+      assert.isTrue(Option.isSome(yield* Fiber.join(written)));
       assert.lengthOf(goalAsks(asked), 2);
       assert.strictEqual(
         (yield* kanban.snapshot(board.id)).goals[0]?.now?.text,
         "Two login cards in progress.",
       );
-    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 0, undefined, 1)));
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 0, calls, 1)));
   }),
 );
 
