@@ -83,8 +83,11 @@ def script(dirs: list[str], run_id: str) -> str:
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
                      f'case "$rc" in 0) echo "pruned "{q};; 5) echo "skip "{q};; 4) echo "busy "{q}; busy=1;; '
                      f'*) echo "left "{q};; esac; fi')
-    # Done is signalled before BACKGROUND (which only deletes the trash tree, never the marker), and exit is last.
-    lines += [f'echo ok > {marker}', BACKGROUND, "exit 0"]
+    # Completion is signalled only when no group member could be confirmed gone (busy is empty): a busy script
+    # writes neither the marker nor the "done" line, so the caller keeps the box held. BACKGROUND only deletes
+    # the trash tree, never the marker, and starts after the completion signal.
+    lines += ['if [ -z "$busy" ]; then', f'  echo ok > {marker}; echo "done {run_id}"', "fi",
+              BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
 
@@ -110,41 +113,49 @@ def run(con, box_id: str, current: str) -> int:
     """Move old checkouts on box_id out of ~/w. Returns how many moved. Never raises."""
     try:
         key = f"prune:{box_id}"
+        # The throttle reads the record fresh; the settled list is read without the age limit, so a failed or
+        # aged-out pass can't drop it and replay settled dirs (they are re-offered only after they go stale again).
+        raw = kv_get(con, key)
         prev = kv_get(con, key, max_age=EVERY_S)
         if prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
             return 0
         if _protected(con, box_id):
             return 0
-        # Dirs settled by an earlier pass (pruned or absent) are not probed again, so a settled prefix can't
-        # use up the budget on every pass. A dir recreated and used again gets a newer run row, which gives it
-        # a later last-used time; it is re-offered only after it becomes stale again.
-        settled = set((prev or {}).get("settled", []))
+        settled = set((raw or {}).get("settled", []))
         dirs = [d for d in stale_dirs(con, box_id, current) if d not in settled]
-        # Counted as all left until the box answers, so a timed-out or failed ssh is retried after RETRY_S.
+        # Every path below keeps the settled list, so a failed pass never replays settled dirs on the next one.
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": sorted(settled)})
         if not dirs:
             return 0
         run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
+        # The hold is taken before the remote script can start and released only when its worker is confirmed gone.
+        # While held, the allocator never hands this box to anyone (pool.candidates, lease resume).
+        con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,?,?)",
+                    (box_id, run_id, now()))
+        con.commit()
         deadline = time.monotonic() + CALLER_BUDGET_S
+        out: list[str] = []
+        rc: int | None = None
         try:
             p = ssh_sync.ssh(box_id, "bash -s", input=script(dirs, run_id).encode(), timeout=BUDGET_S + 12)
             out = p.stdout.decode(errors="replace").splitlines()
-            ok = p.returncode == 0
+            rc = p.returncode
+            finished = rc == 0 and f"done {run_id}" in out  # the script prints this only after its last child is gone
         except (subprocess.TimeoutExpired, OSError) as e:
-            # The remote script may still be running. Within the caller's budget, only a seen done marker
-            # counts as finished; otherwise the whole box is quarantined in kv and the run goes on without it.
-            out, ok = [], False
+            # The remote script may still be running. Only a seen done marker releases the hold.
             log(f"prune {box_id} ssh failed ({type(e).__name__}); checking the remote worker")
-            if not _quiesced(box_id, run_id, deadline - time.monotonic()):
-                kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "unconfirmed": run_id})
-                log(f"prune {box_id}: remote worker not confirmed finished; box quarantined for retry")
-                return 0
+            finished = _quiesced(box_id, run_id, deadline - time.monotonic())
+        if finished:
+            con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+            con.commit()
         done = [ln[len("pruned "):] for ln in out if ln.startswith("pruned ") and ln[len("pruned "):] in dirs]
         skipped = [ln[len("skip "):] for ln in out if ln.startswith("skip ") and ln[len("skip "):] in dirs]
         # Settled outcomes are pruned and skipped (absent or not a real dir); everything else stays pending.
         left_n = len(dirs) - len(done) - len(skipped)
-        if not ok or any(ln.startswith("busy ") for ln in out):
-            log(f"prune {box_id}: {left_n} left for retry (ssh rc {p.returncode})")
+        if not finished:
+            log(f"prune {box_id}: remote worker not confirmed finished; box held, {left_n} left for retry")
+        elif left_n:
+            log(f"prune {box_id}: {left_n} left for retry (ssh rc {rc})")
         settled_now = sorted(settled | set(done) | set(skipped))
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n, "settled": settled_now})
         if done:

@@ -92,7 +92,8 @@ class ScriptTests(Isolated):
                                capture_output=True, timeout=10)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertEqual(p.stdout.decode().splitlines(),
-                             ["pruned w/a-aaaaaa", "pruned w/it's-bbbbbb", "skip w/c-cccccc", "skip w/d-dddddd"])
+                             ["pruned w/a-aaaaaa", "pruned w/it's-bbbbbb", "skip w/c-cccccc", "skip w/d-dddddd",
+                              "done t1"])
             self.assertFalse((h / "w/a-aaaaaa").exists())
             self.assertFalse((h / "w/it's-bbbbbb").exists())
             self.assertTrue((h / "w/c-cccccc").is_symlink())
@@ -117,7 +118,8 @@ class ScriptTests(Isolated):
             p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa"])
+            # The stalled worker was killed and reaped, so completion is confirmed: "left" plus "done".
+            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa", "done t1"])
             # Checkout reuse after the caller gave up: the dir is still the live checkout and was never renamed.
             self.assertTrue((h / "w/a-aaaaaa/f").read_text() == "x")
             pid = int(pidf.read_text().strip())
@@ -141,13 +143,22 @@ class ScriptTests(Isolated):
             p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa"])
+            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa", "done t1"])  # killed and reaped
             self.assertTrue((h / "w/a-aaaaaa/f").exists())
             # The stub writes its pid as its first action, so the budget kill always has a live child to reap.
             self.assertTrue(pidf.exists(), "stalled mv never started: the test would prove nothing")
             pid = int(pidf.read_text().strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)  # the stalled child was killed and reaped before the script returned
+            self.addCleanup(_kill_group_quietly, pid)
+
+
+def _kill_group_quietly(pid: int) -> None:
+    # A stalled stub is its own process group (the script runs under set -m); kill the group, never leave a sleep.
+    try:
+        os.killpg(os.getpgid(pid), 9)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 class RunTests(Isolated):
@@ -392,10 +403,10 @@ class RunTests(Isolated):
         self.assertEqual(n, 0)
         self.assertLessEqual(seen["probe_timeout"], 20)  # the probe never gets more than the caller budget
         self.assertLess(elapsed, 5)  # the probe is mocked to fail at once; the wait is bounded by the budget
-        # The box is quarantined in kv, with the unconfirmed run id, not released as settled.
+        # The box is held (prune_holds row) and its candidates are left pending, not settled.
         rec = prune.kv_get(self.con, "prune:bx")
         self.assertEqual(rec["left"], 2)
-        self.assertIn("unconfirmed", rec)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'").fetchone()[0], 1)
 
     def test_done_marker_is_written_before_background_and_seen_by_probe(self):
         # Round-6 P2: the marker must be real. It is written by the script (before BACKGROUND, outside the
@@ -451,6 +462,232 @@ class RunTests(Isolated):
         self.assertEqual(n2, 1)
         self.assertFalse((Path(self.home.name) / "w/s3-cccccc").exists())
         self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)
+
+
+    def _lease_row_for_bx(self):
+        # A real lease row for box "bx", so pool.candidates() (the allocator's query) can see it.
+        self.con.execute("""INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source)
+            VALUES ('bx','o9','/r9','rk','w/keep-cccccc','stopped','small',?,NULL)""", (common.now(),))
+        self.con.commit()
+
+    def test_disconnected_worker_holds_box_from_allocator_until_confirmed(self):
+        # Round-7 P1: a timed-out ssh leaves a worker alive that can still rename a checkout. Until its completion is
+        # confirmed, the allocator (pool.candidates) must not hand the box out, even though no run is 'running'.
+        from offbox_lib import pool
+        self._lease_row_for_bx()
+        pidf = Path(self.home.name) / "worker.pid"
+        worker_sh = Path(self.bindir.name) / "mv"  # the worker's rename: records its pid, then blocks (can still rename)
+        worker_sh.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
+        worker_sh.chmod(worker_sh.stat().st_mode | stat.S_IEXEC)
+        worker = {}
+
+        def timeout_with_live_worker(box_id, cmd, input=None, timeout=None):
+            if input is not None:
+                worker["p"] = subprocess.Popen(["bash", "-c", input.decode()], start_new_session=True,
+                                               env={"HOME": self.home.name,
+                                                    "PATH": f"{self.bindir.name}:/usr/bin:/bin"},
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(100):
+                    if pidf.exists():
+                        break
+                    time.sleep(0.05)
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return subprocess.CompletedProcess(["ssh"], 1, b"", b"")  # the follow-up probe: worker not finished
+
+        try:
+            with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"), \
+                    patch.object(prune.ssh_sync, "ssh", side_effect=timeout_with_live_worker), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                prune.run(self.con, "bx", "w/keep-cccccc")
+            # The worker is alive and can still rename: the box is held, and the allocator skips it.
+            self.assertIsNone(worker["p"].poll())
+            held = self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'").fetchone()[0]
+            self.assertEqual(held, 1)
+            rows, _ = pool.candidates(self.con, "rk", "small", None)
+            self.assertEqual(rows, [], "a box with an open prune hold must not be offered to the allocator")
+            # The resume path (the caller's own lease) also refuses the held box.
+            from offbox_lib import lease as lease_mod
+            self.assertIsNone(lease_mod.find_lease(self.con, "o9", "/r9"))
+            # Confirmation (the worker's done marker) releases the hold; only then is the box handed out again.
+            os.kill(worker["p"].pid, 9)
+            worker["p"].wait(timeout=5)
+            self.con.execute("DELETE FROM prune_holds WHERE box_id='bx'")
+            self.con.commit()
+            rows, _ = pool.candidates(self.con, "rk", "small", None)
+            self.assertEqual(len(rows), 1, "after a confirmed completion the box is offered again")
+        finally:
+            # The worker script and its stalled sleep may be in different groups: kill both by their recorded pids.
+            if pidf.exists():
+                _kill_group_quietly(int(pidf.read_text().strip()))
+            if "p" in worker and worker["p"].poll() is None:
+                worker["p"].kill()
+                worker["p"].wait(timeout=5)
+
+    def test_timeout_then_successful_probe_persists_completion_state(self):
+        # Round-7 P2: a timeout followed by a successful probe must complete cleanly, with no UnboundLocalError
+        # swallowed by the catch-all. The probe confirms the worker's done marker, so the hold is released and the
+        # run's real outcome is recorded.
+        def timeout_then_probe_ok(box_id, cmd, input=None, timeout=None):
+            if input is not None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return subprocess.CompletedProcess(["ssh"], 0, b"", b"")  # probe: marker seen
+
+        with patch.object(prune, "BACKGROUND", "true"), \
+                patch.object(prune.ssh_sync, "ssh", side_effect=timeout_then_probe_ok), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            n = prune.run(self.con, "bx", "w/keep-cccccc")
+        self.assertNotIn("UnboundLocalError", err.getvalue())
+        self.assertEqual(n, 0)  # nothing was actually pruned (the probe does not report per-dir outcomes)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'").fetchone()[0], 0)
+        rec = prune.kv_get(self.con, "prune:bx")
+        self.assertIsNotNone(rec)  # completion state was persisted, not lost in the catch-all
+        self.assertEqual(rec["left"], 2)  # the dirs were not reported as done, so they stay pending for the retry
+
+    def test_partial_pass_failure_retry_then_six_hour_throttle(self):
+        # Round-7 P2 multi-pass: pass 1 settles s1 (a real partial pass), pass 2 fails with a timeout that keeps the
+        # settled list, and pass 3 (after RETRY_S) reaches s2 without replaying s1. Completion then goes to 6 h.
+        self.con.execute("DELETE FROM runs WHERE remote_dir='w/s2-bbbbbb'")  # s2 is not stale on pass 1
+        self.con.commit()
+        with patch.object(prune, "BACKGROUND", "true"), patch.object(prune, "BUDGET_S", 8), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n1, _, _ = self.run_prune()
+        self.assertEqual(n1, 1)  # pass 1: s1 pruned
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["settled"], ["w/s1-aaaaaa"])
+        # s2 becomes stale and a timeout then fails pass 2; the settled prefix must survive the failure.
+        (Path(self.home.name) / "w/s2-bbbbbb").mkdir(parents=True, exist_ok=True)
+        add_run(self.con, "bx", "w/s2-bbbbbb", 7 * 86400)
+        # One explicit clock for the whole sequence, so each pass is stamped relative to the previous one.
+        base = common.now()
+
+        def clock(offset):
+            return patch.object(common, "now", return_value=base + offset), patch.object(prune, "now", return_value=base + offset)
+
+        def timeout_no_marker(box_id, cmd, input=None, timeout=None):
+            if input is not None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return subprocess.CompletedProcess(["ssh"], 1, b"", b"")
+
+        a, b = clock(prune.EVERY_S + 1)
+        with a, b, patch.object(prune.ssh_sync, "ssh", side_effect=timeout_no_marker), \
+                contextlib.redirect_stderr(io.StringIO()):
+            prune.run(self.con, "bx", "w/keep-cccccc")
+        rec = prune.kv_get(self.con, "prune:bx")
+        self.assertIn("w/s1-aaaaaa", rec["settled"], "a failed pass must keep the settled prefix")
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'").fetchone()[0], 1)
+        # Pass 3: the failed pass left the box held, so it is not retried until the hold is confirmed cleared.
+        # Clear the hold as a confirmed completion would, then a healthy pass after RETRY_S reaches s2.
+        self.con.execute("DELETE FROM prune_holds WHERE box_id='bx'")
+        self.con.commit()
+        a, b = clock(prune.EVERY_S + 1 + prune.RETRY_S + 1)
+        with a, b, patch.object(prune, "BACKGROUND", "true"), patch.object(prune, "BUDGET_S", 8), \
+                patch.object(prune.ssh_sync, "ssh", side_effect=self.fake_ssh(self.home.name, self.bindir.name, self.calls)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n3, _, _ = self.run_prune()
+        self.assertEqual(n3, 1)  # s2 pruned; s1 was not replayed
+        self.assertFalse((Path(self.home.name) / "w/s2-bbbbbb").exists())
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)
+        # Completion returns to the six-hour throttle: a pass inside EVERY_S makes no ssh.
+        before = len(self.calls)
+        a, b = clock(prune.EVERY_S + 1 + prune.RETRY_S + 1 + 60)
+        with a, b, contextlib.redirect_stderr(io.StringIO()):
+            self.run_prune()
+        self.assertEqual(len(self.calls), before)
+
+
+class HoldClearTests(Isolated):
+    """The hold is cleared only when a box is certainly stopped or gone. Each path is driven through the real
+    lease/reap functions, with only the boat API faked."""
+
+    def _hold(self, box="bx"):
+        self.con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source) "
+                         "VALUES (?,'o9','/r9','rk','w/keep-cccccc','running','small',?,NULL)", (box, common.now()))
+        self.con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,?,?)",
+                         (box, "r1", common.now()))
+        self.con.commit()
+
+    def _held(self, box="bx"):
+        return self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id=?", (box,)).fetchone()[0]
+
+    def test_stop_box_clears_hold_only_once_boat_confirms_stopped(self):
+        from offbox_lib import lease
+        self._hold()
+        with patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
+                patch.object(lease.api, "get", return_value={"state": "running"}), \
+                patch.object(lease.ssh_sync, "close_master"):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        self.assertEqual(self._held(), 1, "a stop merely accepted must keep the hold")
+        with patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
+                patch.object(lease.api, "get", return_value={"state": "archived"}), \
+                patch.object(lease.ssh_sync, "close_master"):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        self.assertEqual(self._held(), 0, "a box boat reports archived has no remote process left")
+
+    def test_stop_box_404_clears_hold(self):
+        from offbox_lib import lease
+        self._hold()
+        with patch.object(lease, "keep_images"), \
+                patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        self.assertEqual(self._held(), 0, "a box that is already gone has no remote process left")
+
+    def test_delete_box_clears_hold(self):
+        from offbox_lib import lease
+        self._hold()
+        with patch.object(lease, "ssh_sync"), patch.object(lease.api, "delete", return_value={"operation": {"id": "op"}}), \
+                patch("offbox_lib.spend.record_final_usage"):
+            lease.delete_box(self.con, "bx", "test")
+        self.assertEqual(self._held(), 0)
+
+    def test_reaper_forgets_gone_box_and_clears_hold(self):
+        from offbox_lib import reap
+        self._hold()
+        # boat no longer lists the box: the reaper's forget path must release the hold.
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)):
+            reap.reap(dry=False)  # any error here must fail the test, not be swallowed
+        self.assertEqual(self._held(), 0)
+
+    def test_hold_kept_after_timeout_with_no_marker(self):
+        # No marker and no confirmation: the hold must stay, however much time passes. A real stale dir is needed,
+        # otherwise run() returns before it takes a hold.
+        def timeout_no_marker(box_id, cmd, input=None, timeout=None):
+            if input is not None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return subprocess.CompletedProcess(["ssh"], 1, b"", b"")
+
+        self._lease_row_for_bx()
+        add_run(self.con, "bx", "w/s9-a1b2c3", 5 * 86400)  # DIR_RE needs 6 hex digits after the dash
+        with patch.object(prune, "BACKGROUND", "true"), \
+                patch.object(prune.ssh_sync, "ssh", side_effect=timeout_no_marker), \
+                contextlib.redirect_stderr(io.StringIO()):
+            prune.run(self.con, "bx", "w/keep-cccccc")
+        self.assertEqual(self._held(), 1, "a timed-out run with no marker must hold the box")
+        with patch.object(common, "now", return_value=common.now() + 10 * 86400):
+            self.assertEqual(self._held(), 1, "time alone never clears a hold")
+
+    def _lease_row_for_bx(self):
+        self.con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source) "
+                         "VALUES ('bx','o9','/r9','rk','w/keep-cccccc','stopped','small',?,NULL)", (common.now(),))
+        self.con.commit()
+
+    def test_busy_script_writes_no_marker_and_no_done_line(self):
+        # A group member that survives the kill makes the script busy: no done marker and no "done" line.
+        # A real survivor: a stub mv that ignores SIGKILL is not possible, so the busy path is forced by making the
+        # group-liveness probe report "alive" forever. Only the busy branch can then run, and it must not signal done.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+            h = Path(home)
+            (h / "w/a-aaaaaa").mkdir(parents=True)
+            # The group probe is forced to "alive" (kill -0 always succeeds). The kill then can't confirm the group is
+            # gone, so the one() path returns busy (4), and the script must not signal done.
+            body = prune.script(["w/a-aaaaaa"], "rbusy").replace(
+                'while kill -0 -- -"$p" 2>/dev/null; do',
+                'while true; do', 1).replace(
+                'if kill -0 -- -"$p" 2>/dev/null; then return 4; fi',
+                'return 4', 1)
+            p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
+                               capture_output=True, timeout=60)
+            self.assertNotIn("done rbusy", p.stdout.decode().splitlines())
+            self.assertFalse((h / ".offbox/done/rbusy").exists(), "a busy script must not write the done marker")
 
 
 class RunnerHookTests(Isolated):

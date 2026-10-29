@@ -70,6 +70,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             if not dry:
                 con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
                 con.commit()
+                lease.clear_prune_hold(con, bid)  # gone from boat: no remote process survives
                 event(con, bid, "reap_forget", "box no longer exists on boat")
             actions.append(f"forget {bid}: gone from boat")
             continue
@@ -84,6 +85,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry and state in api.STOPPED_STATES and r["state"] == "running":
             con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (bid,))
             con.commit()
+        if not dry and state in api.STOPPED_STATES:
+            lease.clear_prune_hold(con, bid)  # boat says stopped: no remote process survives
         # thread status for deletion decisions
         gone_since = r["thread_gone_since"]
         if bid in pooled:
