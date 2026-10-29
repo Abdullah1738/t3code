@@ -330,6 +330,22 @@ describe("pointer drag", () => {
       writes.mock.calls.filter(([key]) => key === boardColumnsStorageKey(BOARD_ID)),
     ).toHaveLength(1);
   });
+
+  it("narrows a column below the layout's min width live and keeps it on release", async () => {
+    const separator = handle("To-Do")!;
+    const column = separator.parentElement as HTMLElement;
+    const startWidth = column.getBoundingClientRect().width;
+    const target = 160;
+
+    await act(() => pointer(separator, "pointerdown", 400));
+    await act(() => pointer(separator, "pointermove", 400 - (startWidth - target)));
+    await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
+    expect(column.getBoundingClientRect().width).toBeCloseTo(target, 0);
+
+    await act(() => pointer(separator, "pointerup", 400 - (startWidth - target)));
+    expect(readStored(boardColumnsStorageKey(BOARD_ID)).widths.todo).toBeCloseTo(target, 0);
+    expect(column.getBoundingClientRect().width).toBeCloseTo(target, 0);
+  });
 });
 
 describe("group columns", () => {
