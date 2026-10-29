@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Data from "effect/Data";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -52,6 +53,7 @@ interface FakeThread {
   running: boolean;
   runStartedAt?: string;
   stuck?: boolean;
+  quietSince?: string;
   archived: boolean;
 }
 
@@ -67,22 +69,26 @@ const makeFake = Effect.gen(function* () {
   // The next this-many thread reads fail, like a projection read error.
   const failReads = { left: 0 };
   let next = 0;
+  // Like production, updatedAt always moves with the clock (shared provider-session bumps).
   const read = (threadId: ThreadId) =>
-    Ref.get(threads).pipe(
-      Effect.map((all): KanbanThreadView | null => {
-        const thread = all.get(threadId);
-        if (!thread) return null;
-        return {
-          threadId,
-          projectId: ProjectId.make("project-1"),
-          title: thread.title,
-          state: thread.stuck ? "needs-input" : thread.running ? "running" : "idle",
-          updatedAt: "2026-10-25T13:00:00.000Z",
-          runStartedAt: thread.runStartedAt ?? null,
-          prs: prs.get(threadId) ?? [],
-          archived: thread.archived,
-        };
-      }),
+    Effect.flatMap(Clock.currentTimeMillis, (nowMs) =>
+      Ref.get(threads).pipe(
+        Effect.map((all): KanbanThreadView | null => {
+          const thread = all.get(threadId);
+          if (!thread) return null;
+          return {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: thread.title,
+            state: thread.stuck ? "needs-input" : thread.running ? "running" : "idle",
+            updatedAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+            quietSince: thread.quietSince ?? "2026-10-25T13:00:00.000Z",
+            runStartedAt: thread.runStartedAt ?? null,
+            prs: prs.get(threadId) ?? [],
+            archived: thread.archived,
+          };
+        }),
+      ),
     );
   const find = (threadId: ThreadId): Effect.Effect<KanbanThreadView | null, KanbanThreadError> =>
     Effect.suspend(() => {
@@ -1602,6 +1608,37 @@ it.effect("the tick nudges a quiet worker and interrupts one stuck on its own qu
       assert.strictEqual(fake.interrupted.filter((id) => id === thread).length, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect(
+  "the tick interrupts a worker stuck on its own question even while the shell's updatedAt keeps moving",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* Ref.update(fake.threads, (all) => {
+          all.get(thread)!.stuck = true;
+          all.get(thread)!.quietSince = "2026-10-25T13:00:00.000Z";
+          return all;
+        });
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        assert.isTrue(fake.interrupted.includes(thread));
+        const events = (yield* kanban.card(card.id)).events;
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.kind === "thread" &&
+              event.body === "Interrupted: stuck on its own question",
+          ),
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("a thread stuck on its own question shows as needing input, not running", () =>

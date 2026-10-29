@@ -836,13 +836,19 @@ describe("workerQuietDue", () => {
     movedAt: START_ISO,
   });
   const at = (minutes: number) => START + minutes * 60 * 1000;
-  const view = (state: string) => ({ state, updatedAt: START_ISO });
+  const view = (state: string) => ({ state, quietSince: START_ISO });
 
   it("is due for an idle or stuck worker after 30 minutes", () => {
     expect(workerQuietDue(working, view("idle"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("idle"), at(29))).toBe(false);
     expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
+  });
+
+  it("counts from quietSince", () => {
+    const quiet = { state: "idle", quietSince: "2026-10-25T00:20:00.000Z" };
+    expect(workerQuietDue(working, quiet, at(31))).toBe(false);
+    expect(workerQuietDue(working, quiet, at(51))).toBe(true);
   });
 
   it("counts from the last nudge and skips stalled or review cards", () => {

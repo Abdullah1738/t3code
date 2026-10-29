@@ -16,7 +16,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
-import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ProviderFailure,
+  OrchestrationV2ThreadShell,
+} from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 
@@ -43,6 +46,8 @@ export interface KanbanThreadView {
   readonly title: string;
   readonly state: ControlThreadState;
   readonly updatedAt: string;
+  /** When the thread itself last did something: its open question, else its last finished run. updatedAt also moves on shared provider-session updates. */
+  readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
@@ -95,6 +100,13 @@ const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCry
 const detailOf = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
 
+const quietSinceOf = (shell: OrchestrationV2ThreadShell): DateTime.Utc => {
+  const request = shell.pendingRuntimeRequest;
+  // An async question doesn't stop the run, so it says nothing about quiet.
+  if (request !== null) return request.blocking === false ? shell.updatedAt : request.createdAt;
+  return shell.latestRunCompletedAt ?? shell.updatedAt;
+};
+
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
@@ -110,6 +122,7 @@ const make = Effect.gen(function* () {
               title: shell.title,
               state: stateFromShell(shell),
               updatedAt: DateTime.formatIso(shell.updatedAt),
+              quietSince: DateTime.formatIso(quietSinceOf(shell)),
               runStartedAt: shell.activityRunStartedAt
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
