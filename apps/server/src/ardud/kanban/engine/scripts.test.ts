@@ -169,7 +169,7 @@ describe("board scripts", () => {
   it("a card a script moved on stdout fires no card.moved script, its own or another's", () => {
     const eventOf = eventTracker([["card-1", "todo"]]);
     const moved = card({ id: "card-1", number: 1, stage: "deployed", priority: 3 } as never);
-    const byScript = { _tag: "script", scriptId: "script-1" } as const;
+    const byScript = { _tag: "script", scriptId: "script-1" as never } as const;
     const event = eventOf({ _tag: "card", card: moved, by: byScript });
     expect(event?.name).toBe("card.moved");
     expect(event?.by).toEqual(byScript);

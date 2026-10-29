@@ -884,7 +884,7 @@ const make = Effect.gen(function* () {
     by?: KanbanActor,
   ) {
     yield* store.putCard(card);
-    yield* publish(card.boardId, { _tag: "card", card, ...(by ? { by } : {}) });
+    yield* publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by });
   });
 
   const logEvent = Effect.fn("KanbanService.logEvent")(function* (
