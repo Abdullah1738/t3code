@@ -2625,7 +2625,7 @@ const setArchived = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
     return all;
   });
 
-it.effect("an owner's new channel goes to the board's live evaluator", () =>
+it.effect("an owner's new channel starts its own evaluator", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -2635,15 +2635,21 @@ it.effect("an owner's new channel goes to the board's live evaluator", () =>
       const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
       yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
 
-      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, setup);
-      const all = [...(yield* Ref.get(fake.threads)).entries()];
-      assert.strictEqual(all.filter(([, view]) => view.title.startsWith("Evaluator")).length, 1);
-      assert.include(all.find(([id]) => id === setup)![1].messages.at(-1) ?? "", "Round fees up");
+      const next = (yield* kanban.discussion(channel.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, setup);
+      const all = yield* Ref.get(fake.threads);
+      assert.strictEqual(
+        [...all.values()].filter((view) => view.title.startsWith("Evaluator")).length,
+        2,
+      );
+      assert.include(all.get(next!)!.messages.join("\n"), "Round fees up");
+      assert.isFalse(all.get(setup)!.messages.some((text) => text.includes("Round fees up")));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("an archived evaluator is stopped and its discussion moves to a live one", () =>
+it.effect("an archived evaluator is stopped and its discussion gets a new evaluator", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -2660,11 +2666,15 @@ it.effect("an archived evaluator is stopped and its discussion moves to a live o
 
       yield* kanban.post(opened.id, owner, [{ _tag: "md", text: "Still there?" }]);
 
-      assert.strictEqual((yield* kanban.discussion(opened.id)).evaluatorThreadId, request);
+      const next = (yield* kanban.discussion(opened.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, setup);
+      assert.notStrictEqual(next, request);
       assert.include(fake.interrupted, setup);
       const all = yield* Ref.get(fake.threads);
       assert.isFalse(all.get(setup)!.messages.some((text) => text.includes("Still there?")));
-      assert.include(all.get(request)!.messages.at(-1) ?? "", "Still there?");
+      assert.isFalse(all.get(request)!.messages.some((text) => text.includes("Still there?")));
+      assert.include(all.get(next!)!.messages.join("\n"), "Still there?");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -2692,7 +2702,7 @@ it.effect("an archived evaluator with no live one is replaced", () =>
   }),
 );
 
-it.effect("a board evaluator whose turn ended still takes the owner's new channel", () =>
+it.effect("a new channel doesn't go to an ended request evaluator", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -2705,41 +2715,11 @@ it.effect("a board evaluator whose turn ended still takes the owner's new channe
       const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
       yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
 
-      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, request);
+      const next = (yield* kanban.discussion(channel.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, request);
       const all = [...(yield* Ref.get(fake.threads)).values()];
-      assert.strictEqual(all.filter((view) => view.title.startsWith("Evaluator")).length, 1);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
-);
-
-it.effect("twenty newer non-evaluator links don't hide the live board evaluator", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const request = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Add a card" });
-      const store = yield* KanbanStore.KanbanStore;
-      for (let i = 0; i < 20; i += 1) {
-        yield* store.putThreadLink({
-          threadId: ThreadId.make(`noise-${i}`),
-          boardId: board.id,
-          cardId: null,
-          role: "work",
-          purpose: null,
-          paused: null,
-          discussionId: null,
-          model: null,
-          startedAt: "2026-10-25T13:00:00.000Z",
-          endedAt: null,
-        });
-      }
-
-      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
-      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
-
-      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, request);
-      const all = [...(yield* Ref.get(fake.threads)).values()];
-      assert.strictEqual(all.filter((view) => view.title.startsWith("Evaluator")).length, 1);
+      assert.strictEqual(all.filter((view) => view.title.startsWith("Evaluator")).length, 2);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
