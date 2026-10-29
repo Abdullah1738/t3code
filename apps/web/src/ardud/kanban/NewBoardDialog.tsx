@@ -180,98 +180,100 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
             Pick the setup evaluator's model, then press Start setup. It opens a Setup discussion.
           </DialogDescription>
         </DialogHeader>
-        <DialogPanel className="flex flex-col gap-4">
-          <label className="flex flex-col gap-1 text-sm">
-            <span>Name</span>
-            <Input
-              value={name}
-              disabled={pending !== null}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="Robob"
-            />
-          </label>
-          <label className="flex flex-col gap-1 text-sm">
-            <span>Slug</span>
-            <Input
-              value={effectiveSlug}
-              disabled={pending !== null}
-              onChange={(event) => {
-                setSlugTouched(true);
-                setSlug(slugOf(event.target.value));
-              }}
-            />
-          </label>
-          <div className="flex flex-col gap-1 text-sm">
-            <span>Icon (optional)</span>
-            <div className="flex flex-wrap gap-1.5">
-              {KANBAN_BOARD_ICONS.map((entry) => {
-                const Icon = BOARD_ICONS[entry];
-                const selected = icon === entry;
-                return (
-                  <button
-                    key={entry}
-                    type="button"
-                    aria-label={entry}
-                    aria-pressed={selected}
-                    onClick={() => setIcon(selected ? null : entry)}
-                    className={
-                      selected
-                        ? "flex size-8 items-center justify-center rounded-lg bg-accent"
-                        : "flex size-8 items-center justify-center rounded-lg hover:bg-accent"
-                    }
-                  >
-                    <Icon aria-hidden className="size-4" />
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-          <label className="flex flex-col gap-1 text-sm">
-            <span>Project</span>
-            <select
-              className="rounded-md border bg-background px-2 py-1.5"
-              disabled={pending !== null}
-              value={projectId ?? ""}
-              onChange={(event) =>
-                setProjectId(event.target.value ? (event.target.value as ProjectId) : null)
-              }
-            >
-              <option value="">Choose a project</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.title}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="flex flex-col gap-1 text-sm">
-            <span>Setup evaluator model</span>
-            {environmentId && entries[0] ? (
-              <ProviderModelPicker
-                environmentId={environmentId}
-                activeInstanceId={model?.instanceId ?? entries[0].instanceId}
-                model={model?.model ?? ""}
-                lockedProvider={null}
-                instanceEntries={entries}
-                modelOptionsByInstance={modelOptions}
-                {...(model ? {} : { triggerLabel: "Pick a model" })}
-                onInstanceModelChange={(instanceId, modelId) =>
-                  setModel({ instanceId, model: modelId })
-                }
+        <DialogPanel>
+          <div className="flex flex-col gap-4">
+            <label className="flex flex-col gap-1 text-sm">
+              <span>Name</span>
+              <Input
+                value={name}
+                disabled={pending !== null}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Robob"
               />
-            ) : (
-              <span className="text-muted-foreground">No environment connected.</span>
-            )}
+            </label>
+            <label className="flex flex-col gap-1 text-sm">
+              <span>Slug</span>
+              <Input
+                value={effectiveSlug}
+                disabled={pending !== null}
+                onChange={(event) => {
+                  setSlugTouched(true);
+                  setSlug(slugOf(event.target.value));
+                }}
+              />
+            </label>
+            <div className="flex flex-col gap-1 text-sm">
+              <span>Icon (optional)</span>
+              <div className="flex flex-wrap gap-1.5">
+                {KANBAN_BOARD_ICONS.map((entry) => {
+                  const Icon = BOARD_ICONS[entry];
+                  const selected = icon === entry;
+                  return (
+                    <button
+                      key={entry}
+                      type="button"
+                      aria-label={entry}
+                      aria-pressed={selected}
+                      onClick={() => setIcon(selected ? null : entry)}
+                      className={
+                        selected
+                          ? "flex size-8 items-center justify-center rounded-lg bg-accent"
+                          : "flex size-8 items-center justify-center rounded-lg hover:bg-accent"
+                      }
+                    >
+                      <Icon aria-hidden className="size-4" />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <label className="flex flex-col gap-1 text-sm">
+              <span>Project</span>
+              <select
+                className="rounded-md border bg-background px-2 py-1.5"
+                disabled={pending !== null}
+                value={projectId ?? ""}
+                onChange={(event) =>
+                  setProjectId(event.target.value ? (event.target.value as ProjectId) : null)
+                }
+              >
+                <option value="">Choose a project</option>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.title}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flex flex-col gap-1 text-sm">
+              <span>Setup evaluator model</span>
+              {environmentId && entries[0] ? (
+                <ProviderModelPicker
+                  environmentId={environmentId}
+                  activeInstanceId={model?.instanceId ?? entries[0].instanceId}
+                  model={model?.model ?? ""}
+                  lockedProvider={null}
+                  instanceEntries={entries}
+                  modelOptionsByInstance={modelOptions}
+                  {...(model ? {} : { triggerLabel: "Pick a model" })}
+                  onInstanceModelChange={(instanceId, modelId) =>
+                    setModel({ instanceId, model: modelId })
+                  }
+                />
+              ) : (
+                <span className="text-muted-foreground">No environment connected.</span>
+              )}
+            </div>
+            <label className="flex flex-col gap-1 text-sm">
+              <span>Notes for the setup evaluator (optional)</span>
+              <Textarea
+                value={notes}
+                onChange={(event) => setNotes(event.target.value)}
+                placeholder="Leave empty for the default setup."
+                rows={4}
+              />
+            </label>
           </div>
-          <label className="flex flex-col gap-1 text-sm">
-            <span>Notes for the setup evaluator (optional)</span>
-            <Textarea
-              value={notes}
-              onChange={(event) => setNotes(event.target.value)}
-              placeholder="Leave empty for the default setup."
-              rows={4}
-            />
-          </label>
         </DialogPanel>
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" />}>Cancel</DialogClose>
