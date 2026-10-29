@@ -2538,12 +2538,15 @@ it.effect("an owner's channel gets a title from his first message, unless he nam
 class ModelDown extends Data.TaggedError("ModelDown")<{}> {}
 
 const groupAsks = (asked: ReadonlyArray<string>) => asked.filter((prompt) => prompt.startsWith("You group"));
+const goalAsks = (asked: ReadonlyArray<string>) =>
+  asked.filter((prompt) => prompt.startsWith("You keep a work board's goals"));
 
 const scribeLayer = (
   fake: Layer.Layer<KanbanThreads>,
   asked: Array<string>,
   failures = 0,
   calls?: Queue.Queue<string>,
+  goalFailures = 0,
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
@@ -2558,6 +2561,7 @@ const scribeLayer = (
             asked.push(input.prompt);
             if (calls) yield* Queue.offer(calls, input.prompt);
             if (input.prompt.startsWith("You keep a work board's goals")) {
+              if (goalAsks(asked).length <= goalFailures) return yield* Effect.fail(new ModelDown());
               const id = /Goal (\S+):/.exec(input.prompt)?.[1] ?? "";
               return {
                 assign: [{ card: 2, goal: id }],
@@ -2714,6 +2718,39 @@ it.effect("the scribe puts a goal-less card in a matching goal and writes the go
       assert.strictEqual(goal?.now?.text, "Two login cards in progress.");
       assert.lengthOf(goal?.story ?? [], 0);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("a failed goal scribe run is retried after the cooldown, even with cards unchanged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const login = yield* kanban.setGoal(board.id, { name: "Login" });
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in page", goalId: login.id },
+        owner,
+      );
+      // The first goal call fails; no Now lands and the attempt is not marked done.
+      yield* kanban.tick;
+      assert.lengthOf(goalAsks(asked), 1);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).goals[0]?.now, null);
+
+      // Cards unchanged, under the cooldown: no retry.
+      yield* kanban.tick;
+      assert.lengthOf(goalAsks(asked), 1);
+
+      // Cooldown passed, cards unchanged: the failed pass is retried and writes the Now.
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.tick;
+      assert.lengthOf(goalAsks(asked), 2);
+      assert.strictEqual(
+        (yield* kanban.snapshot(board.id)).goals[0]?.now?.text,
+        "Two login cards in progress.",
+      );
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 0, undefined, 1)));
   }),
 );
 

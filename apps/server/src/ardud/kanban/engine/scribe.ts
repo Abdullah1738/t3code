@@ -44,15 +44,22 @@ const openCards = (cards: ReadonlyArray<KanbanCard>) =>
   cards.filter(isOpen).toSorted((a, b) => a.number - b.number);
 
 /** Numbers of a goal's cards that finished after its last story line (or after it was made). */
-export function finishedSince(goal: KanbanGoal, cards: ReadonlyArray<KanbanCard>): Array<number> {
+export function finishedSince(
+  goal: KanbanGoal,
+  cards: ReadonlyArray<KanbanCard>,
+  until = Number.POSITIVE_INFINITY,
+): Array<number> {
   const since = Date.parse(goal.story.at(-1)?.at ?? goal.createdAt);
   return cards
-    .filter(
-      (card) =>
+    .filter((card) => {
+      const moved = Date.parse(card.movedAt);
+      return (
         card.goalId === goal.id &&
         KANBAN_DONE_STAGES.has(card.stage) &&
-        Date.parse(card.movedAt) > since,
-    )
+        moved > since &&
+        moved <= until
+      );
+    })
     .map((card) => card.number)
     .toSorted((a, b) => a - b);
 }
@@ -66,8 +73,10 @@ export function goalsFingerprint(
   if (active.size === 0) return "";
   const lines = [...active];
   for (const card of cards) {
-    if (!isOpen(card)) continue;
-    if (card.goalId !== null && !active.has(card.goalId as string)) continue;
+    // A goal's finished cards count too: their move to completed, deployed or verified is
+    // what the goal's Story needs to hear about.
+    const inGoal = card.goalId !== null && active.has(card.goalId as string);
+    if (!inGoal && (card.goalId !== null || !isOpen(card))) continue;
     lines.push(`${card.number}:${card.stage}:${card.goalId ?? "-"}`);
   }
   return lines.sort().join("\n");
@@ -165,8 +174,9 @@ export function goalsPrompt(
   const open = openCards(cards);
   const active = goals.filter((goal) => goal.status === "active");
   const goalBlocks = active.flatMap((goal) => {
-    const own = open
+    const own = cards
       .filter((card) => card.goalId === goal.id)
+      .toSorted((a, b) => a.number - b.number)
       .slice(-MAX_GOAL_CARDS)
       .map(
         (card) => `#${card.number} | ${oneLine(card.title, 120)} | ${card.stage}`,
@@ -206,6 +216,7 @@ export function toGoalUpdates(
   output: ScribeGoalsOutput,
   cards: ReadonlyArray<KanbanCard>,
   goals: ReadonlyArray<KanbanGoal>,
+  until = Number.POSITIVE_INFINITY,
 ): {
   readonly assign: Array<{ readonly cardId: KanbanCard["id"]; readonly goalId: KanbanGoal["id"] }>;
   readonly goals: Array<{
@@ -243,7 +254,7 @@ export function toGoalUpdates(
     seen.add(entry.id);
     const now = entry.now.trim().slice(0, 600);
     const text = entry.story?.trim() ?? "";
-    const story = text !== "" && finishedSince(goal, cards).length > 0 ? text : null;
+    const story = text !== "" && finishedSince(goal, cards, until).length > 0 ? text : null;
     if (now === "" && story === null) continue;
     updates.push({ id: goal.id, now, story });
   }

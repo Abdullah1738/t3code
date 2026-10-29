@@ -603,7 +603,10 @@ const make = Effect.gen(function* () {
   // and whether that attempt grouped the board. A failed attempt is retried after the
   // cooldown even when the cards did not change.
   const goalsScribed = yield* Ref.make<
-    ReadonlyMap<KanbanBoardId, { readonly fingerprint: string; readonly at: number }>
+    ReadonlyMap<
+      KanbanBoardId,
+      { readonly fingerprint: string; readonly at: number; readonly done: boolean }
+    >
   >(new Map());
   const scribed = yield* Ref.make<
     ReadonlyMap<
@@ -1095,6 +1098,9 @@ const make = Effect.gen(function* () {
     if (board.defaultProjectId === null) return;
     const project = yield* projects.getById(board.defaultProjectId);
     if (Option.isNone(project)) return;
+    // Cards that finish during the call wait for the next pass: the Story cutoff is the
+    // time this snapshot was read, not the time the write lands.
+    const snapshotMs = yield* nowMillis;
     const output = yield* generateJson({
       cwd: project.value.workspaceRoot,
       prompt: Scribe.goalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId)),
@@ -1105,10 +1111,12 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const cards = yield* store.cards(boardId);
         const goals = yield* store.goals(boardId);
-        const updates = Scribe.toGoalUpdates(output, cards, goals);
+        const updates = Scribe.toGoalUpdates(output, cards, goals, snapshotMs);
         const at = yield* nowIso;
         const nowMs = yield* nowMillis;
         const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+        // A Now held back for a fresh hand-written one is retried after the cooldown.
+        let held = false;
         for (const { cardId, goalId } of updates.assign) {
           const card = cards.find((entry) => entry.id === cardId);
           const goal = goals.find((entry) => entry.id === goalId);
@@ -1123,15 +1131,28 @@ const make = Effect.gen(function* () {
           const keepNow =
             update.now === "" ||
             (goal.now !== null && nowMs - Date.parse(goal.now.at) < SCRIBE_KEEPS_NOW_MS);
+          if (keepNow && update.now !== "") held = true;
           if (keepNow && update.story === null) continue;
           const next: KanbanGoal = {
             ...goal,
             now: keepNow ? goal.now : { text: update.now, at },
-            story: update.story === null ? goal.story : [...goal.story, { at, text: update.story }],
+            story:
+              update.story === null
+                ? goal.story
+                : [
+                    ...goal.story,
+                    { at: DateTime.formatIso(DateTime.makeUnsafe(snapshotMs)), text: update.story },
+                  ],
           };
           yield* store.putGoal(next);
           yield* publish(boardId, { _tag: "goal", goal: next });
         }
+        yield* Ref.update(goalsScribed, (all) => {
+          const attempt = all.get(boardId);
+          return attempt === undefined
+            ? all
+            : new Map(all).set(boardId, { ...attempt, done: !held });
+        });
       }),
     );
   });
@@ -2350,13 +2371,14 @@ const make = Effect.gen(function* () {
         yield* store.goals(board.id),
       );
       const lastGoals = (yield* Ref.get(goalsScribed)).get(board.id);
-      if (
+      // A failed or held-back attempt is retried after the cooldown, cards unchanged or not.
+      const goalsDue =
         goalsPrint !== "" &&
-        goalsPrint !== lastGoals?.fingerprint &&
-        (lastGoals === undefined || now - lastGoals.at >= Scribe.SCRIBE_EVERY_MS)
-      ) {
+        (lastGoals === undefined || now - lastGoals.at >= Scribe.SCRIBE_EVERY_MS) &&
+        (lastGoals === undefined || !lastGoals.done || goalsPrint !== lastGoals.fingerprint);
+      if (goalsDue) {
         yield* Ref.update(goalsScribed, (all) =>
-          new Map(all).set(board.id, { fingerprint: goalsPrint, at: now }),
+          new Map(all).set(board.id, { fingerprint: goalsPrint, at: now, done: false }),
         );
         yield* forkGoals(board.id);
       }

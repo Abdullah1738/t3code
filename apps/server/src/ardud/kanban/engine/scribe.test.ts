@@ -4,6 +4,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   finishedSince,
   goalsFingerprint,
+  goalsPrompt,
   groupsFingerprint,
   groupsPrompt,
   toGoalUpdates,
@@ -137,5 +138,42 @@ describe("scribe", () => {
       "",
     );
     expect(goalsFingerprint([card(1)] as unknown as KanbanCard[], [goal()])).not.toBe("");
+  });
+
+  it("goalsFingerprint changes when a goal's card finishes, not only while it is open", () => {
+    const active = [goal()];
+    const working = [card(1, { goalId: "goal-a", stage: "working" })] as unknown as KanbanCard[];
+    const completed = [card(1, { goalId: "goal-a", stage: "completed" })] as unknown as KanbanCard[];
+    const verified = [card(1, { goalId: "goal-a", stage: "verified" })] as unknown as KanbanCard[];
+    const a = goalsFingerprint(working, active);
+    const b = goalsFingerprint(completed, active);
+    const c = goalsFingerprint(verified, active);
+    expect(b).not.toBe(a);
+    expect(c).not.toBe(b);
+  });
+
+  it("goalsPrompt lists a goal's finished cards with their titles", () => {
+    const cards = [
+      card(7, { goalId: "goal-a", stage: "verified", title: "Sign-in page", movedAt: "2026-10-25T11:00:00.000Z" }),
+    ] as unknown as KanbanCard[];
+    const prompt = goalsPrompt(cards, [goal()]);
+    expect(prompt).toContain("#7 | Sign-in page | verified");
+    expect(prompt).toContain("Finished since the last story line: #7");
+  });
+
+  it("toGoalUpdates drops a story for a card that finished after the snapshot", () => {
+    const cards = [
+      card(1, { goalId: "goal-a", stage: "verified", movedAt: "2026-10-25T11:00:00.000Z" }),
+      card(2, { goalId: "goal-a", stage: "verified", movedAt: "2026-10-25T13:00:00.000Z" }),
+    ] as unknown as KanbanCard[];
+    const snapshot = Date.parse("2026-10-25T12:00:00.000Z");
+    const updates = toGoalUpdates(
+      { assign: [], goals: [{ id: "goal-a", now: "Done.", story: "Sign-in landed." }] },
+      cards,
+      [goal()],
+      snapshot,
+    );
+    expect(updates.goals).toEqual([{ id: "goal-a", now: "Done.", story: "Sign-in landed." }]);
+    expect(finishedSince(goal(), cards, snapshot)).toEqual([1]);
   });
 });
