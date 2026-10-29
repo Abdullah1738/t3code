@@ -33,7 +33,7 @@ import {
   sortProviderInstanceEntries,
 } from "../../providerInstances";
 import { BOARD_ICONS } from "./boardIcon";
-import { kanban, runAction } from "./kanbanStore";
+import { kanban, runAction, useBoards } from "./kanbanStore";
 
 /** A board slug: lowercase words joined by dashes, the way the server keys boards. */
 export function slugOf(name: string): string {
@@ -54,7 +54,9 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
   const environmentId = usePrimaryEnvironmentId();
   const providersByEnvironment = useEnvironmentProviders();
   const settings = usePrimarySettings();
-  const projects = useProjects();
+  // Kanban requests go to the primary environment, so only its projects can be a board's project.
+  const projects = useProjects().filter((project) => project.environmentId === environmentId);
+  const boards = useBoards() ?? [];
   const providers =
     (environmentId ? providersByEnvironment.get(environmentId) : undefined) ?? EMPTY_SERVER_PROVIDERS;
 
@@ -97,6 +99,13 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
 
   const start = async () => {
     if (!canStart || model === null) return;
+    // Refuse a taken slug before anything is created or changed. The server refuses it too.
+    if (boards.some((summary) => summary.board.slug === effectiveSlug)) {
+      await runAction("Couldn't create the board", async () => {
+        throw new Error(`A board with the slug "${effectiveSlug}" already exists. Pick another name.`);
+      });
+      return;
+    }
     setBusy(true);
     await runAction("Couldn't start setup", async () => {
       const created = await kanban.createBoard({
@@ -115,7 +124,8 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
       await navigate({
         to: "/boards/$boardId",
         params: { boardId: created.id },
-        search: { discussion: started.discussionId },
+        // The board opens on its columns by default, so the discussions view is named explicitly.
+        search: { view: "discussions", discussion: started.discussionId },
       });
     });
     setBusy(false);

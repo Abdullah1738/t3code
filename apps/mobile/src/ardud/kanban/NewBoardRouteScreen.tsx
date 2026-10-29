@@ -1,16 +1,16 @@
 import { useNavigation } from "@react-navigation/native";
 import type { ModelSelection, ProjectId } from "@t3tools/contracts";
 import { useMemo, useState } from "react";
-import { ScrollView, View } from "react-native";
+import { ScrollView, TextInput, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { usePairedEnvironmentId } from "../common/environment";
-import { kanbanClient } from "./kanbanStore";
+import { kanbanClient, useKanbanBoards } from "./kanbanStore";
 
-/** Same rule as the web dialog: the board's slug is the name, lowercased with dashes. */
+/** Same rule as the web dialog: the slug is the name, lowercased with dashes. */
 export function slugOf(name: string): string {
   return name
     .trim()
@@ -20,36 +20,45 @@ export function slugOf(name: string): string {
 }
 
 /**
- * New board on the phone: name, project, the setup evaluator's model and notes.
- * Start setup creates the board, starts the setup evaluator on the picked model
- * and opens its Setup discussion. Nothing is created until then.
+ * New board on the phone: name and slug, project, the setup evaluator's model and
+ * notes. Start setup creates the board, starts the setup evaluator on the picked
+ * model and opens its Setup discussion. Nothing is created until then.
  */
 export function NewBoardRouteScreen() {
   const navigation = useNavigation();
   const environmentId = usePairedEnvironmentId();
   const config = useEnvironmentServerConfig(environmentId);
-  const projects = useProjects();
+  // Kanban requests go to the paired environment, so only its projects can be a board's project.
+  const projects = useProjects().filter((project) => project.environmentId === environmentId);
+  const boards = useKanbanBoards() ?? [];
 
   const [name, setName] = useState("");
+  const [slugEdit, setSlugEdit] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<ProjectId | null>(null);
   const [model, setModel] = useState<ModelSelection | null>(null);
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const slug = slugEdit ?? slugOf(name);
   const modelGroups = useMemo(
     () => groupByProvider(buildModelOptions(config, model, undefined, projectId)),
     [config, model, projectId],
   );
-  const canStart = name.trim() !== "" && projectId !== null && model !== null && !busy;
+  const canStart =
+    name.trim() !== "" && slug !== "" && projectId !== null && model !== null && !busy;
 
   const start = async () => {
     if (!canStart || model === null || projectId === null) return;
+    // Refuse a taken slug before anything is created or changed. The server refuses it too.
+    if (boards.some((summary) => summary.board.slug === slug)) {
+      setError(`A board with the slug "${slug}" already exists. Pick another name.`);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const client = kanbanClient();
-      const slug = slugOf(name);
       const created = await client.createBoard({
         slug,
         name: name.trim(),
@@ -76,9 +85,24 @@ export function NewBoardRouteScreen() {
 
   return (
     <ScrollView contentContainerClassName="gap-4 p-4">
-      <View className="gap-1">
+      <View className="gap-1.5">
         <Text className="text-sm text-foreground-muted">Name</Text>
-        <Text className="text-base text-foreground">{name || "Untitled"}</Text>
+        <TextInput
+          value={name}
+          onChangeText={setName}
+          placeholder="Robob"
+          placeholderTextColorClassName="accent-placeholder"
+          className="rounded-lg border border-input-border bg-input px-3 py-2 text-base text-foreground"
+        />
+      </View>
+      <View className="gap-1.5">
+        <Text className="text-sm text-foreground-muted">Slug</Text>
+        <TextInput
+          value={slug}
+          onChangeText={(value) => setSlugEdit(slugOf(value))}
+          autoCapitalize="none"
+          className="rounded-lg border border-input-border bg-input px-3 py-2 text-base text-foreground"
+        />
       </View>
       <Text className="text-sm text-foreground-muted">Project</Text>
       {projects.map((project) => (
@@ -105,6 +129,17 @@ export function NewBoardRouteScreen() {
           />
         )),
       )}
+      <View className="gap-1.5">
+        <Text className="text-sm text-foreground-muted">Notes for the setup evaluator (optional)</Text>
+        <TextInput
+          value={notes}
+          onChangeText={setNotes}
+          multiline
+          placeholder="Leave empty for the default setup."
+          placeholderTextColorClassName="accent-placeholder"
+          className="min-h-24 rounded-lg border border-input-border bg-input px-3 py-2 text-base text-foreground"
+        />
+      </View>
       {error ? <Text className="text-sm text-danger-foreground">{error}</Text> : null}
       <Button
         label="Start setup"

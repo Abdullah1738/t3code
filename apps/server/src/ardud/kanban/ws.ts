@@ -1,5 +1,6 @@
 import {
   KANBAN_WS_METHODS as M,
+  KanbanError,
   type KanbanBoardUpdateInput,
   type KanbanCardPatchInput,
   type KanbanDiscussionUpdateInput,
@@ -63,8 +64,19 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       ),
     [M.wiki]: (input: { readonly boardId: Parameters<KanbanServiceShape["wiki"]>[0] }) =>
       service.wiki(input.boardId),
+    // The owner's create must not reuse a board: ensureBoard returns an existing one on a
+    // slug match, so a taken slug is refused here, before any model or setup change.
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["ensureBoard"]>[0]) =>
-      service.ensureBoard(input),
+      Effect.gen(function* () {
+        const slug = input.slug.trim().toLowerCase();
+        const taken = (yield* service.boards).some((board) => board.slug === slug);
+        if (taken) {
+          return yield* Effect.fail(
+            new KanbanError({ code: "conflict", detail: `a board with slug ${slug} already exists` }),
+          );
+        }
+        return yield* service.ensureBoard(input);
+      }),
     [M.boardUpdate]: updateBoard,
     [M.setupStart]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
