@@ -2549,19 +2549,44 @@ it.effect("steer on a sibling card after a shared thread's model switch carries 
       yield* kanban.setPool(board.id, haiku, 1);
       const first = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
       yield* kanban.dispatchNow;
-      // The second card is created once the first thread runs, so it joins that thread.
-      const second = yield* kanban.createCard(board.id, { prompt: "b", title: "b" }, owner);
-      yield* kanban.dispatchNow;
-      const shared = (yield* kanban.card(first.id)).card;
-      assert.isNotNull(shared.activeThreadId);
-      // The second card's own thread is not shared here; this test covers the sibling
-      // model sync the switch applies to any card the thread carries.
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId;
+      assert.isNotNull(thread);
+      const second = yield* kanban.createForThread(thread!, { prompt: "b", title: "b" });
+      const sharedId = second.card.id;
+      assert.strictEqual(second.card.activeThreadId, thread);
+      // A switch on the first card moves the whole shared thread to Haiku.
       yield* kanban.editCard(first.id, { model: haiku }, owner);
-      const after = (yield* kanban.card(second.id)).card;
-      assert.strictEqual(after.model.model, shared.model.model);
-      yield* kanban.cardThread(first.id, "steer", "go on", owner);
-      const last = fake.sends[fake.sends.length - 1];
-      assert.strictEqual(last?.model?.model, haiku.model);
+      const sibling = (yield* kanban.card(sharedId)).card;
+      assert.strictEqual(sibling.model.model, haiku.model);
+      yield* kanban.cardThread(sharedId, "steer", "go on", owner);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
+      yield* kanban.cardThread(sharedId, "wake", "again", owner);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("steer through a released sibling keeps the thread on the switched model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.setPool(board.id, haiku, 1);
+      const a = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(a.id)).card.activeThreadId;
+      assert.isNotNull(thread);
+      const b = yield* kanban.createForThread(thread!, { prompt: "b", title: "b" });
+      // B goes to review and is released from the thread; A stays on it.
+      const bThread: KanbanActor = { _tag: "thread", threadId: thread! };
+      yield* kanban.moveCard(b.card.id, "needs_review", "cardThread", bThread, { note: "done" });
+      assert.strictEqual((yield* kanban.card(b.card.id)).card.stage, "needs_review");
+      yield* kanban.editCard(a.id, { model: haiku }, owner);
+      yield* kanban.cardThread(b.card.id, "steer", "go on", owner);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
+      assert.strictEqual(fake.sends[fake.sends.length - 1]?.threadId, thread);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
