@@ -515,7 +515,6 @@ function Details(props: {
                       type="button"
                       onClick={() => void removeLink(link)}
                       aria-label={`Remove link ${link.label ?? link.url}`}
-                      title="Remove link"
                       className="grid size-5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
                     >
                       <XIcon className="size-3" />
