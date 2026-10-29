@@ -2493,6 +2493,7 @@ it.effect("twenty newer non-evaluator links don't hide the live board evaluator"
           cardId: null,
           role: "work",
           purpose: null,
+          paused: null,
           discussionId: null,
           model: null,
           startedAt: "2026-10-25T13:00:00.000Z",
@@ -2680,7 +2681,7 @@ it.effect("a paused evaluator is kept open and woken", () =>
       fake.failures.set(threadId, outage);
       yield* kanban.turnEnded(threadId);
       const link = yield* kanban.caller(threadId);
-      assert.isNull(link?.endedAt ?? "set");
+      assert.isNull(link?.endedAt ?? null);
       assert.isNotNull(link?.paused);
       probe.ok = true;
       yield* TestClock.adjust("5 minutes");
