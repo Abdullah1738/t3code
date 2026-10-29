@@ -17,12 +17,12 @@ import { Glyph } from "./parts";
 export function KanbanBoardsGroup() {
   const navigation = useNavigation();
   const boards = useKanbanBoards();
-  if (!boards || boards.length === 0) return null;
+  // The group stays visible with no boards so "New board" is always reachable.
   return (
     <View className="gap-1.5 px-4 pb-1 pt-3">
       <SectionHead title="Boards" />
       <Group>
-        {boards.map((summary, index) => (
+        {(boards ?? []).map((summary, index) => (
           <Fragment key={summary.board.id}>
             {index > 0 ? <Separator /> : null}
             <BoardRow
@@ -31,6 +31,10 @@ export function KanbanBoardsGroup() {
             />
           </Fragment>
         ))}
+        {(boards ?? []).length > 0 ? <Separator /> : null}
+        <Row onPress={() => navigation.navigate("KanbanNewBoard")} className="items-center">
+          <Title className="flex-1">New board</Title>
+        </Row>
       </Group>
     </View>
   );
