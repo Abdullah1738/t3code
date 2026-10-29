@@ -278,14 +278,19 @@ export class RobobBackend implements ChatBackend {
       const native = record.type === "assistant" ? nativeMessageId(record.id) : undefined;
       if (native) record.nativeMessage = native;
     }
-    const steps = records.filter((record): record is Extract<MessageRecord, { type: "assistant" }> => record.type === "assistant" && record.finish === "stop");
+    // Every assistant step is looked up, not only the ones that look like answers: a
+    // step's finish is the only way to tell that it called tools (`tool-calls`).
+    const steps = records.filter((record): record is Extract<MessageRecord, { type: "assistant" }> => record.type === "assistant");
     // Clear before working out what's missing, so this page's steps are looked up again rather than lost.
     if (this.finished.size > 5_000) this.finished.clear();
     const missing = steps.map(step => step.id).filter(id => !this.finished.has(id));
     if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
     for (const step of steps) {
       const finish = this.finished.get(step.id);
-      if (finish !== undefined) step.answer = finish === "stop";
+      // Only a step OpenCode finished with `stop` is proven tool-free; any other finish (an
+      // error, or a step still unfinished) may have run tools first, so it stays unknown.
+      step.toolEvidence = finish === "tool-calls" ? "ran" : finish === "stop" ? "none" : "unknown";
+      if (step.finish === "stop" && finish !== undefined) step.answer = finish === "stop";
     }
     return records;
   }

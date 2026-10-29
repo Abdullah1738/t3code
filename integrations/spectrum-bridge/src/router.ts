@@ -306,6 +306,15 @@ const clip = (text: string, max: number) => {
   return flat.length <= max ? flat : `${flat.slice(0, max - 3).trimEnd()}...`;
 };
 /** Honest wording once a synthetic row is given up on. It never implies the owner sent anything. */
+/**
+ * Whether a failed turn may have run a tool. A tool part in the record counts, and so does a
+ * step the backend could not classify (`unknown`): only a step proven tool-free can be retried.
+ */
+export function turnRanTools(replies: readonly MessageRecord[]): boolean {
+  return replies.some(m => m.type === "assistant" && (
+    (Array.isArray(m.content) && m.content.some(p => p?.type === "tool")) || m.toolEvidence === "ran" || m.toolEvidence === "unknown"
+  ));
+}
 function syntheticLabel(id: string, text: string): string {
   if (id.startsWith("wake:")) {
     const [frame = "", title = ""] = text.split("\n");
@@ -2545,8 +2554,7 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
-        const ranTools = replies.some(m => Array.isArray(m.content) && m.content.some(p => p?.type === "tool"));
-        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, ranTools ? "failed" : "errored");
+        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, turnRanTools(replies) ? "failed" : "errored");
         return;
       }
       // `start >= 0`: the watermark record is on the page read, so `after` is

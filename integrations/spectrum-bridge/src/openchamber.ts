@@ -33,6 +33,11 @@ export type MessageRecord =
       type: "assistant";
       content: AssistantContent[];
       finish?: string;
+      /**
+       * Whether this step called tools, when the backend can tell (Robob reads it from
+       * OpenCode's step finish). `unknown` means the backend can't prove either way.
+       */
+      toolEvidence?: "ran" | "none" | "unknown";
       error?: unknown;
       retry?: unknown;
       time: { created: number; completed?: number };
