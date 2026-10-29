@@ -48,6 +48,13 @@ test("native run evidence: truncated scans are unknown, a complete stop-only run
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
   // An errored step that carried a tool part did run a tool.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "tool", id: "t", name: "patch", state: { status: "error" } }] } }]))("ses_run", 0)).toBe("ran");
+  // An unfinished step may still be executing (no finish yet), so it is never proven tool-free.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { content: [] } }]))("ses_run", 0)).toBe("unknown");
+  // A terminal error that emitted text or reasoning but no tool is proven tool-free.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
+  // A content part the reader does not know is not proven tool-free.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "file", url: "x" }] } }]))("ses_run", 0)).toBe("unknown");
   // No rows in the window: nothing to prove.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: stop }]))("ses_run", 5000)).toBe("unknown");
 });

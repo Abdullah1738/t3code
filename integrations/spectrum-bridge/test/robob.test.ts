@@ -564,6 +564,94 @@ test("a first-call provider error with positive no-tool evidence is classified t
   expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("none");
 });
 
+/** A real Robob backend, the real OpenCode run-row reader on `path`, and a router over them. */
+function nativeRouter(path: string) {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: opencodeRunEvidence(path) });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  };
+  const router = new Router(store, backend, transport, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+    droppedBatchMs: 0,
+  });
+  return { control, store, router };
+}
+
+/** An OpenCode DB at a temp path with one session's rows, written before the test starts. */
+function nativeDb(session: string, rows: [string, unknown][]) {
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-native-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  // Rows are written after the run starts (the run's requestedAt is `base`), as native execution would write them.
+  const base = Date.now();
+  rows.forEach(([id, data], index) => db.query("INSERT INTO session_message VALUES (?, ?, 'assistant', ?, ?, ?)").run(id, session, index, base + 5_000 + index, JSON.stringify(data)));
+  db.close();
+  return { path, base };
+}
+
+/** Drives one wake to a settled failed run on `session`, then returns the router's state after the given offsets. */
+async function failedWake(path: string, session: string, base: number, offsetsMs: number[]) {
+  const { control, store, router } = nativeRouter(path);
+  setSystemTime(base);
+  const wake = `wake:${session.slice(-8).padEnd(64, "0")}`;
+  store.acceptInbound(wake, { id: wake, text: wakeBody(), attachments: [], isAudioMessage: false, source: "typed", receivedAt: base } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.nativeSessionId = session;
+  thread.lastError = "model returned 400";
+  thread.runs.at(-1)!.status = "failed";
+  await router.tick();
+  const states: string[] = [];
+  states.push(inbounds(store).find(row => row.id === wake)?.state ?? "missing");
+  for (const offset of offsetsMs) {
+    setSystemTime(base + offset);
+    await router.tick();
+    states.push(inbounds(store).find(row => row.id === wake)?.state ?? "missing");
+  }
+  return { control, store, router, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
+}
+
+test("an unfinished native step is never retried, even when that run later completes a tool", async () => {
+  // The first call's row has no finish yet: execution may still be running, so it is not provably tool-free.
+  const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);
+  const first = await failedWake(path, "ses_cont_run", base, []);
+  // Robob failed the run, but the native row is unfinished: the wake is reported and not retried.
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // The same native row keeps running and finishes with a tool call. The router must still not send again.
+  const db = new Database(path);
+  db.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }), "msg_open");
+  db.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
+
+test("a first-call error that emitted text but ran no tool is retried, end to end", async () => {
+  const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
+  const run = await failedWake(path, "ses_text_400", base, [120_000]);
+  // Retried: the failure left it pending, and the +2 min tick sent it again (in flight, so `processing`).
+  expect(run.states).toEqual(["pending", "processing"]);
+  expect(run.sends()).toBe(2);
+});
+
+test("a first-call error that emitted reasoning but ran no tool is retried, end to end", async () => {
+  const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
+  const run = await failedWake(path, "ses_reason_400", base, [120_000]);
+  expect(run.states).toEqual(["pending", "processing"]);
+  expect(run.sends()).toBe(2);
+});
+
 test("a run whose tool call sits past a truncated scan is never retried, through the real router and OpenCode's run rows", async () => {
   const dirPath = mkdtempSync(join(tmpdir(), "robob-truncated-"));
   dirs.push(dirPath);
