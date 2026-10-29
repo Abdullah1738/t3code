@@ -354,17 +354,26 @@ export function headsUpText(watcher: Watcher, event: string): string {
 /** Telegram accepts only a short plain source label. */
 const telegramSource = (text: string) => (text.replace(/[^A-Za-z0-9 ._-]/g, " ").replace(/\s+/g, " ").trim() || "Watcher").slice(0, 40);
 
+/** Card #14: under a test run a real iMessage/Telegram send is refused unless the test overrode its CLI path. */
+export function underTest(): boolean {
+  return Boolean(process.env.ROBOB_TEST) || process.env.NODE_ENV === "test" || Boolean(process.env.PYTEST_CURRENT_TEST);
+}
+const refused = (what: string) => ({ ok: false, out: `refused: test run; ${what} would reach a real app` });
+
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
   return run([BUN, SPECTRUM_CLI, "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
   return run([BUN, SPECTRUM_CLI, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
+  if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
   return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
 }
 

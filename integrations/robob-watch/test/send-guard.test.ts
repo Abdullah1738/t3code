@@ -43,6 +43,26 @@ test("wa send still runs its stubbed wacli under a test run", () => {
   expect(r.stderr.toString()).not.toContain("refused: test run");
 });
 
+// src/lib.ts sends iMessage and Telegram through the bridge CLIs; a test run must refuse without a stub CLI.
+const libGuard = (expr: string) => Bun.spawnSync([process.execPath, "-e",
+  `import { imessage, wake, telegram } from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))}; console.log(JSON.stringify(await (${expr})))`],
+  { env: bare({ ROBOB_TEST: "1" }) });
+
+test("src imessage() refuses a real send under a test run", () => {
+  const r = libGuard(`imessage("hi", "k")`);
+  expect(r.stdout.toString()).toContain("refused: test run");
+});
+
+test("src wake() refuses a real wake under a test run", () => {
+  const r = libGuard(`wake("src", "hi", "k")`);
+  expect(r.stdout.toString()).toContain("refused: test run");
+});
+
+test("src telegram() refuses a real notify under a test run", () => {
+  const r = libGuard(`telegram("src", "hi", "k")`);
+  expect(r.stdout.toString()).toContain("refused: test run");
+});
+
 // ride-card and convo-card look up their card before they reach the bridge, so call bridge() directly.
 const bridgeGuard = (file: string) => {
   const code = `from importlib.machinery import SourceFileLoader; m = SourceFileLoader("h", ${JSON.stringify(file)}).load_module(); m.bridge("send", "--text", "x")`;
