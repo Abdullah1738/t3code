@@ -3959,17 +3959,23 @@ const make = Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const key = Rules.poolKey(model);
         const count = Math.max(0, Math.round(slots));
-        const existing = (yield* store.pools(board.id)).some((pool) => pool.key === key);
+        const existing = (yield* store.pools(board.id)).find((pool) => pool.key === key);
         // Pausing an existing pool must always work, even when its model has left the
         // provider's catalog: the pool is being stopped, not started.
-        const pausing = count === 0 && existing;
+        const pausing = count === 0 && existing !== undefined;
+        // A pause that names a variant the provider doesn't offer keeps the pool's stored
+        // model, so the board's model for this pool is never replaced by an unoffered one.
+        const stored =
+          pausing && existing !== undefined && Result.isFailure(yield* Effect.result(checkModel(model)))
+            ? existing.model
+            : model;
         if (!pausing) yield* checkModel(model);
         // Unknown (null) never blocks; only a model the composer is known not to offer does.
         const listed = isListed(yield* models.listed, model);
         if (listed === false && !pausing) {
           return yield* failWith("invalid", `${key} isn't in the model list; pick a model the composer offers`);
         }
-        yield* store.putPool(boardId, { key, model, slots: count });
+        yield* store.putPool(boardId, { key, model: stored, slots: count });
         const pools = yield* store.pools(boardId);
         yield* publish(boardId, { _tag: "pools", pools });
         yield* kick;

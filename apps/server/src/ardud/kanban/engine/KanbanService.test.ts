@@ -4177,6 +4177,27 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
   }),
 );
 
+it.effect("pausing a pool at a variant the provider doesn't offer keeps the pool's variant", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, astraXhigh, 2);
+      const paused = yield* kanban.setPool(board.id, astraHigh, 0);
+      const pool = paused.find((candidate) => candidate.key === Rules.poolKey(astraXhigh));
+      assert.strictEqual(pool?.slots, 0);
+      assert.strictEqual(pool?.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "x", title: "x", model: astraHigh },
+        owner,
+      );
+      assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the pool's variant wins on create and edit", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
