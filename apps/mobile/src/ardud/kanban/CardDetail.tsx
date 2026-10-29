@@ -338,6 +338,7 @@ function CardFacts(props: {
   readonly onOpenGoal: (goalId: string) => void;
 }) {
   const { card, state } = props;
+  const action = useBoardAction();
   const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
   const variant = modelVariant(card.model);
   const chainName = card.reviewChain ?? state.board.defaultReviewChain;
@@ -386,11 +387,24 @@ function CardFacts(props: {
               key={link.url}
               label={link.label ?? linkLabel(link.url)}
               glyph={link.kind === "pr" ? prGlyph(link.state) : null}
+              accessibilityHint="Long-press to remove"
               onPress={() =>
                 void tryOpenExternalUrl(
                   link.url,
                   link.kind === "pr" ? "pull-request" : "markdown-link",
                 )
+              }
+              onLongPress={() =>
+                confirmAction({
+                  title: "Remove this link?",
+                  message: link.label ?? link.url,
+                  confirmLabel: "Remove",
+                  destructive: true,
+                  onConfirm: () =>
+                    void action.run("Couldn't remove the link", () =>
+                      kanbanClient().patchCard({ cardId: card.id, removeLinks: [link.url] }),
+                    ),
+                })
               }
             />
           ))
