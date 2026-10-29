@@ -170,6 +170,13 @@ live_lock() {
 }
 
 sub=${1:-help}; shift 2>/dev/null
+# Test runs never reach WhatsApp: a draft or send under a test needs a stub wacli injected via WA_WACLI.
+case $sub in
+  draft|draftfile|send|sendfile)
+    if [[ -n ${ROBOB_TEST:-} || ${NODE_ENV:-} == test || -n ${PYTEST_CURRENT_TEST:-} ]] && [[ -z ${WA_WACLI:-} ]]; then
+      print -r -- "refused: test run; wa $sub would reach WhatsApp (set WA_WACLI to a stub)" >&2; exit 2
+    fi ;;
+esac
 case $sub in
   status) "$H" health ;;
   start)

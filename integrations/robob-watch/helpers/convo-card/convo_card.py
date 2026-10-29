@@ -79,6 +79,11 @@ def wacli_cmd():
     return _cmd("CONVO_CARD_WACLI", [str(HOME / ".local/bin/wacli")])
 
 
+def under_test():
+    """True under `ROBOB_TEST=1`, bun test (NODE_ENV=test) or pytest (PYTEST_CURRENT_TEST)."""
+    return bool(os.environ.get("ROBOB_TEST")) or os.environ.get("NODE_ENV") == "test" or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 def bridge_cmd():
     return _cmd("CONVO_CARD_BRIDGE", ["/Users/ardud/.bun/bin/bun", str(HOME / ".local/share/spectrum-bridge/src/cli.ts")])
 
@@ -662,6 +667,10 @@ def cmd_translate(a):
 
 
 def bridge(*args, timeout=60):
+    # Under a test, only an injected stub bridge may run: the real one would send iMessage.
+    if under_test() and not os.environ.get("CONVO_CARD_BRIDGE"):
+        sys.exit(f"refused: test run; convo-card would send via the real bridge ({args[0] if args else '?'}); "
+                 "set CONVO_CARD_BRIDGE to a stub")
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
     p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
                        stdin=subprocess.DEVNULL)
