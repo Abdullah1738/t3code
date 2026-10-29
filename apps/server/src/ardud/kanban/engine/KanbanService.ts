@@ -2402,7 +2402,8 @@ const make = Effect.gen(function* () {
     // doesn't repeat it on the next probe.
     const state = (yield* Ref.get(down)).get(key);
     if (state !== undefined) {
-      const pending = new Set([...state.announced].filter((id) => !state.recovered.has(id)));
+      const pending = new Set<KanbanBoard["id"]>();
+      for (const id of state.announced) if (!state.recovered.has(id)) pending.add(id);
       if (pending.size > 0) {
         const backed = yield* alertBoards(
           key,
@@ -2981,7 +2982,9 @@ const make = Effect.gen(function* () {
             if (linkKey(link, board) === key) boards.add(board.id);
           }
           const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
-          return new Set([...boards].filter((id) => !announced.has(id)));
+          const unannounced = new Set<KanbanBoard["id"]>();
+          for (const id of boards) if (!announced.has(id)) unannounced.add(id);
+          return unannounced;
         }),
       );
       if (unannounced.size > 0) {
