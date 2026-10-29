@@ -1,3 +1,4 @@
+import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -12,6 +13,28 @@ import { layer as KanbanModelsLayer } from "./engine/models.ts";
 import { KanbanScripts, layer as KanbanScriptsLayer } from "./engine/ScriptService.ts";
 import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
 import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
+
+/**
+ * Events that change a thread's live state (a pending question opening or
+ * resolving) without a run status change. A native answer resolves the request
+ * with no run update at all, so these must reach the board too.
+ */
+const THREAD_STATE_EVENTS = new Set<string>([
+  "run.updated",
+  "runtime-request.updated",
+  "node.updated",
+  "turn-item.updated",
+  "provider-session.updated",
+]);
+
+/** Which board action a domain event triggers, if any. Exported so the route is tested itself. */
+export const boardEventRoute = (
+  event: OrchestrationV2DomainEvent,
+): "turnEnd" | "threadChanged" | null => {
+  if (event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status))
+    return "turnEnd";
+  return THREAD_STATE_EVENTS.has(event.type) ? "threadChanged" : null;
+};
 
 /** Typing heartbeat, review completion and the dispatcher's safety net. */
 const TICK = "30 seconds";
@@ -40,15 +63,15 @@ export const ArdudKanbanLive = Layer.effectDiscard(
       ),
     );
     yield* forkParked(
-      Stream.runForEach(engine.streamDomainEvents, (event) =>
-        event.type !== "run.updated"
-          ? Effect.void
-          : TERMINAL_RUN_STATUSES.has(event.payload.status)
-            ? service.notifyTurnEnded(event.threadId)
-            : service
-                .notifyThreadChanged(event.threadId)
-                .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change"))),
-      ).pipe(
+      Stream.runForEach(engine.streamDomainEvents, (event) => {
+        const route = boardEventRoute(event);
+        if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
+        if (route === "threadChanged")
+          return service
+            .notifyThreadChanged(event.threadId)
+            .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change")));
+        return Effect.void;
+      }).pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
       ),
     );
