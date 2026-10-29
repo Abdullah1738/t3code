@@ -1,4 +1,4 @@
-import type { KanbanCard, KanbanGoal, KanbanGroup } from "@t3tools/contracts";
+import type { KanbanCard, KanbanGoal, KanbanGroup, KanbanMessage } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -7,9 +7,22 @@ import {
   goalsPrompt,
   groupsFingerprint,
   groupsPrompt,
+  proposalDue,
   toGoalUpdates,
   toGroups,
+  toProposals,
 } from "./scribe.ts";
+
+const message = (blocks: Array<unknown>, answers: Array<unknown>, createdAt: string) =>
+  ({
+    discussionId: "disc-1",
+    seq: 1,
+    author: { _tag: "system", component: "scribe" },
+    authorName: "Board",
+    blocks,
+    answers,
+    createdAt,
+  }) as unknown as KanbanMessage;
 
 const goal = (patch: Record<string, unknown> = {}) =>
   ({
@@ -32,6 +45,7 @@ const card = (number: number, patch: Record<string, unknown> = {}) =>
     projects: [],
     stage: "todo",
     settledAt: null,
+    goalId: null,
     ...patch,
   }) as unknown as KanbanCard;
 
@@ -175,5 +189,47 @@ describe("scribe", () => {
     );
     expect(updates.goals).toEqual([{ id: "goal-a", now: "Done.", story: "Sign-in landed." }]);
     expect(finishedSince(goal(), cards, snapshot)).toEqual([1]);
+  });
+
+  it("toProposals keeps clear new goals with 3 or more goal-less open cards", () => {
+    const cards = [1, 2, 3, 4, 5, 6]
+      .map((n) => card(n))
+      .concat([card(7, { goalId: "goal-a" }), card(8, { stage: "completed" })]);
+    const past = ['Make goal "Payments"? x Cards: #9, #10, #11 (no answer yet)'];
+    const output = {
+      proposals: [
+        { name: ' "Search" ', summary: " Find things. ", cards: [1, 2, 3, 3, 7, 8, 99] },
+        { name: "login", summary: "", cards: [4, 5, 6] },
+        { name: "Payments", summary: "", cards: [4, 5, 6] },
+        { name: "Two", summary: "", cards: [4, 5] },
+        { name: "Reports", summary: "Weekly reports.", cards: [3, 4, 5, 6] },
+      ],
+    };
+    expect(toProposals(output, cards, [goal({ name: "Login" })], past)).toEqual([
+      { name: "Search", summary: "Find things.", cards: [1, 2, 3] },
+      { name: "Reports", summary: "Weekly reports.", cards: [4, 5, 6] },
+    ]);
+  });
+
+  it("proposalDue waits for enough cards, room and an old or answered proposal", () => {
+    const NOW = Date.parse("2026-10-26T12:00:00.000Z");
+    const three = [card(1), card(2), card(3)];
+    const active = (n: number) =>
+      Array.from({ length: n }, (_, i) => goal({ id: `goal-${i}`, name: `G${i}` }));
+    const choice = [{ _tag: "choice", id: "goal-1", style: "pick", question: "q", options: [], multi: false }];
+    const answered = [
+      { blockId: "goal-1", by: { _tag: "owner" }, choice: ["skip"], text: null, at: "2026-10-26T06:00:00.000Z" },
+    ];
+
+    expect(proposalDue(three, [], null, NOW)).toBe(true);
+    expect(proposalDue([card(1), card(2)], [], null, NOW)).toBe(false);
+    expect(proposalDue(three, active(6), null, NOW)).toBe(false);
+
+    const sevenHours = message(choice, [], "2026-10-26T05:00:00.000Z");
+    expect(proposalDue(three, [], sevenHours, NOW)).toBe(false);
+    const sevenHoursAnswered = message(choice, answered, "2026-10-26T05:00:00.000Z");
+    expect(proposalDue(three, [], sevenHoursAnswered, NOW)).toBe(true);
+    const dayOld = message(choice, [], "2026-10-25T11:00:00.000Z");
+    expect(proposalDue(three, [], dayOld, NOW)).toBe(true);
   });
 });

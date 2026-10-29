@@ -617,6 +617,7 @@ const make = Effect.gen(function* () {
       { readonly fingerprint: string; readonly at: number; readonly done: boolean }
     >
   >(new Map());
+  const proposalsChecked = yield* Ref.make<ReadonlyMap<KanbanBoardId, number>>(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -1170,6 +1171,59 @@ const make = Effect.gen(function* () {
   const forkGoals = (boardId: KanbanBoardId) =>
     writeGoals(boardId).pipe(
       Effect.catchCause((cause) => Effect.logWarning("kanban goal scribe failed", { boardId, cause })),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+  const scribeActor: KanbanActor = { _tag: "system", component: "scribe" };
+  // The board's "Goal ideas" discussion: the newest open one the scribe made.
+  const ideasDiscussion = Effect.fn("KanbanService.ideasDiscussion")(function* (boardId: KanbanBoardId) {
+    const all = yield* store.discussions(boardId);
+    return (
+      all
+        .filter(
+          (entry) =>
+            entry.cardId === null &&
+            entry.archivedAt === null &&
+            entry.createdBy._tag === "system" &&
+            entry.createdBy.component === "scribe",
+        )
+        .at(-1) ?? null
+    );
+  });
+  const writeProposals = Effect.fn("KanbanService.writeProposals")(function* (boardId: KanbanBoardId) {
+    const generateJson = textGeneration.generateJson;
+    if (!generateJson) return;
+    const board = yield* boardOf(boardId);
+    if (board.defaultProjectId === null) return;
+    const project = yield* projects.getById(board.defaultProjectId);
+    if (Option.isNone(project)) return;
+    const ideas = yield* ideasDiscussion(boardId);
+    const past = ideas === null ? [] : Scribe.pastProposals(yield* store.messages(ideas.id, { limit: 100 }));
+    const output = yield* generateJson({
+      cwd: project.value.workspaceRoot,
+      prompt: Scribe.proposalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId), past),
+      outputSchema: Scribe.ScribeProposalsOutput,
+      modelSelection: board.managerModel,
+    });
+    yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const proposals = Scribe.toProposals(
+          output,
+          yield* store.cards(boardId),
+          yield* store.goals(boardId),
+          past,
+        );
+        if (proposals.length === 0) return;
+        const discussion =
+          (yield* ideasDiscussion(boardId)) ??
+          (yield* newDiscussion(boardId, Scribe.GOAL_IDEAS_TITLE, null, scribeActor));
+        yield* postUnlocked(discussion.id, scribeActor, Scribe.proposalBlocks(proposals), false);
+      }),
+    );
+  });
+  const forkProposals = (boardId: KanbanBoardId) =>
+    writeProposals(boardId).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("kanban goal ideas failed", { boardId, cause })),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2393,6 +2447,20 @@ const make = Effect.gen(function* () {
           new Map(all).set(board.id, { fingerprint: goalsPrint, at: now, done: false }),
         );
         yield* forkGoals(board.id);
+      }
+      // Goal ideas: checked every PROPOSAL_CHECK_MS per board, asked only when due.
+      const checked = (yield* Ref.get(proposalsChecked)).get(board.id);
+      if (checked === undefined || now - checked >= Scribe.PROPOSAL_CHECK_MS) {
+        yield* Ref.update(proposalsChecked, (all) => new Map(all).set(board.id, now));
+        const ideas = yield* ideasDiscussion(board.id);
+        const last =
+          ideas === null
+            ? null
+            : ((yield* store.messages(ideas.id, { limit: 20 })).filter(
+                (message) => message.author._tag === "system",
+              ).at(-1) ?? null);
+        if (Scribe.proposalDue(yield* store.cards(board.id), yield* store.goals(board.id), last, now))
+          yield* forkProposals(board.id);
       }
       // A card whose thread was deleted goes back to its queue for a new one.
       for (const card of yield* store.cards(board.id)) {

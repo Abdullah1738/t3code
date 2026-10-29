@@ -2651,6 +2651,9 @@ const scribeLayer = (
           Effect.gen(function* () {
             asked.push(input.prompt);
             if (calls) yield* Queue.offer(calls, input.prompt);
+            if (input.prompt.startsWith("You suggest goals")) {
+              return { proposals: [{ name: "Search", summary: "People find things.", cards: [1, 2, 3] }] };
+            }
             if (input.prompt.startsWith("You keep a work board's goals")) {
               if (goalAsks(asked).length <= goalFailures) return yield* Effect.fail(new ModelDown());
               const id = /Goal (\S+):/.exec(input.prompt)?.[1] ?? "";
@@ -2724,6 +2727,50 @@ it.effect("the scribe groups a board's open cards when they change, at most ever
       yield* kanban.tick;
       assert.isTrue(Option.isSome(yield* Fiber.join(secondRun)));
       assert.lengthOf(groupAsks(asked), 2);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("the scribe proposes a goal in Goal ideas, once, and his answer goes to an evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const posted = Stream.runHead(
+        Stream.filter(yield* kanban.changes, ({ change }) => change._tag === "message"),
+      );
+      for (const [prompt, title] of [
+        ["A", "Login form"],
+        ["B", "Login button"],
+        ["C", "Login errors"],
+      ] as const) {
+        yield* kanban.createCard(board.id, { prompt, title, description: "Sign-in" }, owner);
+      }
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* posted));
+      const ideas = (yield* kanban.discussions(board.id)).find(
+        (entry) => entry.title === "Goal ideas",
+      )!;
+      const [first] = yield* kanban.messages(ideas.id);
+      const choice = first!.blocks.find((block) => block._tag === "choice");
+      assert.equal(
+        choice?._tag === "choice" ? choice.question : "",
+        'Make goal "Search"? People find things. Cards: #1, #2, #3',
+      );
+
+      // Unanswered and under 24 hours old: no second post.
+      yield* TestClock.adjust("1 hour");
+      yield* kanban.tick;
+      assert.lengthOf(yield* kanban.messages(ideas.id), 1);
+
+      yield* kanban.answer(ideas.id, first!.seq, "goal-1", ["make"], owner);
+      const threads = [...(yield* Ref.get(fake.threads)).values()];
+      assert.isTrue(
+        threads.some((thread) =>
+          thread.messages.some((text) => text.includes('Owner answered "Make goal')),
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
   }),
 );
