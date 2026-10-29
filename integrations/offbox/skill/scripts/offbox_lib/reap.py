@@ -1,11 +1,12 @@
-"""Reaper: stop idle leases (free, keeps disk); delete only archived-7d / unused-30d unpinned leases.
-Bases and templates are never touched. Every action is logged to events + offbox.log."""
+"""Reaper: stop idle leases (free; boat keeps the disk 14 days after the stop); delete only archived-7d /
+unused-30d unpinned leases; forget leases whose data boat deleted; keep pinned leases, bases and templates past
+boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 
 from __future__ import annotations
 
-from . import api, capacity, lease
-from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock, iso_ts, now,
-                     say)
+from . import api, bases, capacity, lease
+from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+                     iso_ts, now, say)
 from .identity import thread_get
 
 
@@ -60,6 +61,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 event(con, box_id, f"reap_{what}_failed", f"{why}: {e}")
                 actions[-1] += f" (FAILED: {e})"
 
+    refreshes = 0  # resume+stop of pinned leases near boat's 14-day limit; a few per pass (120 s budget)
     # A lease with an open prune hold stays on the list even if it is marked deleted: its hold is released only
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
     rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
@@ -82,6 +84,20 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                     actions.append(f"hold kept {bid}: gone from boat, not yet confirmed")
             else:
                 actions.append(f"forget {bid}: gone from boat")
+            continue
+        if b.get("dataExpiredAt"):
+            # Same release rule as a box gone from boat: nothing can run on a box whose data is deleted, but the
+            # hold goes only after a locked, fresh confirmation; a busy lock leaves it for a later pass.
+            if not dry:
+                if lease.release_if_confirmed(con, bid):
+                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
+                    con.commit()
+                    event(con, bid, "reap_expired", f"boat deleted its data at {b['dataExpiredAt']}")
+                    actions.append(f"forget {bid}: boat deleted its data")
+                else:
+                    actions.append(f"hold kept {bid}: boat deleted its data, not yet confirmed")
+            else:
+                actions.append(f"forget {bid}: boat deleted its data")
             continue
         state = b.get("state")
         running_runs = lease.active_runs(con, bid)
@@ -130,6 +146,11 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if state in api.LIVE_STATES and idle > idle_limit:
             act(bid, "stop", f"idle {int(idle // 60)}m",
                 lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True))  # act() holds box-<id>
+        stopped = iso_ts(b.get("stoppedAt"))
+        if pinned and state in api.STOPPED_STATES and stopped and now() - stopped > KEEPALIVE_S and refreshes < 2:
+            refreshes += 1
+            act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
+                lambda bid=bid: lease.refresh_box(con, bid))
     # Templates/bases: make sure they are stopped (they are free when stopped).
     for bid in protected:
         b = live.get(bid)
@@ -138,6 +159,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                                (bid, now() - 3 * 3600)).fetchone()[0]
             if not busy:
                 act(bid, "stop", "template/base left running", lambda bid=bid: api.stop(bid))
+    bases.upkeep(con, live, dry, actions, act)
     # Orphans: offbox-named live boxes we have no record of (e.g. a crashed create).
     known = {r[0] for r in con.execute("SELECT box_id FROM leases")} | protected
     for bid, b in live.items():

@@ -87,7 +87,7 @@ offbox local --list ; offbox local --clear
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if the box ran Docker in the last 2 h
   or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
-  cooldown (stopped = free, disk kept). A resume takes ~6-10 s. The next run resumes it with everything
+  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). A resume takes ~6-10 s. The next run resumes it with everything
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
@@ -95,7 +95,9 @@ offbox local --list ; offbox local --clear
 - Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
   times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
 - Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
-- Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`.
+- Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
+  deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
+  says so) and the reaper rebuilds the template. An expired default base falls back to the template.
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
@@ -143,15 +145,19 @@ UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on 
 
 ## Save state for later (do this!)
 
-Stopped boxes are free forever, so save generously:
+Stopped boxes are free, but boat deletes a stopped box's data 14 days after its last stop. Bases and templates
+are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
+resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
 
 - After an expensive setup (`npm ci`, `go mod download`, harness images pulled, a seeded database), run
   `offbox save --default --note "npm ci done at <sha>"`. New threads on this repo then start from that state and
   only rsync the delta. `save` briefly stops your lease to capture it (the next run resumes it), costs one machine
   start (~15-25 s), then $0. Names: `offbox save --name pg-seeded`; use one
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
-- `offbox bases` lists saved bases; `offbox base rm <name>` removes one. Bases are never auto-deleted.
-- `offbox keep --days 30` pins your current lease so the reaper never deletes it (it still stops when idle).
+- `offbox bases` lists saved bases and whether each is kept (saved snapshot), box-only (with the date boat deletes
+  it) or EXPIRED; `offbox base rm <name>` removes one. Bases are never auto-deleted by offbox.
+- `offbox keep --days 30` pins your current lease so the reaper never deletes it and keeps its disk past boat's
+  14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
 ## Housekeeping
@@ -163,8 +169,8 @@ Stopped boxes are free forever, so save generously:
 
 ## Costs and the cap
 
-$100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and saved bases
-are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
+$100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and the plan's 50
+included saved snapshots are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
 at every $100. At $500 the cap trips: new leases are refused and all boxes stop. Heavy work returns 91.
 
 Create, fork and resume each consume a start. Offbox reserves starts atomically against rolling **25/minute,
@@ -218,7 +224,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
-  Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready).
+  Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready). `offbox template
+  list` shows each template's state: kept (saved snapshot), box only (date boat deletes it) or EXPIRED.
 - **Changing offbox**: the source is the Robob fork, `/Volumes/ExternalSSD/t3code-fork/integrations/offbox/`
   (this skill is `skill/`, plus the gate plugin, `boat` wrapper and monitor plist). Never edit the live copy.
   Edit there, run its tests (README), commit, `git push origin HEAD:main`, then `integrations/offbox/install.zsh`.

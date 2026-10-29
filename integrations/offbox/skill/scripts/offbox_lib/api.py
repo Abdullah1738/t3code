@@ -165,10 +165,41 @@ def list_boxes(state: str | None = None) -> list[dict]:
         cursor = pi["nextCursor"]
 
 
-def create(size: str, ttl: int, name: str, idem: str) -> dict:
+def create(size: str, ttl: int, name: str, idem: str, saved: str | None = None) -> dict:
     body = {"type": size, "ttlSeconds": ttl, "noEnv": True, "name": name[:120]}
+    if saved:
+        body["from"] = saved
     d = call("POST", "/sandboxes", body, {"Idempotency-Key": idem}, retries=4)
     return d["sandbox"]
+
+
+# boat deletes a stopped box's data 14 days after it stopped (resume/fork then answer 409
+# snapshot_data_expired). A saved snapshot is kept until deleted, and the plan includes a number of them.
+DATA_GONE = ("snapshot_data_expired", "snapshot_not_found")
+
+
+def data_gone(e: ApiError) -> bool:
+    return e.api_code in DATA_GONE or e.status == 404
+
+
+def saved_list() -> tuple[list[dict], dict]:
+    d = call("GET", "/saved-snapshots") or {}
+    return d.get("snapshots") or [], d.get("allowance") or {}
+
+
+def saved_get(name: str) -> dict | None:
+    d = call("GET", f"/saved-snapshots/{urllib.parse.quote(name)}", ok404=True)
+    return None if d is None else d.get("snapshot")
+
+
+def save(box_id: str, name: str) -> dict:
+    """Saving under an existing name replaces that snapshot once the new one is ready."""
+    d = call("POST", "/saved-snapshots", {"sandboxId": box_id, "name": name}) or {}
+    return d.get("snapshot") or {}
+
+
+def delete_saved(name: str) -> None:
+    call("DELETE", f"/saved-snapshots/{urllib.parse.quote(name)}", ok404=True)
 
 
 def fork(src: str, ttl: int, idem: str, size: str | None = None) -> dict:

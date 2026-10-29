@@ -40,6 +40,8 @@ TTL_REFRESH_S = 10 * 60
 ARCHIVED_DELETE_S = 7 * 86400  # delete a lease 7 days after its thread is archived
 UNUSED_DELETE_S = 30 * 86400   # delete an unpinned lease unused for 30 days
 BASES_SOFT_LIMIT = 50
+DATA_KEEP_S = 14 * 86400       # boat deletes a stopped box's data this long after its last stop
+KEEPALIVE_S = 12 * 86400       # resume + stop a box that must survive, once it has been stopped this long
 SIZES = ("small", "default", "large", "xlarge")
 TEMPLATES = ("crpko-go", "crpko-node", "crpko-harness", "generic")
 
@@ -177,6 +179,12 @@ def db() -> sqlite3.Connection:
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
+    for table in ("templates", "bases"):
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for col in ("saved TEXT", "expired_at REAL"):
+            if col.split()[0] not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     return con
 
 

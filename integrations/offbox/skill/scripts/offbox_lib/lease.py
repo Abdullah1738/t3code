@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -30,14 +31,14 @@ def natural_size(con, row) -> str:
     Its template's size (generic stays default); bases and fresh boxes never go below large, which is what
     ordinary Go/Python runs got before boxes were shrunk."""
     src = row["source"] or ""
-    if src == "template:generic":
+    if src in ("template:generic", "recipe:generic"):
         return "default"
     size = "large"
     if src.startswith("base:"):
         b = con.execute("SELECT size FROM bases WHERE name=?", (src[5:],)).fetchone()
         size = (b and b["size"]) or "large"
-    elif src.startswith("template:"):
-        size = DEFAULT_SIZE.get(src[9:], "large")
+    elif src.startswith(("template:", "recipe:")):
+        size = DEFAULT_SIZE.get(src.split(":", 1)[1], "large")
     return size if _rank(size) >= _rank("large") else "large"
 
 
@@ -183,8 +184,41 @@ def bootstrap_fresh(box_id: str) -> None:
         say(f"warning: cache env bootstrap failed on {box_id}: {p.stderr.decode(errors='replace')[-200:]}")
 
 
+def _start_from(con, table: str, row, sz: str, name: str, idem: str) -> dict | None:
+    """Start a box from a template/base row: its saved snapshot, else a fork of its stopped box.
+
+    None when boat has deleted the stopped box's data (14 days after it stopped); the row is marked expired."""
+    kind = table[:-1]
+    if row["saved"]:
+        say(f"starting {kind} {row['name']} from its saved snapshot {row['saved']} as {sz}")
+        try:
+            return api.create(sz, RUN_TTL_S, name, f"{idem}-{kind}-saved", saved=row["saved"])
+        except api.ApiError as e:
+            if not api.data_gone(e):
+                raise
+            say(f"saved snapshot {row['saved']} of {kind} {row['name']} is gone ({e}); forking its box")
+            con.execute(f"UPDATE {table} SET saved=NULL WHERE name=?", (row["name"],))
+            con.commit()
+            event(con, row["box_id"], f"{kind}_saved_gone", f"{row['name']} {row['saved']}: {e}")
+    if row["expired_at"]:
+        return None
+    say(f"forking {kind} {row['name']} ({row['box_id']}) as {sz}")
+    try:
+        return api.fork(row["box_id"], RUN_TTL_S, f"{idem}-{kind}", sz)
+    except api.ApiError as e:
+        if not api.data_gone(e):
+            raise
+        con.execute(f"UPDATE {table} SET expired_at=? WHERE name=?", (now(), row["name"]))
+        con.commit()
+        event(con, row["box_id"], f"{kind}_expired", f"{row['name']}: {e}")
+        return None
+
+
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
-    """-> (sandbox dict, source label, base_remote_dir or None, size)."""
+    """-> (sandbox dict, source label, base_remote_dir or None, size).
+
+    Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
+    deleted the template's data."""
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
@@ -197,12 +231,18 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             if not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
-            brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1", (rk,)).fetchone()
+            brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
+                               "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
         if brow:
             sz = size or brow["size"] or "large"
-            say(f"forking saved base {brow['name']} ({brow['box_id']}) as {sz}")
-            s = api.fork(brow["box_id"], RUN_TTL_S, idem, sz)
-            return s, f"base:{brow['name']}", brow["remote_dir"], sz
+            s = _start_from(con, "bases", brow, sz, name, idem)
+            if s:
+                return s, f"base:{brow['name']}", brow["remote_dir"], sz
+            if base:
+                raise OffboxError(f"saved base '{brow['name']}' is gone: boat deletes a stopped box's data after 14 "
+                                  f"days. Run without --base and `offbox save` again; `offbox base rm "
+                                  f"{brow['short'] or brow['name']}` drops the entry.", code=2)
+            say(f"default base {brow['name']} is gone (boat deleted its data); using the repo template")
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
         trow = con.execute("SELECT * FROM templates WHERE name=?", (tname,)).fetchone()
@@ -212,22 +252,60 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                 say(f"template {tname} not built yet; using generic")
         if trow:
             sz = size or DEFAULT_SIZE.get(tname, "default")
-            say(f"forking template {trow['name']} ({trow['box_id']}) as {sz}")
-            s = api.fork(trow["box_id"], RUN_TTL_S, idem, sz)
-            return s, f"template:{trow['name']}", None, sz
+            s = _start_from(con, "templates", trow, sz, name, idem)
+            if s:
+                return s, f"template:{trow['name']}", None, sz
+            say(f"template {trow['name']} is gone (boat deleted its data); building this box from its recipe "
+                f"instead, which takes a few minutes. The reaper rebuilds the template.")
+            s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
+            return s, f"recipe:{trow['name']}", None, sz
     sz = size or DEFAULT_SIZE.get(tname or "generic", "default")
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
     return s, "fresh", None, sz
 
 
-def _bring_up(box_id: str, fresh: bool = False) -> dict:
+def run_recipe(box_id: str, name: str) -> None:
+    """Build a template's environment on this box (the script `offbox template build` runs). Best effort."""
+    from . import bases
+    from .common import LOGS_DIR
+    from .runs import follow
+    t = now()
+    log_path = LOGS_DIR / f"recipe-{name}-{box_id}.log"
+    try:
+        # The box lock keeps the reaper from idle-stopping the box while the recipe runs.
+        with file_lock("box-" + box_id, timeout=60):
+            script, _sha = bases.recipe(name)
+            ssh_sync.put_file(box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700")
+            bases.template_uploads(name, box_id)
+            r = api.cmd_start(box_id, "bash -lc " + shlex.quote("bash ~/.offbox/recipe.sh"))
+            code = follow(box_id, r["processId"], log_path, echo=False)
+    except Exception as e:  # noqa: BLE001 - best effort: the run still gets a working (if colder) box
+        code = f"error: {e}"
+    touch(box_id)
+    event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
+    if code != 0:
+        say(f"warning: {name} recipe did not finish on {box_id} ({code}); log {log_path}")
+
+
+def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:
     s = api.wait_state(box_id, api.LIVE_STATES, timeout=900)
     ssh_sync.setup(box_id)
     ssh_sync.wait_ssh(box_id)
-    if fresh:
+    if recipe:
+        run_recipe(box_id, recipe)
+    elif fresh:
         bootstrap_fresh(box_id)
     return s
+
+
+def refresh_box(con, box_id: str) -> None:
+    """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    capacity.check(con)
+    api.resume(box_id, 600)
+    api.wait_state(box_id, api.LIVE_STATES, timeout=60)
+    api.stop(box_id)
+    event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
 
 
 def acquire(me: dict, size: str | None = None, template: str | None = None, base: str | None = None,
@@ -262,7 +340,8 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         con.commit()
         event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
         try:
-            _bring_up(box_id, fresh=(source == "fresh"))
+            _bring_up(box_id, fresh=(source == "fresh"),
+                      recipe=source.split(":", 1)[1] if source.startswith("recipe:") else None)
             try:
                 api.rename(box_id, box_name(me, me["repo_key"]))
             except OffboxError:
@@ -290,6 +369,14 @@ class ArchivingSkip(OffboxError):
     """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
 
 
+def _forget_expired(con, box_id: str, why: str) -> None:
+    """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    say(f"lease {box_id} expired ({why}); starting a new box")
+    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+    con.commit()
+    event(con, box_id, "lease_expired", why)
+
+
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
@@ -303,6 +390,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         con.commit()
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
+        return None
+    if s.get("dataExpiredAt"):
+        _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
     st = s.get("state")
     if st == "archiving":
@@ -367,6 +457,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         try:
             api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
         except api.ApiError as e:
+            if e.api_code in api.DATA_GONE:
+                _forget_expired(con, box_id, str(e))
+                return None
             # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
             if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
                     or not SHRINK_TEXT.search(f"{e.api_code} {e}"):

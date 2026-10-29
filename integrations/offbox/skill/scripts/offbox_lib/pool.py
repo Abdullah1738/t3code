@@ -64,7 +64,8 @@ def candidates(con, key, size, source, me=None):
     for r in rows:
         if r["pool_key"] not in (None, key) or (full and r["pool_key"] is None):
             continue
-        if source and r["source"] != source:
+        # A box built from a template's recipe (the template had expired) serves that template's runs too.
+        if source and (r["source"] or "").replace("recipe:", "template:", 1) != source:
             continue
         out.append(r)
     # Running boxes first: the caller's own box (its checkout is already synced there), then the smallest that
