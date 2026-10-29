@@ -552,7 +552,7 @@ class RunTests(Isolated):
                 contextlib.redirect_stderr(io.StringIO()):
             n1, _, _ = self.run_prune()
         self.assertEqual(n1, 1)  # pass 1: s1 pruned
-        self.assertEqual(prune.kv_get(self.con, "prune:bx")["settled"], ["w/s1-aaaaaa"])
+        self.assertEqual(list(prune.kv_get(self.con, "prune:bx")["settled"]), ["w/s1-aaaaaa"])
         # s2 becomes stale and a timeout then fails pass 2; the settled prefix must survive the failure.
         (Path(self.home.name) / "w/s2-bbbbbb").mkdir(parents=True, exist_ok=True)
         add_run(self.con, "bx", "w/s2-bbbbbb", 7 * 86400)
@@ -593,7 +593,126 @@ class RunTests(Isolated):
             self.run_prune()
         self.assertEqual(len(self.calls), before)
 
+    def test_recreated_checkout_is_pruned_again_after_it_goes_stale(self):
+        # Pass 1 prunes s1 (settled at its last-used time). Its checkout is recreated and used again, goes stale, and
+        # must be pruned again. Six-hour throttle is checked between the passes.
+        with patch.object(prune, "BACKGROUND", "true"), contextlib.redirect_stderr(io.StringIO()):
+            n1, _, _ = self.run_prune()
+        self.assertEqual(n1, 2)
+        base = common.now()
+        # s1 is recreated and used again: a newer run row whose last-used time is well past the 3-day cutoff by
+        # pass 2 (it was used 4 days ago, so it is stale then). Its settled generation is now out of date.
+        (Path(self.home.name) / "w/s1-aaaaaa").mkdir(parents=True, exist_ok=True)
+        add_run(self.con, "bx", "w/s1-aaaaaa", 4 * 86400)
+        with patch.object(common, "now", return_value=base + prune.EVERY_S + 1), \
+                patch.object(prune, "now", return_value=base + prune.EVERY_S + 1), \
+                patch.object(prune, "BACKGROUND", "true"), contextlib.redirect_stderr(io.StringIO()):
+            n2, _, _ = self.run_prune()
+        self.assertEqual(n2, 1, "a recreated checkout that went stale again must be pruned")
+        self.assertFalse((Path(self.home.name) / "w/s1-aaaaaa").exists())
 
+    def test_settled_entry_still_suppresses_same_generation(self):
+        # Within the same generation (same last-used time) a settled dir is not re-probed.
+        with patch.object(prune, "BACKGROUND", "true"), contextlib.redirect_stderr(io.StringIO()):
+            self.run_prune()
+        before = len(self.calls)
+        with patch.object(common, "now", return_value=common.now() + prune.EVERY_S + 1), \
+                patch.object(prune, "now", return_value=common.now() + prune.EVERY_S + 1), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.run_prune()
+        self.assertEqual(len(self.calls), before + 0, "no candidates left in the same generation: no ssh")
+
+
+class ReleaseTests(Isolated):
+    """Round-8 coverage: a hold is released only after a locked, fresh confirmation; a settled dir is re-offered
+    once its checkout is recreated and used again; stop_all and the reaper follow the same rule."""
+
+    def _box_with_hold(self, box="bx", run_id="r-old", state="running"):
+        self.con.execute("INSERT OR REPLACE INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,"
+                         "last_used_at,source) VALUES (?,'o9','/r9','rk','w/keep-cccccc',?,'small',?,NULL)",
+                         (box, state, common.now()))
+        self.con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,?,?)",
+                         (box, run_id, common.now()))
+        self.con.commit()
+
+    def _held(self, box="bx"):
+        return self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id=?", (box,)).fetchone()[0]
+
+    # --- locked, fresh confirmation (P1) ---------------------------------------------------------------------------
+    def test_stale_snapshot_then_resume_and_new_hold_is_not_cleared(self):
+        # The reaper's snapshot says archived; before it reaches the box, the box is resumed and a new prune takes a
+        # hold (run_id r-new). Confirmation under the lock sees "ready" and must not clear the new hold.
+        from offbox_lib import lease
+        self._box_with_hold(run_id="r-old")
+        self.con.execute("UPDATE prune_holds SET run_id='r-new' WHERE box_id='bx'")
+        self.con.commit()
+        with patch.object(lease.api, "get", return_value={"state": "ready"}):
+            self.assertFalse(lease.release_if_confirmed(self.con, "bx", run_id="r-old"))
+        self.assertEqual(self._held(), 1, "a resumed box's new hold must survive a stale stopped snapshot")
+
+    def test_confirmed_stop_releases_only_the_covered_hold(self):
+        from offbox_lib import lease
+        self._box_with_hold(run_id="r-old", state="stopped")
+        with patch.object(lease.api, "get", return_value={"state": "archived"}):
+            self.assertTrue(lease.release_if_confirmed(self.con, "bx", run_id="r-old"))
+        self.assertEqual(self._held(), 0)
+
+    def test_lock_busy_keeps_the_hold(self):
+        from offbox_lib import lease
+        from offbox_lib.common import file_lock
+        self._box_with_hold()
+        with file_lock("box-bx", timeout=5):
+            with patch.object(lease.api, "get", return_value={"state": "archived"}):
+                self.assertFalse(lease.release_if_confirmed(self.con, "bx"))
+        self.assertEqual(self._held(), 1, "a box whose lock is busy may be allocating: keep the hold")
+
+    # --- stop_all (P2): confirmed, pending and failed stops ---------------------------------------------------------
+    def test_stop_all_confirmed_stop_releases_hold(self):
+        from offbox_lib import spend
+        self._box_with_hold()
+        with patch.object(spend.api, "list_boxes", return_value=[{"id": "bx", "state": "ready"}]), \
+                patch.object(spend.api, "stop", return_value={}), \
+                patch.object(spend.api, "get", return_value={"state": "archived"}), \
+                patch.object(spend, "db", return_value=self.con):
+            spend.stop_all("test")
+        self.assertEqual(self._held(), 0)
+
+    def test_stop_all_pending_stop_keeps_hold(self):
+        from offbox_lib import spend
+        self._box_with_hold()
+        with patch.object(spend.api, "list_boxes", return_value=[{"id": "bx", "state": "ready"}]), \
+                patch.object(spend.api, "stop", return_value={}), \
+                patch.object(spend.api, "get", return_value={"state": "ready"}), \
+                patch.object(spend, "db", return_value=self.con):
+            spend.stop_all("test")
+        self.assertEqual(self._held(), 1, "a stop accepted but not yet confirmed keeps the hold")
+
+    def test_stop_all_failed_stop_keeps_hold(self):
+        from offbox_lib import spend
+        from offbox_lib.common import OffboxError
+        self._box_with_hold()
+        with patch.object(spend.api, "list_boxes", return_value=[{"id": "bx", "state": "ready"}]), \
+                patch.object(spend.api, "stop", side_effect=OffboxError("boom")), \
+                patch.object(spend, "db", return_value=self.con):
+            spend.stop_all("test")
+        self.assertEqual(self._held(), 1, "a failed stop never clears the hold")
+
+    # --- reaper stopped-state (P1) -----------------------------------------------------------------------------------
+    def test_reaper_stopped_snapshot_clears_only_after_fresh_confirmation(self):
+        from offbox_lib import reap, lease
+        self._box_with_hold(state="stopped")
+        with patch.object(reap.api, "list_boxes", return_value=[{"id": "bx", "state": "archived"}]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(lease.api, "get", return_value={"state": "ready"}):
+            reap.reap(dry=False)
+        self.assertEqual(self._held(), 1, "a snapshot-stopped box that is ready on fresh read keeps its hold")
+        with patch.object(reap.api, "list_boxes", return_value=[{"id": "bx", "state": "archived"}]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(lease.api, "get", return_value={"state": "archived"}):
+            reap.reap(dry=False)
+        self.assertEqual(self._held(), 0)
+
+    # --- settled generation (P2) -------------------------------------------------------------------------------------
 class HoldClearTests(Isolated):
     """The hold is cleared only when a box is certainly stopped or gone. Each path is driven through the real
     lease/reap functions, with only the boat API faked."""

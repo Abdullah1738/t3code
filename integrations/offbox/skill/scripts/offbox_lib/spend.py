@@ -80,12 +80,16 @@ def stop_all(reason: str) -> int:
         if b.get("state") in api.LIVE_STATES or b.get("state") in api.STARTING_STATES:
             try:
                 api.stop(b["id"])
-                con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (b["id"],))
-                con.commit()
-                event(con, b["id"], "stop", reason)
-                n += 1
             except OffboxError as e:
                 event(con, b["id"], "stop_failed", f"{reason}: {e}")
+                continue
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (b["id"],))
+            con.commit()
+            event(con, b["id"], "stop", reason)
+            n += 1
+            # The hold is released only if boat confirms the box is stopped under its lock; a pending stop keeps it.
+            from .lease import release_if_confirmed
+            release_if_confirmed(con, b["id"])
     return n
 
 

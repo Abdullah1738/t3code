@@ -30,7 +30,7 @@ BACKGROUND = ("(S=; command -v setsid >/dev/null 2>&1 && S=setsid; "
               "</dev/null >/dev/null 2>&1 &)")
 
 
-def stale_dirs(con, box_id: str, current: str) -> list[str]:
+def _stale_with_times(con, box_id: str, current: str) -> list[tuple[str, int]]:
     keep_n = capacity.setting("OFFBOX_PRUNE_KEEP", 10, minimum=1, maximum=500)
     days = capacity.setting("OFFBOX_PRUNE_DAYS", 3, minimum=1, maximum=60)
     cutoff = now() - days * 86400
@@ -38,7 +38,7 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
                                  SUM(CASE WHEN status IN ('starting', 'running') THEN 1 ELSE 0 END) AS active
                           FROM runs WHERE box_id=? AND remote_dir IS NOT NULL
                           GROUP BY remote_dir ORDER BY last DESC""", (box_id,)).fetchall()
-    out: list[str] = []
+    out: list[tuple[str, int]] = []
     kept = 0
     floor = now() - FLOOR_S
     for r in rows:
@@ -51,8 +51,12 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
         if r["last"] >= cutoff and kept < keep_n:
             kept += 1
             continue
-        out.append(d)
+        out.append((d, int(r["last"])))
     return out
+
+
+def stale_dirs(con, box_id: str, current: str) -> list[str]:
+    return [d for d, _ in _stale_with_times(con, box_id, current)]
 
 
 def script(dirs: list[str], run_id: str) -> str:
@@ -104,6 +108,16 @@ def _quiesced(box_id: str, run_id: str, remaining_s: float) -> bool:
         return False
 
 
+def _settled_map(raw) -> dict[str, int]:
+    """Read the settled record. Accepts the current {dir: last} map and the older list of bare names
+    (a bare name means "settled at any generation", the old meaning)."""
+    if isinstance(raw, dict):
+        return {str(d): int(v) for d, v in raw.items()}
+    if isinstance(raw, list):
+        return {str(d): -1 for d in raw}
+    return {}
+
+
 def _protected(con, box_id: str) -> bool:
     return con.execute("SELECT 1 FROM bases WHERE box_id=? UNION ALL SELECT 1 FROM templates WHERE box_id=?",
                        (box_id, box_id)).fetchone() is not None
@@ -121,10 +135,13 @@ def run(con, box_id: str, current: str) -> int:
             return 0
         if _protected(con, box_id):
             return 0
-        settled = set((raw or {}).get("settled", []))
-        dirs = [d for d in stale_dirs(con, box_id, current) if d not in settled]
-        # Every path below keeps the settled list, so a failed pass never replays settled dirs on the next one.
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": sorted(settled)})
+        # settled maps dir -> the last-used time it was settled at. It only suppresses that generation: a recreated
+        # checkout that is used and goes stale again has a newer last-used time, so it is offered again.
+        settled = _settled_map((raw or {}).get("settled"))
+        rows = _stale_with_times(con, box_id, current)
+        dirs = [d for d, last in rows if settled.get(d) != last]
+        # Every path below keeps the settled map, so a failed pass never replays settled dirs on the next one.
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": settled})
         if not dirs:
             return 0
         run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
@@ -156,8 +173,10 @@ def run(con, box_id: str, current: str) -> int:
             log(f"prune {box_id}: remote worker not confirmed finished; box held, {left_n} left for retry")
         elif left_n:
             log(f"prune {box_id}: {left_n} left for retry (ssh rc {rc})")
-        settled_now = sorted(settled | set(done) | set(skipped))
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n, "settled": settled_now})
+        lasts = dict(rows)
+        for d in done + skipped:
+            settled[d] = lasts[d]
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n, "settled": settled})
         if done:
             con.executemany("DELETE FROM pool_callers WHERE box_id=? AND remote_dir=?", [(box_id, d) for d in done])
             con.commit()
