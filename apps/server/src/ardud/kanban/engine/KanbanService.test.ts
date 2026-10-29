@@ -2545,16 +2545,16 @@ it.effect("steer on a sibling card after a shared thread's model switch carries 
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
-      // Two slots: both cards take one work thread (a batch), so they share it.
       yield* kanban.setPool(board.id, board.defaultCardModel, 2);
       yield* kanban.setPool(board.id, haiku, 1);
       const first = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
+      yield* kanban.dispatchNow;
+      // The second card is created once the first thread runs, so it joins that thread.
       const second = yield* kanban.createCard(board.id, { prompt: "b", title: "b" }, owner);
       yield* kanban.dispatchNow;
       const shared = (yield* kanban.card(first.id)).card;
       assert.isNotNull(shared.activeThreadId);
       const sibling = (yield* kanban.card(second.id)).card;
-      // Both cards on the shared thread are on Opus now.
       assert.strictEqual(sibling.activeThreadId, shared.activeThreadId);
       yield* kanban.editCard(first.id, { model: haiku }, owner);
       yield* kanban.cardThread(second.id, "steer", "go on", owner);
