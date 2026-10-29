@@ -513,6 +513,50 @@ test("a failed run whose steps all stopped with no tool is classified tool-free,
   expect(turnRanTools(records)).toBe(false);
 });
 
+test("a tool-only run with no text still counts as having run a tool, so an interrupted turn is never retried", async () => {
+  const control = fakeControl();
+  const sawDb: string[][] = [];
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(),
+    runEvidence: (session, since) => { sawDb.push([session, String(since)]); return "ran"; } });
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"d".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "run the check", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // The run called a tool and was interrupted: Robob has no text record for it at all.
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_tool";
+  thread.runs.at(-1)!.status = "interrupted";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("ran");
+  expect(sawDb[0]![0]).toBe("ses_native_tool");
+});
+
+test("a first-call provider error with no native evidence is unproven, so it is reported once and never retried", async () => {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: () => "unknown" });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"e".repeat(64)}`, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // Robob's record of a 400 on the very first call: the run settled failed, no text, lastError set.
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_400";
+  thread.runs.at(-1)!.status = "failed";
+  thread.lastError = "model returned 400";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("unknown");
+});
+
+test("a first-call provider error with positive no-tool evidence is classified tool-free, so it may be retried", async () => {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: () => "none" });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"f".repeat(64)}`, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_none";
+  thread.runs.at(-1)!.status = "failed";
+  thread.lastError = "model returned 400";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("none");
+});
+
 test("a background run's answer before two steered texts reaches the chat along with the last one", async () => {
   // 22 Oct, Home group: a finished delegated task woke the thread, Robob said the
   // car was booked, two of Moni's texts were steered in, and only the next answer

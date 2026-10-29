@@ -1615,6 +1615,40 @@ test("a watcher turn that errored before any tool is retried, then reported once
   expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
 });
 
+test("a first-call provider error with no tool evidence is reported once and never retried, through the backend", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  // The provider returned 400 on the first call: no text, no tool, and no proof either way.
+  Object.assign(h.backend, { runToolEvidence: async () => "unknown" as const });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"k".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  setSystemTime(start + 10 * 60_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test("a first-call provider error with positive no-tool evidence is retried, then reported once", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  Object.assign(h.backend, { runToolEvidence: async () => "none" as const });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"l".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+});
+
 test("a failed turn whose tool use the backend cannot rule out is never retried", async () => {
   const h = setup(":memory:", { droppedBatchMs: 0 });
   const start = Date.parse("2026-09-29T07:00:11Z");
