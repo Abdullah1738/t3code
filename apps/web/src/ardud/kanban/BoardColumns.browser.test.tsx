@@ -618,7 +618,8 @@ describe("review stack at the iPad width", () => {
       boardColumnsStorageKey(BOARD_ID),
       JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
     );
-    await mountAt(1044, 900, "coarse");
+    // The container pads 20px, so 1084px leaves a 1064px board: over the 1044px threshold.
+    await mountAt(1084, 900, "coarse");
 
     expect(isStageGrid()).toBe(true);
     expect(container.querySelector("[data-review-stack]")).toBeNull();
