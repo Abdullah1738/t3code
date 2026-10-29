@@ -57,6 +57,8 @@ const makeFake = Effect.gen(function* () {
   const failures = new Map<string, OrchestrationV2ProviderFailure>();
   const sends: Array<{ threadId: string; model: ModelSelection | undefined }> = [];
   const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
+  // Threads whose sends are refused, to test a wake that doesn't land.
+  const rejectSends = new Set<string>();
   let next = 0;
   const layer = Layer.succeed(
     KanbanThreads,
@@ -107,6 +109,11 @@ const makeFake = Effect.gen(function* () {
                 new KanbanThreadError({ operation: "send", detail: "thread is archived" }),
               );
             }
+            if (rejectSends.has(input.threadId)) {
+              return Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "refused" }),
+              );
+            }
             if (thread) thread.messages.push(input.text);
             sends.push({ threadId: input.threadId, model: input.model });
             return Effect.void;
@@ -118,7 +125,7 @@ const makeFake = Effect.gen(function* () {
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
-  return { threads, layer, interrupted, prs, failures, sends, modelSwitches };
+  return { threads, layer, interrupted, prs, failures, sends, modelSwitches, rejectSends };
 });
 
 /** Board file storage (ServerConfig + FileSystem) that KanbanService now needs when built. */
@@ -2707,6 +2714,55 @@ it.effect("the backstop doesn't nudge a paused worker", () =>
       yield* kanban.tick;
       assert.strictEqual((yield* Ref.get(fake.threads)).get(workThread)!.messages.length, before);
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a reused, already ended evaluator is still woken when its model recovers", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "First" });
+      yield* kanban.turnEnded(threadId);
+      assert.isNotNull((yield* kanban.caller(threadId))?.endedAt ?? null);
+      // Reuse the ended evaluator, then fail that run on an outage.
+      yield* kanban.startEvaluator(board.id, { kind: "request", text: "Again" });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+      probe.ok = true;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.include(messages[messages.length - 1] ?? "", "answers again");
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a rejected wake keeps the pause and is retried on the next probe", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      probe.ok = true;
+      fake.rejectSends.add(threadId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+      fake.rejectSends.delete(threadId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
 
