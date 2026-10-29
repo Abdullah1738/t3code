@@ -612,6 +612,30 @@ describe("review stack at the iPad width", () => {
       );
     },
   );
+
+  it("drops the review stack and its resize handle when both stages are hidden", async () => {
+    localStorage.setItem(
+      boardColumnsStorageKey(BOARD_ID),
+      JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
+    );
+    await mountAt(1044, 900, "coarse");
+
+    expect(isStageGrid()).toBe(true);
+    expect(container.querySelector("[data-review-stack]")).toBeNull();
+    expect(container.querySelector('[aria-label="Resize Review"]')).toBeNull();
+    expect(container.querySelector('button[aria-label^="Show Needs Review"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label^="Show In Review"]')).not.toBeNull();
+
+    const strip = container.querySelector<HTMLElement>(".overflow-x-auto")!;
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
+    const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
+    const visibleShipped = shipped ?? folded;
+    expect(visibleShipped).not.toBeNull();
+    expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
+      strip.getBoundingClientRect().right + 1,
+    );
+  });
 });
 
 describe("saved widths", () => {
