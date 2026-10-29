@@ -62,14 +62,21 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
       }
       // One row past the cap tells a truncated scan from a complete one. A truncated scan can
       // never prove a run tool-free, so it is `unknown` whatever the rows it did read say.
-      const rows = db.query<{ finish: unknown; content: unknown; retry: unknown }, [string, number, number]>(
-        "SELECT json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content, json_extract(data, '$.retry') AS retry FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
+      // Assistant steps and the session's idle markers, in order. OpenCode writes an `idle` row
+      // once the execution has settled, and that is the only durable proof the run is over: a
+      // step's own finish is written before the execution knows whether it will go on.
+      const rows = db.query<{ type: string; finish: unknown; content: unknown; retry: unknown; outcome: unknown }, [string, number, number]>(
+        "SELECT type, json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content, json_extract(data, '$.retry') AS retry, json_extract(data, '$.outcome') AS outcome FROM session_message WHERE session_id = ? AND type IN ('assistant', 'idle') AND time_created >= ? ORDER BY seq LIMIT ?",
       ).all(sessionId, sinceMs, maxRows + 1);
-      if (rows.some(stepRan)) return "ran";
-      // `none` needs a complete scan: a truncated one may hide a tool row past the cap. And every
-      // step must be terminal with fully known, no-tool content (an unfinished step may still run).
-      if (rows.length === 0 || rows.length > maxRows) return "unknown";
-      return rows.every(stepIsTerminalNoTool) ? "none" : "unknown";
+      const steps = rows.filter(row => row.type === "assistant");
+      if (steps.some(stepRan)) return "ran";
+      // `none` needs a complete scan (a truncated one may hide a tool row past the cap), the run's
+      // own idle marker, and every step terminal with fully known, no-tool content.
+      if (steps.length === 0 || rows.length > maxRows) return "unknown";
+      const idle = rows.findIndex(row => row.type === "idle");
+      if (idle < 0 || typeof rows[idle]!.outcome !== "string") return "unknown";
+      if (rows.slice(idle + 1).some(row => row.type === "assistant")) return "unknown";
+      return steps.every(stepIsTerminalNoTool) ? "none" : "unknown";
     } catch {
       close();
       return "unknown";
