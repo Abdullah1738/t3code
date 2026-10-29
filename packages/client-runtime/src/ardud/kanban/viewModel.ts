@@ -17,6 +17,7 @@ import {
   type KanbanMessage,
   type KanbanStage,
   type ModelSelection,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 
 import { ageView } from "../common/time.ts";
@@ -63,6 +64,50 @@ export function modelVariant(model: ModelSelection | null): string | null {
 
 export const modelLetter = (model: ModelSelection | null) =>
   modelName(model).charAt(0).toUpperCase();
+
+/**
+ * The composer picker's value (instance, model, effort/variant) as the board's
+ * ModelSelection. The board stores the variant as an option named "variant".
+ */
+export function boardModelSelection(input: {
+  readonly instanceId: ProviderInstanceId;
+  readonly model: string;
+  readonly variant?: string | null | undefined;
+}): ModelSelection {
+  const { instanceId, model, variant } = input;
+  return variant
+    ? { instanceId, model, options: [{ id: "variant", value: variant }] }
+    : { instanceId, model };
+}
+
+/**
+ * Whether a pool's model is still in the composer's model list. Mirrors the
+ * server rule in card #48: an instance missing from a non-empty list, disabled,
+ * or not offering the slug is missing; null means unknown and must not be read as missing.
+ */
+export function poolListed(
+  model: { readonly instanceId: ProviderInstanceId; readonly model: string },
+  providers: ReadonlyArray<{
+    readonly instanceId: ProviderInstanceId;
+    readonly enabled: boolean;
+    readonly models: ReadonlyArray<{ readonly slug: string; readonly isCustom?: boolean }>;
+  }>,
+  settings: {
+    readonly providerModelPreferences?:
+      | Readonly<Record<string, { readonly hiddenModels: ReadonlyArray<string> } | undefined>>
+      | null
+      | undefined;
+  },
+): boolean | null {
+  if (providers.length === 0) return null;
+  const provider = providers.find((entry) => entry.instanceId === model.instanceId);
+  if (!provider || !provider.enabled) return false;
+  if (provider.models.length === 0) return null;
+  const hidden = new Set(settings.providerModelPreferences?.[model.instanceId]?.hiddenModels ?? []);
+  return provider.models.some(
+    (entry) => entry.slug === model.model && (entry.isCustom === true || !hidden.has(entry.slug)),
+  );
+}
 
 export type CardFlag =
   | { readonly kind: "stalled"; readonly label: string }
