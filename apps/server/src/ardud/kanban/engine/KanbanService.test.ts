@@ -15,6 +15,7 @@ import {
   type KanbanBlock,
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
+  type ServerProvider,
 } from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
@@ -104,6 +105,7 @@ const listedLayer = (listed: Ref.Ref<KanbanModels.ListedModels | null>) =>
 const testLayer = (
   fake: Layer.Layer<KanbanThreads>,
   models: Layer.Layer<KanbanModels.KanbanModels> = KanbanModels.layerTest(null),
+  providers: ReadonlyArray<ServerProvider> = [opencodeTestProvider()],
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
@@ -112,7 +114,7 @@ const testLayer = (
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
-    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(providerRegistryLayer(providers)),
     Layer.provideMerge(boardFilesLayer),
   );
 
@@ -3081,5 +3083,39 @@ it.effect("removePool refuses a pool that a card's pinned work model is on, even
       assert.strictEqual(refused.code, "invalid");
       assert.include(refused.detail, `card #${card.number} uses`);
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
+  }),
+);
+
+it.effect("setPool 0 pauses an existing pool whose model left a non-empty provider catalog", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    const retired = modelSelectionOf({ model: "opus/retired-model", instanceId: "opencode" });
+    const kept = opencodeTestProvider();
+    // The provider still offers other models, but no longer offers the retired slug.
+    const catalogWithout = [
+      { ...kept, models: kept.models.filter((model) => model.slug !== "opus/retired-model") },
+    ];
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const instance = board.defaultCardModel.instanceId as string;
+      yield* Ref.set(
+        listed,
+        new Map<string, KanbanModels.ListedModelEntry>([
+          [instance, new Set([board.defaultCardModel.model, retired.model])],
+        ]),
+      );
+      // A pool that already has slots, written as if it were created before the slug was retired.
+      yield* store.putPool(board.id, { key: Rules.poolKey(retired), model: retired, slots: 2 });
+
+      const pools = yield* kanban.setPool(board.id, retired, 0);
+      assert.isTrue(pools.some((pool) => pool.key === Rules.poolKey(retired) && pool.slots === 0));
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed), catalogWithout)));
   }),
 );
