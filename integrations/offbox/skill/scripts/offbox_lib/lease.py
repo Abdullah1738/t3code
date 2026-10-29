@@ -9,10 +9,12 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event, file_lock,
-                     month_key, new_id, now, read_json, say)
+from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event,
+                     file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
+# Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
+ARCHIVING_WAIT_S = 120
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
@@ -268,7 +270,11 @@ def _bigger(a: str | None, b: str | None) -> bool:
     return rank.get(a, 1) > rank.get(b or "default", 1)
 
 
-def _reuse(con, row, size: str | None):
+class ArchivingSkip(OffboxError):
+    """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
@@ -283,6 +289,13 @@ def _reuse(con, row, size: str | None):
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     st = s.get("state")
+    if st == "archiving":
+        if skip_archiving:
+            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
+        say(f"{box_id} is stopping; waiting to resume it")
+        s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
+        st = s.get("state")
+    # After the archiving wait: a box that came back live still gets the size check below.
     have = s.get("type") or row["size"]
     want = have
     if st in api.LIVE_STATES and _bigger(size, have):
@@ -294,11 +307,38 @@ def _reuse(con, row, size: str | None):
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
         api.stop(box_id)
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
-        st = s.get("state")
-    if st == "archiving":
-        say(f"{box_id} is stopping; waiting to resume it")
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
+        if skip_archiving:
+            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
+            # bigger size once boat reports it archived.
+            ssh_sync.close_master(box_id)
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+            con.commit()
+            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+            raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
+        # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
+        # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
+        try:
+            s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except OffboxError:
+            s = api.get(box_id)
+            st = s and s.get("state")
+            if st in api.LIVE_STATES and not _bigger(want, s.get("type") or have):
+                pass  # live and already big enough: use it
+            elif st in api.LIVE_STATES:
+                # The stop didn't take and the box is live at its old size. Record that, and refuse rather than
+                # hand out a box smaller than the run asked for.
+                got = s.get("type") or have
+                con.execute("UPDATE leases SET state='running', size=? WHERE box_id=?", (got, box_id))
+                con.commit()
+                event(con, box_id, "lease_resize_bounced", f"{got}, wanted {want}")
+                raise OffboxError(f"{box_id} came back {got} instead of stopping to grow to {want}; "
+                                  f"nothing ran, retry") from None
+            else:
+                # Still stopping: the stop was asked for, so the next caller resumes it once boat says archived.
+                ssh_sync.close_master(box_id)
+                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+                con.commit()
+                raise
         st = s.get("state")
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,
