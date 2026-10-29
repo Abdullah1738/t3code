@@ -2306,6 +2306,7 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
+        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const providerThreadBase = {
@@ -2520,6 +2521,7 @@ it.effect("drops late root provider-thread writes from a superseded attempt", ()
           ServerSettings.layerTest(),
         ),
       ),
+      Layer.provideMerge(PreviewAgentActivity.layer),
     );
 
     const providerThreadBase = {
@@ -2710,6 +2712,7 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
+        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const providerThreadBase = {
@@ -2864,6 +2867,7 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
+        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const providerThreadBase = {
@@ -3457,6 +3461,7 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
+        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const runningSubagent = makeRunOwnedSubagentFixture({
