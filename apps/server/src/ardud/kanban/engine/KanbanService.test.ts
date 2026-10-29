@@ -2833,7 +2833,7 @@ it.effect("a paused link gets exactly one wake when its probe passes", () =>
       yield* kanban.probeOutages;
       const after = (yield* Ref.get(fake.threads)).get(threadId)!.messages.length;
       assert.strictEqual(after - before, 1);
-    }).pipe(Effect.provide(probeLayer(fake.layer)));
+    }).pipe(Effect.provide(failingPostProbeLayer(fake.layer)));
   }),
 );
 
@@ -4706,3 +4706,148 @@ it.effect("a quick outage that never gets probed posts nothing", () =>
     }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
+
+const outageTitled = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unknown> }>) =>
+  messages.map((message) => messageText([message]));
+
+it.effect("staggered outages on two boards are each announced, and recovery reaches both once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "x", title: "a" }, owner);
+      yield* kanban.dispatchNow;
+      const firstThread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      fake.failures.set(firstThread, outage);
+      yield* kanban.turnEnded(firstThread);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      const discussionId = (yield* kanban.discussions(board.id)).find(
+        (discussion) => discussion.title === "Provider outages" && discussion.cardId === null,
+      )!.id;
+      assert.strictEqual((yield* kanban.messages(discussionId)).length, 1);
+
+      // A second board thread on the same model fails later; its board isn't announced yet.
+      const second = yield* kanban.createCard(board.id, { prompt: "x", title: "b" }, owner);
+      yield* kanban.dispatchNow;
+      const secondThread = (yield* kanban.card(second.id)).card.activeThreadId!;
+      fake.failures.set(secondThread, outage);
+      yield* kanban.turnEnded(secondThread);
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual((yield* kanban.messages(discussionId)).length, 2);
+
+      probe.ok = true;
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      const texts = outageTitled(yield* kanban.messages(discussionId));
+      assert.strictEqual(texts.filter((text) => text.includes("answers again")).length, 1);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a failed outage post is retried by the next probe, and recovery waits for it", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      // The first announce post fails; the probe still runs and keeps the pause.
+      postFailures.remaining = 1;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+      assert.strictEqual(
+        (yield* kanban.discussions(board.id)).filter((discussion) => discussion.title === "Provider outages")
+          .length,
+        0,
+      );
+      // The next failed probe retries the announcement.
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.probeOutages;
+      const discussionId = (yield* kanban.discussions(board.id)).find(
+        (discussion) => discussion.title === "Provider outages",
+      )!.id;
+      assert.strictEqual((yield* kanban.messages(discussionId)).length, 1);
+      assert.include(messageText(yield* kanban.messages(discussionId)), "1 thread paused");
+
+      probe.ok = true;
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      const texts = outageTitled(yield* kanban.messages(discussionId));
+      assert.strictEqual(texts.length, 2);
+      assert.include(texts[1] ?? "", "answers again");
+    }).pipe(Effect.provide(failingPostProbeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a rejected wake after an announced recovery does not post recovery twice", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      const discussionId = (yield* kanban.discussions(board.id)).find(
+        (discussion) => discussion.title === "Provider outages",
+      )!.id;
+
+      // Recovery posts, but the wake is refused: the link stays paused.
+      probe.ok = true;
+      fake.rejectSends.add(threadId);
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+
+      // The wake lands on the next passing probe; recovery must not be posted again.
+      fake.rejectSends.delete(threadId);
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+      const texts = outageTitled(yield* kanban.messages(discussionId));
+      assert.strictEqual(texts.filter((text) => text.includes("answers again")).length, 1);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(probeDeps(fake)),
+    Layer.provideMerge(failingPostStore),
+  );
+
+// Fails the next `postFailures.remaining` writes of a "provider-watch" outage post.
+const postFailures = { remaining: 0 };
+const failingPostStore = Layer.effect(
+  KanbanStore.KanbanStore,
+  Effect.gen(function* () {
+    const real = yield* KanbanStore.KanbanStore;
+    return {
+      ...real,
+      putMessage: (message) =>
+        message.author._tag === "system" && postFailures.remaining > 0
+          ? ((postFailures.remaining -= 1),
+            Effect.fail(new KanbanStore.KanbanStoreError({ operation: "write message", cause: "injected" })))
+          : real.putMessage(message),
+    };
+  }),
+).pipe(Layer.provide(KanbanStore.layer));

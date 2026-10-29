@@ -624,7 +624,15 @@ const make = Effect.gen(function* () {
   const down = yield* Ref.make<
     ReadonlyMap<
       string,
-      { readonly delayMs: number; readonly nextAt: number; readonly alerted: boolean }
+      {
+        readonly delayMs: number;
+        readonly nextAt: number;
+        // Boards whose "Provider outages" post for this outage landed. Per board, so a
+        // board that failed later is still announced by a later probe.
+        readonly announced: ReadonlySet<KanbanBoard["id"]>;
+        // Boards that already got their "answers again" post for this outage.
+        readonly recovered: ReadonlySet<KanbanBoard["id"]>;
+      }
     >
   >(new Map());
   const scanned = yield* Ref.make(false);
@@ -2300,7 +2308,12 @@ const make = Effect.gen(function* () {
       const next = new Map(map);
       for (const key of keys) {
         if (!next.has(key))
-          next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now, alerted: false });
+          next.set(key, {
+            delayMs: Rules.PROBE_FIRST_MS,
+            nextAt: now,
+            announced: new Set(),
+            recovered: new Set(),
+          });
       }
       return next;
     });
@@ -2329,7 +2342,8 @@ const make = Effect.gen(function* () {
         : new Map(map).set(key, {
             delayMs: Rules.PROBE_FIRST_MS,
             nextAt: now + Rules.PROBE_FIRST_MS,
-            alerted: false,
+            announced: new Set(),
+            recovered: new Set(),
           }),
     );
   });
@@ -2337,25 +2351,44 @@ const make = Effect.gen(function* () {
   const OUTAGE_TITLE = "Provider outages";
   const outageActor: KanbanActor = { _tag: "system", component: "provider-watch" };
 
-  /** Posts to each board's "Provider outages" discussion how many of its threads wait on `key`. */
+  /**
+   * Posts to the "Provider outages" discussion of each board in `only` that has threads
+   * waiting on `key`, with how many. Returns the boards whose post landed. A failed post
+   * is logged and left out, so the caller retries it next time; it never fails the probe.
+   */
   const alertBoards = Effect.fn("KanbanService.alertBoards")(function* (
     key: string,
+    only: ReadonlySet<KanbanBoard["id"]>,
     text: (count: number) => string,
   ) {
     const counts = new Map<KanbanBoard["id"], number>();
     for (const { link, board } of yield* pausedLinks) {
-      if (linkKey(link, board) === key) counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
+      if (linkKey(link, board) === key && only.has(board.id)) {
+        counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
+      }
     }
+    const delivered = new Set<KanbanBoard["id"]>();
     for (const [boardId, count] of counts) {
-      const existing = (yield* store.discussions(boardId)).find(
-        (discussion) =>
-          discussion.cardId === null &&
-          discussion.archivedAt === null &&
-          discussion.title === OUTAGE_TITLE,
+      const posted = yield* Effect.gen(function* () {
+        const existing = (yield* store.discussions(boardId)).find(
+          (discussion) =>
+            discussion.cardId === null &&
+            discussion.archivedAt === null &&
+            discussion.title === OUTAGE_TITLE,
+        );
+        const discussion = existing ?? (yield* newDiscussion(boardId, OUTAGE_TITLE, null, outageActor));
+        yield* postUnlocked(discussion.id, outageActor, [{ _tag: "md", text: text(count) }], false);
+      }).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban outage alert failed", { boardId, cause }).pipe(
+            Effect.as(false),
+          ),
+        ),
       );
-      const discussion = existing ?? (yield* newDiscussion(boardId, OUTAGE_TITLE, null, outageActor));
-      yield* postUnlocked(discussion.id, outageActor, [{ _tag: "md", text: text(count) }], false);
+      if (posted) delivered.add(boardId);
     }
+    return delivered;
   });
 
   /**
@@ -2364,13 +2397,28 @@ const make = Effect.gen(function* () {
    * Callers hold the lock.
    */
   const resumeKey = Effect.fn("KanbanService.resumeKey")(function* (key: string) {
-    // Only a key that was announced gets a "back" message.
-    if ((yield* Ref.get(down)).get(key)?.alerted) {
-      yield* alertBoards(
-        key,
-        (count) =>
-          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
-      ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { cause })));
+    // Only boards that were announced get a "back" message, once per outage: a board
+    // is recorded as recovered as soon as its post lands, so a rejected wake below
+    // doesn't repeat it on the next probe.
+    const state = (yield* Ref.get(down)).get(key);
+    if (state !== undefined) {
+      const pending = new Set([...state.announced].filter((id) => !state.recovered.has(id)));
+      if (pending.size > 0) {
+        const backed = yield* alertBoards(
+          key,
+          pending,
+          (count) =>
+            `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
+        );
+        yield* Ref.update(down, (map) => {
+          const entry = map.get(key);
+          if (!entry) return map;
+          return new Map(map).set(key, {
+            ...entry,
+            recovered: new Set([...entry.recovered, ...backed]),
+          });
+        });
+      }
     }
     let failed = false;
     for (const { link, board } of yield* pausedLinks) {
@@ -2895,7 +2943,8 @@ const make = Effect.gen(function* () {
               next.set(key, {
                 delayMs: Rules.PROBE_FIRST_MS,
                 nextAt: seededAt,
-                alerted: false,
+                announced: new Set(),
+                recovered: new Set(),
               });
           }
           return next;
@@ -2919,21 +2968,38 @@ const make = Effect.gen(function* () {
         new Map(map).set(key, {
           delayMs,
           nextAt: now + delayMs,
-          alerted: state?.alerted ?? false,
+          announced: state?.announced ?? new Set(),
+          recovered: state?.recovered ?? new Set(),
         }),
       );
-      // One alert per outage, after the first failed probe, so threads that die in the same minutes are counted.
-      if (!(state?.alerted ?? false)) {
-        yield* lock.withPermits(1)(
+      // One alert per board per outage, after the first failed probe, so threads that die in the same minutes are counted.
+      // A board whose post failed is not marked announced and is retried by the next failed probe.
+      const unannounced = yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const boards = new Set<KanbanBoard["id"]>();
+          for (const { link, board } of yield* pausedLinks) {
+            if (linkKey(link, board) === key) boards.add(board.id);
+          }
+          const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
+          return new Set([...boards].filter((id) => !announced.has(id)));
+        }),
+      );
+      if (unannounced.size > 0) {
+        const posted = yield* lock.withPermits(1)(
           alertBoards(
             key,
+            unannounced,
             (count) =>
               `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
           ),
-        ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { cause })));
+        );
         yield* Ref.update(down, (map) => {
           const entry = map.get(key);
-          return entry ? new Map(map).set(key, { ...entry, alerted: true }) : map;
+          if (!entry) return map;
+          return new Map(map).set(key, {
+            ...entry,
+            announced: new Set([...entry.announced, ...posted]),
+          });
         });
       }
     }
