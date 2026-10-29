@@ -194,7 +194,9 @@ export function NewBoardRouteScreen() {
         )),
       )}
       <View className="gap-1.5">
-        <Text className="text-sm text-foreground-muted">Notes for the setup evaluator (optional)</Text>
+        <Text className="text-sm text-foreground-muted">
+          Notes for the setup evaluator (optional)
+        </Text>
         <TextInput
           value={notes}
           onChangeText={setNotes}

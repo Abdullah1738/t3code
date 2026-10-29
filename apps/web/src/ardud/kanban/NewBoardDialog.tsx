@@ -59,7 +59,8 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
   const projects = useProjects().filter((project) => project.environmentId === environmentId);
   const boards = useBoards() ?? [];
   const providers =
-    (environmentId ? providersByEnvironment.get(environmentId) : undefined) ?? EMPTY_SERVER_PROVIDERS;
+    (environmentId ? providersByEnvironment.get(environmentId) : undefined) ??
+    EMPTY_SERVER_PROVIDERS;
 
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
@@ -110,7 +111,9 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
     // A pending board already owns its slug, so a retry skips this check.
     if (pending === null && boards.some((summary) => summary.board.slug === effectiveSlug)) {
       await runAction("Couldn't create the board", async () => {
-        throw new Error(`A board with the slug "${effectiveSlug}" already exists. Pick another name.`);
+        throw new Error(
+          `A board with the slug "${effectiveSlug}" already exists. Pick another name.`,
+        );
       });
       return;
     }
