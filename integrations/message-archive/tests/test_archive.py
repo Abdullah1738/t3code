@@ -135,6 +135,15 @@ class StoreSearchTest(unittest.TestCase):
     def ids(self, q, **kw):
         return [r["ext_id"] for r in search.run(self.db, q, **kw)]
 
+    def test_chat_sizes_flags_only_small_whatsapp_chats(self):
+        store.upsert(self.db, item(source="whatsapp", account="wa", ext_id="s1", conv="971506644345@s.whatsapp.net",
+                                   conv_name="Umm Zayed", body="voice note"))
+        for i in range(5):
+            store.upsert(self.db, item(source="whatsapp", account="wa", ext_id=f"b{i}",
+                                       conv="971500000000@s.whatsapp.net", conv_name="Big chat", body="voice note"))
+        self.assertEqual(search.chat_sizes(self.db, search.run(self.db, "voice")),
+                         {"971506644345@s.whatsapp.net": 1})
+
     def test_concurrent_writers_take_turns(self):
         # The daemon runs one thread per source against the same file; none may hit "database is locked".
         import threading
@@ -553,6 +562,51 @@ class SearchFlagsTest(unittest.TestCase):
         q, kw = self.run_cli("hello", "world")
         self.assertEqual(q, "hello world")
         self.assertEqual(kw["limit"], 20)
+
+
+class StubChatOutputTest(unittest.TestCase):
+    def setUp(self):
+        if os.path.exists(store.common.DB_PATH):
+            os.remove(store.common.DB_PATH)
+        self.db = store.connect()
+        store.upsert(self.db, item(source="whatsapp", account="wa", ext_id="s1", conv="971506644345@s.whatsapp.net",
+                                   conv_name="Umm Zayed", body="voice note"))
+        for i in range(5):
+            store.upsert(self.db, item(source="whatsapp", account="wa", ext_id=f"b{i}",
+                                       conv="971500000000@s.whatsapp.net", conv_name="Big chat", body="voice note"))
+        self.db.commit()
+        import msgs
+        self.msgs = msgs
+        self.old_connect = store.connect
+        store.connect = lambda readonly=False: self.db
+
+    def tearDown(self):
+        store.connect = self.old_connect
+        self.db.close()
+
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.msgs.main(["search", "voice", *argv])
+        return out.getvalue(), err.getvalue()
+
+    def test_text_output_notes_the_stub_chat(self):
+        out, err = self.run_cli()
+        self.assertIn('WhatsApp chat "Umm Zayed" has only 1 message(s) on this Mac', err)
+        self.assertIn("wa read 971506644345@s.whatsapp.net --more 2", err)
+        self.assertNotIn("Big chat\" has only", err)
+        self.assertNotIn("note:", out)
+
+    def test_json_output_marks_stub_rows(self):
+        import json
+        out, _ = self.run_cli("--json")
+        rows = {r["conv"]: r for r in map(json.loads, out.splitlines())}
+        self.assertTrue(rows["971506644345@s.whatsapp.net"]["stub"])
+        self.assertEqual(rows["971506644345@s.whatsapp.net"]["chat_messages"], 1)
+        self.assertFalse(rows["971500000000@s.whatsapp.net"]["stub"])
+        self.assertEqual(rows["971500000000@s.whatsapp.net"]["chat_messages"], 5)
 
 
 class GuardTest(unittest.TestCase):
