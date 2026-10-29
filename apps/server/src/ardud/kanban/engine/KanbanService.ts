@@ -191,6 +191,16 @@ export interface KanbanServiceShape {
     readonly evaluatorModel?: ModelSelection | undefined;
     readonly defaultCardModel?: ModelSelection | undefined;
   }) => Effect.Effect<KanbanBoard, KanbanError>;
+  /**
+   * The owner's create: fails with conflict when the slug is taken. The check and the insert
+   * run under one lock, so two creates for the same slug cannot both succeed.
+   */
+  readonly createBoard: (input: {
+    readonly slug: string;
+    readonly name: string;
+    readonly defaultProjectId: ProjectId | null;
+    readonly evaluatorModel?: ModelSelection | undefined;
+  }) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly updateBoard: (
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
@@ -2472,32 +2482,56 @@ const make = Effect.gen(function* () {
     return added;
   };
 
+  const createBoard: KanbanServiceShape["createBoard"] = (input) =>
+    guard(
+      Effect.gen(function* () {
+        const slug = input.slug.trim().toLowerCase();
+        if ((yield* store.boards).some((board) => board.slug === slug)) {
+          return yield* failWith("conflict", `a board with slug ${slug} already exists`);
+        }
+        return yield* insertBoardUnlocked({ ...input, slug });
+      }),
+    );
+
+  /** Inserts a board for a slug. Callers hold the lock and have checked the slug is free. */
+  const insertBoardUnlocked = Effect.fn("KanbanService.insertBoardUnlocked")(function* (input: {
+    readonly slug: string;
+    readonly name: string;
+    readonly defaultProjectId: ProjectId | null;
+    readonly managerModel?: ModelSelection | undefined;
+    readonly evaluatorModel?: ModelSelection | undefined;
+    readonly defaultCardModel?: ModelSelection | undefined;
+  }) {
+    const slug = input.slug.trim().toLowerCase();
+    const board: KanbanBoard = {
+      id: KanbanBoardId.make(`board-${slug}`),
+      slug,
+      name: input.name.trim() || slug,
+      icon: null,
+      iconImage: null,
+      defaultProjectId: input.defaultProjectId,
+      managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
+      evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
+      defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
+      reviewChains: [],
+      defaultReviewChain: null,
+      instructions: Defaults.DEFAULT_INSTRUCTIONS,
+      setup: null,
+      createdAt: yield* nowIso,
+      archivedAt: null,
+    };
+    yield* store.putBoardWithPools(board, missingPools([], boardModels(board)));
+    yield* publish(board.id, { _tag: "board", board });
+    return board;
+  });
+
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
         const slug = input.slug.trim().toLowerCase();
         const existing = (yield* store.boards).find((board) => board.slug === slug);
         if (existing) return existing;
-        const board: KanbanBoard = {
-          id: KanbanBoardId.make(`board-${slug}`),
-          slug,
-          name: input.name.trim() || slug,
-          icon: null,
-          iconImage: null,
-          defaultProjectId: input.defaultProjectId,
-          managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
-          evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
-          defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
-          reviewChains: [],
-          defaultReviewChain: null,
-          instructions: Defaults.DEFAULT_INSTRUCTIONS,
-          setup: null,
-          createdAt: yield* nowIso,
-          archivedAt: null,
-        };
-        yield* store.putBoardWithPools(board, missingPools([], boardModels(board)));
-        yield* publish(board.id, { _tag: "board", board });
-        return board;
+        return yield* insertBoardUnlocked({ ...input, slug });
       }),
     );
 
@@ -3694,6 +3728,7 @@ const make = Effect.gen(function* () {
   return KanbanService.of({
     boards: read(store.boards),
     ensureBoard,
+    createBoard,
     updateBoard,
     snapshot: (boardId) => read(snapshotOf(boardId)),
     watch,
