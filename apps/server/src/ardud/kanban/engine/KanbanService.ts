@@ -39,6 +39,7 @@ import {
   type KanbanThreadState,
   type KanbanWikiPage,
   type ModelSelection,
+  type ProviderOptionSelection,
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -76,6 +77,21 @@ import { KanbanModels, isListed } from "./models.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
+
+/**
+ * Same option list in the same order. A value that isn't a primitive compares by reference,
+ * so it reads as changed and gets checked: the safe direction for a validation skip.
+ */
+function sameOptions(
+  left: ReadonlyArray<ProviderOptionSelection>,
+  right: ReadonlyArray<ProviderOptionSelection>,
+): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((option, index) => {
+    const other = right[index];
+    return other !== undefined && option.id === other.id && option.value === other.value;
+  });
+}
 const OWNER_NAME = "You";
 
 export interface NewLink {
@@ -2511,7 +2527,7 @@ const make = Effect.gen(function* () {
               previous !== undefined &&
               previous.instanceId === step.instanceId &&
               previous.model === step.model &&
-              JSON.stringify(previous.options ?? []) === JSON.stringify(step.options ?? []);
+              sameOptions(previous.options ?? [], step.options ?? []);
             if (!unchanged) yield* checkModel(step);
           }
         }

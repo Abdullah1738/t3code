@@ -3222,6 +3222,34 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
   }),
 );
 
+it.effect("repairing one review-chain step is not blocked by another invalid step", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const missing = modelSelectionOf({ model: "opus/retired-model" });
+      const repaired = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+      // Both steps are invalid under the fake catalog: one unknown model, one bad variant.
+      // Written to the store directly: updateBoard itself now refuses them.
+      const store = yield* KanbanStore.KanbanStore;
+      const current = (yield* store.boards).find((candidate) => candidate.id === board.id);
+      yield* store.putBoard({
+        ...current!,
+        reviewChains: [{ name: "Critical", steps: [missing, astraHigh] }],
+      });
+      const stored = yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Critical", steps: [repaired, astraXhigh] }],
+      });
+      assert.deepStrictEqual(stored.reviewChains[0]?.steps, [repaired, astraXhigh]);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a card stored with an invalid model is not started and is flagged", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
