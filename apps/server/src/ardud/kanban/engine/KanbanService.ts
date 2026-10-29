@@ -1623,23 +1623,6 @@ const make = Effect.gen(function* () {
     return !!view && !view.archived;
   });
 
-  /** The newest live board-channel evaluator (no card), if any. */
-  const boardEvaluator = Effect.fn("KanbanService.boardEvaluator")(function* (
-    boardId: KanbanBoard["id"],
-  ) {
-    // Ended links stay sendable: a setup or request evaluator is ended at its
-    // turn's end but its thread still takes messages.
-    const links = yield* store.threadLinks({ boardId, open: false });
-    const boardLevel = links
-      .filter((link) => link.role === "evaluator" && link.cardId === null)
-      .toReversed()
-      .slice(0, 20);
-    for (const link of boardLevel) {
-      if (yield* liveEvaluator(link.threadId)) return link.threadId;
-    }
-    return null;
-  });
-
   /**
    * The discussion's evaluator gets the text: an existing one is steered,
    * otherwise one starts. A `note` owes no reply in the discussion.
@@ -1666,20 +1649,6 @@ const make = Effect.gen(function* () {
         yield* threads.interrupt(
           discussion.evaluatorThreadId,
           `Replaced as evaluator of "${discussion.title}"`,
-        );
-      }
-    }
-    // Board channels share the board's live evaluator; card discussions start their own.
-    if (discussion.cardId === null) {
-      const live = yield* boardEvaluator(discussion.boardId);
-      if (live !== null) {
-        return yield* deliver(
-          withParticipant({ ...discussion, evaluatorThreadId: live }, actorOf(live), "Evaluator", {}),
-          actorOf(live),
-          "Evaluator",
-          live,
-          text,
-          note,
         );
       }
     }
