@@ -66,9 +66,10 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
         "SELECT json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
       ).all(sessionId, sinceMs, maxRows + 1);
       if (rows.some(stepRan)) return "ran";
-      // `none` needs a complete scan: a truncated one may hide a tool row past the cap.
+      // `none` needs a complete scan: a truncated one may hide a tool row past the cap. And every
+      // step must be terminal with fully known, no-tool content (an unfinished step may still run).
       if (rows.length === 0 || rows.length > maxRows) return "unknown";
-      return rows.every(row => row.finish === "stop" || stepIsEmpty(row)) ? "none" : "unknown";
+      return rows.every(stepIsTerminalNoTool) ? "none" : "unknown";
     } catch {
       close();
       return "unknown";
@@ -85,12 +86,23 @@ function stepRan(row: { finish: unknown; content: unknown }): boolean {
   return Array.isArray(row.content) && row.content.some(part => (part as { type?: unknown })?.type === "tool");
 }
 
-/** An empty step: no content at all, so it proves nothing was called. Used for a provider error with no output. */
-function stepIsEmpty(row: { content: unknown }): boolean {
-  if (typeof row.content === "string") {
-    try { return (JSON.parse(row.content) as unknown[]).length === 0; } catch { return false; }
-  }
-  return Array.isArray(row.content) && row.content.length === 0;
+/** Content parts a step can carry without calling a tool. Any other part type is not proven tool-free. */
+const NO_TOOL_PARTS = new Set(["text", "reasoning"]);
+
+/**
+ * A step that settled without calling a tool. It must be terminal (OpenCode wrote a `stop` or
+ * `error` finish; an unfinished step may still be executing) and its content, read in full, may
+ * hold only text or reasoning. A failed first call with no output has empty content.
+ */
+function stepIsTerminalNoTool(row: { finish: unknown; content: unknown }): boolean {
+  if (row.finish !== "stop" && row.finish !== "error") return false;
+  const parts = typeof row.content === "string" ? parseParts(row.content) : row.content;
+  if (!Array.isArray(parts)) return false;
+  return parts.every(part => NO_TOOL_PARTS.has(String((part as { type?: unknown })?.type)));
+}
+
+function parseParts(text: string): unknown {
+  try { return JSON.parse(text); } catch { return undefined; }
 }
 
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
