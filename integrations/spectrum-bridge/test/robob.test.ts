@@ -619,6 +619,23 @@ async function failedWake(path: string, session: string, base: number, offsetsMs
   return { control, store, router, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
 }
 
+test("an error step with a pending native retry is never retried, even when that execution later completes a tool", async () => {
+  // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
+  const { path, base } = nativeDb("ses_retry_run", [["msg_retry", { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: Date.now() + 120_000 }, error: { type: "provider.internal" } }]]);
+  const first = await failedWake(path, "ses_retry_run", base, []);
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // During the backoff the same execution carries on and completes a tool. A terminal step does not prove it stopped.
+  const db = new Database(path);
+  db.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }), "msg_retry");
+  db.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
+
 test("an unfinished native step is never retried, even when that run later completes a tool", async () => {
   // The first call's row has no finish yet: execution may still be running, so it is not provably tool-free.
   const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);

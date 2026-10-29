@@ -53,6 +53,8 @@ test("native run evidence: truncated scans are unknown, a complete stop-only run
   // A terminal error that emitted text or reasoning but no tool is proven tool-free.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
+  // OpenCode can record a pending native retry on an error step and keep executing: not settled.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: 2000 }, error: { type: "provider.internal" } } }]))("ses_run", 0)).toBe("unknown");
   // A content part the reader does not know is not proven tool-free.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "file", url: "x" }] } }]))("ses_run", 0)).toBe("unknown");
   // No rows in the window: nothing to prove.
