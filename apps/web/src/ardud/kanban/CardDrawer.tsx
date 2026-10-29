@@ -809,13 +809,14 @@ function ThreadList(props: {
       {list.map((thread) => {
         const live = props.state.threads.get(thread.threadId);
         const running = live?.running ?? false;
+        const stuck = live?.needsInput ?? false;
         return (
           <li key={thread.threadId} className="flex items-center gap-1">
             <ThreadLink
               threadId={thread.threadId}
               className="-ms-2 flex h-11 min-w-0 flex-1 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
             >
-              <Glyph kind={running ? "ok" : thread.endedAt ? "done" : "idle"} />
+              <Glyph kind={stuck ? "ask" : running ? "ok" : thread.endedAt ? "done" : "idle"} />
               <span className="min-w-0 flex-1 truncate">
                 {live?.title ?? ROLE_LABELS[thread.role]}
               </span>

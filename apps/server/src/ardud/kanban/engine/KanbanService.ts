@@ -635,7 +635,13 @@ const make = Effect.gen(function* () {
     yield* store.putThreadLink(link);
     yield* publish(link.boardId, {
       _tag: "thread",
-      thread: { threadId: link.threadId, title, running: true, lastActivityAt: link.startedAt },
+      thread: {
+        threadId: link.threadId,
+        title,
+        running: true,
+        needsInput: false,
+        lastActivityAt: link.startedAt,
+      },
     });
   });
 
@@ -741,7 +747,8 @@ const make = Effect.gen(function* () {
     const state: KanbanThreadState = {
       threadId,
       title: view.title,
-      running: view.state !== "idle",
+      running: view.state !== "idle" && view.state !== "needs-input",
+      needsInput: view.state === "needs-input",
       lastActivityAt: view.updatedAt,
     };
     return [state];
@@ -772,7 +779,7 @@ const make = Effect.gen(function* () {
             discussionId: link.discussionId,
             model: link.model,
             title: view?.title ?? null,
-            running: view !== null && view.state !== "idle",
+            running: view !== null && view.state !== "idle" && view.state !== "needs-input",
             lastActivityAt: view?.updatedAt ?? null,
             startedAt: link.startedAt,
             endedAt: link.endedAt,

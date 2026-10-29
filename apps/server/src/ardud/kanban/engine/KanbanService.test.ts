@@ -1113,6 +1113,36 @@ it.effect("the tick nudges a quiet worker and interrupts one stuck on its own qu
   }),
 );
 
+it.effect("a thread stuck on its own question shows as needing input, not running", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const entryOf = Effect.map(kanban.snapshot(board.id), (snapshot) =>
+        snapshot.threads.find((entry) => entry.threadId === thread)!,
+      );
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.stuck = true;
+        return all;
+      });
+      const stuck = yield* entryOf;
+      assert.isFalse(stuck.running);
+      assert.isTrue(stuck.needsInput);
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.stuck = false;
+        return all;
+      });
+      yield* setRunning(fake, thread, true);
+      const busy = yield* entryOf;
+      assert.isTrue(busy.running);
+      assert.isFalse(busy.needsInput);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a work thread's own cards are the ones it took and still has", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

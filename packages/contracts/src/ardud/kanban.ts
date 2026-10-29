@@ -682,6 +682,8 @@ export const KanbanThreadState = Schema.Struct({
   threadId: ThreadId,
   title: Schema.String,
   running: Schema.Boolean,
+  /** Waiting on its own built-in question, which nobody sees; running is false then. */
+  needsInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   lastActivityAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;

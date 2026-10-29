@@ -132,6 +132,7 @@ export interface CardView {
   } | null;
   readonly model: { readonly name: string; readonly letter: string };
   readonly running: boolean;
+  readonly needsInput: boolean;
   readonly unread: number;
   /** Subtasks done or skipped out of all, or null for a card with no plan. */
   readonly subtasks: { readonly done: number; readonly total: number } | null;
@@ -210,6 +211,7 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
     pr: pr ? { label: prLabel(pr.url, pr.label), url: pr.url, state: pr.state } : null,
     model: { name: modelName(card.model), letter: modelLetter(card.model) },
     running: thread?.running ?? false,
+    needsInput: thread?.needsInput ?? false,
     unread: card.discussionId === null ? 0 : (state.unread.get(card.discussionId) ?? 0),
     subtasks: card.subtasks.length === 0 ? null : { done: finished, total: card.subtasks.length },
     card,

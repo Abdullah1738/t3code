@@ -46,7 +46,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
     "- When the work is done, attach every PR with card_update (links) and call card_move to needs_review with a one-line note. A reviewer picks it up; findings come back to you in this thread.",
-    "- If you need a decision from the owner, ask with card_ask. Don't guess on product or risk calls. Ask async and keep working where you can; his answer comes to this thread. Pass blocking only when you can't go on without it: the card then waits in Needs Owner and comes back to you with the answer.",
+    "- If you need a decision from the owner, ask with card_ask. Don't guess on product or risk calls. Ask async and keep working where you can; his answer comes to this thread. Pass blocking only when you can't go on without it: the card then waits in Needs Owner and comes back to you with the answer. Never use the built-in question tool: nobody sees it and the card stalls.",
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,

@@ -176,6 +176,16 @@ describe("stageBoard", () => {
     expect(view.total).toBe(5);
   });
 
+  it("a card whose thread waits on its own question shows needsInput, not running", () => {
+    const state = boardStateFromSnapshot({
+      ...snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]),
+      threads: [{ threadId: ThreadId.make("t1"), title: "w", running: false, needsInput: true, lastActivityAt: null }],
+    } as never);
+    const view = stageBoard(state, NOW).active.find((column) => column.stage === "working")!.cards[0]!;
+    expect(view.needsInput).toBe(true);
+    expect(view.running).toBe(false);
+  });
+
   it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {
     const ask = (id: string, text: string, blocking: boolean, closedAt: string | null = null) => ({
       id,

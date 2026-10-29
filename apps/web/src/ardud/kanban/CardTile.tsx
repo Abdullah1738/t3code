@@ -94,7 +94,11 @@ export const CardTile = memo(function CardTile(props: {
             {card.subtasks.done}/{card.subtasks.total}
           </span>
         ) : null}
-        {card.running ? <Glyph kind="ok" label="Running" /> : null}
+        {card.needsInput ? (
+          <Glyph kind="ask" label="Stuck on its own question" />
+        ) : card.running ? (
+          <Glyph kind="ok" label="Running" />
+        ) : null}
         <ModelMark name={card.model.name} letter={card.model.letter} />
       </span>
     </button>
