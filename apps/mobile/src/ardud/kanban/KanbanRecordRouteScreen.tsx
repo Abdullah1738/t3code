@@ -1,5 +1,6 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import {
+  cardSteps,
   discussionSnoozed,
   type KanbanBoardState,
   setupBanner,
@@ -17,6 +18,7 @@ import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
 import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
+import { useBoardFilter } from "./boardFilterStore";
 import { copyLinkAction } from "./copyLink";
 import { SetupStrip } from "./BoardView";
 import { Chat } from "./Chat";
@@ -52,6 +54,7 @@ export function KanbanRecordRouteScreen({
   const feed = useKanbanBoardFeed(boardId);
   const nav = useKanbanNav(boardId);
   const back = () => navigation.goBack();
+  const filter = useBoardFilter(boardId);
 
   if (record === null) {
     return (
@@ -71,17 +74,35 @@ export function KanbanRecordRouteScreen({
   switch (record.kind) {
     case "card": {
       const card = state.cards.get(record.id ?? "");
+      const steps = cardSteps(state, nowMs, filter, "stage", record.id ?? "");
+      // Stepping replaces this screen's card (no new screen), so Back still returns to the board.
+      const step = (id: string) => navigation.setParams({ ...route.params, id });
       return (
         <Shell
           title={card ? `#${card.number}` : "Card"}
           onBack={back}
-          actions={
-            card ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)] : []
-          }
+          actions={[
+            ...(card
+              ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)]
+              : []),
+            {
+              accessibilityLabel: "Previous card",
+              icon: "chevron.up",
+              disabled: steps.previous === null,
+              onPress: () => steps.previous && step(steps.previous),
+            },
+            {
+              accessibilityLabel: "Next card",
+              icon: "chevron.down",
+              disabled: steps.next === null,
+              onPress: () => steps.next && step(steps.next),
+            },
+          ]}
           state={state}
           boardId={boardId}
         >
           <CardDetail
+            key={record.id}
             boardId={boardId}
             state={state}
             cardId={record.id ?? ""}
@@ -90,6 +111,7 @@ export function KanbanRecordRouteScreen({
             onOpenCard={nav.openCard}
             onOpenGoal={nav.openGoal}
             onOpenThread={nav.openThread}
+            stepper={{ steps, onStep: step, onDone: back }}
           />
         </Shell>
       );

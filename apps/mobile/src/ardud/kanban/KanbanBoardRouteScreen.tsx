@@ -1,5 +1,5 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { totalUnread } from "@t3tools/client-runtime/ardud/kanban";
+import { cardSteps, totalUnread } from "@t3tools/client-runtime/ardud/kanban";
 import { useState } from "react";
 import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
@@ -11,6 +11,7 @@ import { EmptyLine } from "../common/parts";
 import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { BoardView } from "./BoardView";
 import { CardDetail } from "./CardDetail";
+import { useBoardFilter } from "./boardFilterStore";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { boardLayout, cardPaneWidth, type KanbanBoardParams } from "./logic";
 import { useKanbanNav } from "./nav";
@@ -44,6 +45,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   const openCard = (cardId: string) => (pane ? setPaneCardId(cardId) : nav.openCard(cardId));
   const paneCard = pane && paneCardId !== null && state?.cards.has(paneCardId) ? paneCardId : null;
   const unread = state ? totalUnread(state) : 0;
+  const filter = useBoardFilter(boardId);
 
   let body: React.ReactNode;
   if (boardId === "") body = <EmptyLine label="This link does not open a board." />;
@@ -88,6 +90,11 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
               onOpenGoal={nav.openGoal}
               onOpenThread={nav.openThread}
               onClose={() => setPaneCardId(null)}
+              stepper={{
+                steps: cardSteps(state, nowMs, filter, "stage", paneCard),
+                onStep: setPaneCardId,
+                onDone: () => setPaneCardId(null),
+              }}
             />
           </View>
         ) : null}
