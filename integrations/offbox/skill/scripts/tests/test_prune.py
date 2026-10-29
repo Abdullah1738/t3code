@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,7 +87,7 @@ class ScriptTests(Isolated):
             sudo.write_text("#!/bin/sh\nexit 0\n")
             sudo.chmod(sudo.stat().st_mode | stat.S_IEXEC)
             dirs = ["w/a-aaaaaa", "w/it's-bbbbbb", "w/c-cccccc", "w/d-dddddd"]
-            p = subprocess.run(["bash", "-c", prune.script(dirs)],
+            p = subprocess.run(["bash", "-c", prune.script(dirs, "t1")],
                                env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=10)
             self.assertEqual(p.returncode, 0, p.stderr)
@@ -112,7 +113,7 @@ class ScriptTests(Isolated):
             stall.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
             stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
             with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"):
-                body = prune.script(["w/a-aaaaaa"])
+                body = prune.script(["w/a-aaaaaa"], "t1")
             p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stderr)
@@ -136,7 +137,7 @@ class ScriptTests(Isolated):
             stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
             # BUDGET_S 2: the first dir starts at $SECONDS 0 so its mv is attempted, then mvb kills it at 2 s.
             with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"):
-                body = prune.script(["w/a-aaaaaa"])
+                body = prune.script(["w/a-aaaaaa"], "t1")
             p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stderr)
@@ -263,36 +264,92 @@ class RunTests(Isolated):
         n, _, _ = self.run_prune()  # finished: back to the 6 h throttle
         self.assertEqual((n, len(self.calls)), (0, 2))
 
-    def test_ssh_timeout_with_stalled_mv_then_reuse_never_renames_checkout(self):
-        # Round-4 P1 regression through run(): a stalled mv makes the script outlive the ssh timeout, the caller
-        # gets a TimeoutExpired, and the box is then reused. The live checkout must be untouched by the reuse.
+    def test_ssh_returns_while_worker_alive_then_reuse_does_not_rename_candidate(self):
+        # Round-5 P1: ssh gives up (TimeoutExpired) while the remote worker is still alive and its candidate is
+        # about to be renamed. run() must not hand the box back on that basis: it must wait for the worker's
+        # done marker, and if that never comes, leave the box pending. A reuse of the candidate while the worker
+        # is still alive must not rename it.
         pidf = Path(self.home.name) / "mv.pid"
-        stall = Path(self.bindir.name) / "mv"  # stalled mv: records its pid, never renames
+        stall = Path(self.bindir.name) / "mv"  # the worker's mv: records its pid, then blocks without renaming
         stall.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
         stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
         real = self.fake_ssh(self.home.name, self.bindir.name, self.calls)
+        worker = {}
 
-        def timing_out(box_id, cmd, input=None, timeout=None):
-            # The stalled script is killed at the budget; the ssh layer reports a timeout to run().
-            real(box_id, cmd, input=input, timeout=timeout)
-            raise subprocess.TimeoutExpired("ssh", timeout)
+        def ssh_gives_up_while_worker_alive(box_id, cmd, input=None, timeout=None):
+            # Start the real script detached, as the remote side does, then return to the caller before it ends.
+            if input is not None:
+                script_body = input.decode()
+                worker["p"] = subprocess.Popen(["bash", "-c", script_body], start_new_session=True,
+                                               env={"HOME": self.home.name,
+                                                    "PATH": f"{self.bindir.name}:/usr/bin:/bin"},
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                worker["script"] = script_body
+                # Wait until the stub mv really is running (the worker is alive, mid-move).
+                for _ in range(100):
+                    if pidf.exists():
+                        break
+                    time.sleep(0.05)
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            # The done-marker probe: the worker has not written it yet, so this must report not-quiesced.
+            return subprocess.CompletedProcess(["ssh"], 1, b"", b"")
 
-        with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"), \
-                patch.object(prune.ssh_sync, "ssh", side_effect=timing_out), \
+        try:
+            with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"), \
+                    patch.object(prune.ssh_sync, "ssh", side_effect=ssh_gives_up_while_worker_alive), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                n = prune.run(self.con, "bx", "w/keep-cccccc")
+            # run() returned while the worker is alive; the worker is still running and must not have renamed
+            # the candidate. The box must be recorded as pending, not settled.
+            self.assertEqual(n, 0)
+            self.assertIsNone(worker["p"].poll())
+            self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
+            # Reuse: the same candidate is offered again (the box was handed back) while the worker is still alive.
+            with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
+                    patch.object(prune.ssh_sync, "ssh", side_effect=real), \
+                    patch.object(prune, "BUDGET_S", 8), contextlib.redirect_stderr(io.StringIO()):
+                prune.run(self.con, "bx", "w/keep-cccccc")
+            self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())  # never renamed while reused
+        finally:
+            if "p" in worker and worker["p"].poll() is None:
+                os.killpg(worker["p"].pid, 9)
+                worker["p"].wait(timeout=5)
+
+    def test_exhausted_budget_probes_nothing_and_settled_dirs_still_counted(self):
+        # Round-5 P2 measured directly: a slow/blocked probe must not run past the budget. Here every candidate's
+        # filesystem probe would hang for 5 s if it ran. With the budget already spent, none may run: the script
+        # returns fast, the hung probe never starts, and the absent dir still counts as settled.
+        import shutil
+        shutil.rmtree(Path(self.home.name) / "w/s2-bbbbbb")  # absent: a settled outcome
+        # A hanging `[` is not stubbable, so the slow probe is a `stat` that sleeps; the script's probes call it.
+        stat_stub = Path(self.bindir.name) / "stat"
+        stat_stub.write_text('#!/bin/sh\nsleep 5\n')
+        stat_stub.chmod(stat_stub.stat().st_mode | stat.S_IEXEC)
+        sentinel = Path(self.home.name) / "probe-ran"
+        blocking_mv = Path(self.bindir.name) / "mv"
+        blocking_mv.write_text(f'#!/bin/sh\ntouch "{sentinel}"\nexec sleep 1000\n')
+        blocking_mv.chmod(blocking_mv.stat().st_mode | stat.S_IEXEC)
+        with patch.object(prune, "BUDGET_S", 0), patch.object(prune, "BACKGROUND", "true"), \
                 contextlib.redirect_stderr(io.StringIO()):
-            n = prune.run(self.con, "bx", "w/keep-cccccc")
+            t0 = time.time()
+            n, _, _ = self.run_prune()
+            elapsed = time.time() - t0
         self.assertEqual(n, 0)
-        self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())  # not renamed by the timed-out run
-        if pidf.exists():
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pidf.read_text().strip()), 0)  # the stalled child is gone before the box is free
-        # Reuse: a later run on the same box (after RETRY_S) sees the same dir and must not rename it while
-        # the previous checkout is still in use by a run that reused it.
-        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
-                patch.object(prune.ssh_sync, "ssh", side_effect=real), \
-                patch.object(prune, "BUDGET_S", 0), contextlib.redirect_stderr(io.StringIO()):
-            prune.run(self.con, "bx", "w/keep-cccccc")
-        self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())
+        self.assertLess(elapsed, 5, "no probe may run once the budget is spent")
+        self.assertFalse(sentinel.exists(), "no mv may start once the budget is spent")
+        # With no budget left nothing is probed, so absent and present dirs are both unknown: both stay pending.
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
+
+    def test_absent_dir_settles_when_budget_remains(self):
+        # The settled-accounting half of round 5 P2: while budget remains, an absent dir is probed (cheaply) and
+        # counted as skip, not pending, so a later pass retries only the present dir.
+        import shutil
+        shutil.rmtree(Path(self.home.name) / "w/s2-bbbbbb")
+        with patch.object(prune, "BUDGET_S", 8), patch.object(prune, "BACKGROUND", "true"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n, _, _ = self.run_prune()
+        self.assertEqual(n, 1)  # s1 pruned
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)  # s2 settled as skip, nothing pending
 
     def test_absent_dirs_are_settled_not_retried_forever(self):
         # Round-4 P2: a dir already deleted but still in runs must not keep the box on 20-minute retries.
@@ -300,9 +357,9 @@ class RunTests(Isolated):
         import shutil
         shutil.rmtree(Path(self.home.name) / "w/s2-bbbbbb")
         with patch.object(prune, "BUDGET_S", 0), patch.object(prune, "BACKGROUND", "true"):
-            n, _, _ = self.run_prune()  # BUDGET_S 0: nothing is moved; s1 is left, s2 is absent (skip)
+            n, _, _ = self.run_prune()  # BUDGET_S 0: nothing is probed, so both are unknown and stay pending
         self.assertEqual(n, 0)
-        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 1)  # only s1 pending, not s2
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
         # Next pass after RETRY_S: s1 now prunes; s2 stays absent and must not be counted as pending again.
         with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
                 patch.object(prune, "BACKGROUND", "true"):
