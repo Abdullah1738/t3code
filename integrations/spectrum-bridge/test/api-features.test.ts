@@ -75,6 +75,29 @@ test("a rule-breaking /send gets one 422 and queues nothing; the retry queues", 
   expect(logged).toEqual(["reply-bounced:banned"]);
 });
 
+test("an accepted rule-breaking send replays as 200 after the turn changes, and bounce state is untouched", async () => {
+  const h = setup({ replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined });
+  const ok = { ...send, text: "Hello there", dedupeKey: "replay-1" };
+  expect((await h.post("/send", ok)).status).toBe(202);
+  // The accepted text is then replayed with a banned word added to the same key: a conflict, not a bounce.
+  const turn = () => h.store.set("activeTurn", { messageId: "m-2" });
+  const bad = { ...send, text: "Giardia again", dedupeKey: "replay-2" };
+  h.store.set("activeTurn", { messageId: "m-1" });
+  const rejected = await h.post("/send", bad);
+  expect(rejected.status).toBe(422);
+  const bounceBefore = h.store.get<unknown>("reply-bounce");
+  // Identical replay after the turn changed and the bounce window would have expired.
+  turn();
+  const replay = await h.post("/send", ok);
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual({ id: `send:${hash("replay-1")}`, created: false });
+  expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
+  // A different text under an accepted key is a conflict (409) and records no bounce.
+  const conflict = await h.post("/send", { ...ok, text: "Giardia changed it" });
+  expect(conflict.status).toBe(409);
+  expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
+});
+
 test("app cards are refused in a group chat with a reason, while send still queues there", async () => {
   const h = setup();
   h.state.chat = "group:GRP-1";

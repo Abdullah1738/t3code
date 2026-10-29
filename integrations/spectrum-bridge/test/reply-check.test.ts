@@ -90,7 +90,59 @@ describe("bounce loop guard", () => {
   });
 });
 
+describe("malformed rules files", () => {
+  test("a string instead of an array is no rules, not one ban per letter", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "r.json");
+    await writeFile(path, JSON.stringify({ moni: { banned: "giardia" } }));
+    expect(readReplyRules(path)).toEqual({});
+    expect(checkReply(moni, "I can do that.", readReplyRules(path))).toBeUndefined();
+  });
+
+  test("null entries and other non-object shapes fall back to {} without throwing", async () => {
+    const dir = await tempDir();
+    for (const body of [{ moni: { banned: [null] } }, { moni: { banned: [""] } }, ["x"], "str", { moni: null }]) {
+      const path = join(dir, `r-${JSON.stringify(body).length}.json`);
+      await writeFile(path, JSON.stringify(body));
+      expect(readReplyRules(path)).toEqual({});
+    }
+    await writeFile(join(dir, "bad.json"), "{not json");
+    expect(readReplyRules(join(dir, "bad.json"))).toEqual({});
+  });
+
+  test("ban refuses to rewrite a malformed file, so other chats' bans are not wiped", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "r.json");
+    await writeFile(path, JSON.stringify({ moni: { banned: "giardia" }, owner: { banned: ["x"] } }));
+    await expect(editBans(path, "owner", "ban", "y")).rejects.toThrow("malformed");
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ moni: { banned: "giardia" }, owner: { banned: ["x"] } });
+  });
+});
+
 describe("ban, unban and bans", () => {
+  test("seeded mixed-case and punctuated entries are normalized, so unban clears them and ban does not duplicate them", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "reply-rules.json");
+    await writeFile(path, JSON.stringify({ moni: { banned: ["Noble Vet", "noble-vet", "Giardia"] } }));
+    expect(readReplyRules(path)).toEqual({ moni: { banned: ["noble vet", "giardia"] } });
+    await editBans(path, "moni", "ban", "GIARDIA!");
+    expect(readReplyRules(path)).toEqual({ moni: { banned: ["noble vet", "giardia"] } });
+    await editBans(path, "moni", "unban", "noble vet");
+    expect(readReplyRules(path)).toEqual({ moni: { banned: ["giardia"] } });
+    expect(checkReply(moni, "Noble-Vet results", readReplyRules(path))).toBeUndefined();
+  });
+
+  test("ban and unban work on a seeded file via the CLI runner", async () => {
+    const dir = await tempDir();
+    const rulesPath = join(dir, "reply-rules.json");
+    await writeFile(rulesPath, JSON.stringify({ moni: { banned: ["Noble Vet", "noble-vet"] } }));
+    const run = (args: string[]) => runLocalCommand(parseLocalCommand(args), { rulesPath });
+    await run(["unban", "--chat", "moni", "--word", "noble vet"]);
+    expect(await run(["bans", "--chat", "moni"])).toEqual({ moni: { banned: [] } });
+  });
+});
+
+describe("ban, unban and bans (original)", () => {
   test("ban dedupes, unban removes, bans lists, and the file is mode 0600", async () => {
     const dir = await tempDir();
     const rulesPath = join(dir, "reply-rules.json");

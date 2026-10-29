@@ -8,6 +8,7 @@ export type ReplyRules = Record<string, { banned: string[] }>;
 export type ReplyHit = { rule: string; reason: string };
 
 const MAX_MONI_CHARS = 600;
+const MALFORMED = "reply-rules.json is unreadable or malformed; fix it before changing bans";
 const BOUNCE_WINDOW_MS = 30 * 60_000;
 const SENT_TEXTS = 50;
 
@@ -19,11 +20,42 @@ const CARD_LIMIT = /\blimits?\b|available (credit|balance)|headroom|balance firs
 const CARD_DECLINE = /\bdeclined\b/i;
 const CARD_SMS = /\b(sms|text)\b/i;
 
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * Strict load: a missing file is no rules; a file that exists but is malformed throws, so an edit
+ * can never silently rewrite (and wipe) another chat's bans. Entries are normalized and deduped on load.
+ */
+export function readReplyRulesStrict(path: string): ReplyRules {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(MALFORMED);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(MALFORMED);
+  }
+  if (!isObject(parsed)) throw new Error(MALFORMED);
+  const rules: ReplyRules = {};
+  for (const [slug, entry] of Object.entries(parsed)) {
+    if (!isObject(entry) || !Array.isArray(entry.banned)) throw new Error(MALFORMED);
+    const banned = entry.banned.map(word => typeof word === "string" ? normalizeWords(word) : "");
+    if (banned.some(word => !word)) throw new Error(MALFORMED);
+    rules[slug] = { banned: [...new Set(banned)] };
+  }
+  return rules;
+}
+
+/** Agent-path read: a bad file means no rules (fail-open for the check, never a 409 on every send). */
 export function readReplyRules(path: string): ReplyRules {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as ReplyRules;
+    return readReplyRulesStrict(path);
   } catch {
     return {};
   }
@@ -69,7 +101,7 @@ export function noteSent(store: Store, turnKey: string, text: string): void {
 
 /** Adds or removes a banned word for one chat, writing atomically with mode 0600. */
 export async function editBans(path: string, slug: string, action: "ban" | "unban", word: string): Promise<ReplyRules> {
-  const rules = readReplyRules(path);
+  const rules = readReplyRulesStrict(path);
   const needle = normalizeWords(word);
   const current = new Set(rules[slug]?.banned ?? []);
   if (action === "ban") current.add(needle);

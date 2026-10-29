@@ -140,6 +140,28 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
   return { id, created };
 }
 
+/** The stored spec for a send key on the live route, plus the spec this request would store. */
+function sendSpecs(store: Store, dedupeKey: string, sessionId: string, content: SessionContent) {
+  const id = `send:${hash(dedupeKey)}`;
+  const route = store.get<{ id: string; generation: number } | null>("route");
+  if (!sessionMatches(route, sessionId)) return undefined;
+  const spec = JSON.stringify({ id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation });
+  const saved = store.get<{ spec: string }>(`api:send:${id}`)?.spec;
+  return { id, spec, saved };
+}
+
+/** The id of an identical, already-accepted send on the live route; undefined for anything new or conflicting. */
+function sendReplay(store: Store, dedupeKey: string, sessionId: string, content: SessionContent): string | undefined {
+  const specs = sendSpecs(store, dedupeKey, sessionId, content);
+  return specs && specs.saved === specs.spec ? specs.id : undefined;
+}
+
+/** True when the key is already accepted with different content (queueSession answers 409 for this). */
+function sendConflict(store: Store, dedupeKey: string, sessionId: string, content: SessionContent): boolean {
+  const specs = sendSpecs(store, dedupeKey, sessionId, content);
+  return specs !== undefined && specs.saved !== undefined && specs.saved !== specs.spec;
+}
+
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
 export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
@@ -240,15 +262,22 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
         const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
+        const content = {
+          text, ...(effect === undefined ? {} : { effect }), ...(subject === undefined ? {} : { subject: subject as string }),
+        };
+        // A bounce is only for a fresh request on the live route. Replays of an accepted send, and any
+        // stale or conflicting request, keep their existing answer and never touch bounce state.
+        const existing = sendReplay(store, dedupeKey, sessionId, content);
+        if (existing) return json({ id: existing, created: false }, 200);
+        // A stored key with different content is a conflict, reported before any rule is applied.
+        if (sendConflict(store, dedupeKey, sessionId, content)) throw new ApiError(409);
         const hit = replyCheck?.(text);
         if (hit && mayBounce(store, turnKey)) {
           noteBounce(store, turnKey);
           log?.("reply-bounced", hit.rule);
           return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
         }
-        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, {
-          text, ...(effect === undefined ? {} : { effect }), ...(subject === undefined ? {} : { subject: subject as string }),
-        });
+        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content);
         if (created) noteSent(store, turnKey, text);
         return json({ id, created }, created ? 202 : 200);
       }
