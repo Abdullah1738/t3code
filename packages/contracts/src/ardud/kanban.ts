@@ -416,6 +416,8 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Review events: the commit the reviewer reviewed, when it said. Null otherwise. */
+  head: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanCardEvent = typeof KanbanCardEvent.Type;
 

@@ -151,7 +151,7 @@ export const reviewBrief = (
     card.subtasks.length > 0
       ? "Check the subtasks the worker marked done really are; a clear verdict ticks off the review's own."
       : null,
-    "Finish by calling card_review_result exactly once:",
+    "Finish by calling card_review_result exactly once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
     board.instructions.reviewerRouting.trim()

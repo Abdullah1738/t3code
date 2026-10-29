@@ -245,6 +245,12 @@ const CardReviewResult = tool(
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),
+    head: Schema.optional(
+      Schema.String.annotate({
+        description:
+          "The commit you reviewed: the PR's head sha, or `git rev-parse HEAD` on the card's branch. Stored on the review event so scripts land only what was reviewed.",
+      }),
+    ),
   },
   { card: Record },
   { readonly: false },

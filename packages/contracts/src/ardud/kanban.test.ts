@@ -5,6 +5,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanCardEvent,
   kanbanBlocking,
   kanbanBoardIcon,
   kanbanHeldUpBy,
@@ -58,6 +59,22 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
     ...rest,
   };
 }
+
+describe("KanbanCardEvent", () => {
+  it("decodes an event stored before head existed as head null", () => {
+    const event = Schema.decodeUnknownSync(KanbanCardEvent)({
+      id: 1,
+      cardId: "card-1",
+      at: "2026-10-29T10:00:00.000Z",
+      actor: { _tag: "owner" },
+      kind: "review",
+      fromStage: "in_review",
+      toStage: "completed",
+      body: "clear",
+    });
+    expect(event.head).toBeNull();
+  });
+});
 
 describe("kanbanBlocking", () => {
   it("counts a diamond of waiters once each and takes the most urgent one's priority", () => {

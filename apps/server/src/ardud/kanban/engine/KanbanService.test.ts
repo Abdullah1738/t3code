@@ -241,6 +241,54 @@ it.effect("runs a card from To-Do through work, review findings, fix and a clear
   }),
 );
 
+it.effect("a review event records the head the reviewer passed", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Fix the flaky test", title: "Flaky test" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const thread: KanbanActor = { _tag: "thread", threadId: workThread };
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", thread, { note: "done" });
+      yield* kanban.dispatchNow;
+      const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+
+      const invalid = yield* kanban
+        .reviewResult(reviewThread, "clear", [], "not-a-sha")
+        .pipe(Effect.flip);
+      assert.strictEqual(invalid.code, "invalid");
+      assert.strictEqual((yield* kanban.card(created.id)).card.stage, "in_review");
+
+      // A findings round without a head stores head null on its review event.
+      yield* kanban.reviewResult(reviewThread, "findings", ["Test still sleeps 2s"]);
+      yield* kanban.dispatchNow;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", thread);
+      yield* kanban.dispatchNow;
+      const secondReview = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.reviewResult(secondReview, "clear", [], " ABC1234DEF ");
+
+      const reviews = (yield* kanban.card(created.id)).events.filter(
+        (event) => event.kind === "review",
+      );
+      assert.deepStrictEqual(
+        reviews.map((event) => event.head),
+        [null, "abc1234def"],
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("tells the card's evaluator to decide scope after the third findings round", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

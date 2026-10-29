@@ -297,10 +297,12 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** `head` is the reviewed commit, stored on the review event. */
   readonly reviewResult: (
     threadId: ThreadId,
     verdict: "clear" | "findings",
     findings: ReadonlyArray<string>,
+    head?: string | null,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly cardThread: (
     cardId: KanbanCard["id"],
@@ -877,6 +879,7 @@ const make = Effect.gen(function* () {
       readonly fromStage?: KanbanStage | null;
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
+      readonly head?: string | null;
     } = {},
   ) {
     return yield* store.addCardEvent({
@@ -887,6 +890,7 @@ const make = Effect.gen(function* () {
       fromStage: extra.fromStage ?? null,
       toStage: extra.toStage ?? null,
       body: extra.body ?? null,
+      head: extra.head ?? null,
     });
   });
 
@@ -3796,7 +3800,12 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings) =>
+  const reviewResult: KanbanServiceShape["reviewResult"] = (
+    threadId,
+    verdict,
+    findings,
+    head,
+  ) =>
     guard(
       Effect.gen(function* () {
         const link = yield* store.threadLink(threadId);
@@ -3812,6 +3821,13 @@ const make = Effect.gen(function* () {
         }
         if (verdict === "findings" && findings.length === 0) {
           return yield* failWith("invalid", "findings need at least one line");
+        }
+        const sha = head?.trim().toLowerCase() || null;
+        if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
+          return yield* failWith(
+            "invalid",
+            "head is the commit you reviewed: 7 to 40 hex characters",
+          );
         }
         const board = yield* boardOf(card.boardId);
         const chain = Rules.chainFor(board, card);
@@ -3846,6 +3862,7 @@ const make = Effect.gen(function* () {
           fromStage: card.stage,
           toStage: next.stage,
           body,
+          head: sha,
         });
         yield* saveCard(next);
         yield* evaluatorTurn(card, next, { _tag: "thread", threadId });
