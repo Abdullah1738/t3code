@@ -31,6 +31,7 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
@@ -395,6 +396,12 @@ function Details(props: {
     void runAction("Couldn't update the card", () =>
       kanban.patchCard({ cardId: card.id as never, ...input }),
     );
+  const removeLink = async (link: KanbanCard["links"][number]) => {
+    const message = `Remove this link from the card?\n${link.label ?? link.url}`;
+    const confirmed =
+      (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
+    if (confirmed) patch({ removeLinks: [link.url] });
+  };
   const moves = props.events
     .filter((event) => event.kind === "moved")
     .slice(-6)
@@ -498,10 +505,23 @@ function Details(props: {
           <Fact label="Links">
             <span className="flex flex-wrap gap-1.5">
               {card.links.map((link) => (
-                <LinkChip key={link.url} href={link.url}>
-                  {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
-                  {link.label ?? link.kind}
-                </LinkChip>
+                <span key={link.url} className="inline-flex items-center">
+                  <LinkChip href={link.url}>
+                    {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
+                    {link.label ?? link.kind}
+                  </LinkChip>
+                  {canPatch ? (
+                    <button
+                      type="button"
+                      onClick={() => void removeLink(link)}
+                      aria-label={`Remove link ${link.label ?? link.url}`}
+                      title="Remove link"
+                      className="grid size-5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  ) : null}
+                </span>
               ))}
             </span>
           </Fact>
