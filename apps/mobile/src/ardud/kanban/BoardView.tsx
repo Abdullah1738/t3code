@@ -18,7 +18,7 @@ import {
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
@@ -39,6 +39,7 @@ import {
   parseFilterAction,
   type FilterAction,
 } from "./logic";
+import { publishBoardFilter } from "./boardFilterStore";
 import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts";
 
 // Needs Owner cards shown above the tabs before "All N" opens the rest.
@@ -124,6 +125,8 @@ export function BoardView(props: {
   const [query, setQuery] = useState("");
   const searchRef = useRef<TextInputInstance | null>(null);
   const filter = boardFilter(props.state, prefs, query.trim());
+  // Card screens step through the same cards the board shows.
+  useEffect(() => publishBoardFilter(boardId, filter), [boardId, filter]);
   const pickedGoalIds = filter.goalIds ?? [];
   const board = stageBoard(props.state, props.nowMs, filter);
   const picked = activeFilterCount(prefs);

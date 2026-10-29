@@ -7,6 +7,7 @@ import {
   STAGE_LABELS,
   SUBTASK_OWNER_LABELS,
   subtaskSteps,
+  type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
@@ -15,6 +16,7 @@ import { Pressable, ScrollView, View } from "react-native";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
+import { ControlPill } from "../../components/ui/ControlPill";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { ActionButton, EmptyLine } from "../common/parts";
@@ -33,6 +35,14 @@ const ROLE_LABEL: Record<KanbanThreadLink["role"], string> = {
   evaluator: "Evaluator",
 };
 
+/** Neighbours on the board and what Settle opens next, for the card's stepper. */
+export interface CardStepper {
+  readonly steps: CardSteps;
+  readonly onStep: (cardId: string) => void;
+  /** Settle left nothing to open: close the card. */
+  readonly onDone: () => void;
+}
+
 /** One card: title and chips, then its details, discussion and threads. */
 export function CardDetail(props: {
   readonly boardId: string;
@@ -45,6 +55,8 @@ export function CardDetail(props: {
   readonly onOpenThread: (threadId: string) => void;
   /** Shown in a pane beside the board: a close button and the number in the header. */
   readonly onClose?: () => void;
+  /** Up and down between neighbours, and Settle's next card. Omit when not over the board. */
+  readonly stepper?: CardStepper;
 }) {
   const card = props.state.cards.get(props.cardId);
   const [tab, setTab] = useState<CardTab>("details");
@@ -59,6 +71,7 @@ export function CardDetail(props: {
         state={props.state}
         nowMs={props.nowMs}
         onClose={props.onClose}
+        stepper={props.stepper}
         onOpenGoal={props.onOpenGoal}
         onAnswer={() => setTab("discussion")}
       />
@@ -129,10 +142,11 @@ function CardHeader(props: {
   readonly state: KanbanBoardState;
   readonly nowMs: number;
   readonly onClose: (() => void) | undefined;
+  readonly stepper: CardStepper | undefined;
   readonly onOpenGoal: (goalId: string) => void;
   readonly onAnswer: () => void;
 }) {
-  const { card } = props;
+  const { card, stepper } = props;
   const view = cardView(card, props.state, props.nowMs);
   const asks = askViews(card, props.nowMs);
   const goal = view.goal;
@@ -142,6 +156,22 @@ function CardHeader(props: {
         <View className="flex-row items-center gap-2">
           <PriorityBars priority={card.priority} />
           <Text className="flex-1 text-[13px] text-foreground-muted">{card.number}</Text>
+          {stepper ? (
+            <>
+              <ControlPill
+                icon="chevron.up"
+                accessibilityLabel="Previous card"
+                disabled={stepper.steps.previous === null}
+                onPress={() => stepper.steps.previous && stepper.onStep(stepper.steps.previous)}
+              />
+              <ControlPill
+                icon="chevron.down"
+                accessibilityLabel="Next card"
+                disabled={stepper.steps.next === null}
+                onPress={() => stepper.steps.next && stepper.onStep(stepper.steps.next)}
+              />
+            </>
+          ) : null}
           <ActionButton label="Close" onPress={props.onClose} />
         </View>
       ) : null}
@@ -178,7 +208,7 @@ function CardHeader(props: {
           label="Copy link"
           onPress={copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`).onPress}
         />
-        <CardActions card={card} />
+        <CardActions card={card} stepper={stepper} />
       </View>
     </View>
   );
@@ -240,8 +270,11 @@ function OwnerAsks(props: {
 }
 
 /** Settle once verified, Stop while a thread runs, back to To-Do from Needs Owner. */
-function CardActions(props: { readonly card: KanbanCard }) {
-  const { card } = props;
+function CardActions(props: {
+  readonly card: KanbanCard;
+  readonly stepper: CardStepper | undefined;
+}) {
+  const { card, stepper } = props;
   const action = useBoardAction();
   const canSettle = card.stage === "verified" && card.settledAt === null;
   const canStop = card.activeThreadId !== null;
@@ -254,9 +287,17 @@ function CardActions(props: { readonly card: KanbanCard }) {
           label="Settle"
           primary
           disabled={action.pending}
-          onPress={() =>
-            void action.run("Couldn't settle", () => kanbanClient().settleCard(card.id))
-          }
+          onPress={() => {
+            // Read before settling: once settled, the card leaves the Verified list.
+            const after = stepper?.steps.afterSettle ?? null;
+            void action
+              .run("Couldn't settle", () => kanbanClient().settleCard(card.id))
+              .then((ok) => {
+                if (!ok || !stepper) return;
+                if (after !== null) stepper.onStep(after);
+                else stepper.onDone();
+              });
+          }}
         />
       ) : null}
       {canQueue ? (
