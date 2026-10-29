@@ -2663,15 +2663,18 @@ const make = Effect.gen(function* () {
           !modelSelectionsEqual(card.model, saved.model)
         ) {
           // The thread now runs the new model's pool; its slot follows, so the pool
-          // counts and the one-slot limit stay right.
+          // counts and the one-slot limit stay right. Cards sharing the thread take the
+          // same model, so a steer or wake to any of them keeps the thread on it.
           const newPool = Rules.poolKey(saved.model);
-          if (saved.activePool !== newPool) {
-            for (const other of yield* store.cardsByThread(saved.activeThreadId)) {
-              yield* saveCard({ ...other, activePool: newPool });
-            }
-            if ((yield* Ref.get(holds)).has(saved.activeThreadId)) {
-              yield* hold(saved.activeThreadId, saved.boardId, newPool);
-            }
+          for (const other of yield* store.cardsByThread(saved.activeThreadId)) {
+            if (other.id === saved.id) continue;
+            yield* saveCard({ ...other, model: saved.model, activePool: newPool });
+          }
+          if (
+            saved.activePool !== newPool &&
+            (yield* Ref.get(holds)).has(saved.activeThreadId)
+          ) {
+            yield* hold(saved.activeThreadId, saved.boardId, newPool);
           }
           // An open work thread runs the card's model; switch it now, not on its next wake.
           yield* threads

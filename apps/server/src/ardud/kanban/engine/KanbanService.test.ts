@@ -2509,10 +2509,11 @@ it.effect("the pool's variant wins for a create without an explicit model", () =
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      // The board default is a valid high, but its pool runs xhigh: the pool wins.
-      const defaultHigh = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
-      yield* kanban.setPool(board.id, astraXhigh, 1);
-      yield* kanban.updateBoard(board.id, { defaultCardModel: defaultHigh }).pipe(Effect.ignore);
+      // Opus offers high, so a high board default is valid; the Opus xhigh pool wins anyway.
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, opusXhigh, 1);
+      yield* kanban.updateBoard(board.id, { defaultCardModel: opusHigh });
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -2534,6 +2535,30 @@ it.effect("a card model change moves its open thread to the new pool's slot", ()
       yield* kanban.editCard(card.id, { model: haiku }, owner);
       const moved = (yield* kanban.card(card.id)).card;
       assert.strictEqual(moved.activePool, Rules.poolKey(haiku));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("steer on a sibling card after a shared thread's model switch carries the new model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      yield* kanban.setPool(board.id, haiku, 1);
+      const first = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
+      const second = yield* kanban.createCard(board.id, { prompt: "b", title: "b" }, owner);
+      yield* kanban.dispatchNow;
+      const shared = (yield* kanban.card(first.id)).card;
+      assert.isNotNull(shared.activeThreadId);
+      const sibling = (yield* kanban.card(second.id)).card;
+      // Both cards on the shared thread are on Opus now.
+      assert.strictEqual(sibling.activeThreadId, shared.activeThreadId);
+      yield* kanban.editCard(first.id, { model: haiku }, owner);
+      yield* kanban.cardThread(second.id, "steer", "go on", owner);
+      const last = fake.sends[fake.sends.length - 1];
+      assert.strictEqual(last?.model?.model, haiku.model);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
