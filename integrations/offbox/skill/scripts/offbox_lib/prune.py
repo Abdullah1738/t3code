@@ -50,13 +50,16 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
 
 
 def script(dirs: list[str]) -> str:
-    # A dropped ssh must not kill the script before it starts the background delete.
-    lines = ["trap '' PIPE HUP", 't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
+    # A dropped ssh (HUP/PIPE) must not kill the script before it starts the background delete, but it
+    # must stop new moves: the flag is checked before every move, so at most one rename in flight finishes.
+    lines = ["trap 'cancel=1' PIPE HUP", "cancel=",
+             f'ok() {{ [ -z "$cancel" ] && [ "$SECONDS" -lt {BUDGET_S} ]; }}',
+             't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
     for i, d in enumerate(dirs):
         q = shlex.quote(d)
-        lines.append(f'if [ "$SECONDS" -ge {BUDGET_S} ]; then echo "left "{q}; '
+        lines.append(f'if ! ok; then echo "left "{q}; '
                      f'elif [ -d "$HOME"/{q} ] && [ ! -L "$HOME"/{q} ]; then '
-                     f'mv "$HOME"/{q} "$t/{i}" && echo "pruned "{q}; fi')
+                     f'if ok; then mv "$HOME"/{q} "$t/{i}" && echo "pruned "{q}; else echo "left "{q}; fi; fi')
     lines += [BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
@@ -84,7 +87,12 @@ def run(con, box_id: str, current: str) -> int:
         out = p.stdout.decode(errors="replace").splitlines()
         done = [ln[len("pruned "):] for ln in out if ln.startswith("pruned ") and ln[len("pruned "):] in dirs]
         left = [ln[len("left "):] for ln in out if ln.startswith("left ") and ln[len("left "):] in dirs]
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(left)})
+        # ssh() does not raise on a nonzero exit: only a clean run's "left" lines are trusted, otherwise
+        # everything not confirmed pruned stays pending for the retry.
+        left_n = len(left) if p.returncode == 0 else len(dirs) - len(done)
+        if p.returncode != 0:
+            log(f"prune {box_id} ssh exit {p.returncode}: {len(dirs) - len(done)} left for retry")
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n})
         if done:
             con.executemany("DELETE FROM pool_callers WHERE box_id=? AND remote_dir=?", [(box_id, d) for d in done])
             con.commit()

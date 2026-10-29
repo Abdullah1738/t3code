@@ -96,6 +96,25 @@ class ScriptTests(Isolated):
             self.assertTrue((h / "w/c-cccccc").is_symlink())
             self.assertTrue(target.is_dir())
 
+    def test_hangup_stops_new_moves_but_script_still_finishes(self):
+        # A dropped ssh delivers HUP mid-script: no further dir may move after it, and the script exits 0.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+            h = Path(home)
+            for d in ("w/a-aaaaaa", "w/b-bbbbbb"):
+                (h / d).mkdir(parents=True)
+            sudo = Path(bindir) / "sudo"
+            sudo.write_text("#!/bin/sh\nexit 0\n")
+            sudo.chmod(sudo.stat().st_mode | stat.S_IEXEC)
+            lines = prune.script(["w/a-aaaaaa", "w/b-bbbbbb"]).splitlines()
+            at = next(i for i, ln in enumerate(lines) if ln.startswith('t="$HOME'))
+            body = "\n".join(lines[:at] + ["kill -HUP $$"] + lines[at:]) + "\n"  # HUP after the trap, before any move
+            p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
+                               capture_output=True, timeout=10)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa", "left w/b-bbbbbb"])
+            self.assertTrue((h / "w/a-aaaaaa").is_dir())
+            self.assertTrue((h / "w/b-bbbbbb").is_dir())
+
 
 class RunTests(Isolated):
     def fake_ssh(self, home, bindir, calls, exc=None):
@@ -178,6 +197,21 @@ class RunTests(Isolated):
             # Unknown outcome counts as all left, so the box is tried again after RETRY_S, not 6 h.
             self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
 
+    def test_nonzero_ssh_exit_keeps_rest_pending_and_retries_after_retry_window(self):
+        # ssh() returns (check=False) on a failed connection: empty stdout, rc 255 must not record left=0.
+        def failing(box_id, cmd, input=None, timeout=None):
+            self.calls.append((box_id, cmd))
+            return subprocess.CompletedProcess(["ssh"], 255, b"", b"ssh: connect failed")
+        with patch.object(prune.ssh_sync, "ssh", side_effect=failing):
+            with contextlib.redirect_stderr(io.StringIO()):
+                n = prune.run(self.con, "bx", "w/keep-cccccc")
+        self.assertEqual(n, 0)
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
+        n, _, _ = self.run_prune()  # inside RETRY_S: throttled, no second ssh
+        self.assertEqual((n, len(self.calls)), (0, 1))
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1):
+            n, _, _ = self.run_prune()
+        self.assertEqual((n, len(self.calls)), (2, 2))
 
     def test_out_of_budget_leaves_rest_and_retries_after_retry_window(self):
         # No background delete here: it would race the next call's fresh trash dir in this temp HOME.
