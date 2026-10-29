@@ -3796,6 +3796,22 @@ const make = Effect.gen(function* () {
         });
         yield* saveCard(next);
         yield* evaluatorTurn(card, next, { _tag: "thread", threadId });
+        if (verdict === "findings" && next.reviewRound === 3) {
+          // Third findings round: the evaluator decides scope rather than the loop running on.
+          // A failed note must not fail the review result, so it only logs.
+          yield* cardDiscussionUnlocked(next.id).pipe(
+            Effect.flatMap((discussion) =>
+              toEvaluator(
+                discussion,
+                `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`,
+                true,
+              ),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban third review round note failed", { cardId: next.id, cause }),
+            ),
+          );
+        }
         yield* kick;
         return next;
       }),

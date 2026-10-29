@@ -239,6 +239,52 @@ it.effect("runs a card from To-Do through work, review findings, fix and a clear
   }),
 );
 
+it.effect("tells the card's evaluator to decide scope after the third findings round", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Keep the review loop short", title: "Review loop" },
+        owner,
+      );
+      const note = "got review findings for the third time";
+      const evaluatorNotes = () =>
+        Ref.get(fake.threads).pipe(
+          Effect.map((threads) =>
+            [...threads.values()].flatMap((thread) =>
+              thread.messages.filter((message) => message.includes(note)),
+            ),
+          ),
+        );
+
+      for (let round = 1; round <= 3; round++) {
+        yield* kanban.dispatchNow;
+        let card = (yield* kanban.card(created.id)).card;
+        const workThread = card.activeThreadId!;
+        const thread: KanbanActor = { _tag: "thread", threadId: workThread };
+        yield* kanban.moveCard(created.id, "needs_review", "cardThread", thread, { note: "done" });
+        yield* kanban.dispatchNow;
+        card = (yield* kanban.card(created.id)).card;
+        const reviewThread = card.activeThreadId!;
+        yield* kanban.reviewResult(reviewThread, "findings", [`Round ${round} finding`]);
+        card = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(card.reviewRound, round);
+        if (round < 3) assert.lengthOf(yield* evaluatorNotes(), 0);
+      }
+
+      assert.lengthOf(yield* evaluatorNotes(), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("walks the critical chain on the same review thread, switching models", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
