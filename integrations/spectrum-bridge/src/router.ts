@@ -358,8 +358,6 @@ export function providerRefusal(record: MessageRecord): boolean {
 }
 /** An auto-generated session title that is itself the provider's refusal text. */
 export const refusalTitle = (title: unknown) => typeof title === "string" && REFUSAL_TEXT.test(title);
-/** A quoted reply needs a real provider message to point at. */
-const replyTarget = (id: string | undefined) => id === undefined || synthetic(id) ? {} : { replyTo: id };
 const CLI = `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
 // The short consent grammar for a runtime request: only these phrases plus please
 // or thanks, and never a question mark.
@@ -583,7 +581,7 @@ export class Router {
         else this.retrySynthetic(id, "undelivered");
         return;
       }
-      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...replyTarget(id) });
+      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
       this.store.updateInbound(id, state);
     }).immediate();
   }
@@ -603,6 +601,23 @@ export class Router {
     if (id === undefined || !synthetic(id)) return;
     const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
     return ids.every(synthetic) ? ids : undefined;
+  }
+
+  /**
+   * The message a reply quotes: the batch's first typed message. iMessage can't thread onto a tapback
+   * (Sendblue fails it minutes later with 5504 and the reply never arrives), so reactions are skipped;
+   * a batch of only reactions gets an unthreaded reply.
+   */
+  private replyTarget(id: string | undefined): { replyTo?: string } {
+    if (id === undefined || synthetic(id)) return {};
+    const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
+    for (const member of ids) {
+      if (synthetic(member)) continue;
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(member);
+      const text = row ? (JSON.parse(row.payload) as NormalizedInbound).text ?? "" : "";
+      if (!row || !isTapback(text)) return { replyTo: member };
+    }
+    return {};
   }
 
   private retryKey(id: string): string {
@@ -719,7 +734,7 @@ export class Router {
   private notice(turn: Turn, key: string, text: string): void {
     const id = `turn:${turn.generation}:${turn.messageId}:${key}`;
     if (!this.store.getOperation(id)) this.store.enqueue({
-      id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...replyTarget(turn.inboundId),
+      id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...this.replyTarget(turn.inboundId),
     });
   }
 
@@ -1273,7 +1288,7 @@ export class Router {
       this.store.db.transaction(() => {
         this.store.updateInbound(inboundId, "pending", { ...input, detached: true } satisfies Detachable);
         this.store.enqueue({
-          id: `nudge:${hash(inboundId)}`, kind: "control", replyTo: inboundId,
+          id: `nudge:${hash(inboundId)}`, kind: "control", ...this.replyTarget(inboundId),
           text: "Got it, I'll come back to that. I still need a yes or no on the check above before I can keep going.",
         });
       }).immediate();
@@ -1484,7 +1499,7 @@ export class Router {
       if (!existing || !["pending", "sending", "sent", "uncertain"].includes(existing.state)) {
         this.store.enqueue({
           id, kind: "control", text, sessionId: turn.id, generation: turn.generation,
-          ...(poll ? { poll } : {}), ...(poll ? {} : replyTarget(turn.inboundId)),
+          ...(poll ? { poll } : {}), ...(poll ? {} : this.replyTarget(turn.inboundId)),
         });
       }
       this.store.set("pendingApprovals", entries);
@@ -2610,12 +2625,12 @@ export class Router {
           const words = replyText(assistantText(reply));
           if (words) this.store.enqueue({
             id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn!.id, generation: turn!.generation,
-            ...replyTarget(turn!.inboundId),
+            ...this.replyTarget(turn!.inboundId),
           });
         }
         if (text) this.store.enqueue({
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
-          ...replyTarget(turn!.inboundId),
+          ...this.replyTarget(turn!.inboundId),
         });
         const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
