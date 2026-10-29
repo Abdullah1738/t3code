@@ -373,6 +373,86 @@ class RunTests(Isolated):
         self.assertEqual(n, 0)
 
 
+    def test_full_recovery_path_stays_within_caller_budget(self):
+        # Round-6 P1: the first ssh (timeout) plus the follow-up probe must return within CALLER_BUDGET_S, not
+        # 50-60 s. The fake clock shows the probe gets only the time left after the first ssh.
+        seen = {}
+
+        def timing_out(box_id, cmd, input=None, timeout=None):
+            if input is not None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            seen["probe_timeout"] = timeout
+            return subprocess.CompletedProcess(["ssh"], 1, b"", b"")
+
+        with patch.object(prune, "CALLER_BUDGET_S", 20), patch.object(prune.ssh_sync, "ssh", side_effect=timing_out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            t0 = time.monotonic()
+            n = prune.run(self.con, "bx", "w/keep-cccccc")
+            elapsed = time.monotonic() - t0
+        self.assertEqual(n, 0)
+        self.assertLessEqual(seen["probe_timeout"], 20)  # the probe never gets more than the caller budget
+        self.assertLess(elapsed, 5)  # the probe is mocked to fail at once; the wait is bounded by the budget
+        # The box is quarantined in kv, with the unconfirmed run id, not released as settled.
+        rec = prune.kv_get(self.con, "prune:bx")
+        self.assertEqual(rec["left"], 2)
+        self.assertIn("unconfirmed", rec)
+
+    def test_done_marker_is_written_before_background_and_seen_by_probe(self):
+        # Round-6 P2: the marker must be real. It is written by the script (before BACKGROUND, outside the
+        # trash tree), and a follow-up probe that looks at the same path finds it.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+            h = Path(home)
+            body = prune.script([], "rid-1")
+            p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
+                               capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            marker = h / ".offbox/done/rid-1"
+            self.assertTrue(marker.is_file(), "the worker must write its done marker")
+            self.assertNotIn(".offbox/trash", str(marker))  # not inside the tree BACKGROUND deletes
+            # The follow-up probe, as _quiesced runs it, sees the marker.
+            probe = subprocess.run(["bash", "-c", f'[ -f "$HOME/.offbox/done/rid-1" ] && exit 0; exit 1'],
+                                   env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"}, timeout=10)
+            self.assertEqual(probe.returncode, 0)
+
+    def test_settled_prefix_does_not_block_progress_across_passes(self):
+        # Round-6 P2: dirs settled by an earlier pass must not consume the budget of later passes. Here the
+        # first pass settles s1 (pruned); the second pass has only s2 left and must reach it.
+        with patch.object(prune, "BACKGROUND", "true"), patch.object(prune, "BUDGET_S", 8), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n1, _, _ = self.run_prune()
+        self.assertEqual(n1, 2)  # both stale dirs settled in one pass (budget is ample)
+        self.assertEqual(sorted(prune.kv_get(self.con, "prune:bx")["settled"]), ["w/s1-aaaaaa", "w/s2-bbbbbb"])
+        # The settled prefix is excluded from the candidate list, so the next pass sends no dirs at all.
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
+                patch.object(prune, "BACKGROUND", "true"), contextlib.redirect_stderr(io.StringIO()):
+            n2, _, _ = self.run_prune()
+        self.assertEqual(n2, 0)
+        self.assertEqual(len(self.calls), 1, "no candidates left: the second pass must not start an ssh")
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)
+
+    def test_multi_pass_settled_prefix_exceeding_budget_still_reaches_real_dirs(self):
+        # Round-6 P2 regression: a settled prefix alone exceeds the pass budget. Pass 1 settles the prefix, pass 2
+        # must reach the real dir (not spend the budget on the prefix again), and completion returns to 6 h.
+        self.con.execute("DELETE FROM runs WHERE remote_dir='w/s2-bbbbbb'")
+        self.con.commit()
+        with patch.object(prune, "BACKGROUND", "true"), patch.object(prune, "BUDGET_S", 8), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n1, _, _ = self.run_prune()
+        self.assertEqual(n1, 1)  # s1 pruned; the box still has nothing left after this pass
+        # New stale dir appears after the first pass: it must be reached on the next pass, not blocked by s1.
+        (Path(self.home.name) / "w/s3-cccccc").mkdir(parents=True)
+        add_run(self.con, "bx", "w/s3-cccccc", 7 * 86400)
+        # A finished box (left 0) waits out the 6 h throttle before it looks for new stale dirs. kv_get reads
+        # common.now (not prune.now), so the clock is moved where the throttle is actually checked.
+        with patch.object(common, "now", return_value=common.now() + prune.EVERY_S + 1), \
+                patch.object(prune, "now", return_value=common.now() + prune.EVERY_S + 1), \
+                patch.object(prune, "BACKGROUND", "true"), contextlib.redirect_stderr(io.StringIO()):
+            n2, _, _ = self.run_prune()
+        self.assertEqual(n2, 1)
+        self.assertFalse((Path(self.home.name) / "w/s3-cccccc").exists())
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)
+
+
 class RunnerHookTests(Isolated):
     def test_prune_runs_after_record_and_before_push(self):
         order = []

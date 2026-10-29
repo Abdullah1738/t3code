@@ -6,6 +6,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import time
 
 from . import capacity, common, ssh_sync
 from .common import event, kv_get, kv_set, log, now, say
@@ -18,6 +19,8 @@ RETRY_S = 20 * 60
 # Seconds the box spends moving dirs before it leaves the rest for the next prune, so a slow box
 # delays the run by about this much (a 30 s ssh timeout used to kill the script mid-move).
 BUDGET_S = 8
+# The whole foreground prune (first ssh plus any follow-up probe) must return within this, the caller's budget.
+CALLER_BUDGET_S = 20
 # A worker often runs `npm ci` and then tests minutes or hours later: never pull a dir out from under it.
 FLOOR_S = 12 * 3600
 # Deletes in the background so the run doesn't wait; fstrim hands freed blocks back so boat's
@@ -59,9 +62,10 @@ def script(dirs: list[str], run_id: str) -> str:
     # be confirmed gone; the script stops. A dropped ssh (HUP/PIPE) is ignored so the background delete starts.
     # The done marker (named by run_id, known to the caller) is written last, so a caller can tell the worker
     # finished even after its ssh gave up.
-    marker = f'"$HOME/.offbox/trash/.done-{run_id}"'
+    # The marker lives outside the trash tree, which BACKGROUND deletes, and is written before BACKGROUND starts.
+    marker = f'"$HOME/.offbox/done/{run_id}"'
     lines = ["set -m", "trap '' PIPE HUP", "busy=",
-             'mkdir -p "$HOME/.offbox/trash" || exit 0',
+             'mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0',
              f't="$HOME/.offbox/trash/{run_id}"', 'mkdir -p "$t" || exit 0',
              # Probe classes: 0 moved, 5 settled (absent or not a real dir), 4 busy, anything else left.
              'one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; mv "$1" "$2"; exit $? ) & p=$!; '
@@ -79,17 +83,19 @@ def script(dirs: list[str], run_id: str) -> str:
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
                      f'case "$rc" in 0) echo "pruned "{q};; 5) echo "skip "{q};; 4) echo "busy "{q}; busy=1;; '
                      f'*) echo "left "{q};; esac; fi')
-    lines += [BACKGROUND, "exit 0"]
-    # Written last, after BACKGROUND has started: the worker is finished once this file exists.
-    lines += [f'echo ok > {marker}', "exit 0"]
+    # Done is signalled before BACKGROUND (which only deletes the trash tree, never the marker), and exit is last.
+    lines += [f'echo ok > {marker}', BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
 
-def _quiesced(box_id: str, run_id: str) -> bool:
-    """True only if the remote worker's done marker is seen. Bounded: the ssh gives up after ~40 s."""
+def _quiesced(box_id: str, run_id: str, remaining_s: float) -> bool:
+    """True only if the remote done marker is seen within remaining_s. Never waits past the caller's deadline."""
+    if remaining_s < 1:
+        return False
+    polls = max(1, int(remaining_s / 0.5))
     try:
-        p = ssh_sync.ssh(box_id, f'for i in $(seq 1 60); do [ -f "$HOME/.offbox/trash/.done-{run_id}" ] && exit 0; '
-                                 f'sleep 0.5; done; exit 1', timeout=40)
+        p = ssh_sync.ssh(box_id, f'for i in $(seq 1 {polls}); do [ -f "$HOME/.offbox/done/{run_id}" ] && exit 0; '
+                                 f'sleep 0.5; done; exit 1', timeout=remaining_s)
         return p.returncode == 0
     except Exception:  # noqa: BLE001 - an unknown worker state is treated as not quiesced
         return False
@@ -109,24 +115,29 @@ def run(con, box_id: str, current: str) -> int:
             return 0
         if _protected(con, box_id):
             return 0
-        dirs = stale_dirs(con, box_id, current)
+        # Dirs settled by an earlier pass (pruned or absent) are not probed again, so a settled prefix can't
+        # use up the budget on every pass. A dir recreated and used again gets a newer run row, which gives it
+        # a later last-used time; it is re-offered only after it becomes stale again.
+        settled = set((prev or {}).get("settled", []))
+        dirs = [d for d in stale_dirs(con, box_id, current) if d not in settled]
         # Counted as all left until the box answers, so a timed-out or failed ssh is retried after RETRY_S.
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs)})
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": sorted(settled)})
         if not dirs:
             return 0
         run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
+        deadline = time.monotonic() + CALLER_BUDGET_S
         try:
             p = ssh_sync.ssh(box_id, "bash -s", input=script(dirs, run_id).encode(), timeout=BUDGET_S + 12)
             out = p.stdout.decode(errors="replace").splitlines()
             ok = p.returncode == 0
         except (subprocess.TimeoutExpired, OSError) as e:
-            # The remote script may still be running (it ignores HUP and only stops at its own budget or
-            # when its children are gone). Don't hand the box back until its worker is confirmed finished.
+            # The remote script may still be running. Within the caller's budget, only a seen done marker
+            # counts as finished; otherwise the whole box is quarantined in kv and the run goes on without it.
             out, ok = [], False
-            log(f"prune {box_id} ssh failed ({type(e).__name__}); waiting for the remote worker to finish")
-            if not _quiesced(box_id, run_id):
-                kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs)})
-                log(f"prune {box_id}: remote worker not confirmed finished; box left pending")
+            log(f"prune {box_id} ssh failed ({type(e).__name__}); checking the remote worker")
+            if not _quiesced(box_id, run_id, deadline - time.monotonic()):
+                kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "unconfirmed": run_id})
+                log(f"prune {box_id}: remote worker not confirmed finished; box quarantined for retry")
                 return 0
         done = [ln[len("pruned "):] for ln in out if ln.startswith("pruned ") and ln[len("pruned "):] in dirs]
         skipped = [ln[len("skip "):] for ln in out if ln.startswith("skip ") and ln[len("skip "):] in dirs]
@@ -134,7 +145,8 @@ def run(con, box_id: str, current: str) -> int:
         left_n = len(dirs) - len(done) - len(skipped)
         if not ok or any(ln.startswith("busy ") for ln in out):
             log(f"prune {box_id}: {left_n} left for retry (ssh rc {p.returncode})")
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n})
+        settled_now = sorted(settled | set(done) | set(skipped))
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n, "settled": settled_now})
         if done:
             con.executemany("DELETE FROM pool_callers WHERE box_id=? AND remote_dir=?", [(box_id, d) for d in done])
             con.commit()
