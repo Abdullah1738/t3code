@@ -2545,6 +2545,7 @@ const scribeLayer = (
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
