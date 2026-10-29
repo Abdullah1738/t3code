@@ -4647,9 +4647,15 @@ it.effect("an outage posts one board alert, then one back message", () =>
       const threads: string[] = [];
       for (let i = 0; i < 2; i++) {
         const created = yield* kanban.createCard(board.id, { prompt: "x", title: `x${i}` }, owner);
-        yield* kanban.dispatchNow;
-        const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
-        threads.push(threadId);
+        threads.push(created.id);
+      }
+      yield* kanban.dispatchNow;
+      // Both cards start before either fails: a paused key holds later dispatches.
+      const threadIds: string[] = [];
+      for (const cardId of threads) {
+        threadIds.push((yield* kanban.card(cardId)).card.activeThreadId!);
+      }
+      for (const threadId of threadIds) {
         fake.failures.set(threadId, outage);
         yield* kanban.turnEnded(threadId);
       }

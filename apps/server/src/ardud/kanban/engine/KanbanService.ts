@@ -2299,7 +2299,8 @@ const make = Effect.gen(function* () {
     yield* Ref.update(down, (map) => {
       const next = new Map(map);
       for (const key of keys) {
-        if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now });
+        if (!next.has(key))
+          next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now, alerted: false });
       }
       return next;
     });
@@ -2890,7 +2891,12 @@ const make = Effect.gen(function* () {
           const next = new Map([...map].filter(([key]) => found.has(key)));
           for (const key of found.keys()) {
             // nextAt is now: the loop below probes it right away.
-            if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: seededAt });
+            if (!next.has(key))
+              next.set(key, {
+                delayMs: Rules.PROBE_FIRST_MS,
+                nextAt: seededAt,
+                alerted: false,
+              });
           }
           return next;
         });
