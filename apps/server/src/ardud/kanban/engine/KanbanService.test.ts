@@ -4710,7 +4710,7 @@ it.effect("a quick outage that never gets probed posts nothing", () =>
 const outageTitled = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unknown> }>) =>
   messages.map((message) => messageText([message]));
 
-it.effect("staggered outages on two boards are each announced, and recovery reaches both once", () =>
+it.effect("staggered outages on two boards are each announced once, and each recovers once", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     probe.ok = false;
@@ -4719,58 +4719,66 @@ it.effect("staggered outages on two boards are each announced, and recovery reac
       const kanban = yield* KanbanService.KanbanService;
       const { board } = yield* toyBoard;
       const boardB = yield* kanban.ensureBoard({
-        slug: "toy-b",
-        name: "Toy B",
-        defaultProjectId: ProjectId.make("project-1"),
+        slug: "other",
+        name: "Other",
+        defaultProjectId: ProjectId.make("project-other"),
       });
-      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
-      yield* kanban.setPool(boardB.id, boardB.defaultCardModel, 2);
-      // Both threads are running on the same model before anything fails.
-      const first = yield* kanban.createCard(board.id, { prompt: "x", title: "a" }, owner);
-      const second = yield* kanban.createCard(boardB.id, { prompt: "x", title: "b" }, owner);
-      yield* kanban.dispatchNow;
-      const firstThread = (yield* kanban.card(first.id)).card.activeThreadId!;
-      const secondThread = (yield* kanban.card(second.id)).card.activeThreadId!;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      yield* kanban.setPool(boardB.id, boardB.defaultCardModel, 1);
+      // Both boards run the same model, so both threads share one pool key.
+      assert.strictEqual(boardB.defaultCardModel.model, board.defaultCardModel.model);
 
-      // Board A's thread fails first; its board is announced.
-      fake.failures.set(firstThread, outage);
-      yield* kanban.turnEnded(firstThread);
+      const cardA = yield* kanban.createCard(board.id, { prompt: "x", title: "a" }, owner);
+      const cardB = yield* kanban.createCard(boardB.id, { prompt: "x", title: "b" }, owner);
+      // One dispatch: both threads are running before anything fails.
+      yield* kanban.dispatchNow;
+      const threadA = (yield* kanban.card(cardA.id)).card.activeThreadId!;
+      const threadB = (yield* kanban.card(cardB.id)).card.activeThreadId!;
+
+      const alertOf = (boardId: typeof board.id) =>
+        kanban.discussions(boardId).pipe(
+          Effect.map((all) =>
+            all.find((discussion) => discussion.title === "Provider outages" && discussion.cardId === null),
+          ),
+        );
+
+      // Board A's thread fails first: A is announced, B is not yet.
+      fake.failures.set(threadA, outage);
+      yield* kanban.turnEnded(threadA);
       yield* TestClock.adjust("5 minutes");
       yield* kanban.probeOutages;
-      const alertsA = (yield* kanban.discussions(board.id)).find(
-        (discussion) => discussion.title === "Provider outages" && discussion.cardId === null,
-      )!;
-      assert.strictEqual((yield* kanban.messages(alertsA.id)).length, 1);
+      const alertA = (yield* alertOf(board.id))!;
+      const bAfterA = yield* alertOf(boardB.id);
+      assert.isUndefined(bAfterA);
+      const aMessages = yield* kanban.messages(alertA.id);
+      assert.strictEqual(aMessages.length, 1);
+      assert.include(messageText(aMessages), "1 thread paused");
 
-      // Board B's thread fails later, after A was announced; B is not announced yet.
-      fake.failures.set(secondThread, outage);
-      yield* kanban.turnEnded(secondThread);
-      const alertsB = (yield* kanban.discussions(boardB.id)).find(
-        (discussion) => discussion.title === "Provider outages" && discussion.cardId === null,
-      );
-      assert.isUndefined(alertsB);
-
-      // The next failed probe announces B, and only B: A keeps its one message.
+      // Board B's thread fails later: B is announced once, A keeps its one message.
+      fake.failures.set(threadB, outage);
+      yield* kanban.turnEnded(threadB);
       yield* TestClock.adjust("10 minutes");
       yield* kanban.probeOutages;
-      const alertsBAfter = (yield* kanban.discussions(boardB.id)).find(
-        (discussion) => discussion.title === "Provider outages" && discussion.cardId === null,
-      )!;
-      assert.strictEqual((yield* kanban.messages(alertsBAfter.id)).length, 1);
-      assert.strictEqual((yield* kanban.messages(alertsA.id)).length, 1);
+      const alertB = (yield* alertOf(boardB.id))!;
+      const bMessages = yield* kanban.messages(alertB.id);
+      assert.strictEqual(bMessages.length, 1);
+      assert.include(messageText(bMessages), "1 thread paused");
+      assert.strictEqual((yield* kanban.messages(alertA.id)).length, 1);
 
-      // Recovery posts once to each board that was announced.
+      // Recovery: each board gets exactly one "answers again", and both threads are unpaused.
       probe.ok = true;
       yield* TestClock.adjust("20 minutes");
       yield* kanban.probeOutages;
-      const recoveryA = outageTitled(yield* kanban.messages(alertsA.id)).filter((text) =>
+      const recoveredA = outageTitled(yield* kanban.messages(alertA.id)).filter((text) =>
         text.includes("answers again"),
       );
-      const recoveryB = outageTitled(yield* kanban.messages(alertsBAfter.id)).filter((text) =>
+      const recoveredB = outageTitled(yield* kanban.messages(alertB.id)).filter((text) =>
         text.includes("answers again"),
       );
-      assert.strictEqual(recoveryA.length, 1);
-      assert.strictEqual(recoveryB.length, 1);
+      assert.strictEqual(recoveredA.length, 1);
+      assert.strictEqual(recoveredB.length, 1);
+      assert.isNull((yield* kanban.caller(threadA))?.paused ?? null);
+      assert.isNull((yield* kanban.caller(threadB))?.paused ?? null);
     }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
