@@ -3459,6 +3459,8 @@ describe("PreviewManager", () => {
         expect(writeFile).not.toHaveBeenCalled();
       }),
     ),
+  );
+
   effectIt.effect(
     "asks the client to paint a navigated server tab while the agent captures it",
     () =>

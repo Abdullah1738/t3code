@@ -2044,6 +2044,16 @@ it.effect(
 );
 
 it.effect("keeps ingesting a failed root's background item when its work continues", () =>
+  Effect.gen(function* () {
+    const observed = yield* runBackgroundItemScenario("bg-failed-continues", (ids) => [
+      backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+      { ...rootTerminalEvent(ids, "failed"), childTurnsContinue: true },
+      backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
+    ]);
+    assert.deepEqual(observed, ["turn_item:running", "root-finalized", "turn_item:completed"]);
+  }),
+);
+
 it.effect("keeps ingesting until the last of several background items terminalizes", () =>
   Effect.gen(function* () {
     const secondItemId = TurnItemId.make("turn-item:bg-multi:second");
