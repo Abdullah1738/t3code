@@ -166,6 +166,9 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     goto: vi.fn(async (next: string) => {
       url = next;
       events.emit("load");
+      const pending = initialNavigation;
+      initialNavigation = null;
+      await pending?.();
     }),
     goBack: vi.fn(async () => {}),
     goForward: vi.fn(async () => {}),
@@ -220,6 +223,7 @@ let pageCopy = "";
 let keyCopy = "";
 let focusedFrame: ReturnType<typeof makeFrame> | null = null;
 let contextFailure: Error | null = null;
+let initialNavigation: (() => Promise<void>) | null = null;
 let desktopRendersNext = false;
 const desktopDetaches = new NodeEvents.EventEmitter();
 const desktopTabs = new Set<string>();
