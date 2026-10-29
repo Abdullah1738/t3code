@@ -2546,6 +2546,169 @@ it.effect("an owner's pick on an archived evaluator's choice reaches its replace
   }),
 );
 
+// Provider outage tests: the probe answers when probe.ok is true, dies otherwise.
+const outage = {
+  class: "provider_error",
+  code: "provider.invalid-request",
+  message: "Third-party apps now draw from your extra usage, not your plan limits.",
+} as never;
+const probe = { ok: false, calls: 0 };
+const probeLayer = (fake: Layer.Layer<KanbanThreads>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateJson: (() => {
+          probe.calls += 1;
+          return probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
+        }) as never,
+      }),
+    ),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+it.effect("a work run that dies on an outage is paused, not flagged or nudged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(workThread)!.messages.length;
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      const messages = (yield* Ref.get(fake.threads)).get(workThread)!.messages;
+      assert.strictEqual(messages.length, before);
+      const held = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(held.stage, "working");
+      assert.strictEqual(held.activeThreadId, workThread);
+      assert.isNull(held.stalled);
+      assert.match((yield* kanban.caller(workThread))?.paused?.message ?? "", /extra usage/);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a down pool takes no new card; a weighted card starts on its other model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      yield* kanban.setPool(board.id, sol, 1);
+      const first = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      const weighted = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "x",
+          title: "W",
+          models: [
+            { model: board.defaultCardModel, weight: 2 },
+            { model: sol, weight: 1 },
+          ],
+        } as never,
+        owner,
+      );
+      const plain = yield* kanban.createCard(board.id, { prompt: "x", title: "P" }, owner);
+      yield* kanban.dispatchNow;
+      const w = (yield* kanban.card(weighted.id)).card;
+      assert.include(w.activePool ?? "", "gpt-6.1-sol");
+      const p = (yield* kanban.card(plain.id)).card;
+      assert.strictEqual(p.stage, "todo");
+      assert.isNull(p.activeThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("probeOutages backs off, then wakes paused threads when the model answers", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(workThread)!.messages.length;
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.probeOutages;
+      assert.strictEqual(probe.calls, 0);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual(probe.calls, 1);
+      assert.isNotNull((yield* kanban.caller(workThread))?.paused);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual(probe.calls, 1);
+      probe.ok = true;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual(probe.calls, 2);
+      const messages = (yield* Ref.get(fake.threads)).get(workThread)!.messages;
+      assert.strictEqual(messages.length, before + 1);
+      assert.include(messages[messages.length - 1] ?? "", "answers again");
+      assert.isNull((yield* kanban.caller(workThread))?.paused ?? null);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a paused evaluator is kept open and woken", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Look at it",
+      });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      const link = yield* kanban.caller(threadId);
+      assert.isNull(link?.endedAt ?? "set");
+      assert.isNotNull(link?.paused);
+      probe.ok = true;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.include(messages[messages.length - 1] ?? "", "answers again");
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("the backstop doesn't nudge a paused worker", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(workThread)!.messages.length;
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(workThread)!.messages.length, before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const titledLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),

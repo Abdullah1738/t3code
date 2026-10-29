@@ -308,6 +308,12 @@ export const runFailedText = (
 ) =>
   `Card #${card.number}'s ${role} run failed: "${message}". The card is flagged stalled and back in ${stage}; its thread is released. Fix the cause. If the provider refused the model or variant, card_edit the model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain). Then clear the flag with card_flag stalled false and say in the card's discussion what you changed.`;
 
+export const providerBackText = (message: string) =>
+  lines(
+    `Your last run stopped on a provider error: "${message}". The model answers again now.`,
+    "Pick up exactly where you stopped. Check what you already did (git log, the card, your last messages) before redoing anything.",
+  );
+
 export const modelRefusedText = (card: KanbanCard, problem: string) =>
   `Card #${card.number} was not started: ${problem} It is flagged stalled. card_edit its model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain), clear the flag with card_flag stalled false, and say in the card's discussion what you changed.`;
 

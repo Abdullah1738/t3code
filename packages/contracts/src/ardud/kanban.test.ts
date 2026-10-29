@@ -9,6 +9,7 @@ import {
   kanbanBoardIcon,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
+  KanbanThreadLink,
   type KanbanCard,
 } from "./kanban.ts";
 
@@ -131,4 +132,21 @@ describe("own answers", () => {
     expect(decoded.choice).toEqual(["o1"]);
   });
 });
+});
+
+describe("KanbanThreadLink", () => {
+  it("decodes a link written before pauses existed as not paused", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanThreadLink)({
+      threadId: "thread-1",
+      boardId: "board-1",
+      cardId: null,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model: null,
+      startedAt: "2026-10-28T00:00:00.000Z",
+      endedAt: null,
+    });
+    expect(decoded.paused).toBeNull();
+  });
 });

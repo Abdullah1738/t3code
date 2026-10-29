@@ -414,6 +414,8 @@ export interface KanbanServiceShape {
   readonly turnEnded: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Periodic upkeep: typing heartbeat, PR states, dispatch. */
   readonly tick: Effect.Effect<void, KanbanError>;
+  /** Probes the models paused threads wait on and wakes them when one answers. */
+  readonly probeOutages: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
   readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
   /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
@@ -446,6 +448,7 @@ const DISCUSSION_TITLE_MAX = 80;
 const TITLE_SCAN_MAX = 20;
 
 const WriterOutput = Schema.Struct({ title: Schema.String, description: Schema.String });
+const ProbeOutput = Schema.Struct({ ok: Schema.Boolean });
 
 const uuid = () => NodeCrypto.randomUUID();
 
@@ -561,10 +564,8 @@ const make = Effect.gen(function* () {
   const textGeneration = yield* TextGeneration.TextGeneration;
   const projects = yield* ProjectService.ProjectService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
-  const attachments = makeBoardAttachments(
-    yield* ServerConfig.ServerConfig,
-    yield* FileSystem.FileSystem,
-  );
+  const serverConfig = yield* ServerConfig.ServerConfig;
+  const attachments = makeBoardAttachments(serverConfig, yield* FileSystem.FileSystem);
   const scope = yield* Effect.scope;
 
   const lock = yield* Semaphore.make(1);
@@ -599,6 +600,12 @@ const make = Effect.gen(function* () {
   // Threads a card was running on that were missing at the last tick. `view`
   // also answers null on a read error, so a card is let go on the second miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  // Pool keys whose model is out of usage or down, with when to probe next. In memory:
+  // after a restart probeOutages rebuilds it from the paused thread links.
+  const down = yield* Ref.make<
+    ReadonlyMap<string, { readonly delayMs: number; readonly nextAt: number }>
+  >(new Map());
+  const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
   const unlistedPools = yield* Ref.make<ReadonlySet<string>>(new Set());
@@ -1482,6 +1489,7 @@ const make = Effect.gen(function* () {
         model: board.evaluatorModel,
         startedAt: at,
         endedAt: null,
+        paused: null,
       },
       title,
     );
@@ -2170,6 +2178,7 @@ const make = Effect.gen(function* () {
           model: dispatch.model,
           startedAt: at,
           endedAt: null,
+          paused: null,
         },
         title,
       );
@@ -2203,12 +2212,13 @@ const make = Effect.gen(function* () {
     yield* Ref.set(kickPending, false);
     const random = yield* Random.Random;
     const pick = (count: number) => Math.floor(random.nextDoubleUnsafe() * count);
+    const downKeys = new Set((yield* Ref.get(down)).keys());
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
       const plan = Rules.planDispatch(
         board,
         yield* store.cards(board.id),
-        yield* store.pools(board.id),
+        Rules.maskDownPools(yield* store.pools(board.id), downKeys),
         yield* boardHolds(board.id),
         pick,
       );
@@ -2220,6 +2230,63 @@ const make = Effect.gen(function* () {
         );
       }
     }
+  });
+
+  /** The pool key a board thread runs on. */
+  const linkKey = (link: KanbanThreadLink, board: KanbanBoard) =>
+    Rules.poolKey(link.model ?? board.evaluatorModel);
+
+  /** Open thread links paused on a provider outage, on every board. */
+  const pausedLinks = Effect.gen(function* () {
+    const found: Array<{ readonly link: KanbanThreadLink; readonly board: KanbanBoard }> = [];
+    for (const board of yield* store.boards) {
+      if (board.archivedAt !== null) continue;
+      for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
+        if (link.paused !== null) found.push({ link, board });
+      }
+    }
+    return found;
+  });
+
+  const pauseThread = Effect.fn("KanbanService.pauseThread")(function* (
+    link: KanbanThreadLink,
+    message: string,
+  ) {
+    const board = yield* boardOf(link.boardId);
+    const at = yield* nowIso;
+    const now = yield* nowMillis;
+    yield* store.putThreadLink({ ...link, paused: { at: link.paused?.at ?? at, message } });
+    const key = linkKey(link, board);
+    yield* Ref.update(down, (map) =>
+      map.has(key)
+        ? map
+        : new Map(map).set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now + Rules.PROBE_FIRST_MS }),
+    );
+  });
+
+  /** Wakes every thread paused on `key` and frees its pools; callers hold the lock. */
+  const resumeKey = Effect.fn("KanbanService.resumeKey")(function* (key: string) {
+    for (const { link, board } of yield* pausedLinks) {
+      if (link.paused === null || linkKey(link, board) !== key) continue;
+      yield* store.putThreadLink({ ...link, paused: null });
+      // Only a thread that still owns its work and isn't already running again.
+      let live = link.role === "evaluator";
+      if (link.role === "work") live = (yield* store.cardsByThread(link.threadId)).length > 0;
+      if (link.role === "review" && link.cardId !== null) {
+        live = (yield* store.card(link.cardId))?.activeThreadId === link.threadId;
+      }
+      const view = yield* threads.view(link.threadId);
+      if (!live || view === null || view.state !== "idle") continue;
+      yield* threads
+        .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
+        .pipe(Effect.ignore);
+    }
+    yield* Ref.update(down, (map) => {
+      const next = new Map(map);
+      next.delete(key);
+      return next;
+    });
+    yield* kick;
   });
 
   /** A stopped worker hears about its cards still in Working, every time. nudgedAt records the last nudge instead of a card event, so a looping worker can't flood the history. */
@@ -2268,6 +2335,11 @@ const make = Effect.gen(function* () {
     // A run that failed (the provider refused the model or variant, or a route is gone)
     // would only loop on a nudge, so the failure is read first and nothing is nudged.
     const failure = yield* threads.lastFailure(threadId);
+    // Out of usage or down: a nudge or a flag can't help, so the thread waits for
+    // probeOutages to wake it on the same model.
+    const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
+    if (outage !== null) yield* pauseThread(link, outage.message);
+    else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
     // Discussions the thread evaluates, or is still typing or owing in after
     // being told something there (which the link and card don't name).
     for (const discussion of yield* store.discussions(link.boardId)) {
@@ -2311,7 +2383,8 @@ const make = Effect.gen(function* () {
     }
 
     if (link.role === "evaluator") {
-      if (link.discussionId === null && link.endedAt === null) {
+      // A paused evaluator stays open so it can be woken (and `link` is stale after pauseThread).
+      if (link.discussionId === null && link.endedAt === null && outage === null) {
         yield* store.putThreadLink({ ...link, endedAt: at });
       }
       return;
@@ -2328,6 +2401,8 @@ const make = Effect.gen(function* () {
         yield* kick;
         return;
       }
+      // Paused: the card keeps its thread until probeOutages wakes it.
+      if (outage !== null) return;
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
         for (const entry of carried) {
@@ -2366,6 +2441,7 @@ const make = Effect.gen(function* () {
       yield* kick;
       return;
     }
+    if (outage !== null) return;
     if (failure !== null) {
       const reason = `Run failed: ${failure.message}`;
       const next: KanbanCard = {
@@ -2502,6 +2578,8 @@ const make = Effect.gen(function* () {
       for (const card of yield* store.cards(board.id)) {
         const threadId = card.activeThreadId;
         if (threadId === null || card.activeRole !== "work") continue;
+        // A paused worker waits for probeOutages, not a nudge.
+        if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
         if (view === null || !Rules.workerQuietDue(card, view, now)) continue;
         if (view.state === "needs-input") {
@@ -2634,6 +2712,48 @@ const make = Effect.gen(function* () {
     yield* Ref.set(unlistedPools, unlistedNow);
     yield* Ref.set(missing, missed);
     yield* dispatchUnlocked();
+  });
+
+  /** One tiny generation on `model`: true when its provider answers. */
+  const probeModel = (model: ModelSelection): Effect.Effect<boolean> => {
+    const generateJson = textGeneration.generateJson;
+    if (!generateJson) return Effect.succeed(false);
+    return generateJson({
+      cwd: serverConfig.cwd,
+      prompt: 'Health check from the missions board. Reply with {"ok": true}.',
+      outputSchema: ProbeOutput,
+      modelSelection: model,
+    }).pipe(
+      Effect.timeout("90 seconds"),
+      Effect.as(true),
+      Effect.catchCause(() => Effect.succeed(false)),
+    );
+  };
+
+  // Runs outside the lock: a probe can take a minute and must not hold the board.
+  const probeOutagesNow = Effect.fn("KanbanService.probeOutages")(function* () {
+    // Nothing down and the links already read once since start: skip the read.
+    if ((yield* Ref.get(down)).size === 0 && (yield* Ref.getAndSet(scanned, true))) return;
+    const paused = yield* lock.withPermits(1)(pausedLinks);
+    const models = new Map<string, ModelSelection>();
+    for (const { link, board } of paused) {
+      models.set(linkKey(link, board), link.model ?? board.evaluatorModel);
+    }
+    // A key whose threads all came back on their own is up again.
+    yield* Ref.update(down, (map) => new Map([...map].filter(([key]) => models.has(key))));
+    for (const [key, model] of models) {
+      const now = yield* nowMillis;
+      // No state after a restart: probe right away.
+      const state = (yield* Ref.get(down)).get(key);
+      if (state !== undefined && now < state.nextAt) continue;
+      if (yield* probeModel(model)) {
+        yield* lock.withPermits(1)(resumeKey(key));
+        continue;
+      }
+      const delayMs =
+        state === undefined ? Rules.PROBE_FIRST_MS : Rules.nextProbeDelay(state.delayMs);
+      yield* Ref.update(down, (map) => new Map(map).set(key, { delayMs, nextAt: now + delayMs }));
+    }
   });
 
   const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -4051,6 +4171,7 @@ const make = Effect.gen(function* () {
     dispatchNow: guard(dispatchUnlocked()),
     turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
     tick: guard(tickUnlocked()),
+    probeOutages: read(probeOutagesNow()),
     notifyTurnEnded: (threadId) =>
       Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
     notifyThreadChanged: (threadId) =>

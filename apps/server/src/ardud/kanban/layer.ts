@@ -80,6 +80,14 @@ export const ArdudKanbanLive = Layer.effectDiscard(
         Effect.asVoid,
       ),
     );
+    // Its own fiber: a probe can take a minute and must not delay the tick.
+    yield* forkParked(
+      service.probeOutages.pipe(
+        Effect.catchCause(warnUnlessInterrupted("provider probe failed")),
+        Effect.repeat(Schedule.spaced("1 minute")),
+        Effect.asVoid,
+      ),
+    );
   }),
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
