@@ -230,8 +230,16 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
         />
       </Section>
       <Section title="Review">
-        {board.reviewChains.map((chain) => {
+        {board.reviewChains.map((chain, chainIndex) => {
           const isDefault = chain.name === board.defaultReviewChain;
+          const saveStep = (index: number, next: ModelSelection) =>
+            update({
+              reviewChains: board.reviewChains.map((c, ci) =>
+                ci === chainIndex
+                  ? { ...c, steps: c.steps.map((s, si) => (si === index ? next : s)) }
+                  : c,
+              ),
+            });
           return (
             <div
               key={chain.name}
@@ -242,12 +250,49 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 {chain.steps.map((step, index) => (
                   <span key={`${step.model}:${index}`} className="flex items-center gap-1.5">
                     {index > 0 ? <span className="text-(--m-muted)">→</span> : null}
-                    <Chip>
-                      {modelName(step)}
-                      {modelVariant(step) ? (
-                        <span className="text-(--m-muted)">{modelVariant(step)}</span>
-                      ) : null}
-                    </Chip>
+                    <ProviderModelPicker
+                      environmentId={environmentId}
+                      activeInstanceId={step.instanceId}
+                      model={step.model}
+                      lockedProvider={null}
+                      instanceEntries={instanceEntries}
+                      modelOptionsByInstance={getCustomModelOptionsByInstance(
+                        settings,
+                        providers,
+                        step.instanceId,
+                        step.model,
+                      )}
+                      disabled={!canEdit}
+                      triggerLabel={modelName(step)}
+                      onInstanceModelChange={(nextInstanceId, model) =>
+                        saveStep(index, boardModelSelection({ instanceId: nextInstanceId, model }))
+                      }
+                    />
+                    {(() => {
+                      const entry = instanceEntries.find(
+                        (candidate) => candidate.instanceId === step.instanceId,
+                      );
+                      return entry ? (
+                        <TraitsPicker
+                          provider={entry.driverKind}
+                          instanceId={step.instanceId}
+                          models={entry.models}
+                          model={step.model}
+                          prompt=""
+                          onPromptChange={() => {}}
+                          modelOptions={step.options ?? []}
+                          allowPromptInjectedEffort={false}
+                          planModeEnabled={settings.planModeEnabled}
+                          disabled={!canEdit}
+                          onModelOptionsChange={(options) =>
+                            saveStep(
+                              index,
+                              createModelSelection(step.instanceId, step.model, options),
+                            )
+                          }
+                        />
+                      ) : null;
+                    })()}
                   </span>
                 ))}
                 <span className="flex items-center gap-1 text-xs text-(--m-muted)">
