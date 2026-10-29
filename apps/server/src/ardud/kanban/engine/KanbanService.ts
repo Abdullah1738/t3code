@@ -356,6 +356,14 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<KanbanWikiPage, KanbanError>;
 
   /**
+   * The owner's "Start setup": saves the evaluator model, starts the setup evaluator
+   * and returns the Setup discussion it talks in. Refused while setup already runs.
+   */
+  readonly startSetup: (
+    boardId: KanbanBoard["id"],
+    input: { readonly evaluatorModel: ModelSelection; readonly text?: string | undefined },
+  ) => Effect.Effect<{ readonly discussionId: KanbanDiscussionId }, KanbanError>;
+  /**
    * Ends a board's running setup: the owner's "End setup" (actor owner) or the
    * setup evaluator's setup_done (actor evaluator, only its own thread).
    */
@@ -3731,6 +3739,26 @@ const make = Effect.gen(function* () {
     wiki: (boardId) => read(store.wiki(boardId)),
     writeWiki,
     endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
+    startSetup: (boardId, input) =>
+      guard(
+        Effect.gen(function* () {
+          const board = yield* boardOf(boardId);
+          if (board.setup?.status === "running") {
+            return yield* failWith("invalid", `board ${board.slug} is already in setup`);
+          }
+          yield* checkModel(input.evaluatorModel);
+          const saved: KanbanBoard = { ...board, evaluatorModel: input.evaluatorModel };
+          yield* store.putBoard(saved);
+          yield* publish(board.id, { _tag: "board", board: saved });
+          const text = input.text?.trim() ? input.text.trim() : Defaults.DEFAULT_SETUP_TEXT;
+          // startEvaluatorUnlocked opens the Setup discussion and marks setup running.
+          // It returns the thread, so the discussion is read back from the board.
+          yield* startEvaluatorUnlocked(saved, { kind: "setup", text }, {});
+          const started = (yield* boardOf(boardId)).setup;
+          if (!started) return yield* failWith("invalid", "setup did not open a Setup discussion");
+          return { discussionId: started.discussionId };
+        }),
+      ),
     startEvaluator: (boardId, purpose, text) =>
       guard(
         Effect.gen(function* () {

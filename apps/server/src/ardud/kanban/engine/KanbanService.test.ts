@@ -13,6 +13,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   type KanbanActor,
   type KanbanBlock,
@@ -2218,6 +2219,34 @@ it.effect("setup_done ends a running setup; only its own thread or the owner may
       assert.strictEqual(
         (yield* kanban.boards).find((b) => b.id === board.id)!.setup?.status,
         "done",
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("setupStart saves the picked model, starts setup once and refuses a second start", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const picked = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
+      const started = yield* kanban.startSetup(board.id, { evaluatorModel: picked });
+      const after = (yield* kanban.boards).find((b) => b.id === board.id)!;
+      assert.strictEqual(after.evaluatorModel.model, "opus/claude-opus-5-5");
+      assert.strictEqual(after.setup?.status, "running");
+      assert.strictEqual(after.setup?.discussionId, started.discussionId);
+      // The setup evaluator talks in the Setup discussion it was handed.
+      const discussion = yield* kanban.discussion(started.discussionId);
+      assert.strictEqual(discussion.title, "Setup");
+
+      // A second start while setup runs is refused and starts nothing.
+      const again = yield* Effect.exit(
+        kanban.startSetup(board.id, { evaluatorModel: picked, text: "Again" }),
+      );
+      assert.isTrue(Exit.isFailure(again));
+      assert.strictEqual(
+        (yield* kanban.boards).find((b) => b.id === board.id)!.setup?.discussionId,
+        started.discussionId,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

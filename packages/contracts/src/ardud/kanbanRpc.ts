@@ -61,6 +61,7 @@ export const KANBAN_WS_METHODS = {
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
+  setupStart: "kanban.setup.start",
   setupEnd: "kanban.setup.end",
   cardPatch: "kanban.card.patch",
   cardSettle: "kanban.card.settle",
@@ -189,6 +190,15 @@ export const KanbanRpcs = RpcGroup.make(
     KanbanBoard,
   ),
   call(M.boardUpdate, KanbanBoardUpdateInput, KanbanBoard),
+  call(
+    M.setupStart,
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      evaluatorModel: ModelSelection,
+      text: Schema.optional(Schema.String),
+    }),
+    Schema.Struct({ discussionId: KanbanDiscussionId }),
+  ),
   call(M.setupEnd, Schema.Struct({ boardId: KanbanBoardId }), KanbanBoard),
   call(M.cardPatch, KanbanCardPatchInput, KanbanCard),
   call(M.cardSettle, CardRef, KanbanCard),
@@ -275,6 +285,7 @@ export const KANBAN_READ_SCOPES = {
 export const KANBAN_GUARDED_SCOPES = {
   [M.boardCreate]: AuthOrchestrationOperateScope,
   [M.boardUpdate]: AuthOrchestrationOperateScope,
+  [M.setupStart]: AuthOrchestrationOperateScope,
   [M.setupEnd]: AuthOrchestrationOperateScope,
   [M.cardPatch]: AuthOrchestrationOperateScope,
   [M.cardSettle]: AuthOrchestrationOperateScope,

@@ -66,6 +66,11 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["ensureBoard"]>[0]) =>
       service.ensureBoard(input),
     [M.boardUpdate]: updateBoard,
+    [M.setupStart]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
+      readonly evaluatorModel: Parameters<KanbanServiceShape["startSetup"]>[1]["evaluatorModel"];
+      readonly text?: string | undefined;
+    }) => service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
     [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
       service.endSetup(input.boardId, OWNER),
     [M.cardPatch]: patchCard,
