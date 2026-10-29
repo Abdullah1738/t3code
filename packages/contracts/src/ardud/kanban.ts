@@ -274,10 +274,23 @@ const isOpenCard = (card: KanbanCard) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
+ * A completed card whose evaluator merge subtask is still open: review has
+ * passed, but its work isn't on ardud/main yet. Completed means review-passed;
+ * the merge is a later evaluator subtask.
+ */
+export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">): boolean =>
+  card.stage === "completed" &&
+  card.subtasks.some(
+    (subtask) =>
+      subtask.state === "open" && subtask.owner === "evaluator" && /\bmerge\b/i.test(subtask.text),
+  );
+
+/**
  * The first unfinished card holding `card` up, or undefined. A blocker on the
  * same work thread is no block, since that thread does both in order, unless
  * it can't go on itself: stalled, in the backlog, waiting on the owner or the
- * evaluator, or held up in turn.
+ * evaluator, or held up in turn. A completed blocker still holds while its
+ * merge subtask is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -288,8 +301,12 @@ export function kanbanHeldUpBy(
   const heldUp = (waiter: KanbanCard, path: Set<string>): KanbanCard | undefined => {
     for (const id of waiter.blockedBy) {
       const blocker = byId.get(id);
-      if (blocker === undefined || KANBAN_DONE_STAGES.has(blocker.stage)) continue;
+      if (blocker === undefined) continue;
+      const done = KANBAN_DONE_STAGES.has(blocker.stage);
+      if (done && !kanbanAwaitsMerge(blocker)) continue;
       if (thread === null || blocker.workThreadId !== thread) return blocker;
+      // Same thread: it carries the blocker's commits on its own branch, so a finished blocker isn't held.
+      if (done) continue;
       if (
         blocker.stalled !== null ||
         blocker.priority === KANBAN_BACKLOG ||

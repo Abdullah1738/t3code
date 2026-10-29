@@ -265,6 +265,31 @@ describe("planDispatch", () => {
     expect(plan.map((d) => d.cardId)).toEqual([b.id, a.id]);
   });
 
+  it("holds a waiter until its completed blocker's merge subtask is done", () => {
+    const mergeStep = (state: "open" | "done") => [
+      {
+        id: "m1",
+        step: 4,
+        text: "Rebase on latest ardud/main, merge into ardud/main, push origin main",
+        owner: "evaluator" as const,
+        state,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ];
+    const blocker = card({ stage: "completed", subtasks: mergeStep("open") });
+    const waiter = card({ blockedBy: [blocker.id] });
+    expect(planDispatch(board, [blocker, waiter], pools([[opus, 2]])).map((d) => d.cardId)).toEqual(
+      [],
+    );
+    const merged = card({ stage: "completed", subtasks: mergeStep("done") });
+    const waiting = card({ blockedBy: [merged.id] });
+    expect(
+      planDispatch(board, [merged, waiting], pools([[opus, 2]])).map((d) => d.cardId),
+    ).toEqual([waiting.id]);
+  });
+
   it("counts running cards against their pool and never goes negative", () => {
     const running = card({
       stage: "working",

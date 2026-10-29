@@ -191,7 +191,13 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
   } else {
     const blocker = isDoneStage(card.stage) ? undefined : kanbanHeldUpBy(card, state.cards);
     if (blocker !== undefined) {
-      flag = { kind: "blocked", label: `After #${blocker.number}` };
+      flag = {
+        kind: "blocked",
+        label:
+          blocker.stage === "completed"
+            ? `Waits for #${blocker.number} to be merged`
+            : `After #${blocker.number}`,
+      };
     } else if (kanbanWaitsOnEvaluator(card)) {
       flag = { kind: "blocked", label: "Waits on the evaluator" };
     }
