@@ -592,6 +592,8 @@ function nativeDb(session: string, rows: [string, unknown][]) {
   // Rows are written after the run starts (the run's requestedAt is `base`), as native execution would write them.
   const base = Date.now();
   rows.forEach(([id, data], index) => db.query("INSERT INTO session_message VALUES (?, ?, 'assistant', ?, ?, ?)").run(id, session, index, base + 5_000 + index, JSON.stringify(data)));
+  // The run has settled: OpenCode wrote its idle marker after the steps.
+  db.query("INSERT INTO session_message VALUES (?, ?, 'idle', ?, ?, ?)").run(`idle_${session}`, session, rows.length, base + 10_000, JSON.stringify({ outcome: "failed" }));
   db.close();
   return { path, base };
 }
@@ -618,6 +620,33 @@ async function failedWake(path: string, session: string, base: number, offsetsMs
   }
   return { control, store, router, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
 }
+
+test("an errored step classified between OpenCode's commits, before the native idle marker, is never retried, even when execution later completes a tool", async () => {
+  // Between the two native commits: the step is `error` with no retry yet and the run has no idle marker.
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-between-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  const base = Date.now();
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  db.query("INSERT INTO session_message VALUES ('msg_between', 'ses_between', 'assistant', 0, ?, ?)").run(base + 5_000, JSON.stringify({ finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "provider.internal" } }));
+  db.close();
+  const first = await failedWake(path, "ses_between", base, []);
+  // No idle marker yet: the run is between OpenCode's commits, so it is unsettled and the wake is not retried.
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // Execution carries on: retry.scheduled lands, then a tool completes, then the run settles idle.
+  const later = new Database(path);
+  later.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: base + 120_000 }, error: { type: "provider.internal" } }), "msg_between");
+  later.query("INSERT INTO session_message VALUES ('msg_tool', 'ses_between', 'assistant', 1, ?, ?)").run(base + 60_000, JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }));
+  later.query("INSERT INTO session_message VALUES ('idle_ses_between', 'ses_between', 'idle', 2, ?, ?)").run(base + 90_000, JSON.stringify({ outcome: "succeeded" }));
+  later.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
 
 test("an error step with a pending native retry is never retried, even when that execution later completes a tool", async () => {
   // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
@@ -718,6 +747,8 @@ test("a first-call provider 400 on Robob is retried after 2 minutes, through the
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
   db.query("INSERT INTO session_message VALUES (?, 'ses_native_400', 'assistant', 0, ?, ?)").run("msg_400", Date.now(), JSON.stringify({ finish: "error", content: [], error: { type: "aborted" } }));
+  // The settled run: OpenCode wrote its idle marker after the failed step.
+  db.query("INSERT INTO session_message VALUES ('idle_400', 'ses_native_400', 'idle', 1, ?, ?)").run(Date.now() + 1000, JSON.stringify({ outcome: "failed" }));
   db.close();
   const control = fakeControl();
   const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,

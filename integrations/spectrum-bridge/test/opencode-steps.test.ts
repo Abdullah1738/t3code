@@ -21,13 +21,15 @@ function opencodeDb(rows: [string, unknown][]) {
   return { dir, path };
 }
 
-function runDb(rows: { seq: number; time: number; data: unknown }[]) {
+/** A session's rows; by default the run ends with its native idle marker, as OpenCode writes once execution settles. */
+function runDb(rows: { seq: number; time: number; data: unknown }[], { idle = true, idleAt = 10_000 }: { idle?: boolean; idleAt?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "opencode-run-"));
   dirs.push(dir);
   const path = join(dir, "opencode.db");
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
   rows.forEach((row, index) => db.query("INSERT INTO session_message VALUES (?, 'ses_run', 'assistant', ?, ?, ?)").run(`msg_${index}`, row.seq, row.time, JSON.stringify(row.data)));
+  if (idle) db.query("INSERT INTO session_message VALUES ('idle_1', 'ses_run', 'idle', ?, ?, ?)").run(rows.length + 1, idleAt, JSON.stringify({ outcome: "succeeded" }));
   db.close();
   return path;
 }
@@ -48,6 +50,10 @@ test("native run evidence: truncated scans are unknown, a complete stop-only run
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
   // An errored step that carried a tool part did run a tool.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "tool", id: "t", name: "patch", state: { status: "error" } }] } }]))("ses_run", 0)).toBe("ran");
+  // Without the run's idle marker, execution may still be running: a terminal step alone proves nothing.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: stop }], { idle: false }))("ses_run", 0)).toBe("unknown");
+  // An idle marker that belongs to an earlier run (before this run's start) does not settle this one.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: stop }], { idleAt: 500 }))("ses_run", 1000)).toBe("unknown");
   // An unfinished step may still be executing (no finish yet), so it is never proven tool-free.
   expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { content: [] } }]))("ses_run", 0)).toBe("unknown");
   // A terminal error that emitted text or reasoning but no tool is proven tool-free.
