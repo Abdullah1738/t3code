@@ -364,6 +364,7 @@ it.effect("lists a board's card and evaluator threads, and marks board threads a
         name: "Threads",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
       const created = yield* kanban.createCard(
         board.id,
         { prompt: "Add a retry", title: "Retry" },
