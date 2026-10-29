@@ -1,8 +1,9 @@
 /**
  * Board scripts: what runs them, when they are due, and how they talk to the
  * board. A script prints one JSON object per line with a `kanban` key to add
- * a card, post in a discussion or resize a pool; every other line is plain
- * output.
+ * a card, post in a discussion, resize a pool, tick its subtask (`subtask`),
+ * hand one back to the evaluator (`handback`) or move a card to completed,
+ * deployed or verified (`move`); every other line is plain output.
  */
 import type {
   KanbanActor,
@@ -100,11 +101,47 @@ const PoolCommand = Schema.Struct({
   slots: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 50 })),
 });
 
-export const ScriptCommand = Schema.Union([CardCommand, PostCommand, PoolCommand]);
+/** Marks a subtask this script owns done, or skipped with a note. */
+const SubtaskCommand = Schema.Struct({
+  kanban: Schema.Literal("subtask"),
+  /** A card number on the script's board. */
+  card: Schema.Int,
+  subtask: Schema.String,
+  state: Schema.Literals(["done", "skipped"]),
+  note: Schema.optional(Schema.String),
+});
+
+/** Hands a subtask this script owns back to the card's evaluator with what failed; wakes it once. */
+const HandBackCommand = Schema.Struct({
+  kanban: Schema.Literal("handback"),
+  card: Schema.Int,
+  subtask: Schema.String,
+  note: Schema.String,
+});
+
+/** Moves a card to completed, deployed or verified, with a note for its history. */
+const MoveCommand = Schema.Struct({
+  kanban: Schema.Literal("move"),
+  card: Schema.Int,
+  to: Schema.Literals(["completed", "deployed", "verified"]),
+  note: Schema.optional(Schema.String),
+});
+
+export const ScriptCommand = Schema.Union([
+  CardCommand,
+  PostCommand,
+  PoolCommand,
+  SubtaskCommand,
+  HandBackCommand,
+  MoveCommand,
+]);
 export type ScriptCommand = typeof ScriptCommand.Type;
 export type CardCommand = typeof CardCommand.Type;
 export type PostCommand = typeof PostCommand.Type;
 export type PoolCommand = typeof PoolCommand.Type;
+export type SubtaskCommand = typeof SubtaskCommand.Type;
+export type HandBackCommand = typeof HandBackCommand.Type;
+export type MoveCommand = typeof MoveCommand.Type;
 
 const decodeCommand = Schema.decodeUnknownResult(ScriptCommand);
 

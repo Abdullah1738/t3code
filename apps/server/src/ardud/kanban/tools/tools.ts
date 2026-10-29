@@ -82,8 +82,14 @@ const SubtasksInput = describe(
       ),
       text: TrimmedNonEmptyString,
       owner: describe(
-        Schema.Literals(["work", "review", "evaluator"]),
-        "Who does it: the worker, the reviewer (ticked when the review passes) or an evaluator.",
+        Schema.Literals(["work", "review", "evaluator", "script"]),
+        "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
+      ),
+      script: Schema.optional(
+        describe(
+          TrimmedNonEmptyString,
+          "For a script's subtask: the name of the board script that does it. Left out, any script on the board can.",
+        ),
       ),
     }),
   ),

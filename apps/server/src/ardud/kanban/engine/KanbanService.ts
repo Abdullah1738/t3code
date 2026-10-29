@@ -297,6 +297,17 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * A board script hands its open subtask back to the card's evaluator with
+   * what failed: the subtask becomes the evaluator's and the evaluator is
+   * woken once, with the note.
+   */
+  readonly handBack: (
+    cardId: KanbanCard["id"],
+    subtaskId: string,
+    note: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
   /** `head` is the reviewed commit, stored on the review event. */
   readonly reviewResult: (
     threadId: ThreadId,
@@ -1723,7 +1734,7 @@ const make = Effect.gen(function* () {
         ((card.stage === "todo" && card.wakeNote === null) ||
           card.stage === "in_review" ||
           (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
-          ? Subtasks.subtaskIds(kanbanStepSubtasks(card))
+          ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
           : null;
       const now = turn(after);
       if (now === null) return;
@@ -1732,8 +1743,16 @@ const make = Effect.gen(function* () {
         // An evaluator's change never starts an evaluator: one is already on the card.
         if (before === null || after.discussionId === null) return;
         // Part of a step its evaluator already heard about got done: nothing new.
-        const told = turn(before) === null ? null : new Set(kanbanStepSubtasks(before).map((subtask) => subtask.id));
-        if (told !== null && kanbanStepSubtasks(after).every((subtask) => told.has(subtask.id))) return;
+        const told =
+          turn(before) === null
+            ? null
+            : new Set(kanbanStepSubtasks(before, "evaluator").map((subtask) => subtask.id));
+        if (
+          told !== null &&
+          kanbanStepSubtasks(after, "evaluator").every((subtask) => told.has(subtask.id))
+        ) {
+          return;
+        }
         const discussion = yield* store.discussion(after.discussionId);
         const own = discussion?.evaluatorThreadId ?? null;
         if (discussion === null || own === null || own === actor.threadId) return;
@@ -3055,6 +3074,7 @@ const make = Effect.gen(function* () {
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
     const plan = Subtasks.planSubtasks([], input.subtasks ?? []);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
+    yield* checkScriptNames(input.boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
       boardId,
@@ -3418,6 +3438,7 @@ const make = Effect.gen(function* () {
           ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
+        if (plan?.ok) yield* checkScriptNames(card.boardId, plan.subtasks);
         const removeUrls = (patch.removeLinks ?? []).map((url) => url.trim());
         for (const url of removeUrls) {
           if (!card.links.some((link) => link.url === url))
@@ -3729,7 +3750,9 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        const check = Subtasks.checkMark(card, subtaskId, state, role, note);
+        const scriptName =
+          role === "script" ? (yield* scriptFor(card, actor)).name : null;
+        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
         if (!check.ok) return yield* failWith("denied", check.reason);
         const at = yield* nowIso;
         const marked: KanbanCard = {
@@ -3788,6 +3811,69 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+
+  /** Only a board script does a script's subtask, and only on its own board. */
+  const scriptFor = Effect.fn("KanbanService.scriptFor")(function* (
+    card: KanbanCard,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "script") return yield* failWith("denied", "only a board script does this");
+    const script = yield* store.script(actor.scriptId);
+    if (script === null || script.boardId !== card.boardId) {
+      return yield* failWith("denied", `card #${card.number} isn't on this script's board`);
+    }
+    return script;
+  });
+
+  const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const script = yield* scriptFor(card, actor);
+        const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
+        if (!check.ok) return yield* failWith("denied", check.reason);
+        const at = yield* nowIso;
+        const trimmed = note.trim();
+        const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
+        const next: KanbanCard = {
+          ...card,
+          subtasks: Subtasks.handBack(card.subtasks, subtaskId, trimmed),
+          updatedAt: at,
+        };
+        yield* logEvent(next, actor, "subtask", {
+          body: `${subtaskId} handed back to the evaluator: ${text} (${trimmed})`,
+        });
+        yield* saveCard(next);
+        // One wake for the hand-back itself: the evaluator hears the note once.
+        yield* noteDiscussion(next, Briefs.handBackText(next, subtaskId, script.name, trimmed)).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban hand-back note failed", cause),
+          ),
+        );
+        yield* kick;
+        return next;
+      }),
+    );
+
+  /** A script's subtask names a script on this board: a misspelt name would leave its step waiting for good. */
+  const checkScriptNames = Effect.fn("KanbanService.checkScriptNames")(function* (
+    boardId: KanbanBoard["id"],
+    subtasks: ReadonlyArray<KanbanSubtask>,
+  ) {
+    const names = new Set(
+      (yield* store.scripts(boardId)).map((script) => script.name.toLowerCase()),
+    );
+    for (const subtask of subtasks) {
+      if (subtask.state !== "open" || subtask.script === undefined) continue;
+      if (!names.has(subtask.script.toLowerCase())) {
+        return yield* failWith(
+          "invalid",
+          `subtask ${subtask.id}: no script named "${subtask.script}" on this board`,
+        );
+      }
+    }
+  });
+
 
   /**
    * A reviewer that lost its slot mid-review (the dispatcher's no-verdict flag,
@@ -4372,6 +4458,7 @@ const make = Effect.gen(function* () {
     flagCard,
     settleCard,
     markSubtask,
+    handBack,
     askOwner,
     changeAsk,
     reviewResult,

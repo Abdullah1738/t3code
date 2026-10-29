@@ -5,7 +5,7 @@ import {
   modelName,
   modelVariant,
   STAGE_LABELS,
-  SUBTASK_OWNER_LABELS,
+  subtaskOwnerLabel,
   subtaskSteps,
   type CardSteps,
   type KanbanBoardState,
@@ -494,7 +494,7 @@ function CardSubtasks(props: { readonly card: KanbanCard }) {
                     {subtask.text}
                   </Text>
                   <Text className="text-[12px] text-foreground-muted">
-                    {SUBTASK_OWNER_LABELS[subtask.owner]}
+                    {subtaskOwnerLabel(subtask)}
                     {subtask.note ? ` · ${subtask.note}` : ""}
                   </Text>
                 </View>

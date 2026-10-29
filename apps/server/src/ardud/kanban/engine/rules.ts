@@ -5,6 +5,7 @@ import {
   kanbanCardModels,
   kanbanHeldUpBy,
   kanbanPickOrder,
+  kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
@@ -15,8 +16,11 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 
-/** Who is asking for a move. `cardThread` is the card's own work or review thread. */
-export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "system";
+/**
+ * Who is asking for a move. `cardThread` is the card's own work or review thread.
+ * `script` is a board script, from its output.
+ */
+export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "system" | "script";
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
@@ -52,6 +56,15 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       // Review results and PR merges.
       if (from === "in_review" && (to === "todo" || to === "completed")) return ok;
       return no(`system cannot move ${from} -> ${to}`);
+    case "script":
+      if (card.settledAt !== null) return no("card is settled");
+      if (KANBAN_THREAD_STAGES.includes(from)) {
+        return no(`a script doesn't move a card a thread has (${from})`);
+      }
+      if (!(to === "completed" || to === "deployed" || to === "verified")) {
+        return no(`a script moves a card only to completed, deployed or verified, not ${to}`);
+      }
+      return ok;
     case "evaluator":
     case "owner":
       if (card.settledAt !== null) return no("card is settled");
@@ -405,7 +418,9 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   }
   if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
   if (kanbanWaitsOnEvaluator(card)) {
-    return no(`card #${card.number} waits on an evaluator's subtask first`);
+    return no(
+      `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
+    );
   }
   const runsOn =
     card.workThreadId === null
