@@ -400,10 +400,19 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model. Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
   { model: ModelInput, slots: NonNegativeInt },
   { pools: Records },
   { readonly: false },
+);
+
+const PoolRemove = tool(
+  "pool_remove",
+  "Remove a model pool",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  { model: ModelInput },
+  { pools: Records },
+  { readonly: false, destructive: true },
 );
 
 const GoalSet = tool(
@@ -474,7 +483,7 @@ const BoardOpen = tool(
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
-  "Start an evaluator thread on a board for a job: setup or request (with text), or a sweep (stalled, completed, deployed, check).",
+  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text.",
   {
     boardId: TrimmedNonEmptyString,
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
@@ -516,6 +525,7 @@ export const KanbanToolkit = Toolkit.make(
   SubtaskDone,
   CardThread,
   PoolSet,
+  PoolRemove,
   GoalSet,
   GroupSet,
   DiscussionCreate,

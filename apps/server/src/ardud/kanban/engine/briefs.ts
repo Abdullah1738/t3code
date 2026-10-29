@@ -50,7 +50,8 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,
-    "- If you can't continue (missing access, broken env), call card_flag with the reason.",
+    "- Never end a turn while a card of yours is in Working: move it to needs_review, ask with card_ask (blocking when you can't go on), flag it, or keep working. Wait for CI or a deploy inside the turn. Each time you stop with a card in Working you are nudged.",
+    "- If you can't continue (missing access, broken env), call card_flag with the reason: the card goes back to To Do and the evaluator is told.",
     "- Messages from the card discussion arrive here. Answer them with discussion_post; plain replies in this thread are not seen there.",
     "- Read the board wiki (wiki_read) for lessons that apply to this work.",
     LINKS_LINE,
@@ -96,6 +97,14 @@ export const planChangedText = (card: KanbanCard) =>
     `Card #${card.number}'s plan changed.`,
     "",
     subtaskLines(card) ?? "It has no subtasks now.",
+  );
+
+/** The same, when another evaluator's change put the card on this step. */
+export const evaluatorStepFromOtherText = (card: KanbanCard, by: string) =>
+  lines(
+    evaluatorStepText(card),
+    "",
+    `Another evaluator (thread ${by}) moved the card on to this step. Read the card's events first, so nothing outward is done twice.`,
   );
 
 /** Sent to the card discussion's evaluator when the step a card is on becomes its own. */
@@ -229,7 +238,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     "- Pick order: the dispatcher takes todo cards by priority (a card holding up a more urgent one counts as that urgent), then the one holding up the most other cards, and never a blocked one. Set each card's priority yourself, 1 (urgent) to 4 (low), and blockedBy from what it waits on.",
     "- Backlog: priority 5 is never picked up, and a card with a thread is paused there until it leaves. Move a card into the backlog, or out of it, only when the owner asks.",
     "- Threads: card_thread steer|stop|wake. Every message to a thread is a steer. Threads only talk to each other through you.",
-    "- Capacity: pool_set changes how many threads run per model. Lowering never kills work by itself; stop threads to fit if needed.",
+    "- Capacity: pool_set changes how many threads run per model, and adds a pool for any model in the composer's list (orchestrator_capabilities), at 0 slots unless the owner gives a number; pool_remove drops an unused one. A model that leaves the list drops to 0 by itself. Lowering never kills work by itself; stop threads to fit if needed. A pool the routing below doesn't name runs work only when the owner asks for that model.",
     "- Models: give a card several models with weights (models on card_create or card_edit) when the routing below says so. It starts on the highest-weight model whose pool has room, equal weights at random, and its thread keeps that model. A model or variant the provider doesn't offer is refused when you set it, and the error lists what it does offer; pick the closest one yourself. If a card's run fails, it is flagged stalled and you get a note: fix it, clear the flag, and say what you changed.",
     "- Goals: goal_set keeps a goal's Now (current status) and its numbered Story for a non-technical reader.",
     "- Discussions: discussion_create opens a channel, discussion_post writes to any discussion (markdown, collapse, html, choice, card blocks).",
@@ -288,7 +297,7 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working. If the work is done, card_move to needs_review. If you need the owner, ask with card_ask. If you are waiting on something (CI, a deploy), add a card_update comment saying what.`;
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Wait for CI or a deploy inside your turn instead of ending it.`;
 };
 
 export const runFailedText = (
@@ -301,6 +310,9 @@ export const runFailedText = (
 
 export const modelRefusedText = (card: KanbanCard, problem: string) =>
   `Card #${card.number} was not started: ${problem} It is flagged stalled. card_edit its model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain), clear the flag with card_flag stalled false, and say in the card's discussion what you changed.`;
+
+export const workerFlaggedText = (card: KanbanCard, reason: string) =>
+  `Card #${card.number} (${card.title || "untitled"}): its thread flagged it and let it go: "${reason}". It is in ${card.stage}, flagged, and its slot is free. Read the thread (t3_thread_read), sort out what it needs, then card_thread wake with what to do next (it goes back to the same thread), or re-plan the card.`;
 
 export const nudgeReviewText = (card: KanbanCard) =>
   `Card #${card.number}: record your verdict with card_review_result (clear or findings).`;

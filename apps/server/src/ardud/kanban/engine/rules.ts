@@ -144,6 +144,24 @@ export function discussionSettleDue(
   return nowMs - quietSince >= DISCUSSION_IDLE_MS;
 }
 
+export const WORKER_QUIET_MS = 30 * 60 * 1000;
+
+/** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
+export function workerQuietDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly updatedAt: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle" && view.state !== "needs-input") return false;
+  const since = Math.max(
+    Date.parse(view.updatedAt),
+    Date.parse(card.movedAt),
+    card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+  );
+  return nowMs - since >= WORKER_QUIET_MS;
+}
+
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
 export const isBlocked = (
   card: KanbanCard,

@@ -43,6 +43,7 @@ export interface KanbanThreadView {
   readonly state: ControlThreadState;
   readonly updatedAt: string;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
+  readonly archived: boolean;
 }
 
 export interface KanbanLaunchInput {
@@ -100,6 +101,7 @@ const make = Effect.gen(function* () {
               title: shell.title,
               state: stateFromShell(shell),
               updatedAt: DateTime.formatIso(shell.updatedAt),
+              archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,
                 title: pr.snapshot?.title ?? null,

@@ -499,6 +499,13 @@ export const OrchestrationV2RestartCancelledBackgroundWork = Schema.Struct({
   kind: Schema.Literals(["subagent", "shell", "monitor", "task"]),
   label: TrimmedNonEmptyString,
   id: Schema.optional(TrimmedNonEmptyString),
+  /** ardud: the child thread a native subagent runs on, and when it started, so restart can check it. */
+  child: Schema.optional(
+    Schema.Struct({
+      threadId: ThreadId,
+      startedAt: Schema.DateTimeUtc,
+    }),
+  ),
 });
 export type OrchestrationV2RestartCancelledBackgroundWork =
   typeof OrchestrationV2RestartCancelledBackgroundWork.Type;
@@ -506,6 +513,18 @@ export type OrchestrationV2RestartCancelledBackgroundWork =
 export const OrchestrationV2RunBackgroundWorkCancelled = Schema.Struct({
   runId: RunId,
   restartCancelledBackgroundWork: Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
+});
+// ardud: the JSON form of the restart work, shared by the run record and the cancellation event.
+const OrchestrationV2RestartCancelledBackgroundWorkJson = Schema.Struct({
+  kind: OrchestrationV2RestartCancelledBackgroundWork.fields.kind,
+  label: OrchestrationV2RestartCancelledBackgroundWork.fields.label,
+  id: OrchestrationV2RestartCancelledBackgroundWork.fields.id,
+  child: Schema.optional(
+    Schema.Struct({
+      threadId: ThreadId,
+      startedAt: Schema.DateTimeUtcFromString,
+    }),
+  ),
 });
 export type OrchestrationV2RunBackgroundWorkCancelled =
   typeof OrchestrationV2RunBackgroundWorkCancelled.Type;
@@ -1996,6 +2015,10 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
+  // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
+  restartCancelledBackgroundWork: Schema.optional(
+    Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),
+  ),
 }));
 export type OrchestrationV2RunJson = typeof OrchestrationV2RunJson.Type;
 
@@ -2488,7 +2511,10 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("run.background-work-cancelled"),
-    payload: OrchestrationV2RunBackgroundWorkCancelled,
+    payload: Schema.Struct({
+      runId: RunId,
+      restartCancelledBackgroundWork: Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),
+    }),
   }),
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,

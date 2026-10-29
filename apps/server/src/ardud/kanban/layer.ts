@@ -8,6 +8,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
 import { KanbanService, layer as KanbanServiceLayer } from "./engine/KanbanService.ts";
+import { layer as KanbanModelsLayer } from "./engine/models.ts";
 import { KanbanScripts, layer as KanbanScriptsLayer } from "./engine/ScriptService.ts";
 import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
 import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
@@ -61,6 +62,7 @@ export const ArdudKanbanLive = Layer.effectDiscard(
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
   Layer.provideMerge(KanbanServiceLayer),
+  Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),
 );

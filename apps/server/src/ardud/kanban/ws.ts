@@ -49,6 +49,9 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.discussions]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["discussions"]>[0];
     }) => service.discussions(input.boardId),
+    [M.threads]: (input: { readonly boardId: Parameters<KanbanServiceShape["threads"]>[0] }) =>
+      service.threads(input.boardId),
+    [M.owner]: (input: { readonly threadId: string }) => service.caller(input.threadId),
     [M.messages]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["messages"]>[0];
       readonly afterSeq?: number | undefined;
@@ -83,6 +86,10 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
       readonly slots: number;
     }) => service.setPool(input.boardId, input.model, input.slots),
+    [M.poolRemove]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
+      readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
+    }) => service.removePool(input.boardId, input.model),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;

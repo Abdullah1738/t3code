@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { XIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronUpIcon, XIcon } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
@@ -10,6 +10,7 @@ import {
   STAGE_LABELS,
   SUBTASK_OWNER_LABELS,
   subtaskSteps,
+  type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
@@ -27,8 +28,10 @@ import {
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
@@ -75,6 +78,9 @@ export function CardDrawer(props: {
   boardId: string;
   cardId: string;
   state: KanbanBoardState;
+  /** Neighbours on the board, or null when the drawer isn't over the board view. */
+  steps: CardSteps | null;
+  onStepCard: (cardId: string) => void;
   onClose: () => void;
   onOpenCard: (cardId: string) => void;
 }) {
@@ -87,6 +93,13 @@ export function CardDrawer(props: {
   const panelRef = useRef<HTMLElement>(null);
 
   const onClose = useStableCallback(props.onClose);
+  const onStep = useStableCallback((direction: -1 | 1) => {
+    const steps = props.steps;
+    if (steps === null) return false;
+    const target = direction < 0 ? steps.previous : steps.next;
+    if (target !== null) props.onStepCard(target);
+    return true;
+  });
   const canStop = useKanbanPermission(KANBAN_WS_METHODS.cardStop);
   const canSettle = useKanbanPermission(KANBAN_WS_METHODS.cardSettle);
 
@@ -94,6 +107,11 @@ export function CardDrawer(props: {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) {
         onClose();
+        return;
+      }
+      const direction = stepFromKey(event);
+      if (direction !== null) {
+        if (onStep(direction)) event.preventDefault();
         return;
       }
       // Tab stays inside the drawer; the page behind it is out of reach.
@@ -121,7 +139,7 @@ export function CardDrawer(props: {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, onStep]);
 
   // The drawer is keyed by card, so this runs once per opened card. Focus
   // goes back to what opened the first card of this drawer session.
@@ -164,6 +182,26 @@ export function CardDrawer(props: {
           <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
             <Pri priority={card.priority} />
             <span className="tabular-nums">#{card.number}</span>
+            {props.steps !== null ? (
+              <>
+                <StepButton
+                  label="Previous card"
+                  hint="Previous card (↑)"
+                  target={props.steps.previous}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronUpIcon className="size-4" />
+                </StepButton>
+                <StepButton
+                  label="Next card"
+                  hint="Next card (↓)"
+                  target={props.steps.next}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronDownIcon className="size-4" />
+                </StepButton>
+              </>
+            ) : null}
             <span className="flex-1" />
             <CopyLinkButton
               kind="kanban-card"
@@ -189,11 +227,17 @@ export function CardDrawer(props: {
                 type="button"
                 disabled={!canSettle}
                 title={canSettle ? undefined : "Your connection can't settle cards"}
-                onClick={() =>
-                  void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
-                    (ok) => ok && props.onClose(),
-                  )
-                }
+                onClick={() => {
+                  // Read before settling: once settled, the card leaves the Verified list.
+                  const after = props.steps?.afterSettle ?? null;
+                  void runAction("Couldn't settle the card", () =>
+                    kanban.settleCard(card.id),
+                  ).then((ok) => {
+                    if (!ok) return;
+                    if (after !== null) props.onStepCard(after);
+                    else props.onClose();
+                  });
+                }}
                 className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               >
                 Settle
@@ -655,6 +699,34 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
         </li>
       ))}
     </ul>
+  );
+}
+
+function StepButton(props: {
+  label: string;
+  hint: string;
+  target: string | null;
+  onStep: (cardId: string) => void;
+  children: ReactNode;
+}) {
+  const { target } = props;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            disabled={target === null}
+            onClick={() => target !== null && props.onStep(target)}
+            aria-label={props.label}
+            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40"
+          />
+        }
+      >
+        {props.children}
+      </TooltipTrigger>
+      <TooltipPopup>{props.hint}</TooltipPopup>
+    </Tooltip>
   );
 }
 

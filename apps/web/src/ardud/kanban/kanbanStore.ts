@@ -7,6 +7,7 @@ import type {
   KanbanMessage,
   KanbanScript,
   KanbanScriptRun,
+  KanbanThreadRow,
   KanbanWikiPage,
 } from "@t3tools/contracts";
 import {
@@ -46,6 +47,43 @@ export function useBoardThreadIds(): ReadonlySet<string> {
   return boardThreadIds(useStore(kanban.boards));
 }
 
+/** The board that started a thread, or undefined for threads a board did not start. */
+export function useBoardRunOf(threadId: string):
+  | {
+      readonly boardId: string;
+      readonly boardName: string;
+    }
+  | undefined {
+  const boards = useStore(kanban.boards);
+  if (boards === undefined) return undefined;
+  for (const entry of boards) {
+    if (entry.threadIds.includes(threadId as never)) {
+      return { boardId: entry.board.id, boardName: entry.board.name };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The owning card or discussion of a board-run thread, read from the board's
+ * thread rows so the bar can link back to the record that owns the run.
+ */
+export function useBoardRunRecord(
+  threadId: string,
+): { readonly cardId: string | null; readonly discussionId: string | null } | undefined {
+  // Read by thread id, not from the capped Threads list, so an old run still links back.
+  const link = useStore(threadId === "" ? NO_OWNER : kanban.owner(threadId));
+  if (link === undefined || link === null) return undefined;
+  return { cardId: link.cardId, discussionId: link.discussionId };
+}
+
+const NO_OWNER: SnapshotStore<null> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
+
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
   return useStore(kanban.board(boardId));
 }
@@ -63,6 +101,10 @@ export function useCardDetail(boardId: string, cardId: string): KanbanCardDetail
 
 export function useWiki(boardId: string): ReadonlyArray<KanbanWikiPage> | undefined {
   return useStore(kanban.wiki(boardId));
+}
+
+export function useBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow> | undefined {
+  return useStore(kanban.threads(boardId));
 }
 
 /**
