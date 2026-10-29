@@ -576,7 +576,11 @@ describe("review stack", () => {
 
       const shown = column(shownLabel)!;
       const list = shown.querySelector<HTMLElement>(":scope > div:last-child")!;
-      expect(rect(shown).top).toBeCloseTo(rect(column("To-Do")!).top, 0);
+      // The stack's restore row sits above the shown column when its sibling is hidden,
+      // so the shown column starts a row lower than the strip's top.
+      const stackTop = rect(shown.parentElement!).top;
+      expect(rect(shown).top).toBeGreaterThanOrEqual(stackTop);
+      expect(rect(shown).top).toBeLessThan(stackTop + 120);
       expect(rect(shown).bottom).toBeLessThanOrEqual(900);
       expect(rect(shown).width).toBeGreaterThanOrEqual(176);
       // Every card of the visible stage shows; nothing is squeezed into a sliver.
