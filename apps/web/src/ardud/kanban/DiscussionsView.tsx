@@ -295,17 +295,17 @@ export function DiscussionsView(props: {
       {showList ? (
         <div className="flex min-h-0 flex-col gap-1 pe-2.5 md:border-e md:border-(--m-rule)">
           <div className="flex h-9 shrink-0 items-center ps-2.5">
-            {selection.ids.size > 0 ? (
-              <span className="text-sm font-medium">{selection.ids.size} selected</span>
+            {selectedRows.length > 0 ? (
+              <span className="text-sm font-medium">{selectedRows.length} selected</span>
             ) : (
               <h2 className="text-base font-semibold">Discussions</h2>
             )}
             <span className="flex-1" />
-            {selection.ids.size > 0 ? (
+            {selectedRows.length > 0 ? (
               <>
                 <button
                   type="button"
-                  aria-label={`Actions for ${selection.ids.size} discussions`}
+                  aria-label={`Actions for ${selectedRows.length} discussions`}
                   className={ROUND_BUTTON}
                   onClick={(event) => {
                     const rect = event.currentTarget.getBoundingClientRect();
@@ -353,7 +353,7 @@ export function DiscussionsView(props: {
           <div
             className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3"
             onKeyDown={(event) => {
-              if (event.key === "Escape" && selection.ids.size > 0) {
+              if (event.key === "Escape" && selectedRows.length > 0) {
                 event.preventDefault();
                 clearSelection();
               }
@@ -557,7 +557,12 @@ function DiscussionListRow(props: {
         type="button"
         onClick={props.onClick}
         onMouseDown={(event) => {
-          if (event.shiftKey) event.preventDefault();
+          // preventDefault stops the text highlight but also stops focus moving here,
+          // so focus the row by hand; otherwise the list's Escape handler never sees keys.
+          if (event.shiftKey) {
+            event.preventDefault();
+            event.currentTarget.focus();
+          }
         }}
         aria-current={props.current ? "true" : undefined}
         data-selected={props.selected ? "true" : undefined}
