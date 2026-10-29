@@ -2689,9 +2689,10 @@ it.effect("the scribe puts a goal-less card in a matching goal and writes the go
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const login = yield* kanban.setGoal(board.id, { name: "Login" });
-      const changed = Stream.runHead(
-        Stream.filter(yield* kanban.changes, ({ change }) => change._tag === "goal"),
-      );
+      const changed = Effect.gen(function* () {
+        const changes = yield* kanban.changes;
+        return Stream.runHead(Stream.filter(changes, ({ change }) => change._tag === "goal"));
+      });
       const first = yield* kanban.createCard(
         board.id,
         { prompt: "A", title: "Login form", description: "Sign-in page", goalId: login.id },

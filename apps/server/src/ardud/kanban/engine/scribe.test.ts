@@ -4,7 +4,6 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   finishedSince,
   goalsFingerprint,
-  goalsPrompt,
   groupsFingerprint,
   groupsPrompt,
   toGoalUpdates,
@@ -106,7 +105,7 @@ describe("scribe", () => {
   it("toGoalUpdates assigns only goal-less open cards to active goals and drops a story with nothing finished", () => {
     const cards = [
       card(1, { goalId: "goal-a", stage: "working", movedAt: "2026-10-25T11:00:00.000Z" }),
-      card(2),
+      card(2, { goalId: null }),
       card(3, { goalId: "goal-b" }),
       card(4, { stage: "completed" }),
     ] as unknown as KanbanCard[];
