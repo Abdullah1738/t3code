@@ -10,7 +10,7 @@ import {
   toGroups,
 } from "./scribe.ts";
 
-const goal = (patch: Partial<KanbanGoal> = {}) =>
+const goal = (patch: Record<string, unknown> = {}) =>
   ({
     id: "goal-a",
     boardId: "board-toy",
