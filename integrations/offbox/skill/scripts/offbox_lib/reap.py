@@ -60,7 +60,10 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 event(con, box_id, f"reap_{what}_failed", f"{why}: {e}")
                 actions[-1] += f" (FAILED: {e})"
 
-    rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped')").fetchall()
+    # A lease with an open prune hold stays on the list even if it is marked deleted: its hold is released only
+    # after fresh confirmation, and a failed or busy release must be retried on a later pass.
+    rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
+                       "OR box_id IN (SELECT box_id FROM prune_holds)").fetchall()
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -68,11 +71,17 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         if b is None:
             if not dry:
-                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                con.commit()
-                lease.release_if_confirmed(con, bid)  # re-confirmed under the box lock before the hold goes
-                event(con, bid, "reap_forget", "box no longer exists on boat")
-            actions.append(f"forget {bid}: gone from boat")
+                # Release first. The lease is retired only once no hold remains: a busy lock or a failed read keeps
+                # the hold and the lease state, so a later pass finds it again and retries.
+                if lease.release_if_confirmed(con, bid):
+                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
+                    con.commit()
+                    event(con, bid, "reap_forget", "box no longer exists on boat")
+                    actions.append(f"forget {bid}: gone from boat")
+                else:
+                    actions.append(f"hold kept {bid}: gone from boat, not yet confirmed")
+            else:
+                actions.append(f"forget {bid}: gone from boat")
             continue
         state = b.get("state")
         running_runs = lease.active_runs(con, bid)

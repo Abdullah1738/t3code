@@ -412,7 +412,10 @@ def _release_locked(con, box_id: str, run_id: str | None = None) -> bool:
     re-read now, not from an earlier snapshot. run_id, when given, limits the clear to that run's hold."""
     if active_runs(con, box_id):
         return False
-    s = api.get(box_id)
+    try:
+        s = api.get(box_id)
+    except OffboxError:
+        return False  # a failed read is not confirmation: keep the hold, a later pass retries
     if s is not None and s.get("state") not in api.STOPPED_STATES:
         return False
     ensure_holds(con)
@@ -446,10 +449,11 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
-            con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-            con.commit()
-            # The lease is marked deleted now, so the reaper will not visit this box again: release in this call.
-            release(con, box_id)
+            # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
+            # state and the hold, so the reaper revisits this box and releases it on a later pass.
+            if release(con, box_id):
+                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+                con.commit()
             return False
         raise
     ssh_sync.close_master(box_id)

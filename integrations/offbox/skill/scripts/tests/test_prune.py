@@ -757,6 +757,84 @@ class ReleaseTests(NoNetwork):
         self.assertEqual(self._held(), 0)
 
     # --- settled generation (P2) -------------------------------------------------------------------------------------
+class RetirementTests(NoNetwork):
+    """Round-10 P2: a lease is retired (marked deleted) only after its hold is released. A failed confirmation or a busy
+    lock keeps both the hold and the lease visible, and a later pass with a healthy read reconciles them."""
+
+    def _held_lease(self, box="bx", state="running"):
+        self.con.execute("INSERT OR REPLACE INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,"
+                         "last_used_at,source) VALUES (?,'o9','/r9','rk','w/keep-cccccc',?,'small',?,NULL)",
+                         (box, state, common.now()))
+        self.con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,'r1',?)",
+                         (box, common.now()))
+        self.con.commit()
+
+    def _held(self, box="bx"):
+        return self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id=?", (box,)).fetchone()[0]
+
+    def _state(self, box="bx"):
+        return self.con.execute("SELECT state FROM leases WHERE box_id=?", (box,)).fetchone()[0]
+
+    def test_404_with_failed_confirmation_keeps_hold_and_lease_then_reconciles(self):
+        from offbox_lib import lease
+        self._held_lease()
+        # Pass 1: stop returns 404 and the confirmation read fails. Nothing is retired.
+        with patch.object(lease, "keep_images"), \
+                patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
+                patch.object(lease.api, "get", side_effect=lease.api.ApiError(503, "unavailable", "boat down")):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        self.assertEqual(self._held(), 1, "a failed confirmation must keep the hold")
+        self.assertEqual(self._state(), "running", "the lease must not be retired before its hold is released")
+        # The reaper still lists the held lease, so the next pass can reconcile it.
+        from offbox_lib import reap
+        visible = self.con.execute("SELECT box_id FROM leases WHERE state IN ('running','stopped') "
+                                   "OR box_id IN (SELECT box_id FROM prune_holds)").fetchall()
+        self.assertIn("bx", [r[0] for r in visible])
+        # Pass 2: boat confirms the box gone. The hold is released and the lease retired.
+        with patch.object(lease, "keep_images"), \
+                patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
+                patch.object(lease.api, "get", return_value=None):
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+        self.assertEqual(self._held(), 0)
+        self.assertEqual(self._state(), "deleted")
+
+    def test_reaper_forget_with_busy_lock_keeps_lease_then_reconciles(self):
+        from offbox_lib import reap, lease
+        from offbox_lib.common import file_lock
+        self._held_lease()
+        # Pass 1: boat no longer lists the box, but the box lock is busy (a run may be allocating it).
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                file_lock("box-bx", timeout=5):
+            actions = reap.reap(dry=False)
+        self.assertEqual(self._held(), 1, "a busy lock must keep the hold")
+        self.assertEqual(self._state(), "running", "the lease is not retired while its hold is held")
+        self.assertTrue(any("hold kept" in a for a in actions))
+        # Pass 2: the lock is free and boat confirms gone: the hold is released and the lease retired.
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", return_value=None):
+            reap.reap(dry=False)
+        self.assertEqual(self._held(), 0)
+        self.assertEqual(self._state(), "deleted")
+
+    def test_reaper_forget_with_failed_read_keeps_lease_then_reconciles(self):
+        from offbox_lib import reap
+        self._held_lease()
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", side_effect=reap.api.ApiError(503, "unavailable", "boat down")):
+            reap.reap(dry=False)
+        self.assertEqual(self._held(), 1, "a failed read is not confirmation")
+        self.assertEqual(self._state(), "running")
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", return_value=None):
+            reap.reap(dry=False)
+        self.assertEqual(self._held(), 0)
+        self.assertEqual(self._state(), "deleted")
+
+
 class HoldClearTests(NoNetwork):
     """The hold is cleared only when a box is certainly stopped or gone. Each path is driven through the real
     lease/reap functions, with only the boat API faked."""
