@@ -2646,7 +2646,14 @@ const make = Effect.gen(function* () {
           });
         if (patch.comment?.trim())
           yield* logEvent(next, actor, "comment", { body: patch.comment.trim() });
-        const saved = yield* pauseIfBacklog(card, next, actor, at);
+        const paused = yield* pauseIfBacklog(card, next, actor, at);
+        // An open work thread now runs the new model's pool, so the card's slot moves with it.
+        const saved =
+          paused.activeThreadId !== null &&
+          paused.activeRole === "work" &&
+          paused.activePool !== Rules.poolKey(paused.model)
+            ? { ...paused, activePool: Rules.poolKey(paused.model) }
+            : paused;
         yield* saveCard(saved);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });
@@ -2671,7 +2678,8 @@ const make = Effect.gen(function* () {
             yield* saveCard({ ...other, model: saved.model, activePool: newPool });
           }
           if (
-            saved.activePool !== newPool &&
+            card.activePool !== null &&
+            card.activePool !== newPool &&
             (yield* Ref.get(holds)).has(saved.activeThreadId)
           ) {
             yield* hold(saved.activeThreadId, saved.boardId, newPool);
