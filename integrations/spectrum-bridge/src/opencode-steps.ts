@@ -62,8 +62,8 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
       }
       // One row past the cap tells a truncated scan from a complete one. A truncated scan can
       // never prove a run tool-free, so it is `unknown` whatever the rows it did read say.
-      const rows = db.query<{ finish: unknown; content: unknown }, [string, number, number]>(
-        "SELECT json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
+      const rows = db.query<{ finish: unknown; content: unknown; retry: unknown }, [string, number, number]>(
+        "SELECT json_extract(data, '$.finish') AS finish, json_extract(data, '$.content') AS content, json_extract(data, '$.retry') AS retry FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
       ).all(sessionId, sinceMs, maxRows + 1);
       if (rows.some(stepRan)) return "ran";
       // `none` needs a complete scan: a truncated one may hide a tool row past the cap. And every
@@ -93,9 +93,14 @@ const NO_TOOL_PARTS = new Set(["text", "reasoning"]);
  * A step that settled without calling a tool. It must be terminal (OpenCode wrote a `stop` or
  * `error` finish; an unfinished step may still be executing) and its content, read in full, may
  * hold only text or reasoning. A failed first call with no output has empty content.
+ *
+ * A terminal finish alone does not prove the execution stopped: OpenCode can record a pending
+ * native retry (`retry`) on an `error` step and then carry on running the same execution. So a
+ * step with a retry is unsettled, and so is any row that is not a plain terminal finish.
  */
-function stepIsTerminalNoTool(row: { finish: unknown; content: unknown }): boolean {
+function stepIsTerminalNoTool(row: { finish: unknown; content: unknown; retry: unknown }): boolean {
   if (row.finish !== "stop" && row.finish !== "error") return false;
+  if (row.retry !== null && row.retry !== undefined) return false;
   const parts = typeof row.content === "string" ? parseParts(row.content) : row.content;
   if (!Array.isArray(parts)) return false;
   return parts.every(part => NO_TOOL_PARTS.has(String((part as { type?: unknown })?.type)));
