@@ -1024,3 +1024,55 @@ test("cancellation during file acceptance keeps its checkpoint and alias without
   expect(h.store.byProviderId("file-guid")?.id).toBe("file");
   expect(h.log).not.toHaveBeenCalled();
 });
+
+test("a threaded reply Sendblue fails minutes after accepting goes once more without its thread", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls[0]!.replyTo).toBe("inbound-1");
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+
+  statuses.set("provider-1", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls[1]!.replyTo).toBeUndefined();
+  expect(h.calls[1]!.id).toBe(unthreadedId("reply", 0));
+  expect(h.calls[1]!.retryOf).toBe(stableId("reply", 0));
+  expect(h.calls[1]!.text).toBe("Use 70% alcohol");
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+  expect(h.log).toHaveBeenCalledWith("outbound-async-unthreaded", "error");
+
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 7 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+});
+
+test("delivered replies, unthreaded texts and old sends are left alone", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("a", { kind: "conversation", text: "first", replyTo: "inbound-1" });
+  h.enqueue("b", { kind: "conversation", text: "second" });
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  statuses.set("provider-1", "DELIVERED");
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+
+  setSystemTime(now + 21 * 60_000);
+  check.mockClear();
+  await delivery.tick();
+  expect(check).not.toHaveBeenCalled();
+});

@@ -568,3 +568,14 @@ describe("ingress", () => {
     expect(accepted).toHaveLength(0);
   });
 });
+
+test("outboundStatuses maps Sendblue's status by handle", async () => {
+  const line = fakeLine({
+    outbound: async () => [
+      { handle: "h1", chat: chatKey.dm(owner), text: "x", sentAt: 1, status: "ERROR" } as LineOutbound,
+      { handle: "", chat: chatKey.dm(owner), text: "y", sentAt: 2, status: "SENT" } as LineOutbound,
+    ],
+  });
+  const transport = sbTransport(line, chatKey.dm(owner), store(), () => 200);
+  expect([...(await transport.outboundStatuses(0))]).toEqual([["h1", "ERROR"]]);
+});

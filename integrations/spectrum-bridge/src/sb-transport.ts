@@ -117,6 +117,11 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     async read(_chatGuid: string): Promise<void> {
       await wrap(() => line.read(chat));
     },
+    /** Sendblue's current status of each outbound message in this chat updated since sinceMs, by handle. */
+    async outboundStatuses(sinceMs: number): Promise<Map<string, string>> {
+      const sent = await wrap(() => line.outbound(chat, sinceMs));
+      return new Map(sent.filter(message => message.handle).map(message => [message.handle, message.status]));
+    },
     async downloadAttachment(guid: string, maxBytes: number, timeoutMs = 30_000): Promise<{ data: Uint8Array; mimeType: string; name: string }> {
       const file: LineFile = await wrap(() => line.download(guid, maxBytes, timeoutMs));
       return { data: file.data, mimeType: file.mimeType, name: file.name };

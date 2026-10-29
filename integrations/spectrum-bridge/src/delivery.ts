@@ -18,6 +18,8 @@ type Options = {
   notify?: (severity: "attention" | "info", text: string, key: string) => Promise<boolean>;
   /** Hands an image or card that iMessage keeps refusing to another channel. */
   fallback?: (item: OutboxRecord) => Promise<"sent" | "skip" | "retry">;
+  /** Sendblue's status by handle for this chat's sends updated since sinceMs; lets a late failure be caught. */
+  statuses?: (sinceMs: number) => Promise<Map<string, string>>;
 };
 type Checkpoint = { accepted: boolean; providerId?: string };
 type UploadCheckpoint = { guid: string; sha256: string };
@@ -31,6 +33,9 @@ export const OUTAGE_AFTER = 10 * 60_000;
 const ALERT_COOLDOWN = 60 * 60_000;
 const HOUSEKEEPING_EVERY = 30_000;
 const FALLBACK_RETRY = 5 * 60_000;
+/** Sendblue reports a refused quote-reply about 5 minutes after accepting it. */
+const LANDED_EVERY = 60_000;
+const LANDED_WINDOW = 20 * 60_000;
 type App = NonNullable<OutboxRecord["app"]>;
 
 /** Card text gets the same cleanup as messages; a caption left empty makes the card unsendable. */
@@ -49,6 +54,7 @@ export class Delivery {
   private ticking?: Promise<void>;
   private lastError = "";
   private nextHousekeeping = 0;
+  private nextLandedCheck = 0;
   private readonly fallbackRetry = new Map<string, number>();
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -238,7 +244,51 @@ export class Delivery {
 
   private async run(): Promise<void> {
     await this.send();
+    await this.checkLanded();
     await this.housekeeping();
+  }
+
+  /**
+   * A threaded text Sendblue accepted and then failed (5504, "unable to resolve inline reply thread")
+   * never reached the phone. Send its failed chunks once more without the thread target.
+   */
+  private async checkLanded(): Promise<void> {
+    if (!this.options.statuses || Date.now() < this.nextLandedCheck) return;
+    this.nextLandedCheck = Date.now() + LANDED_EVERY;
+    const rows = this.store.db.query<{ id: string; at: number }, [number]>(
+      "SELECT o.id AS id, CAST(k.value AS INTEGER) AS at FROM kv k JOIN outbox o ON o.id = substr(k.key, 9) "
+      + "WHERE substr(k.key, 1, 8) = 'sent-at:' AND k.value NOT GLOB '*[^0-9]*' AND CAST(k.value AS INTEGER) >= ? AND o.state = 'sent'",
+    ).all(Date.now() - LANDED_WINDOW);
+    const candidates = rows.filter(({ id }) => {
+      const item = this.store.getOperation(id);
+      return item !== undefined && item.replyTo !== undefined && !item.attachment && !item.poll && !item.app
+        && this.store.get<boolean>(`unthreaded:${id}`) === undefined;
+    });
+    if (!candidates.length) return;
+    let statuses: Map<string, string>;
+    try {
+      statuses = await this.options.statuses(Math.min(...candidates.map(row => row.at)) - 60_000);
+    } catch {
+      return; // the next check tries again
+    }
+    for (const { id } of candidates) {
+      const failed: number[] = [];
+      let status = "";
+      for (let index = 0; ; index++) {
+        const checkpoint = this.store.get<Checkpoint>(`chunk:${id}:${index}`);
+        if (!checkpoint) break;
+        const now = checkpoint.providerId ? statuses.get(checkpoint.providerId) : undefined;
+        if (now && /^(error|declined|failed)$/i.test(now)) { failed.push(index); status = now; }
+      }
+      if (!failed.length) continue;
+      this.store.db.transaction(() => {
+        if (this.store.getOperation(id)?.state !== "sent") return;
+        this.store.set(`unthreaded:${id}`, true);
+        for (const index of failed) this.store.db.query("DELETE FROM kv WHERE key = ?").run(`chunk:${id}:${index}`);
+        this.store.outboxState(id, "pending");
+      }).immediate();
+      this.options.log?.("outbound-async-unthreaded", status.toLowerCase());
+    }
   }
 
   private async send(): Promise<void> {
