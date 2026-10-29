@@ -878,9 +878,13 @@ const make = Effect.gen(function* () {
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
-  const saveCard = Effect.fn("KanbanService.saveCard")(function* (card: KanbanCard) {
+  // `by` is set when a move saved the card, so a script's own move doesn't re-trigger a card.moved script.
+  const saveCard = Effect.fn("KanbanService.saveCard")(function* (
+    card: KanbanCard,
+    by?: KanbanActor,
+  ) {
     yield* store.putCard(card);
-    yield* publish(card.boardId, { _tag: "card", card });
+    yield* publish(card.boardId, { _tag: "card", card, ...(by ? { by } : {}) });
   });
 
   const logEvent = Effect.fn("KanbanService.logEvent")(function* (
@@ -1018,7 +1022,7 @@ const make = Effect.gen(function* () {
       toStage: to,
       body: options.note ?? null,
     });
-    yield* saveCard(next);
+    yield* saveCard(next, actor);
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator" || !(yield* liveEvaluator(ask.by.threadId))) continue;
       yield* threads

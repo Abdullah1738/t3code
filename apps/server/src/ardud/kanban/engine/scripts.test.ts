@@ -166,6 +166,32 @@ describe("board scripts", () => {
     expect(listensTo({ ...listener, enabled: false }, byOwner)).toBe(false);
   });
 
+  it("a card a script moved on stdout fires no card.moved script, its own or another's", () => {
+    const eventOf = eventTracker([["card-1", "todo"]]);
+    const moved = card({ id: "card-1", number: 1, stage: "deployed", priority: 3 } as never);
+    const byScript = { _tag: "script", scriptId: "script-1" } as const;
+    const event = eventOf({ _tag: "card", card: moved, by: byScript });
+    expect(event?.name).toBe("card.moved");
+    expect(event?.by).toEqual(byScript);
+    const mover = script({
+      id: "script-1" as never,
+      trigger: { _tag: "event", event: "card.moved" },
+    });
+    const other = script({
+      id: "script-2" as never,
+      trigger: { _tag: "event", event: "card.moved" },
+    });
+    expect(listensTo(mover, event!)).toBe(false);
+    expect(listensTo(other, event!)).toBe(false);
+    // A move by the owner still reaches the listener.
+    const byOwnerEvent = eventTracker([["card-1", "todo"]])({
+      _tag: "card",
+      card: moved,
+      by: { _tag: "owner" },
+    });
+    expect(listensTo(mover, byOwnerEvent!)).toBe(true);
+  });
+
   it("knows the discussions a script opened or posted in", () => {
     const discussion = (patch: object) =>
       ({ createdBy: { _tag: "owner" }, participants: [], ...patch }) as never;

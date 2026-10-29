@@ -243,7 +243,11 @@ export const eventTracker = (stages: Iterable<readonly [string, KanbanCard["stag
           return { name: "card.created", by: card.createdBy, payload: cardPayload(card) };
         }
         if (before === card.stage) return null;
-        return { name: "card.moved", by: null, payload: { ...cardPayload(card), from: before } };
+        return {
+          name: "card.moved",
+          by: change.by ?? null,
+          payload: { ...cardPayload(card), from: before },
+        };
       }
       case "cardRemoved":
         seen.delete(change.cardId);

@@ -804,7 +804,8 @@ export const KanbanBoardListEntry = Schema.Struct({
 export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 
 export const KanbanChange = Schema.Union([
-  Schema.TaggedStruct("card", { card: KanbanCard }),
+  // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
+  Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),
