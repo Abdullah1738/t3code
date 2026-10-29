@@ -22,9 +22,24 @@ AUTH = os.path.expanduser("~/.config/dbxcli/auth.json")
 BLOCK = 4 * 1024 * 1024
 
 
+def load_auth(path=AUTH):
+    """Parse the dbxcli auth file. Trailing bytes after the JSON object are an
+    error, not silently ignored: a stray brace once broke every Dropbox run."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    try:
+        d, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"{path} is not valid JSON: {e.msg} at char {e.pos} "
+                           f"(of {len(text)}); repair the file, don't print it") from None
+    if text[end:].strip():
+        raise RuntimeError(f"{path} has {len(text) - end} trailing byte(s) after the JSON "
+                           f"object at char {end} (of {len(text)}); repair the file")
+    return d
+
+
 def token():
-    with open(AUTH) as f:
-        d = json.load(f)
+    d = load_auth()
     p = (d.get("") or next(iter(d.values())))["personal"]
     body = urllib.parse.urlencode({"grant_type": "refresh_token",
                                    "refresh_token": p["refresh_token"],
