@@ -31,7 +31,7 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
-import { requestConfirmDialog } from "../../confirmDialog";
+import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
@@ -106,6 +106,9 @@ export function CardDrawer(props: {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // A confirm dialog is portaled outside the panel; the Tab trap below
+      // would pull its focus back into the drawer, so the drawer yields.
+      if (isConfirmDialogActive()) return;
       if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) {
         onClose();
         return;
