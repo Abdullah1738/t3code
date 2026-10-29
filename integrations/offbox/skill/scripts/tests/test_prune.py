@@ -835,6 +835,66 @@ class RetirementTests(NoNetwork):
         self.assertEqual(self._state(), "deleted")
 
 
+class StrandedRunTests(NoNetwork):
+    """Round-11 P2: a held box that boat confirms gone must settle the runs its dead client left active, then release
+    the hold and retire the lease. A failed confirmation keeps all three; a later healthy pass finishes them."""
+
+    def _held_with_stranded_run(self, box="bx"):
+        self.con.execute("INSERT OR REPLACE INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,"
+                         "last_used_at,source) VALUES (?,'o9','/r9','rk','w/keep-cccccc','running','small',?,NULL)",
+                         (box, common.now()))
+        self.con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,'r-prune',?)",
+                         (box, common.now()))
+        # The dead client's run: still marked starting/running, with no one left to end it.
+        self.con.execute("INSERT INTO runs(run_id, box_id, remote_dir, start_at, status, mode) "
+                         "VALUES ('r-stranded', ?, 'w/keep-cccccc', ?, 'running', 'fg')", (box, common.now() - 60))
+        self.con.commit()
+
+    def _row(self, sql, *a):
+        return self.con.execute(sql, a).fetchone()
+
+    def test_gone_box_settles_stranded_run_and_releases_hold(self):
+        from offbox_lib import reap
+        self._held_with_stranded_run()
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", return_value=None):
+            reap.reap(dry=False)
+        self.assertEqual(self._row("SELECT status FROM runs WHERE run_id='r-stranded'")[0], "lost",
+                         "the dead client's run must be settled once the box is confirmed gone")
+        self.assertEqual(self._row("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'")[0], 0)
+        self.assertEqual(self._row("SELECT state FROM leases WHERE box_id='bx'")[0], "deleted")
+
+    def test_failed_confirmation_then_recovery_settles_and_releases(self):
+        from offbox_lib import reap
+        self._held_with_stranded_run()
+        # Pass 1: boat's read fails. Nothing is settled, released or retired.
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", side_effect=reap.api.ApiError(503, "unavailable", "boat down")):
+            reap.reap(dry=False)
+        self.assertEqual(self._row("SELECT status FROM runs WHERE run_id='r-stranded'")[0], "running")
+        self.assertEqual(self._row("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'")[0], 1)
+        self.assertEqual(self._row("SELECT state FROM leases WHERE box_id='bx'")[0], "running")
+        # Pass 2: boat answers. The stranded run is settled, then the hold and lease follow.
+        with patch.object(reap.api, "list_boxes", return_value=[]), \
+                patch.object(reap, "thread_get", return_value=("ok", None)), \
+                patch.object(reap.lease.api, "get", return_value=None):
+            reap.reap(dry=False)
+        self.assertEqual(self._row("SELECT status FROM runs WHERE run_id='r-stranded'")[0], "lost")
+        self.assertEqual(self._row("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'")[0], 0)
+        self.assertEqual(self._row("SELECT state FROM leases WHERE box_id='bx'")[0], "deleted")
+
+    def test_live_box_with_active_run_is_never_settled(self):
+        # Boat says the box is live: its run may be real. Nothing is settled and the hold stays.
+        from offbox_lib import lease
+        self._held_with_stranded_run()
+        with patch.object(lease.api, "get", return_value={"state": "ready"}):
+            self.assertFalse(lease.release_if_confirmed(self.con, "bx"))
+        self.assertEqual(self._row("SELECT status FROM runs WHERE run_id='r-stranded'")[0], "running")
+        self.assertEqual(self._row("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'")[0], 1)
+
+
 class HoldClearTests(NoNetwork):
     """The hold is cleared only when a box is certainly stopped or gone. Each path is driven through the real
     lease/reap functions, with only the boat API faked."""

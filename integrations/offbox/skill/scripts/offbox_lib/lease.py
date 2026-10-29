@@ -406,17 +406,31 @@ def clear_prune_hold(con, box_id: str) -> None:
     con.commit()
 
 
+def settle_stranded_runs(con, box_id: str) -> int:
+    """Mark the box's starting/running runs lost. Call only once boat has confirmed the box is gone or stopped, so
+    no process can still be running them. A run that outlived its client (no one left to end it) is then not
+    counted as active forever. Caller holds 'box-<id>'. Returns how many runs were settled."""
+    cur = con.execute("UPDATE runs SET status='lost', end_at=? WHERE box_id=? AND status IN ('starting','running')",
+                      (now(), box_id))
+    con.commit()
+    if cur.rowcount:
+        event(con, box_id, "run_lost", f"{cur.rowcount} stranded run(s) settled: box confirmed gone or stopped")
+    return cur.rowcount
+
+
 def _release_locked(con, box_id: str, run_id: str | None = None) -> bool:
     """The confirmation and release, for a caller that already holds 'box-<id>'. Not reentrant: never call it
-    without the lock held. Clears the hold only if no run is active and boat reports the box stopped or gone,
-    re-read now, not from an earlier snapshot. run_id, when given, limits the clear to that run's hold."""
-    if active_runs(con, box_id):
-        return False
+    without the lock held. Boat is asked first, not after the active-run check: a box confirmed gone or stopped has
+    no live process, so its stranded runs are settled and then the hold can go. A live box with an active run is
+    never released. A failed read is not confirmation. run_id, when given, limits the clear to that run's hold."""
     try:
         s = api.get(box_id)
     except OffboxError:
         return False  # a failed read is not confirmation: keep the hold, a later pass retries
     if s is not None and s.get("state") not in api.STOPPED_STATES:
+        return False  # boat reports it live: its runs may be real, so nothing is settled and nothing released
+    settle_stranded_runs(con, box_id)
+    if active_runs(con, box_id):
         return False
     ensure_holds(con)
     if run_id is None:
