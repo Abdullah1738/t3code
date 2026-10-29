@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -2529,6 +2530,83 @@ it.effect("an owner's channel gets a title from his first message, unless he nam
         .pipe(Effect.flip);
       assert.strictEqual(agent.code, "denied");
     }).pipe(Effect.scoped, Effect.provide(titledLayer(fake.layer, asked)));
+  }),
+);
+
+const scribeLayer = (fake: Layer.Layer<KanbanThreads>, asked: Array<string>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateJson: ((input: { readonly prompt: string }) =>
+          Effect.sync(() => {
+            asked.push(input.prompt);
+            return { groups: [{ id: null, name: "Login", summary: "Sign-in work.", cards: [1, 2] }] };
+          })) as never,
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () => Effect.succeed(Option.some({ workspaceRoot: "/repo" } as never)),
+      }),
+    ),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+it.effect("the scribe groups a board's open cards when they change, at most every 10 minutes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const grouped = Effect.gen(function* () {
+        const changes = yield* kanban.changes;
+        return Stream.runHead(Stream.filter(changes, ({ change }) => change._tag === "groups"));
+      });
+
+      const first = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in page" },
+        owner,
+      );
+      const second = yield* kanban.createCard(
+        board.id,
+        { prompt: "B", title: "Login errors", description: "Sign-in errors" },
+        owner,
+      );
+
+      const firstRun = yield* (yield* grouped).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* Fiber.join(firstRun)));
+      const groups = (yield* kanban.snapshot(board.id)).groups;
+      assert.lengthOf(groups, 1);
+      assert.strictEqual(groups[0]?.name, "Login");
+      assert.deepStrictEqual(groups[0]?.cardIds, [first.id, second.id]);
+      assert.lengthOf(asked, 1);
+      assert.include(asked[0] ?? "", "#1 |");
+
+      // Nothing changed: no new run.
+      yield* kanban.tick;
+      assert.lengthOf(asked, 1);
+
+      // A new card changes the fingerprint, but the last run was under 10 minutes ago.
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "C", title: "Logout", description: "Sign-out" },
+        owner,
+      );
+      yield* kanban.tick;
+      assert.lengthOf(asked, 1);
+
+      yield* TestClock.adjust("10 minutes");
+      const secondRun = yield* (yield* grouped).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* Fiber.join(secondRun)));
+      assert.lengthOf(asked, 2);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
   }),
 );
 

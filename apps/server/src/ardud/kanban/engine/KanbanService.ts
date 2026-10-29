@@ -68,6 +68,7 @@ import * as ServerConfig from "../../../config.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import { KanbanThreads } from "./threads.ts";
@@ -580,6 +581,10 @@ const make = Effect.gen(function* () {
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
   const unlistedPools = yield* Ref.make<ReadonlySet<string>>(new Set());
+  // Per board: the open-card fingerprint the scribe last grouped, and when.
+  const scribed = yield* Ref.make<
+    ReadonlyMap<KanbanBoardId, { readonly fingerprint: string; readonly at: number }>
+  >(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -1007,6 +1012,44 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban title writer failed", { cardId, cause }),
       ),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
+  // The scribe regroups a board's open cards with the board's cheap model. Groups are
+  // view-only, but card_next offers same-group cards, so they batch similar work.
+  const writeGroups = Effect.fn("KanbanService.writeGroups")(function* (boardId: KanbanBoardId) {
+    const generateJson = textGeneration.generateJson;
+    if (!generateJson) return;
+    const board = yield* boardOf(boardId);
+    if (board.defaultProjectId === null) return;
+    const project = yield* projects.getById(board.defaultProjectId);
+    if (Option.isNone(project)) return;
+    const output = yield* generateJson({
+      cwd: project.value.workspaceRoot,
+      prompt: Scribe.groupsPrompt(yield* store.cards(boardId), yield* store.groups(boardId)),
+      outputSchema: Scribe.ScribeGroupsOutput,
+      modelSelection: board.managerModel,
+    });
+    yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        // Cards may have changed during the call: map numbers against the current ones.
+        const groups = Scribe.toGroups(
+          output,
+          yield* store.cards(boardId),
+          yield* store.groups(boardId),
+          () => "grp-" + uuid().slice(0, 8),
+        );
+        const at = yield* nowIso;
+        const next = groups.map((group) => ({ ...group, updatedAt: at }));
+        yield* store.putGroups(boardId, next);
+        yield* publish(boardId, { _tag: "groups", groups: next });
+      }),
+    );
+  });
+  const forkGroups = (boardId: KanbanBoardId) =>
+    writeGroups(boardId).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("kanban scribe failed", { boardId, cause })),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2199,6 +2242,17 @@ const make = Effect.gen(function* () {
     const before = yield* Ref.get(missing);
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
+      // The scribe regroups at most every SCRIBE_EVERY_MS, and only when open cards changed.
+      const fingerprint = Scribe.groupsFingerprint(yield* store.cards(board.id));
+      const last = (yield* Ref.get(scribed)).get(board.id);
+      if (
+        fingerprint !== "" &&
+        fingerprint !== last?.fingerprint &&
+        (last === undefined || now - last.at >= Scribe.SCRIBE_EVERY_MS)
+      ) {
+        yield* Ref.update(scribed, (all) => new Map(all).set(board.id, { fingerprint, at: now }));
+        yield* forkGroups(board.id);
+      }
       // A card whose thread was deleted goes back to its queue for a new one.
       for (const card of yield* store.cards(board.id)) {
         const threadId = card.activeThreadId;
