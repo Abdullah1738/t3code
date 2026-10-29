@@ -2742,6 +2742,28 @@ it.effect("a reused, already ended evaluator is still woken when its model recov
   }),
 );
 
+it.effect("a paused link gets exactly one wake when its probe passes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Once" });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      const before = (yield* Ref.get(fake.threads)).get(threadId)!.messages.length;
+      probe.ok = true;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      yield* kanban.probeOutages;
+      const after = (yield* Ref.get(fake.threads)).get(threadId)!.messages.length;
+      assert.strictEqual(after - before, 1);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
 it.effect("a rejected wake keeps the pause and is retried on the next probe", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

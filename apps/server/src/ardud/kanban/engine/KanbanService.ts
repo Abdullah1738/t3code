@@ -2244,15 +2244,20 @@ const make = Effect.gen(function* () {
   const linkKey = (link: KanbanThreadLink, board: KanbanBoard) =>
     Rules.poolKey(link.model ?? board.evaluatorModel);
 
-  /** Every paused thread link on every live board, ended or not: a reused evaluator is ended but still reachable. */
+  /**
+   * Every paused thread link on every live board, ended or not: a reused evaluator is
+   * ended but still reachable. `open: false` already returns every link (open ones too),
+   * so one scan covers both; a thread id seen twice would otherwise wake twice.
+   */
   const pausedLinks = Effect.gen(function* () {
     const found: Array<{ readonly link: KanbanThreadLink; readonly board: KanbanBoard }> = [];
+    const seen = new Set<string>();
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
-      for (const open of [true, false]) {
-        for (const link of yield* store.threadLinks({ boardId: board.id, open })) {
-          if (link.paused !== null) found.push({ link, board });
-        }
+      for (const link of yield* store.threadLinks({ boardId: board.id, open: false })) {
+        if (link.paused === null || seen.has(link.threadId)) continue;
+        seen.add(link.threadId);
+        found.push({ link, board });
       }
     }
     return found;
