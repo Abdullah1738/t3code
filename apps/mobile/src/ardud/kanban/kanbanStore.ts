@@ -1,4 +1,9 @@
-import type { KanbanBoardSummary, KanbanCardDetail, KanbanMessage } from "@t3tools/contracts";
+import type {
+  KanbanBoardSummary,
+  KanbanCardDetail,
+  KanbanMessage,
+  KanbanThreadRow,
+} from "@t3tools/contracts";
 import {
   boardThreadIds,
   createAtomKanbanTransport,
@@ -55,6 +60,62 @@ export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined
   const boards = useStore(kanbanClient().boards);
   return useMemo(() => boards?.filter((summary) => summary.board.archivedAt === null), [boards]);
 }
+
+/** Every thread a board started, cards and evaluators alike, kept current by the list. */
+export function useKanbanBoardThreads(
+  boardId: string,
+): ReadonlyArray<KanbanThreadRow> | undefined {
+  return useStore(kanbanClient().threads(boardId));
+}
+
+/**
+ * The board that started a thread, with the card or discussion that owns the
+ * run, or undefined for threads a board did not start.
+ */
+export function useKanbanBoardRunOf(threadId: string):
+  | {
+      readonly boardId: string;
+      readonly boardName: string;
+      readonly cardId: string | null;
+      readonly discussionId: string | null;
+    }
+  | undefined {
+  const boards = useStore(kanbanClient().boards);
+  const entry = useMemo(
+    () => boards?.find((board) => board.threadIds.includes(threadId as never)),
+    [boards, threadId],
+  );
+  const owner = useKanbanThreadOwner(entry === undefined ? "" : threadId);
+  if (entry === undefined) return undefined;
+  return {
+    boardId: entry.board.id,
+    boardName: entry.board.name,
+    cardId: owner?.cardId ?? null,
+    discussionId: owner?.discussionId ?? null,
+  };
+}
+
+// Stands in for a board's thread rows when there is no board yet, so the hook
+// keeps its call order and reads nothing.
+/**
+ * The owning card or discussion of a board's thread, from that board's thread
+ * rows. An empty board id reads nothing: the caller has no board yet.
+ */
+export function useKanbanThreadOwner(
+  threadId: string,
+): { readonly cardId: string | null; readonly discussionId: string | null } | undefined {
+  // Read by thread id, not from the capped Threads list, so an old run still links back.
+  const link = useStore(threadId === "" ? NO_OWNER : kanbanClient().owner(threadId));
+  if (link === undefined || link === null) return undefined;
+  return { cardId: link.cardId, discussionId: link.discussionId };
+}
+
+const NO_OWNER: SnapshotStore<null> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
 
 /** Threads the boards started, archived boards too, for thread lists to leave out. */
 export function useKanbanBoardThreadIds(): ReadonlySet<string> {

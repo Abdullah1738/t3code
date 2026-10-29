@@ -24,6 +24,7 @@ import {
 } from "./index.ts";
 import {
   latestProviderTurnForAttempt,
+  OrchestrationV2DomainEventJson,
   OrchestrationV2Checkpoint,
   OrchestrationV2CheckpointScope,
   OrchestrationV2Command,
@@ -1566,5 +1567,47 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("restart-cancelled background work", () => {
+  // ardud: recovery writes this event, and history and replay read it back through JSON.
+  it("round-trips a child's start time through the JSON event", () => {
+    const startedAt = DateTime.makeUnsafe("2026-10-28T10:00:00.000Z");
+    const event = {
+      id: EventId.make("event:cancelled-child-roundtrip"),
+      type: "run.background-work-cancelled",
+      threadId: ThreadId.make("thread:restart-child"),
+      runId: RunId.make("run:restart-child"),
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      occurredAt: DateTime.makeUnsafe("2026-10-28T10:01:00.000Z"),
+      payload: {
+        runId: RunId.make("run:restart-child"),
+        restartCancelledBackgroundWork: [
+          {
+            kind: "subagent",
+            label: "Reviewer (id ses_child)",
+            id: "item:child",
+            child: {
+              threadId: ThreadId.make("native-thread:ses_child"),
+              startedAt,
+            },
+          },
+        ],
+      },
+    } as const;
+    const encoded = Schema.encodeSync(OrchestrationV2DomainEventJson)(event);
+    const text = JSON.stringify(encoded);
+    const decoded = Schema.decodeUnknownSync(OrchestrationV2DomainEventJson)(JSON.parse(text));
+    expect(decoded.payload).toMatchObject({
+      restartCancelledBackgroundWork: [
+        {
+          child: {
+            threadId: "native-thread:ses_child",
+            startedAt,
+          },
+        },
+      ],
+    });
   });
 });

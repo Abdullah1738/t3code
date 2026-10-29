@@ -4,9 +4,11 @@ import { useState } from "react";
 
 import {
   boardFilter,
+  cardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
   sanitizeBoardFilterPrefs,
+  type BoardFilter,
   type BoardFilterPrefs,
   type GroupBy,
   type KanbanBoardState,
@@ -48,6 +50,7 @@ import { Seg } from "./parts";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
 import { SettingsView } from "./SettingsView";
 import { AutomationsView, WikiView } from "./SideViews";
+import { ThreadsView } from "./ThreadsView";
 import "./tokens.css";
 import "./kanban.css";
 
@@ -75,7 +78,7 @@ const GROUP_OPTIONS: ReadonlyArray<{ value: GroupBy; label: string }> = [
 export function BoardPage(props: {
   boardId: string;
   search: BoardSearch;
-  onSearch: (next: BoardSearch) => void;
+  onSearch: (next: BoardSearch, options?: { readonly replace?: boolean }) => void;
 }) {
   const { boardId, search, onSearch } = props;
   const state = useBoardState(boardId);
@@ -90,11 +93,12 @@ export function BoardPage(props: {
   );
   const prefs = sanitizeBoardFilterPrefs(storedPrefs);
   const setFilters = (next: BoardFilterPrefs) => setPrefs(next);
+  const filter = state ? boardFilter(state, prefs, query.trim()) : null;
 
-  const go = (patch: SearchPatch) => {
+  const go = (patch: SearchPatch, options?: { readonly replace?: boolean }) => {
     const next: Record<string, unknown> = { ...search, ...patch };
     for (const key of Object.keys(next)) if (next[key] === undefined) delete next[key];
-    onSearch(next as BoardSearch);
+    onSearch(next as BoardSearch, options);
   };
   const openCard = (card: string) => {
     noteDrawerOpener();
@@ -106,6 +110,11 @@ export function BoardPage(props: {
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
   const setup = state ? setupBanner(state.board) : null;
+  const stepCard = (card: string) => go({ card }, { replace: true });
+  const steps =
+    view === "board" && state && filter && drawerOpen && search.card
+      ? cardSteps(state, nowMs, filter, search.group ?? "stage", search.card)
+      : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -155,7 +164,7 @@ export function BoardPage(props: {
           <button
             type="button"
             onClick={() => go({ view: "discussions", discussion: NEW_DISCUSSION, card: undefined })}
-            className="inline-flex h-8.5 shrink-0 items-center gap-1.5 rounded-full bg-(--m-accent) ps-3 pe-3.5 text-sm font-medium text-(--m-accent-ink) max-md:px-2.25 outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text)"
+            className="inline-flex h-8.5 shrink-0 items-center gap-1.5 rounded-full bg-(--m-accent) ps-3 pe-3.5 text-sm font-medium text-(--m-accent-ink) max-md:px-2.25 outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-text) pointer-coarse:h-11 pointer-coarse:text-base"
           >
             <PlusIcon className="size-4" aria-hidden />
             <span className="max-md:sr-only">New</span>
@@ -173,7 +182,7 @@ export function BoardPage(props: {
                   <button
                     type="button"
                     onClick={feed.retry}
-                    className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
                   >
                     Retry
                   </button>
@@ -217,7 +226,7 @@ export function BoardPage(props: {
                   boardId={boardId}
                   state={state}
                   search={search}
-                  query={query}
+                  filter={filter ?? {}}
                   prefs={prefs}
                   onPrefs={setFilters}
                   nowMs={nowMs}
@@ -233,6 +242,8 @@ export function BoardPage(props: {
                 boardId={boardId}
                 cardId={search.card}
                 state={state}
+                steps={steps}
+                onStepCard={stepCard}
                 onClose={closeCard}
                 onOpenCard={openCard}
               />
@@ -248,7 +259,7 @@ function BoardBody(props: {
   boardId: string;
   state: KanbanBoardState;
   search: BoardSearch;
-  query: string;
+  filter: BoardFilter;
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
@@ -256,8 +267,7 @@ function BoardBody(props: {
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
 }) {
-  const { state, search, nowMs, go } = props;
-  const filter = boardFilter(state, props.prefs, props.query.trim());
+  const { state, search, nowMs, go, filter } = props;
   switch (search.view ?? "board") {
     case "board":
       return (
@@ -319,6 +329,12 @@ function BoardBody(props: {
           <WikiView boardId={props.boardId} nowMs={nowMs} />
         </div>
       );
+    case "threads":
+      return (
+        <div className="min-h-0 flex-1 overflow-y-auto pe-5">
+          <ThreadsView boardId={props.boardId} nowMs={nowMs} />
+        </div>
+      );
     case "settings":
       return (
         <div className="min-h-0 flex-1 overflow-y-auto pe-5">
@@ -352,7 +368,7 @@ function BoardControls(props: {
               <button
                 type="button"
                 aria-label="Group by"
-                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
               />
             }
           >
@@ -386,7 +402,7 @@ function BoardControls(props: {
               type="button"
               aria-label="Settled cards"
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
                 settled !== "hide"
                   ? "bg-(--m-text) text-(--m-ground)"
                   : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
@@ -422,14 +438,14 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
         type="button"
         aria-label="Search cards"
         onClick={() => setOpen(true)}
-        className="grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        className="grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:size-11"
       >
         <SearchIcon className="size-4" />
       </button>
     );
   }
   return (
-    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1">
+    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1 pointer-coarse:h-11 pointer-coarse:w-64">
       <SearchIcon className="size-4 shrink-0 text-(--m-muted)" aria-hidden />
       <input
         autoFocus
@@ -444,7 +460,7 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
         }}
         placeholder="Search cards"
         aria-label="Search cards"
-        className="min-w-0 flex-1 bg-transparent text-sm text-(--m-text) outline-none placeholder:text-(--m-muted)"
+        className="min-w-0 flex-1 bg-transparent text-sm text-(--m-text) outline-none placeholder:text-(--m-muted) pointer-coarse:text-base"
       />
       <button
         type="button"
@@ -453,7 +469,7 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
           props.onChange("");
           setOpen(false);
         }}
-        className="grid size-6 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        className="grid size-6 place-items-center rounded-full text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:size-9"
       >
         <XIcon className="size-3.5" />
       </button>

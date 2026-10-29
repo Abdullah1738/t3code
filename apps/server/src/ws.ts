@@ -124,7 +124,7 @@ import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 // ardud: owner provenance
 import { ownerAppProvenance, sessionActor } from "./ardud/auth/provenance.ts";
 // ardud: missions board
-import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { KanbanService, type KanbanServiceShape } from "./ardud/kanban/engine/KanbanService.ts";
 import { KanbanScripts } from "./ardud/kanban/engine/ScriptService.ts";
 import { makeKanbanWsHandlers } from "./ardud/kanban/ws.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1176,6 +1176,38 @@ const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
   }),
 );
 
+// ardud: board-run threads are read-only to the owner; the board drives them through
+// KanbanThreads.send, which bypasses this owner RPC entry, so steering keeps working.
+export const refuseBoardRunDispatch = (
+  kanban: Pick<KanbanServiceShape, "caller">,
+  command: OrchestrationV2Command,
+) =>
+  command.type !== "message.dispatch"
+    ? Effect.void
+    : kanban.caller(command.threadId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestrationV2DispatchCommandError({
+              commandId: command.commandId,
+              commandType: command.type,
+              message: "Failed to check the board thread state",
+              cause,
+            }),
+        ),
+        Effect.flatMap((link) =>
+          link === null
+            ? Effect.void
+            : Effect.fail(
+                new OrchestrationV2DispatchCommandError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  message: "This thread belongs to a board run and is read-only.",
+                  detail: "board-thread-read-only",
+                }),
+              ),
+        ),
+      );
+
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientOrigin: OrchestrationClientOrigin,
@@ -1206,6 +1238,8 @@ export const layerWsRpc = (
       const projectService = yield* ProjectService.ProjectService;
       const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
       const threadSearch = yield* ThreadSearch.ThreadSearch;
+      // ardud: board-run threads are read-only to the owner; the board drives them.
+      const kanban = yield* KanbanService;
 
       const providerSessionsV2 = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const mcpAppRequests = yield* McpAppRequests.McpAppRequests;
@@ -1805,6 +1839,8 @@ export const layerWsRpc = (
 
       const handlers = ServerWsCoreRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
+          refuseBoardRunDispatch(kanban, command).pipe(
+            Effect.andThen(
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
             "orchestration_v2.command_type": command.type,
@@ -1852,6 +1888,8 @@ export const layerWsRpc = (
                     });
                   }),
                 ),
+            ),
+          ),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),

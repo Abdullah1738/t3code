@@ -568,6 +568,7 @@ const handlers = {
               ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
               : {}),
             links: input.links,
+            removeLinks: input.removeLinks,
             blockedBy,
             ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
             subtasks: input.subtasks,
@@ -619,6 +620,15 @@ const handlers = {
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
         return { pools: yield* service.setPool(board.id, modelOf(input.model), input.slots) };
+      }),
+    ),
+  ),
+
+  pool_remove: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { pools: yield* service.removePool(board.id, modelOf(input.model)) };
       }),
     ),
   ),
@@ -730,7 +740,15 @@ const handlers = {
         } else {
           purpose = { kind: input.kind };
         }
-        return { threadId: yield* service.startEvaluator(KanbanBoardId.make(board.id), purpose) };
+        // A sweep's text is added to its brief; setup/request already carry it in purpose.
+        const sweepText = purpose.kind === "setup" || purpose.kind === "request" ? undefined : text;
+        return {
+          threadId: yield* service.startEvaluator(
+            KanbanBoardId.make(board.id),
+            purpose,
+            sweepText || undefined,
+          ),
+        };
       }),
     ),
   ),

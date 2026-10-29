@@ -1,5 +1,6 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import {
+  cardSteps,
   discussionSnoozed,
   type KanbanBoardState,
   setupBanner,
@@ -17,6 +18,7 @@ import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
 import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
+import { useBoardFilter } from "./boardFilterStore";
 import { copyLinkAction } from "./copyLink";
 import { SetupStrip } from "./BoardView";
 import { Chat } from "./Chat";
@@ -29,6 +31,7 @@ import {
 } from "./discussionActions";
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
+import { useHideCardDiscussions } from "./useHideCardDiscussions";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { kanbanRecordState, type KanbanRecordParams, requestTitle } from "./logic";
 import { useKanbanNav } from "./nav";
@@ -51,6 +54,7 @@ export function KanbanRecordRouteScreen({
   const feed = useKanbanBoardFeed(boardId);
   const nav = useKanbanNav(boardId);
   const back = () => navigation.goBack();
+  const filter = useBoardFilter(boardId);
 
   if (record === null) {
     return (
@@ -70,17 +74,35 @@ export function KanbanRecordRouteScreen({
   switch (record.kind) {
     case "card": {
       const card = state.cards.get(record.id ?? "");
+      const steps = cardSteps(state, nowMs, filter, "stage", record.id ?? "");
+      // Stepping replaces this screen's card (no new screen), so Back still returns to the board.
+      const step = (id: string) => navigation.setParams({ ...route.params, id });
       return (
         <Shell
           title={card ? `#${card.number}` : "Card"}
           onBack={back}
-          actions={
-            card ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)] : []
-          }
+          actions={[
+            ...(card
+              ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)]
+              : []),
+            {
+              accessibilityLabel: "Previous card",
+              icon: "chevron.up",
+              disabled: steps.previous === null,
+              onPress: () => steps.previous && step(steps.previous),
+            },
+            {
+              accessibilityLabel: "Next card",
+              icon: "chevron.down",
+              disabled: steps.next === null,
+              onPress: () => steps.next && step(steps.next),
+            },
+          ]}
           state={state}
           boardId={boardId}
         >
           <CardDetail
+            key={record.id}
             boardId={boardId}
             state={state}
             cardId={record.id ?? ""}
@@ -89,6 +111,7 @@ export function KanbanRecordRouteScreen({
             onOpenCard={nav.openCard}
             onOpenGoal={nav.openGoal}
             onOpenThread={nav.openThread}
+            stepper={{ steps, onStep: step, onDone: back }}
           />
         </Shell>
       );
@@ -278,6 +301,7 @@ function discussionOptions(
     items: discussionMenu({
       settled: discussion.settledAt !== null,
       snoozed: discussionSnoozed(discussion, nowMs),
+      pinned: discussion.pinnedAt !== null,
       now: new Date(nowMs),
     }).map((item) =>
       "presets" in item
@@ -317,6 +341,8 @@ function DiscussionsScreen(props: {
     wide ? setSelected({ id, key: id ?? `new-${Date.now()}` }) : nav.openDiscussion(id);
   const selectedId = selected?.id ?? null;
   const splitDiscussion = selectedId === null ? undefined : props.state.discussions.get(selectedId);
+  const { hideCards, toggleHideCards } = useHideCardDiscussions();
+  const [unreadOnly, setUnreadOnly] = useState(false);
 
   return (
     <Shell
@@ -325,6 +351,26 @@ function DiscussionsScreen(props: {
       state={props.state}
       boardId={props.boardId}
       actions={[{ accessibilityLabel: "New discussion", icon: "plus", onPress: () => open(null) }]}
+      menus={[
+        {
+          title: "Filter",
+          icon: "line.3.horizontal.decrease.circle",
+          items: [
+            {
+              id: "hide-cards",
+              title: "Hide card discussions",
+              selected: hideCards,
+              onPress: toggleHideCards,
+            },
+            {
+              id: "unread-only",
+              title: "Unread only",
+              selected: unreadOnly,
+              onPress: () => setUnreadOnly((on) => !on),
+            },
+          ],
+        },
+      ]}
     >
       <View
         className="flex-1 flex-row"
@@ -336,6 +382,8 @@ function DiscussionsScreen(props: {
             nowMs={props.nowMs}
             bottomInset={props.bottomInset}
             selectedId={wide ? selectedId : null}
+            hideCards={hideCards}
+            unreadOnly={unreadOnly}
             onOpen={open}
           />
         </View>

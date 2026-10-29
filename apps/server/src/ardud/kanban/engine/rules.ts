@@ -113,10 +113,14 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
-/** Every PR link merged or closed. A card with no PR has nothing to wait for. */
+/**
+ * Every PR the work thread linked is merged or closed. Only those get a state
+ * (syncPrs); a PR link without one is context and holds nothing. A card with
+ * no PR has nothing to wait for.
+ */
 export function prsLanded(card: KanbanCard): boolean {
   return card.links
-    .filter((link) => link.kind === "pr")
+    .filter((link) => link.kind === "pr" && link.state !== null)
     .every((link) => link.state === "merged" || link.state === "closed");
 }
 
@@ -142,6 +146,24 @@ export function discussionSettleDue(
     discussion.snoozedUntil === null ? 0 : Date.parse(discussion.snoozedUntil),
   );
   return nowMs - quietSince >= DISCUSSION_IDLE_MS;
+}
+
+export const WORKER_QUIET_MS = 30 * 60 * 1000;
+
+/** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
+export function workerQuietDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly updatedAt: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle" && view.state !== "needs-input") return false;
+  const since = Math.max(
+    Date.parse(view.updatedAt),
+    Date.parse(card.movedAt),
+    card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+  );
+  return nowMs - since >= WORKER_QUIET_MS;
 }
 
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */

@@ -1,6 +1,10 @@
 import { type KeyboardEvent } from "react";
 
-import { clampColumnWidth, clampGroupWidth, type BoardColumnKey } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  clampColumnWidth,
+  clampGroupWidth,
+  type BoardColumnKey,
+} from "@t3tools/client-runtime/ardud/kanban";
 
 import { useResizeDrag } from "../../hooks/useResizeDrag";
 import { cn } from "../../lib/utils";
@@ -37,8 +41,14 @@ export function ColumnResizeHandle(props: {
     const target = props.liveTarget?.(event.currentTarget) ?? host;
     // Read before any style change: this is the width the user sees, so the drag starts there.
     const startWidth = host.getBoundingClientRect().width;
-    const previous = { width: host.style.width, flex: host.style.flex };
+    const previous = {
+      width: host.style.width,
+      flex: host.style.flex,
+      minWidth: host.style.minWidth,
+    };
     host.style.flex = "none";
+    // A saved width drops the layout's min width, so the live drag must too.
+    host.style.minWidth = "0";
     host.style.width = `var(${COLUMN_WIDTH_PROPERTY})`;
     target.style.setProperty(COLUMN_WIDTH_PROPERTY, `${startWidth}px`);
     return {
@@ -56,6 +66,7 @@ export function ColumnResizeHandle(props: {
         target.style.removeProperty(COLUMN_WIDTH_PROPERTY);
         host.style.width = previous.width;
         host.style.flex = previous.flex;
+        host.style.minWidth = previous.minWidth;
       },
     };
   }, props.columnKey);

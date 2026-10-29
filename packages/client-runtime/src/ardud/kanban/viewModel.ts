@@ -17,6 +17,7 @@ import {
   type KanbanMessage,
   type KanbanStage,
   type ModelSelection,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 
 import { ageView } from "../common/time.ts";
@@ -64,6 +65,50 @@ export function modelVariant(model: ModelSelection | null): string | null {
 export const modelLetter = (model: ModelSelection | null) =>
   modelName(model).charAt(0).toUpperCase();
 
+/**
+ * The composer picker's value (instance, model, effort/variant) as the board's
+ * ModelSelection. The board stores the variant as an option named "variant".
+ */
+export function boardModelSelection(input: {
+  readonly instanceId: ProviderInstanceId;
+  readonly model: string;
+  readonly variant?: string | null | undefined;
+}): ModelSelection {
+  const { instanceId, model, variant } = input;
+  return variant
+    ? { instanceId, model, options: [{ id: "variant", value: variant }] }
+    : { instanceId, model };
+}
+
+/**
+ * Whether a pool's model is still in the composer's model list. Mirrors the
+ * server rule in card #48: an instance missing from a non-empty list, disabled,
+ * or not offering the slug is missing; null means unknown and must not be read as missing.
+ */
+export function poolListed(
+  model: { readonly instanceId: ProviderInstanceId; readonly model: string },
+  providers: ReadonlyArray<{
+    readonly instanceId: ProviderInstanceId;
+    readonly enabled: boolean;
+    readonly models: ReadonlyArray<{ readonly slug: string; readonly isCustom?: boolean }>;
+  }>,
+  settings: {
+    readonly providerModelPreferences?:
+      | Readonly<Record<string, { readonly hiddenModels: ReadonlyArray<string> } | undefined>>
+      | null
+      | undefined;
+  },
+): boolean | null {
+  if (providers.length === 0) return null;
+  const provider = providers.find((entry) => entry.instanceId === model.instanceId);
+  if (!provider || !provider.enabled) return false;
+  if (provider.models.length === 0) return null;
+  const hidden = new Set(settings.providerModelPreferences?.[model.instanceId]?.hiddenModels ?? []);
+  return provider.models.some(
+    (entry) => entry.slug === model.model && (entry.isCustom === true || !hidden.has(entry.slug)),
+  );
+}
+
 export type CardFlag =
   | { readonly kind: "stalled"; readonly label: string }
   | { readonly kind: "blocked"; readonly label: string }
@@ -87,6 +132,7 @@ export interface CardView {
   } | null;
   readonly model: { readonly name: string; readonly letter: string };
   readonly running: boolean;
+  readonly needsInput: boolean;
   readonly unread: number;
   /** Subtasks done or skipped out of all, or null for a card with no plan. */
   readonly subtasks: { readonly done: number; readonly total: number } | null;
@@ -165,6 +211,7 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
     pr: pr ? { label: prLabel(pr.url, pr.label), url: pr.url, state: pr.state } : null,
     model: { name: modelName(card.model), letter: modelLetter(card.model) },
     running: thread?.running ?? false,
+    needsInput: thread?.needsInput ?? false,
     unread: card.discussionId === null ? 0 : (state.unread.get(card.discussionId) ?? 0),
     subtasks: card.subtasks.length === 0 ? null : { done: finished, total: card.subtasks.length },
     card,
@@ -475,6 +522,44 @@ export function groupCards(
       summary: null,
       cards: view(bucket.cards),
     }));
+}
+
+export interface CardSteps {
+  readonly previous: string | null;
+  readonly next: string | null;
+  /** The Verified card to open after settling this one; null closes. */
+  readonly afterSettle: string | null;
+}
+
+/**
+ * Neighbours of a card in the column it sits in, as the board shows it. A card in
+ * several groups steps through the first group that holds it.
+ */
+export function cardSteps(
+  state: KanbanBoardState,
+  nowMs: number,
+  filter: BoardFilter,
+  group: GroupBy,
+  cardId: string,
+): CardSteps {
+  let lanes: ReadonlyArray<ReadonlyArray<CardView>>;
+  let afterSettle: string | null = null;
+  if (group === "stage") {
+    const board = stageBoard(state, nowMs, filter);
+    lanes = [...board.active, ...board.shipped, board.owner].map((column) => column.cards);
+    const verified = board.shipped.find((column) => column.stage === "verified");
+    const open = (verified?.cards ?? []).filter((view) => view.card.settledAt === null);
+    const openAt = open.findIndex((view) => view.id === cardId);
+    afterSettle =
+      openAt >= 0 ? (open[openAt + 1]?.id ?? open[openAt - 1]?.id ?? null) : (open[0]?.id ?? null);
+  } else {
+    lanes = groupCards(state, group, nowMs, filter).map((g) => g.cards);
+  }
+
+  const lane = lanes.find((cards) => cards.some((view) => view.id === cardId)) ?? [];
+  const index = lane.findIndex((view) => view.id === cardId);
+  const at = (i: number) => (index >= 0 && i >= 0 && i < lane.length ? lane[i]!.id : null);
+  return { previous: at(index - 1), next: at(index + 1), afterSettle };
 }
 
 export interface GoalProgress {

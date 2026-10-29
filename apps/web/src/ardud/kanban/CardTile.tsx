@@ -22,7 +22,7 @@ export const CardTile = memo(function CardTile(props: {
       onClick={() => props.onOpen(card.id)}
       aria-current={props.selected ? "true" : undefined}
       className={cn(
-        "flex w-full min-w-0 flex-col gap-1.5 rounded-xl px-2.75 pt-2.25 pb-2.5 text-left text-sm text-(--m-text) outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+        "flex w-full min-w-0 flex-col gap-1.5 rounded-xl px-2.75 pt-2.25 pb-2.5 text-left text-sm text-(--m-text) outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:gap-2 pointer-coarse:px-3.5 pointer-coarse:pt-3 pointer-coarse:pb-3 pointer-coarse:text-base",
         props.raised ? "bg-(--m-raised)" : "bg-(--m-surface)",
         props.selected
           ? "ring-2 ring-inset ring-(--m-text)"
@@ -31,7 +31,7 @@ export const CardTile = memo(function CardTile(props: {
             : "hover:bg-(--m-active)",
       )}
     >
-      <span className="flex items-center gap-1.75 text-xs text-(--m-muted)">
+      <span className="flex items-center gap-1.75 text-xs text-(--m-muted) pointer-coarse:text-sm">
         <Pri priority={card.priority} />
         <span className="tabular-nums">#{card.number}</span>
         {card.unread > 0 ? <UnreadDot label={`${card.unread} unread`} /> : null}
@@ -42,7 +42,7 @@ export const CardTile = memo(function CardTile(props: {
       {card.flag ? (
         <span
           className={cn(
-            "flex gap-1.5 text-xs",
+            "flex gap-1.5 text-xs pointer-coarse:text-sm",
             card.flag.kind === "stalled" && "items-center font-medium text-(--m-negative)",
             card.flag.kind === "blocked" && "items-center text-(--m-muted)",
             card.flag.kind === "ask" &&
@@ -68,7 +68,9 @@ export const CardTile = memo(function CardTile(props: {
             {card.stageLabel}
           </Chip>
         ) : card.goal ? (
-          <Chip className="min-w-0 shrink">
+          // Flex shrink weighs a long PR label by its full text and squeezes the goal
+          // to one letter, so beside a PR the goal holds up to half the row.
+          <Chip className={cn("min-w-0", card.pr ? "max-w-1/2 shrink-0" : "shrink")}>
             <span className="truncate">{card.goal.name}</span>
           </Chip>
         ) : null}
@@ -76,7 +78,7 @@ export const CardTile = memo(function CardTile(props: {
           <Tooltip>
             <TooltipTrigger
               render={
-                <span className="inline-flex min-w-0 shrink items-center gap-1 px-1 text-xs font-medium tabular-nums" />
+                <span className="inline-flex min-w-0 shrink items-center gap-1 px-1 text-xs font-medium tabular-nums pointer-coarse:text-sm" />
               }
             >
               <PrGlyph state={card.pr.state} />
@@ -88,13 +90,17 @@ export const CardTile = memo(function CardTile(props: {
         <span className="flex-1" />
         {card.subtasks ? (
           <span
-            className="shrink-0 px-1 text-xs text-(--m-muted) tabular-nums"
+            className="shrink-0 px-1 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-sm"
             aria-label={`${card.subtasks.done} of ${card.subtasks.total} subtasks done`}
           >
             {card.subtasks.done}/{card.subtasks.total}
           </span>
         ) : null}
-        {card.running ? <Glyph kind="ok" label="Running" /> : null}
+        {card.needsInput ? (
+          <Glyph kind="ask" label="Stuck on its own question" />
+        ) : card.running ? (
+          <Glyph kind="ok" label="Running" />
+        ) : null}
         <ModelMark name={card.model.name} letter={card.model.letter} />
       </span>
     </button>

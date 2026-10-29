@@ -24,6 +24,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
+import * as KanbanModels from "./models.ts";
 import * as ScriptService from "./ScriptService.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -49,6 +50,7 @@ const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
 
 const testLayer = ScriptService.layer.pipe(
   Layer.provideMerge(KanbanService.layer),
+  Layer.provideMerge(KanbanModels.layerTest(null)),
   Layer.provideMerge(threads),
   Layer.provideMerge(KanbanStore.layer),
   Layer.provideMerge(Sqlite.layerMemory),

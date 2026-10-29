@@ -7,8 +7,13 @@ function BoardRouteView() {
   const { boardId } = Route.useParams();
   const search = Route.useSearch();
   const navigate = useNavigate();
-  const onSearch = (next: BoardSearch) => {
-    void navigate({ to: "/boards/$boardId", params: { boardId }, search: next });
+  const onSearch = (next: BoardSearch, options?: { readonly replace?: boolean }) => {
+    void navigate({
+      to: "/boards/$boardId",
+      params: { boardId },
+      search: next,
+      replace: options?.replace === true,
+    });
   };
   return <BoardPage key={boardId} boardId={boardId} search={search} onSearch={onSearch} />;
 }

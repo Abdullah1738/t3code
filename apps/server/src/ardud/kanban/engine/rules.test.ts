@@ -25,6 +25,7 @@ import {
   poolKey,
   prsLanded,
   relatedCandidates,
+  workerQuietDue,
 } from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
@@ -166,6 +167,25 @@ describe("applyReviewResult", () => {
     });
     expect(applyReviewResult(merged, 2, "clear").stage).toBe("completed");
     expect(prsLanded(card())).toBe(true);
+  });
+
+  it("a PR link the work thread never linked is context and holds nothing", () => {
+    const context = (url: string, state: "open" | "merged" | null) => ({
+      kind: "pr" as const,
+      url,
+      label: null,
+      state,
+      checkedAt: null,
+    });
+    expect(prsLanded(card({ links: [context("u", null)] }))).toBe(true);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "open")] }))).toBe(false);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "merged")] }))).toBe(true);
+    const nullStatePr = card({
+      stage: "in_review",
+      reviewStep: 1,
+      links: [context("u", null)],
+    });
+    expect(applyReviewResult(nullStatePr, 2, "clear").stage).toBe("completed");
   });
 });
 
@@ -717,5 +737,38 @@ describe("discussionSettleDue", () => {
     const d = discussion({ lastMessageAt: "2026-10-25T12:00:00.000Z" });
     expect(discussionSettleDue(d, null, START + 25 * H)).toBe(false);
     expect(discussionSettleDue(d, null, START + 37 * H)).toBe(true);
+  });
+});
+
+describe("workerQuietDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const START_ISO = "2026-10-25T00:00:00.000Z";
+  const working = card({
+    stage: "working",
+    activeRole: "work",
+    activeThreadId: ThreadId.make("t1"),
+    movedAt: START_ISO,
+  });
+  const at = (minutes: number) => START + minutes * 60 * 1000;
+  const view = (state: string) => ({ state, updatedAt: START_ISO });
+
+  it("is due for an idle or stuck worker after 30 minutes", () => {
+    expect(workerQuietDue(working, view("idle"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("idle"), at(29))).toBe(false);
+    expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
+  });
+
+  it("counts from the last nudge and skips stalled or review cards", () => {
+    const nudged = { ...working, nudgedAt: "2026-10-25T00:21:00.000Z" };
+    expect(workerQuietDue(nudged, view("idle"), at(31))).toBe(false);
+    expect(
+      workerQuietDue(
+        { ...working, stalled: { reason: "x", by: { _tag: "owner" }, at: START_ISO } },
+        view("idle"),
+        at(31),
+      ),
+    ).toBe(false);
+    expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
   });
 });

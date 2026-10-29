@@ -74,7 +74,7 @@ export const KanbanLink = Schema.Struct({
   kind: KanbanLinkKind,
   url: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String),
-  /** PR state as last checked; null for links that have none. */
+  /** PR state as last checked on the work thread (syncPrs); null for other links, including PRs attached only as context. */
   state: Schema.NullOr(Schema.Literals(["open", "draft", "merged", "closed"])),
   checkedAt: Schema.NullOr(IsoDateTime),
 });
@@ -682,9 +682,34 @@ export const KanbanThreadState = Schema.Struct({
   threadId: ThreadId,
   title: Schema.String,
   running: Schema.Boolean,
+  /** Waiting on its own built-in question, which nobody sees; running is false then. */
+  needsInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   lastActivityAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;
+
+/**
+ * A board thread as the Threads view lists it: the link plus its card and live
+ * state. `running` comes from the thread's real state, not from whether the
+ * link has ended, so an idle persistent evaluator is not shown as running.
+ */
+export const KanbanThreadRow = Schema.Struct({
+  threadId: ThreadId,
+  boardId: KanbanBoardId,
+  role: Schema.Literals(["work", "review", "evaluator"]),
+  purpose: Schema.NullOr(Schema.String),
+  cardId: Schema.NullOr(KanbanCardId),
+  cardNumber: Schema.NullOr(PositiveInt),
+  cardTitle: Schema.NullOr(Schema.String),
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  model: Schema.NullOr(ModelSelection),
+  title: Schema.NullOr(Schema.String),
+  running: Schema.Boolean,
+  lastActivityAt: Schema.NullOr(IsoDateTime),
+  startedAt: IsoDateTime,
+  endedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanThreadRow = typeof KanbanThreadRow.Type;
 
 export const KanbanBoardSnapshot = Schema.Struct({
   board: KanbanBoard,

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { XIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronUpIcon, XIcon } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
@@ -10,6 +10,7 @@ import {
   STAGE_LABELS,
   SUBTASK_OWNER_LABELS,
   subtaskSteps,
+  type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
@@ -27,8 +28,11 @@ import {
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
+import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
@@ -75,6 +79,9 @@ export function CardDrawer(props: {
   boardId: string;
   cardId: string;
   state: KanbanBoardState;
+  /** Neighbours on the board, or null when the drawer isn't over the board view. */
+  steps: CardSteps | null;
+  onStepCard: (cardId: string) => void;
   onClose: () => void;
   onOpenCard: (cardId: string) => void;
 }) {
@@ -87,13 +94,28 @@ export function CardDrawer(props: {
   const panelRef = useRef<HTMLElement>(null);
 
   const onClose = useStableCallback(props.onClose);
+  const onStep = useStableCallback((direction: -1 | 1) => {
+    const steps = props.steps;
+    if (steps === null) return false;
+    const target = direction < 0 ? steps.previous : steps.next;
+    if (target !== null) props.onStepCard(target);
+    return true;
+  });
   const canStop = useKanbanPermission(KANBAN_WS_METHODS.cardStop);
   const canSettle = useKanbanPermission(KANBAN_WS_METHODS.cardSettle);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // A confirm dialog is portaled outside the panel; the Tab trap below
+      // would pull its focus back into the drawer, so the drawer yields.
+      if (isConfirmDialogActive()) return;
       if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) {
         onClose();
+        return;
+      }
+      const direction = stepFromKey(event);
+      if (direction !== null) {
+        if (onStep(direction)) event.preventDefault();
         return;
       }
       // Tab stays inside the drawer; the page behind it is out of reach.
@@ -121,7 +143,7 @@ export function CardDrawer(props: {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, onStep]);
 
   // The drawer is keyed by card, so this runs once per opened card. Focus
   // goes back to what opened the first card of this drawer session.
@@ -164,6 +186,26 @@ export function CardDrawer(props: {
           <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
             <Pri priority={card.priority} />
             <span className="tabular-nums">#{card.number}</span>
+            {props.steps !== null ? (
+              <>
+                <StepButton
+                  label="Previous card"
+                  hint="Previous card (↑)"
+                  target={props.steps.previous}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronUpIcon className="size-4" />
+                </StepButton>
+                <StepButton
+                  label="Next card"
+                  hint="Next card (↓)"
+                  target={props.steps.next}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronDownIcon className="size-4" />
+                </StepButton>
+              </>
+            ) : null}
             <span className="flex-1" />
             <CopyLinkButton
               kind="kanban-card"
@@ -189,11 +231,17 @@ export function CardDrawer(props: {
                 type="button"
                 disabled={!canSettle}
                 title={canSettle ? undefined : "Your connection can't settle cards"}
-                onClick={() =>
-                  void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
-                    (ok) => ok && props.onClose(),
-                  )
-                }
+                onClick={() => {
+                  // Read before settling: once settled, the card leaves the Verified list.
+                  const after = props.steps?.afterSettle ?? null;
+                  void runAction("Couldn't settle the card", () =>
+                    kanban.settleCard(card.id),
+                  ).then((ok) => {
+                    if (!ok) return;
+                    if (after !== null) props.onStepCard(after);
+                    else props.onClose();
+                  });
+                }}
                 className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               >
                 Settle
@@ -351,6 +399,12 @@ function Details(props: {
     void runAction("Couldn't update the card", () =>
       kanban.patchCard({ cardId: card.id as never, ...input }),
     );
+  const removeLink = async (link: KanbanCard["links"][number]) => {
+    const message = `Remove this link from the card?\n${link.label ?? link.url}`;
+    const confirmed =
+      (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
+    if (confirmed) patch({ removeLinks: [link.url] });
+  };
   const moves = props.events
     .filter((event) => event.kind === "moved")
     .slice(-6)
@@ -454,10 +508,22 @@ function Details(props: {
           <Fact label="Links">
             <span className="flex flex-wrap gap-1.5">
               {card.links.map((link) => (
-                <LinkChip key={link.url} href={link.url}>
-                  {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
-                  {link.label ?? link.kind}
-                </LinkChip>
+                <span key={link.url} className="inline-flex items-center">
+                  <LinkChip href={link.url}>
+                    {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
+                    {link.label ?? link.kind}
+                  </LinkChip>
+                  {canPatch ? (
+                    <button
+                      type="button"
+                      onClick={() => void removeLink(link)}
+                      aria-label={`Remove link ${link.label ?? link.url}`}
+                      className="grid size-5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  ) : null}
+                </span>
               ))}
             </span>
           </Fact>
@@ -658,6 +724,34 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
   );
 }
 
+function StepButton(props: {
+  label: string;
+  hint: string;
+  target: string | null;
+  onStep: (cardId: string) => void;
+  children: ReactNode;
+}) {
+  const { target } = props;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            disabled={target === null}
+            onClick={() => target !== null && props.onStep(target)}
+            aria-label={props.label}
+            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40"
+          />
+        }
+      >
+        {props.children}
+      </TooltipTrigger>
+      <TooltipPopup>{props.hint}</TooltipPopup>
+    </Tooltip>
+  );
+}
+
 function QuietButton(props: {
   onClick: () => void;
   children: ReactNode;
@@ -715,13 +809,14 @@ function ThreadList(props: {
       {list.map((thread) => {
         const live = props.state.threads.get(thread.threadId);
         const running = live?.running ?? false;
+        const stuck = live?.needsInput ?? false;
         return (
           <li key={thread.threadId} className="flex items-center gap-1">
             <ThreadLink
               threadId={thread.threadId}
               className="-ms-2 flex h-11 min-w-0 flex-1 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
             >
-              <Glyph kind={running ? "ok" : thread.endedAt ? "done" : "idle"} />
+              <Glyph kind={stuck ? "ask" : running ? "ok" : thread.endedAt ? "done" : "idle"} />
               <span className="min-w-0 flex-1 truncate">
                 {live?.title ?? ROLE_LABELS[thread.role]}
               </span>

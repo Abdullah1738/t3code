@@ -403,7 +403,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           input.kind === "setup" || input.kind === "request"
             ? { kind: input.kind, text: input.text ?? "" }
             : { kind: input.kind };
-        const threadId = yield* service.startEvaluator(board.id, purpose, input.text);
+        // setup/request already carry their text in purpose; only sweeps pass it separately.
+        const sweepText = input.kind === "setup" || input.kind === "request" ? undefined : input.text;
+        const threadId = yield* service.startEvaluator(board.id, purpose, sweepText);
         return { threadId };
       }),
     );

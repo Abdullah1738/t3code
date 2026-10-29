@@ -34,7 +34,7 @@ export function BoardColumnsMenu(props: { boardId: string }) {
             type="button"
             aria-label="Columns"
             className={cn(
-              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
               anyHidden
                 ? "bg-(--m-text) text-(--m-ground)"
                 : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",

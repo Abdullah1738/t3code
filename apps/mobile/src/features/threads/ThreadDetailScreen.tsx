@@ -54,6 +54,7 @@ import {
 } from "@t3tools/client-runtime/state/thread-execution";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { useKanbanBoardRunOf } from "../../ardud/kanban/kanbanStore";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
@@ -64,6 +65,8 @@ import {
   AppState,
   Keyboard,
   Platform,
+  Pressable,
+  Text,
   useWindowDimensions,
   View,
   type GestureResponderEvent,
@@ -490,6 +493,8 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
   const agentsSegment = resolveSubagentPillSegment(turnSubagents);
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  // ardud: a board-run thread is read-only too; the bar points the owner at the board.
+  const boardRun = useKanbanBoardRunOf(String(props.selectedThread.id));
   const editingRunId = props.queuedRunEdit?.runId ?? null;
   useEffect(() => {
     if (editingRunId === null) return;
@@ -1485,6 +1490,42 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
                               }
                         }
                       />
+                    </View>
+                  ) : boardRun !== undefined ? (
+                    <View
+                      className="self-center px-3 pt-1.5"
+                      style={{
+                        width: "100%",
+                        maxWidth: contentMaxWidth,
+                        paddingBottom: composerBottomInset + 6,
+                      }}
+                    >
+                      <View className="min-h-12 flex-row items-center justify-between gap-3 rounded-3xl px-5 py-2">
+                        <Text numberOfLines={1} className="shrink text-sm font-medium text-foreground">
+                          Run by the {boardRun.boardName} board · view only
+                        </Text>
+                        {boardRun.cardId !== null || boardRun.discussionId !== null ? (
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={
+                              boardRun.cardId !== null ? "Open card" : "Open discussion"
+                            }
+                            onPress={() =>
+                              navigation.dispatch(
+                                StackActions.push("KanbanRecord", {
+                                  kind: boardRun.cardId !== null ? "card" : "discussion",
+                                  boardId: boardRun.boardId,
+                                  id: boardRun.cardId ?? boardRun.discussionId ?? undefined,
+                                }),
+                              )
+                            }
+                          >
+                            <Text className="text-sm font-medium text-foreground">
+                              {boardRun.cardId !== null ? "Open card" : "Open discussion"}
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                      </View>
                     </View>
                   ) : (
                     <>
