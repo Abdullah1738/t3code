@@ -53,6 +53,7 @@ import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -601,7 +602,7 @@ const make = Effect.gen(function* () {
   // also answers null on a read error, so a card is let go on the second miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
   // Pool keys whose model is out of usage or down, with when to probe next. In memory:
-  // after a restart probeOutages rebuilds it from the paused thread links.
+  // after a restart seedDown rebuilds it from the paused thread links.
   const down = yield* Ref.make<
     ReadonlyMap<string, { readonly delayMs: number; readonly nextAt: number }>
   >(new Map());
@@ -2220,6 +2221,7 @@ const make = Effect.gen(function* () {
     yield* Ref.set(kickPending, false);
     const random = yield* Random.Random;
     const pick = (count: number) => Math.floor(random.nextDoubleUnsafe() * count);
+    yield* seedDown;
     const downKeys = new Set((yield* Ref.get(down)).keys());
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
@@ -2263,6 +2265,27 @@ const make = Effect.gen(function* () {
     return found;
   });
 
+  /**
+   * After a restart `down` is empty, so the first dispatch rebuilds it from the
+   * persisted pauses before planning: a known-down model takes no new card while
+   * its first probe is still to come. Each key is probed right away. Callers hold the lock.
+   */
+  const seedDown = Effect.gen(function* () {
+    if (yield* Ref.get(scanned)) return;
+    const now = yield* nowMillis;
+    const keys = new Set<string>();
+    for (const { link, board } of yield* pausedLinks) keys.add(linkKey(link, board));
+    yield* Ref.update(down, (map) => {
+      const next = new Map(map);
+      for (const key of keys) {
+        if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now });
+      }
+      return next;
+    });
+    // Set last: a failed read is retried on the next dispatch.
+    yield* Ref.set(scanned, true);
+  });
+
   /** Marks a thread paused on the model its failed run used. A reused evaluator is reopened so it stays wakeable. */
   const pauseThread = Effect.fn("KanbanService.pauseThread")(function* (
     link: KanbanThreadLink,
@@ -2300,8 +2323,20 @@ const make = Effect.gen(function* () {
       if (link.role === "review" && link.cardId !== null) {
         live = (yield* store.card(link.cardId))?.activeThreadId === link.threadId;
       }
-      const view = yield* threads.view(link.threadId);
-      if (!live || view === null || view.state !== "idle") {
+      if (!live) {
+        yield* store.putThreadLink({ ...link, paused: null });
+        continue;
+      }
+      // A failed read is not a deleted thread: keep the wake for the next probe.
+      const found = yield* Effect.result(threads.find(link.threadId));
+      if (Result.isFailure(found)) {
+        failed = true;
+        continue;
+      }
+      // Deleted, archived (it takes no messages) or running again: nothing to wake,
+      // and its pause must not hold the pool down.
+      const view = found.success;
+      if (view === null || view.archived || view.state !== "idle") {
         yield* store.putThreadLink({ ...link, paused: null });
         continue;
       }
@@ -2423,9 +2458,11 @@ const make = Effect.gen(function* () {
     }
 
     if (link.role === "evaluator") {
-      // A paused evaluator stays open so it can be woken (and `link` is stale after pauseThread).
+      // A paused evaluator stays open so it can be woken. `link` is stale once its
+      // pause was set or cleared above, so the current row is ended.
       if (link.discussionId === null && link.endedAt === null && outage === null) {
-        yield* store.putThreadLink({ ...link, endedAt: at });
+        const current = (yield* store.threadLink(threadId)) ?? link;
+        yield* store.putThreadLink({ ...current, endedAt: at });
       }
       return;
     }
@@ -2773,8 +2810,8 @@ const make = Effect.gen(function* () {
   // Runs outside the lock: a probe can take a minute and must not hold the board.
   const probeOutagesNow = Effect.fn("KanbanService.probeOutages")(function* () {
     // Nothing down and the links already read once since start: skip the read.
-    if ((yield* Ref.get(down)).size === 0 && (yield* Ref.getAndSet(scanned, true))) return;
-    const paused = yield* lock.withPermits(1)(pausedLinks);
+    if ((yield* Ref.get(down)).size === 0 && (yield* Ref.get(scanned))) return;
+    const paused = yield* lock.withPermits(1)(seedDown.pipe(Effect.andThen(pausedLinks)));
     const models = new Map<string, ModelSelection>();
     for (const { link, board } of paused) {
       if (link.paused === null) continue;

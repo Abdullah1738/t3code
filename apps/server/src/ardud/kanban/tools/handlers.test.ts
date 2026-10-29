@@ -85,6 +85,7 @@ const fakeThreads = () => {
           prs: [],
           archived: false,
         }),
+      find: () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {
