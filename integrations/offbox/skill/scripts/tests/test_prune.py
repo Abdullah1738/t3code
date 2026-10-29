@@ -90,7 +90,8 @@ class ScriptTests(Isolated):
                                env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
                                capture_output=True, timeout=10)
             self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertEqual(p.stdout.decode().splitlines(), ["pruned w/a-aaaaaa", "pruned w/it's-bbbbbb"])
+            self.assertEqual(p.stdout.decode().splitlines(),
+                             ["pruned w/a-aaaaaa", "pruned w/it's-bbbbbb", "skip w/c-cccccc", "skip w/d-dddddd"])
             self.assertFalse((h / "w/a-aaaaaa").exists())
             self.assertFalse((h / "w/it's-bbbbbb").exists())
             self.assertTrue((h / "w/c-cccccc").is_symlink())
@@ -261,6 +262,59 @@ class RunTests(Isolated):
         self.assertFalse((Path(self.home.name) / "w/s1-aaaaaa").exists())
         n, _, _ = self.run_prune()  # finished: back to the 6 h throttle
         self.assertEqual((n, len(self.calls)), (0, 2))
+
+    def test_ssh_timeout_with_stalled_mv_then_reuse_never_renames_checkout(self):
+        # Round-4 P1 regression through run(): a stalled mv makes the script outlive the ssh timeout, the caller
+        # gets a TimeoutExpired, and the box is then reused. The live checkout must be untouched by the reuse.
+        pidf = Path(self.home.name) / "mv.pid"
+        stall = Path(self.bindir.name) / "mv"  # stalled mv: records its pid, never renames
+        stall.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
+        stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
+        real = self.fake_ssh(self.home.name, self.bindir.name, self.calls)
+
+        def timing_out(box_id, cmd, input=None, timeout=None):
+            # The stalled script is killed at the budget; the ssh layer reports a timeout to run().
+            real(box_id, cmd, input=input, timeout=timeout)
+            raise subprocess.TimeoutExpired("ssh", timeout)
+
+        with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"), \
+                patch.object(prune.ssh_sync, "ssh", side_effect=timing_out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            n = prune.run(self.con, "bx", "w/keep-cccccc")
+        self.assertEqual(n, 0)
+        self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())  # not renamed by the timed-out run
+        if pidf.exists():
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pidf.read_text().strip()), 0)  # the stalled child is gone before the box is free
+        # Reuse: a later run on the same box (after RETRY_S) sees the same dir and must not rename it while
+        # the previous checkout is still in use by a run that reused it.
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
+                patch.object(prune.ssh_sync, "ssh", side_effect=real), \
+                patch.object(prune, "BUDGET_S", 0), contextlib.redirect_stderr(io.StringIO()):
+            prune.run(self.con, "bx", "w/keep-cccccc")
+        self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())
+
+    def test_absent_dirs_are_settled_not_retried_forever(self):
+        # Round-4 P2: a dir already deleted but still in runs must not keep the box on 20-minute retries.
+        # s1 is present, s2 is already gone, keep is the current checkout (never a candidate).
+        import shutil
+        shutil.rmtree(Path(self.home.name) / "w/s2-bbbbbb")
+        with patch.object(prune, "BUDGET_S", 0), patch.object(prune, "BACKGROUND", "true"):
+            n, _, _ = self.run_prune()  # BUDGET_S 0: nothing is moved; s1 is left, s2 is absent (skip)
+        self.assertEqual(n, 0)
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 1)  # only s1 pending, not s2
+        # Next pass after RETRY_S: s1 now prunes; s2 stays absent and must not be counted as pending again.
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1), \
+                patch.object(prune, "BACKGROUND", "true"):
+            n, _, _ = self.run_prune()
+        self.assertEqual(n, 1)
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 0)
+        self.assertFalse((Path(self.home.name) / "w/s1-aaaaaa").exists())
+        # A settled box stays on the 6 h throttle, not the 20-minute retry.
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1):
+            n, _, _ = self.run_prune()
+        self.assertEqual(n, 0)
+
 
 class RunnerHookTests(Isolated):
     def test_prune_runs_after_record_and_before_push(self):

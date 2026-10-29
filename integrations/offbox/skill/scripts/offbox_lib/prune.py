@@ -50,28 +50,27 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
 
 
 def script(dirs: list[str]) -> str:
-    # The directory test and the move run in one child, in its own process group. The parent only starts
-    # a child before the budget, and at the budget it kills the whole group and confirms it is gone before
-    # moving on, so no test or rename starts after the budget. If a child cannot be confirmed gone (stuck
-    # in uninterruptible I/O), the script reports "busy" and stops; that residual is logged, not hidden.
-    # A dropped ssh (HUP/PIPE) is ignored so the background delete still starts.
+    # Each dir is checked and moved by one child in its own process group, so a hung check or mv is
+    # killed as a whole at the budget. The script returns only after that group is gone, and well inside
+    # the ssh timeout (BUDGET_S + grace). "busy" means a member could not be confirmed gone: the script
+    # stops and the box stays pending. A dropped ssh (HUP/PIPE) is ignored so the background delete starts.
     lines = ["set -m", "trap '' PIPE HUP", "busy=",
-             # A zombie or missing pid is not alive; "D" (uninterruptible) still counts as alive.
-             'alive() { st=$(ps -o stat= -p "$1" 2>/dev/null | tr -d " "); [ -n "$st" ] && [ "${st#Z}" = "$st" ]; }',
-             'one() { ( if [ -d "$1" ] && [ ! -L "$1" ]; then mv "$1" "$2"; else exit 5; fi ) & p=$!; '
-             f'while alive "$p"; do if [ "$SECONDS" -ge {BUDGET_S} ]; then kill -KILL -- -"$p" 2>/dev/null; '
-             'k=0; while alive "$p" && [ "$k" -lt 25 ]; do sleep 0.2; k=$((k+1)); done; '
-             'if alive "$p"; then return 4; fi; wait "$p" 2>/dev/null; return 3; fi; sleep 0.2; done; wait "$p"; }',
+             'one() { ( if [ -d "$1" ] && [ ! -L "$1" ]; then mv "$1" "$2"; exit $?; fi; exit 5 ) & p=$!; '
+             # kill -0 on the negative pgid checks every member of the group, not only the leader.
+             f'while kill -0 -- -"$p" 2>/dev/null; do '
+             f'if [ "$SECONDS" -ge {BUDGET_S} ]; then kill -KILL -- -"$p" 2>/dev/null; k=0; '
+             'while kill -0 -- -"$p" 2>/dev/null && [ "$k" -lt 25 ]; do sleep 0.2; k=$((k+1)); done; '
+             'wait "$p" 2>/dev/null; if kill -0 -- -"$p" 2>/dev/null; then return 4; fi; '
+             '[ -e "$1" ] && return 3; return 0; fi; sleep 0.2; done; wait "$p"; }',
              't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
     for i, d in enumerate(dirs):
         q = shlex.quote(d)
-        # rc 0 = moved, 5 = not a real dir (skip silently, as before), 4 = child not confirmed dead.
-        lines.append(f'if [ -n "$busy" ] || [ "$SECONDS" -ge {BUDGET_S} ]; then echo "left "{q}; '
+        # An absent or non-dir path is settled ("skip") before the budget gate: it needs no work, so it must
+        # not be counted as pending when the budget is already spent. 0 moved, 4 busy, else left for retry.
+        lines.append(f'if [ ! -d "$HOME"/{q} ] || [ -L "$HOME"/{q} ]; then echo "skip "{q}; '
+                     f'elif [ -n "$busy" ] || [ "$SECONDS" -ge {BUDGET_S} ]; then echo "left "{q}; '
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
-                     f'if [ "$rc" -eq 0 ]; then echo "pruned "{q}; '
-                     f'elif [ "$rc" -eq 5 ]; then :; '
-                     f'elif [ "$rc" -eq 4 ]; then echo "busy "{q}; busy=1; '
-                     f'else echo "left "{q}; fi; fi')
+                     f'case "$rc" in 0) echo "pruned "{q};; 4) echo "busy "{q}; busy=1;; *) echo "left "{q};; esac; fi')
     lines += [BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
@@ -98,11 +97,14 @@ def run(con, box_id: str, current: str) -> int:
         p = ssh_sync.ssh(box_id, "bash -s", input=script(dirs).encode(), timeout=BUDGET_S + 12)
         out = p.stdout.decode(errors="replace").splitlines()
         done = [ln[len("pruned "):] for ln in out if ln.startswith("pruned ") and ln[len("pruned "):] in dirs]
-        # ssh() does not raise on a nonzero exit, and a timeout leaves the remote state unknown: anything
-        # not confirmed pruned stays pending for the retry.
+        skipped = [ln[len("skip "):] for ln in out if ln.startswith("skip ") and ln[len("skip "):] in dirs]
+        # Absent or non-dir paths are settled, not pending: only dirs with no confirmed outcome are retried.
+        # ssh() does not raise on a nonzero exit, and a timeout leaves the remote state unknown, so anything
+        # unreported stays pending.
+        left_n = len(dirs) - len(done) - len(skipped)
         if p.returncode != 0 or any(ln.startswith("busy ") for ln in out):
-            log(f"prune {box_id} ssh exit {p.returncode}: {len(dirs) - len(done)} left for retry")
-        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs) - len(done)})
+            log(f"prune {box_id} ssh exit {p.returncode}: {left_n} left for retry")
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": left_n})
         if done:
             con.executemany("DELETE FROM pool_callers WHERE box_id=? AND remote_dir=?", [(box_id, d) for d in done])
             con.commit()
