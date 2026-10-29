@@ -1,7 +1,10 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Data from "effect/Data";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -2529,6 +2532,142 @@ it.effect("an owner's channel gets a title from his first message, unless he nam
         .pipe(Effect.flip);
       assert.strictEqual(agent.code, "denied");
     }).pipe(Effect.scoped, Effect.provide(titledLayer(fake.layer, asked)));
+  }),
+);
+
+class ModelDown extends Data.TaggedError("ModelDown")<{}> {}
+
+const scribeLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  asked: Array<string>,
+  failures = 0,
+  calls?: Queue.Queue<string>,
+) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateJson: ((input: { readonly prompt: string }) =>
+          Effect.gen(function* () {
+            asked.push(input.prompt);
+            if (calls) yield* Queue.offer(calls, input.prompt);
+            if (asked.length <= failures) return yield* Effect.fail(new ModelDown());
+            return { groups: [{ id: null, name: "Login", summary: "Sign-in work.", cards: [1, 2] }] };
+          })) as never,
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () => Effect.succeed(Option.some({ workspaceRoot: "/repo" } as never)),
+      }),
+    ),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+it.effect("the scribe groups a board's open cards when they change, at most every 10 minutes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const grouped = Effect.gen(function* () {
+        const changes = yield* kanban.changes;
+        return Stream.runHead(Stream.filter(changes, ({ change }) => change._tag === "groups"));
+      });
+
+      const first = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in page" },
+        owner,
+      );
+      const second = yield* kanban.createCard(
+        board.id,
+        { prompt: "B", title: "Login errors", description: "Sign-in errors" },
+        owner,
+      );
+
+      const firstRun = yield* (yield* grouped).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* Fiber.join(firstRun)));
+      const groups = (yield* kanban.snapshot(board.id)).groups;
+      assert.lengthOf(groups, 1);
+      assert.strictEqual(groups[0]?.name, "Login");
+      assert.deepStrictEqual(groups[0]?.cardIds, [first.id, second.id]);
+      assert.lengthOf(asked, 1);
+      assert.include(asked[0] ?? "", "#1 |");
+
+      // Nothing changed: no new run.
+      yield* kanban.tick;
+      assert.lengthOf(asked, 1);
+
+      // A new card changes the fingerprint, but the last run was under 10 minutes ago.
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "C", title: "Logout", description: "Sign-out" },
+        owner,
+      );
+      yield* kanban.tick;
+      assert.lengthOf(asked, 1);
+
+      yield* TestClock.adjust("10 minutes");
+      const secondRun = yield* (yield* grouped).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      assert.isTrue(Option.isSome(yield* Fiber.join(secondRun)));
+      assert.lengthOf(asked, 2);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
+  }),
+);
+
+it.effect("a failed scribe run is retried after the cooldown, even with cards unchanged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    const calls = yield* Queue.unbounded<string>();
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const changes = yield* kanban.changes;
+      const grouped = Effect.gen(function* () {
+        return Stream.runHead(Stream.filter(changes, ({ change }) => change._tag === "groups"));
+      });
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in page" },
+        owner,
+      );
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "B", title: "Login errors", description: "Sign-in errors" },
+        owner,
+      );
+
+      // The first model call fails: no groups land and the board is not marked done.
+      yield* kanban.tick;
+      yield* Queue.take(calls);
+      assert.lengthOf(asked, 1);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 0);
+
+      // Cards unchanged, under the cooldown: no retry.
+      yield* kanban.tick;
+      assert.lengthOf(asked, 1);
+
+      // Cooldown passed, cards unchanged: the failed attempt is retried and succeeds.
+      yield* TestClock.adjust("10 minutes");
+      const retried = yield* (yield* grouped).pipe(Effect.forkScoped);
+      yield* kanban.tick;
+      yield* Queue.take(calls);
+      assert.isTrue(Option.isSome(yield* Fiber.join(retried)));
+      assert.lengthOf(asked, 2);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 1);
+
+      // Success with unchanged cards: no further runs.
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.tick;
+      assert.lengthOf(asked, 2);
+    }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked, 1, calls)));
   }),
 );
 
