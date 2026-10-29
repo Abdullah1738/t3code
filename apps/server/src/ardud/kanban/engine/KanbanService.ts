@@ -581,9 +581,14 @@ const make = Effect.gen(function* () {
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
   const unlistedPools = yield* Ref.make<ReadonlySet<string>>(new Set());
-  // Per board: the open-card fingerprint the scribe last grouped, and when.
+  // Per board: the open-card fingerprint of the scribe's last attempt, when it started,
+  // and whether that attempt grouped the board. A failed attempt is retried after the
+  // cooldown even when the cards did not change.
   const scribed = yield* Ref.make<
-    ReadonlyMap<KanbanBoardId, { readonly fingerprint: string; readonly at: number }>
+    ReadonlyMap<
+      KanbanBoardId,
+      { readonly fingerprint: string; readonly at: number; readonly done: boolean }
+    >
   >(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
@@ -1044,6 +1049,12 @@ const make = Effect.gen(function* () {
         const next = groups.map((group) => ({ ...group, updatedAt: at }));
         yield* store.putGroups(boardId, next);
         yield* publish(boardId, { _tag: "groups", groups: next });
+        yield* Ref.update(scribed, (all) => {
+          const attempt = all.get(boardId);
+          return attempt === undefined
+            ? all
+            : new Map(all).set(boardId, { ...attempt, done: true });
+        });
       }),
     );
   });
@@ -2245,12 +2256,16 @@ const make = Effect.gen(function* () {
       // The scribe regroups at most every SCRIBE_EVERY_MS, and only when open cards changed.
       const fingerprint = Scribe.groupsFingerprint(yield* store.cards(board.id));
       const last = (yield* Ref.get(scribed)).get(board.id);
-      if (
+      const cooled = last === undefined || now - last.at >= Scribe.SCRIBE_EVERY_MS;
+      // A failed attempt is retried once the cooldown has passed, cards changed or not.
+      const due =
         fingerprint !== "" &&
-        fingerprint !== last?.fingerprint &&
-        (last === undefined || now - last.at >= Scribe.SCRIBE_EVERY_MS)
-      ) {
-        yield* Ref.update(scribed, (all) => new Map(all).set(board.id, { fingerprint, at: now }));
+        cooled &&
+        (last === undefined || !last.done || fingerprint !== last.fingerprint);
+      if (due) {
+        yield* Ref.update(scribed, (all) =>
+          new Map(all).set(board.id, { fingerprint, at: now, done: false }),
+        );
         yield* forkGroups(board.id);
       }
       // A card whose thread was deleted goes back to its queue for a new one.
