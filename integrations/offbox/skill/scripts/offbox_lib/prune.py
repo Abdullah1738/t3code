@@ -10,6 +10,11 @@ from .common import event, kv_get, kv_set, log, now, say
 # Checkout dirs offbox itself makes (identity.remote_dir_for). Anything else on the box is left alone.
 DIR_RE = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 EVERY_S = 6 * 3600
+# A box that ran out of budget (slow FUSE home, heavy load) is tried again this soon, not after 6 h.
+RETRY_S = 20 * 60
+# Seconds the box spends moving dirs before it leaves the rest for the next prune, so a slow box
+# delays the run by about this much (a 30 s ssh timeout used to kill the script mid-move).
+BUDGET_S = 8
 # A worker often runs `npm ci` and then tests minutes or hours later: never pull a dir out from under it.
 FLOOR_S = 12 * 3600
 # Deletes in the background so the run doesn't wait; fstrim hands freed blocks back so boat's
@@ -45,10 +50,12 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
 
 
 def script(dirs: list[str]) -> str:
-    lines = ['t="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
+    # A dropped ssh must not kill the script before it starts the background delete.
+    lines = ["trap '' PIPE HUP", 't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
     for i, d in enumerate(dirs):
         q = shlex.quote(d)
-        lines.append(f'if [ -d "$HOME"/{q} ] && [ ! -L "$HOME"/{q} ]; then '
+        lines.append(f'if [ "$SECONDS" -ge {BUDGET_S} ]; then echo "left "{q}; '
+                     f'elif [ -d "$HOME"/{q} ] && [ ! -L "$HOME"/{q} ]; then '
                      f'mv "$HOME"/{q} "$t/{i}" && echo "pruned "{q}; fi')
     lines += [BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
@@ -63,15 +70,21 @@ def run(con, box_id: str, current: str) -> int:
     """Move old checkouts on box_id out of ~/w. Returns how many moved. Never raises."""
     try:
         key = f"prune:{box_id}"
-        if kv_get(con, key, max_age=EVERY_S) is not None or _protected(con, box_id):
+        prev = kv_get(con, key, max_age=EVERY_S)
+        if prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
+            return 0
+        if _protected(con, box_id):
             return 0
         dirs = stale_dirs(con, box_id, current)
-        kv_set(con, key, {"at": now(), "stale": len(dirs)})
+        # Counted as all left until the box answers, so a timed-out or failed ssh is retried after RETRY_S.
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs)})
         if not dirs:
             return 0
-        p = ssh_sync.ssh(box_id, "bash -s", input=script(dirs).encode(), timeout=30)
+        p = ssh_sync.ssh(box_id, "bash -s", input=script(dirs).encode(), timeout=BUDGET_S + 12)
         out = p.stdout.decode(errors="replace").splitlines()
         done = [ln[len("pruned "):] for ln in out if ln.startswith("pruned ") and ln[len("pruned "):] in dirs]
+        left = [ln[len("left "):] for ln in out if ln.startswith("left ") and ln[len("left "):] in dirs]
+        kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(left)})
         if done:
             con.executemany("DELETE FROM pool_callers WHERE box_id=? AND remote_dir=?", [(box_id, d) for d in done])
             con.commit()

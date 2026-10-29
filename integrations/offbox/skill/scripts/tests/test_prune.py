@@ -175,7 +175,26 @@ class RunTests(Isolated):
             self.con.commit()
             n, _, _ = self.run_prune(exc=exc)
             self.assertEqual(n, 0)
+            # Unknown outcome counts as all left, so the box is tried again after RETRY_S, not 6 h.
+            self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
 
+
+    def test_out_of_budget_leaves_rest_and_retries_after_retry_window(self):
+        # No background delete here: it would race the next call's fresh trash dir in this temp HOME.
+        self.stack.enter_context(patch.object(prune, "BACKGROUND", "true"))
+        with patch.object(prune, "BUDGET_S", 0):
+            n, _, _ = self.run_prune()
+        self.assertEqual(n, 0)
+        self.assertTrue((Path(self.home.name) / "w/s1-aaaaaa").is_dir())
+        self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
+        n, _, _ = self.run_prune()  # inside RETRY_S: no second ssh
+        self.assertEqual((n, len(self.calls)), (0, 1))
+        with patch.object(prune, "now", return_value=common.now() + prune.RETRY_S + 1):
+            n, _, _ = self.run_prune()
+        self.assertEqual((n, len(self.calls)), (2, 2))
+        self.assertFalse((Path(self.home.name) / "w/s1-aaaaaa").exists())
+        n, _, _ = self.run_prune()  # finished: back to the 6 h throttle
+        self.assertEqual((n, len(self.calls)), (0, 2))
 
 class RunnerHookTests(Isolated):
     def test_prune_runs_after_record_and_before_push(self):
