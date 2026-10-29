@@ -6,11 +6,14 @@ import { cdp, page } from "vite-plus/test/browser";
 
 import {
   boardStateFromSnapshot,
+  EMPTY_FILTER_PREFS,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanCard, KanbanBoardSnapshot } from "@t3tools/contracts";
 
 import { BoardColumns } from "./BoardColumns";
+import { BoardColumnsMenu } from "./BoardColumnsMenu";
+import { BoardFilterMenu } from "./BoardFilterMenu";
 import "./tokens.css";
 import "./kanban.css";
 import { boardColumnsStorageKey } from "./useBoardColumnPrefs";
@@ -495,6 +498,41 @@ describe("iPad layout", () => {
     expect(tiles.length).toBeGreaterThan(2);
     expect(rect(tiles[1]!).top).toBeCloseTo(rect(tiles[0]!).top, 0);
     expect(shortButtons()).toEqual([]);
+  });
+});
+
+describe("header triggers", () => {
+  /** The board header's Columns and Filter menus, as BoardControls mounts them. */
+  async function mountHeader(pointerKind: "coarse" | "fine") {
+    await mountAt(1084, 900, pointerKind);
+    await act(() =>
+      root.render(
+        <div>
+          <BoardColumnsMenu boardId={BOARD_ID} />
+          <BoardFilterMenu
+            state={toyState()}
+            prefs={EMPTY_FILTER_PREFS}
+            narrow={false}
+            onChange={() => {}}
+          />
+        </div>,
+      ),
+    );
+    const trigger = (label: string) =>
+      container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
+    return [trigger("Columns"), trigger("Filter")] as const;
+  }
+
+  it("gives Columns and Filter touch height under a coarse pointer", async () => {
+    for (const trigger of await mountHeader("coarse")) {
+      expect(rect(trigger).height, trigger.ariaLabel ?? "").toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  it("keeps Columns and Filter at desktop height under a fine pointer", async () => {
+    for (const trigger of await mountHeader("fine")) {
+      expect(rect(trigger).height, trigger.ariaLabel ?? "").toBeCloseTo(32, 0);
+    }
   });
 });
 
