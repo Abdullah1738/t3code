@@ -25,7 +25,8 @@ RECOVERY_NOT_REORDER=('Still unconfirmed. Do not place another order. Check "com
 # Every paying lane is pinned to this saved card (reviews refuse any other).
 ORDER_CARD_LAST4='5542'
 # Only outcomes that clearly mean the card itself was refused.
-CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'})
+CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
+                                'PAYMENT_DECLINED_BY_ISSUER_NO_RETRY'})
 
 
 def register_tracking(flow, label, recipient='owner', *, paid=True):
