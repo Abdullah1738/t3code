@@ -52,6 +52,7 @@ const makeFake = Effect.gen(function* () {
             };
           }),
         ),
+      find: () => Effect.succeed(null),
       launch: (input) =>
         Ref.modify(threads, (all) => {
           const threadId = ThreadId.make(`thread-${all.size + 1}`);
@@ -65,6 +66,8 @@ const makeFake = Effect.gen(function* () {
           return all;
         }),
       lastFailure: () => Effect.succeed(null),
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
       interrupt: () => Effect.void,
     }),
   );

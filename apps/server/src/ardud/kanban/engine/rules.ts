@@ -166,6 +166,33 @@ export function workerQuietDue(
   return nowMs - since >= WORKER_QUIET_MS;
 }
 
+// Words a provider uses when it is out of usage or down, not when the request is wrong.
+const OUTAGE_TEXT =
+  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired/i;
+
+/** A failed run the same request would pass once the provider is back. */
+export function isOutage(failure: {
+  readonly class: string;
+  readonly code: string | null;
+  readonly message: string;
+}): boolean {
+  if (failure.class === "usage_limit") return true;
+  if (failure.code === "provider.quota" || failure.code === "provider.rate-limit") return true;
+  return OUTAGE_TEXT.test(failure.message);
+}
+
+export const PROBE_FIRST_MS = 5 * 60 * 1000;
+export const PROBE_MAX_MS = 30 * 60 * 1000;
+export const nextProbeDelay = (delayMs: number): number => Math.min(delayMs * 2, PROBE_MAX_MS);
+
+/** Pools on a down model take no new card; threads already running are untouched. */
+export function maskDownPools(
+  pools: ReadonlyArray<KanbanPool>,
+  down: ReadonlySet<string>,
+): ReadonlyArray<KanbanPool> {
+  return pools.map((pool) => (down.has(pool.key) ? { ...pool, slots: 0 } : pool));
+}
+
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
 export const isBlocked = (
   card: KanbanCard,

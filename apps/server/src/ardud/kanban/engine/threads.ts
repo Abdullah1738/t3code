@@ -17,6 +17,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -68,12 +69,18 @@ export interface KanbanSendInput {
  */
 export interface KanbanThreadsShape {
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
+  /** Like view, but a failed read fails: null means the thread is gone. */
+  readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
+  /** The model the thread runs now, or null when the thread is gone. */
+  readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
   readonly lastFailure: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ProviderFailure | null>;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
+  /** Switches an open thread to this model now; does nothing when it already runs it. */
+  readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
   readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
 }
 
@@ -90,7 +97,7 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
 
-  const view: KanbanThreadsShape["view"] = (threadId) =>
+  const find: KanbanThreadsShape["find"] = (threadId) =>
     threads.getThreadShell(threadId).pipe(
       Effect.map((shell): KanbanThreadView | null =>
         shell === null || shell.deletedAt !== null
@@ -114,14 +121,38 @@ const make = Effect.gen(function* () {
               })),
             },
       ),
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "view", detail: detailOf(error) }),
+      ),
+    );
+
+  const view: KanbanThreadsShape["view"] = (threadId) =>
+    find(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
+
+  const model: KanbanThreadsShape["model"] = (threadId) =>
+    threads.getThreadShell(threadId).pipe(
+      Effect.map((shell) =>
+        shell === null || shell.deletedAt !== null ? null : shell.modelSelection,
+      ),
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
   const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
     threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
-      Effect.map((records) =>
-        latestRootProviderFailure(latestExecutedRun(records.runs), records.turnItems),
-      ),
+      Effect.map((records) => {
+        const run = latestExecutedRun(records.runs);
+        const failure = latestRootProviderFailure(run, records.turnItems);
+        // A failed run can leave no error item on its root node; it still counts as failed.
+        if (failure === null && run?.status === "failed") {
+          return {
+            class: "unknown",
+            message: "The run failed without an error message.",
+            code: null,
+            retryable: null,
+          } as OrchestrationV2ProviderFailure;
+        }
+        return failure;
+      }),
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
@@ -173,6 +204,27 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const setModel: KanbanThreadsShape["setModel"] = Effect.fn("KanbanThreads.setModel")(
+    function* (threadId, model) {
+      const shell = yield* threads.getThreadShell(threadId);
+      if (shell === null || shell.deletedAt !== null) {
+        return yield* new KanbanThreadError({ operation: "setModel", detail: "thread not found" });
+      }
+      if (modelSelectionsEqual(shell.modelSelection, model)) return;
+      yield* threads.dispatch({
+        type: model.instanceId === shell.providerInstanceId ? "thread.model-selection.set" : "provider.switch",
+        commandId: commandId("model"),
+        threadId,
+        modelSelection: model,
+      });
+    },
+    Effect.mapError((error) =>
+      isKanbanThreadError(error)
+        ? error
+        : new KanbanThreadError({ operation: "setModel", detail: detailOf(error) }),
+    ),
+  );
+
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
     function* (threadId, reason) {
       const shell = yield* threads.getThreadShell(threadId);
@@ -187,7 +239,7 @@ const make = Effect.gen(function* () {
     Effect.catchCause(() => Effect.void),
   );
 
-  return KanbanThreads.of({ view, lastFailure, launch, send, interrupt });
+  return KanbanThreads.of({ view, find, model, lastFailure, launch, send, setModel, interrupt });
 });
 
 export const layer = Layer.effect(KanbanThreads, make);

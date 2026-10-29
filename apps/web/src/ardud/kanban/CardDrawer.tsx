@@ -31,6 +31,7 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
@@ -105,6 +106,9 @@ export function CardDrawer(props: {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // A confirm dialog is portaled outside the panel; the Tab trap below
+      // would pull its focus back into the drawer, so the drawer yields.
+      if (isConfirmDialogActive()) return;
       if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) {
         onClose();
         return;
@@ -395,6 +399,12 @@ function Details(props: {
     void runAction("Couldn't update the card", () =>
       kanban.patchCard({ cardId: card.id as never, ...input }),
     );
+  const removeLink = async (link: KanbanCard["links"][number]) => {
+    const message = `Remove this link from the card?\n${link.label ?? link.url}`;
+    const confirmed =
+      (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
+    if (confirmed) patch({ removeLinks: [link.url] });
+  };
   const moves = props.events
     .filter((event) => event.kind === "moved")
     .slice(-6)
@@ -498,10 +508,22 @@ function Details(props: {
           <Fact label="Links">
             <span className="flex flex-wrap gap-1.5">
               {card.links.map((link) => (
-                <LinkChip key={link.url} href={link.url}>
-                  {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
-                  {link.label ?? link.kind}
-                </LinkChip>
+                <span key={link.url} className="inline-flex items-center">
+                  <LinkChip href={link.url}>
+                    {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
+                    {link.label ?? link.kind}
+                  </LinkChip>
+                  {canPatch ? (
+                    <button
+                      type="button"
+                      onClick={() => void removeLink(link)}
+                      aria-label={`Remove link ${link.label ?? link.url}`}
+                      className="grid size-5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  ) : null}
+                </span>
               ))}
             </span>
           </Fact>
@@ -787,13 +809,14 @@ function ThreadList(props: {
       {list.map((thread) => {
         const live = props.state.threads.get(thread.threadId);
         const running = live?.running ?? false;
+        const stuck = live?.needsInput ?? false;
         return (
           <li key={thread.threadId} className="flex items-center gap-1">
             <ThreadLink
               threadId={thread.threadId}
               className="-ms-2 flex h-11 min-w-0 flex-1 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
             >
-              <Glyph kind={running ? "ok" : thread.endedAt ? "done" : "idle"} />
+              <Glyph kind={stuck ? "ask" : running ? "ok" : thread.endedAt ? "done" : "idle"} />
               <span className="min-w-0 flex-1 truncate">
                 {live?.title ?? ROLE_LABELS[thread.role]}
               </span>

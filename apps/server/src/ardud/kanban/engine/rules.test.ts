@@ -19,8 +19,11 @@ import {
   checkMove,
   discussionSettleDue,
   isBlocked,
+  isOutage,
   MAX_BATCH,
+  maskDownPools,
   modelOnPool,
+  nextProbeDelay,
   planDispatch,
   poolKey,
   prsLanded,
@@ -770,5 +773,84 @@ describe("workerQuietDue", () => {
       ),
     ).toBe(false);
     expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
+  });
+});
+
+describe("isOutage", () => {
+  it("treats out-of-usage, rate-limit and expired-token failures as outages", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message:
+          'Provider error [400]: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."}}',
+      }),
+    ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message:
+          "Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.",
+      }),
+    ).toBe(true);
+    expect(
+      isOutage({ class: "usage_limit", code: "provider.rate-limit", message: "slow down" }),
+    ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "OAuth access token has expired",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps request, model and content failures on the flag path", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "prompt is too long: 1200000 tokens > 1000000 maximum",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Variant unavailable for opus/gpt-6-astra: high",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.content-filter",
+        message: "Provider blocked the response",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("probe backoff and pool masking", () => {
+  it("doubles the probe delay from 5 minutes up to 30", () => {
+    const minutes = 60 * 1000;
+    expect(nextProbeDelay(5 * minutes)).toBe(10 * minutes);
+    expect(nextProbeDelay(10 * minutes)).toBe(20 * minutes);
+    expect(nextProbeDelay(20 * minutes)).toBe(30 * minutes);
+    expect(nextProbeDelay(30 * minutes)).toBe(30 * minutes);
+  });
+
+  it("zeroes only the down pool's slots", () => {
+    const down = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/claude-opus-5-5",
+    } as ModelSelection;
+    const up = { ...down, model: "opus/cx/gpt-6.1-sol" } as ModelSelection;
+    const pools = [
+      { key: poolKey(down), model: down, slots: 3 },
+      { key: poolKey(up), model: up, slots: 1 },
+    ] as unknown as ReadonlyArray<KanbanPool>;
+    const masked = maskDownPools(pools, new Set(["opencode/opus/claude-opus-5-5"]));
+    expect(masked.map((pool) => pool.slots)).toEqual([0, 1]);
   });
 });

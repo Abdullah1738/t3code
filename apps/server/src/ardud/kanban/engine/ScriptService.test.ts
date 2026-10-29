@@ -35,9 +35,12 @@ const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
     view: () => Effect.succeed(null),
+    find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
+    model: () => Effect.succeed(null),
+    setModel: () => Effect.void,
     interrupt: () => Effect.void,
   }),
 );

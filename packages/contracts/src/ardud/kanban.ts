@@ -87,6 +87,13 @@ export const KanbanReviewChain = Schema.Struct({
 });
 export type KanbanReviewChain = typeof KanbanReviewChain.Type;
 
+/** Why a board thread is paused: its last run died on a provider outage. */
+export const KanbanThreadPause = Schema.Struct({
+  at: IsoDateTime,
+  message: Schema.String,
+});
+export type KanbanThreadPause = typeof KanbanThreadPause.Type;
+
 /** Every thread the board started: card work/review threads and evaluators. */
 export const KanbanThreadLink = Schema.Struct({
   threadId: ThreadId,
@@ -99,6 +106,8 @@ export const KanbanThreadLink = Schema.Struct({
   model: Schema.NullOr(ModelSelection),
   startedAt: IsoDateTime,
   endedAt: Schema.NullOr(IsoDateTime),
+  /** Set while its model is out of usage or down; the board wakes the thread when a probe passes. */
+  paused: Schema.NullOr(KanbanThreadPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanThreadLink = typeof KanbanThreadLink.Type;
 
@@ -682,6 +691,8 @@ export const KanbanThreadState = Schema.Struct({
   threadId: ThreadId,
   title: Schema.String,
   running: Schema.Boolean,
+  /** Waiting on its own built-in question, which nobody sees; running is false then. */
+  needsInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   lastActivityAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;

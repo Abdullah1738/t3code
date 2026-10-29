@@ -85,6 +85,7 @@ const fakeThreads = () => {
           prs: [],
           archived: false,
         }),
+      find: () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {
@@ -92,6 +93,8 @@ const fakeThreads = () => {
           return ThreadId.make(`thread-${++launched}`);
         }),
       send: () => Effect.void,
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
       interrupt: () => Effect.void,
     }),
   );

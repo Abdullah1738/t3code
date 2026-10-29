@@ -17,7 +17,7 @@ export function Glyph(props: {
   return (
     <svg
       viewBox="0 0 12 12"
-      className={cn("size-2.5 shrink-0", props.className)}
+      className={cn("size-2.5 shrink-0 pointer-coarse:size-3", props.className)}
       role={props.label ? "img" : undefined}
       aria-label={props.label}
       aria-hidden={props.label ? undefined : true}
@@ -95,7 +95,7 @@ export function Pri(props: { priority: number }) {
 export function ModelMark(props: { name: string; letter: string }) {
   return (
     <span
-      className="inline-grid size-5 shrink-0 place-items-center rounded-full text-3xs font-semibold text-(--m-muted) ring-2 ring-inset ring-(--m-bar-3)"
+      className="inline-grid size-5 shrink-0 place-items-center rounded-full text-3xs font-semibold text-(--m-muted) ring-2 ring-inset ring-(--m-bar-3) pointer-coarse:size-6 pointer-coarse:text-2xs"
       role="img"
       aria-label={props.name}
     >
@@ -134,7 +134,7 @@ export function Chip(props: { children: ReactNode; className?: string }) {
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-chip) px-2.25 text-xs font-medium whitespace-nowrap text-(--m-text)",
+        "inline-flex h-5.5 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-chip) px-2.25 text-xs font-medium whitespace-nowrap text-(--m-text) pointer-coarse:h-6.5 pointer-coarse:px-2.75 pointer-coarse:text-sm",
         props.className,
       )}
     >
@@ -204,7 +204,7 @@ export function Seg<T extends string>(props: {
             aria-pressed={pressed}
             onClick={() => props.onChange(option.value)}
             className={cn(
-              "inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) focus-visible:ring-inset",
+              "inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) focus-visible:ring-inset pointer-coarse:h-9 pointer-coarse:px-3.5 pointer-coarse:text-base",
               pressed
                 ? "bg-(--m-raised) text-(--m-text)"
                 : "text-(--m-muted) hover:text-(--m-text)",
@@ -241,7 +241,7 @@ export function Tabs<T extends string>(props: {
             aria-selected={selected}
             onClick={() => props.onChange(option.value)}
             className={cn(
-              "inline-flex h-9 shrink-0 items-center gap-1.5 border-b-2 font-medium whitespace-nowrap outline-none focus-visible:text-(--m-text)",
+              "inline-flex h-9 shrink-0 items-center gap-1.5 border-b-2 font-medium whitespace-nowrap outline-none focus-visible:text-(--m-text) pointer-coarse:h-11",
               selected
                 ? "border-(--m-text) text-(--m-text)"
                 : "border-transparent text-(--m-muted) hover:text-(--m-text)",

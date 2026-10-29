@@ -55,7 +55,7 @@ export function BoardFilterMenu(props: {
             type="button"
             aria-label={label}
             className={cn(
-              "inline-flex h-8 max-w-48 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+              "inline-flex h-8 max-w-48 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
               count > 0
                 ? "bg-(--m-text) text-(--m-ground)"
                 : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",

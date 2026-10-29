@@ -234,6 +234,8 @@ export interface KanbanStoreShape {
     id: KanbanDiscussionId,
     options?: { readonly afterSeq?: number; readonly limit?: number },
   ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
+  /** Every message of a discussion, oldest first. */
+  readonly allMessages: (id: KanbanDiscussionId) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
   readonly message: (
     id: KanbanDiscussionId,
     seq: number,
@@ -570,6 +572,14 @@ const make = Effect.gen(function* () {
         (rows) => decodeAll(rows, Message.decode),
       ),
     );
+  const allMessages = (id: KanbanDiscussionId) =>
+    run(
+      "read all messages",
+      Effect.flatMap(
+        sql<JsonRow>`SELECT json FROM ardud_kanban_messages WHERE discussion_id = ${id} ORDER BY seq`,
+        (rows) => decodeAll(rows, Message.decode),
+      ),
+    );
   const message = (id: KanbanDiscussionId, seq: number) =>
     run(
       "read message",
@@ -788,6 +798,7 @@ const make = Effect.gen(function* () {
     discussionByEvaluator,
     putDiscussion,
     messages,
+    allMessages,
     message,
     putMessage,
     scripts,
