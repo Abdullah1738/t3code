@@ -2599,6 +2599,8 @@ it.effect("steer through a released sibling keeps the thread on the switched mod
       yield* kanban.cardThread(b.card.id, "steer", "again", owner);
       assert.strictEqual(fake.sends[fake.sends.length - 1]?.model?.model, haiku.model);
       assert.strictEqual(fake.sends[fake.sends.length - 1]?.threadId, thread);
+      // The turn ends: the hold goes, and only the thread's live model still names Haiku.
+      yield* kanban.turnEnded(thread!);
       // A follow-up card on that thread, with no model, inherits the switched Haiku model
       // and takes the Haiku slot instead of being denied for running Opus.
       const follow = yield* kanban.createForThread(thread!, { prompt: "c", title: "c" });

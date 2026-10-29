@@ -2371,8 +2371,13 @@ const make = Effect.gen(function* () {
     if (!view) return yield* failWith("not-found", `thread ${threadId}`);
     const carried = yield* store.cardsByThread(threadId);
     const held = (yield* Ref.get(holds)).get(threadId);
+    // Past the last card and the hold, the thread's own model still names its pool.
     const pool =
-      carried[0]?.activePool ?? held?.pool ?? Rules.poolKey(link.model ?? board.defaultCardModel);
+      carried[0]?.activePool ??
+      held?.pool ??
+      Rules.poolKey(
+        (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
+      );
     const origin = carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null);
     return {
       link,
