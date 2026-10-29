@@ -4793,11 +4793,11 @@ it.effect("a failed outage post is retried by the next probe, and recovery waits
       yield* TestClock.adjust("5 minutes");
       yield* kanban.probeOutages;
       assert.isNotNull((yield* kanban.caller(threadId))?.paused);
-      assert.strictEqual(
-        (yield* kanban.discussions(board.id)).filter((discussion) => discussion.title === "Provider outages")
-          .length,
-        0,
+      // The discussion is created before the post; the failed post leaves no message in it.
+      const failedAlert = (yield* kanban.discussions(board.id)).find(
+        (discussion) => discussion.title === "Provider outages",
       );
+      assert.strictEqual((yield* kanban.messages(failedAlert!.id)).length, 0);
       // The next failed probe retries the announcement.
       yield* TestClock.adjust("10 minutes");
       yield* kanban.probeOutages;
