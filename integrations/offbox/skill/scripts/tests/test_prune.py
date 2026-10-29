@@ -96,24 +96,30 @@ class ScriptTests(Isolated):
             self.assertTrue((h / "w/c-cccccc").is_symlink())
             self.assertTrue(target.is_dir())
 
-    def test_hangup_stops_new_moves_but_script_still_finishes(self):
-        # A dropped ssh delivers HUP mid-script: no further dir may move after it, and the script exits 0.
+    def test_stalled_mv_is_killed_and_reaped_before_script_returns(self):
+        # Blocked-mv + SSH-timeout + checkout-reuse: a mv that stalls past the budget must be dead before
+        # the script returns, so the caller can't release the box while a rename is still pending.
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
             h = Path(home)
-            for d in ("w/a-aaaaaa", "w/b-bbbbbb"):
-                (h / d).mkdir(parents=True)
-            sudo = Path(bindir) / "sudo"
-            sudo.write_text("#!/bin/sh\nexit 0\n")
-            sudo.chmod(sudo.stat().st_mode | stat.S_IEXEC)
-            lines = prune.script(["w/a-aaaaaa", "w/b-bbbbbb"]).splitlines()
-            at = next(i for i, ln in enumerate(lines) if ln.startswith('t="$HOME'))
-            body = "\n".join(lines[:at] + ["kill -HUP $$"] + lines[at:]) + "\n"  # HUP after the trap, before any move
+            (h / "w/a-aaaaaa").mkdir(parents=True)
+            (h / "w/a-aaaaaa/f").write_text("x")
+            pidf = h / "mv.pid"
+            stall = Path(bindir) / "mv"  # stalled mv: records its pid, then never renames
+            stall.write_text(f'#!/bin/sh\necho $$ > "{pidf}"\nexec sleep 1000\n')
+            stall.chmod(stall.stat().st_mode | stat.S_IEXEC)
+            # BUDGET_S 2: the first dir starts at $SECONDS 0 so its mv is attempted, then mvb kills it at 2 s.
+            with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"):
+                body = prune.script(["w/a-aaaaaa"])
             p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa", "left w/b-bbbbbb"])
-            self.assertTrue((h / "w/a-aaaaaa").is_dir())
-            self.assertTrue((h / "w/b-bbbbbb").is_dir())
+            self.assertEqual(p.stdout.decode().splitlines(), ["left w/a-aaaaaa"])
+            self.assertTrue((h / "w/a-aaaaaa/f").exists())
+            # The stub writes its pid as its first action, so the budget kill always has a live child to reap.
+            self.assertTrue(pidf.exists(), "stalled mv never started: the test would prove nothing")
+            pid = int(pidf.read_text().strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)  # the stalled child was killed and reaped before the script returned
 
 
 class RunTests(Isolated):

@@ -50,16 +50,19 @@ def stale_dirs(con, box_id: str, current: str) -> list[str]:
 
 
 def script(dirs: list[str]) -> str:
-    # A dropped ssh (HUP/PIPE) must not kill the script before it starts the background delete, but it
-    # must stop new moves: the flag is checked before every move, so at most one rename in flight finishes.
-    lines = ["trap 'cancel=1' PIPE HUP", "cancel=",
-             f'ok() {{ [ -z "$cancel" ] && [ "$SECONDS" -lt {BUDGET_S} ]; }}',
-             't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0']
+    # Each mv is a child of this script and is reaped before the script moves on, so nothing it started
+    # can rename after the script returns. A mv still running at the budget is SIGKILLed; a directory
+    # rename is one syscall, so a killed mv either moved the dir or left it in place. A dropped ssh
+    # (HUP/PIPE) is ignored so the background delete still starts.
+    lines = ["trap '' PIPE HUP", 't="$HOME/.offbox/trash/$(date +%s)-$$"', 'mkdir -p "$t" || exit 0',
+             'mvb() { "$@" & p=$!; while kill -0 "$p" 2>/dev/null; do '
+             f'if [ "$SECONDS" -ge {BUDGET_S} ]; then kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 3; fi; '
+             'sleep 0.2; done; wait "$p"; }']
     for i, d in enumerate(dirs):
         q = shlex.quote(d)
-        lines.append(f'if ! ok; then echo "left "{q}; '
+        lines.append(f'if [ "$SECONDS" -ge {BUDGET_S} ]; then echo "left "{q}; '
                      f'elif [ -d "$HOME"/{q} ] && [ ! -L "$HOME"/{q} ]; then '
-                     f'if ok; then mv "$HOME"/{q} "$t/{i}" && echo "pruned "{q}; else echo "left "{q}; fi; fi')
+                     f'if mvb mv "$HOME"/{q} "$t/{i}"; then echo "pruned "{q}; else echo "left "{q}; fi; fi')
     lines += [BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
