@@ -278,6 +278,11 @@ export interface ChatBackend {
   retireOthers?(keepId: string): Promise<number>;
   /** True when the agent in this chat can reset its own context in place (Robob's t3_context_reset tool). */
   resetsContext?(id: string): boolean;
+  /**
+   * Whether the run that started at `sinceMs` called tools, from the backend's own execution data.
+   * It covers a run with no text records (a tool-only turn). Unset or unknown means unproven.
+   */
+  runToolEvidence?(id: string, directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown">;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
   children(id: string, directory: string): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;

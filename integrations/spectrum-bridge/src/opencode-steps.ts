@@ -34,6 +34,45 @@ export const OPENCODE_DB = join(homedir(), ".local/share/opencode/opencode.db");
  * locked, schema change) leaves every id unknown, which keeps the router's
  * old rule: only a run's last word goes out.
  */
+/**
+ * Whether a native OpenCode run called any tool, read from its session's step rows. A run is
+ * `ran` when any step finished `tool-calls`, `none` only when every step finished `stop` (and
+ * there was at least one step), and `unknown` for anything else, including a read failure.
+ * Only bounded reads: one session, rows from `sinceMs` on, at most `limit` rows.
+ */
+export type RunToolEvidence = "ran" | "none" | "unknown";
+export type RunEvidence = (sessionId: string, sinceMs: number) => RunToolEvidence;
+
+export function opencodeRunEvidence(path = OPENCODE_DB, limit = 200): RunEvidence {
+  let db: Database | undefined;
+  let inode: number | undefined;
+  const close = () => {
+    try { db?.close(); } catch { /* already gone */ }
+    db = undefined;
+  };
+  return (sessionId, sinceMs) => {
+    if (!/^ses_[A-Za-z0-9]+$/.test(sessionId) || !Number.isFinite(sinceMs)) return "unknown";
+    try {
+      const current = statSync(path).ino;
+      if (db && current !== inode) close();
+      if (!db) {
+        db = new Database(path, { readonly: true });
+        inode = current;
+      }
+      const rows = db.query<{ finish: unknown }, [string, number, number]>(
+        "SELECT json_extract(data, '$.finish') AS finish FROM session_message WHERE session_id = ? AND type = 'assistant' AND time_created >= ? ORDER BY seq LIMIT ?",
+      ).all(sessionId, sinceMs, limit);
+      if (rows.length === 0) return "unknown";
+      if (rows.some(row => row.finish === "tool-calls")) return "ran";
+      if (rows.every(row => row.finish === "stop")) return "none";
+      return "unknown";
+    } catch {
+      close();
+      return "unknown";
+    }
+  };
+}
+
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
   let db: Database | undefined;
   let inode: number | undefined;

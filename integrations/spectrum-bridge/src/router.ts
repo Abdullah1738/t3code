@@ -2554,7 +2554,12 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
-        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, turnRanTools(replies) ? "failed" : "errored");
+        // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
+        // A backend without run evidence (none declared) leaves the reply list as the only proof.
+        const ran = turnRanTools(replies) || (this.backend.runToolEvidence
+          ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
+          : false);
+        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, ran ? "failed" : "errored");
         return;
       }
       // `start >= 0`: the watermark record is on the page read, so `after` is
