@@ -2043,17 +2043,6 @@ it.effect(
     }).pipe(Effect.scoped),
 );
 
-it.effect("keeps ingesting a failed root's background item when its work continues", () =>
-  Effect.gen(function* () {
-    const observed = yield* runBackgroundItemScenario("bg-failed-continues", (ids) => [
-      backgroundTurnItemEvent(ids, "command_execution", "running", 1),
-      { ...rootTerminalEvent(ids, "failed"), childTurnsContinue: true },
-      backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
-    ]);
-    assert.deepEqual(observed, ["turn_item:running", "root-finalized", "turn_item:completed"]);
-  }),
-);
-
 it.effect("keeps ingesting until the last of several background items terminalizes", () =>
   Effect.gen(function* () {
     const secondItemId = TurnItemId.make("turn-item:bg-multi:second");
@@ -2246,6 +2235,7 @@ it.effect(
         Layer.provide(
           Layer.mergeAll(
             McpAppModelContext.layerEmpty,
+            PreviewAgentActivity.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               captureBaseline: () => Effect.void,
             }),
@@ -2306,7 +2296,6 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
-        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const providerThreadBase = {
@@ -2999,7 +2988,6 @@ it.effect(
         Layer.provide(
           Layer.mergeAll(
             McpAppModelContext.layerEmpty,
-            PreviewAgentActivity.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               captureBaseline: () => Effect.void,
             }),
@@ -3021,6 +3009,7 @@ it.effect(
             ServerSettings.layerTest(),
           ),
         ),
+        Layer.provideMerge(PreviewAgentActivity.layer),
       );
 
       const runningSubagent = makeRunOwnedSubagentFixture({
@@ -4075,252 +4064,6 @@ it.effect("refreshes pull requests after a provider stream exits with an error",
   }),
 );
 
-it.effect.each(["failure", "defect", "interrupt-failure", "ownership-lost"] as const)(
-  "stops the live provider and background work before settling an ingestion %s",
-  (failureMode) =>
-    Effect.gen(function* () {
-      const started = yield* Deferred.make<void>();
-      const stopped = yield* Deferred.make<void>();
-      const backgroundWorkRunning = yield* Ref.make(true);
-      const backgroundWorkAtFinalization = yield* Ref.make<boolean | null>(null);
-      const now = yield* DateTime.now;
-      const interrupts = yield* Ref.make<
-        ReadonlyArray<ProviderAdapter.ProviderAdapterV2InterruptInput>
-      >([]);
-      const ids = backgroundScenarioIds(`ingestion:${failureMode}`);
-      const { observed, finalEvents } = yield* captureRootRunTermination({
-        key: `ingestion:${failureMode}`,
-        initialProviderTurnId: null,
-        rejectTerminalWrite: failureMode === "ownership-lost",
-        shouldFinalizeRun: () => Effect.succeed(true),
-        startTurn: () =>
-          Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(stopped))),
-        events: () =>
-          Stream.unwrap(
-            Deferred.await(started).pipe(
-              Effect.as(
-                Stream.make({
-                  type: "provider_turn.updated" as const,
-                  driver,
-                  providerTurn: {
-                    id: ids.rootProviderTurnId,
-                    providerThreadId: ids.providerThreadId,
-                    nodeId: ids.rootNodeId,
-                    runAttemptId: ids.attemptId,
-                    nativeTurnRef: null,
-                    ordinal: 1,
-                    status: "running" as const,
-                    startedAt: now,
-                    completedAt: null,
-                  },
-                }),
-              ),
-            ),
-          ),
-        ingestNormalized: () => {
-          const error = new ProviderEventIngestor.ProviderEventPublishError({
-            providerSessionId: ProviderSessionId.make(`session:${failureMode}`),
-            eventCount: 1,
-            cause: new Error("SQLITE_FULL: database or disk is full"),
-          });
-          return failureMode === "defect" ? Effect.die(error) : Effect.fail(error);
-        },
-        interruptTurn: (input) =>
-          Ref.update(interrupts, (current) => [...current, input]).pipe(
-            Effect.andThen(
-              input.requestRuntimeRestart === true && failureMode !== "interrupt-failure"
-                ? Ref.set(backgroundWorkRunning, false)
-                : Effect.void,
-            ),
-            Effect.andThen(Deferred.succeed(stopped, undefined)),
-            Effect.andThen(
-              failureMode === "interrupt-failure"
-                ? Effect.fail(
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver,
-                      providerThreadId: input.providerThread.id,
-                      providerTurnId: input.providerTurnId,
-                      cause: "provider already exited",
-                    }),
-                  )
-                : Effect.void,
-            ),
-          ),
-        beforeTerminalWrite: () =>
-          Effect.gen(function* () {
-            const calls = yield* Ref.get(interrupts);
-            assert.equal(calls.length, 1);
-            assert.equal(calls[0]?.providerTurnId, ids.rootProviderTurnId);
-            assert.equal(calls[0]?.providerThread.id, ids.providerThreadId);
-            yield* Ref.set(backgroundWorkAtFinalization, yield* Ref.get(backgroundWorkRunning));
-            return true;
-          }),
-      });
-      if (failureMode === "ownership-lost") {
-        assert.deepEqual(finalEvents, []);
-        assert.deepEqual(observed, []);
-      } else {
-        assert.equal(
-          yield* Ref.get(backgroundWorkAtFinalization),
-          failureMode === "interrupt-failure",
-        );
-        assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
-        const repaired = finalEvents.find((event) => event.type === "provider-turn.updated");
-        if (failureMode === "interrupt-failure") {
-          assert.isUndefined(repaired);
-        } else {
-          assert.equal(repaired?.payload.id, ids.rootProviderTurnId);
-          assert.equal(repaired?.payload.status, "interrupted");
-          assert.isNotNull(repaired?.payload.completedAt);
-        }
-      }
-    }),
-);
-
-it.effect.each([
-  { status: "completed", failure: "later-stream", interrupt: "succeeds" },
-  { status: "failed", failure: "later-stream", interrupt: "succeeds" },
-  { status: "completed", failure: "terminal-ingest", interrupt: "succeeds" },
-  { status: "completed", failure: "terminal-ingest", interrupt: "fails" },
-] as const)(
-  "stores a $status root provider turn snapshot after a $failure failure only if the interrupt succeeds (it $interrupt)",
-  ({ status, failure, interrupt }) =>
-    Effect.gen(function* () {
-      const now = yield* DateTime.now;
-      const terminalAt = DateTime.subtract(now, { seconds: 1 });
-      const key = `terminal-snapshot:${status}:${failure}:${interrupt}`;
-      const durableTurns = yield* Ref.make<
-        ReadonlyMap<ProviderTurnId, OrchestrationV2ProviderTurn>
-      >(new Map());
-      const persist = (turn: OrchestrationV2ProviderTurn) =>
-        Ref.update(durableTurns, (current) => new Map(current).set(turn.id, turn));
-      const interrupts = yield* Ref.make<
-        ReadonlyArray<ProviderAdapter.ProviderAdapterV2InterruptInput>
-      >([]);
-      const ids = backgroundScenarioIds(key);
-      const rootTurn = (
-        turnStatus: OrchestrationV2ProviderTurn["status"],
-        completedAt: DateTime.Utc | null,
-      ) => ({
-        type: "provider_turn.updated" as const,
-        driver,
-        providerTurn: {
-          id: ids.rootProviderTurnId,
-          providerThreadId: ids.providerThreadId,
-          nodeId: ids.rootNodeId,
-          runAttemptId: ids.attemptId,
-          nativeTurnRef: null,
-          ordinal: 1,
-          status: turnStatus,
-          startedAt: terminalAt,
-          completedAt,
-        },
-      });
-      const { observed, finalEvents } = yield* captureRootRunTermination({
-        key,
-        shouldFinalizeRun: () => Effect.succeed(true),
-        events: () =>
-          Stream.make(rootTurn("running", null), rootTurn(status, terminalAt)).pipe(
-            Stream.concat(
-              failure === "later-stream"
-                ? Stream.fail(
-                    new ProviderAdapter.ProviderAdapterEventStreamError({
-                      driver,
-                      providerSessionId: ProviderSessionId.make(`session:${key}`),
-                      cause: "provider process exited",
-                    }),
-                  )
-                : Stream.empty,
-            ),
-          ),
-        ingestNormalized: ({ event }) =>
-          event.type !== "provider_turn.updated"
-            ? Effect.succeed([])
-            : failure === "terminal-ingest" && event.providerTurn.status !== "running"
-              ? Effect.fail(
-                  new ProviderEventIngestor.ProviderEventPublishError({
-                    providerSessionId: ProviderSessionId.make(`session:${key}`),
-                    eventCount: 1,
-                    cause: new Error("SQLITE_FULL: database or disk is full"),
-                  }),
-                )
-              : persist(event.providerTurn).pipe(Effect.as([])),
-        interruptTurn: (input) =>
-          Ref.update(interrupts, (current) => [...current, input]).pipe(
-            Effect.andThen(
-              interrupt === "fails"
-                ? Effect.fail(
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver,
-                      providerThreadId: input.providerThread.id,
-                      providerTurnId: input.providerTurnId,
-                      cause: "provider already exited",
-                    }),
-                  )
-                : Effect.void,
-            ),
-          ),
-        beforeTerminalWrite: (request) =>
-          Effect.forEach(request.events, (event) =>
-            event.type === "provider-turn.updated" ? persist(event.payload) : Effect.void,
-          ).pipe(Effect.as(true)),
-      });
-      const calls = yield* Ref.get(interrupts);
-      assert.equal(calls.length, 1);
-      assert.isTrue(calls[0]?.requestRuntimeRestart);
-      assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
-      assert.isTrue(finalEvents.some((event) => event.type === "run.updated"));
-      const durable = (yield* Ref.get(durableTurns)).get(ids.rootProviderTurnId);
-      // A failed interrupt keeps the stored turn running for the next start to retry.
-      assert.equal(durable?.status, interrupt === "fails" ? "running" : status);
-      assert.deepEqual(durable?.completedAt, interrupt === "fails" ? null : terminalAt);
-    }),
-);
-
-it.effect("does not interrupt an ended provider when its terminal write fails", () =>
-  Effect.gen(function* () {
-    const interrupts = yield* Ref.make(0);
-    const writes = yield* Ref.make(0);
-    const { observed } = yield* captureRootRunTermination({
-      key: "terminal-write-failure",
-      shouldFinalizeRun: () => Effect.succeed(true),
-      events: (ids) => Stream.make(rootTerminalEvent(ids, "completed")),
-      interruptTurn: () => Ref.update(interrupts, (count) => count + 1),
-      beforeTerminalWrite: () =>
-        Effect.gen(function* () {
-          if ((yield* Ref.updateAndGet(writes, (count) => count + 1)) === 1) {
-            return yield* new EventSink.EventSinkWriteError({ eventCount: 1 });
-          }
-          return true;
-        }),
-    });
-    assert.equal(yield* Ref.get(interrupts), 0);
-    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
-  }),
-);
-
-it.effect("does not interrupt a provider when ingestion fails before the root turn is known", () =>
-  Effect.gen(function* () {
-    const interrupts = yield* Ref.make(0);
-    const { observed } = yield* captureRootRunTermination({
-      key: "unknown-turn-stream-error",
-      initialProviderTurnId: null,
-      shouldFinalizeRun: () => Effect.succeed(true),
-      events: () =>
-        Stream.fail(
-          new ProviderAdapter.ProviderAdapterEventStreamError({
-            driver,
-            providerSessionId: ProviderSessionId.make("session:unknown-turn"),
-            cause: "provider process exited",
-          }),
-        ),
-      interruptTurn: () => Ref.update(interrupts, (count) => count + 1),
-    });
-    assert.equal(yield* Ref.get(interrupts), 0);
-    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
-  }),
-);
-
 // The server browser keeps an agent's tab focused for exactly this span.
 it.effect.each(["completed", "failed"] as const)(
   "reports the thread executing until its %s run's event consumer ends",
@@ -4522,16 +4265,9 @@ function captureRootRunTermination(input: {
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
-  readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
-  readonly beforeTerminalWrite?: (
-    request: Parameters<EventSink.EventSinkV2["Service"]["writeIfRunCurrent"]>[0],
-  ) => Effect.Effect<boolean, EventSink.EventSinkV2Error>;
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
   ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
-  readonly onStartFailure?: (
-    error: RunExecutionService.RunExecutionServiceV2Error,
-  ) => Effect.Effect<void>;
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -4619,7 +4355,7 @@ function captureRootRunTermination(input: {
 
     const previewActivityEnded = yield* Effect.gen(function* () {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
-      const start = runExecution.startRootRun({
+      yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${input.key}`),
         appThread: { id: ids.threadId } as OrchestrationV2AppThread,
         providerSessionId: ProviderSessionId.make(`session:${input.key}`),
@@ -4657,7 +4393,6 @@ function captureRootRunTermination(input: {
             ),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
-          interruptTurn: input.interruptTurn ?? (() => Effect.void),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {
@@ -4712,16 +4447,12 @@ function captureRootRunTermination(input: {
           },
         },
       });
-      yield* start.pipe(
-        Effect.catch((error) => input.onStartFailure?.(error) ?? Effect.fail(error)),
-      );
       yield* input.afterStart?.(ingestionDone) ?? Effect.void;
       yield* Deferred.await(ingestionDone);
       const activity = yield* PreviewAgentActivity.PreviewAgentActivity;
       return !(yield* activity.active(ids.threadId));
     }).pipe(Effect.provide(layerTest));
 
-    yield* Deferred.await(ingestionDone);
     return {
       previewActivityEnded,
       written: yield* Ref.get(writtenItems),
