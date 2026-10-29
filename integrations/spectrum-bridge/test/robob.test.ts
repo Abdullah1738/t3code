@@ -6,7 +6,7 @@ import { backendKind } from "../src/backend.ts";
 import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
-import { Router } from "../src/router.ts";
+import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 
 type Thread = {
@@ -472,6 +472,45 @@ test("assistant steps carry their OpenCode message id, so blocks of one message 
   expect(marked.map(record => record.type === "assistant" && [record.answer, record.nativeMessage])).toEqual([
     [true, "msg_quiet"], [true, "msg_quiet"], [undefined, undefined],
   ]);
+});
+
+test("a failed run that ran a tool reports tool evidence through messages(), so the router never retries it", async () => {
+  let tick = 0;
+  const now = () => new Date(Date.UTC(2026, 9, 29) + tick++ * 1000).toISOString();
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"b".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "check the board", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // The run made a tool call (step finish `tool-calls`), then a second step errored.
+  const toolStep = `message:provider:opencode:native-item:${encodeURIComponent("msg_tool:text:0")}`;
+  const errorStep = `message:provider:opencode:native-item:${encodeURIComponent("msg_err:text:0")}`;
+  control.threads.get(id)!.messages.push(
+    { messageId: toolStep, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "Checking.", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() },
+    { messageId: errorStep, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() },
+  );
+  control.finishes.set(toolStep, "tool-calls");
+  control.finishes.set(errorStep, "error");
+  control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  const records = await backend.messages(id, directory);
+  const replies = records.filter(record => record.type === "assistant");
+  expect(replies.map(record => record.type === "assistant" && record.toolEvidence)).toEqual(["ran", "unknown"]);
+  expect(turnRanTools(records)).toBe(true);
+});
+
+test("a failed run whose steps all stopped with no tool is classified tool-free, so it may be retried", async () => {
+  const now = () => new Date().toISOString();
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"c".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  const step = `message:provider:opencode:native-item:${encodeURIComponent("msg_stop:text:0")}`;
+  control.threads.get(id)!.messages.push({ messageId: step, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() });
+  control.finishes.set(step, "stop");
+  control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  const records = await backend.messages(id, directory);
+  expect(turnRanTools(records)).toBe(false);
 });
 
 test("a background run's answer before two steered texts reaches the chat along with the last one", async () => {

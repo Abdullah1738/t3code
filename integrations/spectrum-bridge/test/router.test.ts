@@ -1615,6 +1615,26 @@ test("a watcher turn that errored before any tool is retried, then reported once
   expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
 });
 
+test("a failed turn whose tool use the backend cannot rule out is never retried", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"j".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  // Robob's record for an errored step: no tool part, and no finish to prove that no tool ran.
+  const step = h.backend.step("", "error");
+  step.toolEvidence = "unknown";
+  step.error = { type: "ProviderError", message: "PRIVATE_ERROR" };
+  h.backend.settle("failed");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
 test("an errored wake that succeeds on retry sends nothing extra", async () => {
   const h = setup(":memory:", { droppedBatchMs: 0 });
   const start = Date.parse("2026-09-29T07:00:11Z");
