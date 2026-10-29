@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { nativeMessageId, opencodeFinishes } from "../src/opencode-steps.ts";
+import { nativeMessageId, opencodeFinishes, opencodeRunEvidence } from "../src/opencode-steps.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -20,6 +20,37 @@ function opencodeDb(rows: [string, unknown][]) {
   db.close();
   return { dir, path };
 }
+
+function runDb(rows: { seq: number; time: number; data: unknown }[]) {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-run-"));
+  dirs.push(dir);
+  const path = join(dir, "opencode.db");
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  rows.forEach((row, index) => db.query("INSERT INTO session_message VALUES (?, 'ses_run', 'assistant', ?, ?, ?)").run(`msg_${index}`, row.seq, row.time, JSON.stringify(row.data)));
+  db.close();
+  return path;
+}
+
+test("native run evidence: truncated scans are unknown, a complete stop-only run is none, a tool row anywhere is ran", () => {
+  const stop = { finish: "stop", content: [{ type: "text", text: "ok" }] };
+  // 200 stop steps, then a tool step past the old cap: never `none`.
+  const long: { seq: number; time: number; data: unknown }[] = Array.from({ length: 200 }, (_, i) => ({ seq: i, time: 1000 + i, data: stop }));
+  long.push({ seq: 200, time: 1300, data: { finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] } });
+  const evidence = opencodeRunEvidence(runDb(long), 200);
+  expect(evidence("ses_run", 0)).toBe("ran");
+  // Same stop steps only but more than the cap: the scan is truncated, so unknown.
+  const capped = Array.from({ length: 250 }, (_, i) => ({ seq: i, time: 1000 + i, data: stop }));
+  expect(opencodeRunEvidence(runDb(capped), 200)("ses_run", 0)).toBe("unknown");
+  // A complete, all-stop run is proven tool-free.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: stop }]))("ses_run", 0)).toBe("none");
+  // A first-call provider error: a failed step with no content (finish error) proves nothing ran.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [], error: { type: "aborted" } } }]))("ses_run", 0)).toBe("none");
+  // An errored step that carried a tool part did run a tool.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: { finish: "error", content: [{ type: "tool", id: "t", name: "patch", state: { status: "error" } }] } }]))("ses_run", 0)).toBe("ran");
+  // No rows in the window: nothing to prove.
+  expect(opencodeRunEvidence(runDb([{ seq: 0, time: 1000, data: stop }]))("ses_run", 5000)).toBe("unknown");
+});
 
 test("control message ids map to OpenCode message ids; anything else is not OpenCode's", () => {
   expect(nativeMessageId(control("msg_1631c3533001gglKYKx3h1Eo1y"))).toBe("msg_1631c3533001gglKYKx3h1Eo1y");
