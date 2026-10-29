@@ -178,19 +178,24 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
     );
   };
 
+  // A hidden review stage's rail sits beside the stack, not in it: a full-height rail
+  // inside the stack would squeeze the visible stage to nothing.
+  const reviewRail = (stage: KanbanStage) => {
+    const column = stageColumn(stage);
+    if (!column || !hidden(stage)) return null;
+    return (
+      <HiddenColumnRail
+        key={stage}
+        label={column.label}
+        count={column.cards.length}
+        onShow={() => toggle(stage)}
+      />
+    );
+  };
+
   const reviewColumn = (stage: KanbanStage) => {
     const column = stageColumn(stage);
-    if (!column) return null;
-    if (hidden(stage)) {
-      return (
-        <HiddenColumnRail
-          key={stage}
-          label={column.label}
-          count={column.cards.length}
-          onShow={() => toggle(stage)}
-        />
-      );
-    }
+    if (!column || hidden(stage)) return null;
     return (
       <Column key={stage} column={column} className="min-h-0 shrink">
         {column.cards.map((card) => (
@@ -214,12 +219,14 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       >
         {workColumn("todo")}
         {workColumn("working")}
+        {reviewRail("needs_review")}
         {reviewNeedsRoom ? (
           <div className="flex min-h-0 min-w-44 flex-1 flex-col gap-3 pointer-coarse:min-w-52">
             {reviewColumn("needs_review")}
             {reviewColumn("in_review")}
           </div>
         ) : null}
+        {reviewRail("in_review")}
         {shippedHidden ? (
           <HiddenColumnRail
             label="Shipped"

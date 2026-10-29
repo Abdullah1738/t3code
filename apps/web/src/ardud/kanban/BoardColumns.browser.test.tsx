@@ -498,6 +498,39 @@ describe("iPad layout", () => {
   });
 });
 
+describe("review stack", () => {
+  for (const [hiddenStage, hiddenLabel, shownLabel] of [
+    ["needs_review", "Needs Review", "In Review"],
+    ["in_review", "In Review", "Needs Review"],
+  ] as const) {
+    it(`keeps ${shownLabel} whole when ${hiddenLabel} is hidden`, async () => {
+      localStorage.setItem(
+        boardColumnsStorageKey(BOARD_ID),
+        JSON.stringify({ widths: {}, hidden: [hiddenStage], groupWidth: null }),
+      );
+      await mountAt(1400, 900, "fine");
+
+      expect(isStageGrid()).toBe(true);
+      expect(column(hiddenLabel)).toBeNull();
+      const rail = container.querySelector<HTMLElement>(
+        `button[aria-label^="Show ${hiddenLabel}"]`,
+      );
+      expect(rail).not.toBeNull();
+      // The rail stands in the column strip beside the stack, not inside it.
+      expect(rail!.parentElement).toBe(column("To-Do")!.parentElement);
+
+      const shown = column(shownLabel)!;
+      const list = shown.querySelector<HTMLElement>(":scope > div:last-child")!;
+      expect(rect(shown).top).toBeCloseTo(rect(column("To-Do")!).top, 0);
+      expect(rect(shown).bottom).toBeLessThanOrEqual(900);
+      expect(rect(shown).width).toBeGreaterThanOrEqual(176);
+      // Every card of the visible stage shows; nothing is squeezed into a sliver.
+      expect(list.clientHeight).toBeGreaterThanOrEqual(list.scrollHeight - 1);
+      expect(list.querySelectorAll("button").length).toBeGreaterThan(0);
+    });
+  }
+});
+
 describe("left-edge keyboard step", () => {
   it("widens Needs Owner from its rendered width on ArrowLeft", async () => {
     const separator = handle("Needs Owner")!;
