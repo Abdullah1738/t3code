@@ -188,7 +188,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         type="button"
         onClick={() => toggle(stage)}
         aria-label={`Show ${column.label} (${column.cards.length})`}
-        className="flex shrink-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-[0.8125rem]"
+        className="flex shrink-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-sm"
       >
         <span className="font-medium">{column.label}</span>
         <span className="tabular-nums">{column.cards.length} hidden · show</span>
