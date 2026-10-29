@@ -87,6 +87,22 @@ export function NewBoardRouteScreen() {
       }
       if (icon) await client.updateBoard({ boardId, icon });
       if (discussionId === null) {
+        // A setup that started before a lost reply is on the board already. Open it, and only
+        // start one when the board's persisted setup is absent (startSetup refuses a running one).
+        const list = client.boards.get();
+        if (list === undefined) {
+          throw new Error("Board list is still loading. Try again in a moment.");
+        }
+        const entry = list.find((summary) => summary.board.id === boardId);
+        if (entry === undefined) {
+          throw new Error("The new board is still syncing. Try again in a moment.");
+        }
+        if (entry.board.setup?.discussionId) {
+          discussionId = entry.board.setup.discussionId;
+          setPending({ boardId, discussionId });
+        }
+      }
+      if (discussionId === null) {
         const started = await client.startSetup(boardId, {
           evaluatorModel: model,
           ...(notes.trim() ? { text: notes.trim() } : {}),

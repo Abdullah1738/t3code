@@ -132,6 +132,25 @@ export function NewBoardDialog(props: { open: boolean; onOpenChange: (open: bool
       }
       if (icon) await kanban.updateBoard({ boardId, icon });
       if (discussionId === null) {
+        // A setup that started before a lost reply is on the board already. Open it, and only
+        // start one when the board has none (startSetup would refuse a running setup anyway).
+        const list = kanban.boards.get();
+        if (list === undefined) {
+          // The board list has not loaded, so the setup state is unknown. Starting setup now could
+          // double-start after a lost reply; ask the owner to retry once the list has loaded.
+          throw new Error("Board list is still loading. Try again in a moment.");
+        }
+        const entry = list.find((summary) => summary.board.id === boardId);
+        if (entry === undefined) {
+          // The board was created but the list has not caught up yet, so its setup is unknown.
+          throw new Error("The new board is still syncing. Try again in a moment.");
+        }
+        if (entry.board.setup?.discussionId) {
+          discussionId = entry.board.setup.discussionId;
+          setPending({ boardId, discussionId });
+        }
+      }
+      if (discussionId === null) {
         const started = await kanban.startSetup(boardId, {
           evaluatorModel: model,
           ...(notes.trim() ? { text: notes.trim() } : {}),
