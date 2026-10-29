@@ -553,11 +553,12 @@ describe("header triggers", () => {
 });
 
 describe("review stack", () => {
-  for (const [hiddenStage, hiddenLabel, shownLabel] of [
+  it.each([
     ["needs_review", "Needs Review", "In Review"],
     ["in_review", "In Review", "Needs Review"],
-  ] as const) {
-    it(`keeps ${shownLabel} whole when ${hiddenLabel} is hidden`, async () => {
+  ] as const)(
+    "hides %s and keeps the other review stage whole",
+    async (hiddenStage, hiddenLabel, shownLabel) => {
       localStorage.setItem(
         boardColumnsStorageKey(BOARD_ID),
         JSON.stringify({ widths: {}, hidden: [hiddenStage], groupWidth: null }),
@@ -581,8 +582,8 @@ describe("review stack", () => {
       // Every card of the visible stage shows; nothing is squeezed into a sliver.
       expect(list.clientHeight).toBeGreaterThanOrEqual(list.scrollHeight - 1);
       expect(list.querySelectorAll("button").length).toBeGreaterThan(0);
-    });
-  }
+    },
+  );
 });
 
 describe("saved widths", () => {
