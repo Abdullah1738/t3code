@@ -4628,3 +4628,78 @@ it.effect("setPool 0 pauses an existing pool whose model left a non-empty provid
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed), catalogWithout)));
   }),
 );
+
+const messageText = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unknown> }>) =>
+  messages
+    .at(-1)
+    ?.blocks.map((block) => ("text" in (block as object) ? (block as { text: string }).text : ""))
+    .join("") ?? "";
+
+it.effect("an outage posts one board alert, then one back message", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const threads: string[] = [];
+      for (let i = 0; i < 2; i++) {
+        const created = yield* kanban.createCard(board.id, { prompt: "x", title: `x${i}` }, owner);
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+        threads.push(threadId);
+        fake.failures.set(threadId, outage);
+        yield* kanban.turnEnded(threadId);
+      }
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      const alertsAfterFirst = (yield* kanban.discussions(board.id)).filter(
+        (discussion) => discussion.title === "Provider outages" && discussion.cardId === null,
+      );
+      assert.strictEqual(alertsAfterFirst.length, 1);
+      const discussionId = alertsAfterFirst[0]!.id;
+      const first = yield* kanban.messages(discussionId);
+      assert.strictEqual(first.length, 1);
+      assert.include(messageText(first), "2 threads paused");
+      assert.deepStrictEqual(first[0]?.author, { _tag: "system", component: "provider-watch" });
+
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual((yield* kanban.messages(discussionId)).length, 1);
+
+      probe.ok = true;
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      const all = yield* kanban.messages(discussionId);
+      assert.strictEqual(all.length, 2);
+      assert.include(messageText(all), "answers again");
+      assert.include(messageText(all), "2 paused threads woken");
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a quick outage that never gets probed posts nothing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+      const alerts = (yield* kanban.discussions(board.id)).filter(
+        (discussion) => discussion.title === "Provider outages",
+      );
+      assert.strictEqual(alerts.length, 0);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);

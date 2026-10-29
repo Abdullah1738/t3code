@@ -622,7 +622,10 @@ const make = Effect.gen(function* () {
   // Pool keys whose model is out of usage or down, with when to probe next. In memory:
   // after a restart seedDown rebuilds it from the paused thread links.
   const down = yield* Ref.make<
-    ReadonlyMap<string, { readonly delayMs: number; readonly nextAt: number }>
+    ReadonlyMap<
+      string,
+      { readonly delayMs: number; readonly nextAt: number; readonly alerted: boolean }
+    >
   >(new Map());
   const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
@@ -2322,8 +2325,36 @@ const make = Effect.gen(function* () {
     yield* Ref.update(down, (map) =>
       map.has(key)
         ? map
-        : new Map(map).set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now + Rules.PROBE_FIRST_MS }),
+        : new Map(map).set(key, {
+            delayMs: Rules.PROBE_FIRST_MS,
+            nextAt: now + Rules.PROBE_FIRST_MS,
+            alerted: false,
+          }),
     );
+  });
+
+  const OUTAGE_TITLE = "Provider outages";
+  const outageActor: KanbanActor = { _tag: "system", component: "provider-watch" };
+
+  /** Posts to each board's "Provider outages" discussion how many of its threads wait on `key`. */
+  const alertBoards = Effect.fn("KanbanService.alertBoards")(function* (
+    key: string,
+    text: (count: number) => string,
+  ) {
+    const counts = new Map<KanbanBoard["id"], number>();
+    for (const { link, board } of yield* pausedLinks) {
+      if (linkKey(link, board) === key) counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
+    }
+    for (const [boardId, count] of counts) {
+      const existing = (yield* store.discussions(boardId)).find(
+        (discussion) =>
+          discussion.cardId === null &&
+          discussion.archivedAt === null &&
+          discussion.title === OUTAGE_TITLE,
+      );
+      const discussion = existing ?? (yield* newDiscussion(boardId, OUTAGE_TITLE, null, outageActor));
+      yield* postUnlocked(discussion.id, outageActor, [{ _tag: "md", text: text(count) }], false);
+    }
   });
 
   /**
@@ -2332,6 +2363,14 @@ const make = Effect.gen(function* () {
    * Callers hold the lock.
    */
   const resumeKey = Effect.fn("KanbanService.resumeKey")(function* (key: string) {
+    // Only a key that was announced gets a "back" message.
+    if ((yield* Ref.get(down)).get(key)?.alerted) {
+      yield* alertBoards(
+        key,
+        (count) =>
+          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
+      ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { cause })));
+    }
     let failed = false;
     for (const { link, board } of yield* pausedLinks) {
       if (link.paused === null || linkKey(link, board) !== key) continue;
@@ -2870,7 +2909,27 @@ const make = Effect.gen(function* () {
       }
       const delayMs =
         state === undefined ? Rules.PROBE_FIRST_MS : Rules.nextProbeDelay(state.delayMs);
-      yield* Ref.update(down, (map) => new Map(map).set(key, { delayMs, nextAt: now + delayMs }));
+      yield* Ref.update(down, (map) =>
+        new Map(map).set(key, {
+          delayMs,
+          nextAt: now + delayMs,
+          alerted: state?.alerted ?? false,
+        }),
+      );
+      // One alert per outage, after the first failed probe, so threads that die in the same minutes are counted.
+      if (!(state?.alerted ?? false)) {
+        yield* lock.withPermits(1)(
+          alertBoards(
+            key,
+            (count) =>
+              `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
+          ),
+        ).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { cause })));
+        yield* Ref.update(down, (map) => {
+          const entry = map.get(key);
+          return entry ? new Map(map).set(key, { ...entry, alerted: true }) : map;
+        });
+      }
     }
   });
 
