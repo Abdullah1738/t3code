@@ -43,6 +43,8 @@ export interface KanbanThreadView {
   readonly title: string;
   readonly state: ControlThreadState;
   readonly updatedAt: string;
+  /** When the current run started, or null when no run is active. */
+  readonly runStartedAt: string | null;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
   readonly archived: boolean;
 }
@@ -108,6 +110,9 @@ const make = Effect.gen(function* () {
               title: shell.title,
               state: stateFromShell(shell),
               updatedAt: DateTime.formatIso(shell.updatedAt),
+              runStartedAt: shell.activityRunStartedAt
+                ? DateTime.formatIso(shell.activityRunStartedAt)
+                : null,
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,

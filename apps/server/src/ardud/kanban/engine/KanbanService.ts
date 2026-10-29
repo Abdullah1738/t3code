@@ -459,6 +459,9 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+// An evaluator turn that has run this long is asked for a one-line status, then again every hour.
+const STATUS_FIRST_MS = 45 * 60_000;
+const STATUS_EVERY_MS = 60 * 60_000;
 // A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
@@ -601,6 +604,10 @@ const make = Effect.gen(function* () {
    * or that outlived HOLD_MAX_MS.
    */
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
+  // Evaluator threads asked for a status: the run it was asked in and when. A new run starts over.
+  const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
+    new Map(),
+  );
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
@@ -2692,6 +2699,48 @@ const make = Effect.gen(function* () {
           continue;
         }
         yield* nudgeWorker(threadId, [card]);
+      }
+      // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
+      for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
+        if (link.role !== "evaluator") continue;
+        const view = yield* threads.view(link.threadId);
+        if (view?.state !== "running" || view.runStartedAt === null) {
+          yield* Ref.update(statusAsked, (all) => {
+            if (!all.has(link.threadId)) return all;
+            const next = new Map(all);
+            next.delete(link.threadId);
+            return next;
+          });
+          continue;
+        }
+        const run = view.runStartedAt;
+        const started = Date.parse(run);
+        const asked = (yield* Ref.get(statusAsked)).get(link.threadId);
+        const due =
+          asked?.run === run
+            ? now - asked.at >= STATUS_EVERY_MS
+            : now - started >= STATUS_FIRST_MS;
+        if (!due) continue;
+        const minutes = Math.round((now - started) / 60_000);
+        const sent = yield* threads
+          .send({
+            threadId: link.threadId,
+            text: `Board check: this turn has been running for ${minutes} minutes. Post a one-line status where Abdullah reads it (your discussion, with discussion_post): what you're doing and when you expect to finish. Then carry on; don't stop for this.`,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban evaluator status ask failed", {
+                threadId: link.threadId,
+                cause,
+              }).pipe(Effect.as(false)),
+            ),
+          );
+        if (sent) {
+          yield* Ref.update(statusAsked, (all) =>
+            new Map(all).set(link.threadId, { run, at: now }),
+          );
+        }
       }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {

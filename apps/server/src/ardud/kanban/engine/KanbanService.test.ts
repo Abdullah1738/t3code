@@ -48,6 +48,7 @@ interface FakeThread {
   readonly model: ModelSelection;
   readonly messages: Array<string>;
   running: boolean;
+  runStartedAt?: string;
   stuck?: boolean;
   archived: boolean;
 }
@@ -75,6 +76,7 @@ const makeFake = Effect.gen(function* () {
           title: thread.title,
           state: thread.stuck ? "needs-input" : thread.running ? "running" : "idle",
           updatedAt: "2026-10-25T13:00:00.000Z",
+          runStartedAt: thread.runStartedAt ?? null,
           prs: prs.get(threadId) ?? [],
           archived: thread.archived,
         };
@@ -1156,6 +1158,75 @@ it.effect("a worker that flags its own card tells the card's evaluator", () =>
       assert.isNull(after.activeThreadId);
       assert.strictEqual(yield* evaluatorNotesFor(fake, `#${card.number}`), 1);
       assert.strictEqual(yield* evaluatorNotesFor(fake, "Env broken: no node modules"), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+const statusAsksTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map(
+      (all) =>
+        all
+          .get(threadId)!
+          .messages.filter((text) => text.includes("Board check: this turn has been running"))
+          .length,
+    ),
+  );
+
+const setRunStart = (
+  fake: Effect.Success<typeof makeFake>,
+  threadId: string,
+  running: boolean,
+  runStartedAt: string,
+) =>
+  Ref.update(fake.threads, (all) => {
+    const thread = all.get(threadId)!;
+    thread.running = running;
+    thread.runStartedAt = runStartedAt;
+    return all;
+  });
+
+it.effect("a long evaluator turn is asked for a status at 45 minutes, then hourly", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Busy" });
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("44 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 0);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+      const ask = (yield* Ref.get(fake.threads)).get(evaluator)!.messages.at(-1) ?? "";
+      assert.include(ask, "running for 46 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 2);
+      // A new run starts over: no ask until its own 45 minutes pass.
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T14:46:00.000Z");
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 2);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an evaluator that is not running gets no status ask", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Idle" });
+      yield* setRunStart(fake, evaluator, false, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* statusAsksTo(fake, evaluator), 0);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
