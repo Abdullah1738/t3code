@@ -315,7 +315,30 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
             con.commit()
             event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
             raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
+        # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
+        # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
+        try:
+            s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except OffboxError:
+            s = api.get(box_id)
+            st = s and s.get("state")
+            if st in api.LIVE_STATES and not _bigger(want, s.get("type") or have):
+                pass  # live and already big enough: use it
+            elif st in api.LIVE_STATES:
+                # The stop didn't take and the box is live at its old size. Record that, and refuse rather than
+                # hand out a box smaller than the run asked for.
+                got = s.get("type") or have
+                con.execute("UPDATE leases SET state='running', size=? WHERE box_id=?", (got, box_id))
+                con.commit()
+                event(con, box_id, "lease_resize_bounced", f"{got}, wanted {want}")
+                raise OffboxError(f"{box_id} came back {got} instead of stopping to grow to {want}; "
+                                  f"nothing ran, retry") from None
+            else:
+                # Still stopping: the stop was asked for, so the next caller resumes it once boat says archived.
+                ssh_sync.close_master(box_id)
+                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+                con.commit()
+                raise
         st = s.get("state")
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,

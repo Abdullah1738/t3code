@@ -168,6 +168,42 @@ class ArchivingSkipTests(Isolated):
         self.assertEqual(resume.call_args.args[2], 'xlarge')
         self.assertEqual(got['size'], 'xlarge')
 
+    def direct_resize_with_stuck_stop(self, after_stop):
+        """archiving -> idle on a large box with --size xlarge, then the resize stop never reaches archived."""
+        self.box('arch', 'running', used=200)
+        boats = FakeBoats({'arch': ['archiving', after_stop]})
+        timeouts = []
+
+        def fake_wait(box_id, want, timeout=600, poll=0.7):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return {'id': box_id, 'state': 'idle', 'type': 'large'}
+            raise api.OffboxError(f'box {box_id} stuck in {after_stop} after {int(timeout)}s')
+
+        with patch.object(api, 'get', side_effect=boats.get), patch.object(api, 'wait_state', side_effect=fake_wait), \
+                patch.object(api, 'stop', return_value={}) as stop, \
+                patch.object(api, 'resume', side_effect=AssertionError('no resume of an unstopped box')), \
+                patch.object(lease, '_bring_up', side_effect=AssertionError('no undersized box')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(api.OffboxError) as raised:
+                lease._reuse(self.con, self.row('arch'), 'xlarge')
+        stop.assert_called_once_with('arch')
+        self.assertEqual(len(timeouts), 2)
+        self.assertTrue(all(t <= lease.ARCHIVING_WAIT_S for t in timeouts), timeouts)
+        return raised.exception
+
+    def test_direct_resize_stop_that_bounces_back_to_idle_is_bounded_and_refused(self):
+        # Review round 2: the second stop transition is bounded too, and an idle large box isn't handed out.
+        err = self.direct_resize_with_stuck_stop('idle')
+        self.assertIn('instead of stopping to grow to xlarge', str(err))
+        self.assertEqual(self.row('arch')['state'], 'running')
+        self.assertEqual(self.row('arch')['size'], 'large')
+
+    def test_direct_resize_stop_stuck_in_archiving_is_bounded_and_left_stopping(self):
+        err = self.direct_resize_with_stuck_stop('archiving')
+        self.assertIn('stuck in archiving', str(err))
+        self.assertEqual(self.row('arch')['state'], 'stopped')  # the next caller resumes it once archived
+
 
 if __name__ == '__main__':
     unittest.main()
