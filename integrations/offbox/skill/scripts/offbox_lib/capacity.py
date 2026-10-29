@@ -37,6 +37,11 @@ def schema(con):
           owner TEXT, repo_root TEXT, box_id TEXT, remote_dir TEXT,
           PRIMARY KEY(owner, repo_root)
         );
+        -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
+        -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
+        CREATE TABLE IF NOT EXISTS prune_holds (
+          box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL
+        );
     """)
     # Preserve the rolling history on deployment. New clients record before sending; older
     # clients still in flight may emit legacy events, so import only unmatched events.

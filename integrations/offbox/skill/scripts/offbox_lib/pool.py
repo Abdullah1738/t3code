@@ -56,6 +56,7 @@ def candidates(con, key, size, source, me=None):
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running'))
+        AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)
         ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""", (key, size)).fetchall()
     cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
     full = len(members(con, key)) >= cap
