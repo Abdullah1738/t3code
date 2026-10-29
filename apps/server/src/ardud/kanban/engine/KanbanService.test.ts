@@ -241,6 +241,69 @@ it.effect("runs a card from To-Do through work, review findings, fix and a clear
   }),
 );
 
+it.effect("an evaluator can't complete or deploy an unreviewed card; the owner can", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "A",
+          title: "A",
+          subtasks: [
+            { text: "Do it", owner: "work" },
+            { text: "Review it", owner: "review" },
+          ],
+        },
+        owner,
+      );
+      const toCompleted = yield* kanban
+        .moveCard(card.id, "completed", "evaluator", evaluator)
+        .pipe(Effect.flip);
+      assert.strictEqual(toCompleted.code, "denied");
+      assert.include(toCompleted.detail ?? "", "s2");
+      const toDeployed = yield* kanban
+        .moveCard(card.id, "deployed", "evaluator", evaluator)
+        .pipe(Effect.flip);
+      assert.strictEqual(toDeployed.code, "denied");
+      assert.include(toDeployed.detail ?? "", "s2");
+
+      const byOwner = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      assert.strictEqual(byOwner.stage, "completed");
+      const stillDenied = yield* kanban
+        .moveCard(card.id, "deployed", "evaluator", evaluator)
+        .pipe(Effect.flip);
+      assert.strictEqual(stillDenied.code, "denied");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a reviewed card goes on to deployed", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker, { note: "done" });
+      yield* kanban.dispatchNow;
+      const reviewThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const reviewMessages = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages;
+      assert.include(reviewMessages[0] ?? "", "Verdict:");
+      yield* kanban.reviewResult(reviewThread, "clear", []);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "completed");
+      const deployed = yield* kanban.moveCard(card.id, "deployed", "evaluator", evaluator);
+      assert.strictEqual(deployed.stage, "deployed");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a review event records the head the reviewer passed", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -1564,7 +1627,7 @@ it.effect(
         const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
         const worker: KanbanActor = { _tag: "thread", threadId: workThread };
         yield* kanban.markSubtask(card.id, "s1", "done", "PR #4", worker, "work");
-        yield* kanban.moveCard(card.id, "completed", "evaluator", evaluator);
+        yield* kanban.moveCard(card.id, "completed", "owner", owner);
         yield* kanban.moveCard(card.id, "needs_owner", "evaluator", evaluator, {
           question: "Post this to the reporter?",
         });
@@ -2025,7 +2088,7 @@ it.effect("the owner's own question and a pick on an evaluator's go where they b
       // An evaluator's approval as a pick: the card goes back where it was.
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       const theirs = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
-      yield* kanban.moveCard(theirs.id, "completed", "evaluator", evaluator);
+      yield* kanban.moveCard(theirs.id, "completed", "owner", owner);
       yield* kanban.moveCard(theirs.id, "needs_owner", "evaluator", evaluator, {
         question: "Post it?",
       });
@@ -2200,7 +2263,7 @@ it.effect("own words are refused where they don't fit", () =>
       const { kanban, board } = yield* toyBoard;
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
-      yield* kanban.moveCard(card.id, "completed", "evaluator", evaluator);
+      yield* kanban.moveCard(card.id, "completed", "owner", owner);
       const talk = yield* kanban.cardDiscussion(card.id);
       const poll = yield* kanban.post(talk.id, evaluator, [
         {
@@ -2277,7 +2340,7 @@ it.effect("a dropped ask tells its asker; an evaluator's blocking ask goes back 
 
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
-      yield* kanban.moveCard(other.id, "completed", "evaluator", evaluator);
+      yield* kanban.moveCard(other.id, "completed", "owner", owner);
       const waiting = yield* kanban.askOwner(
         other.id,
         { question: "Post it?", blocking: true, options: ["Approve", "Drop"] },

@@ -113,6 +113,16 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+/** Why a card can't be completed or deployed yet, or null. */
+export function reviewGate(card: KanbanCard, chainLength: number): string | null {
+  const open = card.subtasks.filter((s) => s.owner === "review" && s.state === "open");
+  if (open.length > 0)
+    return `card #${card.number} still has review subtask ${open.map((s) => s.id).join(", ")} open: it closes when its review passes`;
+  if (!reviewFinished(card, chainLength))
+    return `card #${card.number} hasn't passed its review: move it to needs_review`;
+  return null;
+}
+
 /**
  * Every PR the work thread linked is merged or closed. Only those get a state
  * (syncPrs); a PR link without one is context and holds nothing. A card with

@@ -154,6 +154,7 @@ export const reviewBrief = (
     "Finish by calling card_review_result exactly once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
+    'After that call, end your final message with one line: "Verdict: clear" or "Verdict: changes needed: <top finding>".',
     board.instructions.reviewerRouting.trim()
       ? `\nReviewer routing instructions:\n${board.instructions.reviewerRouting.trim()}`
       : null,
@@ -210,9 +211,9 @@ const purposeText = (purpose: EvaluatorPurpose) => {
     case "stalled":
       return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
     case "completed":
-      return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing.";
+      return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing. Cards are completed and deployed only once the card's review passed.";
     case "deployed":
-      return "Deployed batch: for each Deployed card, verify the behaviour in the real environment. Move verified ones to verified; send failures back to todo with the evidence.";
+      return "Deployed batch: for each Deployed card, verify the behaviour in the real environment. Move verified ones to verified; send failures back to todo with the evidence. Cards are completed and deployed only once the card's review passed.";
     case "check":
       return "Board check: read the board and the live threads. Steer threads that drift, split cards that are too big, create cards for follow-ups, give a plan of subtasks to cards that have none, do the evaluator subtasks cards are waiting on, keep goals' Now and Story current.";
     case "packets":

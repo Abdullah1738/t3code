@@ -3518,6 +3518,11 @@ const make = Effect.gen(function* () {
             );
           }
         }
+        if ((to === "completed" || to === "deployed") && role !== "owner") {
+          const board = yield* boardOf(card.boardId);
+          const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
+          if (blocked !== null) return yield* failWith("denied", blocked);
+        }
         if (role === "evaluator" && to === "todo" && kanbanEvaluatorStep(card)) {
           return yield* failWith(
             "denied",
