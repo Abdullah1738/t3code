@@ -27,12 +27,15 @@ def load_auth(path=AUTH):
     error, not silently ignored: a stray brace once broke every Dropbox run."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
+    # JSON whitespace is exactly space, tab, CR, LF; str.strip() also eats NBSP etc.
+    ws = " \t\r\n"
+    start = len(text) - len(text.lstrip(ws))
     try:
-        d, end = json.JSONDecoder().raw_decode(text)
+        d, end = json.JSONDecoder().raw_decode(text, start)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{path} is not valid JSON: {e.msg} at char {e.pos} "
                            f"(of {len(text)}); repair the file, don't print it") from None
-    if text[end:].strip():
+    if text[end:].strip(ws):
         raise RuntimeError(f"{path} has {len(text) - end} trailing byte(s) after the JSON "
                            f"object at char {end} (of {len(text)}); repair the file")
     return d
@@ -128,11 +131,15 @@ def wait_delete(api, job, limit=1800):
     return "delete_batch still running"
 
 
-def upload(src, dst):
+def upload(src, dst, tok):
+    # dbxcli refreshes and rewrites auth.json unlocked and non-atomically when it
+    # runs from the file, so parallel puts can corrupt the shared file. Hand it the
+    # token we already hold in memory via DBXCLI_ACCESS_TOKEN (never saved locally).
+    env = dict(os.environ, DBXCLI_ACCESS_TOKEN=tok)
     for attempt in range(4):
         r = subprocess.run([DBX, "put", "--if-exists", "overwrite", "-w", "4",
                             "-c", str(32 * 1024 * 1024), "--timeout", "30m", src, dst],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=env)
         if r.returncode == 0:
             return None
         time.sleep(5 * (attempt + 1))
@@ -172,7 +179,8 @@ def main():
     uploaded = 0
     if not a.verify_only and not a.dry_run and need:
         with cf.ThreadPoolExecutor(a.jobs) as ex:
-            futs = {ex.submit(upload, loc[k]["abs"], f"{root}/{loc[k]['rel']}"): k for k in need}
+            futs = {ex.submit(upload, loc[k]["abs"], f"{root}/{loc[k]['rel']}", api.tok): k
+                    for k in need}
             for fu in cf.as_completed(futs):
                 err = fu.result()
                 if err:
