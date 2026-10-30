@@ -426,11 +426,7 @@ function BlockView(props: {
       );
     case "card":
       return (
-        <CardBlock
-          boardId={props.boardId}
-          cardId={block.cardId}
-          onOpenCard={props.onOpenCard}
-        />
+        <CardBlock boardId={props.boardId} cardId={block.cardId} onOpenCard={props.onOpenCard} />
       );
     case "image":
       return <ImageBlock url={block.url} alt={block.alt} />;
