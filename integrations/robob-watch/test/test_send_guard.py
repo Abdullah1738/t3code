@@ -1,6 +1,7 @@
 """Card #14: mailsend refuses a real draft or send under a test run, and a stubbed himalaya still runs."""
 import os
 import subprocess
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -9,8 +10,10 @@ HELPER = os.path.join(HERE, "..", "helpers", "mailsend")
 
 def run_ms(*args, **extra):
     # Start from a clean env (no inherited test markers) so each case controls the guard itself.
-    env = {"HOME": HERE, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "ROBOB_TEST": "1", **extra}
-    return subprocess.run(["/usr/bin/python3", HELPER, *args], env=env, capture_output=True, text=True, timeout=30)
+    # A throwaway HOME: Python's cache and mailsend's draft locks land there, not in the repo.
+    with tempfile.TemporaryDirectory(prefix="send-guard-home-") as home:
+        env = {"HOME": home, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "ROBOB_TEST": "1", **extra}
+        return subprocess.run(["/usr/bin/python3", HELPER, *args], env=env, capture_output=True, text=True, timeout=30)
 
 
 class MailsendSendGuard(unittest.TestCase):

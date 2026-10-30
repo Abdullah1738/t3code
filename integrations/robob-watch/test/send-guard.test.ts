@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,10 +8,13 @@ import { join } from "node:path";
 const helpers = join(import.meta.dir, "../helpers");
 // The test-run marker comes from the shared setup (bunfig.toml preload), not from each fixture. A child env built
 // here keeps it only when the parent has it, so a missing shared setup shows up as a real send, not a pass.
+// Children write caches and locks under HOME, so it is a throwaway dir, never the repo.
+const bareHome = mkdtempSync(join(tmpdir(), "send-guard-home-"));
+afterAll(() => rmSync(bareHome, { recursive: true, force: true }));
 const bare = (extra: Record<string, string> = {}) => ({
   PATH: "/usr/bin:/bin",
   LANG: "en_US.UTF-8",
-  HOME: join(import.meta.dir, ".."),
+  HOME: bareHome,
   ...(process.env.ROBOB_TEST ? { ROBOB_TEST: process.env.ROBOB_TEST } : {}),
   ...extra,
 });
