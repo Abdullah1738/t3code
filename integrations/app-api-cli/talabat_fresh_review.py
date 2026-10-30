@@ -11,6 +11,7 @@ import hmac
 import json
 import math
 
+import order_card
 import talabat_place_contract as place
 import talabat_submit_journal as journal
 
@@ -146,7 +147,7 @@ def build_review(snapshot, *, observed_at, now, started_monotonic, now_monotonic
               'payable_minor':int(Decimal(amount) * 100), 'observed_at':observed_at, 'expires_at':expires}
     display = {'currency':'AED', 'payable_minor':review['payable_minor'],
         'item':'Quest Chocolate Protein Shake 325ml', 'quantity':1,
-        'address':'Banyantree 2104', 'card_last4':'5542',
+        'address':'Banyantree 2104', 'card_last4':order_card.LAST4,
         'charges':projected['charges'], 'leave_at_door':True, 'no_bell':True, 'no_call':True,
         'tip_selected':False, 'subscription_selected':False, 'wallet_selected':False,
         'save_instructions':False, 'save_tip':False}

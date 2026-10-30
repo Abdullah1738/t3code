@@ -3,6 +3,7 @@
 Financial review needs the real selected-session schema; preparation can already
 be bound to the exact observed cart without overwriting another basket.
 """
+import order_card
 import uuid
 import time
 import hashlib
@@ -32,7 +33,7 @@ class MarketplaceFlow:
         self.review=None
         self.receipt_store=None
         self.scope_hash=journal.digest({'service':service,'account':self.account_hash,
-            'home':self.address_hash,'card':'5542','quiet':True})
+            'home':self.address_hash,'card':order_card.LAST4,'quiet':True})
         self.client=market.MarketplaceClient(service,header_provider=self._headers,
             before_send=self._before,receipt=self._receipt,response_cookies=self._cookies,request=request)
 

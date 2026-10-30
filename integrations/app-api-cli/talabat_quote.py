@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import order_card
 import talabat_checkout as c
 
 INITIAL_INTENT = Path('/Users/ardud/.robob/scratch/2026-10-08-continue-already-owner-authorized-autonomous-2092997c/tmp/talabat-initial-quote-20261009.intent')
@@ -118,7 +119,7 @@ def selected_card_body(home, vendor, config, saved_card):
     method = payment.get('method'); features = row.get('supportedFeatures')
     if (row.get('isEnabled') is not True or type(row.get('isSelected')) is not bool
             or type(row.get('title')) is not str
-            or not re.search(r'(?<![0-9])5542(?![0-9])', row['title'])
+            or not re.search(rf'(?<![0-9]){order_card.LAST4}(?![0-9])', row['title'])
             or events.get('selected') is not None
             or type(method) is not dict or type(method.get('paymentMethod')) is not int
             or method['paymentMethod'] != 2 or type(method.get('addTPayMethod')) is not int

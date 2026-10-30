@@ -5,6 +5,7 @@ import time
 import urllib.parse
 import uuid
 
+import order_card
 from commerce_auth_status import CommerceAuth
 from commerce_flow import FlowGate, account_hash
 import commerce_journal as journal
@@ -16,7 +17,7 @@ def intent_scope(vertical, branch, items, allow_duplicate_of=None):
     # choice set changes the intent. Raw requested rows form the intent.
     scope = {'branch':branch,'vertical':vertical,
         'items':[(x.item_id,x.quantity) for x in items],
-        'home':'Banyantree2104','card':'5542','quiet':True,'extras':False}
+        'home':'Banyantree2104','card':order_card.LAST4,'quiet':True,'extras':False}
     notes = [(x.item_id,x.note) for x in items if x.note]
     if notes:
         scope['item_notes'] = notes
@@ -133,7 +134,7 @@ class TalabatFlow:
         if c.quote is None:journal.fail('EXACT_REVIEW_REQUIRED')
         review=h.project_quote(c.quote)
         if (review['payable_minor'] <= 0
-                or review['currency']!='AED' or review['card_last4']!='5542'
+                or review['currency']!='AED' or review['card_last4']!=order_card.LAST4
                 or review['quiet_selected'] is not True
                 or any(review[k] is not False for k in ('tip','subscription','wallet','save_preferences'))):
             journal.fail('OWNER_TEST_SCOPE_OR_BUDGET_FAILED')
@@ -214,7 +215,7 @@ class TalabatFlow:
         final = c.prepare(selected=True,quiet_from=initial)
         review = h.project_quote(final)
         if (review['payable_minor'] <= 0
-                or review['currency'] != 'AED' or review['card_last4'] != '5542'
+                or review['currency'] != 'AED' or review['card_last4'] != order_card.LAST4
                 or review['quiet_selected'] is not True
                 or any(review[k] is not False for k in ('tip','subscription','wallet','save_preferences'))):
             journal.fail('OWNER_TEST_SCOPE_OR_BUDGET_FAILED')

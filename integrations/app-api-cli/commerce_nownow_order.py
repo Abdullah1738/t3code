@@ -12,6 +12,7 @@ Lifecycle (every mutation journalled at-most-once):
   (BOTH quiet flags true in ONE call) -> place-order {sessionCode,total} ->
   tracking poll until placed/preparing -> watcher registration.
 """
+import order_card
 import datetime as dt
 from decimal import Decimal
 import hashlib
@@ -48,7 +49,7 @@ def _fail(code):
 
 
 def saved_card(client, *, timeout=25):
-    """Unique live default Mastercard 5542 from the account paymentcards read.
+    """Unique live default Mastercard (order_card.LAST4) from the account paymentcards read.
 
     The card token is the same numeric id edit-payment sends as paymentToken
     (captured live: numeric paymentcard id == edit-payment paymentToken).
@@ -56,7 +57,7 @@ def saved_card(client, *, timeout=25):
     snap = client.payment_cards(timeout=timeout)
     rows = snap.wire.get('data')
     matches = [row for row in rows
-               if isinstance(row.get('ccMasked'), str) and row['ccMasked'].endswith('5542')
+               if isinstance(row.get('ccMasked'), str) and row['ccMasked'].endswith(order_card.LAST4)
                and isinstance(row.get('ccType'), str) and row['ccType'].lower() == 'mastercard'
                and row.get('isDeleted') is False]
     if len(matches) != 1 or not str(matches[0].get('id', '')).isdigit():
@@ -132,10 +133,10 @@ def _scope_hash(store_code, items, address_hash):
     if len(items) == 1:
         return journal.digest({'store': store_code, 'product': items[0]['product_code'],
                                'qty': items[0]['quantity'], 'home': address_hash,
-                               'card': '5542', 'quiet': True})
+                               'card': order_card.LAST4, 'quiet': True})
     return journal.digest({'store': store_code,
                            'products': [[i['product_code'], i['quantity']] for i in items],
-                           'home': address_hash, 'card': '5542', 'quiet': True})
+                           'home': address_hash, 'card': order_card.LAST4, 'quiet': True})
 
 
 def _wire_qty(value):
@@ -316,7 +317,7 @@ class NowNowOrderFlow:
         self.card = saved_card(self.client, timeout=timeout)
         corroborate_token(self.client, self.card, timeout=timeout)
         return {'active_orders': len(active), 'store_cart_clear': True,
-                'card_last4': '5542', 'token_corroborated': True}
+                'card_last4': order_card.LAST4, 'token_corroborated': True}
 
     # -- lifecycle ----------------------------------------------------------
     def create_session(self, *, timeout=25):
@@ -449,7 +450,7 @@ class NowNowOrderFlow:
                       'total_minor': state['total_minor'],
                       'address_code': row.get('addressCode'),
                       'address_version': row.get('addressVersion'),
-                      'card_last4': '5542', 'quiet': True}
+                      'card_last4': order_card.LAST4, 'quiet': True}
         if not self.single:
             # Multi-line basket binds the full sorted manifest (single-item
             # flows keep the exact legacy projection shape/digest).

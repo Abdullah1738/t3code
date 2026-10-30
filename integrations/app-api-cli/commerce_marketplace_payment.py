@@ -1,4 +1,5 @@
 """Main/Supermall payment continuation; one send, then bounded exact reads."""
+import order_card
 import json
 import math
 import os
@@ -68,7 +69,7 @@ class MarketplacePayment:
         selected = [card for method in methods if method.get('code') == 'cc_noonpay'
                     and method.get('status') == 'active' for card in method.get('cards', [])
                     if card.get('isDefault') is True and card.get('isSelected') is True
-                    and str(card.get('mask', '')).endswith('5542')]
+                    and str(card.get('mask', '')).endswith(order_card.LAST4)]
         if len(selected) != 1:
             journal.fail('MARKETPLACE_SAVED_CARD_MISMATCH')
         self.payment_card_token = market._id(selected[0].get('id'))

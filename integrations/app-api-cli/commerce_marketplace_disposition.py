@@ -1,4 +1,5 @@
 """Exact native cancellation + non-capture proof for marketplace orders."""
+import order_card
 import time
 
 import commerce_journal as journal
@@ -37,7 +38,7 @@ def failed_evidence(status, detail, refund, order, amount):
     methods = payment.get('paymentMethods')
     require(isinstance(methods, list) and len(methods) == 1
             and methods[0].get('code') == 'mastercard'
-            and methods[0].get('title') == 'MASTERCARD xxxx5542'
+            and methods[0].get('title') == f'MASTERCARD xxxx{order_card.LAST4}'
             and market.fils(methods[0].get('amount')) == amount)
     for name in ('completedRefunds', 'triggeredRefunds'):
         block = sections.get(name, {})
@@ -45,7 +46,7 @@ def failed_evidence(status, detail, refund, order, amount):
         require(isinstance(mediums, list) and len(mediums) == 1)
         medium = mediums[0]
         require(medium.get('code') == 'mastercard'
-                and medium.get('title') == 'Processed to xxxx5542'
+                and medium.get('title') == f'Processed to xxxx{order_card.LAST4}'
                 and market.fils(medium.get('amount')) == amount
                 and isinstance(medium.get('description'), str)
                 and medium['description'].startswith(NO_CAPTURE + ' '))
@@ -57,7 +58,7 @@ def failed_evidence(status, detail, refund, order, amount):
         require(isinstance(fees, list)
                 and sum(market.fils(r.get('amount')) for r in rows + fees) == amount)
     return {'order': order, 'currency': 'AED', 'amount_minor': amount,
-            'all_items_cancelled': True, 'payment_failed': True, 'card_last4': '5542',
+            'all_items_cancelled': True, 'payment_failed': True, 'card_last4': order_card.LAST4,
             'provider_no_charge_proven': True, 'refund_pending_minor': 0,
             'non_capture_statement': NO_CAPTURE,
             'response_hashes': [journal.digest(x) for x in (status, detail, refund)]}

@@ -29,7 +29,7 @@ def require_no_payment_challenge(requirement):
 
 
 def place_body(*, home, vendor, config, saved_card, quote, quote_body, cart_id, payment_requirement=None):
-    """Build ONLY the supported saved-Home/5542/Quest ordinary-delivery draft.
+    """Build ONLY the supported saved-Home/order-card/Quest ordinary-delivery draft.
 
     The caller must independently establish fresh account/Home/cart provenance and
     supply the exact selected-card prepare body used to obtain this quote. Local

@@ -1,4 +1,5 @@
 """Profile-bound NowNow exact reads using current auth overlays and retention."""
+import order_card
 import time
 import uuid
 import hashlib
@@ -47,7 +48,7 @@ class NowNowFlow:
         self.account_hash,self.address_hash=self.snapshot.account_ref,self.snapshot.address_ref
         journal.require_account_available('noon',self.account_hash)
         self.flow_id=str(uuid.uuid4())
-        self.scope_hash=journal.digest({'store':store_code,'products':self.products,'home':self.address_hash,'card':'5542'})
+        self.scope_hash=journal.digest({'store':store_code,'products':self.products,'home':self.address_hash,'card':order_card.LAST4})
         self.opened=False;self.expected=None;self.session_code=None;self.current=None;self.review=None
         self.receipt_store=None;self.pending_cookies=[]
         self.preorder_intent_hash=None
