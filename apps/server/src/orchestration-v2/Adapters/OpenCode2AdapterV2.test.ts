@@ -5249,6 +5249,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           sessionID: SESSION,
           model: { providerID: "opencode", id: "big-pickle", variant: "idle-shutdown" },
         }),
+        // The next turn's prepareTurn removes the stale server, then adds it at the location.
         out("mcp.remove", { server, "location[directory]": WORK }),
         reply("mcp.remove", null),
         add,
@@ -5260,8 +5261,13 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         reply("mcp.remove", null),
       ]);
       const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      const synced = yield* variantUpdate(runtime, "idle-shutdown").pipe(Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
       assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+      yield* Fiber.join(synced);
+      const nextTerminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(secondTurn(thread));
+      assert.equal((yield* Fiber.join(nextTerminal))?.status, "completed");
       yield* runtime.unloadThread!({ providerThread: thread });
     }).pipe(Effect.scoped),
   );
