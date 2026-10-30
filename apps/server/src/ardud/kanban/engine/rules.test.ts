@@ -28,6 +28,7 @@ import {
   poolKey,
   prsLanded,
   relatedCandidates,
+  reviewGate,
   workerQuietDue,
 } from "./rules.ts";
 
@@ -130,6 +131,31 @@ describe("checkMove", () => {
     expect(
       checkMove("owner", card({ stage: "verified", settledAt: "2026-10-25T01:00:00Z" }), "todo").ok,
     ).toBe(false);
+  });
+});
+
+describe("reviewGate", () => {
+  const reviewSub = {
+    id: "s2",
+    step: 2,
+    text: "r",
+    owner: "review",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  } as unknown as KanbanCard["subtasks"][number];
+
+  it("names an open review subtask", () => {
+    const result = reviewGate(card({ subtasks: [reviewSub] }), 1);
+    expect(result).not.toBeNull();
+    expect(result).toContain("s2");
+  });
+
+  it("waits for the whole chain", () => {
+    expect(reviewGate(card({ reviewStep: 0 }), 1)).not.toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 1)).toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 2)).not.toBeNull();
   });
 });
 
