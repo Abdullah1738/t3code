@@ -17,13 +17,14 @@ from commerce_basket_input import input_items
 import talabat_http_checkout as talabat
 import talabat_http_orders as talabat_orders
 import order_watch_receipt
+import order_card
 
 RECONCILE_NOT_REORDER=('An order ID may already exist and payment may have been sent. Do not place another '
                        'order. Run "commerce recover-payment {flow}" and "commerce order-status {flow}".')
 RECOVERY_NOT_REORDER=('Still unconfirmed. Do not place another order. Check "commerce order-status {flow}" '
                       'and "commerce reconcile-order {flow}"; rerun recover-payment later.')
-# Every paying lane is pinned to this saved card (reviews refuse any other).
-ORDER_CARD_LAST4='5542'
+# Every paying lane uses this saved card (order_card.LAST4; the cancelled card is refused there).
+ORDER_CARD_LAST4=order_card.LAST4
 # Owner pause on all ordering: while this file exists, money commands refuse (exit 4).
 PAUSE_FILE=Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home()/'.local/state/ordering-paused')
 PAUSED_COMMANDS=frozenset({'order','test-talabat-shops','await-payment','marketplace-cart','cart','recover-payment'})
@@ -410,7 +411,7 @@ def order_main(args):
     """Paid noon MAIN marketplace E2E replay (NAEIA0042714780 contract).
 
     skuConfig -> offer -> cart add -> checkout session {shouldUpdateSession:
-    true} with server-carried silent delivery + default card 5542 + home
+    true} with server-carried silent delivery + default card (order_card.LAST4) + home
     address -> place-order {total} -> order-status poll until success with
     shipments (paid), including encrypted CVV and out-of-band ENBD approval.
     """
@@ -458,7 +459,7 @@ def order_supermall(args):
 
     rocket catalog resolve -> quick-atc cart add -> checkout session
     {shouldUpdateSession:true} with server-carried silent delivery + default
-    card 5542 + home address + isRocket shipment with absolute express
+    card (order_card.LAST4) + home address + isRocket shipment with absolute express
     deliveryDate -> place-order {total} -> order-status poll until success
     with shipments (paid), including encrypted CVV and ENBD approval.
     """
