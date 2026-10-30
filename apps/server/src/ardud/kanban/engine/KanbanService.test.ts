@@ -2824,7 +2824,7 @@ it.effect("new cards from a script share one packets evaluator", () =>
   }),
 );
 
-const packetsEvaluator = (fake: Awaited<ReturnType<typeof makeFake>>) =>
+const packetsEvaluator = (fake: { readonly threads: Ref.Ref<Map<string, FakeThread>> }) =>
   Effect.gen(function* () {
     const evaluators = [...(yield* Ref.get(fake.threads)).entries()].filter(
       ([, view]) => view.title === "Evaluator: packets",
