@@ -337,17 +337,19 @@ def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
     return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
 
 
-def cmd_status(box_id: str, pid: int) -> dict | None:
-    return call("GET", f"/sandboxes/{box_id}/commands/{pid}?tailBytes=4096", ok404=True)
+def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2) -> dict | None:
+    return call("GET", f"/sandboxes/{box_id}/commands/{pid}?tailBytes=4096", timeout=timeout, retries=retries,
+                ok404=True)
 
 
 def cmd_kill(box_id: str, pid: int) -> dict | None:
     return call("DELETE", f"/sandboxes/{box_id}/commands/{pid}", ok404=True, retries=1)
 
 
-def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0):
+def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeout: float = 90):
+    # `timeout` is the socket read timeout: a quiet stream returns control to follow() after at most this long.
     return stream(f"/sandboxes/{box_id}/commands/{pid}/stream?stdoutOffset={out_off}&stderrOffset={err_off}",
-                  timeout=90)
+                  timeout=timeout)
 
 
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0) -> dict:

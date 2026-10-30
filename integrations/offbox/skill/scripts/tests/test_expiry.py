@@ -544,7 +544,7 @@ class ExpiryTests(Isolated):
         import threading
         closed = threading.Event()
 
-        def endless(box_id, pid, out_off=0, err_off=0):
+        def endless(box_id, pid, out_off=0, err_off=0, **kw):
             n = out_off
             try:
                 while True:

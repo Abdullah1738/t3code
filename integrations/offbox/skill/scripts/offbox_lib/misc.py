@@ -252,14 +252,15 @@ def _settled(r) -> int:
     return r["exit_code"] if r["exit_code"] is not None else 90
 
 
-def _tail(path, pos: int) -> int:
+def _tail(path, pos: int, echo: bool) -> int:
+    """Consume the holder's local log from `pos`; print the new bytes only when echoing. Returns the new position."""
     try:
         with open(path, "rb") as f:
             f.seek(pos)
             data = f.read()
     except OSError:
         return pos
-    if data:
+    if data and echo:
         sys.stdout.write(data.decode(errors="replace"))
         sys.stdout.flush()
     return pos + len(data)
@@ -267,7 +268,8 @@ def _tail(path, pos: int) -> int:
 
 def _wait_locked(r, echo, timeout=None):
     """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
-    holds the lock, poll the run row (and tail the local log) instead of failing on the lock."""
+    holds the lock, poll the run row (and tail the local log) instead of failing on the lock.
+    `pos` is the local-log byte count already delivered (printed when echoing, or appended by the takeover follow)."""
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     pos, said = 0, False
@@ -279,18 +281,21 @@ def _wait_locked(r, echo, timeout=None):
             pass
         else:
             try:
+                # The holder writes its last output before it records the end and releases the lock: drain that first.
+                pos = _tail(log_path, pos, echo)
                 cur = _run_row(r['run_id'])
                 if cur['status'] not in ('starting', 'running'):
                     return _settled(cur)
-                return _wait_run(cur, echo, until=deadline)
+                # Take over the follow from the offsets the holder had reached, so nothing is printed or logged twice.
+                from .runs import load_offsets
+                return _wait_run(cur, echo, until=deadline, start_offsets=load_offsets(log_path))
             finally:
                 guard.__exit__(None, None, None)
-        if echo:
-            pos = _tail(log_path, pos)
+        pos = _tail(log_path, pos, echo)
         cur = _run_row(r['run_id'])
         if cur['status'] not in ('starting', 'running'):
-            if echo:
-                _tail(log_path, pos)
+            # Drain the holder's final bytes that landed after the poll above, then report the recorded end.
+            _tail(log_path, pos, echo)
             return _settled(cur)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
@@ -299,15 +304,16 @@ def _wait_locked(r, echo, timeout=None):
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
                 f"waiting for it to record the end")
             said = True
-        time.sleep(WAIT_POLL_S)
+        pause = WAIT_POLL_S if deadline is None else max(0.0, min(WAIT_POLL_S, deadline - now()))
+        time.sleep(pause)
 
 
-def _wait_run(r, echo, until=None):
+def _wait_run(r, echo, until=None, start_offsets=(0, 0)):
     from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo, run_id=r["run_id"],
-                  until=until)
+                  until=until, start_offsets=start_offsets)
     if code is None:
         code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
         if code is not None:
