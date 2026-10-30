@@ -203,6 +203,22 @@ class Explain(unittest.TestCase):
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
         self.assertEqual(r['verdict'], 'ask')
 
+    def test_an_order_of_something_else_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'Summarize the order of Apple product announcements', 'Apple talk')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
+    def test_an_explicit_ownership_answer_explains_the_charge(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'The Apple charge is mine', 'Apple charge')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'owner')
+
     def test_his_denials_and_questions_explain_nothing(self):
         for text in ('I do not recognise the ACME charge. It is not mine.', "What's this Acme charge?",
                      "acme isn't me, block the card", 'Dispute the Acme one'):
@@ -292,6 +308,23 @@ class OwnerTexts(unittest.TestCase):
                 got = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
             # Newest first, as the state DB returns the rows.
             self.assertEqual([t for _, t, _ in got], ['Acme ordering now', 'acme is mine'])
+            # Automation stamped 'system' (a kanban prompt, a bracketed watcher wake) isn't his words.
+            with patch.object(ch, 'STATE_DB', path):
+                db = sqlite3.connect(path)
+                # A kanban task and a watcher run each have their own thread, not his iMessage thread.
+                db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
+                           ('k', 'Kanban: Apple order receipt parsing', '2026-10-24T00:00:00.000Z'))
+                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
+                           ('k', 'user', '2026-10-24T00:11:00.000Z',
+                            json.dumps({'createdBy': 'system', 'text': 'Review Apple order receipt parsing'})))
+                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
+                           ('a', 'user', '2026-10-24T00:12:00.000Z',
+                            json.dumps({'createdBy': 'system', 'text': '[Watcher] APPLE.COM/BILL USD 99 charged'})))
+                db.commit()
+                db.close()
+                kanban = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
+            self.assertNotIn('Review Apple order receipt parsing', kanban)
+            self.assertNotIn('[Watcher] APPLE.COM/BILL USD 99 charged', kanban)
             with patch.object(ch, 'STATE_DB', Path(tmp) / 'missing.sqlite'), self.assertRaises(ch.Lookup):
                 ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
 

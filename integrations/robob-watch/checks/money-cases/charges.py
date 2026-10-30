@@ -70,8 +70,10 @@ RECEIPT_WORDS = re.compile(r"\b(?:(?:receipt|invoice|amount paid|paid on|billed 
 NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fraud|scam|stolen|block|dispute|"
                       r"cancel|refund|who|what|why|which)\b", re.I)
 # His words own a payment: he is ordering, paying, subscribing or topping up (not just naming a merchant).
-OWNER_BUYS = re.compile(r"\b(?:order(?:ing|ed|s)?|paying|paid|pay(?:ing)? (?:for|the)|set ?up|subscrib(?:e|ed|ing)|"
-                        r"top(?:ped|ping)? up|bought|buying)\b", re.I)
+OWNER_BUYS = re.compile(r"\b(?:ordering|ordered|paying|paid|set ?up|subscrib(?:e|ed|ing)|top(?:ped|ping)? up|"
+                        r"bought|buying|(?:is|are|was|it'?s|that'?s) mine|mine)\b"
+                        # "acme order" or "my order" is his purchase; "the order of Apple announcements" isn't.
+                        r"|\b\w+ orders?\b(?! of)|\border (?:#|no\.?|number)\s*\d", re.I)
 
 
 class Lookup(Exception):
@@ -151,6 +153,16 @@ def iso(t):
     return t.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
+def owner_turn(created_by, text, title=''):
+    """Whether a Robob user turn is his own typing: the app's 'user' in any thread, or the bridge's
+    'system' send in his iMessage thread without a leading [tag]. Kanban, schedule and watcher threads
+    never carry his words, whatever their stamp."""
+    if created_by == 'user':
+        return True
+    return created_by == 'system' and str(title or '').startswith('iMessage') \
+        and not str(text).lstrip().startswith('[')
+
+
 def owner_texts(since, until, deadline=None):
     """What the owner typed in his own Robob threads (app or iMessage) between two times."""
     left(deadline, 5)
@@ -173,9 +185,11 @@ def owner_texts(since, until, deadline=None):
         except ValueError:
             continue
         text = str(p.get('text') or '')
-        # The bridge stamps the owner's iMessage turns 'system' (control/http.ts), so 'user' alone drops
-        # all of them. Synthetic wakes and other people's chats still don't count as his words.
-        if p.get('createdBy') not in ('user', 'system') or text.startswith('[Forwarded by') \
+        # 'user' is the owner typing in the app. The bridge sends his iMessages as 'system' (control API,
+        # no owner provenance), so 'system' counts only without a leading [tag]: every automated wake
+        # (watchers, bridge requests, kanban, replies) starts with one. Other people's chats and forwards
+        # never count.
+        if not owner_turn(p.get('createdBy'), text, title) or text.startswith('[Forwarded by') \
                 or re.match(r'(?:Moni|Group)\b', title or ''):
             continue
         out.append((created, text, title or ''))
@@ -222,6 +236,15 @@ def alert_text(shown):
     return shown
 
 
+HEADER = re.compile(r'^(?:Account|Date|From|To|Cc|Subject|File|Message-ID|Folder):', re.I)
+
+
+def body_key(text):
+    """The mail's words without its headers: copies of one notice differ only in Date and File."""
+    lines = [ln for ln in str(text).splitlines() if not HEADER.match(ln.strip())]
+    return ' '.join(' '.join(lines).split())
+
+
 def receipt(charge, at, now, find=None, deadline=None, read=None):
     """The receipt or order mail for a charge. It shows the amount as money in the charge's currency
     and reads as a receipt, and either names the merchant (from two hours before the charge on) or,
@@ -235,7 +258,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None):
     tries = []
     if names:
         tries.append((amount + ' ' + ' OR '.join(f'"{w}"' for w in names), at - RECEIPT_BEFORE, now,
-                      lambda text: named.search(text) and (RECEIPT_WORDS.search(text) or card.search(text))))
+                      lambda text: named.search(text) and RECEIPT_WORDS.search(text)))
     tries.append((amount, at - SAME_TIME, min(now, at + SAME_TIME),
                   lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
     reads, seen_bodies = 0, set()
@@ -249,7 +272,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None):
                     or BANKS.search(str(row.get('sender') or '')):
                 continue
             text = read(row, deadline)
-            key = ' '.join(text.split())
+            key = body_key(text)
             if key in seen_bodies:
                 continue
             if reads >= RECEIPT_READS:

@@ -535,24 +535,32 @@ class Questions(Base):
         self.assertEqual(second['verdict'], 'ask')
 
     def test_a_receipt_behind_21_usage_notices_is_still_found(self):
-        # The receipt is the oldest mail in the window; 21 newer usage notices fill the first page of hits.
-        receipt = {**RECEIPT, 'ts': at('2026-10-23T23:50').timestamp(), 'body': 'Thanks for ordering. Total AED 12.34'}
-        notices = [{'id': 100 + i, 'ts': at('2026-10-23T23:55').timestamp() + i, 'sender': 'Acme <usage@acme.example>',
-                    'subject': 'Usage notice', 'body': 'Usage of AED 12.34 on card 1111', 'source': 'email', 'from_me': 0}
-                   for i in range(21)]
-        seen = []
+        # Real msgs show output: each copy of a notice has its own Date and File headers, so only the
+        # words after them are the same. The receipt is the oldest mail in the window.
+        aed = 'Purchase of AED 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+        receipt = {'id': 2, 'ts': at('2026-10-23T23:50').timestamp(), 'sender': 'Acme <noreply@acme.example>',
+                   'subject': 'Your Acme order', 'source': 'email', 'from_me': 0}
+        shown = {2: 'Account: ardud@icloud\nDate: Fri 23 Oct 23:50\nFrom: Acme <noreply@acme.example>\n'
+                    'Subject: Your Acme order\nFile: /m/2.emlx\n\nThanks for ordering. Total AED 12.34'}
+        notices = []
+        for i in range(21):
+            nid = 100 + i
+            notices.append({'id': nid, 'ts': at('2026-10-23T23:55').timestamp() + i, 'sender': 'Acme <usage@acme.example>',
+                            'subject': 'Usage notice', 'source': 'email', 'from_me': 0})
+            shown[nid] = (f'Account: ardud@icloud\nDate: Fri 23 Oct 23:5{i % 10}\nFrom: Acme <usage@acme.example>\n'
+                          f'Subject: Usage notice\nFile: /m/{nid}.emlx\n\nYour card 1111 was used for AED 12.34 at Acme. Avl limit.')
+        reads = []
 
         def find(query, since, until=None, source=None, n=20, deadline=None):
-            seen.append(n)
-            # Newest first, as msgs search returns them, cut at the requested hit count.
-            rows = sorted([receipt] + notices, key=lambda r: -r['ts'])
-            return rows[:n]
-        aed = 'Purchase of AED 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+            return sorted([receipt] + notices, key=lambda r: -r['ts'])[:n]
+
+        def read(row, deadline=None):
+            reads.append(row['id'])
+            return shown[row['id']]
         r = mc.charges.receipt(mc.charges.parse(aed, BANK), at('2026-10-24T00:37'), at('2026-10-24T00:45'),
                                find=find, read=read)
         self.assertIsNotNone(r)
         self.assertEqual(r['id'], receipt['id'])
-        self.assertTrue(all(n > 20 for n in seen))
 
     def test_what_it_stores_is_redacted(self):
         def said(since, until, deadline=None):
