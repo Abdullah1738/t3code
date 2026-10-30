@@ -2558,7 +2558,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         for (const state of threads.values()) {
           if (state.mcp?.directory !== directory) continue;
           // Idle eviction also shuts a location down; an idle thread gets its server back from its next prepareTurn.
-          if (state.active === undefined && !busy.has(state.sessionId) && !runsShell(state.sessionId))
+          if (
+            state.active === undefined &&
+            !busy.has(state.sessionId) &&
+            !runsShell(state.sessionId)
+          )
             continue;
           // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
           yield* Effect.forkIn(

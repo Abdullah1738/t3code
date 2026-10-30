@@ -86,7 +86,10 @@ const durable = { durable: { aggregateID: SESSION, seq: 1, version: 1 } };
 // `event()` cannot set the top-level `location` the shutdown and shell events carry.
 const rawEvent = (type: string, extra: Record<string, unknown>): ProviderReplayEntry => ({
   type: "emit_inbound",
-  frame: { type: "sdk.event", event: { id: `evt_${type.replaceAll(".", "")}0000`, created: 1, type, ...extra } },
+  frame: {
+    type: "sdk.event",
+    event: { id: `evt_${type.replaceAll(".", "")}0000`, created: 1, type, ...extra },
+  },
 });
 const locationShutdown = (directory: string) =>
   rawEvent("location.shutdown", { location: { directory }, data: {} });
@@ -107,7 +110,10 @@ const shellCreated = (id: string, sessionID: string) =>
     },
   });
 const shellExited = (id: string) =>
-  rawEvent("shell.exited", { location: { directory: WORK }, data: { id, exit: 0, status: "exited" } });
+  rawEvent("shell.exited", {
+    location: { directory: WORK },
+    data: { id, exit: 0, status: "exited" },
+  });
 
 const mcpRules = [
   { action: "t3-code-*", resource: "*", effect: "deny" },
@@ -5214,66 +5220,68 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("leaves an idle thread's MCP server to its next turn when its location shuts down", () =>
-    Effect.gen(function* () {
-      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
-      yield* mcpSessions.set({
-        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
-        threadId,
-        providerSessionId: "mcp:opencode2-adapter",
-        providerInstanceId: instanceId,
-        endpoint: "http://127.0.0.1:3773/mcp",
-        authorizationHeader: "Bearer thread-credential",
-        browserToolsAvailable: false,
-      });
-      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
-      const server = "t3-code-thread_opencode2-adapter";
-      const add = out("mcp.add", {
-        server,
-        "location[directory]": WORK,
-        config: {
-          type: "remote",
-          url: "http://127.0.0.1:3773/mcp",
-          headers: { Authorization: "Bearer thread-credential" },
-          oauth: false,
-        },
-      });
-      const { runtime, thread } = yield* resumed([
-        add,
-        reply("mcp.add", null),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        locationShutdown(WORK),
-        event("session.model.selected", {
-          sessionID: SESSION,
-          model: { providerID: "opencode", id: "big-pickle", variant: "idle-shutdown" },
-        }),
-        // The next turn switches the model back from the synced variant, then re-adds the
-        // unchanged config; no remove, since prepareTurn only removes a config that changed.
-        out("session.switchModel", {
-          sessionID: SESSION,
-          model: { id: "big-pickle", providerID: "opencode" },
-        }),
-        reply("session.switchModel", null),
-        add,
-        reply("mcp.add", null),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        out("mcp.remove", { server, "location[directory]": WORK }),
-        reply("mcp.remove", null),
-      ]);
-      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
-      const synced = yield* variantUpdate(runtime, "idle-shutdown").pipe(Effect.forkScoped);
-      yield* runtime.startTurn(turnInput(thread));
-      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
-      yield* Fiber.join(synced);
-      const nextTerminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
-      yield* runtime.startTurn(secondTurn(thread));
-      assert.equal((yield* Fiber.join(nextTerminal))?.status, "completed");
-      yield* runtime.unloadThread!({ providerThread: thread });
-    }).pipe(Effect.scoped),
+  it.effect(
+    "leaves an idle thread's MCP server to its next turn when its location shuts down",
+    () =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        yield* mcpSessions.set({
+          environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+          threadId,
+          providerSessionId: "mcp:opencode2-adapter",
+          providerInstanceId: instanceId,
+          endpoint: "http://127.0.0.1:3773/mcp",
+          authorizationHeader: "Bearer thread-credential",
+          browserToolsAvailable: false,
+        });
+        yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+        const server = "t3-code-thread_opencode2-adapter";
+        const add = out("mcp.add", {
+          server,
+          "location[directory]": WORK,
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:3773/mcp",
+            headers: { Authorization: "Bearer thread-credential" },
+            oauth: false,
+          },
+        });
+        const { runtime, thread } = yield* resumed([
+          add,
+          reply("mcp.add", null),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          locationShutdown(WORK),
+          event("session.model.selected", {
+            sessionID: SESSION,
+            model: { providerID: "opencode", id: "big-pickle", variant: "idle-shutdown" },
+          }),
+          // The next turn switches the model back from the synced variant, then re-adds the
+          // unchanged config; no remove, since prepareTurn only removes a config that changed.
+          out("session.switchModel", {
+            sessionID: SESSION,
+            model: { id: "big-pickle", providerID: "opencode" },
+          }),
+          reply("session.switchModel", null),
+          add,
+          reply("mcp.add", null),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          out("mcp.remove", { server, "location[directory]": WORK }),
+          reply("mcp.remove", null),
+        ]);
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        const synced = yield* variantUpdate(runtime, "idle-shutdown").pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+        yield* Fiber.join(synced);
+        const nextTerminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn(secondTurn(thread));
+        assert.equal((yield* Fiber.join(nextTerminal))?.status, "completed");
+        yield* runtime.unloadThread!({ providerThread: thread });
+      }).pipe(Effect.scoped),
   );
 
   it.effect("ignores a location shutdown for another directory", () =>
@@ -5341,54 +5349,56 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("re-adds T3's MCP server for an idle thread whose background shell runs when its location shuts down", () =>
-    Effect.gen(function* () {
-      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
-      yield* mcpSessions.set({
-        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
-        threadId,
-        providerSessionId: "mcp:opencode2-adapter",
-        providerInstanceId: instanceId,
-        endpoint: "http://127.0.0.1:3773/mcp",
-        authorizationHeader: "Bearer thread-credential",
-        browserToolsAvailable: false,
-      });
-      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
-      const server = "t3-code-thread_opencode2-adapter";
-      const add = out("mcp.add", {
-        server,
-        "location[directory]": WORK,
-        config: {
-          type: "remote",
-          url: "http://127.0.0.1:3773/mcp",
-          headers: { Authorization: "Bearer thread-credential" },
-          oauth: false,
-        },
-      });
-      const { runtime, thread } = yield* resumed([
-        add,
-        reply("mcp.add", null),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        shellCreated("sh_mine", SESSION),
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        locationShutdown(WORK),
-        add,
-        reply("mcp.add", null),
-        event("session.model.selected", {
-          sessionID: SESSION,
-          model: { providerID: "opencode", id: "big-pickle", variant: "shell-shutdown" },
-        }),
-        out("mcp.remove", { server, "location[directory]": WORK }),
-        reply("mcp.remove", null),
-      ]);
-      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
-      const synced = yield* variantUpdate(runtime, "shell-shutdown").pipe(Effect.forkScoped);
-      yield* runtime.startTurn(turnInput(thread));
-      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
-      yield* Fiber.join(synced);
-      yield* runtime.unloadThread!({ providerThread: thread });
-    }).pipe(Effect.scoped),
+  it.effect(
+    "re-adds T3's MCP server for an idle thread whose background shell runs when its location shuts down",
+    () =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        yield* mcpSessions.set({
+          environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+          threadId,
+          providerSessionId: "mcp:opencode2-adapter",
+          providerInstanceId: instanceId,
+          endpoint: "http://127.0.0.1:3773/mcp",
+          authorizationHeader: "Bearer thread-credential",
+          browserToolsAvailable: false,
+        });
+        yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+        const server = "t3-code-thread_opencode2-adapter";
+        const add = out("mcp.add", {
+          server,
+          "location[directory]": WORK,
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:3773/mcp",
+            headers: { Authorization: "Bearer thread-credential" },
+            oauth: false,
+          },
+        });
+        const { runtime, thread } = yield* resumed([
+          add,
+          reply("mcp.add", null),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          shellCreated("sh_mine", SESSION),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          locationShutdown(WORK),
+          add,
+          reply("mcp.add", null),
+          event("session.model.selected", {
+            sessionID: SESSION,
+            model: { providerID: "opencode", id: "big-pickle", variant: "shell-shutdown" },
+          }),
+          out("mcp.remove", { server, "location[directory]": WORK }),
+          reply("mcp.remove", null),
+        ]);
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        const synced = yield* variantUpdate(runtime, "shell-shutdown").pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+        yield* Fiber.join(synced);
+        yield* runtime.unloadThread!({ providerThread: thread });
+      }).pipe(Effect.scoped),
   );
 
   it.effect("keeps T3's MCP server with a session the agent moved", () =>
