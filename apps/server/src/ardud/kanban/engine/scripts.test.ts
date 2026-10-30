@@ -84,6 +84,23 @@ describe("board scripts", () => {
     expect(parsed.text).toBe('checked 3 repos\n{"other": 1}');
   });
 
+  it("decodes the subtask, handback and move commands", () => {
+    const parsed = parseOutput(
+      [
+        '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged abc1234"}',
+        '{"kanban":"handback","card":1,"subtask":"s2","note":"deploy failed: exit 1"}',
+        '{"kanban":"move","card":1,"to":"deployed","note":"landed"}',
+        '{"kanban":"move","card":1,"to":"working"}',
+      ].join("\n"),
+    );
+    expect(parsed.commands.map((command) => command.kanban)).toEqual([
+      "subtask",
+      "handback",
+      "move",
+    ]);
+    expect(parsed.errors).toHaveLength(1);
+  });
+
   it("finds a card the script already made", () => {
     const cards = [
       card({
@@ -147,6 +164,32 @@ describe("board scripts", () => {
     const byOwner = { ...created!, by: { _tag: "owner" } as const };
     expect(listensTo(listener, byOwner)).toBe(true);
     expect(listensTo({ ...listener, enabled: false }, byOwner)).toBe(false);
+  });
+
+  it("a card a script moved on stdout fires no card.moved script, its own or another's", () => {
+    const eventOf = eventTracker([["card-1", "todo"]]);
+    const moved = card({ id: "card-1", number: 1, stage: "deployed", priority: 3 } as never);
+    const byScript = { _tag: "script", scriptId: "script-1" as never } as const;
+    const event = eventOf({ _tag: "card", card: moved, by: byScript });
+    expect(event?.name).toBe("card.moved");
+    expect(event?.by).toEqual(byScript);
+    const mover = script({
+      id: "script-1" as never,
+      trigger: { _tag: "event", event: "card.moved" },
+    });
+    const other = script({
+      id: "script-2" as never,
+      trigger: { _tag: "event", event: "card.moved" },
+    });
+    expect(listensTo(mover, event!)).toBe(false);
+    expect(listensTo(other, event!)).toBe(false);
+    // A move by the owner still reaches the listener.
+    const byOwnerEvent = eventTracker([["card-1", "todo"]])({
+      _tag: "card",
+      card: moved,
+      by: { _tag: "owner" },
+    });
+    expect(listensTo(mover, byOwnerEvent!)).toBe(true);
   });
 
   it("knows the discussions a script opened or posted in", () => {

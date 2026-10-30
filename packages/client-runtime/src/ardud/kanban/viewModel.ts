@@ -6,6 +6,7 @@ import {
   kanbanOpenAsks,
   kanbanOpenStep,
   kanbanPickOrder,
+  kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   type KanbanActor,
   type KanbanAnswer,
@@ -16,6 +17,7 @@ import {
   type KanbanGoal,
   type KanbanMessage,
   type KanbanStage,
+  type KanbanSubtask,
   type ModelSelection,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
@@ -199,7 +201,10 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
             : `After #${blocker.number}`,
       };
     } else if (kanbanWaitsOnEvaluator(card)) {
-      flag = { kind: "blocked", label: "Waits on the evaluator" };
+      flag = {
+        kind: "blocked",
+        label: kanbanScriptStep(card) ? "Waits on a script" : "Waits on the evaluator",
+      };
     }
   }
   const thread = card.activeThreadId === null ? undefined : state.threads.get(card.activeThreadId);
@@ -258,7 +263,14 @@ export const SUBTASK_OWNER_LABELS = {
   work: "Worker",
   review: "Reviewer",
   evaluator: "Evaluator",
+  script: "Script",
 } as const;
+
+/** "Script: land" for a subtask a named script does; the owner's label otherwise. */
+export const subtaskOwnerLabel = (subtask: Pick<KanbanSubtask, "owner" | "script">): string =>
+  subtask.owner === "script" && subtask.script !== undefined
+    ? `Script: ${subtask.script}`
+    : SUBTASK_OWNER_LABELS[subtask.owner];
 
 export interface SubtaskStepView {
   readonly step: number;
