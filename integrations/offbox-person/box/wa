@@ -32,7 +32,35 @@ die() { echo "wa: $*" >&2; exit 2; }
 norm() { local j=$1; [[ $j == *@* ]] || j="${j//[^0-9]/}@s.whatsapp.net"; printf '%s\n' "$j"; }
 uctl() { systemctl --user "$@"; }
 authed() { "$W" auth status --json 2>/dev/null | grep -q '"authenticated":[[:space:]]*true'; }
-need_link() { [ -f "$WACLI_STORE_DIR/session.db" ] && authed || die "not linked yet (wa link <her number>)"; }
+need_link() { [ -f "$WACLI_STORE_DIR/session.db" ] && authed || die "not linked yet (wa link <her number>)"; catchup; }
+# Right after a box resume the service has only just reconnected: wait (max ~25 s) for WhatsApp's offline sync, so a
+# read or watcher run sees what arrived while the box was stopped.
+catchup() {
+  uctl is-active --quiet $SVC || return 0
+  local since now
+  since=$(uctl show -p ActiveEnterTimestampMonotonic --value $SVC 2>/dev/null) || return 0
+  now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+  (( now - since < 90000000 )) || return 0
+  local start_ms=$(( $(date +%s%3N) - (now - since) / 1000 ))
+  for _ in $(seq 1 25); do
+    python3 - "$P/wa/sync.events.log" "$start_ms" <<'PY' && return 0
+import json, sys
+try:
+    lines = open(sys.argv[1], errors="replace").read().splitlines()[-200:]
+except OSError:
+    sys.exit(1)
+for l in reversed(lines):
+    try:
+        e = json.loads(l)
+    except ValueError:
+        continue
+    if e.get("event") == "offline_sync_completed" and e.get("ts", 0) >= int(sys.argv[2]):
+        sys.exit(0)
+sys.exit(1)
+PY
+    sleep 1
+  done
+}
 
 cmd=${1:-status}; shift || true
 case $cmd in
@@ -57,7 +85,7 @@ case $cmd in
     # sync then takes over.
     systemd-run --user --unit=wa-link --collect --quiet \
       --setenv=WACLI_STORE_DIR="$WACLI_STORE_DIR" \
-      bash -c "'$W' auth ${mode[*]} --events --idle-exit 90s >/dev/null 2>>'$log'; systemctl --user start $SVC" \
+      bash -c "'$W' auth ${mode[*]} --events --idle-exit 90s >/dev/null 2>>'$log' && systemctl --user enable --now $SVC" \
       || die "could not start the link job"
     for _ in $(seq 1 45); do
       line=$(grep -m1 "\"event\":\"$kind\"" "$log" 2>/dev/null) && break
@@ -74,7 +102,7 @@ case $cmd in
     tail -3 "$P/wa/link.events.log" 2>/dev/null | cut -c1-300 | grep -v '"code"' || true
     ;;
   start|restart) need_link; uctl enable --quiet $SVC; uctl restart $SVC; sleep 3; exec "$0" status ;;
-  stop) uctl stop $SVC; echo stopped ;;
+  stop) uctl stop wa-link.service $SVC 2>/dev/null; echo stopped ;;
   chats) need_link; exec "$DB" chats "${1:-40}" ;;
   find) need_link; [ $# -ge 1 ] || die "usage: wa find <name|number>"; exec "$DB" find "$*" ;;
   read) need_link; [ $# -ge 1 ] || die "usage: wa read <jid> [N]"; exec "$DB" read "$(norm "$1")" --limit "${2:-40}" ;;
@@ -118,10 +146,11 @@ for m in d.get("messages") or []:
     [ $# -ge 2 ] || die "usage: wa new <jid> <watch-key> [run] [run-ok]"
     [[ $2 =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || die "bad watch key"
     uctl is-active --quiet $SVC || { echo "her wacli sync is not running ($(authed && echo linked || echo 'not linked'))" >&2; exit 1; }
+    catchup
     wd="$P/wa/watch/$2"; mkdir -p "$wd"
     [ -n "${4:-}" ] && printf '%s' "$4" > "$wd/.run-ok"
     WATCH_DIR="$wd" WATCH_RUN="${3:-}" exec "$DB" new "$(norm "$1")"
     ;;
   events) tail -n "${1:-20}" "$P/wa/sync.events.log" | grep -v '"qr_code"\|"pair_code"' | cut -c1-400 ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  *) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 2 ;;
 esac

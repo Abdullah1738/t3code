@@ -106,6 +106,69 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
   the `agent-mail` skill. Send only with the owner's or her OK on the exact draft.
 - Her working files: `~/person/files/` (for example `moni-spending-2026-09/`, her bank statement work).
 
+## Her WhatsApp (her own account, on her box; set up 31 Oct 2026)
+
+Same design as Abdullah's `wa` on the Mac (`whatsapp` skill), but her linked device, store and service live
+only on her box. Never read her chats with the owner's `wa`/`msgs` (those are HIS account), and never copy her
+store or messages to the Mac; only the answer she asked for goes back to her chat.
+
+- wacli 0.20.0 at `~/person/bin/wacli`, store `~/person/wa/store` (mode 700), systemd --user service
+  `wacli-sync` (`sync --follow`, same flags as the Mac LaunchAgent, Restart=always, enabled). Lingering is on,
+  so it starts on every box resume. Logs `~/person/wa/sync.events.log`. Reader `~/person/bin/wa-db` (the same
+  file as robob-watch `helpers/wa-db`), wrapper `~/person/bin/wa` (Dubai times).
+- From the Mac: `offbox-person wa <person> <cmd>`. A plain ssh: it resumes a stopped box (~10 s) and doesn't
+  start the browser or tunnels. After a resume the first read waits up to ~25 s for WhatsApp to hand over
+  what arrived while the box was off.
+
+```bash
+offbox-person wa moni status                  # online pid N | offline (linked|not linked) | linking
+offbox-person wa moni chats 20                # recent chats: name (unread) | jid
+offbox-person wa moni find "Ana"              # contacts -> jid | name | push name
+offbox-person wa moni read 9715xxxxxxx 40     # last 40 in that chat, phone JID + LID merged
+offbox-person wa moni search "passport" --after 2026-10-01 --limit 20   # FTS over all her chats
+offbox-person wa moni ids <jid> 10            # message ids + media type
+offbox-person wa moni download <jid> <msgid>  # -> ~/person/files/whatsapp/ on her box (send it with care)
+offbox-person wa moni send <jid> "text"       # sends AS HER. Only on her own ask, exact wording she OKed
+offbox-person wa moni sendfile <jid> <box-path> [caption]
+offbox-person wa moni events 20               # connected / logged_out / warnings
+offbox-person wa moni setup                   # (re)install wacli, wa, wa-db and the unit; idempotent
+```
+
+- Sending: it's her account. Send only what she asked for, in her words or a draft she OKed in her chat.
+  Never test-send to her contacts.
+- Linking or re-linking (her phone removed the device, `logged_out` in events): `offbox-person wa moni link
+  <her number, digits>` prints an 8-character code. Send it to her chat as one plain line: "WhatsApp > Settings
+  > Linked devices > Link a device > Link with phone number instead, then type this code: XXXX-XXXX". It is good for about 2
+  minutes. The link job (transient unit `wa-link`) then pulls history and starts `wacli-sync` by itself.
+  `link --qr` prints a QR payload instead (render the text as a PNG; it rotates every 20 s, so the pair code is
+  easier over iMessage). `link-status` shows progress. At most two tries, then ask her when she's free.
+  Her number is in `~/.config/spectrum-bridge/access.json`.
+- Watchers on her WhatsApp: robob-watch on the Mac, with `--chat moni` so the fire wakes HER chat (never the
+  owner's; a failed wake stays pending, there is no owner fallback). The check is
+  `offbox-person-wa-new <person> <jid>`: it runs `wa new` on her box, whose cursor and outbox live in
+  `~/person/wa/watch/<watcher id>` there (the runner's WATCH_RUN/.run-ok are passed along). Remove the
+  watcher when done; the box-side cursor dir can stay.
+
+```bash
+robob-watch add --id moni-wa-ana --title "Ana replied on Moni's WhatsApp" --chat moni \
+  --check 'offbox-person-wa-new moni 9715xxxxxxx' --interval 300 --mode wake --expires 3d --max-fires 1 \
+  --session CURRENT_SESSION_ID --context "Moni asked (date) to be told when Ana replies about X. Read the chat with offbox-person wa moni read <jid>, tell Moni in one line. Never send anything from her WhatsApp."
+```
+
+- Cost (her box is `default`, $0.036/h; it stops after 10 min idle and stopped is free). Every `wa` call or
+  watcher run touches the lease and keeps it up for another 10 min. No watcher: the box only runs while an
+  agent uses it, about $0. A watcher at 5 min or less keeps the box on: about $0.86/day ($26/month). A
+  30 min interval lets it stop between runs, roughly $0.30/day, but a reply can wait up to 30 min. While the
+  box is stopped, her phone holds the new messages and hands them over on the next resume (offline sync), so
+  nothing is lost, only delayed. Pick the interval for the job, give watchers a short expiry, and don't run an
+  always-on watcher for her without a reason she gave. The owner's `msgs` doesn't index her WhatsApp, on
+  purpose; use `wa search` on her box.
+- Linked devices are dropped by WhatsApp after about 30 days without connecting. The box is pinned and boat
+  resumes it at least every 12 days, but if `wa status` says `not linked` or the events show `logged_out`, re-link
+  as above.
+- Her WhatsApp store (session keys and messages) is in the encrypted Dropbox backup with the rest of her
+  home.
+
 ## Backups (Dropbox)
 
 `offbox-person-backup <person>|--all` backs up her box home from its latest boat snapshot:
