@@ -558,6 +558,19 @@ it.effect("a subtask a script ticks, which moves a deployed card back to todo, w
       { _tag: "event", event: "card.moved" },
       "watcher",
     );
+    // The land script has to exist before a card names it.
+    const ticker = yield* register(
+      board,
+      scriptFile(
+        [
+          `echo '{"kanban":"move","card":1,"to":"deployed","note":"landed"}'`,
+          `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged"}'`,
+          "",
+        ].join("\n"),
+      ),
+      manual,
+      "ticker",
+    );
     // Step 1: the script's merge. Step 2: the worker's follow-up.
     const card = yield* kanban.createCard(
       board.id,
@@ -572,19 +585,6 @@ it.effect("a subtask a script ticks, which moves a deployed card back to todo, w
       owner,
     );
     assert.strictEqual(card.number, 1);
-    // The land script moves the card to deployed, then ticks its merge subtask.
-    const ticker = yield* register(
-      board,
-      scriptFile(
-        [
-          `echo '{"kanban":"move","card":1,"to":"deployed","note":"landed"}'`,
-          `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged"}'`,
-          "",
-        ].join("\n"),
-      ),
-      manual,
-      "ticker",
-    );
     yield* scripts.listen;
     yield* scripts.run(ticker.id, "manual");
     yield* scripts.idle;
