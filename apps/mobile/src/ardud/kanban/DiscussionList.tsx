@@ -16,27 +16,42 @@ import { SearchField } from "../../components/ui/SearchField";
 import { cn } from "../../lib/cn";
 import { LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
+import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
+import {
+  discussionMenu,
+  MENU_ICONS,
+  runDiscussionMenu,
+  snoozeDiscussion,
+} from "./discussionActions";
 import { kanbanClient } from "./kanbanStore";
+import { useDiscussionShelves } from "./use-discussion-shelves";
 
 /**
- * Board discussions, newest first, like the thread list: open ones on top,
- * then Snoozed and Settled shelves that open on tap. Long-press a row for
- * Settle, Snooze and Rename.
+ * Board discussions, newest first, like the thread list: pinned ones on top,
+ * then open ones, then Snoozed and Settled shelves that open on tap. Long-press
+ * a row for Settle, Snooze, Pin and Rename.
  */
 export function DiscussionList(props: {
   readonly state: KanbanBoardState;
   readonly nowMs: number;
   readonly bottomInset: number;
   readonly selectedId?: string | null;
+  readonly hideCards: boolean;
+  readonly unreadOnly: boolean;
   readonly onOpen: (discussionId: string) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [open, setOpen] = useState({ snoozed: false, settled: false });
   const searchRef = useRef<TextInputInstance | null>(null);
-  const groups = discussionRows(props.state, props.nowMs, { query });
-  const total = groups.active.length + groups.snoozed.length + groups.settled.length;
+  const groups = discussionRows(props.state, props.nowMs, {
+    query,
+    hideCards: props.hideCards,
+    unreadOnly: props.unreadOnly,
+  });
+  const total =
+    groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const boardId = props.state.board.id;
+  const shelves = useDiscussionShelves(boardId);
+  const open = shelves.open;
   useEffect(() => kanbanClient().watchPreviews(boardId), [boardId]);
   if (!props.state.discussionsLoaded && total === 0 && query === "") return <LoadingLine />;
   const searching = query.trim() !== "";
@@ -74,7 +89,18 @@ export function DiscussionList(props: {
           />
         </View>
       ) : null}
-      {total === 0 ? <EmptyLine label={searching ? "No matches" : "No discussions"} /> : null}
+      {total === 0 ? (
+        <EmptyLine
+          label={
+            searching
+              ? "No matches"
+              : props.unreadOnly
+                ? "No unread discussions"
+                : "No discussions"
+          }
+        />
+      ) : null}
+      {rowList(groups.pinned)}
       {rowList(groups.active)}
       {(["snoozed", "settled"] as const).map((kind) => {
         const rows = groups[kind];
@@ -88,7 +114,7 @@ export function DiscussionList(props: {
               count={rows.length}
               expanded={expanded}
               tone={kind}
-              onToggle={() => setOpen((current) => ({ ...current, [kind]: !current[kind] }))}
+              onToggle={() => shelves.toggle(kind)}
             />
             {expanded ? rowList(rows) : null}
           </View>
@@ -134,6 +160,7 @@ function menuActions(row: DiscussionRow): MenuAction[] {
   return discussionMenu({
     settled: row.settledAt !== null,
     snoozed: row.snoozedUntil !== null,
+    pinned: row.pinnedAt !== null,
     now: new Date(),
   }).map((item) => ({
     id: item.id,
@@ -158,63 +185,77 @@ function DiscussionItem(props: {
       : snoozeWakeLabel(row.snoozedUntil, { now: new Date(props.nowMs).toISOString() });
   const label = [
     row.title,
+    row.pinnedAt !== null ? "pinned" : null,
     row.unread > 0 ? `${row.unread} unread` : null,
     wake && `snoozed ${wake}`,
   ]
     .filter(Boolean)
     .join(", ");
+  const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
   return (
-    <Menu
-      shouldOpenOnLongPress
-      title={row.title}
-      actions={menuActions(row)}
-      onPressAction={({ nativeEvent }) =>
-        runDiscussionMenu({
-          boardId: props.boardId,
-          discussionId: row.id,
-          title: row.title,
-          choice: nativeEvent.event,
-        })
-      }
-    >
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={label}
-        accessibilityHint="Long-press for settle, snooze and rename"
-        accessibilityState={{ selected: props.selected }}
-        onPress={() => props.onOpen(row.id)}
-        className={cn("min-h-16 gap-1 rounded-[12px] px-3 py-2.5", props.selected && "bg-card")}
+    <>
+      <Menu
+        shouldOpenOnLongPress
+        title={row.title}
+        actions={menuActions(row)}
+        onPressAction={({ nativeEvent }) =>
+          runDiscussionMenu({
+            boardId: props.boardId,
+            discussionId: row.id,
+            title: row.title,
+            choice: nativeEvent.event,
+            onCustomSnooze: () => setCustomSnoozeOpen(true),
+          })
+        }
       >
-        <View className="flex-row items-center gap-2">
-          <Text
-            numberOfLines={1}
-            className={cn(
-              "shrink text-[15px]",
-              settled ? "text-foreground-muted" : "text-foreground",
-              row.unread > 0 ? "font-t3-bold" : "font-t3-medium",
-            )}
-          >
-            {row.title}
-          </Text>
-          {row.unread > 0 ? <View className="size-1.5 rounded-full bg-primary" /> : null}
-          <View className="flex-1" />
-          {wake ? (
-            <View className="flex-row items-center gap-1">
-              <SymbolView name="clock" size={11} tintColorClassName="accent-foreground-muted" />
-              <Text className="text-[12px] text-foreground-muted">{wake}</Text>
-            </View>
-          ) : row.at ? (
-            <Text className="text-[12px] text-foreground-muted">
-              {clockLabel(row.at, props.nowMs)}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={label}
+          accessibilityHint="Long-press for settle, snooze, pin and rename"
+          accessibilityState={{ selected: props.selected }}
+          onPress={() => props.onOpen(row.id)}
+          className={cn("min-h-16 gap-1 rounded-[12px] px-3 py-2.5", props.selected && "bg-card")}
+        >
+          <View className="flex-row items-center gap-2">
+            <Text
+              numberOfLines={1}
+              className={cn(
+                "shrink text-[15px]",
+                settled ? "text-foreground-muted" : "text-foreground",
+                row.unread > 0 ? "font-t3-bold" : "font-t3-medium",
+              )}
+            >
+              {row.title}
+            </Text>
+            {row.pinnedAt !== null ? (
+              <SymbolView name="pin" size={12} tintColorClassName="accent-foreground-muted" />
+            ) : null}
+            {row.unread > 0 ? <View className="size-1.5 rounded-full bg-primary" /> : null}
+            <View className="flex-1" />
+            {wake ? (
+              <View className="flex-row items-center gap-1">
+                <SymbolView name="clock" size={11} tintColorClassName="accent-foreground-muted" />
+                <Text className="text-[12px] text-foreground-muted">{wake}</Text>
+              </View>
+            ) : row.at ? (
+              <Text className="text-[12px] text-foreground-muted">
+                {clockLabel(row.at, props.nowMs)}
+              </Text>
+            ) : null}
+          </View>
+          {row.preview ? (
+            <Text numberOfLines={1} className="text-[13px] text-foreground-muted">
+              {row.preview}
             </Text>
           ) : null}
-        </View>
-        {row.preview ? (
-          <Text numberOfLines={1} className="text-[13px] text-foreground-muted">
-            {row.preview}
-          </Text>
-        ) : null}
-      </Pressable>
-    </Menu>
+        </Pressable>
+      </Menu>
+      {customSnoozeOpen ? (
+        <CustomSnoozeSheet
+          onClose={() => setCustomSnoozeOpen(false)}
+          onSnooze={(snoozedUntil) => snoozeDiscussion(props.boardId, row.id, snoozedUntil)}
+        />
+      ) : null}
+    </>
   );
 }

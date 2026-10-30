@@ -1,9 +1,10 @@
-import { useNavigation } from "@react-navigation/native";
+import { StackActions, useNavigation } from "@react-navigation/native";
 import {
   viewMarkdownChunks,
   viewMarkdownFold,
   viewMarkdownPreview,
 } from "@t3tools/client-runtime/ardud/common";
+import { parseKanbanLink } from "@t3tools/client-runtime/ardud/kanban";
 import { parseThreadLinkHref } from "@t3tools/shared/threadLinks";
 import { useMemo, useState } from "react";
 import { FlatList, Modal, View } from "react-native";
@@ -17,11 +18,30 @@ import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { usePairedEnvironmentId } from "./environment";
 import { LinkButton } from "./parts";
 
-/** Thread links open the thread's screen (after `before`, e.g. closing a reader); others open outside. */
-function useOpenMarkdownLink(before?: () => void) {
+/** A board link resolves to the record it opens on the current board, or null when it isn't on that board. */
+export type KanbanLinkTarget = {
+  readonly kind: "card" | "discussion";
+  readonly boardId: string;
+  readonly id: string;
+};
+export type ResolveKanbanLink = (href: string) => KanbanLinkTarget | null;
+
+/**
+ * Thread links open the thread's screen and board links open the card or
+ * discussion (after `before`, e.g. closing a reader); others open outside.
+ * A board link that isn't on the current board stays inert.
+ */
+function useOpenMarkdownLink(before?: () => void, resolveKanbanLink?: ResolveKanbanLink) {
   const navigation = useNavigation();
   const environmentId = usePairedEnvironmentId();
   return (href: string) => {
+    if (parseKanbanLink(href) !== null) {
+      const target = resolveKanbanLink?.(href) ?? null;
+      if (target === null) return;
+      before?.();
+      navigation.dispatch(StackActions.push("KanbanRecord", target));
+      return;
+    }
     const threadId = parseThreadLinkHref(href);
     if (threadId === null) return void tryOpenExternalUrl(href, "markdown-link");
     if (environmentId === null) return;
@@ -58,11 +78,12 @@ export function MarkdownText(props: {
   readonly text: string;
   readonly maxLines: number | null;
   readonly tone?: "screen" | "user";
+  readonly resolveKanbanLink?: ResolveKanbanLink;
 }) {
   const textStyle = useTextStyle(props.tone ?? "screen");
   const [unfolded, setUnfolded] = useState(false);
   const [reading, setReading] = useState(false);
-  const openMarkdownLink = useOpenMarkdownLink();
+  const openMarkdownLink = useOpenMarkdownLink(undefined, props.resolveKanbanLink);
   const [height, setHeight] = useState<number | null>(null);
   const preview = useMemo(
     () =>
@@ -110,7 +131,13 @@ export function MarkdownText(props: {
           />
         </View>
       )}
-      {reading ? <MarkdownReader text={props.text} onClose={() => setReading(false)} /> : null}
+      {reading ? (
+        <MarkdownReader
+          text={props.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+          onClose={() => setReading(false)}
+        />
+      ) : null}
     </View>
   );
 }
@@ -119,7 +146,11 @@ export function MarkdownText(props: {
  * A long report in a screen of its own. It renders in pieces as they scroll
  * in, where one native view of the whole text would lay out every line first.
  */
-function MarkdownReader(props: { readonly text: string; readonly onClose: () => void }) {
+function MarkdownReader(props: {
+  readonly text: string;
+  readonly resolveKanbanLink?: ResolveKanbanLink;
+  readonly onClose: () => void;
+}) {
   return (
     <Modal
       visible
@@ -130,15 +161,23 @@ function MarkdownReader(props: { readonly text: string; readonly onClose: () => 
       {/* Its own provider: the modal is a separate window whose insets follow
           rotation, where the board's would go stale. */}
       <SafeAreaProvider>
-        <MarkdownReaderBody text={props.text} onClose={props.onClose} />
+        <MarkdownReaderBody
+          text={props.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+          onClose={props.onClose}
+        />
       </SafeAreaProvider>
     </Modal>
   );
 }
 
-function MarkdownReaderBody(props: { readonly text: string; readonly onClose: () => void }) {
+function MarkdownReaderBody(props: {
+  readonly text: string;
+  readonly resolveKanbanLink?: ResolveKanbanLink;
+  readonly onClose: () => void;
+}) {
   const styles = useMarkdownPreviewStyles();
-  const openMarkdownLink = useOpenMarkdownLink(props.onClose);
+  const openMarkdownLink = useOpenMarkdownLink(props.onClose, props.resolveKanbanLink);
   const insets = useSafeAreaInsets();
   const chunks = useMemo(() => viewMarkdownChunks(props.text), [props.text]);
   return (

@@ -18,6 +18,7 @@ import {
 import {
   askViews,
   canSendChoice,
+  cardSteps,
   discussionPresence,
   discussionRows,
   goalPage,
@@ -50,6 +51,7 @@ function card(number: number, patch: Partial<KanbanCard> = {}): KanbanCard {
     model,
     models: [],
     subtasks: [],
+    subtaskSeq: 0,
     projectId: null,
     links: [],
     blockedBy: [],
@@ -129,6 +131,8 @@ function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
     titleEditedAt: null,
     settledAt: null,
     snoozedUntil: null,
+    pinnedAt: null,
+    reopenedAt: null,
   } as never;
 }
 
@@ -170,6 +174,44 @@ describe("stageBoard", () => {
     expect(view.owner.cards[0]!.flag).toEqual({ kind: "ask", label: "Window?", blocking: true });
     expect(view.shipped.flatMap((column) => column.cards.map((c) => c.number))).toEqual([6]);
     expect(view.total).toBe(5);
+  });
+
+  it("labels a card waiting on a completed blocker's merge", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, {
+          stage: "completed",
+          subtasks: [
+            {
+              id: "m1",
+              step: 4,
+              text: "Rebase on latest ardud/main, merge into ardud/main, push origin main",
+              owner: "evaluator",
+              state: "open",
+              note: null,
+              doneBy: null,
+              doneAt: null,
+            },
+          ],
+        }),
+        card(2, { blockedBy: ["card-1" as never] }),
+      ]),
+    );
+    const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!;
+    expect(todo.cards[0]!.flag).toEqual({
+      kind: "blocked",
+      label: "Waits for #1 to be merged",
+    });
+  });
+
+  it("a card whose thread waits on its own question shows needsInput, not running", () => {
+    const state = boardStateFromSnapshot({
+      ...snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]),
+      threads: [{ threadId: ThreadId.make("t1"), title: "w", running: false, needsInput: true, lastActivityAt: null }],
+    } as never);
+    const view = stageBoard(state, NOW).active.find((column) => column.stage === "working")!.cards[0]!;
+    expect(view.needsInput).toBe(true);
+    expect(view.running).toBe(false);
   });
 
   it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {
@@ -240,6 +282,34 @@ describe("stageBoard", () => {
     const backlog = columns.find((column) => column.stage === "todo")!.cards.at(-1)!;
     expect(backlog.flag).toEqual({ kind: "blocked", label: "In the backlog" });
     expect(numbers("needs_review")).toEqual([6, 5]);
+  });
+
+  it("says a card waits on setup while the board's setup runs, and not after it ends", () => {
+    const setup = (status: "running" | "done") => ({
+      status,
+      discussionId: "disc-setup",
+      threadId: "t-setup",
+      startedAt: "2026-10-25T09:00:00.000Z",
+      finishedAt: status === "done" ? "2026-10-25T10:00:00.000Z" : null,
+    });
+    const withSetup = (status: "running" | "done", cards: KanbanCard[]) => {
+      const snap = snapshot(cards);
+      return boardStateFromSnapshot({
+        ...snap,
+        board: { ...snap.board, setup: setup(status) },
+      } as KanbanBoardSnapshot);
+    };
+    const flagOf = (state: ReturnType<typeof withSetup>, n: number) =>
+      stageBoard(state, NOW)
+        .active.flatMap((column) => column.cards)
+        .find((c) => c.number === n)!.flag;
+
+    const waiting = card(1, { priority: 1 });
+    const running = card(2, { priority: 1, stage: "working", activeThreadId: "t-work" as never });
+    const duringSetup = withSetup("running", [waiting, running]);
+    expect(flagOf(duringSetup, 1)).toEqual({ kind: "blocked", label: "Setup is running" });
+    expect(flagOf(duringSetup, 2)).toBeNull();
+    expect(flagOf(withSetup("done", [waiting, running]), 1)).toBeNull();
   });
 
   it("counts a card's subtasks, and flags one waiting on the evaluator's step", () => {
@@ -323,6 +393,121 @@ describe("groupCards", () => {
       ["Ungrouped", 1],
     ]);
     expect(groupCards(state, "goal", NOW).map((g) => g.label)).toEqual(["PBV2", "No goal"]);
+  });
+});
+
+describe("cardSteps", () => {
+  const completed = (number: number, movedAt: string) =>
+    card(number, { stage: "completed", movedAt });
+
+  it("steps through a stage column in board order and stops at the ends", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        completed(1, "2026-10-25T09:00:00.000Z"),
+        completed(2, "2026-10-25T10:00:00.000Z"),
+        completed(3, "2026-10-25T11:00:00.000Z"),
+      ]),
+    );
+    const steps = (id: string) => cardSteps(state, NOW, {}, "stage", id);
+    // Newest first: 3, 2, 1.
+    expect(steps("card-3")).toMatchObject({ previous: null, next: "card-2" });
+    expect(steps("card-2")).toMatchObject({ previous: "card-3", next: "card-1" });
+    expect(steps("card-1")).toMatchObject({ previous: "card-2", next: null });
+  });
+
+  it("steps a Needs Owner card through Needs Owner, and a Working card with an open ask through Working", () => {
+    const ask = {
+      id: "q1",
+      text: "Which window?",
+      blocking: false,
+      by: { _tag: "thread", threadId: "t1" } as never,
+      at: "2026-10-25T10:00:00.000Z",
+      closedAt: null,
+    };
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "needs_owner", question: "Window?", priority: 2 }),
+        card(2, { stage: "needs_owner", question: "Scope?", priority: 2 }),
+        card(3, { stage: "working", asks: [ask] as never }),
+        card(4, { stage: "working" }),
+      ]),
+    );
+    expect(cardSteps(state, NOW, {}, "stage", "card-1")).toMatchObject({
+      previous: null,
+      next: "card-2",
+    });
+    expect(cardSteps(state, NOW, {}, "stage", "card-3")).toMatchObject({
+      previous: null,
+      next: "card-4",
+    });
+  });
+
+  it("skips cards the filter hides, and gives null for an unknown card", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "todo", title: "alpha" }),
+        card(2, { stage: "todo", title: "beta" }),
+        card(3, { stage: "todo", title: "alpha two" }),
+      ]),
+    );
+    const steps = cardSteps(state, NOW, { query: "alpha" }, "stage", "card-1");
+    expect(steps.next).toBe("card-3");
+    expect(cardSteps(state, NOW, { query: "alpha" }, "stage", "card-2")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+    expect(cardSteps(state, NOW, {}, "stage", "card-99")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+  });
+
+  it("steps within a card's goal group only when grouped by goal", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "todo", goalId: "goal-a" as never }),
+        card(2, { stage: "todo", goalId: "goal-a" as never }),
+        card(3, { stage: "todo" }),
+      ]),
+    );
+    const steps = cardSteps(state, NOW, {}, "goal", "card-2");
+    expect(steps.previous !== null || steps.next !== null).toBe(true);
+    expect([steps.previous, steps.next]).not.toContain("card-3");
+    expect(cardSteps(state, NOW, {}, "goal", "card-3")).toMatchObject({
+      previous: null,
+      next: null,
+    });
+  });
+
+  it("opens the next open Verified card after settling, and closes when none is left", () => {
+    const verified = (number: number, movedAt: string, settledAt: string | null = null) =>
+      card(number, { stage: "verified", movedAt, settledAt: settledAt as never });
+    // Newest first: A (12:00), B (11:00), C (10:00).
+    const state = boardStateFromSnapshot(
+      snapshot([
+        verified(1, "2026-10-25T12:00:00.000Z"),
+        verified(2, "2026-10-25T11:00:00.000Z"),
+        verified(3, "2026-10-25T10:00:00.000Z"),
+      ]),
+    );
+    expect(cardSteps(state, NOW, {}, "stage", "card-2").afterSettle).toBe("card-3");
+    expect(cardSteps(state, NOW, {}, "stage", "card-3").afterSettle).toBe("card-2");
+
+    const lone = boardStateFromSnapshot(snapshot([verified(1, "2026-10-25T12:00:00.000Z")]));
+    expect(cardSteps(lone, NOW, {}, "stage", "card-1").afterSettle).toBeNull();
+
+    const withSettled = boardStateFromSnapshot(
+      snapshot([
+        verified(1, "2026-10-25T12:00:00.000Z"),
+        verified(2, "2026-10-25T11:00:00.000Z", "2026-10-25T11:30:00.000Z"),
+        verified(3, "2026-10-25T10:00:00.000Z"),
+      ]),
+    );
+    expect(cardSteps(withSettled, NOW, { settled: "include" }, "stage", "card-1").afterSettle).toBe(
+      "card-3",
+    );
+
+    expect(cardSteps(state, NOW, {}, "goal", "card-2").afterSettle).toBeNull();
   });
 });
 
@@ -432,6 +617,55 @@ describe("discussions", () => {
       "later",
       "plain",
     ]);
+  });
+
+  it("puts pinned discussions in their own group and can hide card discussions", () => {
+    const named = (id: string, patch: Partial<KanbanDiscussion>) =>
+      ({ ...discussion(1, 1), id, title: id, ...patch }) as KanbanDiscussion;
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [
+      named("plain", {}),
+      named("pinned", { pinnedAt: "2026-10-25T10:00:00.000Z" }),
+      // Settled wins over a pin on the record.
+      named("parked-pinned", {
+        pinnedAt: "2026-10-25T10:00:00.000Z",
+        settledAt: "2026-10-25T11:30:00.000Z",
+      }),
+      named("snoozed-pinned", {
+        pinnedAt: "2026-10-25T10:00:00.000Z",
+        snoozedUntil: "2026-10-25T15:00:00.000Z",
+      }),
+      named("card-chat", { cardId: "card-1" as KanbanDiscussion["cardId"] }),
+      named("channel", { cardId: null }),
+    ]);
+    const ids = (rows: ReadonlyArray<{ id: string }>) => rows.map((row) => row.id).sort();
+    const groups = discussionRows(state, NOW);
+    expect(ids(groups.pinned)).toEqual(["pinned"]);
+    expect(ids(groups.settled)).toEqual(["parked-pinned"]);
+    expect(ids(groups.snoozed)).toEqual(["snoozed-pinned"]);
+    expect(ids(groups.active)).toEqual(["card-chat", "channel", "plain"]);
+
+    const hidden = discussionRows(state, NOW, { hideCards: true });
+    const visible = [
+      ...hidden.pinned,
+      ...hidden.active,
+      ...hidden.snoozed,
+      ...hidden.settled,
+    ].map((row) => row.id);
+    expect(visible).not.toContain("card-chat");
+    expect(visible).toContain("channel");
+    expect(ids(hidden.active)).toEqual(["channel", "plain"]);
+  });
+
+  it("keeps only unread discussions with unreadOnly", () => {
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [discussion(3, 1)]);
+    state = withDiscussions(state, [], [message(3, false, "Window?")]);
+    expect(discussionRows(state, NOW, { unreadOnly: true }).active.map((row) => row.id)).toEqual([
+      "disc-1",
+    ]);
+    state = withOwnerRead(state, "disc-1", 3);
+    expect(discussionRows(state, NOW, { unreadOnly: true }).active).toEqual([]);
   });
 
   it("searches discussions by title and latest message", () => {

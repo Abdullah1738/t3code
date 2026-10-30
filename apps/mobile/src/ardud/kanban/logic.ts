@@ -225,6 +225,28 @@ export function kanbanRecordState(
   return { kind, boardId, id };
 }
 
+/**
+ * Where a board link opens, as the record params the pushed screen reads: the
+ * card or discussion on this board. A link to another board, or to a record
+ * that isn't on this board, opens nothing (null).
+ */
+export function kanbanLinkTarget(
+  link: { readonly kind: string; readonly id: string },
+  boardId: string,
+  board: {
+    readonly cards: ReadonlyMap<string, unknown>;
+    readonly discussions: ReadonlyMap<string, unknown>;
+  },
+): { readonly kind: "card" | "discussion"; readonly boardId: string; readonly id: string } | null {
+  if (link.kind === "kanban-card") {
+    return board.cards.has(link.id) ? { kind: "card", boardId, id: link.id } : null;
+  }
+  if (link.kind === "kanban-discussion") {
+    return board.discussions.has(link.id) ? { kind: "discussion", boardId, id: link.id } : null;
+  }
+  return null;
+}
+
 /** An attachment the server has stored, as a block refers to it. */
 export type StoredAttachment = ChatImageAttachment | ChatFileAttachment;
 
@@ -273,4 +295,44 @@ export function groupBlockRuns(blocks: ReadonlyArray<KanbanBlock>): BlockRun[] {
     }
   });
   return runs;
+}
+
+/**
+ * A native filter-menu action id. Facet values are the same strings the menu
+ * was built from: priorities are numbers, the rest are goal ids, project and
+ * model names; "" marks the "No ..." option.
+ */
+export type FilterAction =
+  | { readonly kind: "toggle"; readonly facet: "priorities"; readonly value: number }
+  | {
+      readonly kind: "toggle";
+      readonly facet: "goalIds" | "projects" | "models";
+      readonly value: string;
+    }
+  | { readonly kind: "clear" };
+
+export function filterActionId(action: FilterAction): string {
+  if (action.kind === "clear") return "clear";
+  const key = { priorities: "priority", goalIds: "goal", projects: "project", models: "model" }[
+    action.facet
+  ];
+  return `${key}:${action.value}`;
+}
+
+export function parseFilterAction(id: string): FilterAction | null {
+  if (id === "clear") return { kind: "clear" };
+  const separator = id.indexOf(":");
+  if (separator < 0) return null;
+  const key = id.slice(0, separator);
+  const value = id.slice(separator + 1);
+  if (key === "priority") {
+    const priority = Number(value);
+    return Number.isInteger(priority) && priority >= 1 && priority <= 5
+      ? { kind: "toggle", facet: "priorities", value: priority }
+      : null;
+  }
+  if (key === "goal") return { kind: "toggle", facet: "goalIds", value };
+  if (key === "project") return { kind: "toggle", facet: "projects", value };
+  if (key === "model") return { kind: "toggle", facet: "models", value };
+  return null;
 }

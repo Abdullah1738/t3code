@@ -9,10 +9,12 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event, file_lock,
-                     month_key, new_id, now, read_json, say)
+from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event,
+                     file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
+# Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
+ARCHIVING_WAIT_S = 120
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
@@ -56,6 +58,19 @@ def uses_docker(cmd: str, repo_root: str) -> bool:
         except OSError:
             continue
     return False
+
+
+TYPECHECK_CMD = re.compile(r"\btsc(-rs)?\b|\btypecheck\b")
+
+
+def typecheck_size(cmd: str, repo_root: str, size: str | None) -> str | None:
+    """Type-check runs in JS/TS repos get xlarge: large boxes get OOM-killed (exit 137) on the Robob server
+    typecheck. An explicit size always wins; only repos with a package.json are affected."""
+    if size:
+        return size
+    if TYPECHECK_CMD.search(cmd or "") and os.path.isfile(os.path.join(repo_root or "", "package.json")):
+        return "xlarge"
+    return None
 
 
 def docker_recent(con, box_id: str | None = None, within: int = 7200, repo_root: str | None = None,
@@ -108,13 +123,16 @@ def pick_template(root: Path, repo_key: str) -> str:
 
 def find_lease(con, owner: str, root: str):
     capacity.schema(con)
+    # A box with an unconfirmed prune worker is never handed back, not even to its own caller.
     mapped = con.execute("SELECT l.*, c.remote_dir AS caller_dir FROM pool_callers c JOIN leases l USING(box_id) "
-                         "WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped')", (owner, root)).fetchone()
+                         "WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') "
+                         "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)", (owner, root)).fetchone()
     if mapped:
         out = dict(mapped)
         out['remote_dir'] = out.pop('caller_dir')
         return out
     return con.execute("SELECT * FROM leases WHERE owner=? AND repo_root=? AND state IN ('running','stopped') "
+                       "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=leases.box_id) "
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
 
@@ -268,7 +286,11 @@ def _bigger(a: str | None, b: str | None) -> bool:
     return rank.get(a, 1) > rank.get(b or "default", 1)
 
 
-def _reuse(con, row, size: str | None):
+class ArchivingSkip(OffboxError):
+    """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
@@ -283,6 +305,13 @@ def _reuse(con, row, size: str | None):
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     st = s.get("state")
+    if st == "archiving":
+        if skip_archiving:
+            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
+        say(f"{box_id} is stopping; waiting to resume it")
+        s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
+        st = s.get("state")
+    # After the archiving wait: a box that came back live still gets the size check below.
     have = s.get("type") or row["size"]
     want = have
     if st in api.LIVE_STATES and _bigger(size, have):
@@ -294,11 +323,38 @@ def _reuse(con, row, size: str | None):
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
         api.stop(box_id)
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
-        st = s.get("state")
-    if st == "archiving":
-        say(f"{box_id} is stopping; waiting to resume it")
-        s = api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
+        if skip_archiving:
+            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
+            # bigger size once boat reports it archived.
+            ssh_sync.close_master(box_id)
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+            con.commit()
+            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+            raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
+        # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
+        # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
+        try:
+            s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except OffboxError:
+            s = api.get(box_id)
+            st = s and s.get("state")
+            if st in api.LIVE_STATES and not _bigger(want, s.get("type") or have):
+                pass  # live and already big enough: use it
+            elif st in api.LIVE_STATES:
+                # The stop didn't take and the box is live at its old size. Record that, and refuse rather than
+                # hand out a box smaller than the run asked for.
+                got = s.get("type") or have
+                con.execute("UPDATE leases SET state='running', size=? WHERE box_id=?", (got, box_id))
+                con.commit()
+                event(con, box_id, "lease_resize_bounced", f"{got}, wanted {want}")
+                raise OffboxError(f"{box_id} came back {got} instead of stopping to grow to {want}; "
+                                  f"nothing ran, retry") from None
+            else:
+                # Still stopping: the stop was asked for, so the next caller resumes it once boat says archived.
+                ssh_sync.close_master(box_id)
+                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+                con.commit()
+                raise
         st = s.get("state")
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,
@@ -345,22 +401,94 @@ def keep_images(box_id: str) -> None:
         event(db(), box_id, "keep_images_failed", str(e)[:300])
 
 
-def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True) -> bool:
+_HOLDS_DDL = ("CREATE TABLE IF NOT EXISTS prune_holds ("
+              "box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL)")
+
+
+def ensure_holds(con) -> None:
+    """Create the prune_holds table if this database predates it. common.db() builds only the old schema, and
+    capacity.schema() is not guaranteed to have run first, so every hold path makes the table itself."""
+    con.execute(_HOLDS_DDL)
+
+
+def clear_prune_hold(con, box_id: str) -> None:
+    """Release a box's prune hold. Call only once no remote process can still run there: the box is deleted.
+    Never by time alone. Callers outside a box-locked, fresh-confirmed path must use release_if_confirmed."""
+    ensure_holds(con)
+    con.execute("DELETE FROM prune_holds WHERE box_id=?", (box_id,))
+    con.commit()
+
+
+def settle_stranded_runs(con, box_id: str) -> int:
+    """Mark the box's starting/running runs lost. Call only once boat has confirmed the box is gone or stopped, so
+    no process can still be running them. A run that outlived its client (no one left to end it) is then not
+    counted as active forever. Caller holds 'box-<id>'. Returns how many runs were settled."""
+    cur = con.execute("UPDATE runs SET status='lost', end_at=? WHERE box_id=? AND status IN ('starting','running')",
+                      (now(), box_id))
+    con.commit()
+    if cur.rowcount:
+        event(con, box_id, "run_lost", f"{cur.rowcount} stranded run(s) settled: box confirmed gone or stopped")
+    return cur.rowcount
+
+
+def _release_locked(con, box_id: str, run_id: str | None = None) -> bool:
+    """The confirmation and release, for a caller that already holds 'box-<id>'. Not reentrant: never call it
+    without the lock held. Boat is asked first, not after the active-run check: a box confirmed gone or stopped has
+    no live process, so its stranded runs are settled and then the hold can go. A live box with an active run is
+    never released. A failed read is not confirmation. run_id, when given, limits the clear to that run's hold."""
+    try:
+        s = api.get(box_id)
+    except OffboxError:
+        return False  # a failed read is not confirmation: keep the hold, a later pass retries
+    if s is not None and s.get("state") not in api.STOPPED_STATES:
+        return False  # boat reports it live: its runs may be real, so nothing is settled and nothing released
+    settle_stranded_runs(con, box_id)
+    if active_runs(con, box_id):
+        return False
+    ensure_holds(con)
+    if run_id is None:
+        con.execute("DELETE FROM prune_holds WHERE box_id=?", (box_id,))
+    else:
+        con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+    con.commit()
+    return True
+
+
+def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
+    """For a caller that does NOT hold the box lock: take it (no wait), then confirm and release. A busy lock keeps
+    the hold, since a run may be allocating the box right now."""
+    try:
+        with file_lock('box-' + box_id, timeout=0):
+            return _release_locked(con, box_id, run_id)
+    except OffboxError:
+        return False
+
+
+def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False) -> bool:
+    """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
+    released with _release_locked, since the lock is not reentrant."""
     if images:
         keep_images(box_id)
+    release = _release_locked if locked else release_if_confirmed
     try:
         api.stop(box_id)
         if wait:
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
-            con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-            con.commit()
+            # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
+            # state and the hold, so the reaper revisits this box and releases it on a later pass.
+            if release(con, box_id):
+                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+                con.commit()
             return False
         raise
     ssh_sync.close_master(box_id)
     con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
     con.commit()
+    # Clear the hold only after boat confirms the box is stopped; a stop merely accepted, or a box resumed in the
+    # meantime, keeps its hold.
+    release(con, box_id)
     event(con, box_id, "stop", reason)
     return True
 
@@ -373,6 +501,7 @@ def delete_box(con, box_id: str, reason: str) -> bool:
     op = (d.get("operation") or {}).get("id")
     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
     con.commit()
+    clear_prune_hold(con, box_id)  # deleted: no remote process survives
     event(con, box_id, "delete", f"{reason} op={op}")
     return True
 

@@ -1,5 +1,5 @@
 # offbox template: crpko-node (large). Expo/React Native prototypes (crpko-mobile-prototype), crpko-devops scripts,
-# Next.js frontends. No .nvmrc in those repos; react-native 0.86 / metro need node ^20.19.4 || ^22.13 || ^24.3 -> Node 24.
+# Next.js frontends. Node 24 (nvm default) plus Node 22 for repos that pin 22.13 (.nvmrc/engines); offbox picks the one the repo asks for.
 # npm cache lives in $HOME/.npm (npm_config_cache), kept by stops/forks.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -9,6 +9,7 @@ export NVM_DIR="$HOME/.nvm"
 
 NODE_MAJOR="${OFFBOX_NODE_MAJOR:-24}"
 nvm install "$NODE_MAJOR" >/dev/null
+nvm install 22 >/dev/null  # crpko_mobile_app and backoffice-frontend pin 22.13 via .nvmrc/engines; offbox picks per repo
 nvm alias default "$NODE_MAJOR" >/dev/null
 nvm use default >/dev/null
 node --version

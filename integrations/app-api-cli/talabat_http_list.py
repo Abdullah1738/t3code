@@ -19,6 +19,7 @@ PATH = '/vendor-list/v1/orders/country/4'
 HOME = {'latitude': '25.0778251', 'longitude': '55.1569039'}
 PAGE_SIZE = 75
 MAX_PAGES = 5
+MAX_SINGLE_PAGE_ROWS = 2000
 STAGES = {'Delivered': 'delivered', 'Preparing': 'preparing', 'Delivering': 'out for delivery'}
 
 
@@ -119,8 +120,13 @@ def _list_orders(saved, deadline, page, pages, limit, *, stop_at=None):
     for index in range(page, page + pages):
         data = page_request(saved, index, deadline)
         rows, last, total = data.get('orders'), data.get('is_last_page'), data.get('total_orders')
-        if (not isinstance(rows, list) or len(rows) > PAGE_SIZE or type(last) is not bool
+        if (not isinstance(rows, list) or type(last) is not bool
                 or type(total) is not int or total < 0 or total < len(rows)):
+            raise http.TalabatError('ORDER_LIST_SCHEMA_CHANGED')
+        # Since 2026-10-28 the server ignores page_size and returns the whole
+        # history on page 0. Accept that only as one complete, final page.
+        if len(rows) > PAGE_SIZE and not (index == 0 and last and len(rows) == total
+                                          and len(rows) <= MAX_SINGLE_PAGE_ROWS):
             raise http.TalabatError('ORDER_LIST_SCHEMA_CHANGED')
         pages_fetched += 1
         rows_fetched += len(rows)

@@ -105,8 +105,6 @@ export type State = {
   wakes?: TrackedWake[];
   /** Trigger-file signature seen at the start of the last run. */
   trigger_sig?: string;
-  /** The owner was told this watcher is held (see heldCheck). */
-  held_alerted?: boolean;
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
 
@@ -221,13 +219,6 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   const relays = input.relays;
   if (relays !== undefined && !validRelays(relays)) {
     errors.push("relays must be up to 8 distinct {to, name, quote, at}: to a phone number or phone/group jid (not an @lid), quote the owner's own words allowing it, at the ISO time he said it (not in the future)");
-  }
-  // 23 Oct: an ETA watcher's standing OK in its context let it text a group 5-7 times; who may hear from a fire is now a field.
-  if (relays === undefined && mentionsWhatsAppSend(input)) {
-    errors.push("this watcher may send WhatsApp messages: list who it may message in relays (with the owner's words allowing each), or pass --owner-only (relays: []) so it tells only the owner");
-  } else if (Array.isArray(relays) && relays.length === 0 && WA_SENDS.test(String(input.check ?? ""))) {
-    // Sol r2 (25 Oct): owner-only can't stop a draft the check itself makes; the fire wakes the agent, which tells him.
-    errors.push("an owner-only watcher's check can't run wa draft/send/sendfile: make the check only detect the change, and the fire tells the owner");
   }
   if (errors.length) throw new Error(errors.join("; "));
   return {
@@ -382,22 +373,25 @@ export const mentionsWhatsAppSend = (watcher: { check?: unknown; context?: unkno
   WA_SENDS.test(`${watcher.check ?? ""}\n${watcher.context ?? ""}`);
 
 /**
- * A watcher that may message nobody (no relays field, from before they existed, or owner-only) whose check
- * command itself drafts or sends WhatsApp: the check never runs, since a draft it makes can't be taken back by
- * an owner-only wake. Re-adding it with a check that only detects the change releases it (or with relays the
- * owner named).
+ * One-line notes printed when a watcher is added, for a watcher whose text or check sends WhatsApp. Nothing is
+ * refused: relays (his words per person) are optional, and a check that sends runs on every change.
  */
-export const heldCheck = (watcher: Watcher) => (watcher.relays ?? []).length === 0 && WA_SENDS.test(watcher.check);
+export function sendNotes(watcher: { check?: unknown; context?: unknown; relays?: unknown }): string[] {
+  const notes: string[] = [];
+  if (watcher.relays === undefined && mentionsWhatsAppSend(watcher)) {
+    notes.push("its text mentions WhatsApp sends: relays, with his words, are optional and give the fire his stops and the ETA throttle");
+  }
+  if (WA_SENDS.test(String(watcher.check ?? ""))) {
+    notes.push("its check sends WhatsApp by itself on every change, with no agent reading it first");
+  }
+  return notes;
+}
 
-/**
- * Set up before relays existed (11c84e10d9) and its text talks about WhatsApp sends: nobody besides the owner
- * was ever listed, so it is owner-only. The add-time guard only sees new input; this covers the old ones.
- */
+/** Set up before relays existed and its text talks about WhatsApp sends: it lists nobody but the owner. */
 export const unscopedSender = (watcher: Watcher) => watcher.relays === undefined && mentionsWhatsAppSend(watcher);
 
 function relayLines(watcher: Watcher): string[] {
-  const legacy = unscopedSender(watcher);
-  if (watcher.relays === undefined && watcher.trip === undefined && !legacy) return [];
+  if (watcher.relays === undefined && watcher.trip === undefined) return [];
   const stops = readStops();
   const relays = (watcher.relays ?? []).map(relay => ({ relay, stop: stopFor(stops, watcher, relay) }));
   const live = relays.filter(entry => !entry.stop).map(entry => entry.relay);
@@ -406,7 +400,6 @@ function relayLines(watcher: Watcher): string[] {
     live.length
       ? `People besides the owner this may update (he allowed each one; nobody else hears from this watcher). Before each message run \`robob-watch relay-ok ${watcher.id} --to <to>\` (add --eta ISO for an ETA change) and send only on "ok":`
       : "No third-party relays: tell only the owner.",
-    ...(legacy ? ["This watcher was set up before it had to name who it may message, and it names nobody: whatever its context says about messaging other people (drafts, sends, standing OKs) no longer applies. Tell only the owner."] : []),
     ...live.map(relay => `- ${relay.name} (${relay.to}), allowed ${relay.at.slice(0, 10)}: ${JSON.stringify(relay.quote)}`),
     ...relays.flatMap(({ relay, stop }) => stop
       ? [`- ${relay.name} (${relay.to}): the owner stopped these on ${stop.at.slice(0, 10)} (${JSON.stringify(stop.quote)}). Don't message them.`]
@@ -505,6 +498,26 @@ function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at:
   return { ok: true, reason: `send to ${relay.name}; counted at ${iso(at)}` };
 }
 
+/** Wakes repeat the saved context on every fire; this is the start that carries the action, the rest is a pointer. */
+export const CONTEXT_PREVIEW = 280;
+
+export function contextPreview(w: Watcher): string {
+  const context = w.context || "";
+  if (!context) return "(none)";
+  if (context.length <= CONTEXT_PREVIEW) return context;
+  const head = context.slice(0, CONTEXT_PREVIEW);
+  const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("\n"));
+  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: \`robob-watch context ${w.id}\` (read them before acting on anything beyond the lines above).`;
+}
+
+/** The first fire of each Dubai day (or of the watcher's quiet-hours zone) carries the whole context; decided from state so a retried key keeps its text. */
+function firstFireToday(watcher: Watcher, state: State): boolean {
+  if (!state.last_fire_at) return true;
+  const zone = watcher.quiet?.time_zone ?? "Asia/Dubai";
+  const day = (at: string) => new Intl.DateTimeFormat("en-CA", { timeZone: zone }).format(new Date(at));
+  return day(state.last_fire_at) !== day(state.pending?.at ?? iso());
+}
+
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
   const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
   const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
@@ -520,7 +533,7 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     clip(event.trim(), MAX_EVENT),
     "",
     "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
-    watcher.context || "(none)",
+    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher),
     "",
     `Watcher ${watcher.id} (${fires}). ${after}`,
   ].join("\n");
@@ -531,7 +544,6 @@ export type Delivery = { ok: boolean; via: string; detail: string };
 /** Delivers one event; each channel is idempotent under the same key. */
 export async function deliver(watcher: Watcher, event: string, key: string, state: State, test = false): Promise<Delivery> {
   const tried: string[] = [];
-  if (watcher.mode === "wake" && unscopedSender(watcher)) log(watcher.id, "mentions wa draft/send but lists no relays: told the agent owner-only");
   const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
   if (watcher.mode === "wake") {
     const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);
@@ -586,7 +598,7 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
     `Then \`robob-watch resume ${watcher.id}\` to re-run it at once and \`robob-watch show ${watcher.id}\` to confirm. Only text the owner if you cannot fix it or something was missed; otherwise log it and end with NO_REPLY.`,
     "",
     "The watcher's own context (do not act on it now; it is for when it fires):",
-    clip(watcher.context || "(none)", 1_500),
+    contextPreview(watcher),
   ].join("\n");
 }
 

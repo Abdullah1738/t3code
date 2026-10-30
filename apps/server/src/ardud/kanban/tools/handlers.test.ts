@@ -20,8 +20,11 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
+import * as KanbanModels from "../engine/models.ts";
 import { KanbanThreads } from "../engine/threads.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
 import { KanbanToolkit } from "./tools.ts";
 
@@ -68,6 +71,7 @@ const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =
 const fakeThreads = () => {
   const running = new Set<string>();
   let launched = 0;
+  const launches: Array<string> = [];
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
@@ -78,10 +82,20 @@ const fakeThreads = () => {
           title: "thread",
           state: running.has(threadId) ? "running" : "idle",
           updatedAt: "2026-10-26T08:00:00.000Z",
+          runStartedAt: null,
           prs: [],
+          archived: false,
         }),
-      launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
+      find: () => Effect.succeed(null),
+      lastFailure: () => Effect.succeed(null),
+      launch: (input) =>
+        Effect.sync(() => {
+          launches.push(input.text);
+          return ThreadId.make(`thread-${++launched}`);
+        }),
       send: () => Effect.void,
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
       interrupt: () => Effect.void,
     }),
   );
@@ -92,14 +106,16 @@ const fakeThreads = () => {
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(liveThreadsLayer),
     Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
-  return { running, layer };
+  return { running, launches, layer };
 };
 
 const owner: KanbanActor = { _tag: "owner" };
@@ -213,6 +229,45 @@ it.effect("board_open gives a board its icon only while it has none", () => {
       icon: "nope",
     }).pipe(Effect.flip);
     assert.include(String(unknown), "Invalid parameters");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("evaluator_start gives a sweep its text and refuses a second running sweep of the kind", () => {
+  const { running, launches, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const evaluator = ThreadId.make("thread-evaluator");
+
+    const first = yield* call(evaluator, "evaluator_start", {
+      boardId: "toy",
+      kind: "stalled",
+      text: "Only card #437",
+    });
+    assert.isFalse(first.isError, first.text);
+    assert.include(launches.at(-1) ?? "", "Only card #437");
+
+    running.add(first.structured.threadId as string);
+    const refused = yield* call(evaluator, "evaluator_start", {
+      boardId: "toy",
+      kind: "stalled",
+      text: "Only card #438",
+    });
+    assert.isTrue(refused.isError);
+    assert.include(refused.text, first.structured.threadId as string);
+    assert.strictEqual(launches.length, 1);
+
+    const request = yield* call(evaluator, "evaluator_start", {
+      boardId: "toy",
+      kind: "request",
+      text: "Look at #437",
+    });
+    assert.isFalse(request.isError, request.text);
+    assert.strictEqual(launches.at(-1)!.split("Look at #437").length, 2);
   }).pipe(Effect.provide(layer));
 });
 

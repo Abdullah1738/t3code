@@ -11,8 +11,9 @@ the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at
 
 Completion is quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
 a trip that disappears without a terminal history status shows "Checking" and is retried for
-UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself; the only bridge call
-it makes is `unshare`, an hour after a ride ended, for that ride's public share link.
+UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself; the only bridge calls
+it makes are `shares` and `unshare`, an hour after a ride ended, for that ride's public share link
+(never a stable-origin link, which stays up until someone unshares it on purpose).
 
 Env overrides (all optional):
   WATCH_DIR          directory for rides.json and polls.jsonl (one line per poll: raw Uber status,
@@ -137,16 +138,24 @@ def unshare_ended(now, live=None):
     """An hour after a ride ends, its public share link goes: the bridge caps live shares at 10 and
     old ride links used them all up (trip e44d36f9). Reads the share journal, so rides this state
     file no longer tracks are covered too. A bridge that fails is tried again next run. The trip Uber
-    shows right now is never touched, whatever its card says."""
+    shows right now is never touched, whatever its card says. A stable-origin link is never retired,
+    and a run that can't read the bridge's share list retires nothing."""
     if not os.environ.get("RIDE_CARD_BRIDGE") and Path(WD).resolve() != LIVE_DIR.resolve():
         return  # a scratch run's journal isn't the real one: never touch real shares from it
-    done = 0
+    done, permanent = 0, None
     for p in sorted(rc.journal_dir().glob("*.json")):
         if done >= UNSHARES_PER_RUN:
             return  # the rest go next run; the check has a 60s budget
         uuid = p.stem
         if uuid == live or not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() \
-                or not rc.public_link(uuid):
+                or not rc.public_link(uuid) or not rc.link_done(rc.load_card(uuid), now):
+            continue
+        if permanent is None:  # asked once per run, and only when some link is due
+            permanent = rc.permanent_apps()
+            if permanent is None:
+                print("ride-share: bridge share list unreadable, no link retired this run", file=sys.stderr)
+                return
+        if rc.slug(uuid) in permanent:
             continue
         try:
             with rc.trip_lock(uuid, wait=False):

@@ -12,7 +12,13 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentAuthorizationError,
 } from "../auth.ts";
-import { IsoDateTime, NonNegativeInt, ProjectId } from "../baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlock,
@@ -40,6 +46,7 @@ import {
   KanbanScriptRun,
   KanbanStage,
   KanbanThreadLink,
+  KanbanThreadRow,
   KanbanWikiPage,
 } from "./kanban.ts";
 
@@ -48,16 +55,21 @@ export const KANBAN_WS_METHODS = {
   subscribe: "kanban.subscribe",
   card: "kanban.card",
   discussions: "kanban.discussions",
+  threads: "kanban.threads",
+  owner: "kanban.owner",
   messages: "kanban.messages",
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
+  setupStart: "kanban.setup.start",
+  setupEnd: "kanban.setup.end",
   cardPatch: "kanban.card.patch",
   cardSettle: "kanban.card.settle",
   cardStop: "kanban.card.stop",
   cardAsk: "kanban.card.ask",
   cardDiscussion: "kanban.card.discussion",
   poolSet: "kanban.pool.set",
+  poolRemove: "kanban.pool.remove",
   discussionCreate: "kanban.discussion.create",
   discussionRead: "kanban.discussion.read",
   discussionUpdate: "kanban.discussion.update",
@@ -93,6 +105,8 @@ export const KanbanCardPatchInput = Schema.Struct({
   stage: Schema.optional(KanbanStage),
   /** Clears the stalled flag when false. */
   stalled: Schema.optional(Schema.Boolean),
+  /** Links to take off, by URL. */
+  removeLinks: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   comment: Schema.optional(Schema.String),
 });
 export type KanbanCardPatchInput = typeof KanbanCardPatchInput.Type;
@@ -112,12 +126,13 @@ export const KanbanBoardUpdateInput = Schema.Struct({
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
 
-/** Owner changes to a discussion. `settled: false` and `snoozedUntil: null` undo. */
+/** Owner changes to a discussion. `settled: false`, `snoozedUntil: null` and `pinned: false` undo. */
 export const KanbanDiscussionUpdateInput = Schema.Struct({
   discussionId: KanbanDiscussionId,
   title: Schema.optional(Schema.String),
   settled: Schema.optional(Schema.Boolean),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinned: Schema.optional(Schema.Boolean),
 });
 export type KanbanDiscussionUpdateInput = typeof KanbanDiscussionUpdateInput.Type;
 
@@ -150,6 +165,8 @@ export const KanbanRpcs = RpcGroup.make(
   }),
   call(M.card, CardRef, KanbanCardDetail),
   call(M.discussions, BoardRef, Schema.Array(KanbanDiscussion)),
+  call(M.threads, BoardRef, Schema.Array(KanbanThreadRow)),
+  call(M.owner, Schema.Struct({ threadId: ThreadId }), Schema.NullOr(KanbanThreadLink)),
   call(
     M.messages,
     Schema.Struct({
@@ -173,6 +190,16 @@ export const KanbanRpcs = RpcGroup.make(
     KanbanBoard,
   ),
   call(M.boardUpdate, KanbanBoardUpdateInput, KanbanBoard),
+  call(
+    M.setupStart,
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      evaluatorModel: ModelSelection,
+      text: Schema.optional(Schema.String),
+    }),
+    Schema.Struct({ discussionId: KanbanDiscussionId }),
+  ),
+  call(M.setupEnd, Schema.Struct({ boardId: KanbanBoardId }), KanbanBoard),
   call(M.cardPatch, KanbanCardPatchInput, KanbanCard),
   call(M.cardSettle, CardRef, KanbanCard),
   call(M.cardStop, CardRef, KanbanCard),
@@ -191,6 +218,11 @@ export const KanbanRpcs = RpcGroup.make(
   call(
     M.poolSet,
     Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection, slots: NonNegativeInt }),
+    Schema.Array(KanbanPool),
+  ),
+  call(
+    M.poolRemove,
+    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection }),
     Schema.Array(KanbanPool),
   ),
   call(
@@ -241,6 +273,8 @@ export const KANBAN_READ_SCOPES = {
   [M.subscribe]: AuthOrchestrationReadScope,
   [M.card]: AuthOrchestrationReadScope,
   [M.discussions]: AuthOrchestrationReadScope,
+  [M.threads]: AuthOrchestrationReadScope,
+  [M.owner]: AuthOrchestrationReadScope,
   [M.messages]: AuthOrchestrationReadScope,
   [M.wiki]: AuthOrchestrationReadScope,
   [M.scripts]: AuthOrchestrationReadScope,
@@ -251,12 +285,15 @@ export const KANBAN_READ_SCOPES = {
 export const KANBAN_GUARDED_SCOPES = {
   [M.boardCreate]: AuthOrchestrationOperateScope,
   [M.boardUpdate]: AuthOrchestrationOperateScope,
+  [M.setupStart]: AuthOrchestrationOperateScope,
+  [M.setupEnd]: AuthOrchestrationOperateScope,
   [M.cardPatch]: AuthOrchestrationOperateScope,
   [M.cardSettle]: AuthOrchestrationOperateScope,
   [M.cardStop]: AuthOrchestrationOperateScope,
   [M.cardAsk]: AuthOrchestrationOperateScope,
   [M.cardDiscussion]: AuthOrchestrationOperateScope,
   [M.poolSet]: AuthOrchestrationOperateScope,
+  [M.poolRemove]: AuthOrchestrationOperateScope,
   [M.discussionCreate]: AuthOrchestrationOperateScope,
   [M.discussionRead]: AuthOrchestrationOperateScope,
   [M.discussionUpdate]: AuthOrchestrationOperateScope,

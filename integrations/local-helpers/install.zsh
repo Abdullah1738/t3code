@@ -327,7 +327,9 @@ smoke env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -c "import sys; sys.path[:0
 smoke env PYTHONDONTWRITEBYTECODE=1 "$HOME/.local/bin/qcard" templates
 for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
-for f in power-unplug-telegram.sh battery-low-telegram.sh; do smoke zsh -n "$HOME/.local/bin/$f"; done
+for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health; do
+  smoke zsh -n "$HOME/.local/bin/$f"
+done
 # The way the watchers run it: bare PATH, no nvm.
 uber_ours && smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version
 (( fail )) && { print -u2 "local-helpers: installed, but the smoke test failed; the previous files are kept as *.bak-$stamp*"; exit 1 }

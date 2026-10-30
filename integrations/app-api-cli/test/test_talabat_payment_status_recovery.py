@@ -24,6 +24,10 @@ DECLINE = {'type': 'retry', 'title': "Couldn't complete payment",
            'cta': 'Try again'}
 BODY = {'status': 'Error', 'error': DECLINE, 'errors': DECLINE}
 REASON = 'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'
+ISSUER_DECLINE = {**DECLINE, 'exception': '20179 - Transaction was declined, please try again with another card.',
+                  'cta': 'Place order'}
+ISSUER_BODY = {'status': 'Error', 'error': ISSUER_DECLINE, 'errors': ISSUER_DECLINE}
+ISSUER_REASON = 'PAYMENT_DECLINED_BY_ISSUER_NO_RETRY'
 
 
 class PaymentStatusTests(unittest.TestCase):
@@ -74,6 +78,33 @@ class PaymentStatusTests(unittest.TestCase):
         for code in (None, True, 401, 403, 500):
             self.assertEqual(h.parse_async_status(code, BODY, CONTEXT).state, 'PAYMENT_UNKNOWN')
         self.assertEqual(h.parse_async_status(422, BODY, CONTEXT).reason, REASON)
+
+    def test_live_20179_issuer_decline_is_a_named_card_decline(self):
+        # 29 Oct Oomi 4682608185: same dual shape, processor 20179, cta "Place order".
+        result = h.parse_async_status(200, copy.deepcopy(ISSUER_BODY), CONTEXT)
+        self.assertEqual((result.state, result.reason), ('PAYMENT_ERROR_REPORTED', ISSUER_REASON))
+        self.assertNotIn('20179', str(vars(result)))
+        self.assertIn(ISSUER_REASON, cli.CARD_DECLINE_REASONS)
+        self.assertIn(('PAYMENT_ERROR_REPORTED', ISSUER_REASON), cli.receipts.PAYMENT_PAIRS)
+        # Mixed processor codes, non-string exceptions and Success never name a decline.
+        for body in ({**ISSUER_BODY, 'errors': DECLINE},
+                     {**ISSUER_BODY, 'errors': {**ISSUER_DECLINE, 'exception': None}},
+                     {**ISSUER_BODY, 'errors': {**ISSUER_DECLINE, 'exception': 20179}}):
+            with self.subTest(body=body['errors'].get('exception')):
+                self.assertEqual(h.parse_async_status(200, body, CONTEXT).reason, 'NO_ROLLBACK_OR_RETRY_ASSUMED')
+        result = h.parse_async_status(200, {**ISSUER_BODY, 'status': 'Success'}, CONTEXT)
+        self.assertEqual((result.state, result.reason), ('PAYMENT_ERROR_REPORTED', 'NO_ROLLBACK_OR_RETRY_ASSUMED'))
+
+    def test_issuer_decline_records_card_status_like_insufficient_funds(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(cli.os.environ, {'CARD_STATUS_FILE': str(Path(temp) / 'card-status.json')}):
+            noted = cli.note_card_decline({'reason': ISSUER_REASON, 'flow_id': FLOW, 'order': '4682608185'},
+                                          app='talabat')
+            self.assertTrue(noted['recorded'])
+            self.assertTrue(noted['blocked'])
+            self.assertIn(ISSUER_REASON, noted['message'])
+            self.assertIsNone(cli.note_card_decline({'reason': 'NO_ROLLBACK_OR_RETRY_ASSUMED', 'flow_id': FLOW},
+                                                    app='talabat'))
 
 
 class RecoveryTests(unittest.TestCase):

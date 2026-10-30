@@ -26,13 +26,17 @@ class ExitFidelityTests(Isolated):
     so the remote shell's status was echo's 0 while go test failed. offbox must return exactly what the remote
     shell returned and say so on its last line."""
 
-    def run_cli(self, argv, code):
+    def run_cli_full(self, argv, code, recorded=None):
         a = cli.build_parser().parse_args(['run', '--'] + argv)
         err = io.StringIO()
         with patch.object(runs.Runner, 'start', fake_start), patch.object(runs, 'follow', return_value=code), \
-                contextlib.redirect_stderr(err):
+                patch.object(runs, 'recorded_exit', return_value=recorded), contextlib.redirect_stderr(err):
             rc = cli.cmd_run(a, self.me)
-        return rc, err.getvalue().strip().splitlines()[-1]
+        return rc, err.getvalue().strip().splitlines()
+
+    def run_cli(self, argv, code, recorded=None):
+        rc, lines = self.run_cli_full(argv, code, recorded)
+        return rc, lines[-1]
 
     def test_nonzero_remote_exit_is_returned_and_printed_last(self):
         for code in (1, 2, 3, 97, 143):
@@ -56,6 +60,15 @@ class ExitFidelityTests(Isolated):
         self.assertEqual(rc, 90)
         self.assertIn('remote exit unknown', last)
 
+    def test_lost_process_uses_the_recorded_exit(self):
+        rc, lines = self.run_cli_full(['go', 'test', './...'], None, recorded=0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines[-1], 'offbox: remote exit 0')
+        self.assertTrue(any("exit 0 taken from the box's exit file" in ln for ln in lines))
+        rc, last = self.run_cli(['go', 'test', './...'], None, recorded=2)
+        self.assertEqual(rc, 2)
+        self.assertEqual(last, 'offbox: remote exit 2')
+
     def test_hint_only_when_status_can_be_masked(self):
         h = runs.masked_status_hint
         for cmd in ('go test ./...', "go test -run '^(TestA|TestB)$' ./pkg", 'go vet ./... && echo ok',
@@ -73,7 +86,8 @@ class RemoteWrapperTests(unittest.TestCase):
     def run_script(self, argv):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
-            with patch.object(runs, 'GO_REPAIR', ':'):
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                patch.object(runs, 'LDCACHE_REPAIR', ':'):
                 script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,
@@ -151,6 +165,42 @@ class RemoteWrapperTests(unittest.TestCase):
     def test_reserved_command_statuses_pass_through(self):
         for code in (90, 91, 92, 97):
             self.assertEqual(self.run_script([f'(exit {code}) | tail -1']), code)
+
+    def test_exit_file_records_the_status(self):
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / 'w/repo/sub').mkdir(parents=True)
+            env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+            cases = [(['false'], 1), (['exit 3'], 3), (['true'], 0), (['sh', '-c', 'kill -KILL $$'], 137)]
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                    patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                for argv, code in cases:
+                    with self.subTest(argv=argv):
+                        script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
+                        cmd = runs.exit_recording_command(script, 'run-test')
+                        p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(p.returncode, code)
+                        rc_file = Path(home) / '.offbox/exit/run-test.rc'
+                        self.assertEqual(rc_file.read_text().strip(), str(code))
+                steps_script = runs.remote_script('w/repo', 'sub', ['true; false; exit 4'], None, 'run-test',
+                                                  steps=['true', 'false', 'exit 4'])
+                cmd = runs.exit_recording_command(steps_script, 'run-test')
+                p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(p.returncode, 1)
+                self.assertEqual((Path(home) / '.offbox/exit/run-test.rc').read_text().strip(), '1')
+                self.assertIn('offbox step 3 rc=4', p.stderr)
+
+
+class WaitRecoveryTests(Isolated):
+    def test_wait_takes_the_recorded_exit_for_a_lost_run(self):
+        from offbox_lib import misc
+        row = {'run_id': 'run-x', 'status': 'running', 'box_id': 'bx_fake', 'process_id': 7, 'pulls': '[]',
+               'exit_code': None}
+        with patch.object(runs, 'follow', return_value=None), patch.object(runs, 'recorded_exit', return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc._wait_run(dict(row), False), 0)
+        with patch.object(runs, 'follow', return_value=None), patch.object(runs, 'recorded_exit', return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc._wait_run(dict(row), False), 90)
 
 
 class FakeClock:
@@ -231,7 +281,7 @@ class PoolQueueTests(Isolated):
                 self.con.commit()
         clock.time.sleep = sleep
         with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '600'}), patch.object(pool, 'time', clock.time), \
-                patch.object(lease, '_reuse', side_effect=lambda c, r, s: dict(r)), contextlib.redirect_stderr(io.StringIO()):
+                patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), contextlib.redirect_stderr(io.StringIO()):
             row = pool.acquire(self.me)
         try:
             self.assertEqual(row['box_id'], 'one')

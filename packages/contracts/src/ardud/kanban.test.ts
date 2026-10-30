@@ -5,10 +5,13 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanCardEvent,
   kanbanBlocking,
   kanbanBoardIcon,
+  kanbanHeldUpBy,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
+  KanbanThreadLink,
   type KanbanCard,
 } from "./kanban.ts";
 
@@ -30,6 +33,7 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
     model: { instanceId: "opencode" as never, model: "opus/claude-opus-5-5" },
     models: [],
     subtasks: [],
+    subtaskSeq: 0,
     projectId: null,
     links: [],
     blockedBy: blockedBy as never,
@@ -56,6 +60,22 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
   };
 }
 
+describe("KanbanCardEvent", () => {
+  it("decodes an event stored before head existed as head null", () => {
+    const event = Schema.decodeUnknownSync(KanbanCardEvent)({
+      id: 1,
+      cardId: "card-1",
+      at: "2026-10-29T10:00:00.000Z",
+      actor: { _tag: "owner" },
+      kind: "review",
+      fromStage: "in_review",
+      toStage: "completed",
+      body: "clear",
+    });
+    expect(event.head).toBeNull();
+  });
+});
+
 describe("kanbanBlocking", () => {
   it("counts a diamond of waiters once each and takes the most urgent one's priority", () => {
     const blocking = kanbanBlocking([
@@ -81,6 +101,96 @@ describe("kanbanBlocking", () => {
     ]);
     expect(blocking.get("a")).toEqual({ holds: 0, urgency: 3 });
     expect(blocking.get("c")).toEqual({ holds: 1, urgency: KANBAN_BACKLOG });
+  });
+});
+
+describe("kanbanHeldUpBy", () => {
+  const evaluatorSubtask = (text: string, state: "open" | "done" = "open") => ({
+    id: "s1",
+    step: 4,
+    text,
+    owner: "evaluator" as const,
+    state,
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  });
+  const mergeText =
+    "Rebase on latest ardud/main, rerun the box checks if it moved, merge into ardud/main, push origin main";
+  const waiter = card("w", { blockedBy: ["b"], workThreadId: "thread-w" as never });
+  const byId = (blocker: KanbanCard) => new Map([[blocker.id, blocker]]);
+
+  it("holds a waiter on a completed blocker whose merge subtask is open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it("releases the waiter once the blocker's merge subtask is done", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText, "done")],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("releases a waiter once the merge is done, even with a post-install check still open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [
+        evaluatorSubtask(mergeText, "done"),
+        evaluatorSubtask(
+          "After the next Robob install: check a dependent waits until its blocker's merge subtask is done.",
+        ),
+      ],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("holds a waiter on the other merge action forms on the board", () => {
+    for (const text of [
+      "Bring any prefs.md rule text to Abdullah first; merge; deploy robob-watch",
+      "merge router.ts into ardud/main",
+    ]) {
+      const blocker = card("b", {
+        stage: "completed",
+        workThreadId: "thread-b" as never,
+        subtasks: [evaluatorSubtask(text)],
+      });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+    }
+  });
+
+  it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask("Ask Abdullah to deploy spectrum-bridge")],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("doesn't hold a waiter on a verified blocker", () => {
+    const blocker = card("b", {
+      stage: "verified",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("doesn't hold a waiter on the same thread as a completed blocker awaiting merge", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-w" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 });
 
@@ -130,4 +240,23 @@ describe("own answers", () => {
     expect(decoded.choice).toEqual(["o1"]);
   });
 });
+});
+
+const decodeThreadLink = Schema.decodeUnknownSync(KanbanThreadLink);
+
+describe("KanbanThreadLink", () => {
+  it("decodes a link written before pauses existed as not paused", () => {
+    const decoded = decodeThreadLink({
+      threadId: "thread-1",
+      boardId: "board-1",
+      cardId: null,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model: null,
+      startedAt: "2026-10-28T00:00:00.000Z",
+      endedAt: null,
+    });
+    expect(decoded.paused).toBeNull();
+  });
 });

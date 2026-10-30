@@ -79,7 +79,9 @@ offbox local --list ; offbox local --clear
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
   at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
-  directories remain separate per local repo path. Dependencies are warm on whichever box you receive.
+  directories remain separate per local repo path. Dependencies are warm on whichever box you receive. Old
+  checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
+  last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
   Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–8) and
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
@@ -92,11 +94,13 @@ offbox local --list ; offbox local --clear
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
 - Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
   times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
+- Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`.
-  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (Node 24 + warm npm cache,
+  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
   the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
@@ -196,7 +200,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
-  repo and run that.
+  repo and run that. If boat loses track of a run that already ended (status `lost`), offbox reads the exit code the run left on the box (`~/.offbox/exit/<run>.rc`) or, for `--step` runs, the step lines when every step reported; only when neither exists is it 90.
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
 
 ## Troubleshooting
@@ -204,6 +208,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
 - Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it.
 - Go `package unsafe is not in std` or nested `/usr/local/go/go`: a half-swapped GOROOT; the next run repairs it under a box-local lock, verifies the replacement, and removes stale repair directories only after verification.
+- Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
+- Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
   `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).

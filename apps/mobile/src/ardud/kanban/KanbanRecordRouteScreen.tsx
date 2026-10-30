@@ -1,5 +1,10 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { discussionSnoozed, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  cardSteps,
+  discussionSnoozed,
+  type KanbanBoardState,
+  setupBanner,
+} from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanDiscussion } from "@t3tools/contracts";
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
@@ -7,15 +12,26 @@ import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-co
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
+import { IconButton } from "../../components/ui/IconButton";
 import type { AppBarAction, AppBarMenu } from "../../components/ui/AppBar.types";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { useHeaderInset, useNowMs } from "../common/hooks";
+import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
+import { useBoardFilter } from "./boardFilterStore";
+import { copyLinkAction } from "./copyLink";
+import { SetupStrip } from "./BoardView";
 import { Chat } from "./Chat";
-import { discussionMenu, MENU_ICONS, runDiscussionMenu } from "./discussionActions";
+import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
+import {
+  discussionMenu,
+  MENU_ICONS,
+  runDiscussionMenu,
+  snoozeDiscussion,
+} from "./discussionActions";
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
+import { useHideCardDiscussions } from "./useHideCardDiscussions";
 import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { kanbanRecordState, type KanbanRecordParams, requestTitle } from "./logic";
 import { useKanbanNav } from "./nav";
@@ -38,6 +54,7 @@ export function KanbanRecordRouteScreen({
   const feed = useKanbanBoardFeed(boardId);
   const nav = useKanbanNav(boardId);
   const back = () => navigation.goBack();
+  const filter = useBoardFilter(boardId);
 
   if (record === null) {
     return (
@@ -57,9 +74,35 @@ export function KanbanRecordRouteScreen({
   switch (record.kind) {
     case "card": {
       const card = state.cards.get(record.id ?? "");
+      const steps = cardSteps(state, nowMs, filter, "stage", record.id ?? "");
+      // Stepping replaces this screen's card (no new screen), so Back still returns to the board.
+      const step = (id: string) => navigation.setParams({ ...route.params, id });
       return (
-        <Shell title={card ? `#${card.number}` : "Card"} onBack={back}>
+        <Shell
+          title={card ? `#${card.number}` : "Card"}
+          onBack={back}
+          actions={[
+            ...(card
+              ? [copyLinkAction("kanban-card", card.id, `#${card.number} ${card.title}`)]
+              : []),
+            {
+              accessibilityLabel: "Previous card",
+              icon: "chevron.up",
+              disabled: steps.previous === null,
+              onPress: () => steps.previous && step(steps.previous),
+            },
+            {
+              accessibilityLabel: "Next card",
+              icon: "chevron.down",
+              disabled: steps.next === null,
+              onPress: () => steps.next && step(steps.next),
+            },
+          ]}
+          state={state}
+          boardId={boardId}
+        >
           <CardDetail
+            key={record.id}
             boardId={boardId}
             state={state}
             cardId={record.id ?? ""}
@@ -68,13 +111,19 @@ export function KanbanRecordRouteScreen({
             onOpenCard={nav.openCard}
             onOpenGoal={nav.openGoal}
             onOpenThread={nav.openThread}
+            stepper={{ steps, onStep: step, onDone: back }}
           />
         </Shell>
       );
     }
     case "goal":
       return (
-        <Shell title={state.goals.get(record.id ?? "")?.name ?? "Goal"} onBack={back}>
+        <Shell
+          title={state.goals.get(record.id ?? "")?.name ?? "Goal"}
+          onBack={back}
+          state={state}
+          boardId={boardId}
+        >
           <GoalView
             state={state}
             goalId={record.id ?? ""}
@@ -121,9 +170,15 @@ function Shell(props: {
   readonly onBack: () => void;
   readonly actions?: ReadonlyArray<AppBarAction>;
   readonly menus?: ReadonlyArray<AppBarMenu>;
+  /** The board, for its setup strip while the first setup runs. */
+  readonly state?: KanbanBoardState;
+  readonly boardId?: string;
   readonly children: ReactNode;
 }) {
   const headerInset = useHeaderInset();
+  const setup = props.state ? setupBanner(props.state.board) : null;
+  const navSetup = useKanbanNav(props.boardId ?? "");
+  const action = useBoardAction();
   return (
     <View collapsable={false} className="flex-1 bg-screen" style={{ paddingTop: headerInset }}>
       <AppBar
@@ -133,6 +188,19 @@ function Shell(props: {
         {...(props.actions ? { actions: props.actions } : {})}
         {...(props.menus ? { menus: props.menus } : {})}
       />
+      {setup && props.boardId ? (
+        <View className="px-4 pt-2">
+          <SetupStrip
+            setup={setup}
+            onViewSetup={(id) => navSetup.openDiscussion(id)}
+            onEndSetup={() =>
+              void action.run("Couldn't end setup", () =>
+                kanbanClient().endSetup(props.boardId ?? ""),
+              )
+            }
+          />
+        </View>
+      ) : null}
       <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
         {props.children}
       </KeyboardAvoidingView>
@@ -158,22 +226,36 @@ function DiscussionScreen(props: {
     props.discussionId === null ? undefined : props.state.discussions.get(props.discussionId);
   const card = discussion?.cardId ? props.state.cards.get(discussion.cardId) : undefined;
   const title = props.discussionId === null ? "New discussion" : discussion?.title || "Discussion";
+  const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
   return (
     <Shell
       title={title}
       onBack={props.onBack}
-      menus={discussion ? [discussionOptions(props.boardId, discussion, props.nowMs)] : []}
-      actions={
-        card
+      state={props.state}
+      boardId={props.boardId}
+      menus={
+        discussion
           ? [
-              {
-                accessibilityLabel: `Open #${card.number}`,
-                icon: "doc.text",
-                onPress: () => nav.openCard(card.id),
-              },
+              discussionOptions(props.boardId, discussion, props.nowMs, () =>
+                setCustomSnoozeOpen(true),
+              ),
             ]
           : []
       }
+      actions={[
+        ...(card
+          ? [
+              {
+                accessibilityLabel: `Open #${card.number}`,
+                icon: "doc.text" as const,
+                onPress: () => nav.openCard(card.id),
+              },
+            ]
+          : []),
+        ...(discussion
+          ? [copyLinkAction("kanban-discussion", discussion.id, discussion.title)]
+          : []),
+      ]}
     >
       <Chat
         boardId={props.boardId}
@@ -188,6 +270,12 @@ function DiscussionScreen(props: {
         bottomInset={props.bottomInset}
         onOpenCard={nav.openCard}
       />
+      {customSnoozeOpen && discussion ? (
+        <CustomSnoozeSheet
+          onClose={() => setCustomSnoozeOpen(false)}
+          onSnooze={(snoozedUntil) => snoozeDiscussion(props.boardId, discussion.id, snoozedUntil)}
+        />
+      ) : null}
     </Shell>
   );
 }
@@ -197,15 +285,23 @@ function discussionOptions(
   boardId: string,
   discussion: KanbanDiscussion,
   nowMs: number,
+  onCustomSnooze: () => void,
 ): AppBarMenu {
   const run = (choice: string) =>
-    runDiscussionMenu({ boardId, discussionId: discussion.id, title: discussion.title, choice });
+    runDiscussionMenu({
+      boardId,
+      discussionId: discussion.id,
+      title: discussion.title,
+      choice,
+      onCustomSnooze,
+    });
   return {
     title: "Discussion options",
     icon: "ellipsis.circle",
     items: discussionMenu({
       settled: discussion.settledAt !== null,
       snoozed: discussionSnoozed(discussion, nowMs),
+      pinned: discussion.pinnedAt !== null,
       now: new Date(nowMs),
     }).map((item) =>
       "presets" in item
@@ -244,12 +340,37 @@ function DiscussionsScreen(props: {
   const open = (id: string | null) =>
     wide ? setSelected({ id, key: id ?? `new-${Date.now()}` }) : nav.openDiscussion(id);
   const selectedId = selected?.id ?? null;
+  const splitDiscussion = selectedId === null ? undefined : props.state.discussions.get(selectedId);
+  const { hideCards, toggleHideCards } = useHideCardDiscussions();
+  const [unreadOnly, setUnreadOnly] = useState(false);
 
   return (
     <Shell
       title="Discussions"
       onBack={props.onBack}
+      state={props.state}
+      boardId={props.boardId}
       actions={[{ accessibilityLabel: "New discussion", icon: "plus", onPress: () => open(null) }]}
+      menus={[
+        {
+          title: "Filter",
+          icon: "line.3.horizontal.decrease.circle",
+          items: [
+            {
+              id: "hide-cards",
+              title: "Hide card discussions",
+              selected: hideCards,
+              onPress: toggleHideCards,
+            },
+            {
+              id: "unread-only",
+              title: "Unread only",
+              selected: unreadOnly,
+              onPress: () => setUnreadOnly((on) => !on),
+            },
+          ],
+        },
+      ]}
     >
       <View
         className="flex-1 flex-row"
@@ -261,6 +382,8 @@ function DiscussionsScreen(props: {
             nowMs={props.nowMs}
             bottomInset={props.bottomInset}
             selectedId={wide ? selectedId : null}
+            hideCards={hideCards}
+            unreadOnly={unreadOnly}
             onOpen={open}
           />
         </View>
@@ -272,6 +395,19 @@ function DiscussionsScreen(props: {
                 boardId={props.boardId}
                 state={props.state}
                 discussionId={selected.id}
+                header={
+                  splitDiscussion ? (
+                    <View className="flex-row justify-end px-4 pt-2">
+                      <IconButton
+                        {...copyLinkAction(
+                          "kanban-discussion",
+                          splitDiscussion.id,
+                          splitDiscussion.title,
+                        )}
+                      />
+                    </View>
+                  ) : undefined
+                }
                 ensureDiscussion={async (firstText) => {
                   const id = await createDiscussion(props.boardId, firstText);
                   setSelected((current) => (current ? { ...current, id } : current));

@@ -109,6 +109,7 @@ export interface PreviewTabState {
   audioMuted: boolean;
   audible: boolean;
   controller: "human" | "agent" | "none";
+  capturing: boolean;
   favicon?: DesktopPreviewFavicon;
   serverTab?: { readonly threadId: string; readonly tabId: string };
   updatedAt: string;
@@ -391,7 +392,8 @@ interface ManagedListeners {
   readonly webContents: Electron.WebContents;
 }
 
-type FrameCaptureConsumer = "picture-in-picture" | "recording";
+// Each still-image request owns a separate, short-lived rendering lease.
+type FrameCaptureConsumer = "picture-in-picture" | "recording" | symbol;
 
 interface FrameCaptureSession {
   readonly recordingInputOptions?: RecordingInputOptions;
@@ -1716,6 +1718,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           audioMuted: false,
           audible: false,
           controller: "none",
+          capturing: false,
           updatedAt,
         };
         return [
@@ -1789,6 +1792,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       audioMuted: false,
       audible: false,
       controller: "none",
+      capturing: false,
       updatedAt,
     };
     yield* emit(tabId, closed);
@@ -2023,7 +2027,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         audioMuted: current?.audioMuted ?? false,
         audible: current?.audible ?? false,
         controller: current?.controller ?? "none",
+        capturing: current?.capturing ?? false,
         ...(current?.favicon ? { favicon: current.favicon } : {}),
+        ...(current?.serverTab ? { serverTab: current.serverTab } : {}),
         updatedAt,
       };
       return [
@@ -2386,7 +2392,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         return;
       }
       if (afterAttach.serverTab) {
-        yield* listenForAgentPointers;
+        yield* listenToBrowserHost;
         browserHost.attach(afterAttach.serverTab, { webContents: wc, debugger: control.debugger });
       }
       if (afterAttach.colorScheme !== "system") {
@@ -2487,7 +2493,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const [createdAt, millis, image] = yield* Effect.all([
       currentIso,
       currentMillis,
-      capturePageWithRetry(
+      captureStillImage(
         {
           operation: "captureScreenshot.capturePage",
           tabId,
@@ -2533,6 +2539,104 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       sizeBytes: data.byteLength,
       createdAt,
     };
+  });
+
+  const captureStillImage = Effect.fn("PreviewManager.captureStillImage")(function* (
+    errorContext: PreviewOperationContext,
+    tabId: string,
+    wc: Electron.WebContents,
+  ) {
+    const consumer = Symbol("still-image");
+    return yield* Effect.acquireUseRelease(
+      startFrameCapture(tabId, consumer),
+      () =>
+        Effect.gen(function* () {
+          // A DOM mutation can precede its compositor frame even in a shown
+          // window. Keep the original guest rendering through the next paint;
+          // a hidden guest otherwise returns old pixels or never completes.
+          const probe = Effect.fn("PreviewManager.probeStillImagePaint")(function* (
+            send: (
+              method: string,
+              params?: Record<string, unknown>,
+            ) => Effect.Effect<unknown, PreviewOperationError>,
+          ) {
+            // CDP executes against the current document without Electron's
+            // did-stop-loading gate. Isolate scheduling globals from page code.
+            const tree = (yield* send("Page.getFrameTree")) as
+              | { frameTree?: { frame?: { id?: string } } }
+              | undefined;
+            const frameId = tree?.frameTree?.frame?.id;
+            if (typeof frameId !== "string")
+              return yield* new PreviewOperationError({
+                ...errorContext,
+                cause: new Error("The preview paint frame is unavailable."),
+              });
+            const world = (yield* send("Page.createIsolatedWorld", {
+              frameId,
+              worldName: "t3-preview-still-image",
+            })) as { executionContextId?: number } | undefined;
+            if (typeof world?.executionContextId !== "number")
+              return yield* new PreviewOperationError({
+                ...errorContext,
+                cause: new Error("The preview paint context is unavailable."),
+              });
+            const response = (yield* send("Runtime.evaluate", {
+              // Settle and release scheduled work when only timers keep running.
+              // The outer deadline still bounds a frozen renderer.
+              expression: `new Promise(resolve => { let frame; const timer = setTimeout(() => { cancelAnimationFrame(frame); resolve(false); }, ${CAPTURE_PAGE_ATTEMPT_TIMEOUT_MS}); frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => { clearTimeout(timer); resolve(true); }); }); })`,
+              contextId: world.executionContextId,
+              awaitPromise: true,
+              returnByValue: true,
+            })) as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
+            if (response?.exceptionDetails || response?.result?.value !== true)
+              return yield* new PreviewOperationError({
+                ...errorContext,
+                cause: new Error("The preview paint boundary was not confirmed."),
+              });
+          });
+          const paintReady = Effect.gen(function* () {
+            // Only use an existing owned session; never attach or displace
+            // another debugger to obtain a screenshot.
+            const control = (yield* SynchronizedRef.get(controlSessionsRef)).get(wc.id);
+            if (!control)
+              return yield* new PreviewOperationError({
+                ...errorContext,
+                cause: new Error("The preview paint session is unavailable."),
+              });
+            return yield* control.semaphore.withPermit(
+              probe((method, params) =>
+                attemptPromise(errorContext, () => control.debugger.sendCommand(method, params)),
+              ),
+            );
+          }).pipe(
+            Effect.timeout(CAPTURE_PAGE_ATTEMPT_TIMEOUT_MS),
+            Effect.catch((error) =>
+              Effect.logWarning(
+                "Preview paint readiness was not confirmed; capturing available pixels with mutation freshness unconfirmed.",
+                { tabId, webContentsId: wc.id, error },
+              ),
+            ),
+          );
+          // capturePage temporarily marks the original guest as captured. A
+          // minimized page can otherwise keep animation frames suspended even
+          // with scheduler throttling disabled. Discard this warmup image and
+          // accept its output only after readiness settles. If the bounded
+          // probe cannot confirm paint, retain the native capture fallback.
+          const warmup = capturePageWithRetry(errorContext, tabId, wc).pipe(
+            Effect.catchTags({
+              PreviewOperationError: (error) =>
+                Effect.logWarning("Preview warmup capture failed; continuing with final capture.", {
+                  tabId,
+                  webContentsId: wc.id,
+                  error,
+                }),
+            }),
+          );
+          yield* Effect.all([paintReady, warmup], { concurrency: 2, discard: true });
+          return yield* capturePageWithRetry(errorContext, tabId, wc);
+        }),
+      () => stopFrameCapture(tabId, consumer),
+    );
   });
 
   const capturePreviewFrame = Effect.fn("PreviewManager.capturePreviewFrame")(function* (
@@ -3339,14 +3443,33 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       { discard: true },
     );
   });
-  let pointersStarted = false;
-  const listenForAgentPointers = Effect.suspend(() => {
-    if (pointersStarted) return Effect.void;
-    pointersStarted = true;
-    return browserHost.pointers.pipe(
-      Stream.runForEach(emitAgentPointer),
-      Effect.forkIn(parentScope),
-      Effect.asVoid,
+  const updateServerTabCapturing = Effect.fn("PreviewManager.updateServerTabCapturing")(
+    function* (painting: {
+      readonly key: { readonly threadId: string; readonly tabId: string };
+      readonly active: boolean;
+    }) {
+      const tab = [...(yield* SynchronizedRef.get(tabsRef)).values()].find(
+        (candidate) =>
+          candidate.serverTab?.threadId === painting.key.threadId &&
+          candidate.serverTab.tabId === painting.key.tabId,
+      );
+      if (tab && tab.capturing !== painting.active) {
+        yield* update(tab.tabId, { capturing: painting.active });
+      }
+    },
+  );
+  let browserHostStarted = false;
+  // Subscribes before the attach that follows, so no event falls between the two.
+  const listenToBrowserHost = Effect.suspend(() => {
+    if (browserHostStarted) return Effect.void;
+    browserHostStarted = true;
+    const listen = Effect.forkIn(parentScope, { startImmediately: true });
+    return Effect.all(
+      [
+        browserHost.pointers.pipe(Stream.runForEach(emitAgentPointer), listen),
+        browserHost.painting.pipe(Stream.runForEach(updateServerTabCapturing), listen),
+      ],
+      { discard: true },
     );
   });
 

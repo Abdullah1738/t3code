@@ -130,6 +130,7 @@ import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 // ardud kanban: ui-mobile
 import { KanbanBoardRouteScreen } from "./ardud/kanban/KanbanBoardRouteScreen";
+import { NewBoardRouteScreen } from "./ardud/kanban/NewBoardRouteScreen";
 import { KanbanRecordRouteScreen } from "./ardud/kanban/KanbanRecordRouteScreen";
 // end ardud kanban: ui-mobile
 // ardud imessage: mobile
@@ -789,6 +790,10 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: KanbanBoardRouteScreen,
       linking: "boards/:boardId",
       options: { ...SOLID_HEADER_OPTIONS, title: "Board" },
+    }),
+    KanbanNewBoard: createNativeStackScreen({
+      screen: NewBoardRouteScreen,
+      options: { ...SOLID_HEADER_OPTIONS, title: "New board" },
     }),
     KanbanRecord: createNativeStackScreen({
       screen: KanbanRecordRouteScreen,

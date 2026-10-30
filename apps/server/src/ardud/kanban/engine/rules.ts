@@ -8,6 +8,7 @@ import {
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanDiscussion,
   type KanbanGroup,
   type KanbanPool,
   type KanbanStage,
@@ -112,11 +113,94 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
-/** Every PR link merged or closed. A card with no PR has nothing to wait for. */
+/** Why a card can't be completed or deployed yet, or null. */
+export function reviewGate(card: KanbanCard, chainLength: number): string | null {
+  const open = card.subtasks.filter((s) => s.owner === "review" && s.state === "open");
+  if (open.length > 0)
+    return `card #${card.number} still has review subtask ${open.map((s) => s.id).join(", ")} open: it closes when its review passes`;
+  if (!reviewFinished(card, chainLength))
+    return `card #${card.number} hasn't passed its review: move it to needs_review`;
+  return null;
+}
+
+/**
+ * Every PR the work thread linked is merged or closed. Only those get a state
+ * (syncPrs); a PR link without one is context and holds nothing. A card with
+ * no PR has nothing to wait for.
+ */
 export function prsLanded(card: KanbanCard): boolean {
   return card.links
-    .filter((link) => link.kind === "pr")
+    .filter((link) => link.kind === "pr" && link.state !== null)
     .every((link) => link.state === "merged" || link.state === "closed");
+}
+
+export const DISCUSSION_IDLE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A discussion settles itself after a quiet day unless it is pinned, snoozed, being replied to, or its card is still open.
+ * The caller checks threads.
+ */
+export function discussionSettleDue(
+  discussion: KanbanDiscussion,
+  card: KanbanCard | null,
+  nowMs: number,
+): boolean {
+  if (discussion.archivedAt !== null || discussion.settledAt !== null) return false;
+  if (discussion.pinnedAt !== null) return false;
+  if (discussion.snoozedUntil !== null && Date.parse(discussion.snoozedUntil) > nowMs) return false;
+  if (discussion.participants.some((participant) => participant.typingUntil !== null)) return false;
+  if (card !== null && card.stage !== "verified") return false;
+  const quietSince = Math.max(
+    Date.parse(discussion.lastMessageAt ?? discussion.createdAt),
+    discussion.reopenedAt === null ? 0 : Date.parse(discussion.reopenedAt),
+    discussion.snoozedUntil === null ? 0 : Date.parse(discussion.snoozedUntil),
+  );
+  return nowMs - quietSince >= DISCUSSION_IDLE_MS;
+}
+
+export const WORKER_QUIET_MS = 30 * 60 * 1000;
+
+/** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
+export function workerQuietDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly updatedAt: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle" && view.state !== "needs-input") return false;
+  const since = Math.max(
+    Date.parse(view.updatedAt),
+    Date.parse(card.movedAt),
+    card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+  );
+  return nowMs - since >= WORKER_QUIET_MS;
+}
+
+// Words a provider uses when it is out of usage or down, not when the request is wrong.
+const OUTAGE_TEXT =
+  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired/i;
+
+/** A failed run the same request would pass once the provider is back. */
+export function isOutage(failure: {
+  readonly class: string;
+  readonly code: string | null;
+  readonly message: string;
+}): boolean {
+  if (failure.class === "usage_limit") return true;
+  if (failure.code === "provider.quota" || failure.code === "provider.rate-limit") return true;
+  return OUTAGE_TEXT.test(failure.message);
+}
+
+export const PROBE_FIRST_MS = 5 * 60 * 1000;
+export const PROBE_MAX_MS = 30 * 60 * 1000;
+export const nextProbeDelay = (delayMs: number): number => Math.min(delayMs * 2, PROBE_MAX_MS);
+
+/** Pools on a down model take no new card; threads already running are untouched. */
+export function maskDownPools(
+  pools: ReadonlyArray<KanbanPool>,
+  down: ReadonlySet<string>,
+): ReadonlyArray<KanbanPool> {
+  return pools.map((pool) => (down.has(pool.key) ? { ...pool, slots: 0 } : pool));
 }
 
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
@@ -220,6 +304,8 @@ export function planDispatch(
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
 ): ReadonlyArray<Dispatch> {
+  // A board's first setup holds all card work and review until the setup evaluator ends it.
+  if (board.setup?.status === "running") return [];
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
@@ -306,6 +392,8 @@ export interface ClaimContext {
  * outside the thread.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
+  // Same hold as planDispatch: no card work starts while the board's setup runs.
+  if (board.setup?.status === "running") return no("Setup is running");
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

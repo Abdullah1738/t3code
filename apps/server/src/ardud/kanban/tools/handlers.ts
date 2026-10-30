@@ -411,7 +411,14 @@ const handlers = {
         if (input.verdict === "findings" && findings.length === 0) {
           return yield* invalid("A findings verdict needs at least one finding.");
         }
-        return { card: yield* service.reviewResult(caller.threadId, input.verdict, findings) };
+        return {
+          card: yield* service.reviewResult(
+            caller.threadId,
+            input.verdict,
+            findings,
+            input.head ?? null,
+          ),
+        };
       }),
     ),
   ),
@@ -568,6 +575,7 @@ const handlers = {
               ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
               : {}),
             links: input.links,
+            removeLinks: input.removeLinks,
             blockedBy,
             ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
             subtasks: input.subtasks,
@@ -619,6 +627,15 @@ const handlers = {
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
         return { pools: yield* service.setPool(board.id, modelOf(input.model), input.slots) };
+      }),
+    ),
+  ),
+
+  pool_remove: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { pools: yield* service.removePool(board.id, modelOf(input.model)) };
       }),
     ),
   ),
@@ -705,6 +722,15 @@ const handlers = {
     ),
   ),
 
+  setup_done: McpToolAccess.actsAsCaller(() =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller);
+        return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
@@ -713,11 +739,23 @@ const handlers = {
         let purpose: EvaluatorPurpose;
         if (input.kind === "setup" || input.kind === "request") {
           if (!text) return yield* invalid(`A ${input.kind} evaluator needs text.`);
-          purpose = { kind: input.kind, text };
+          purpose = {
+            kind: input.kind,
+            text,
+            ...(input.kind === "setup" ? { discussionId: input.discussionId ?? null } : {}),
+          };
         } else {
           purpose = { kind: input.kind };
         }
-        return { threadId: yield* service.startEvaluator(KanbanBoardId.make(board.id), purpose) };
+        // A sweep's text is added to its brief; setup/request already carry it in purpose.
+        const sweepText = purpose.kind === "setup" || purpose.kind === "request" ? undefined : text;
+        return {
+          threadId: yield* service.startEvaluator(
+            KanbanBoardId.make(board.id),
+            purpose,
+            sweepText || undefined,
+          ),
+        };
       }),
     ),
   ),

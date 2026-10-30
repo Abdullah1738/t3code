@@ -25,9 +25,16 @@ commerce item-options minutes --sku SKU --query "product name"
 noon-search --minutes "grenade white chocolate"      # pick the exact SKU
 commerce order minutes --sku SKU --quantity 1 \
     --cvv-from-keychain --label "minutes <item> x1 (CLI E2E test)"
-commerce await-payment FLOW_UUID [--minutes 4] [--no-notify]   # crash-resume status wait
+commerce await-payment FLOW_UUID [--minutes 10] [--no-notify]  # crash-resume status wait (default wait 10 min)
 commerce track-exact noon minutes ORDER_ID
 ```
+
+Noon can ask for the CVV on a cart (`isCvvRequired`). Such a cart is refused
+at prepare unless `--cvv-from-keychain` is given; with it, the CVV is encrypted
+and the flow places and pays. Without it, place fails `MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN`
+before anything is sent. Always pass `--cvv-from-keychain` for Minutes orders.
+Account/address verification is refreshed live for long baskets (>90 s), so a
+slow basket no longer dies at 120 s.
 
 `--cvv-from-keychain` reads the saved-card CVV from Keychain
 (`robob-card` / `Marriott.card_cvc`) into process RAM through a captured
@@ -87,9 +94,12 @@ argument, file, journal entry or log line.
    is_3ds_failure:false}`.
 8. **3DS wait.** The challenge is out-of-band (owner approves in the ENBD X
    app). On `payment_pending` the flow immediately sends the owner one
-   Telegram attention ping (key `minutes-cli-3ds-<order_nr>`, ~2 min window),
-   then polls `POST …/paymentintent/status` `{"clientSecret":…}` every 5 s for
-   up to 4 min. Observed transitions: `payment_pending/CREATED` →
+   Telegram attention ping ("this is ours: approve noon Minutes AED X in ENBD X
+   now (order …)", source `Noon payment`, key `minutes-cli-3ds-<order_nr>`).
+   It then polls `POST …/paymentintent/status` `{"clientSecret":…}` every 5 s
+   for up to 10 min. If still unpaid after 300 s, a second alert fires once
+   (key `minutes-cli-stall-<order_nr>`) telling the owner to approve in ENBD X
+   or to check noon > Orders before ordering again. Observed transitions: `payment_pending/CREATED` →
    `payment_ready_to_redirect/3DS_ENROLL_INITIATED` →
    `payment_confirmed/CAPTURED`.
 9. **Paid signal.** Exactly `status:"payment_confirmed"` AND

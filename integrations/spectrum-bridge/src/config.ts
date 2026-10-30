@@ -36,6 +36,21 @@ export interface Config {
   cardApp?: CardApp;
   /** Chat slugs whose cards render live in the bubble; every other chat gets static cards. Default ["owner"]. */
   liveCardChats?: string[];
+  /** Stable public origin for shares (a named Cloudflare tunnel to 127.0.0.1:port); unset = quick tunnels. */
+  shareOrigin?: { url: string; port: number };
+}
+
+/** `shareOrigin`: an https origin with no path, and a loopback port its tunnel forwards to. */
+export function shareOriginConfig(raw: unknown): { url: string; port: number } | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw as { url?: unknown; port?: unknown };
+  const url = typeof value?.url === "string" ? value.url.replace(/\/+$/, "") : "";
+  const port = value?.port;
+  if (!/^https:\/\/[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(url)
+    || typeof port !== "number" || !Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error("Invalid bridge configuration");
+  }
+  return { url, port };
 }
 
 export function liveCardChatsConfig(raw: unknown): string[] {
@@ -119,7 +134,7 @@ export async function loadConfig(): Promise<Config> {
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
   return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp),
-    liveCardChats: liveCardChatsConfig(config.liveCardChats) };
+    liveCardChats: liveCardChatsConfig(config.liveCardChats), shareOrigin: shareOriginConfig(config.shareOrigin) };
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

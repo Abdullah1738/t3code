@@ -30,6 +30,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
   createdAt: at,
   archivedAt: null,
 });
@@ -48,6 +49,7 @@ const card = (id: string, patch: Partial<KanbanCard> = {}): KanbanCard => ({
   model: opus,
   models: [],
   subtasks: [],
+  subtaskSeq: 0,
   projectId: null,
   links: [],
   blockedBy: [],
@@ -96,6 +98,8 @@ const discussion = (id: string, lastSeq: number, ownerRead: number): KanbanDiscu
   titleEditedAt: null,
   settledAt: null,
   snoozedUntil: null,
+  pinnedAt: null,
+  reopenedAt: null,
 });
 
 const thread = ThreadId.make("t1");
@@ -170,7 +174,13 @@ describe("board summaries", () => {
     ]);
     const started = {
       _tag: "thread" as const,
-      thread: { threadId: thread, title: "#1 work", running: true, lastActivityAt: at },
+      thread: {
+        threadId: thread,
+        title: "#1 work",
+        running: true,
+        needsInput: false,
+        lastActivityAt: at,
+      },
     };
     expect(applyChange(tallies, "b1", started)).toBe(true);
     expect(applyChange(tallies, "b1", started)).toBe(false);
@@ -195,7 +205,13 @@ describe("board summaries", () => {
     const second = ThreadId.make("t2");
     applyChange(tallies, "b1", {
       _tag: "thread",
-      thread: { threadId: second, title: "#2 work", running: true, lastActivityAt: at },
+      thread: {
+        threadId: second,
+        title: "#2 work",
+        running: true,
+        needsInput: false,
+        lastActivityAt: at,
+      },
     });
     applyChange(tallies, "b2", { _tag: "board", board: board("b2", "Renamed") });
     expect(shape(false)).toEqual([

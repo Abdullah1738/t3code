@@ -1,14 +1,22 @@
+from email.message import Message
 from pathlib import Path
+import base64
 import contextlib
 import io
+import json
+import os
+import subprocess
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
+import commerce_cli as cli
 import commerce_minutes as c
+from commerce_auth_status import CommerceAuth
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint
+from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
 from test.test_noon_minutes_checkout import Harness, HEADERS, fixture
 
 
@@ -136,6 +144,233 @@ class MinutesIntegrationTests(unittest.TestCase):
         self.assertEqual(flow.review['eta'],'2026-10-10T13:28:57+04:00')
 
 
+def _session_wire(cvv_required):
+    """A fixture-based cart session that satisfies approve()'s fee and arithmetic gates."""
+    import copy
+    from test.test_noon_minutes_checkout import fixture as _fixture
+    session=copy.deepcopy(_fixture())
+    session['isCvvRequired']=cvv_required
+    for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
+                'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee',
+                'orderLateNightFee'):
+        session[key]=0
+    # Captured basket figures (order_get_pending): subtotal 6.25 + delivery 8 + small-order 3 = 17.25.
+    session['orderSubtotal']=6.25
+    session['orderTotal']=17.25
+    session['orderPaymentAmount']=17.25
+    session['orderDeliveryFee']=8.0
+    session['orderSmallOrderFee']=3.0
+    # complete() requires the session's payment provider (captured session: NOON_PAY).
+    session['paymentProviderCode']='NOON_PAY'
+    # The real quiet codes the flow requires (select_quiet/approve); the fixture's
+    # synthetic codes are not these.
+    session['deliveryPreferences']=[
+        {'code':'dont_ring_the_bell','value':False,'title':'Do not ring bell'},
+        {'code':'leave_it_at_my_door','value':False,'title':'Leave at door'}]
+    session['driverNotes']=c.m.QUIET_NOTE
+    return session
+
+
+def _quiet_session_wire(cvv_required):
+    import copy
+    q=copy.deepcopy(_session_wire(cvv_required))
+    q['deliveryPreferences']=[
+        {'code':'dont_ring_the_bell','value':True,'title':'Do not ring bell'},
+        {'code':'leave_it_at_my_door','value':True,'title':'Leave at door'}]
+    return q
+
+
+def _empty_session_wire(cvv_required):
+    import copy
+    empty=copy.deepcopy(_session_wire(cvv_required))
+    empty['items']=[]
+    return empty
+
+
+def _saved_cards():
+    # The saved card's id is the same token the session's paymentToken fingerprints to.
+    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx5542','ccType':'mastercard',
+                     'isDefault':True,'isDeleted':False}]}
+
+
+class _NoonAuth:
+    """Stands in for NoonAuthLifecycle (Keychain account storage and whoami).
+
+    Every call hands out a fresh single-use snapshot, as the real lifecycle does.
+    """
+    def __init__(self, events):
+        self.events=events
+
+    def _snap(self):
+        return AuthSnapshot('minutes',fingerprint('synthetic-account'),
+            fingerprint(HEADERS['x-addresscode'],HEADERS['x-addresskey']),
+            time.time(),dict(HEADERS),time.monotonic()+30)
+
+    def status(self,*args,**kwargs):return {'maintenance_state':'none'}
+    def fresh_before_mutation(self,*args,**kwargs):return self._snap()
+    def reconcile(self,*args,**kwargs):return self._snap()
+
+    def revalidate(self,*args,**kwargs):
+        self.events.append('revalidate')
+        return self._snap()
+
+    def retain_response_cookies(self,*args,**kwargs):return True
+
+
+class _NoonResponse:
+    code=200
+
+    def __init__(self, url, body):
+        self.url=url;self.body=json.dumps(body).encode();self.headers=Message()
+
+    def geturl(self):return self.url
+    def read(self,_):return self.body
+    def __enter__(self):return self
+    def __exit__(self,*_):return False
+
+
+class _NoonTransport:
+    """noon's HTTP behind urllib's opener: serves the scripted bodies in call order."""
+    def __init__(self, script, events):
+        self.script=list(script);self.calls=[];self.events=events
+
+    def build_opener(self,*handlers):return self
+
+    def open(self, req, timeout=None):
+        url=req.full_url.split('?')[0]
+        route=next((name for name,(method,host,path) in c.m.ROUTES.items()
+                    if req.get_method()==method and url=='https://'+host+path),url)
+        self.calls.append((route,json.loads(req.data) if req.data else None))
+        self.events.append(route)
+        expected,body=self.script.pop(0) if self.script else (None,None)
+        if route!=expected:
+            raise OSError('unscripted noon request')
+        return _NoonResponse(req.full_url,body)
+
+
+def _noon_script(cvv_required):
+    track={'csHelpLabels':{'orderNumber':ORDER},'status':'confirmed','title':'Order confirmed',
+           'rider':{'showRiderDetails':False}}
+    page={'orders':[{'orderNr':ORDER,'statusCode':'confirmed','placedAt':'2026-10-10T13:18:29',
+                     'estimatedDeliveryText':'Arrives between: 01:20 - 01:30 PM'}]}
+    return [
+        # CLI active-order guard, then prepare_only(): options, cart, quiet, readback, review.
+        ('order_get_active',FIXTURE['get_active']['resp']),
+        ('catalog_search',{'hits':[{'sku':'SYNTHETIC_SHAKE','title':'Vanilla shake','isCustomizable':False}]}),
+        ('session_get',_empty_session_wire(cvv_required)),
+        ('sync',_session_wire(cvv_required)),
+        ('instructions',_quiet_session_wire(cvv_required)),
+        ('session_get',_quiet_session_wire(cvv_required)),
+        ('payment_cards',_saved_cards()),
+        # place(): readback, re-review, active-order guard, place.
+        ('session_get',_quiet_session_wire(cvv_required)),
+        ('payment_cards',_saved_cards()),
+        ('order_get_active',FIXTURE['get_active']['resp']),
+        ('place',FIXTURE['place']['resp']),
+        # complete(cvv), the 3DS wait, then exact tracking.
+        ('order_get',FIXTURE['order_get_pending']),
+        ('payment_config',FIXTURE['config']),
+        ('payment_complete',FIXTURE['complete']['resp']),
+        ('payment_status',FIXTURE['status_confirmed']),
+        ('track',track),
+        ('orders',page),
+    ]
+
+
+PREPARE_SENDS=7
+
+
+class OrderMinutesEndToEndTests(unittest.TestCase):
+    """`commerce order minutes --cvv-from-keychain` through the real CLI, MinutesFlow
+    constructor and client. Only the outside world is faked: noon's HTTP (urllib
+    opener), the noon auth lifecycle, the Keychain CVV read and the Telegram /
+    order-watch subprocesses. Journal, receipts, watcher files and card status
+    live in a temp dir. CVV encryption is real, with the captured public key.
+    """
+    def order(self, *, cvv_required, seconds_before_place=0):
+        events=[];commands=[]
+        auth=_NoonAuth(events)
+        transport=_NoonTransport(_noon_script(cvv_required),events)
+        real_time=time.time;offset=[0.0]
+        def keychain():
+            events.append('keychain')
+            offset[0]+=seconds_before_place
+            return b'123'
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve()
+            def run(command,**kwargs):
+                commands.append(command)
+                if command[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI:
+                    return subprocess.CompletedProcess(command,0,b'',b'')
+                if command[:2]==[c.WATCH_BIN,'add']:
+                    name='order-noon-'+command[command.index('--order')+1].lower()
+                    (root/'orders').mkdir(exist_ok=True)
+                    (root/'orders'/f'{name}.json').write_text(json.dumps(
+                        {'order':command[command.index('--order')+1],'active':True,'watcher':name}))
+                    (root/'watchers'/name).mkdir(parents=True,exist_ok=True)
+                    (root/'watchers'/name/'watcher.json').write_text(json.dumps({'watcher':True}))
+                    return subprocess.CompletedProcess(command,0,
+                        (json.dumps({'moni_notified':'skipped'})+'\n').encode(),b'')
+                raise AssertionError('unexpected subprocess')
+            with patch.object(c.j,'ROOT',root/'commerce'), \
+                    patch.object(c.receipts,'ROOT',root/'commerce'), \
+                    patch.object(c,'WATCH_ORDERS',root/'orders'), \
+                    patch.object(c,'WATCH_WATCHERS',root/'watchers'), \
+                    patch.dict(os.environ,{'CARD_STATUS_FILE':str(root/'card-status.json')}), \
+                    patch.object(cli,'CommerceAuth',lambda:CommerceAuth(noon=auth)), \
+                    patch.object(cli,'cvv_from_keychain',side_effect=keychain) as cvv, \
+                    patch.object(c.m.urllib.request,'build_opener',transport.build_opener), \
+                    patch.object(c.m.urllib.request,'urlopen',side_effect=AssertionError('network')), \
+                    patch.object(c.subprocess,'run',run), \
+                    patch.object(c.time,'time',lambda:real_time()+offset[0]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code=cli.main(['order','minutes','--sku','SYNTHETIC_SHAKE','--cvv-from-keychain',
+                               '--label','minutes e2e test'])
+                lines=[json.loads(x) for x in output.getvalue().splitlines() if x] or [{}]
+                journal=c.j.inspect(lines[-1]['flow_id']) if lines[-1].get('flow_id') else None
+        self.assertEqual(code,0,lines[-1])
+        self.assertEqual([x[0] for x in transport.calls],[x[0] for x in _noon_script(cvv_required)])
+        cvv.assert_called_once_with()
+        return {'result':lines[-1],'lines':lines,'events':events,'calls':transport.calls,
+                'commands':commands,'journal':journal}
+
+    def test_order_minutes_cvv_basket_prepares_places_and_pays(self):
+        """Done-when path 1: noon asks for CVV; the CLI reads it after preparation
+        and before any place-phase send, and the order is placed and paid."""
+        run=self.order(cvv_required=True)
+        result=run['result']
+        review=next(x for x in run['lines'] if x.get('phase')=='review')['review']
+        self.assertTrue(review['cvv_required'])
+        self.assertEqual((result['ok'],result['order'],result['payable_minor']),(True,ORDER,TOTAL_MINOR))
+        self.assertEqual(result['paid']['payment_status'],'payment_confirmed')
+        self.assertEqual(result['paid']['transaction_status'],'CAPTURED')
+        self.assertEqual(result['paid']['captured_minor'],TOTAL_MINOR)
+        self.assertEqual(result['paid']['authorized_minor'],TOTAL_MINOR)
+        self.assertEqual(run['journal']['state'],'COMPLETE')
+        routes=[x for x in run['events'] if x in c.m.ROUTES or x=='keychain']
+        self.assertEqual(routes.index('keychain'),PREPARE_SENDS)
+        # No clock gap: the verified home never needed a refresh after preparation.
+        self.assertNotIn('revalidate',run['events'][run['events'].index('keychain'):])
+        body=next(payload for route,payload in run['calls'] if route=='payment_complete')
+        self.assertEqual(body['cvvEncryption']['publicKeyName'],'key_1')
+        self.assertEqual(len(base64.b64decode(body['cvvEncryption']['encCvv'],validate=True)),256)
+        alerts=[x for x in run['commands'] if x[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI]
+        self.assertEqual(len(alerts),1)
+        self.assertEqual(alerts[0][alerts[0].index('--key')+1],f'minutes-cli-3ds-{ORDER}')
+
+    def test_order_minutes_places_and_pays_300s_after_preparation(self):
+        """Done-when path 2: 300 s pass between real preparation and place. The home
+        verified at flow creation is then too old, so the client refreshes it through
+        the flow's own home provider before place goes out."""
+        run=self.order(cvv_required=False,seconds_before_place=300)
+        result=run['result']
+        self.assertEqual((result['ok'],result['order']),(True,ORDER))
+        self.assertEqual(result['paid']['transaction_status'],'CAPTURED')
+        self.assertEqual(run['journal']['state'],'COMPLETE')
+        events=run['events']
+        self.assertIn('revalidate',events[events.index('keychain'):events.index('place')])
+
+
 def paid_projection(status='payment_confirmed',txn='CAPTURED',authorized=1725,captured=1725,
                     error_code='0',failure=False):
     return {'order':'IAEGA123','payment_status':status,'transaction_status':txn,
@@ -237,6 +472,83 @@ class PaymentAwaitTests(unittest.TestCase):
             self.assertTrue(flow.await_payment(notify=lambda *_:None,
                 sleep=lambda _:None,clock=iter([0,5]).__next__)['paid'])
 
+    def test_stall_alert_fires_once_after_300s_and_not_when_paid(self):
+        flow=self.flow()
+        stalls=[]
+        # Unpaid for 320 s of fake clock time: stall once at >=300 s, never twice.
+        flow.client.payment_intent_status.return_value=c.m.Snapshot({},
+            paid_projection(status='payment_in_progress',txn='AUTHORIZED',authorized=0,captured=0,error_code='0'),time.time())
+        now=[0.0]
+        def clock():return now[0]
+        def sleep(s):now[0]+=s
+        with patch.object(c.j,'observe'):
+            result=flow.await_payment(notify=lambda *_:None,stall=lambda o,t:stalls.append((o,t)),
+                wait_seconds=320,poll_seconds=5,sleep=sleep,clock=clock)
+        self.assertTrue(result['timed_out'])
+        self.assertEqual(stalls,[('IAEGA123',1725)])
+        # Paid before 300 s: the stall never fires.
+        flow2=self.flow()
+        flow2.client.payment_intent_status.return_value=c.m.Snapshot({},paid_projection(),time.time())
+        quiet=[]
+        now=[0.0]
+        with patch.object(c.j,'observe'):
+            paid=flow2.await_payment(notify=lambda *_:None,stall=lambda o,t:quiet.append((o,t)),
+                wait_seconds=600,poll_seconds=5,sleep=sleep,clock=clock)
+        self.assertTrue(paid['paid'])
+        self.assertEqual(quiet,[])
+
+    def test_place_refuses_cvv_asking_review_without_cvv_and_journals_nothing(self):
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':True}
+        flow.client=Mock()
+        flow.approve=Mock(side_effect=AssertionError('no approve before the CVV gate'))
+        with patch.object(c.j,'consume',side_effect=AssertionError('no consume')) as consume, \
+                patch.object(c.j,'fail',side_effect=c.j.JournalError('MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')):
+            with self.assertRaisesRegex(c.j.JournalError,'MINUTES_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN'):
+                flow.place()
+        consume.assert_not_called()
+        flow.client.place_order.assert_not_called()
+
+    def test_fresh_home_returns_reverified_home_and_refuses_moved_address(self):
+        # _fresh_home is what the client's home_provider calls once a home is >90 s
+        # old: it re-verifies live auth and must refuse a moved account or address.
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.snapshot=AuthSnapshot('minutes',fingerprint('account'),
+            fingerprint(HEADERS['x-addresscode'],HEADERS['x-addresskey']),
+            time.time()-300,dict(HEADERS),time.monotonic()+30)
+        flow.auth=Mock()
+        flow.auth.status.return_value={'maintenance_state':'none'}
+        fresh=AuthSnapshot('minutes',fingerprint('account'),
+            fingerprint(HEADERS['x-addresscode'],HEADERS['x-addresskey']),
+            time.time(),dict(HEADERS),time.monotonic()+30)
+        flow.auth.revalidate.return_value=fresh
+        home=flow._fresh_home(time.monotonic()+30)
+        self.assertEqual(home.service,'minutes')
+        self.assertEqual(home.account_ref,flow.snapshot.account_ref)
+        self.assertGreater(home.checked_at,time.time()-5)
+        moved=AuthSnapshot('minutes',fingerprint('account'),fingerprint('moved'),
+            time.time(),dict(HEADERS),time.monotonic()+30)
+        flow.auth.revalidate.return_value=moved
+        with self.assertRaisesRegex(c.j.JournalError,'MINUTES_ACCOUNT_HOME_CHANGED'):
+            flow._fresh_home(time.monotonic()+30)
+
+    def test_place_rechecks_cvv_after_refresh_and_places_with_cvv_ready(self):
+        from unittest.mock import Mock
+        flow=object.__new__(c.MinutesFlow)
+        flow.review={'amount':1725,'digest':'a'*64,'cvv_required':True}
+        flow.client=Mock()
+        flow.client.active_orders.return_value=c.m.Snapshot({},{'active':[],'count':0,'resend_allowed':False},time.time())
+        flow.client.place_order.return_value={'order':'IAEGA123'}
+        flow._expect=Mock()
+        with patch.object(c.MinutesFlow,'approve',lambda self:self.review), \
+                patch.object(c.MinutesFlow,'refresh_cart_readback',return_value={}), \
+                patch.object(c.j,'consume',return_value=True):
+            result=flow.place(cvv_ready=True)
+        self.assertEqual(result['order'],'IAEGA123')
+        self.assertEqual(flow.client.place_order.call_count,1)
+
     def test_telegram_notify_shape_and_failure(self):
         flow=self.flow()
         with patch.object(c.subprocess,'run') as run:
@@ -246,9 +558,8 @@ class PaymentAwaitTests(unittest.TestCase):
         command=run.call_args.args[0]
         self.assertIn('minutes-cli-3ds-IAEGA123',command)
         text=command[command.index('--text')+1]
-        self.assertEqual(text,'Noon Minutes CLI test order IAEGA123 AED 17.25 needs ENBD 3DS approval: '
-            'open ENBD X app notification / Activity and approve. ~2 min window.')
-        self.assertEqual(command[command.index('--source')+1],'Minutes CLI build')
+        self.assertEqual(text,'this is ours: approve noon Minutes AED 17.25 in ENBD X now (order IAEGA123)')
+        self.assertEqual(command[command.index('--source')+1],'Noon payment')
         self.assertEqual(command[command.index('--severity')+1],'attention')
         env=run.call_args.kwargs['env']
         self.assertNotIn('BUN_INSPECT',env)
@@ -511,7 +822,7 @@ class ResumeAndCloseTests(unittest.TestCase):
             self.assertEqual(registration,{'watcher':'order-noon-iaega123','registered':True,
                 'for':'owner','tracker_id':'order-noon-iaega123','watcher_registered':True,
                 'moni_notified':'skipped','moni_notice_failed':False,'moni_notice_held':False,
-                'delivery_card':None})
+                'delivery_card':None,'chat':None})
             command=run.call_args.args[0]
             self.assertEqual(command[command.index('--placed-at')+1],'2026-10-10T13:18:29+04:00')
             self.assertEqual(command[command.index('--eta')+1],'2026-10-10T13:28:57+04:00')

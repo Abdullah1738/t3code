@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
-  saveState, type State, type Stop, stopFor, unscopedSender, heldCheck, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
+  saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
 const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob) when something happens.
@@ -16,6 +16,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                                          expires_at, max_fires, serial, triggers, quiet, trip, relays, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
+  robob-watch context ID                 full saved context (wakes carry only its start)
   robob-watch logs ID [-n 40]
   robob-watch test ID                    run the check once on a scratch copy of its state; no delivery
   robob-watch fire-test ID               deliver a clearly-marked test event through the watcher's mode
@@ -24,7 +25,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch relay-ok ID --to JID [--eta ISO]   may this fire message JID now? "ok" (exit 0) counts it; "no" exits 3
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
                                          watcher sharing ID's trip
-  robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (owner-only)
+  robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (info only)
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -65,9 +66,6 @@ const ago = (value?: string) => {
 };
 
 async function scratchRun(watcher: Watcher) {
-  if (heldCheck(watcher)) {
-    throw new Error(`${watcher.id} is held: its check runs wa draft/send and it may message nobody. Add it again with a check that doesn't draft or send (or with relays, the owner's words for each) first.`);
-  }
   const scratch = mkdtempSync(join(tmpdir(), `robob-watch-${watcher.id}-`));
   try {
     cpSync(watcherDir(watcher.id), scratch, { recursive: true });
@@ -135,6 +133,7 @@ async function main(argv: string[]): Promise<void> {
       state.next_at = 0;
       saveState(watcher.id, state);
       log(watcher.id, `${values.replace ? "replaced" : "added"} by ${watcher.created_by_session ?? "unknown session"}`);
+      for (const note of sendNotes(watcher)) process.stderr.write(`Note for ${watcher.id}: ${note}.\n`);
       let prime = "";
       // --replace keeps the existing baseline, so don't prime: a real reply landing during a prime run would be
       // recorded as "seen" and never delivered (Dynamic reply swallowed 1 Oct 2026 16:18). New watchers still prime.
@@ -167,6 +166,11 @@ async function main(argv: string[]): Promise<void> {
       const w = need(positionals[0]);
       console.log(JSON.stringify({ watcher: w, state: loadState(w.id), dir: watcherDir(w.id) }, null, 2));
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
+      return;
+    }
+    case "context": {
+      const w = need(positionals[0]);
+      console.log(w.context || "(none)");
       return;
     }
     case "logs": {
@@ -249,13 +253,13 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     case "unscoped": {
-      const found = listIds().map(id => loadWatcher(id)).filter((w): w is Watcher => !!w && (unscopedSender(w) || heldCheck(w)));
+      const found = listIds().map(id => loadWatcher(id)).filter((w): w is Watcher => !!w && unscopedSender(w));
       if (!found.length) { console.log("No watchers mention wa draft/send without relays."); return; }
       for (const w of found) {
         const s = loadState(w.id);
-        console.log(`${w.id}  [${w.paused ? "paused" : s.status}${heldCheck(w) ? ", held: its check sends" : ""}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
+        console.log(`${w.id}  [${w.paused ? "paused" : s.status}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
       }
-      console.log("These fire owner-only; held ones don't run their check at all (add them again with a check that doesn't draft or send). To let one message someone, add it again with relays (the owner's words for each).");
+      console.log("These list no relays. Their fires can message anyone their check or context names; relays (his words) are optional, and add them to get his stops and the ETA throttle.");
       return;
     }
     case "runner": {

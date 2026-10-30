@@ -24,7 +24,10 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
+import * as KanbanModels from "./models.ts";
 import * as ScriptService from "./ScriptService.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads } from "./threads.ts";
 
 // Threads only matter here as somewhere for script posts to go.
@@ -32,8 +35,12 @@ const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
     view: () => Effect.succeed(null),
+    find: () => Effect.succeed(null),
+    lastFailure: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
+    model: () => Effect.succeed(null),
+    setModel: () => Effect.void,
     interrupt: () => Effect.void,
   }),
 );
@@ -44,11 +51,13 @@ const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
 
 const testLayer = ScriptService.layer.pipe(
   Layer.provideMerge(KanbanService.layer),
+  Layer.provideMerge(KanbanModels.layerTest(null)),
   Layer.provideMerge(threads),
   Layer.provideMerge(KanbanStore.layer),
   Layer.provideMerge(Sqlite.layerMemory),
   Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
   Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+  Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
   Layer.provideMerge(boardFilesLayer),
 );
 

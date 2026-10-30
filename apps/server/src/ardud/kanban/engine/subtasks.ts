@@ -39,7 +39,12 @@ export const withPacketStep = (
 ];
 
 export type SubtaskPlan =
-  | { readonly ok: true; readonly subtasks: ReadonlyArray<KanbanSubtask> }
+  | {
+      readonly ok: true;
+      readonly subtasks: ReadonlyArray<KanbanSubtask>;
+      /** The card's counter after this plan; store it with the card. */
+      readonly subtaskSeq: number;
+    }
   | { readonly ok: false; readonly reason: string };
 
 /**
@@ -55,14 +60,18 @@ const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 /**
  * Replaces a card's plan with `inputs`. Listed ids keep their state; new
  * entries get the next id. A done or skipped subtask left out stays: what
- * happened isn't rewritten, only what's still to do.
+ * happened isn't rewritten, only what's still to do. `seq` is the card's
+ * counter of ids ever handed out, so an open subtask dropped from the plan
+ * never has its id reused by a later entry.
  */
 export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
   inputs: ReadonlyArray<SubtaskInput>,
+  seq = 0,
 ): SubtaskPlan {
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
-  let nextId = existing.reduce((max, subtask) => Math.max(max, idNumber(subtask.id)), 0);
+  // Cards saved before the counter existed start from the highest id still on them.
+  let nextId = existing.reduce((max, subtask) => Math.max(max, idNumber(subtask.id)), seq);
   const listed = new Set<string>();
   const planned: Array<KanbanSubtask> = [];
   let step = 0;
@@ -102,7 +111,7 @@ export function planSubtasks(
   if (subtasks.length > MAX_SUBTASKS) {
     return { ok: false, reason: `a card has at most ${MAX_SUBTASKS} subtasks` };
   }
-  return { ok: true, subtasks };
+  return { ok: true, subtasks, subtaskSeq: nextId };
 }
 
 /** Whether `role` may set subtask `id` to `state`. */

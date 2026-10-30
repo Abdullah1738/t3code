@@ -8,6 +8,8 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from unittest.mock import patch
+from offbox_lib import runs
 from offbox_lib.runs import GO_REPAIR, remote_script
 
 
@@ -388,7 +390,9 @@ class GoRepairTests(unittest.TestCase):
             sudo.chmod(0o755)
             (home / 'w').mkdir()
             env = dict(os.environ, HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
-            script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test').replace(
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test')
+            script = script.replace(
                 '/tmp/offbox-go-repair.lock', str(home / 'repair.lock')).replace('/usr/local', str(home / 'usr/local'))
             result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
             return result, leftover.exists(), current.read_text()

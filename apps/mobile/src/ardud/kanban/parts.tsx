@@ -80,14 +80,14 @@ export function KChip(props: {
   return (
     <View
       className={cn(
-        "flex-none flex-row items-center gap-1.5 self-start rounded-full bg-secondary",
+        "max-w-full shrink flex-none flex-row items-center gap-1.5 self-start rounded-full bg-secondary",
         large ? "h-[30px] px-3" : "h-[22px] px-2",
       )}
     >
       {props.glyph ? <Glyph kind={props.glyph} /> : null}
       <Text
         numberOfLines={1}
-        className={cn("font-t3-medium text-foreground", large ? "text-[13px]" : "text-[12px]")}
+        className={cn("shrink font-t3-medium text-foreground", large ? "text-[13px]" : "text-[12px]")}
       >
         {props.label}
       </Text>
@@ -101,7 +101,9 @@ export function ChipLink(props: {
   readonly glyph?: GlyphKind | null;
   readonly size?: "small" | "large";
   readonly accessibilityLabel?: string;
+  readonly accessibilityHint?: string;
   readonly onPress?: (() => void) | undefined;
+  readonly onLongPress?: (() => void) | undefined;
 }) {
   const chip = <KChip label={props.label} glyph={props.glyph} size={props.size} />;
   if (!props.onPress) return chip;
@@ -109,8 +111,10 @@ export function ChipLink(props: {
     <Pressable
       accessibilityRole="link"
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityHint={props.accessibilityHint}
       hitSlop={6}
       onPress={props.onPress}
+      onLongPress={props.onLongPress}
     >
       {chip}
     </Pressable>
@@ -258,11 +262,19 @@ export function CardTile(props: {
         {view.title}
       </Text>
       <FlagLine flag={view.flag} />
-      {(view.goal && !props.hideGoal) || view.pr || view.model.letter ? (
+      {(view.goal && !props.hideGoal) || view.pr || view.subtasks || view.model.letter ? (
         <View className="flex-row flex-wrap items-center gap-1.5">
           {view.goal && !props.hideGoal ? <KChip label={view.goal.name} /> : null}
           {view.pr ? <KChip label={view.pr.label} glyph={prGlyph(view.pr.state)} /> : null}
           <View className="flex-1" />
+          {view.subtasks ? (
+            <Text
+              accessibilityLabel={`${view.subtasks.done} of ${view.subtasks.total} subtasks done`}
+              className="flex-none text-[12px] tabular-nums text-foreground-muted"
+            >
+              {view.subtasks.done}/{view.subtasks.total}
+            </Text>
+          ) : null}
           <ModelMark letter={view.model.letter} name={view.model.name} />
         </View>
       ) : null}

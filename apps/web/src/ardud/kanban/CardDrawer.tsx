@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { XIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronUpIcon, XIcon } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
@@ -10,10 +10,16 @@ import {
   STAGE_LABELS,
   SUBTASK_OWNER_LABELS,
   subtaskSteps,
+  type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, formatDayLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanCard, KanbanCardEvent, KanbanStage } from "@t3tools/contracts";
+import {
+  KANBAN_WS_METHODS,
+  type KanbanCard,
+  type KanbanCardEvent,
+  type KanbanStage,
+} from "@t3tools/contracts";
 
 import {
   Menu,
@@ -22,14 +28,24 @@ import {
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
+import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
 import { PrGlyph } from "./CardTile";
 import { Chat, Composer } from "./Chat";
-import { kanban, kanbanErrorMessage, runAction, useCardDetail, useFeed } from "./kanbanStore";
+import {
+  kanban,
+  kanbanErrorMessage,
+  runAction,
+  useCardDetail,
+  useFeed,
+  useKanbanPermission,
+} from "./kanbanStore";
 import { CopyLinkButton, KanbanMarkdown } from "./links";
 import { Chip, Glyph, LinkChip, Pri, priorityLabel, stageGlyph, Tabs } from "./parts";
 
@@ -63,6 +79,9 @@ export function CardDrawer(props: {
   boardId: string;
   cardId: string;
   state: KanbanBoardState;
+  /** Neighbours on the board, or null when the drawer isn't over the board view. */
+  steps: CardSteps | null;
+  onStepCard: (cardId: string) => void;
   onClose: () => void;
   onOpenCard: (cardId: string) => void;
 }) {
@@ -75,11 +94,28 @@ export function CardDrawer(props: {
   const panelRef = useRef<HTMLElement>(null);
 
   const onClose = useStableCallback(props.onClose);
+  const onStep = useStableCallback((direction: -1 | 1) => {
+    const steps = props.steps;
+    if (steps === null) return false;
+    const target = direction < 0 ? steps.previous : steps.next;
+    if (target !== null) props.onStepCard(target);
+    return true;
+  });
+  const canStop = useKanbanPermission(KANBAN_WS_METHODS.cardStop);
+  const canSettle = useKanbanPermission(KANBAN_WS_METHODS.cardSettle);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // A confirm dialog is portaled outside the panel; the Tab trap below
+      // would pull its focus back into the drawer, so the drawer yields.
+      if (isConfirmDialogActive()) return;
       if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) {
         onClose();
+        return;
+      }
+      const direction = stepFromKey(event);
+      if (direction !== null) {
+        if (onStep(direction)) event.preventDefault();
         return;
       }
       // Tab stays inside the drawer; the page behind it is out of reach.
@@ -107,7 +143,7 @@ export function CardDrawer(props: {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, onStep]);
 
   // The drawer is keyed by card, so this runs once per opened card. Focus
   // goes back to what opened the first card of this drawer session.
@@ -145,67 +181,104 @@ export function CardDrawer(props: {
         aria-label={`Card ${card.number}`}
         className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[540px] flex-col bg-(--m-raised) px-5.5 pt-4 shadow-xl ring-1 ring-(--m-rule) outline-none"
       >
-        <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
-          <Pri priority={card.priority} />
-          <span className="tabular-nums">#{card.number}</span>
-          <span className="flex-1" />
-          <CopyLinkButton kind="kanban-card" id={card.id} label={`#${card.number} ${card.title}`} />
-          {card.activeThreadId ? (
-            <ThreadLink threadId={card.activeThreadId}>Open</ThreadLink>
-          ) : null}
-          {card.activeThreadId ? (
-            <QuietButton
-              onClick={() =>
-                void runAction("Couldn't stop the card", () => kanban.stopCard(card.id))
-              }
-            >
-              Stop
-            </QuietButton>
-          ) : null}
-          {card.stage === "verified" && card.settledAt === null ? (
+        {/* Header scrolls and shrinks first on short windows, so the tabs and tab content stay in the drawer. */}
+        <div className="flex min-h-0 shrink flex-col overflow-y-auto">
+          <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
+            <Pri priority={card.priority} />
+            <span className="tabular-nums">#{card.number}</span>
+            {props.steps !== null ? (
+              <>
+                <StepButton
+                  label="Previous card"
+                  hint="Previous card (↑)"
+                  target={props.steps.previous}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronUpIcon className="size-4" />
+                </StepButton>
+                <StepButton
+                  label="Next card"
+                  hint="Next card (↓)"
+                  target={props.steps.next}
+                  onStep={props.onStepCard}
+                >
+                  <ChevronDownIcon className="size-4" />
+                </StepButton>
+              </>
+            ) : null}
+            <span className="flex-1" />
+            <CopyLinkButton
+              kind="kanban-card"
+              id={card.id}
+              label={`#${card.number} ${card.title}`}
+            />
+            {card.activeThreadId ? (
+              <ThreadLink threadId={card.activeThreadId}>Open</ThreadLink>
+            ) : null}
+            {card.activeThreadId ? (
+              <QuietButton
+                disabled={!canStop}
+                title={canStop ? undefined : "Your connection can't stop cards"}
+                onClick={() =>
+                  void runAction("Couldn't stop the card", () => kanban.stopCard(card.id))
+                }
+              >
+                Stop
+              </QuietButton>
+            ) : null}
+            {card.stage === "verified" && card.settledAt === null ? (
+              <button
+                type="button"
+                disabled={!canSettle}
+                title={canSettle ? undefined : "Your connection can't settle cards"}
+                onClick={() => {
+                  // Read before settling: once settled, the card leaves the Verified list.
+                  const after = props.steps?.afterSettle ?? null;
+                  void runAction("Couldn't settle the card", () =>
+                    kanban.settleCard(card.id),
+                  ).then((ok) => {
+                    if (!ok) return;
+                    if (after !== null) props.onStepCard(after);
+                    else props.onClose();
+                  });
+                }}
+                className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              >
+                Settle
+              </button>
+            ) : null}
             <button
               type="button"
-              onClick={() =>
-                void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
-                  (ok) => ok && props.onClose(),
-                )
-              }
-              className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              onClick={props.onClose}
+              aria-label="Close"
+              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >
-              Settle
+              <XIcon className="size-4" />
             </button>
+          </div>
+          <h2 className="mt-2.5 mb-1.5 text-xl leading-tight font-semibold tracking-tight text-balance">
+            {card.title}
+          </h2>
+          {card.description ? (
+            <CardDescription key={card.description} text={card.description} />
           ) : null}
-          <button
-            type="button"
-            onClick={props.onClose}
-            aria-label="Close"
-            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
-          >
-            <XIcon className="size-4" />
-          </button>
+          <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
+            <Chip>
+              <Glyph kind={stageGlyph(card.stage)} />
+              {view.stageLabel}
+            </Chip>
+            {view.goal ? <Chip>{view.goal.name}</Chip> : null}
+            {view.pr ? (
+              <LinkChip href={view.pr.url}>
+                <PrGlyph state={view.pr.state} />
+                {view.pr.label}
+              </LinkChip>
+            ) : null}
+            {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
+            <Chip>{view.model.name}</Chip>
+          </div>
+          <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         </div>
-        <h2 className="mt-2.5 mb-1.5 text-xl leading-tight font-semibold tracking-tight text-balance">
-          {card.title}
-        </h2>
-        {card.description ? (
-          <CardDescription key={card.description} text={card.description} />
-        ) : null}
-        <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
-          <Chip>
-            <Glyph kind={stageGlyph(card.stage)} />
-            {view.stageLabel}
-          </Chip>
-          {view.goal ? <Chip>{view.goal.name}</Chip> : null}
-          {view.pr ? (
-            <LinkChip href={view.pr.url}>
-              <PrGlyph state={view.pr.state} />
-              {view.pr.label}
-            </LinkChip>
-          ) : null}
-          {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
-          <Chip>{view.model.name}</Chip>
-        </div>
-        <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         <Tabs
           label="Card"
           value={tab}
@@ -231,7 +304,8 @@ export function CardDrawer(props: {
             </button>
           </p>
         ) : null}
-        <div className="flex min-h-0 flex-1 flex-col">
+        {/* The asks list gives way so the tab content, and Answer's Discussion, stay on screen. */}
+        <div className="flex min-h-48 flex-1 flex-col">
           {tab === "discussion" ? (
             <CardDiscussion
               boardId={boardId}
@@ -260,6 +334,7 @@ function CardDiscussion(props: {
 }) {
   const { boardId, card, state } = props;
   const discussion = card.discussionId ? state.discussions.get(card.discussionId) : undefined;
+  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
 
   useEffect(() => {
     // The id is known but the list hasn't loaded it yet; the call returns the existing room.
@@ -289,6 +364,7 @@ function CardDiscussion(props: {
       <Composer
         placeholder="Message"
         attachments
+        blockedReason={canPost ? null : "Your connection can't post here"}
         onSend={async (blocks) => {
           setFirstPosting(true);
           const room = await kanban.cardDiscussion(boardId, card.id);
@@ -308,6 +384,8 @@ function Details(props: {
   events: ReadonlyArray<KanbanCardEvent>;
   nowMs: number;
 }) {
+  const canPatch = useKanbanPermission(KANBAN_WS_METHODS.cardPatch);
+  const patchNote = canPatch ? undefined : "Your connection can't change cards";
   const { card, state } = props;
   const board = state.board;
   const goals = [...state.goals.values()].filter((goal) => goal.status === "active");
@@ -321,6 +399,12 @@ function Details(props: {
     void runAction("Couldn't update the card", () =>
       kanban.patchCard({ cardId: card.id as never, ...input }),
     );
+  const removeLink = async (link: KanbanCard["links"][number]) => {
+    const message = `Remove this link from the card?\n${link.label ?? link.url}`;
+    const confirmed =
+      (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
+    if (confirmed) patch({ removeLinks: [link.url] });
+  };
   const moves = props.events
     .filter((event) => event.kind === "moved")
     .slice(-6)
@@ -331,7 +415,7 @@ function Details(props: {
       <dl className="grid grid-cols-[112px_1fr] items-center gap-x-4 gap-y-3 text-sm">
         <Fact label="Stage">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               <Glyph kind={stageGlyph(card.stage)} />
               {STAGE_LABELS[card.stage]}
             </MenuTrigger>
@@ -351,7 +435,7 @@ function Details(props: {
         </Fact>
         <Fact label="Priority">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               <Pri priority={card.priority} />
               {priorityLabel(card.priority)}
             </MenuTrigger>
@@ -371,7 +455,7 @@ function Details(props: {
         </Fact>
         <Fact label="Goal">
           <Menu>
-            <MenuTrigger render={<FactButton />}>
+            <MenuTrigger render={<FactButton disabled={!canPatch} title={patchNote} />}>
               {card.goalId ? (state.goals.get(card.goalId)?.name ?? "Goal") : "None"}
             </MenuTrigger>
             <MenuPopup align="start" side="bottom">
@@ -424,10 +508,22 @@ function Details(props: {
           <Fact label="Links">
             <span className="flex flex-wrap gap-1.5">
               {card.links.map((link) => (
-                <LinkChip key={link.url} href={link.url}>
-                  {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
-                  {link.label ?? link.kind}
-                </LinkChip>
+                <span key={link.url} className="inline-flex items-center">
+                  <LinkChip href={link.url}>
+                    {link.kind === "pr" ? <PrGlyph state={link.state} /> : null}
+                    {link.label ?? link.kind}
+                  </LinkChip>
+                  {canPatch ? (
+                    <button
+                      type="button"
+                      onClick={() => void removeLink(link)}
+                      aria-label={`Remove link ${link.label ?? link.url}`}
+                      className="grid size-5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  ) : null}
+                </span>
               ))}
             </span>
           </Fact>
@@ -464,7 +560,13 @@ function Details(props: {
           <Fact label="Stalled">
             <span className="flex items-center gap-2">
               <span className="text-(--m-negative)">{card.stalled.reason}</span>
-              <QuietButton onClick={() => patch({ stalled: false })}>Clear</QuietButton>
+              <QuietButton
+                disabled={!canPatch}
+                title={patchNote}
+                onClick={() => patch({ stalled: false })}
+              >
+                Clear
+              </QuietButton>
             </span>
           </Fact>
         ) : null}
@@ -566,6 +668,8 @@ function FactButton(props: React.ComponentProps<"button">) {
 /** Open questions for the owner. Answers go in the card's discussion. */
 function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => void }) {
   const { card } = props;
+  const canAsk = useKanbanPermission(KANBAN_WS_METHODS.cardAsk);
+  const askNote = canAsk ? undefined : "Your connection can't change questions";
   const asks = askViews(card, props.nowMs);
   // Cards from before asks were kept only carry the question.
   if (asks.length === 0) {
@@ -577,12 +681,12 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
     ) : null;
   }
   return (
-    <ul className="mb-3.5 flex flex-col gap-1 rounded-xl bg-(--m-warnband) py-1.5">
+    <ul className="mb-3.5 flex max-h-[30vh] shrink-0 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl bg-(--m-warnband) py-1.5">
       {asks.map((ask) => (
         <li key={ask.id} className="flex items-start gap-2 px-3 py-1 text-sm leading-snug">
           <Glyph kind={ask.blocking ? "wait" : "ask"} className="mt-1" />
           <span className="min-w-0 flex-1">
-            <span className="block">{ask.text}</span>
+            <span className="line-clamp-3 break-words">{ask.text}</span>
             <span className="text-xs text-(--m-muted)">
               {ask.by} · {ask.age} · {ask.blocking ? "Card waits" : "Work goes on"}
             </span>
@@ -591,6 +695,8 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
             <QuietButton onClick={props.onAnswer}>Answer</QuietButton>
             {ask.blocking ? null : (
               <QuietButton
+                disabled={!canAsk}
+                title={askNote}
                 onClick={() =>
                   void runAction("Couldn't make it blocking", () =>
                     kanban.changeAsk(card.id, ask.id, "block"),
@@ -601,6 +707,8 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
               </QuietButton>
             )}
             <QuietButton
+              disabled={!canAsk}
+              title={askNote}
               onClick={() =>
                 void runAction("Couldn't drop the question", () =>
                   kanban.changeAsk(card.id, ask.id, "drop"),
@@ -616,12 +724,47 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
   );
 }
 
-function QuietButton(props: { onClick: () => void; children: ReactNode }) {
+function StepButton(props: {
+  label: string;
+  hint: string;
+  target: string | null;
+  onStep: (cardId: string) => void;
+  children: ReactNode;
+}) {
+  const { target } = props;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            disabled={target === null}
+            onClick={() => target !== null && props.onStep(target)}
+            aria-label={props.label}
+            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40"
+          />
+        }
+      >
+        {props.children}
+      </TooltipTrigger>
+      <TooltipPopup>{props.hint}</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+function QuietButton(props: {
+  onClick: () => void;
+  children: ReactNode;
+  disabled?: boolean;
+  title?: string | undefined;
+}) {
   return (
     <button
       type="button"
       onClick={props.onClick}
-      className="h-7.5 rounded-full px-2 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      disabled={props.disabled}
+      title={props.title}
+      className="h-7.5 rounded-full px-2 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"
     >
       {props.children}
     </button>
@@ -666,13 +809,14 @@ function ThreadList(props: {
       {list.map((thread) => {
         const live = props.state.threads.get(thread.threadId);
         const running = live?.running ?? false;
+        const stuck = live?.needsInput ?? false;
         return (
           <li key={thread.threadId} className="flex items-center gap-1">
             <ThreadLink
               threadId={thread.threadId}
               className="-ms-2 flex h-11 min-w-0 flex-1 gap-2.5 rounded-xl px-2 text-sm text-(--m-text) hover:bg-(--m-chip)"
             >
-              <Glyph kind={running ? "ok" : thread.endedAt ? "done" : "idle"} />
+              <Glyph kind={stuck ? "ask" : running ? "ok" : thread.endedAt ? "done" : "idle"} />
               <span className="min-w-0 flex-1 truncate">
                 {live?.title ?? ROLE_LABELS[thread.role]}
               </span>
@@ -697,6 +841,7 @@ function ThreadList(props: {
 }
 
 function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEvent> }) {
+  const canComment = useKanbanPermission(KANBAN_WS_METHODS.cardPatch);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <ol className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto py-4">
@@ -716,6 +861,7 @@ function Comments(props: { cardId: string; comments: ReadonlyArray<KanbanCardEve
       </ol>
       <Composer
         placeholder="Comment"
+        blockedReason={canComment ? null : "Your connection can't comment on cards"}
         onSend={(blocks) => {
           const text = blocks.find((block) => block._tag === "md")?.text ?? "";
           return kanban.patchCard({ cardId: props.cardId as never, comment: text });

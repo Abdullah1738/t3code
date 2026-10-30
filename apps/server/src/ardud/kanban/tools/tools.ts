@@ -47,7 +47,10 @@ export const ModelInput = Schema.Struct({
     describe(TrimmedNonEmptyString, 'Provider instance; leave out to use "opencode".'),
   ),
   variant: Schema.optional(
-    describe(TrimmedNonEmptyString, 'Thinking variant, e.g. "high" or "xhigh".'),
+    describe(
+      TrimmedNonEmptyString,
+      'Thinking variant, e.g. "xhigh". Each model offers its own set (orchestrator_capabilities lists them); one the model doesn\'t offer is refused with the list it does.',
+    ),
   ),
 });
 export type ModelInput = typeof ModelInput.Type;
@@ -166,7 +169,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review: the card completes only when they are merged or closed.",
+  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card.",
   {
     card: Schema.optional(CardRef),
     description: Schema.optional(Schema.String),
@@ -180,7 +183,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns.",
+  "Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
   {
     card: Schema.optional(CardRef),
     to: KanbanStage,
@@ -242,6 +245,12 @@ const CardReviewResult = tool(
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),
+    head: Schema.optional(
+      Schema.String.annotate({
+        description:
+          "The commit you reviewed: the PR's head sha, or `git rev-parse HEAD` on the card's branch. Stored on the review event so scripts land only what was reviewed.",
+      }),
+    ),
   },
   { card: Record },
   { readonly: false },
@@ -340,7 +349,7 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL; blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
   {
     card: CardRef,
     title: Schema.optional(Schema.String),
@@ -358,6 +367,7 @@ const CardEdit = tool(
     models: Schema.optional(WeightedModels),
     projectId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     links: Schema.optional(Schema.Array(LinkInput)),
+    removeLinks: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
     blockedBy: Schema.optional(Schema.Array(CardRef)),
     reviewChain: Schema.optional(Schema.NullOr(Schema.String)),
     subtasks: Schema.optional(SubtasksInput),
@@ -397,10 +407,19 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model. Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
   { model: ModelInput, slots: NonNegativeInt },
   { pools: Records },
   { readonly: false },
+);
+
+const PoolRemove = tool(
+  "pool_remove",
+  "Remove a model pool",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  { model: ModelInput },
+  { pools: Records },
+  { readonly: false, destructive: true },
 );
 
 const GoalSet = tool(
@@ -471,17 +490,29 @@ const BoardOpen = tool(
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
-  "Start an evaluator thread on a board for a job: setup or request (with text), or a sweep (stalled, completed, deployed, check).",
+  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text.",
   {
     boardId: TrimmedNonEmptyString,
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
     text: Schema.optional(Schema.String),
+    /** For setup: an existing discussion on this board to use as the Setup discussion. */
+    discussionId: Schema.optional(TrimmedNonEmptyString),
   },
   { threadId: TrimmedNonEmptyString },
   { readonly: false },
 );
 
+const SetupDone = tool(
+  "setup_done",
+  "End board setup",
+  "Only the board's setup evaluator calls this, once the board's wiki and setup are complete. It lifts the setup hold: card work and review resume, and one line is posted in the Setup discussion.",
+  {},
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
+  SetupDone,
   BoardGet,
   CardSearch,
   CardGet,
@@ -501,6 +532,7 @@ export const KanbanToolkit = Toolkit.make(
   SubtaskDone,
   CardThread,
   PoolSet,
+  PoolRemove,
   GoalSet,
   GroupSet,
   DiscussionCreate,

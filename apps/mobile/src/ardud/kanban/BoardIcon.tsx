@@ -58,7 +58,8 @@ const ICONS: Record<KanbanBoardIcon, Icon> = {
   leaf: IconLeaf,
 };
 
-const THEMED = Object.fromEntries(
+/** Theme-aware icon components by name; the create screen's icon picker draws from these. */
+export const THEMED = Object.fromEntries(
   Object.entries(ICONS).map(([name, icon]) => [name, withUniwind(icon)]),
 ) as Record<KanbanBoardIcon, ReturnType<typeof withUniwind<Icon>>>;
 

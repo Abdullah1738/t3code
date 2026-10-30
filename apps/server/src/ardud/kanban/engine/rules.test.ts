@@ -2,9 +2,11 @@ import {
   KANBAN_BACKLOG,
   KanbanBoardId,
   KanbanCardId,
+  KanbanDiscussionId,
   ThreadId,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanDiscussion,
   type KanbanPool,
   type ModelSelection,
   ProviderInstanceId,
@@ -15,13 +17,19 @@ import {
   applyReviewResult,
   checkClaim,
   checkMove,
+  discussionSettleDue,
   isBlocked,
+  isOutage,
   MAX_BATCH,
+  maskDownPools,
   modelOnPool,
+  nextProbeDelay,
   planDispatch,
   poolKey,
   prsLanded,
   relatedCandidates,
+  reviewGate,
+  workerQuietDue,
 } from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
@@ -49,6 +57,7 @@ const board: KanbanBoard = {
   ],
   defaultReviewChain: "Default",
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
   createdAt: "2026-10-25T00:00:00Z",
   archivedAt: null,
 };
@@ -70,6 +79,7 @@ const card = (patch: Partial<KanbanCard> = {}): KanbanCard => {
     model: opus,
     models: [],
     subtasks: [],
+    subtaskSeq: 0,
     projectId: null,
     links: [],
     blockedBy: [],
@@ -124,6 +134,31 @@ describe("checkMove", () => {
   });
 });
 
+describe("reviewGate", () => {
+  const reviewSub = {
+    id: "s2",
+    step: 2,
+    text: "r",
+    owner: "review",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  } as unknown as KanbanCard["subtasks"][number];
+
+  it("names an open review subtask", () => {
+    const result = reviewGate(card({ subtasks: [reviewSub] }), 1);
+    expect(result).not.toBeNull();
+    expect(result).toContain("s2");
+  });
+
+  it("waits for the whole chain", () => {
+    expect(reviewGate(card({ reviewStep: 0 }), 1)).not.toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 1)).toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 2)).not.toBeNull();
+  });
+});
+
 describe("applyReviewResult", () => {
   it("findings send the card back and restart the chain", () => {
     const c = card({ stage: "in_review", reviewStep: 1, reviewRound: 2 });
@@ -162,9 +197,49 @@ describe("applyReviewResult", () => {
     expect(applyReviewResult(merged, 2, "clear").stage).toBe("completed");
     expect(prsLanded(card())).toBe(true);
   });
+
+  it("a PR link the work thread never linked is context and holds nothing", () => {
+    const context = (url: string, state: "open" | "merged" | null) => ({
+      kind: "pr" as const,
+      url,
+      label: null,
+      state,
+      checkedAt: null,
+    });
+    expect(prsLanded(card({ links: [context("u", null)] }))).toBe(true);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "open")] }))).toBe(false);
+    expect(prsLanded(card({ links: [context("u", null), context("v", "merged")] }))).toBe(true);
+    const nullStatePr = card({
+      stage: "in_review",
+      reviewStep: 1,
+      links: [context("u", null)],
+    });
+    expect(applyReviewResult(nullStatePr, 2, "clear").stage).toBe("completed");
+  });
 });
 
 describe("planDispatch", () => {
+  it("starts no card work or review while the board's setup runs", () => {
+    const setupRunning: KanbanBoard = {
+      ...board,
+      setup: {
+        status: "running",
+        discussionId: KanbanDiscussionId.make("disc-setup"),
+        threadId: ThreadId.make("t-setup"),
+        startedAt: "2026-10-28T00:00:00Z",
+        finishedAt: null,
+      },
+    };
+    const review = card({ stage: "needs_review" });
+    const todo = card();
+    expect(planDispatch(setupRunning, [review, todo], pools([[opus, 2]]))).toEqual([]);
+    const setupDone: KanbanBoard = {
+      ...setupRunning,
+      setup: { ...setupRunning.setup!, status: "done", finishedAt: "2026-10-28T01:00:00Z" },
+    };
+    expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
+  });
+
   it("takes reviews before work and todo by priority", () => {
     const low = card({ priority: 3 });
     const high = card({ priority: 1 });
@@ -214,6 +289,31 @@ describe("planDispatch", () => {
       pools([[opus, 2]]),
     );
     expect(plan.map((d) => d.cardId)).toEqual([b.id, a.id]);
+  });
+
+  it("holds a waiter until its completed blocker's merge subtask is done", () => {
+    const mergeStep = (state: "open" | "done") => [
+      {
+        id: "m1",
+        step: 4,
+        text: "Rebase on latest ardud/main, merge into ardud/main, push origin main",
+        owner: "evaluator" as const,
+        state,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ];
+    const blocker = card({ stage: "completed", subtasks: mergeStep("open") });
+    const waiter = card({ blockedBy: [blocker.id] });
+    expect(planDispatch(board, [blocker, waiter], pools([[opus, 2]])).map((d) => d.cardId)).toEqual(
+      [],
+    );
+    const merged = card({ stage: "completed", subtasks: mergeStep("done") });
+    const waiting = card({ blockedBy: [merged.id] });
+    expect(
+      planDispatch(board, [merged, waiting], pools([[opus, 2]])).map((d) => d.cardId),
+    ).toEqual([waiting.id]);
   });
 
   it("counts running cards against their pool and never goes negative", () => {
@@ -316,6 +416,19 @@ describe("thread batching", () => {
     expect(checkClaim(board, card({ blockedBy: [blocker.id] }), ctx).ok).toBe(false);
     expect(checkClaim(board, card({ blockedBy: [a.id] }), ctx).ok).toBe(true);
     expect(checkClaim(board, card(), { ...ctx, carrying: MAX_BATCH }).ok).toBe(false);
+    // The setup hold covers claims and creates too, not only planDispatch.
+    const setupRunning: KanbanBoard = {
+      ...board,
+      setup: {
+        status: "running",
+        discussionId: KanbanDiscussionId.make("disc-setup"),
+        threadId: ThreadId.make("t-setup"),
+        startedAt: "2026-10-28T00:00:00Z",
+        finishedAt: null,
+      },
+    };
+    expect(checkClaim(setupRunning, card(), ctx)).toEqual({ ok: false, reason: "Setup is running" });
+    expect(checkClaim({ ...setupRunning, setup: { ...setupRunning.setup!, status: "done" } }, card(), ctx).ok).toBe(true);
     expect(checkClaim(board, card({ projectId: "p2" as KanbanCard["projectId"] }), ctx).ok).toBe(
       false,
     );
@@ -578,5 +691,217 @@ describe("model weights", () => {
     // Once its thread has it, the card runs only on that thread's model.
     const kept = { ...c, model: opus, workThreadId: t1 };
     expect(checkClaim(board, kept, ctx).ok).toBe(false);
+  });
+});
+
+describe("discussionSettleDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const H = 60 * 60 * 1000;
+  const discussion = (patch: Partial<KanbanDiscussion> = {}): KanbanDiscussion => ({
+    id: KanbanDiscussionId.make("d1"),
+    boardId: board.id,
+    cardId: null,
+    title: "Talk",
+    evaluatorThreadId: null,
+    participants: [],
+    lastSeq: 0,
+    lastMessageAt: null,
+    createdBy: { _tag: "owner" },
+    createdAt: "2026-10-25T00:00:00.000Z",
+    archivedAt: null,
+    titleEditedAt: null,
+    settledAt: null,
+    snoozedUntil: null,
+    pinnedAt: null,
+    reopenedAt: null,
+    ...patch,
+  });
+  const typing = [
+    {
+      actor: { _tag: "owner" as const },
+      name: "Abdullah",
+      lastReadSeq: 0,
+      typingUntil: "2026-10-26T00:00:00.000Z",
+      owes: null,
+    },
+  ] as KanbanDiscussion["participants"];
+
+  it("settles a board channel and a verified card's discussion once a day has passed", () => {
+    expect(discussionSettleDue(discussion(), null, START + 25 * H)).toBe(true);
+    const verified = card({ stage: "verified" });
+    expect(discussionSettleDue(discussion({ cardId: verified.id }), verified, START + 25 * H)).toBe(
+      true,
+    );
+  });
+
+  it("waits for the full idle day before settling", () => {
+    expect(discussionSettleDue(discussion(), null, START + 23 * H)).toBe(false);
+    expect(discussionSettleDue(discussion(), null, START + 24 * H)).toBe(true);
+  });
+
+  it("keeps a discussion whose card is still open", () => {
+    for (const stage of ["todo", "working", "needs_review", "in_review", "completed"] as const) {
+      const open = card({ stage });
+      expect(discussionSettleDue(discussion({ cardId: open.id }), open, START + 25 * H)).toBe(
+        false,
+      );
+    }
+  });
+
+  it("never settles a pinned, settled or archived discussion", () => {
+    expect(
+      discussionSettleDue(discussion({ pinnedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+    expect(
+      discussionSettleDue(discussion({ settledAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+    expect(
+      discussionSettleDue(discussion({ archivedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+    ).toBe(false);
+  });
+
+  it("keeps a discussion snoozed into the future", () => {
+    const snoozed = discussion({ snoozedUntil: "2026-10-27T00:00:00.000Z" });
+    expect(discussionSettleDue(snoozed, null, START + 25 * H)).toBe(false);
+  });
+
+  it("keeps a discussion while someone is typing in it", () => {
+    expect(discussionSettleDue(discussion({ participants: typing }), null, START + 49 * H)).toBe(
+      false,
+    );
+  });
+
+  it("restarts the idle day when a lapsed snooze ends: 23h false, 25h true", () => {
+    const wake = "2026-10-25T10:00:00.000Z";
+    const wakeMs = Date.parse(wake);
+    const lapsed = discussion({ snoozedUntil: wake });
+    expect(discussionSettleDue(lapsed, null, wakeMs + 23 * H)).toBe(false);
+    expect(discussionSettleDue(lapsed, null, wakeMs + 25 * H)).toBe(true);
+  });
+
+  it("restarts the idle day from reopenedAt: 23h false, 25h true", () => {
+    const reopened = "2026-10-25T10:00:00.000Z";
+    const reopenedMs = Date.parse(reopened);
+    const d = discussion({ reopenedAt: reopened });
+    expect(discussionSettleDue(d, null, reopenedMs + 23 * H)).toBe(false);
+    expect(discussionSettleDue(d, null, reopenedMs + 25 * H)).toBe(true);
+  });
+
+  it("counts the idle day from the last message, not from creation", () => {
+    const d = discussion({ lastMessageAt: "2026-10-25T12:00:00.000Z" });
+    expect(discussionSettleDue(d, null, START + 25 * H)).toBe(false);
+    expect(discussionSettleDue(d, null, START + 37 * H)).toBe(true);
+  });
+});
+
+describe("workerQuietDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const START_ISO = "2026-10-25T00:00:00.000Z";
+  const working = card({
+    stage: "working",
+    activeRole: "work",
+    activeThreadId: ThreadId.make("t1"),
+    movedAt: START_ISO,
+  });
+  const at = (minutes: number) => START + minutes * 60 * 1000;
+  const view = (state: string) => ({ state, updatedAt: START_ISO });
+
+  it("is due for an idle or stuck worker after 30 minutes", () => {
+    expect(workerQuietDue(working, view("idle"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("idle"), at(29))).toBe(false);
+    expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
+    expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
+  });
+
+  it("counts from the last nudge and skips stalled or review cards", () => {
+    const nudged = { ...working, nudgedAt: "2026-10-25T00:21:00.000Z" };
+    expect(workerQuietDue(nudged, view("idle"), at(31))).toBe(false);
+    expect(
+      workerQuietDue(
+        { ...working, stalled: { reason: "x", by: { _tag: "owner" }, at: START_ISO } },
+        view("idle"),
+        at(31),
+      ),
+    ).toBe(false);
+    expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
+  });
+});
+
+describe("isOutage", () => {
+  it("treats out-of-usage, rate-limit and expired-token failures as outages", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message:
+          'Provider error [400]: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."}}',
+      }),
+    ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message:
+          "Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.",
+      }),
+    ).toBe(true);
+    expect(
+      isOutage({ class: "usage_limit", code: "provider.rate-limit", message: "slow down" }),
+    ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "OAuth access token has expired",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps request, model and content failures on the flag path", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "prompt is too long: 1200000 tokens > 1000000 maximum",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Variant unavailable for opus/gpt-6-astra: high",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.content-filter",
+        message: "Provider blocked the response",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("probe backoff and pool masking", () => {
+  it("doubles the probe delay from 5 minutes up to 30", () => {
+    const minutes = 60 * 1000;
+    expect(nextProbeDelay(5 * minutes)).toBe(10 * minutes);
+    expect(nextProbeDelay(10 * minutes)).toBe(20 * minutes);
+    expect(nextProbeDelay(20 * minutes)).toBe(30 * minutes);
+    expect(nextProbeDelay(30 * minutes)).toBe(30 * minutes);
+  });
+
+  it("zeroes only the down pool's slots", () => {
+    const down = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/claude-opus-5-5",
+    } as ModelSelection;
+    const up = { ...down, model: "opus/cx/gpt-6.1-sol" } as ModelSelection;
+    const pools = [
+      { key: poolKey(down), model: down, slots: 3 },
+      { key: poolKey(up), model: up, slots: 1 },
+    ] as unknown as ReadonlyArray<KanbanPool>;
+    const masked = maskDownPools(pools, new Set(["opencode/opus/claude-opus-5-5"]));
+    expect(masked.map((pool) => pool.slots)).toEqual([0, 1]);
   });
 });

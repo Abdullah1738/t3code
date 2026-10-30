@@ -18,8 +18,11 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import { opencodeTestProvider } from "./testProviders.ts";
 
 const owner: KanbanActor = { _tag: "owner" };
 
@@ -44,10 +47,13 @@ const makeFake = Effect.gen(function* () {
               title: thread.title,
               state: "idle",
               updatedAt: "2026-10-27T10:00:00.000Z",
+              runStartedAt: null,
               prs: [],
+              archived: false,
             };
           }),
         ),
+      find: () => Effect.succeed(null),
       launch: (input) =>
         Ref.modify(threads, (all) => {
           const threadId = ThreadId.make(`thread-${all.size + 1}`);
@@ -60,6 +66,9 @@ const makeFake = Effect.gen(function* () {
           all.get(input.threadId)?.messages.push(input.text);
           return all;
         }),
+      lastFailure: () => Effect.succeed(null),
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
       interrupt: () => Effect.void,
     }),
   );
@@ -73,10 +82,12 @@ const attachmentsLayerTest = ServerConfig.layerTest(process.cwd(), {
 const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(attachmentsLayerTest),
   );
 

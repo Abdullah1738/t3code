@@ -49,6 +49,9 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.discussions]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["discussions"]>[0];
     }) => service.discussions(input.boardId),
+    [M.threads]: (input: { readonly boardId: Parameters<KanbanServiceShape["threads"]>[0] }) =>
+      service.threads(input.boardId),
+    [M.owner]: (input: { readonly threadId: string }) => service.caller(input.threadId),
     [M.messages]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["messages"]>[0];
       readonly afterSeq?: number | undefined;
@@ -60,9 +63,18 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       ),
     [M.wiki]: (input: { readonly boardId: Parameters<KanbanServiceShape["wiki"]>[0] }) =>
       service.wiki(input.boardId),
-    [M.boardCreate]: (input: Parameters<KanbanServiceShape["ensureBoard"]>[0]) =>
-      service.ensureBoard(input),
+    // The owner's create never reuses a board: a taken slug fails with conflict, checked
+    // under the service lock (ensureBoard would return the existing board instead).
+    [M.boardCreate]: (input: Parameters<KanbanServiceShape["createBoard"]>[0]) =>
+      service.createBoard(input),
     [M.boardUpdate]: updateBoard,
+    [M.setupStart]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
+      readonly evaluatorModel: Parameters<KanbanServiceShape["startSetup"]>[1]["evaluatorModel"];
+      readonly text?: string | undefined;
+    }) => service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
+    [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
+      service.endSetup(input.boardId, OWNER),
     [M.cardPatch]: patchCard,
     [M.cardSettle]: (input: { readonly cardId: Parameters<KanbanServiceShape["settleCard"]>[0] }) =>
       service.settleCard(input.cardId),
@@ -81,6 +93,10 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
       readonly slots: number;
     }) => service.setPool(input.boardId, input.model, input.slots),
+    [M.poolRemove]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
+      readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
+    }) => service.removePool(input.boardId, input.model),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;

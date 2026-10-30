@@ -8,8 +8,11 @@ import {
   choiceView,
   COLUMNS_MIN_WIDTH,
   defaultBoardTab,
+  filterActionId,
+  kanbanLinkTarget,
   kanbanRecordState,
   nextTypingExpiry,
+  parseFilterAction,
   priorityFill,
   firstSendText,
   groupBlockRuns,
@@ -114,8 +117,7 @@ const answer = (
   choice: string[],
   blockId = "window",
   text: string | null = null,
-): KanbanAnswer =>
-  ({ blockId, by, choice, text, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
+): KanbanAnswer => ({ blockId, by, choice, text, at: "2026-10-25T09:12:00.000Z" }) as KanbanAnswer;
 
 describe("choiceView", () => {
   it("shares out the answers to this block and marks the owner's", () => {
@@ -203,6 +205,36 @@ describe("requestTitle", () => {
   });
 });
 
+describe("kanbanLinkTarget", () => {
+  const board = {
+    cards: new Map([["c1", {}]]),
+    discussions: new Map([["d1", {}]]),
+  };
+
+  it("opens a card or discussion on this board with the board id the record needs", () => {
+    const card = kanbanLinkTarget({ kind: "kanban-card", id: "c1" }, "b", board);
+    expect(card).toEqual({ kind: "card", boardId: "b", id: "c1" });
+    expect(kanbanRecordState(card ?? undefined)).toEqual({
+      kind: "card",
+      boardId: "b",
+      id: "c1",
+    });
+    const discussion = kanbanLinkTarget({ kind: "kanban-discussion", id: "d1" }, "b", board);
+    expect(discussion).toEqual({ kind: "discussion", boardId: "b", id: "d1" });
+    expect(kanbanRecordState(discussion ?? undefined)).toEqual({
+      kind: "discussion",
+      boardId: "b",
+      id: "d1",
+    });
+  });
+
+  it("leaves a reference that isn't on this board inert", () => {
+    expect(kanbanLinkTarget({ kind: "kanban-card", id: "other" }, "b", board)).toBeNull();
+    expect(kanbanLinkTarget({ kind: "kanban-discussion", id: "other" }, "b", board)).toBeNull();
+    expect(kanbanLinkTarget({ kind: "kanban-goal", id: "c1" }, "b", board)).toBeNull();
+  });
+});
+
 describe("kanbanRecordState", () => {
   it("needs a board, and an id for cards and goals", () => {
     expect(kanbanRecordState({ kind: "card", boardId: "b", id: "c1" })).toEqual({
@@ -275,5 +307,27 @@ describe("groupBlockRuns", () => {
       { kind: "block", index: 3, block: blocks[3] },
       { kind: "attachments", index: 4, attachments: [photo] },
     ]);
+  });
+});
+
+describe("parseFilterAction", () => {
+  it("reads back every id filterActionId writes", () => {
+    const actions = [
+      { kind: "toggle", facet: "priorities", value: 2 },
+      { kind: "toggle", facet: "goalIds", value: "goal-1" },
+      { kind: "toggle", facet: "projects", value: "" },
+      { kind: "toggle", facet: "models", value: "Opus" },
+      { kind: "clear" },
+    ] as const;
+    for (const action of actions) {
+      expect(parseFilterAction(filterActionId(action))).toEqual(action);
+    }
+  });
+
+  it("rejects priorities outside 1-5 and unknown keys", () => {
+    expect(parseFilterAction("priority:9")).toBeNull();
+    expect(parseFilterAction("priority:x")).toBeNull();
+    expect(parseFilterAction("colour:red")).toBeNull();
+    expect(parseFilterAction("nothing")).toBeNull();
   });
 });

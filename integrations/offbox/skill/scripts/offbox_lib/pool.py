@@ -56,6 +56,7 @@ def candidates(con, key, size, source, me=None):
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running'))
+        AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)
         ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""", (key, size)).fetchall()
     cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
     full = len(members(con, key)) >= cap
@@ -156,9 +157,16 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                             capacity.check(con)
                         if row['state'] != 'running':
                             stopped_tries += 1
-                        got = lease._reuse(con, row, size)
+                        got = lease._reuse(con, row, size, skip_archiving=True)
                     except capacity.CapacityError as e:
                         last_error = e
+                        continue
+                    except lease.ArchivingSkip as e:
+                        # Busy-like: the box is still archiving, so try the next member. It does not
+                        # make the pool look full, so a create below still runs when under cap.
+                        if row['state'] != 'running':
+                            stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
+                        say(f"skipping pool box {row['box_id']}: {e}")
                         continue
                     except OffboxError as e:
                         if row['state'] == 'running' or e.code != EXIT_INFRA:

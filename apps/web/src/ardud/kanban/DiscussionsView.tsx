@@ -3,14 +3,18 @@ import {
   AlarmClockOffIcon,
   ArrowLeftIcon,
   CircleCheckIcon,
+  ListFilterIcon,
+  MailOpenIcon,
   MoreHorizontalIcon,
   PencilIcon,
+  PinIcon,
+  PinOffIcon,
   SearchIcon,
   Undo2Icon,
   XIcon,
 } from "lucide-react";
 import * as Schema from "effect/Schema";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { type MouseEvent, useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   actorKey,
@@ -22,13 +26,18 @@ import {
   linkLabels,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
-import type { KanbanDiscussion, KanbanDiscussionUpdateInput } from "@t3tools/contracts";
+import {
+  KANBAN_WS_METHODS,
+  type KanbanDiscussion,
+  type KanbanDiscussionUpdateInput,
+} from "@t3tools/contracts";
 
 import { requestCustomSnooze } from "../../components/CustomSnoozeDialog";
 import { resolveSnoozePresets, snoozeWakeLabel } from "../../components/Sidebar.snooze";
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import {
   Menu,
+  MenuCheckboxItem,
   MenuItem,
   MenuPopup,
   MenuSeparator,
@@ -39,13 +48,23 @@ import {
   MenuTrigger,
 } from "../../components/ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
+import { readLocalApi } from "../../localApi";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useClientSettings } from "../../hooks/useSettings";
-import { cn } from "../../lib/utils";
+import { cn, isMacPlatform } from "../../lib/utils";
 import { Chat, Composer } from "./Chat";
 import { composerTitleSource } from "./composerAttachments";
-import { kanban, runAction } from "./kanbanStore";
+import {
+  type BulkDiscussionAction,
+  EMPTY_DISCUSSION_SELECTION,
+  type DiscussionSelection,
+  bulkDiscussionMenu,
+  bulkDiscussionTargets,
+  selectDiscussionRange,
+  toggleDiscussion,
+} from "./discussionSelection";
+import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { CopyLinkButton } from "./links";
 import { Avatar, UnreadDot } from "./parts";
 
@@ -54,6 +73,7 @@ export const NEW_DISCUSSION = "new";
 
 const SNOOZED_EXPANDED_KEY = "t3code:kanban:discussions:snoozed-expanded";
 const SETTLED_EXPANDED_KEY = "t3code:kanban:discussions:settled-expanded";
+const HIDE_CARDS_KEY = "t3code:kanban:discussions:hide-cards";
 
 const ROUND_BUTTON =
   "grid size-8 shrink-0 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) data-popup-open:bg-(--m-chip) data-popup-open:text-(--m-text)";
@@ -68,9 +88,13 @@ function updateDiscussion(boardId: string, discussionId: string, patch: Discussi
         ? patch.settled
           ? "Couldn't settle the discussion"
           : "Couldn't unsettle the discussion"
-        : patch.snoozedUntil === null
-          ? "Couldn't unsnooze the discussion"
-          : "Couldn't snooze the discussion";
+        : patch.pinned !== undefined
+          ? patch.pinned
+            ? "Couldn't pin the discussion"
+            : "Couldn't unpin the discussion"
+          : patch.snoozedUntil === null
+            ? "Couldn't unsnooze the discussion"
+            : "Couldn't snooze the discussion";
   return runAction(failure, () => kanban.updateDiscussion(boardId, discussionId, patch));
 }
 
@@ -83,6 +107,7 @@ function DraftRoom(props: {
   // Created but the first post failed: the retry goes into that discussion
   // instead of creating another.
   const created = useRef<string | null>(null);
+  const canCreate = useKanbanPermission(KANBAN_WS_METHODS.discussionCreate);
   return (
     <div className="flex min-h-0 min-w-0 flex-col pe-5 md:px-6">
       <div className="flex h-9 shrink-0 items-center gap-3">
@@ -93,6 +118,7 @@ function DraftRoom(props: {
         <Composer
           placeholder="What do you need?"
           attachments
+          blockedReason={canCreate ? null : "Your connection can't start discussions"}
           onSend={async (blocks) => {
             const text = blocks.find((block) => block._tag === "md")?.text ?? "";
             const firstFile = blocks.find((block) => block._tag === "attachment");
@@ -149,14 +175,31 @@ export function DiscussionsView(props: {
     false,
     Schema.Boolean,
   );
-  const groups = discussionRows(state, props.nowMs, { query });
-  const total = groups.active.length + groups.snoozed.length + groups.settled.length;
+  const [hideCards, setHideCards] = useLocalStorage(HIDE_CARDS_KEY, false, Schema.Boolean);
+  // Not saved: a reload shows every discussion again.
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [selection, setSelection] = useState<DiscussionSelection>(EMPTY_DISCUSSION_SELECTION);
+  const groups = discussionRows(state, props.nowMs, { query, hideCards, unreadOnly });
+  const total =
+    groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const searching = query.trim().length > 0;
   const narrow = useMediaQuery("max-md");
   const drafting = props.discussionId === NEW_DISCUSSION;
   const selected = props.discussionId ? state.discussions.get(props.discussionId) : undefined;
   const showList = !narrow || (!selected && !drafting);
   const showRoom = !narrow || selected || drafting;
+  const canRead = useKanbanPermission(KANBAN_WS_METHODS.discussionRead);
+  const canUpdate = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
+
+  // The order rows appear on screen, so shift-click ranges match what is visible.
+  const visibleRows = [
+    ...groups.pinned,
+    ...groups.active,
+    ...(snoozedOpen || searching ? groups.snoozed : []),
+    ...(settledOpen || searching ? groups.settled : []),
+  ];
+  const selectedRows = visibleRows.filter((row) => selection.ids.has(row.id));
+  const clearSelection = () => setSelection(EMPTY_DISCUSSION_SELECTION);
 
   useEffect(() => kanban.watchPreviews(props.boardId), [props.boardId]);
 
@@ -164,6 +207,63 @@ export function DiscussionsView(props: {
     props.onOpenDiscussion(discussionId);
     setRenaming(discussionId);
   };
+
+  const runBulk = async (action: BulkDiscussionAction) => {
+    const targets = bulkDiscussionTargets(selectedRows, action);
+    if (action === "mark-read") {
+      for (const id of targets) {
+        const discussion = state.discussions.get(id);
+        if (discussion && discussion.lastSeq > 0) {
+          kanban.markRead(props.boardId, id, discussion.lastSeq);
+        }
+      }
+    } else {
+      const settled = action === "settle";
+      await runAction(
+        settled ? "Couldn't settle some discussions" : "Couldn't unsettle some discussions",
+        async () => {
+          const results = await Promise.allSettled(
+            targets.map((id) => kanban.updateDiscussion(props.boardId, id, { settled })),
+          );
+          const failures = results.filter(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+          );
+          if (failures.length > 0) {
+            throw new Error(`${failures.length} of ${targets.length} failed`, {
+              cause: failures[0]!.reason,
+            });
+          }
+        },
+      );
+    }
+    clearSelection();
+  };
+
+  const showBulkMenu = async (position: { x: number; y: number }) => {
+    const items = bulkDiscussionMenu(selectedRows, { read: canRead, update: canUpdate });
+    const api = readLocalApi();
+    if (!api || items.length === 0) return;
+    const action = await api.contextMenu.show(items, position);
+    if (action) await runBulk(action);
+  };
+
+  const onRowClick = (row: DiscussionRow, event: MouseEvent<HTMLButtonElement>) => {
+    const modifier = isMacPlatform(navigator.platform) ? event.metaKey : event.ctrlKey;
+    if (modifier) {
+      setSelection((current) => toggleDiscussion(current, row.id));
+      return;
+    }
+    if (event.shiftKey) {
+      const order = visibleRows.map((entry) => entry.id);
+      setSelection((current) =>
+        selectDiscussionRange(current, row.id, order, props.discussionId ?? null),
+      );
+      return;
+    }
+    clearSelection();
+    props.onOpenDiscussion(row.id);
+  };
+
   const renderRows = (rows: ReadonlyArray<DiscussionRow>) =>
     rows.map((row) => (
       <DiscussionListRow
@@ -172,7 +272,20 @@ export function DiscussionsView(props: {
         row={row}
         nowMs={props.nowMs}
         current={row.id === props.discussionId}
-        onOpen={() => props.onOpenDiscussion(row.id)}
+        selected={selection.ids.has(row.id)}
+        onClick={(event) => onRowClick(row, event)}
+        onBulkMenu={(position) => void showBulkMenu(position)}
+        onClearSelection={clearSelection}
+        onMarkRead={
+          row.unread > 0
+            ? () => {
+                const discussion = state.discussions.get(row.id);
+                if (discussion && discussion.lastSeq > 0) {
+                  kanban.markRead(props.boardId, row.id, discussion.lastSeq);
+                }
+              }
+            : undefined
+        }
         onRename={() => rename(row.id)}
       />
     ));
@@ -182,16 +295,83 @@ export function DiscussionsView(props: {
       {showList ? (
         <div className="flex min-h-0 flex-col gap-1 pe-2.5 md:border-e md:border-(--m-rule)">
           <div className="flex h-9 shrink-0 items-center ps-2.5">
-            <h2 className="text-base font-semibold">Discussions</h2>
+            {selectedRows.length > 0 ? (
+              <span className="text-sm font-medium">{selectedRows.length} selected</span>
+            ) : (
+              <h2 className="text-base font-semibold">Discussions</h2>
+            )}
+            <span className="flex-1" />
+            {selectedRows.length > 0 ? (
+              <>
+                <button
+                  type="button"
+                  aria-label={`Actions for ${selectedRows.length} discussions`}
+                  className={ROUND_BUTTON}
+                  onClick={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    void showBulkMenu({ x: rect.left, y: rect.bottom });
+                  }}
+                >
+                  <MoreHorizontalIcon className="size-4" />
+                </button>
+                <button
+                  type="button"
+                  aria-label="Clear selection"
+                  className={ROUND_BUTTON}
+                  onClick={clearSelection}
+                >
+                  <XIcon className="size-4" />
+                </button>
+              </>
+            ) : null}
+            <Menu>
+              <MenuTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label="Discussion filters"
+                    className={cn(ROUND_BUTTON, (hideCards || unreadOnly) && "text-(--m-text)")}
+                  />
+                }
+              >
+                <ListFilterIcon className="size-4" />
+              </MenuTrigger>
+              <MenuPopup side="bottom" align="end">
+                <MenuCheckboxItem
+                  checked={!hideCards}
+                  onCheckedChange={(next) => setHideCards(!next)}
+                >
+                  Card discussions
+                </MenuCheckboxItem>
+                <MenuCheckboxItem checked={unreadOnly} onCheckedChange={setUnreadOnly}>
+                  Unread only
+                </MenuCheckboxItem>
+              </MenuPopup>
+            </Menu>
           </div>
           <SearchField value={query} onChange={setQuery} />
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3">
+          <div
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && selectedRows.length > 0) {
+                event.preventDefault();
+                clearSelection();
+              }
+            }}
+          >
             {!state.discussionsLoaded && total === 0 ? null : total === 0 ? (
               <p className="px-2.5 py-2 text-sm text-(--m-muted)">
-                {searching ? "No matches." : "No discussions yet."}
+                {searching
+                  ? "No matches."
+                  : unreadOnly
+                    ? "No unread discussions."
+                    : "No discussions yet."}
               </p>
             ) : null}
-            <ul className="flex flex-col gap-0.5">{renderRows(groups.active)}</ul>
+            <ul className="flex flex-col gap-0.5">
+              {renderRows(groups.pinned)}
+              {renderRows(groups.active)}
+            </ul>
             <ListGroup
               label="Snoozed"
               count={groups.snoozed.length}
@@ -344,7 +524,11 @@ function DiscussionListRow(props: {
   row: DiscussionRow;
   nowMs: number;
   current: boolean;
-  onOpen: () => void;
+  selected: boolean;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
+  onBulkMenu: (position: { x: number; y: number }) => void;
+  onClearSelection: () => void;
+  onMarkRead: (() => void) | undefined;
   onRename: () => void;
 }) {
   const { row } = props;
@@ -361,16 +545,34 @@ function DiscussionListRow(props: {
       className="group/row relative"
       onContextMenu={(event) => {
         event.preventDefault();
+        if (props.selected) {
+          props.onBulkMenu({ x: event.clientX, y: event.clientY });
+          return;
+        }
+        props.onClearSelection();
         setMenuOpen(true);
       }}
     >
       <button
         type="button"
-        onClick={props.onOpen}
+        onClick={props.onClick}
+        onMouseDown={(event) => {
+          // preventDefault stops the text highlight but also stops focus moving here,
+          // so focus the row by hand; otherwise the list's Escape handler never sees keys.
+          if (event.shiftKey) {
+            event.preventDefault();
+            event.currentTarget.focus();
+          }
+        }}
         aria-current={props.current ? "true" : undefined}
+        data-selected={props.selected ? "true" : undefined}
         className={cn(
           "grid w-full grid-cols-[1fr_auto] gap-x-2 gap-y-px rounded-xl px-2.5 py-2.25 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
-          props.current ? "bg-(--m-surface)" : "hover:bg-(--m-surface)",
+          props.selected
+            ? "bg-(--m-active)"
+            : props.current
+              ? "bg-(--m-surface)"
+              : "hover:bg-(--m-surface)",
         )}
       >
         <span
@@ -391,6 +593,7 @@ function DiscussionListRow(props: {
           {row.snoozedUntil !== null ? (
             <AlarmClockIcon aria-label="Snoozed for" className="size-3" />
           ) : null}
+          {row.pinnedAt !== null ? <PinIcon aria-label="Pinned" className="size-3" /> : null}
           {when}
         </span>
         {row.preview ? (
@@ -405,6 +608,7 @@ function DiscussionListRow(props: {
           open={menuOpen}
           onOpenChange={setMenuOpen}
           onRename={props.onRename}
+          onMarkRead={props.onMarkRead}
         />
       </span>
     </li>
@@ -419,11 +623,13 @@ function DiscussionMenu(props: {
     readonly title: string;
     readonly settledAt: string | null;
     readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
   };
   nowMs: number;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   onRename: () => void;
+  onMarkRead?: (() => void) | undefined;
 }) {
   const [ownOpen, setOwnOpen] = useState(false);
   const open = props.open ?? ownOpen;
@@ -432,7 +638,12 @@ function DiscussionMenu(props: {
   const { discussion } = props;
   const settled = discussion.settledAt !== null;
   const snoozed = !settled && discussionSnoozed(discussion, props.nowMs);
+  const pinned = discussion.pinnedAt !== null;
   const presets = open ? resolveSnoozePresets(new Date(), timestampFormat) : [];
+  const canUpdate = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
+  const updateNote = canUpdate ? undefined : "Your connection can't change discussions";
+  const canRead = useKanbanPermission(KANBAN_WS_METHODS.discussionRead);
+  const readNote = canRead ? undefined : "Your connection can't read discussions";
   const update = (patch: DiscussionPatch) =>
     void updateDiscussion(props.boardId, discussion.id, patch);
   return (
@@ -449,25 +660,34 @@ function DiscussionMenu(props: {
         <MoreHorizontalIcon className="size-4" />
       </MenuTrigger>
       <MenuPopup side="bottom" align="end">
+        {props.onMarkRead ? (
+          <>
+            <MenuItem disabled={!canRead} title={readNote} onClick={props.onMarkRead}>
+              <MailOpenIcon />
+              Mark read
+            </MenuItem>
+            <MenuSeparator />
+          </>
+        ) : null}
         {settled ? (
-          <MenuItem onClick={() => update({ settled: false })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: false })}>
             <Undo2Icon />
             Unsettle
           </MenuItem>
         ) : (
-          <MenuItem onClick={() => update({ settled: true })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: true })}>
             <CircleCheckIcon />
             Settle
           </MenuItem>
         )}
         {snoozed ? (
-          <MenuItem onClick={() => update({ snoozedUntil: null })}>
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ snoozedUntil: null })}>
             <AlarmClockOffIcon />
             Unsnooze
           </MenuItem>
         ) : (
           <MenuSub>
-            <MenuSubTrigger>
+            <MenuSubTrigger disabled={!canUpdate} title={updateNote}>
               <AlarmClockIcon />
               Snooze
             </MenuSubTrigger>
@@ -493,8 +713,19 @@ function DiscussionMenu(props: {
             </MenuSubPopup>
           </MenuSub>
         )}
+        {pinned ? (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: false })}>
+            <PinOffIcon />
+            Unpin
+          </MenuItem>
+        ) : (
+          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: true })}>
+            <PinIcon />
+            Pin
+          </MenuItem>
+        )}
         <MenuSeparator />
-        <MenuItem onClick={props.onRename}>
+        <MenuItem disabled={!canUpdate} title={updateNote} onClick={props.onRename}>
           <PencilIcon />
           Rename
         </MenuItem>
@@ -524,6 +755,7 @@ function RoomTitle(props: {
   onEditingChange: (editing: boolean) => void;
   onSave: (title: string) => Promise<boolean>;
 }) {
+  const canRename = useKanbanPermission(KANBAN_WS_METHODS.discussionUpdate);
   if (!props.editing) {
     return (
       <h3 className="flex min-w-0 flex-1">
@@ -532,6 +764,7 @@ function RoomTitle(props: {
             render={
               <button
                 type="button"
+                disabled={!canRename}
                 onClick={() => props.onEditingChange(true)}
                 className="-ms-1.5 min-w-0 truncate rounded-lg px-1.5 py-0.5 text-left text-base font-medium outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               />
@@ -539,7 +772,9 @@ function RoomTitle(props: {
           >
             {props.discussion.title}
           </TooltipTrigger>
-          <TooltipPopup>Rename</TooltipPopup>
+          <TooltipPopup>
+            {canRename ? "Rename" : "Your connection can't rename discussions"}
+          </TooltipPopup>
         </Tooltip>
       </h3>
     );

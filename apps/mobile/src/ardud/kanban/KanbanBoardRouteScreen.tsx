@@ -1,5 +1,5 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { totalUnread } from "@t3tools/client-runtime/ardud/kanban";
+import { cardSteps, totalUnread } from "@t3tools/client-runtime/ardud/kanban";
 import { useState } from "react";
 import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
@@ -8,10 +8,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppBar } from "../../components/ui/AppBar";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { EmptyLine } from "../common/parts";
-import { useHeaderInset, useNowMs } from "../common/hooks";
+import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { BoardView } from "./BoardView";
 import { CardDetail } from "./CardDetail";
-import { useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
+import { useBoardFilter } from "./boardFilterStore";
+import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
 import { boardLayout, cardPaneWidth, type KanbanBoardParams } from "./logic";
 import { useKanbanNav } from "./nav";
 
@@ -38,11 +39,13 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   const nav = useKanbanNav(boardId);
   const [width, setWidth] = useState(0);
   const [paneCardId, setPaneCardId] = useState<string | null>(null);
+  const action = useBoardAction();
   const layout = boardLayout(width);
   const pane = layout.kind === "columns";
   const openCard = (cardId: string) => (pane ? setPaneCardId(cardId) : nav.openCard(cardId));
   const paneCard = pane && paneCardId !== null && state?.cards.has(paneCardId) ? paneCardId : null;
   const unread = state ? totalUnread(state) : 0;
+  const filter = useBoardFilter(boardId);
 
   let body: React.ReactNode;
   if (boardId === "") body = <EmptyLine label="This link does not open a board." />;
@@ -64,6 +67,11 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
           bottomInset={bottomInset}
           onOpenCard={openCard}
           onOpenGoal={nav.openGoal}
+          onOpenThread={nav.openThread}
+          onViewSetup={nav.openDiscussion}
+          onEndSetup={() =>
+            void action.run("Couldn't end setup", () => kanbanClient().endSetup(boardId))
+          }
         />
         {/* A drawer over the columns, so opening a card never reflows the board. */}
         {paneCard !== null ? (
@@ -82,6 +90,11 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
               onOpenGoal={nav.openGoal}
               onOpenThread={nav.openThread}
               onClose={() => setPaneCardId(null)}
+              stepper={{
+                steps: cardSteps(state, nowMs, filter, "stage", paneCard),
+                onStep: setPaneCardId,
+                onDone: () => setPaneCardId(null),
+              }}
             />
           </View>
         ) : null}

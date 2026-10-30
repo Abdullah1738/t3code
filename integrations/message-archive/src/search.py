@@ -122,6 +122,27 @@ def parse(q):
     return fts, where, params, flags
 
 
+def chat_counts(db, rows):
+    """{conv: total items in that WhatsApp chat} for each distinct WhatsApp chat in rows.
+
+    Counts every item in the chat, not just the hits, so a chat with one matching voice note
+    is still known to hold nothing else on this Mac. One indexed count per chat.
+    """
+    counts = {}
+    for conv in {r["conv"] for r in rows if r["source"] == "whatsapp" and r["conv"]}:
+        counts[conv] = db.execute(
+            "SELECT count(*) FROM items WHERE source = 'whatsapp' AND conv = ?", (conv,)).fetchone()[0]
+    return counts
+
+
+STUB_MAX = 3  # a WhatsApp chat with this many messages or fewer on the Mac is a stub
+
+
+def chat_sizes(db, rows):
+    """{conv: count} for WhatsApp chats in rows that are stubs on this Mac."""
+    return {c: n for c, n in chat_counts(db, rows).items() if n <= STUB_MAX}
+
+
 def run(db, q, limit=20, sort="rank", include_junk=False, dedupe=True):
     fts, where, params, flags = parse(q)
     if not include_junk and not flags["junk"]:

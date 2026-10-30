@@ -4,6 +4,7 @@ import {
   parseComposerContextHref,
   replaceComposerContextReferences,
 } from "@t3tools/shared/composerContextReferences";
+import { formatThreadLink } from "@t3tools/shared/threadLinks";
 
 // Board links ride on the composer's context references, so the editor turns a
 // pasted one into a chip and agents read the ids straight from the markdown.
@@ -27,6 +28,14 @@ export function kanbanLink(kind: KanbanLinkKind, id: string, label: string): str
     contextId: id as ComposerContextId,
     label,
   });
+}
+
+/**
+ * The text a copy-link action puts on the clipboard. Threads keep the app's own
+ * t3-thread link, since their ids don't fit a context reference.
+ */
+export function kanbanCopyLink(kind: KanbanLinkKind | "thread", id: string, label: string): string {
+  return kind === "thread" ? formatThreadLink(id, label) : kanbanLink(kind, id, label);
 }
 
 export function kanbanLinkOf(kind: string, contextId: string): KanbanLink | null {

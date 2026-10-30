@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-from . import api, lease, pool, ssh_sync
+from . import api, lease, node_version, pool, ssh_sync
+from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event, new_id, now, say)
 
 BG_TTL_S = 6 * 3600
@@ -22,6 +25,9 @@ ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVA
              "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
              "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "RUST_BACKTRACE", "CARGO_TERM_COLOR", "TERM")
 ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "SESSION", "COOKIE", "AUTH")
+# Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
+DOCKER_HOOK_B64 = base64.b64encode(
+    (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -162,6 +168,61 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     sudo -n rm -rf -- "$_offbox_dir" || _offbox_fail "cannot remove stale staging directory $_offbox_dir"
   done
 ) || { echo offbox-setup-failed >&2; exit 97; }'''
+
+# boat.dev (28 Oct 2026) runs /usr/local/bin/sync-docker-firewall after dockerd starts (docker.service.d drop-in).
+# Boxes resumed from older snapshots can lack it, and systemd then kills dockerd (203/EXEC). Never fails the run.
+DOCKER_REPAIR = r'''(
+  grep -qsF /usr/local/bin/sync-docker-firewall /etc/systemd/system/docker.service.d/*.conf || exit 0
+  if [ ! -x /usr/local/bin/sync-docker-firewall ]; then
+    echo 'offbox: restoring boat docker hook /usr/local/bin/sync-docker-firewall' >&2
+    _offbox_t=$(mktemp) || exit 0
+    printf '%s' '__HOOK_B64__' | base64 -d > "$_offbox_t" &&
+      sudo -n install -m 755 "$_offbox_t" /usr/local/bin/sync-docker-firewall ||
+      echo 'offbox: could not restore the docker hook' >&2
+    rm -f "$_offbox_t"
+  fi
+  # Every systemctl call is bounded: a stalled start must not hold up the user's command.
+  if timeout 10 systemctl is-failed --quiet docker 2>/dev/null; then
+    echo 'offbox: docker had failed; restarting it' >&2
+    sudo -n timeout 10 systemctl reset-failed docker 2>/dev/null
+    sudo -n timeout "${OFFBOX_DOCKER_TIMEOUT:-90}" systemctl start docker ||
+      { echo 'offbox: docker still fails to start (or timed out):' >&2; timeout 10 systemctl status docker --no-pager -n 5 >&2; }
+  fi
+) || true'''.replace('__HOOK_B64__', DOCKER_HOOK_B64)
+
+# A boat resume can bring back an /etc/ld.so.cache that lacks libraries installed on the box (libpq5 on
+# 28 Oct), so ctypes.util.find_library and psycopg fail. Rebuild the cache; never fails the run.
+LDCACHE_REPAIR = r'''(
+  [ -x /sbin/ldconfig ] || exit 0
+  _offbox_skip="$HOME/.offbox/ldcache-uncached"
+  _offbox_missing() (
+    for _offbox_lib in /usr/lib/lib*.so.* /usr/lib/*-linux-gnu/lib*.so.*; do
+      [ -L "$_offbox_lib" ] && [ -e "$_offbox_lib" ] && printf '%s\n' "${_offbox_lib##*/}"
+    done | LC_ALL=C grep -E '\.so\.[0-9]+$' | LC_ALL=C sort -u |
+      LC_ALL=C comm -13 <(LC_ALL=C /sbin/ldconfig -p 2>/dev/null | awk 'NR > 1 { print $1 }' | LC_ALL=C sort -u) - |
+      LC_ALL=C comm -23 - <(LC_ALL=C sort -u "$_offbox_skip" 2>/dev/null)
+  )
+  _offbox_before=$(_offbox_missing)
+  [ -n "$_offbox_before" ] || exit 0
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/tmp/offbox-ldcache.lock && flock -x -w 60 9 || exit 0
+    _offbox_before=$(_offbox_missing)
+    [ -n "$_offbox_before" ] || exit 0
+  fi
+  if ! sudo -n /sbin/ldconfig >/dev/null 2>&1; then
+    echo "offbox: linker cache lacks $(printf '%s\n' "$_offbox_before" | head -n 3 | tr '\n' ' ')and sudo -n ldconfig failed; put 'sudo ldconfig;' before your command" >&2
+    exit 0
+  fi
+  _offbox_after=$(_offbox_missing)
+  _offbox_fixed=$(LC_ALL=C comm -23 <(printf '%s\n' "$_offbox_before") <(printf '%s\n' "$_offbox_after"))
+  if [ -n "$_offbox_fixed" ]; then
+    echo "offbox: linker cache lacked $(printf '%s\n' "$_offbox_fixed" | head -n 3 | tr '\n' ' ')- ran ldconfig" >&2
+  fi
+  # Links ldconfig never caches (file name is not the library's soname) must not rerun it each time.
+  if [ -n "$_offbox_after" ]; then
+    mkdir -p "${_offbox_skip%/*}" && printf '%s\n' "$_offbox_after" >> "$_offbox_skip"
+  fi
+) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
@@ -309,6 +370,56 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+def exit_recording_command(script: str, run_id: str) -> str:
+    """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
+    so a run boat later reports as lost still has its real status on the box."""
+    f = f'"$HOME/.offbox/exit/{run_id}.rc"'
+    outer = "\n".join([
+        'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
+        'find "$HOME/.offbox/exit" -name "*.rc" -mtime +2 -delete 2>/dev/null',
+        'bash -lc "$0"',
+        '__offbox_rc=$?',
+        f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        'exit "$__offbox_rc"',
+    ])
+    return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
+
+
+def recorded_exit(box_id: str, run_id: str) -> int | None:
+    """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
+    try:
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=20)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return int(p.stdout.decode(errors="replace").strip())
+    except ValueError:
+        return None
+
+
+def steps_exit(log_path: Path | None, planned: int) -> int | None:
+    """For --step runs: the first nonzero step rc (else 0), but only when every planned step reported."""
+    if planned <= 0:
+        return None
+    res = dict(step_results(log_path))
+    if not all(n in res for n in range(1, planned + 1)):
+        return None
+    return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
+
+
+def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int) -> tuple[int | None, str]:
+    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines."""
+    code = recorded_exit(box_id, run_id)
+    if code is not None:
+        return code, "the box's exit file"
+    code = steps_exit(log_path, planned)
+    if code is not None:
+        return code, "the step results"
+    return None, ""
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote") -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -316,6 +427,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say(steps_summary(step_res, planned))
     if code == 1 and last_stage_is_grep(cmd):
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
+    if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
+        say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
     if code is None:
         say("remote exit unknown (process lost); offbox exits 90")
     else:
@@ -342,15 +455,18 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None) -> str:
+                  steps: list[str] | None = None, node: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              DOCKER_REPAIR,
+              LDCACHE_REPAIR,
               '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,
+              node,
               cmd]
     return "\n".join(lines)
 
@@ -393,12 +509,16 @@ class Runner:
                      json.dumps(a.pull or []), self.rel, str(self.cwd)))
         con.commit()
         t0 = now()
-        row = pool.acquire(me, size=a.size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+        size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
+        if size != a.size:
+            say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
+        row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
         self.lease_row = row
         self.box = row["box_id"]
         rdir = row["remote_dir"]
         self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                     docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+        prune.run(con, self.box, rdir)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
@@ -418,11 +538,17 @@ class Runner:
         tw.join()
         if err:
             raise err[0]
-        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None)
+        try:
+            w = node_version.want(self.root, self.cwd)
+            node_block = node_version.block(w) if w else ""
+        except Exception:
+            node_block = ""
+        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
+                               node=node_block)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, "bash -lc " + shlex.quote(script))
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
         except api.ApiError as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
@@ -618,6 +744,10 @@ def _run_remote(a, rn) -> int:
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGHUP, old_hup)
+    if code is None:
+        code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
+        if code is not None:
+            say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, validAppUrl, validFileName, validMimeType } from "./cli.ts";
+import { chatKey, GROUP_APP_REFUSAL, type ChatKey } from "./line.ts";
 import { isEffect, type Photon, type ReactionKind } from "./photon.ts";
 import type { Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
   validToken } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
+import { mayBounce, noteBounce, noteSent } from "./replyCheck.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import type { OutboxApp, OutboxOperation, Store } from "./store.ts";
 
@@ -24,6 +26,10 @@ type Options = {
   };
   /** Public Cloudflare links for the apps; absent in per-chat APIs that the Sendblue socket fronts. */
   shares?: Shares;
+  /** Standing chat-rule check on agent sends; absent where no rules apply. */
+  replyCheck?: (text: string) => { rule: string; reason: string } | undefined;
+  /** Receives rule names only, never message text. */
+  log?: (event: string, code?: string) => void;
 };
 
 type SavedSecretRequest = { spec: string; result: { token: string; url: string; expiresAt: number } };
@@ -36,7 +42,7 @@ export const MAX_FILE_BODY = 28 * 1024 * 1024;
 const MAX_RESPONSE = 128 * 1024;
 const errors = {
   400: "Invalid request", 403: "Forbidden", 404: "Not found",
-  409: "Operation could not be completed", 410: "Expired", 413: "Request body too large",
+  409: "Operation could not be completed", 410: "Expired", 413: "Request body too large", 422: GROUP_APP_REFUSAL,
   502: "Tailnet publish failed", 503: "Bridge is not ready",
 } as const;
 class ApiError extends Error {
@@ -134,8 +140,37 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
   return { id, created };
 }
 
+/**
+ * Live-route gate for /send. A stale, missing or invalid route is a 409 before any rule check or bounce write,
+ * so a refused request can never consume the live turn's bounce.
+ */
+function liveSendRoute(store: Store, sessionId: string): { id: string; generation: number } {
+  const route = store.get<{ id: string; generation: number } | null>("route");
+  if (!sessionMatches(route, sessionId) || !route) throw new ApiError(409);
+  return route;
+}
+
+/** The spec a send with this key and content would store on the live route. */
+function sendSpec(id: string, route: { id: string; generation: number }, content: SessionContent): string {
+  return JSON.stringify({ id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation });
+}
+
+/** The id of an identical, already-accepted send on the live route; undefined for anything new or conflicting. */
+function sendReplay(store: Store, dedupeKey: string, route: { id: string; generation: number }, content: SessionContent): string | undefined {
+  const id = `send:${hash(dedupeKey)}`;
+  const saved = store.get<{ spec: string }>(`api:send:${id}`)?.spec;
+  return saved !== undefined && saved === sendSpec(id, route, content) ? id : undefined;
+}
+
+/** True when the key is already accepted with different content (queueSession answers 409 for this). */
+function sendConflict(store: Store, dedupeKey: string, route: { id: string; generation: number }, content: SessionContent): boolean {
+  const id = `send:${hash(dedupeKey)}`;
+  const saved = store.get<{ spec: string }>(`api:send:${id}`)?.spec;
+  return saved !== undefined && saved !== sendSpec(id, route, content);
+}
+
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
     // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
@@ -233,9 +268,25 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const { text, effect, subject, dedupeKey, sessionId } = body;
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
-        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, {
+        const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
+        const content = {
           text, ...(effect === undefined ? {} : { effect }), ...(subject === undefined ? {} : { subject: subject as string }),
-        });
+        };
+        // A bounce is only for a fresh request on the live route. Replays of an accepted send, and any
+        // stale or conflicting request, keep their existing answer and never touch bounce state.
+        const route = liveSendRoute(store, sessionId);
+        const existing = sendReplay(store, dedupeKey, route, content);
+        if (existing) return json({ id: existing, created: false }, 200);
+        // A stored key with different content is a conflict, reported before any rule is applied.
+        if (sendConflict(store, dedupeKey, route, content)) throw new ApiError(409);
+        const hit = replyCheck?.(text);
+        if (hit && mayBounce(store, turnKey)) {
+          noteBounce(store, turnKey);
+          log?.("reply-bounced", hit.rule);
+          return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
+        }
+        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content);
+        if (created) noteSent(store, turnKey, text);
         return json({ id, created }, created ? 202 : 200);
       }
 
@@ -275,6 +326,8 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const { dedupeKey, sessionId } = body;
         const app = appContent(body);
         if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
+        const chat = pairedChat();
+        if (chat && chatKey.isGroup(chat as ChatKey)) throw new ApiError(422);
         const { id, created } = queueSession(store, "app", dedupeKey, sessionId, { text: "", app });
         return json({ id, created }, created ? 202 : 200);
       }

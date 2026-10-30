@@ -36,6 +36,7 @@ const board: KanbanBoard = {
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
+  setup: null,
   archivedAt: null,
 };
 
@@ -53,6 +54,7 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   model,
   models: [],
   subtasks: [],
+  subtaskSeq: 0,
   projectId: null,
   links: [],
   blockedBy: [],
@@ -107,6 +109,7 @@ it.layer(TestLayer)("kanban store", (it) => {
         fromStage: null,
         toStage: null,
         body: "hello",
+        head: null,
       });
       assert.isAbove(event.id, 0);
       const events = yield* store.cardEvents(KanbanCardId.make("card-1"));

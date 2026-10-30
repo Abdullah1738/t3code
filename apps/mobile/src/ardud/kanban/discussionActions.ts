@@ -9,7 +9,10 @@ type DiscussionPatch = Omit<KanbanDiscussionUpdateInput, "discussionId">;
 
 /** What a discussion's menu offers, from where it sits now. */
 export type DiscussionMenuItem =
-  | { readonly id: "settle" | "unsettle" | "unsnooze" | "rename"; readonly title: string }
+  | {
+      readonly id: "settle" | "unsettle" | "unsnooze" | "pin" | "unpin" | "rename";
+      readonly title: string;
+    }
   | {
       readonly id: "snooze";
       readonly title: string;
@@ -21,10 +24,13 @@ export type DiscussionMenuItem =
     };
 
 export const SNOOZE_PREFIX = "snooze:";
+/** Snooze submenu choice that opens the date and time picker instead of a preset. */
+export const CUSTOM_SNOOZE = "snooze-custom";
 
 export function discussionMenu(input: {
   readonly settled: boolean;
   readonly snoozed: boolean;
+  readonly pinned: boolean;
   readonly now: Date;
 }): ReadonlyArray<DiscussionMenuItem> {
   const items: DiscussionMenuItem[] = [];
@@ -35,12 +41,17 @@ export function discussionMenu(input: {
     items.push({
       id: "snooze",
       title: "Snooze",
-      presets: resolveSnoozePresets(input.now).map((preset) => ({
-        id: `${SNOOZE_PREFIX}${preset.snoozedUntil}`,
-        title: preset.label,
-        subtitle: preset.whenLabel,
-      })),
+      presets: [
+        ...resolveSnoozePresets(input.now).map((preset) => ({
+          id: `${SNOOZE_PREFIX}${preset.snoozedUntil}`,
+          title: preset.label,
+          subtitle: preset.whenLabel,
+        })),
+        { id: CUSTOM_SNOOZE, title: "Custom…", subtitle: "Pick a date and time" },
+      ],
     });
+  if (input.pinned) items.push({ id: "unpin", title: "Unpin" });
+  else items.push({ id: "pin", title: "Pin" });
   items.push({ id: "rename", title: "Rename" });
   return items;
 }
@@ -50,6 +61,8 @@ export const MENU_ICONS = {
   unsettle: "arrow.uturn.backward",
   snooze: "clock",
   unsnooze: "clock",
+  pin: "pin",
+  unpin: "pin.slash",
   rename: "square.and.pencil",
 } as const;
 
@@ -72,8 +85,13 @@ export function runDiscussionMenu(input: {
   readonly discussionId: string;
   readonly title: string;
   readonly choice: string;
+  readonly onCustomSnooze?: () => void;
 }): void {
   const { boardId, discussionId } = input;
+  if (input.choice === CUSTOM_SNOOZE) {
+    input.onCustomSnooze?.();
+    return;
+  }
   if (input.choice.startsWith(SNOOZE_PREFIX)) {
     void update(
       boardId,
@@ -93,9 +111,24 @@ export function runDiscussionMenu(input: {
     case "unsnooze":
       void update(boardId, discussionId, { snoozedUntil: null }, "Could not unsnooze");
       return;
+    case "pin":
+      void update(boardId, discussionId, { pinned: true }, "Could not pin");
+      return;
+    case "unpin":
+      void update(boardId, discussionId, { pinned: false }, "Could not unpin");
+      return;
     case "rename":
       renameDiscussion(boardId, discussionId, input.title);
   }
+}
+
+/** Snoozes a discussion until an ISO time, from a preset or the custom picker. */
+export function snoozeDiscussion(
+  boardId: string,
+  discussionId: string,
+  snoozedUntil: string,
+): void {
+  void update(boardId, discussionId, { snoozedUntil }, "Could not snooze");
 }
 
 export function renameDiscussion(boardId: string, discussionId: string, title: string): void {

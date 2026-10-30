@@ -74,7 +74,7 @@ export const KanbanLink = Schema.Struct({
   kind: KanbanLinkKind,
   url: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String),
-  /** PR state as last checked; null for links that have none. */
+  /** PR state as last checked on the work thread (syncPrs); null for other links, including PRs attached only as context. */
   state: Schema.NullOr(Schema.Literals(["open", "draft", "merged", "closed"])),
   checkedAt: Schema.NullOr(IsoDateTime),
 });
@@ -86,6 +86,13 @@ export const KanbanReviewChain = Schema.Struct({
   steps: Schema.Array(ModelSelection),
 });
 export type KanbanReviewChain = typeof KanbanReviewChain.Type;
+
+/** Why a board thread is paused: its last run died on a provider outage. */
+export const KanbanThreadPause = Schema.Struct({
+  at: IsoDateTime,
+  message: Schema.String,
+});
+export type KanbanThreadPause = typeof KanbanThreadPause.Type;
 
 /** Every thread the board started: card work/review threads and evaluators. */
 export const KanbanThreadLink = Schema.Struct({
@@ -99,6 +106,8 @@ export const KanbanThreadLink = Schema.Struct({
   model: Schema.NullOr(ModelSelection),
   startedAt: IsoDateTime,
   endedAt: Schema.NullOr(IsoDateTime),
+  /** Set while its model is out of usage or down; the board wakes the thread when a probe passes. */
+  paused: Schema.NullOr(KanbanThreadPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanThreadLink = typeof KanbanThreadLink.Type;
 
@@ -159,6 +168,8 @@ export const KanbanCard = Schema.Struct({
   prompt: Schema.String,
   /** The card's flow, step by step: the work, its review and what comes after. */
   subtasks: Schema.Array(KanbanSubtask).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  /** Highest subtask number ever handed out on this card, so a dropped id is never reused. */
+  subtaskSeq: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   stage: KanbanStage,
   priority: KanbanPriority,
   goalId: Schema.NullOr(KanbanGoalId),
@@ -263,10 +274,27 @@ const isOpenCard = (card: KanbanCard) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
+ * A completed card whose evaluator merge subtask is still open: review has
+ * passed, but its work isn't on ardud/main yet. Completed means review-passed;
+ * the merge is a later evaluator subtask.
+ */
+export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">): boolean =>
+  card.stage === "completed" &&
+  card.subtasks.some(
+    (subtask) =>
+      subtask.state === "open" &&
+      subtask.owner === "evaluator" &&
+      // A merge action starts a clause ("merge router.ts into ...", "...; merge; deploy ...");
+      // a check that only mentions a merge ("blocker's merge subtask") doesn't.
+      /(?:^|[;:,.]\s*|\b(?:and|then)\s+)merge\b/i.test(subtask.text),
+  );
+
+/**
  * The first unfinished card holding `card` up, or undefined. A blocker on the
  * same work thread is no block, since that thread does both in order, unless
  * it can't go on itself: stalled, in the backlog, waiting on the owner or the
- * evaluator, or held up in turn.
+ * evaluator, or held up in turn. A completed blocker still holds while its
+ * merge subtask is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -277,8 +305,12 @@ export function kanbanHeldUpBy(
   const heldUp = (waiter: KanbanCard, path: Set<string>): KanbanCard | undefined => {
     for (const id of waiter.blockedBy) {
       const blocker = byId.get(id);
-      if (blocker === undefined || KANBAN_DONE_STAGES.has(blocker.stage)) continue;
+      if (blocker === undefined) continue;
+      const done = KANBAN_DONE_STAGES.has(blocker.stage);
+      if (done && !kanbanAwaitsMerge(blocker)) continue;
       if (thread === null || blocker.workThreadId !== thread) return blocker;
+      // Same thread: it carries the blocker's commits on its own branch, so a finished blocker isn't held.
+      if (done) continue;
       if (
         blocker.stalled !== null ||
         blocker.priority === KANBAN_BACKLOG ||
@@ -384,6 +416,8 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Review events: the commit the reviewer reviewed, when it said. Null otherwise. */
+  head: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanCardEvent = typeof KanbanCardEvent.Type;
 
@@ -462,6 +496,19 @@ export const KanbanBoardIconImage = Schema.String.check(
   Schema.isPattern(/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/),
 );
 
+/**
+ * A board's first setup: the setup evaluator backfills the wiki while card work
+ * is held. Null on boards that never ran one (existing rows decode as null).
+ */
+export const KanbanBoardSetup = Schema.Struct({
+  status: Schema.Literals(["running", "done"]),
+  discussionId: KanbanDiscussionId,
+  threadId: ThreadId,
+  startedAt: IsoDateTime,
+  finishedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanBoardSetup = typeof KanbanBoardSetup.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -478,6 +525,7 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   instructions: KanbanInstructions,
+  setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });
@@ -568,6 +616,10 @@ export const KanbanDiscussion = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** Hidden until then, or until someone else posts. */
   snoozedUntil: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The owner pinned it: listed first and never settled automatically. */
+  pinnedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** When the owner last brought it back (unsettle, unsnooze or unpin); the idle day before auto-settle restarts here. */
+  reopenedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanDiscussion = typeof KanbanDiscussion.Type;
 
@@ -575,6 +627,8 @@ export const KanbanScriptTrigger = Schema.Union([
   Schema.TaggedStruct("schedule", {
     everyMs: Schema.NullOr(PositiveInt),
     cron: Schema.NullOr(Schema.String),
+    /** The zone a cron line runs in (the server's), filled on read; null when unknown. */
+    timeZone: Schema.optional(Schema.NullOr(Schema.String)),
   }),
   Schema.TaggedStruct("event", {
     event: Schema.Literals(["card.created", "card.moved", "message.posted"]),
@@ -660,9 +714,34 @@ export const KanbanThreadState = Schema.Struct({
   threadId: ThreadId,
   title: Schema.String,
   running: Schema.Boolean,
+  /** Waiting on its own built-in question, which nobody sees; running is false then. */
+  needsInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   lastActivityAt: Schema.NullOr(IsoDateTime),
 });
 export type KanbanThreadState = typeof KanbanThreadState.Type;
+
+/**
+ * A board thread as the Threads view lists it: the link plus its card and live
+ * state. `running` comes from the thread's real state, not from whether the
+ * link has ended, so an idle persistent evaluator is not shown as running.
+ */
+export const KanbanThreadRow = Schema.Struct({
+  threadId: ThreadId,
+  boardId: KanbanBoardId,
+  role: Schema.Literals(["work", "review", "evaluator"]),
+  purpose: Schema.NullOr(Schema.String),
+  cardId: Schema.NullOr(KanbanCardId),
+  cardNumber: Schema.NullOr(PositiveInt),
+  cardTitle: Schema.NullOr(Schema.String),
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  model: Schema.NullOr(ModelSelection),
+  title: Schema.NullOr(Schema.String),
+  running: Schema.Boolean,
+  lastActivityAt: Schema.NullOr(IsoDateTime),
+  startedAt: IsoDateTime,
+  endedAt: Schema.NullOr(IsoDateTime),
+});
+export type KanbanThreadRow = typeof KanbanThreadRow.Type;
 
 export const KanbanBoardSnapshot = Schema.Struct({
   board: KanbanBoard,

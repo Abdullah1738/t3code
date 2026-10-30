@@ -12,6 +12,7 @@ import {
   cardView,
   discussionPresence,
   ownerReadSeq,
+  parseKanbanLink,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
@@ -39,7 +40,7 @@ import { cn } from "../../lib/cn";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
-import { MarkdownText } from "../common/MarkdownText";
+import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
 import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
 import {
   cardGlyph,
@@ -48,6 +49,7 @@ import {
   groupBlockRuns,
   isLoadableImageUrl,
   nextTypingExpiry,
+  kanbanLinkTarget,
   sendBlocks,
   toggleChoice,
   type StoredAttachment,
@@ -276,6 +278,17 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
   return clock;
 }
 
+/**
+ * Links to this board's own cards and discussions open; anything else (another
+ * board's link, a missing record) stays inert, as on web.
+ */
+function resolveKanbanLinkFor(boardId: string, state: KanbanBoardState): ResolveKanbanLink {
+  return (href) => {
+    const link = parseKanbanLink(href);
+    return link === null ? null : kanbanLinkTarget(link, boardId, state);
+  };
+}
+
 /** Marks what is on screen read while the screen is in front. */
 function useMarkRead(
   boardId: string,
@@ -316,6 +329,7 @@ function MessageView(props: {
       discussionId={props.discussionId}
       message={message}
       state={props.state}
+      resolveKanbanLink={resolveKanbanLinkFor(props.boardId, props.state)}
       nowMs={props.nowMs}
       onOpenCard={props.onOpenCard}
     />
@@ -353,6 +367,7 @@ function Blocks(props: {
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
@@ -373,6 +388,7 @@ function Blocks(props: {
 function BlockView(props: {
   readonly block: KanbanBlock;
   readonly boardId: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly state: KanbanBoardState;
@@ -387,10 +403,17 @@ function BlockView(props: {
           text={block.text}
           maxLines={MESSAGE_LINES}
           tone={props.message.author._tag === "owner" ? "user" : "screen"}
+          resolveKanbanLink={props.resolveKanbanLink}
         />
       );
     case "collapse":
-      return <Collapse title={block.title} text={block.text} />;
+      return (
+        <Collapse
+          title={block.title}
+          text={block.text}
+          resolveKanbanLink={props.resolveKanbanLink}
+        />
+      );
     case "html":
       return <HtmlBlock html={block.html} title={block.title} height={block.height} />;
     case "choice":
@@ -502,7 +525,11 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
   );
 }
 
-function Collapse(props: { readonly title: string; readonly text: string }) {
+function Collapse(props: {
+  readonly title: string;
+  readonly text: string;
+  readonly resolveKanbanLink: ResolveKanbanLink;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <View className="rounded-[12px] bg-screen">
@@ -522,7 +549,11 @@ function Collapse(props: { readonly title: string; readonly text: string }) {
       </Pressable>
       {open ? (
         <View className="px-3 pb-2.5">
-          <MarkdownText text={props.text} maxLines={null} />
+          <MarkdownText
+            text={props.text}
+            maxLines={null}
+            resolveKanbanLink={props.resolveKanbanLink}
+          />
         </View>
       ) : null}
     </View>
@@ -599,7 +630,8 @@ function ChoiceBlock(props: {
   const poll = block.style === "poll";
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
-  const locked = !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
+  const locked =
+    !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
   // Sending from the field removes it while ChoiceBlock stays mounted, and
@@ -942,10 +974,7 @@ function Composer(props: {
       .catch((error: unknown) => {
         if (controller.signal.aborted || !owner.live) return;
         patch(local.id, (current) => ({ ...current, failed: true }));
-        Dialog.alert(
-          "Couldn't attach file",
-          error instanceof Error ? error.message : "Try again.",
-        );
+        Dialog.alert("Couldn't attach file", error instanceof Error ? error.message : "Try again.");
       });
   };
 
@@ -1152,7 +1181,12 @@ function DraftChip(props: {
         onPress={props.onRemove}
         className="size-7 items-center justify-center rounded-full"
       >
-        <SymbolView name="xmark" size={11} tintColorClassName="accent-icon-muted" type="monochrome" />
+        <SymbolView
+          name="xmark"
+          size={11}
+          tintColorClassName="accent-icon-muted"
+          type="monochrome"
+        />
       </Pressable>
     </View>
   );

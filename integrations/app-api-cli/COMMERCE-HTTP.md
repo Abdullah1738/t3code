@@ -183,9 +183,13 @@ Telegram wait, paid triple, tracking and watcher — is documented in
 
 Main/Supermall accept `--cvv-from-keychain`. CVV is encrypted in RAM before
 placement; an exact pending order's returned intent is completed at most once.
-Pending/3DS payment triggers an immediate Telegram attention alert:
-`this is ours: approve noon AED X in ENBD X`. Order/payment reads continue for
-at most ten minutes. `commerce await-payment FLOW_UUID --minutes 10` resumes
+Minutes: CVV-asking carts are allowed with `--cvv-from-keychain` (refused without
+it, before place). Pending/3DS payment triggers an immediate Telegram attention
+alert (`this is ours: approve noon Minutes AED X in ENBD X now (order …)`, source
+`Noon payment`), a second stall alert after 300 s if still unpaid, and the wait
+is 10 minutes (`--minutes 10` default for await-payment). Other lanes keep their
+own wait and alert text. Order/payment reads continue for at most ten minutes
+on this lane. `commerce await-payment FLOW_UUID --minutes 10` resumes
 status-only after interruption, including tracking registration on success.
 It never submits an unconsumed payment or resends a consumed one. This challenge
 path is fixture-tested, not live-paid validated.

@@ -17,6 +17,16 @@ Messages mutate while streaming, so only settled messages are projected
 SETTLE_SECS). A message is re-projected when its time_updated changes; facts
 pointing at replaced rows are re-linked.
 
+A session is rescanned when its time_updated changes OR its message count or max
+seq changes (session_v2.time_updated does not move when messages are appended,
+so the fingerprint in opencode_sync_progress is what catches them). That table
+starts empty, so the first runs rescan every session once. This is resumable:
+each finished session is recorded as it completes, and --deadline still stops
+between sessions.
+
+One failing session is logged and not stamped (so the next run retries it), the
+run continues with the rest, and the process exits 1.
+
 Messages already present in memory from the v1 import (turn_id=<msg_id>, not in
 the sync ledger) are adopted as legacy rows and left alone unless they change.
 
@@ -32,12 +42,13 @@ import os
 import sqlite3
 import sys
 import time
+import traceback
 import zlib
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
 RAW_DB = os.environ.get("OPENCODE_RAW_DB", os.path.join(HOME, ".local/share/memory-system/data/opencode_raw.db"))
-SRC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+SRC_DB = os.environ.get("OPENCODE_DB", os.path.join(HOME, ".local/share/opencode/opencode.db"))
 SOURCE = "opencode"
 SETTLE_SECS = 600
 IMAGE_MIN_LEN = 256
@@ -107,6 +118,16 @@ def text_of(items):
         elif isinstance(it, dict) and it.get("type") == "file":
             out.append("[file {} {}]".format(it.get("mime") or "", it.get("uri") or ""))
     return "\n".join(out)
+
+
+def clean_text(s):
+    # json.loads turns a lone \udXXX escape into a lone surrogate, which sqlite
+    # can't encode; re-pair valid halves and replace lone ones with U+FFFD
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 def settled(mtype, data, time_updated):
@@ -242,11 +263,14 @@ class Sync:
             CREATE TABLE IF NOT EXISTS opencode_sync_sessions(
               session_id TEXT PRIMARY KEY, native INTEGER, time_updated INTEGER,
               synced_at INTEGER);
+            CREATE TABLE IF NOT EXISTS opencode_sync_progress(
+              session_id TEXT PRIMARY KEY, max_seq INTEGER NOT NULL,
+              msg_count INTEGER NOT NULL);
         """)
         self.mem.commit()
         self.att = Attachments(self.mem)
         self.stats = dict(sessions=0, raw_upserts=0, projected=0, reprojected=0,
-                          legacy=0, unsettled=0, rows=0)
+                          legacy=0, unsettled=0, rows=0, errors=0, failed=[])
 
     # ------------------------------------------------------------ source reads
     def changed_sessions(self):
@@ -255,11 +279,22 @@ class Sync:
         self.src.commit()
         known = dict(self.mem.execute(
             "SELECT session_id, time_updated FROM opencode_sync_sessions").fetchall())
+        # session_v2.time_updated does not move when messages are appended, so
+        # the (max seq, message count) fingerprint is what catches new messages
+        src_fp = {sid: (mx, n) for sid, mx, n in self.src.execute(
+            "SELECT session_id, MAX(seq), COUNT(*) FROM session_message GROUP BY session_id")
+            .fetchall()}
+        self.src.commit()
+        have_fp = {sid: (mx, n) for sid, mx, n in self.mem.execute(
+            "SELECT session_id, max_seq, msg_count FROM opencode_sync_progress").fetchall()}
         out = []
         for r in rows:
             d = dict(zip(cols, r))
-            if known.get(d["id"]) == d["time_updated"] and not self.args.full:
+            fp = src_fp.get(d["id"], (0, 0))
+            if (known.get(d["id"]) == d["time_updated"] and have_fp.get(d["id"]) == fp
+                    and not self.args.full):
                 continue
+            d["_fp"] = fp
             out.append(d)
         return out
 
@@ -281,10 +316,9 @@ class Sync:
     def sync_session(self, sess):
         sid = sess["id"]
         native = is_native(sess.get("metadata"))
+        fp = sess.get("_fp") or (0, 0)
         if not native:
-            with_retry(self.mem, lambda: self.mem.execute(
-                "INSERT OR REPLACE INTO opencode_sync_sessions VALUES (?,?,?,?)",
-                (sid, 0, sess["time_updated"], int(time.time()))))
+            with_retry(self.mem, lambda: self._stamp(sid, 0, sess["time_updated"], fp))
             return
         self.stats["sessions"] += 1
         ledger = dict((m, (tu, p, lg)) for m, tu, p, lg in self.mem.execute(
@@ -330,9 +364,18 @@ class Sync:
             "INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
             (sid, sess["time_updated"], zlib.compress(srow, 6))))
         stamp = sess["time_updated"] if all_settled else -1
-        with_retry(self.mem, lambda: self.mem.execute(
+        with_retry(self.mem, lambda: self._stamp(sid, 1, stamp, fp))
+
+    def _stamp(self, sid, native, stamp, fp):
+        # Caller holds BEGIN IMMEDIATE. A -1 stamp (unsettled message) writes no
+        # progress row, so the session is retried on the next run.
+        self.mem.execute(
             "INSERT OR REPLACE INTO opencode_sync_sessions VALUES (?,?,?,?)",
-            (sid, 1, stamp, int(time.time()))))
+            (sid, native, stamp, int(time.time())))
+        if stamp != -1:
+            self.mem.execute(
+                "INSERT OR REPLACE INTO opencode_sync_progress VALUES (?,?,?)",
+                (sid, fp[0], fp[1]))
 
     def _project_chunk(self, sid, sess, chunk):
         m = self.mem
@@ -364,8 +407,8 @@ class Sync:
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,"
                     "content,content_type,model,tokens_used,metadata_json)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (SOURCE, sid, turn_id, ts, speaker, content or "", ctype, model, tokens,
-                     json.dumps(meta, ensure_ascii=False)))
+                    (SOURCE, sid, turn_id, ts, speaker, clean_text(content or ""), ctype,
+                     model, tokens, clean_text(json.dumps(meta, ensure_ascii=False))))
                 self.stats["rows"] += 1
             m.execute("INSERT OR REPLACE INTO opencode_sync_messages VALUES (?,?,?,?,?,?)",
                       (mid, sid, tu, 1, 0, int(time.time())))
@@ -396,7 +439,19 @@ class Sync:
         self.stats["remaining"] = 0
         self.write_progress(0, len(sessions), t0)
         for i, s in enumerate(sessions, 1):
-            self.sync_session(s)
+            # one bad session must not stop the rest: it is not stamped, so the
+            # next run retries it, and the run exits 1 (see main)
+            try:
+                self.sync_session(s)
+            except Exception as e:
+                self.stats["errors"] += 1
+                if len(self.stats["failed"]) < 20:
+                    self.stats["failed"].append(s["id"])
+                print("session {} failed: {}: {}".format(s["id"], type(e).__name__, e), flush=True)
+                print(traceback.format_exc(), flush=True)
+                if self.stats["errors"] >= 20:
+                    print("too many failed sessions, stopping", flush=True)
+                    break
             if i % 200 == 0:
                 print("  {}/{} {}".format(i, len(sessions), self.stats), flush=True)
             if i % 10 == 0:
@@ -424,7 +479,8 @@ def main():
     p.add_argument("--progress", default="",
                    help="write a JSON progress marker here every 10 sessions")
     args = p.parse_args()
-    Sync(args).run()
+    stats = Sync(args).run()
+    sys.exit(1 if stats.get("errors") else 0)
 
 
 if __name__ == "__main__":

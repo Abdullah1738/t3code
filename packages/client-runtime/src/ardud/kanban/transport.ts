@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, type Atom, type AtomRegistry } from "effect/reactivity";
+import { Atom, AsyncResult, type AtomRegistry } from "effect/reactivity";
 
 import type * as EnvironmentRegistry from "../../connection/registry.ts";
 import * as EnvironmentSupervisor from "../../connection/supervisor.ts";
@@ -41,6 +41,8 @@ export interface KanbanTransport {
     tag: TTag,
     input: KanbanRpcInput<TTag>,
   ): Promise<EnvironmentRpcSuccess<TTag>>;
+  /** Whether this connection's grants allow `tag`, for disabling its control. */
+  permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
 }
 
 /** No server is connected yet. Reads wait and retry on it instead of failing. */
@@ -97,12 +99,17 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
   );
 }
 
+/** A kanban request as an environment command; `permissionAtom` gates its control. */
+type KanbanRpcCommand = {
+  readonly run: (...args: never[]) => unknown;
+  readonly permissionAtom: (environmentId: EnvironmentId | null) => Atom.Atom<boolean>;
+};
+
 export function createAtomKanbanTransport<R, ER>(
   options: AtomKanbanTransportOptions<R, ER>,
 ): KanbanTransport {
   const { runtime, registry, environmentId } = options;
-  const commands = new Map<string, { readonly run: (...args: never[]) => unknown }>();
-
+  const commands = new Map<string, KanbanRpcCommand>();
   const commandFor = (tag: KanbanRequestTag) => {
     const existing = commands.get(tag);
     if (existing !== undefined) return existing;
@@ -112,6 +119,13 @@ export function createAtomKanbanTransport<R, ER>(
   };
 
   return {
+    permission(tag) {
+      const { permissionAtom } = commandFor(tag);
+      // The primary environment changes with the connection, so the grant is read per target.
+      return Atom.make((get) => get(permissionAtom(get(environmentId)))).pipe(
+        Atom.withLabel(`kanban-permission:${tag}`),
+      );
+    },
     stream(tag, input, onValue, onError) {
       const atom = runtime.atom((get) => {
         const target = get(environmentId);

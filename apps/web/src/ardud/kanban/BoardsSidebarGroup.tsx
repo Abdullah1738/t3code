@@ -1,7 +1,7 @@
 import { Link, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import { CircleHelpIcon, MessageCircleIcon } from "lucide-react";
-import { memo, type ReactNode } from "react";
+import { memo, type ReactNode, useState } from "react";
 
 import type { KanbanBoardSummary } from "@t3tools/contracts";
 
@@ -10,6 +10,7 @@ import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
 import { BoardIcon } from "./boardIcon";
+import { NewBoardDialog } from "./NewBoardDialog";
 import { useBoards } from "./kanbanStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
@@ -41,20 +42,31 @@ export function BoardsSidebarGroup() {
   };
 
   const live = (boards ?? []).filter((summary) => summary.board.archivedAt === null);
-  if (live.length === 0) return null;
+  const [creating, setCreating] = useState(false);
   const expanded = !state.collapsed;
 
+  // The group stays visible with no boards so "+ New board" is always reachable.
   return (
     <SidebarGroup aria-label="Boards">
-      <div className="mx-0.5 h-8">
-        <CollapsibleSectionHeader
-          expanded={expanded}
-          onClick={() => setState((current) => ({ ...current, collapsed: !current.collapsed }))}
+      <div className="mx-0.5 flex h-8 items-center gap-1">
+        <div className="min-w-0 flex-1">
+          <CollapsibleSectionHeader
+            expanded={expanded}
+            onClick={() => setState((current) => ({ ...current, collapsed: !current.collapsed }))}
+          >
+            Boards
+          </CollapsibleSectionHeader>
+        </div>
+        <button
+          type="button"
+          onClick={() => setCreating(true)}
+          className="rounded-md px-2 py-1 text-xs text-sidebar-muted-foreground hover:bg-sidebar-row-hover"
         >
-          Boards
-        </CollapsibleSectionHeader>
+          + New board
+        </button>
+        <NewBoardDialog open={creating} onOpenChange={setCreating} />
       </div>
-      {expanded ? (
+      {expanded && live.length > 0 ? (
         <ul className="flex flex-col gap-0.5 pb-3.5">
           {live.map((summary) => (
             <BoardRow

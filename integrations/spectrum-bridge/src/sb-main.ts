@@ -12,6 +12,7 @@ import { backendKind, createBackend } from "./backend.ts";
 import type { Access } from "./chats.ts";
 import { alertSkillPath, skillPath, stateRoot, telegramBridgeSocket, type Config } from "./config.ts";
 import { Delivery } from "./delivery.ts";
+import { checkReply, readReplyRules } from "./replyCheck.ts";
 import type { Line, LineEvent } from "./line.ts";
 import { acquireLock } from "./lock.ts";
 import type { ChatBackend } from "./openchamber.ts";
@@ -170,7 +171,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
-  const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
+    origin: config.shareOrigin });
   process.once("exit", () => shares.killAll());
   void shares.restore().catch(() => log("share-sweep-failed"));
   const post = socketPost(telegramBridgeSocket);
@@ -210,6 +212,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       router: () => router, chatGuid: () => chat.info.key,
       ...(apps ? { secrets: { stateRoot: chat.stateRoot, publishApps } } : {}),
       enabled: ready, health: () => ({}),
+      replyCheck: text => checkReply(chat.info, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
+      log,
     });
     return { router, delivery, api: chatApi, backend: chatBackend, busy: false };
   };
