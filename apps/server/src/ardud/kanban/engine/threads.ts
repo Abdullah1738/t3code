@@ -25,7 +25,7 @@ import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/or
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
-import { type ControlThreadState, stateFromShell } from "../../control/model.ts";
+import { type ControlThreadState, stateFromRunStatus } from "../../control/model.ts";
 
 export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
   "KanbanThreadError",
@@ -100,11 +100,25 @@ const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCry
 const detailOf = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
 
-const quietSinceOf = (shell: OrchestrationV2ThreadShell): DateTime.Utc => {
+/**
+ * The state and quiet-since of a thread from the shell fields that matter here.
+ * An async question (blocking false) doesn't stop the run, so it counts as no question at all.
+ */
+export const viewStateOf = (
+  shell: Pick<
+    OrchestrationV2ThreadShell,
+    | "pendingRuntimeRequest"
+    | "activityRunStatus"
+    | "status"
+    | "updatedAt"
+    | "latestRunCompletedAt"
+  >,
+): { readonly state: ControlThreadState; readonly quietSince: DateTime.Utc } => {
   const request = shell.pendingRuntimeRequest;
-  // An async question doesn't stop the run, so it says nothing about quiet.
-  if (request !== null) return request.blocking === false ? shell.updatedAt : request.createdAt;
-  return shell.latestRunCompletedAt ?? shell.updatedAt;
+  const blocking = request !== null && request.blocking !== false ? request : null;
+  const state = stateFromRunStatus(shell.activityRunStatus ?? shell.status, blocking !== null);
+  const quietSince = blocking?.createdAt ?? shell.latestRunCompletedAt ?? shell.updatedAt;
+  return { state, quietSince };
 };
 
 const make = Effect.gen(function* () {
@@ -120,9 +134,9 @@ const make = Effect.gen(function* () {
               threadId: shell.id,
               projectId: shell.projectId,
               title: shell.title,
-              state: stateFromShell(shell),
+              state: viewStateOf(shell).state,
               updatedAt: DateTime.formatIso(shell.updatedAt),
-              quietSince: DateTime.formatIso(quietSinceOf(shell)),
+              quietSince: DateTime.formatIso(viewStateOf(shell).quietSince),
               runStartedAt: shell.activityRunStartedAt
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
