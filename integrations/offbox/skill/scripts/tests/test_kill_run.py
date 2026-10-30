@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, lease, misc, reap, runs  # noqa: E402
+from offbox_lib import api, common, lease, misc, reap, runs  # noqa: E402
 from offbox_lib.common import now  # noqa: E402
 
 from test_capacity import Isolated  # noqa: E402
@@ -61,11 +61,41 @@ class KillRunTests(Isolated):
         self.assertEqual(self.status_of('run-1')['status'], 'running')
         self.assertIn('still reports', err.getvalue())
 
-    def test_kill_error_and_unknown_status_leaves_row_running(self):
+    def test_status_error_leaves_row_running(self):
         self.run_row()
-        self.patched_kill(kill_side_effect=api.OffboxError('boom'), status_values=(api.OffboxError('status boom'),))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        self.patched_kill(status_values=(api.OffboxError('status boom'),))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-1'), 1)
+        self.assertEqual(self.status_of('run-1')['status'], 'running')
+
+    def test_empty_or_unknown_status_never_marks_killed(self):
+        # An empty successful response ({}) or one without a running field is not proof the process stopped.
+        for i, bogus in enumerate(({}, {'status': 'running'}, {'exitCode': 143})):
+            with self.subTest(status=bogus):
+                rid = f'run-bogus-{i}'
+                self.run_row(rid)
+                self.patched_kill(status_values=(bogus,))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(misc.kill_run(rid), 1)
+                self.assertEqual(self.status_of(rid)['status'], 'running')
+                self.assertIn('returned no clear running state', err.getvalue())
+
+    def test_delete_error_then_404_confirms_stop(self):
+        # DELETE timed out but the process is gone: the follow-up GET returning 404 is the accepted confirmation.
+        self.run_row()
+        self.patched_kill(kill_side_effect=api.OffboxError('DELETE timed out'), status_values=(None,))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(misc.kill_run('run-1'), 0)
+        self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
+        self.assertIn('kill request failed', out.getvalue())
+
+    def test_delete_error_with_still_running_leaves_row_running(self):
+        self.run_row()
+        self.patched_kill(kill_side_effect=api.OffboxError('DELETE timed out'),
+                          status_values=({'running': True, 'status': 'running'},))
+        with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(misc.kill_run('run-1'), 1)
         self.assertEqual(self.status_of('run-1')['status'], 'running')
 
@@ -96,6 +126,36 @@ class KillRunTests(Isolated):
             misc._release_one(self.con, r, False)
         self.assertIn('run-hung', err.getvalue())
         self.assertIn('offbox kill <run>', err.getvalue())
+
+    def test_public_release_names_runs_when_box_lock_is_held(self):
+        # A streaming foreground run holds box-<id>; public release must still name the hung run and suggest kill.
+        self.box('bx_held')
+        self.run_row('run-streaming', box='bx_held', pid=9)
+        held = common.file_lock('box-bx_held', timeout=0)
+        held.__enter__()
+        try:
+            err = io.StringIO()
+            with patch.object(misc, 'db', return_value=self.con), contextlib.redirect_stderr(err):
+                misc.release(self.me, 'bx_held', False, False)
+            self.assertIn('run-streaming', err.getvalue())
+            self.assertIn('offbox kill <run>', err.getvalue())
+            self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='bx_held'").fetchone()[0],
+                             'running')
+        finally:
+            held.__exit__(None, None, None)
+
+    def test_public_release_busy_lock_without_runs_is_not_run_hint(self):
+        self.box('bx_busy2')
+        held = common.file_lock('box-bx_busy2', timeout=0)
+        held.__enter__()
+        try:
+            err = io.StringIO()
+            with patch.object(misc, 'db', return_value=self.con), contextlib.redirect_stderr(err):
+                misc.release(self.me, 'bx_busy2', False, False)
+            self.assertIn('box is busy', err.getvalue())
+            self.assertNotIn('offbox kill', err.getvalue())
+        finally:
+            held.__exit__(None, None, None)
 
     def test_reaper_marks_old_nobox_rows_lost_only(self):
         self.run_row('run-old-nobox', box=None, pid=None, mode='bg', start=now() - 3 * 3600)
