@@ -3810,7 +3810,8 @@ const make = Effect.gen(function* () {
             body: to === "todo" ? "Next step is the worker's" : "Next step is the review",
           });
         }
-        yield* saveCard(next);
+        // The actor goes with the save: a card a script's subtask moved is a move by that script.
+        yield* saveCard(next, to !== null && card.stage !== to ? actor : undefined);
         yield* evaluatorTurn(card, next, actor);
         yield* kick;
         return next;

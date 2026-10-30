@@ -538,3 +538,53 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
     assert.strictEqual(sent.filter((text) => text.includes("again")).length, 0);
   }).pipe(Effect.provide(makeTestLayer(recording)));
 });
+
+it.effect("a subtask a script ticks, which moves its card, wakes no card.moved script, its own or another", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+    // Two card.moved listeners. A rerun by either would show up as a run of it.
+    const mover = yield* register(
+      board,
+      scriptFile(`echo "$KANBAN_EVENT"\n`),
+      { _tag: "event", event: "card.moved" },
+      "mover",
+    );
+    const watcher = yield* register(
+      board,
+      scriptFile(`echo "$KANBAN_EVENT"\n`),
+      { _tag: "event", event: "card.moved" },
+      "watcher",
+    );
+    // The ticker's card has one script subtask; ticking it moves the card to completed.
+    const ticker = yield* register(
+      board,
+      scriptFile(
+        `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"landed"}'\n`,
+      ),
+      manual,
+      "ticker",
+    );
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        prompt: "Land the change",
+        title: "Land",
+        subtasks: [{ text: "Merge and deploy", owner: "script", script: "ticker" }],
+      },
+      owner,
+    );
+    assert.strictEqual(card.number, 1);
+    yield* scripts.listen;
+    yield* scripts.run(ticker.id, "manual");
+    yield* scripts.idle;
+    yield* settle;
+
+    const stored = (yield* kanban.snapshot(board.id)).cards.find((entry) => entry.number === card.number)!;
+    assert.strictEqual(stored.stage, "completed");
+    assert.strictEqual((yield* scripts.runs(mover.id, 10)).length, 0);
+    assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
