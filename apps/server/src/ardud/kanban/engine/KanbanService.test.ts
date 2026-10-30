@@ -2815,6 +2815,51 @@ it.effect("the owner makes an ask blocking: the card waits, then wakes with his 
   }),
 );
 
+it.effect("a multi ask posts a tick-several pick and wakes the card with every pick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const talk = yield* kanban.cardDiscussion(card.id);
+
+      // A plain pick (no multi) still posts a single pick.
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Pick one?", blocking: false, options: ["X", "Y"] },
+        worker,
+        "cardThread",
+      );
+      const single = yield* kanban.messages(talk.id);
+      assert.deepStrictEqual(
+        single.at(-1)?.blocks.map((b) => (b._tag === "choice" ? b.multi : null)),
+        [false],
+      );
+
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Which?", blocking: true, options: ["A", "B", "C"], multi: true },
+        worker,
+        "cardThread",
+      );
+      const posted = yield* kanban.messages(talk.id);
+      assert.deepStrictEqual(
+        posted.at(-1)?.blocks.map((b) => (b._tag === "choice" ? b.multi : null)),
+        [true],
+      );
+
+      yield* kanban.answer(talk.id, asked.asks.at(-1)!.seq!, "q2", ["o1", "o3"], owner);
+      const woken = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(woken.stage, "todo");
+      assert.include(woken.wakeNote ?? "", "A");
+      assert.include(woken.wakeNote ?? "", "C");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a blocked ask answered in his own words wakes the card with them", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

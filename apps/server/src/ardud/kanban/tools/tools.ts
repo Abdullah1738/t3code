@@ -205,13 +205,19 @@ const CardMove = tool(
 const CardAsk = tool(
   "card_ask",
   "Ask the owner",
-  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick.",
+  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick; multi lets him tick several.",
   {
     card: Schema.optional(CardRef),
     question: Schema.String,
     blocking: Schema.optional(Schema.Boolean),
     options: Schema.optional(
       describe(Schema.Array(Schema.String), "Answers to pick from, when they are known."),
+    ),
+    multi: Schema.optional(
+      describe(
+        Schema.Boolean,
+        "With options: let the owner tick several (a checklist). Default: one pick.",
+      ),
     ),
   },
   { card: Record },

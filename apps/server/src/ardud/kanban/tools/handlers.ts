@@ -379,7 +379,12 @@ const handlers = {
         }
         const asked = yield* service.askOwner(
           card.id,
-          { question: input.question, blocking: input.blocking ?? false, options: input.options },
+          {
+            question: input.question,
+            blocking: input.blocking ?? false,
+            options: input.options,
+            multi: input.multi,
+          },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );

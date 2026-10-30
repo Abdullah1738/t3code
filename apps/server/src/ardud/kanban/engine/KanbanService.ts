@@ -278,6 +278,7 @@ export interface KanbanServiceShape {
       readonly question: string;
       readonly blocking: boolean;
       readonly options?: ReadonlyArray<string> | undefined;
+      readonly multi?: boolean | undefined;
     },
     actor: KanbanActor,
     role: Rules.MoveRole,
@@ -3836,9 +3837,15 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     ask: KanbanOwnerAsk,
     options: ReadonlyArray<string>,
+    multi = false,
   ) {
     const discussion = yield* cardDiscussionUnlocked(card.id);
-    const message = yield* postUnlocked(discussion.id, ask.by, Asks.askBlocks(ask, options), false);
+    const message = yield* postUnlocked(
+      discussion.id,
+      ask.by,
+      Asks.askBlocks(ask, options, multi),
+      false,
+    );
     const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, { seq: message.seq });
     yield* saveCard(next);
     return next;
@@ -3874,7 +3881,7 @@ const make = Effect.gen(function* () {
           yield* evaluatorTurn(card, next, actor);
         }
         const ask = next.asks.at(-1);
-        return ask ? yield* postAsk(next, ask, input.options ?? []) : next;
+        return ask ? yield* postAsk(next, ask, input.options ?? [], input.multi ?? false) : next;
       }),
     );
 
