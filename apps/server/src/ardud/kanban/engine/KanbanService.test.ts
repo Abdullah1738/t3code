@@ -388,10 +388,18 @@ const chainStepOneLostSlot = (flag: "dispatcher" | "self") =>
     card = (yield* kanban.card(created.id)).card;
     assert.strictEqual(card.reviewStep, 1);
 
+    // The dispatcher's flag is cleared by the verdict, so step 2 dispatches into
+    // the same thread. A reviewer's own flag still holds the card for the
+    // evaluator: nothing is dispatched until someone answers it.
     yield* kanban.dispatchNow;
     card = (yield* kanban.card(created.id)).card;
-    assert.strictEqual(card.activeThreadId, reviewThread);
-    assert.include(card.activePool ?? "", "gpt-6-astra");
+    if (flag === "dispatcher") {
+      assert.strictEqual(card.activeThreadId, reviewThread);
+      assert.include(card.activePool ?? "", "gpt-6-astra");
+    } else {
+      assert.isNull(card.activeThreadId);
+      assert.isNotNull(card.stalled);
+    }
     return { kanban, created, reviewThread };
   });
 
