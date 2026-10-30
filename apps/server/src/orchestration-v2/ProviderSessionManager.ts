@@ -1739,6 +1739,9 @@ export const layerWithOptions = (
           });
         return {
           ...runtime,
+          get providerSession() {
+            return runtime.providerSession;
+          },
           subscribeEvents,
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
