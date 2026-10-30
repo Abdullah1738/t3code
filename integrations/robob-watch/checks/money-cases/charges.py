@@ -66,9 +66,13 @@ RECEIPT_WORDS = re.compile(r"\b(?:(?:receipt|invoice|amount paid|paid on|billed 
                            r"order (?:number|no|id|confirmed|confirmation|summary)|thanks? (?:you )?for "
                            r"(?:your )?(?:\w+ )?order(?:ing)?|payment (?:received|confirmation|successful|confirmed))"
                            r"\b|order #)", re.I)
-# His words mention a charge without owning it when he denies it or asks about it.
+# His words mention a charge without owning it when he denies it, asks about it or isn't sure.
 NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fraud|scam|stolen|block|dispute|"
-                      r"cancel|refund|who|what|why|which)\b", re.I)
+                      r"cancel|refund|who|what|why|which|maybe|perhaps|probably|possibly|might|unsure|think|guess)\b",
+                      re.I)
+# A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
+ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
+                  re.I)
 # His words own a payment: he is ordering, paying, subscribing or topping up (not just naming a merchant).
 OWNER_BUYS = re.compile(r"\b(?:ordering|ordered|paying|paid|set ?up|subscrib(?:e|ed|ing)|top(?:ped|ping)? up|"
                         r"bought|buying|(?:is|are|was|it'?s|that'?s) mine|mine)\b"
@@ -153,21 +157,48 @@ def iso(t):
     return t.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
-# Provenance the scheduler, delegation and notifications stamp on a turn. A scheduled prompt bound to
-# his iMessage thread has no [tag] and a 'system' stamp, so only this metadata tells it apart.
-AUTOMATED_FIELDS = ('scheduledTaskId', 'notification', 'delegatedCompletion')
+# Fields only automation puts on a turn: a scheduled run, a notification, a delegated result, a message
+# from another thread. A turn carrying any of them is never his typing, whoever it is stamped as.
+AUTOMATED = ('scheduledTaskId', 'notification', 'delegatedCompletion', 'senderThreadId')
+# Inbound ids the iMessage bridge makes up for its own turns: watcher wakes, context resets, secure forms.
+SYNTHETIC_IDS = ('wake:', 'reset:', 'secret:')
+INBOUND_ID = re.compile(r'Current incoming message ID: ("(?:[^"\\]|\\.)*")')
 
 
-def owner_turn(created_by, text, title='', payload=None):
-    """Whether a Robob user turn is his own typing. Automated turns never are: anything the scheduler,
-    delegation or a notification stamped (checked by metadata, not by its text). Otherwise the app's
-    'user' turn, or the bridge's 'system' send in his iMessage thread without a leading [tag]."""
-    if any((payload or {}).get(k) not in (None, '', False) for k in AUTOMATED_FIELDS):
+def inbound_id(payload):
+    """The iMessage the bridge relayed in this turn, from its channel-guidance record, or None."""
+    context = payload.get('context')
+    records = context.get('records') if isinstance(context, dict) else None
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict) or record.get('kind') != 'ardud-guidance':
+            continue
+        body = record.get('payload')
+        m = INBOUND_ID.search(str(body.get('text') or '') if isinstance(body, dict) else '')
+        if m:
+            try:
+                return str(json.loads(m.group(1)))
+            except ValueError:
+                return None
+    return None
+
+
+# Where the app stamps a turn he typed himself. 'server' 'user' turns are coord, crw and forwards.
+APP_SOURCES = ('web', 'mobile', 'desktop')
+
+
+def owner_turn(payload, title=''):
+    """Whether a Robob user turn is his own typing. A turn automation made (a schedule run under his saved
+    actor, a notification, a delegated result, another thread's message) never is. Otherwise: a 'user'
+    turn typed in the app, or, in his iMessage thread, a turn relaying a real inbound iMessage. Scheduled
+    prompts, kanban and watcher wakes carry no relayed id, or a made-up wake:/reset:/secret: one."""
+    if any(payload.get(k) for k in AUTOMATED):
         return False
-    if created_by == 'user':
+    if payload.get('createdBy') == 'user' and payload.get('creationSource') in APP_SOURCES:
         return True
-    return created_by == 'system' and str(title or '').startswith('iMessage') \
-        and not str(text).lstrip().startswith('[')
+    if payload.get('createdBy') not in ('user', 'system') or not str(title or '').startswith('iMessage'):
+        return False
+    iid = inbound_id(payload)
+    return bool(iid) and not iid.startswith(SYNTHETIC_IDS) and not str(payload.get('text') or '').lstrip().startswith('[')
 
 
 def owner_texts(since, until, deadline=None):
@@ -191,12 +222,9 @@ def owner_texts(since, until, deadline=None):
             p = json.loads(payload)
         except ValueError:
             continue
-        text = str(p.get('text') or '')
-        # 'user' is the owner typing in the app. The bridge sends his iMessages as 'system' (control API,
-        # no owner provenance), so 'system' counts only without a leading [tag]: every automated wake
-        # (watchers, bridge requests, kanban, replies) starts with one. Other people's chats and forwards
-        # never count.
-        if not owner_turn(p.get('createdBy'), text, title, p) or text.startswith('[Forwarded by') \
+        text = str(p.get('text') or '') if isinstance(p, dict) else ''
+        # Other people's chats and forwarded turns never count.
+        if not isinstance(p, dict) or not owner_turn(p, title) or text.startswith('[Forwarded by') \
                 or re.match(r'(?:Moni|Group)\b', title or ''):
             continue
         out.append((created, text, title or ''))
@@ -291,9 +319,10 @@ def receipt(charge, at, now, find=None, deadline=None, read=None):
     return None
 
 
-def clauses(text):
-    """The text split where a sentence or a clause changes its subject."""
-    return [c for c in re.split(r"[.;!?\n]|,\s*(?:and|but|then|so)\s|\s+and\s+", str(text)) if c.strip()]
+# Where one statement ends and the next begins: "I paid Amazon AED 50. Send me the Apple keynote" is two.
+CLAUSES = re.compile(r'[.!?;:\n]+(?=\s|$)|,\s+|\s+(?:and|then|but|also|plus)\s+', re.I)
+_CODES = r'(?:AED|USD|EUR|GBP|INR|JPY|CNY|SAR|QAR|KWD|OMR|BHD|CAD|AUD|CHF|SGD|HKD|dhs?|dirhams?|bucks|dollars?|euros?|pounds?|rupees?)'
+MONEY = re.compile(rf'(?:\b{_CODES}\b|[$€£¥₹])\s?\d|\d[\d,.]*\s?(?:\b{_CODES}\b|[$€£¥₹])', re.I)
 
 
 def owner_said(charge, at, now, said=None, deadline=None):
@@ -302,14 +331,20 @@ def owner_said(charge, at, now, said=None, deadline=None):
     if not names:
         return None
     pattern = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I)
+    money = amount_pattern(charge)
     for created, text, title in said(at - OWNER_AROUND, min(now, at + OWNER_AROUND), deadline=deadline):
-        # Naming the merchant isn't enough: "Summarize the Apple keynote" names it without buying
-        # anything. He has to say he is paying or ordering it.
-        # "It isn't mine" or "what's the Acme charge?" names the merchant but explains nothing.
-        # The merchant and his purchase or ownership words must be in the same clause: "I paid Amazon.
-        # Send me the Apple summary" pays for something else.
-        if any(pattern.search(c) and OWNER_BUYS.search(c) and not NOT_MINE.search(c) for c in clauses(text)):
-            return created, text, title
+        # "It isn't mine", "what's the Acme charge?" or "Have I paid Acme" anywhere in the message explains
+        # nothing. The whole message is checked, before it is split, so a "?" is never cut off its clause.
+        parts = CLAUSES.split(text)
+        if NOT_MINE.search(text) or any(ASKS.search(c) for c in parts):
+            continue
+        # The purchase words have to be about this merchant, in the same statement: "I paid Amazon AED 50.
+        # Send me the Apple keynote summary." pays Amazon, not Apple. An amount in that statement has to be
+        # this charge's: "I paid AED 50 for the Apple cable" isn't a USD 99 Apple charge.
+        for clause in parts:
+            if pattern.search(clause) and OWNER_BUYS.search(clause) \
+                    and (not MONEY.search(clause) or money.search(clause)):
+                return created, text, title
     return None
 
 

@@ -216,7 +216,7 @@ class Explain(unittest.TestCase):
                        ('a', 'iMessage 2026-10-24 00:30', '2026-10-24T00:00:00.000Z'))
             rows = [('2026-10-24T00:10:00.000Z', {'createdBy': 'system', 'text': 'Check my Apple order status',
                                                   'scheduledTaskId': 'scheduled-task:apple'}),
-                    ('2026-10-24T00:11:00.000Z', {'createdBy': 'system', 'text': 'Ok'})]
+                    ('2026-10-24T00:11:00.000Z', relayed('Ok'))]
             for created, payload in rows:
                 db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
                            ('a', 'user', created, json.dumps(payload)))
@@ -256,6 +256,35 @@ class Explain(unittest.TestCase):
             return [('2026-10-24T00:20:00.000Z', 'The Apple charge is mine', 'Apple charge')]
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
         self.assertEqual(r['verdict'], 'owner')
+
+    def test_paying_another_merchant_in_the_same_message_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+        for text in ('I paid Amazon AED 50. Send me the Apple keynote summary.',
+                     'Paid Amazon, then summarise the Apple keynote',
+                     'I ordered from Amazon and want the Apple keynote notes',
+                     'I paid AED 50 for the Apple cable'):
+            def said(since, until, deadline=None, text=text):
+                return [('2026-10-24T00:20:00.000Z', text, 'iMessage 2026-10-24 00:40')]
+            r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+            self.assertEqual(r['verdict'], 'ask', text)
+        for text in ('I paid Apple USD 99', 'Send me the keynote summary. I paid Apple $99 for iCloud.',
+                     'Amazon was earlier. The Apple charge is mine'):
+            def said(since, until, deadline=None, text=text):
+                return [('2026-10-24T00:20:00.000Z', text, 'iMessage 2026-10-24 00:40')]
+            r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+            self.assertEqual(r['verdict'], 'owner', text)
+
+    def test_a_question_about_paying_or_owning_it_explains_nothing(self):
+        # Review round 4: splitting the message into clauses must not drop the "?" that makes it a question.
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+        for text in ('Is this Apple charge mine?', 'Have I paid Apple?', 'Did I order from Apple? I paid Amazon.',
+                     'Is this Apple charge mine', 'Have I paid Apple', 'Maybe the Apple charge is mine',
+                     'I paid Apple 50 dollars',
+                     'I paid Apple. Actually no, that is not mine, block it', 'Apple orders keep coming. Who is this'):
+            def said(since, until, deadline=None, text=text):
+                return [('2026-10-24T00:20:00.000Z', text, 'iMessage 2026-10-24 00:40')]
+            r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+            self.assertEqual(r['verdict'], 'ask', text)
 
     def test_his_denials_and_questions_explain_nothing(self):
         for text in ('I do not recognise the ACME charge. It is not mine.', "What's this Acme charge?",
@@ -319,6 +348,15 @@ class Explain(unittest.TestCase):
             ch.left(0, 5)
 
 
+def relayed(text, inbound='BCA7F873-4770-43DB-8E0E-7E3294F6C71A', **extra):
+    """A turn as the iMessage bridge sends it: stamped 'system', the relayed id in its channel guidance."""
+    guidance = f'You are the owner\'s personal assistant. Current incoming message ID: {json.dumps(inbound)}. Rest.'
+    record = {'version': 1, 'contextId': 'ardud-guidance', 'label': 'Channel guidance', 'kind': 'ardud-guidance',
+              'payload': {'text': guidance}}
+    return {'createdBy': 'system', 'creationSource': 'server', 'text': text,
+            'context': {'version': 1, 'records': [record]}, **extra}
+
+
 class OwnerTexts(unittest.TestCase):
     def test_only_what_he_typed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,14 +367,17 @@ class OwnerTexts(unittest.TestCase):
                        'payload_json TEXT)')
             for tid, title in (('a', 'iMessage 2026-10-24 00:30'), ('m', 'Moni'), ('g', 'Group sb_gro')):
                 db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)', (tid, title, '2026-10-24T00:00:00.000Z'))
-            rows = [('a', 'user', {'createdBy': 'user', 'text': 'acme is mine'}),
+            rows = [('a', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme is mine'}),
                     # The bridge stamps the owner's iMessage turns 'system' (control/http.ts).
-                    ('a', 'user', {'createdBy': 'system', 'text': 'Acme ordering now'}),
+                    ('a', 'user', relayed('Acme ordering now')),
                     ('a', 'user', {'createdBy': 'agent', 'text': 'acme agent'}),
-                    ('a', 'user', {'createdBy': 'user', 'text': '[Forwarded by the owner from x] acme'}),
-                    ('m', 'user', {'createdBy': 'user', 'text': 'acme from moni'}),
-                    ('g', 'user', {'createdBy': 'user', 'text': 'acme in the group'}),
-                    ('a', 'assistant', {'createdBy': 'user', 'text': 'acme reply'})]
+                    ('a', 'user', {'createdBy': 'user', 'creationSource': 'web',
+                                   'text': '[Forwarded by the owner from x] acme'}),
+                    # Coord and crw wakes were stamped 'user' by the server before 27 Oct.
+                    ('a', 'user', {'createdBy': 'user', 'creationSource': 'server', 'text': 'acme ordered by coord'}),
+                    ('m', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme from moni'}),
+                    ('g', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme in the group'}),
+                    ('a', 'assistant', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme reply'})]
             for tid, role, payload in rows:
                 db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
                            (tid, role, '2026-10-24T00:10:00.000Z', json.dumps(payload)))
@@ -365,6 +406,46 @@ class OwnerTexts(unittest.TestCase):
             self.assertNotIn('[Watcher] APPLE.COM/BILL USD 99 charged', kanban)
             with patch.object(ch, 'STATE_DB', Path(tmp) / 'missing.sqlite'), self.assertRaises(ch.Lookup):
                 ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
+
+    def test_a_schedule_or_wake_in_his_imessage_thread_is_not_his_words(self):
+        # ScheduledTaskService sends a bound task's stored prompt into his iMessage thread as plain text, with
+        # scheduledTaskId and the task's saved actor ('system', or 'user' when he made the task in the app).
+        texts = {'Check my Apple order status': {'createdBy': 'system', 'creationSource': 'server',
+                                                 'scheduledTaskId': 'scheduled-task:1'},
+                 'Apple order is mine, check it': {'createdBy': 'user', 'creationSource': 'web',
+                                                   'scheduledTaskId': 'scheduled-task:2'},
+                 'I paid Apple, notification': {'createdBy': 'system', 'notification': {'kind': 'x'}},
+                 'Apple order from another thread': {'createdBy': 'system', 'senderThreadId': 'thread:x'},
+                 'Apple ordered by a plain control send': {'createdBy': 'system', 'creationSource': 'server'}}
+        rows = [(text, {'text': text, **extra}) for text, extra in texts.items()]
+        # The bridge's own turns carry made-up ids, not a relayed iMessage.
+        for i, fake in enumerate(('wake:abc', 'reset:59:1793073710879', 'secret:abc')):
+            rows.append((f'Apple ordering now {i}', relayed(f'Apple ordering now {i}', inbound=fake)))
+        rows.append(('I am ordering Apple now', relayed('I am ordering Apple now')))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'state.sqlite'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
+            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
+                       'payload_json TEXT)')
+            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
+                       ('a', 'iMessage 2026-10-24 00:30', '2026-10-24T00:00:00.000Z'))
+            for _, payload in rows:
+                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
+                           ('a', 'user', '2026-10-24T00:10:00.000Z', json.dumps(payload)))
+            db.commit()
+            db.close()
+            with patch.object(ch, 'STATE_DB', path):
+                got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
+                self.assertEqual(got, ['I am ordering Apple now'])
+                # The replay from review round 3: the scheduled prompt explains nothing, so the charge is asked.
+                apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+                db = sqlite3.connect(path)
+                db.execute("DELETE FROM orchestration_v2_projection_messages WHERE payload_json LIKE '%I am ordering%'")
+                db.commit()
+                db.close()
+                r = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+                self.assertEqual(r['verdict'], 'ask')
 
 
 if __name__ == '__main__':

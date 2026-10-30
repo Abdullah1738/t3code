@@ -238,7 +238,7 @@ class TriageTests(unittest.TestCase):
             calls.append(seconds)
             real(which, seconds, interval)
             if len(calls) == 1:
-                time.sleep(1.05)  # descheduled between arming and the call
+                time.sleep(3)  # descheduled between arming and the call; the deadline (1 s) cuts this short
         with patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
              patch.object(t, 'classify', side_effect=AssertionError('the deadline came first')):
             hits, meta = t.classify_batch([self.item()], {}, 1)
