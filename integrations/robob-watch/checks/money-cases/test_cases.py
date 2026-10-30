@@ -37,11 +37,24 @@ class Base(unittest.TestCase):
         fields.update(extra)
         return mc.add(self.data, case_id, at=when, root=self.root, **fields)
 
-    def check(self, now, run='r1', ack=True):
+    def check(self, now, run='r1', ack=True, delivered_at=None):
+        """One runner tick: build the event, ack the run, then deliver it.
+
+        The runner delivers at `delivered_at` (default: the same moment), so a test can delay delivery. A
+        delivered event raises `fires` and sets `last_fire_at` in state.json, which is what the check reads.
+        With ack=False nothing is delivered (the runner never took the event)."""
         event = mc.run_check(self.wd, run, self.data, self.root, at(now))
         if ack and event:
             (self.wd / '.run-ok').write_text(run)
+            self.deliver(delivered_at or now)
         return event
+
+    def deliver(self, when):
+        path = self.wd / 'state.json'
+        state = json.loads(path.read_text()) if path.exists() else {'fires': 0}
+        state['fires'] = int(state.get('fires', 0)) + 1
+        state['last_fire_at'] = at(when).isoformat(timespec='seconds')
+        path.write_text(json.dumps(state))
 
     def watcher(self, watcher_id, status, fires=1):
         folder = self.root / 'watchers' / watcher_id
@@ -169,9 +182,13 @@ class Pings(Base):
         self.case(deadline='2026-10-25')
         first = self.check('2026-10-24T10:00', 'r1', ack=False)
         self.assertTrue(first)
-        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), first)
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+        # While that event is undelivered it is held: the next tick builds nothing new over it.
+        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+        self.assertEqual(self.sent(), {})
+        # Once the runner takes it and delivers, the reminder is recorded as sent at its delivery time.
         (self.wd / '.run-ok').write_text('r2')
+        self.deliver('2026-10-24T10:20')
         self.assertEqual(self.check('2026-10-24T10:30', 'r3'), '')
         self.assertIn('acme|r0|soon', self.sent())
 
@@ -190,7 +207,7 @@ class Pings(Base):
         (self.wd / 'state.json').write_text(json.dumps({'fires': 4}))
         self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
         # The runner saved its pending event, died before .run-ok, then delivered it after restart.
-        (self.wd / 'state.json').write_text(json.dumps({'fires': 5}))
+        self.deliver('2026-10-24T10:10')
         self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
         self.assertIn('acme|r0|soon', self.sent())
 
@@ -407,6 +424,20 @@ class Rules(Base):
         self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
                               if '|ask|' in k]), 1)
 
+    def test_a_reminder_delivered_two_days_late_counts_from_delivery(self):
+        # Built 24 Oct 10:00, but the runner only delivers it on 26 Oct at 10:00 (a retry after an outage).
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        (self.wd / '.run-ok').write_text('r1')
+        self.deliver('2026-10-26T10:00')
+        # Delivery day 26 Oct: that is the one reminder for the day, so no second reminder today.
+        self.assertEqual(self.check('2026-10-26T11:00', 'r2'), '')
+        # The clock starts at delivery (26 Oct), so no yes/no on 27 Oct; it is due 28 Oct, two full days later.
+        self.assertNotIn('Yes or no', self.check('2026-10-27T10:00', 'r3'))
+        self.assertIn('Yes or no', self.check('2026-10-28T10:00', 'r4'))
+        pings = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(pings['clock']['acme']['at'], '2026-10-26T10:00:00+04:00')
+
     def test_a_future_case_is_not_asked_before_its_first_reminder(self):
         self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
         for day in range(24, 28):
@@ -462,8 +493,11 @@ class Rules(Base):
     def test_two_real_same_day_charges_of_equal_value_both_stay(self):
         self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
                   charged='2026-10-25', reference='invoice 1001')
-        self.case('boat-b', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
-                  charged='2026-10-25', reference='invoice 1002')
+        with self.assertRaises(mc.CaseError):
+            self.case('boat-b', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                      charged='2026-10-25', reference='invoice 1002')
+        mc.add(self.data, 'boat-b', 'boat.dev', '25.00', 'USD', 's', 'n', '2026-11-10', 'A',
+               charged='2026-10-25', reference='invoice 1002', distinct=True, at=at('2026-10-25T10:00'))
         self.assertEqual(sorted(c['id'] for c in mc.load(self.data)['cases']), ['boat-a', 'boat-b'])
 
     def test_a_hold_and_a_charge_of_the_same_amount_stay_apart(self):

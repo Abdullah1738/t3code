@@ -15,8 +15,10 @@ money-cases show ID
 money-cases update ID --state "..." --next "..." --deadline 2026-10-28 --because "Acme agreed to Wed" [--add-watcher ID] [--note "..."]
 # a deadline change needs --because (the reason) or --reply (his reply id); it is refused otherwise and recorded in history
 money-cases update ID --state "..." --reply msg-9001      # his answer: restarts the two-day clock
-money-cases corroborate ID --merchant boat.dev --amount 25 --currency USD --charged 2026-10-25 --observation "SMS 10:45"
-# another channel saw the same charge: counted once; refused if the charge does not match exactly
+money-cases add boat-sms --merchant boat.dev --amount 25 --currency USD --charged 2026-10-25 --repeat boat-mail ...
+# the SMS is the same charge: a note goes on boat-mail, no second case
+money-cases corroborate boat-mail --merchant boat.dev --amount 25 --currency USD --charged 2026-10-25 --observation "SMS 10:45"
+# same, recorded without adding a case; refused if the charge does not match exactly
 money-cases add talabat-2792 --unmatched --amount 90.30 --currency AED --charged 2026-10-25 --kind charge \
   --state "charge on 2792, merchant not matched" --next "owner: which order?" --deadline 2026-10-28 --who Abdullah
 # --unmatched records merchant "unmatched"; an unmatched charge is never named or matched to a guess
@@ -33,7 +35,8 @@ Rules added 2026-10-30 (money-cases fixes, card #10):
 - **No self-moved deadlines.** A deadline change without `--because` or `--reply` is refused and changes nothing. The reason goes into `history`.
 - **One reminder a case a day.** A second reminder the same day is held until the next day.
 - **One yes/no after two silent days.** The clock starts at the first reminder delivered after his last answer, not at case creation, so a case that was never reminded is never asked about. After two days with no answer the check sends one yes/no and then stays quiet until he answers. An answer is a `close`, a `reopen`, or an update with `--reply` (his reply id). A `--because` reason is recorded but is not an answer, so a process that moves a deadline leaves the case quiet.
-- **Charges are not merged by the check.** A second charge with the same merchant, amount, currency, day and kind is refused by `add` unless its reference differs (then it is a second transaction). To record that another channel saw the same charge, use `corroborate`, which only succeeds on an exact match. Two real same-day equal-value charges with different references both stay. A charge still `unmatched` is never merged.
+- **Charges are never merged or split silently.** A new charge with the same merchant, amount, currency, day and kind as a recorded one is refused, and the refusal names the candidate. The caller decides: `--repeat ID` if it is the same charge (seen again, a note is added to that case), or `--distinct` if it is a second transaction. Free-form references such as "email 09:13" describe where a charge was seen, so they never tell two charges apart. An unmatched charge is never a candidate.
+- **Delivery is what counts.** The runner acks a run before it delivers the event and may retry it later or the next day. A reminder is recorded as sent, and it counts toward the one-a-day cap and starts the two-day clock, only when the runner's `state.json` confirms delivery (`fires` rose and `last_fire_at` is the delivery time). Until then the event stays pending and nothing new is built over it.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 
