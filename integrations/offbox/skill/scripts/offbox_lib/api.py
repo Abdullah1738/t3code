@@ -88,10 +88,6 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
          retries: int = 2, ok404: bool = False):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable)."""
     if _DEADLINE is not None:
-        room = _DEADLINE - time.time()
-        if room <= 0:
-            raise OffboxError(f"boat API budget spent before {method} {path}")
-        timeout = min(timeout, max(1.0, room))
         retries = 0
     url = API + path
     h = {"Authorization": "Bearer " + _key(), "Content-Type": "application/json", "Accept": "application/json"}
@@ -101,11 +97,18 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
     attempt = 0
     while True:
         attempt += 1
+        req_timeout = timeout
+        if _DEADLINE is not None:
+            # Recomputed on every attempt: a slow failure plus the retry pause has used part of the budget.
+            room = _DEADLINE - time.time()
+            if room <= 0:
+                raise OffboxError(f"boat API budget spent before {method} {path}")
+            req_timeout = min(timeout, max(1.0, room))
         req = urllib.request.Request(url, data=data, method=method, headers=h)
         request_id = capacity.reserve(path.rsplit("/", 1)[-1],
                                       path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=req_timeout) as r:
                 raw = r.read()
                 result = json.loads(raw) if raw.strip() else {}
                 if request_id:

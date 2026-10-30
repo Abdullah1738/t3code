@@ -265,56 +265,36 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
     return s, "fresh", None, sz
 
 
-# A recipe fallback runs inside a lease bring-up (harness ~6 min). Past this it is cancelled, not waited for: the
-# TTL keeper would otherwise keep the box alive and billing while the pool lock is held.
+# A recipe fallback runs inside a lease bring-up (harness ~6 min). Past this it is cancelled and the box retired,
+# not waited for: the TTL keeper would otherwise keep the box alive and billing while the pool lock is held.
 RECIPE_TIMEOUT_S = 15 * 60
 
 
-def _recipe_stopped(box_id: str, pid: int) -> bool:
-    """True only when boat confirms the recipe process is no longer running (a failed read is not confirmation)."""
-    try:
-        st = api.cmd_status(box_id, pid)
-    except OffboxError:
-        return False
-    return bool(st) and not st.get("running") and st.get("status") in ("exited", "lost", "killed")
-
-
-def _quarantine(box_id: str, why: str) -> None:
-    """The box stays out of pools and reuse until its recipe is confirmed stopped (see _release_quarantine)."""
+def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
+    """A box whose recipe did not finish cleanly is never handed out or reused: it may be half built, or its recipe
+    may still be changing it. Quarantine it (pools and reuse only take running/stopped leases), stop the recipe, and
+    delete the box: deletion is the one proof the recipe can no longer touch it. A failed delete leaves the lease
+    quarantined and the reaper deletes it on a later pass. True once deleted."""
     con = db()
     con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
     con.commit()
     event(con, box_id, "lease_quarantined", why[:300])
-
-
-def release_quarantine(con, box_id: str) -> bool:
-    """Return a quarantined lease to 'stopped' (never 'running': it must be reused via bring-up again). Only when
-    the recipe is confirmed stopped; a lost kill response leaves it quarantined."""
-    row = con.execute("SELECT state FROM leases WHERE box_id=?", (box_id,)).fetchone()
-    if not row or row["state"] != "quarantined":
-        return False
-    pid = _quarantined_pid(con, box_id)
-    if pid is None or not _recipe_stopped(box_id, pid):
-        return False
-    con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-    con.commit()
-    event(con, box_id, "lease_quarantine_released", f"recipe pid {pid} confirmed stopped")
-    return True
-
-
-def _quarantined_pid(con, box_id: str):
-    r = con.execute("SELECT detail FROM events WHERE box_id=? AND kind='lease_recipe_pid' ORDER BY ts DESC LIMIT 1",
-                    (box_id,)).fetchone()
+    if pid is not None:
+        try:
+            api.cmd_kill(box_id, pid)
+        except OffboxError as e:
+            say(f"warning: could not stop the recipe process on {box_id}: {e}")
     try:
-        return int(r["detail"]) if r else None
-    except (TypeError, ValueError):
-        return None
+        return delete_box(con, box_id, f"recipe cancelled: {why}"[:300])
+    except OffboxError as e:
+        say(f"warning: could not delete {box_id} ({e}); it stays quarantined until the reaper deletes it")
+        return False
 
 
 def run_recipe(box_id: str, name: str) -> None:
-    """Build a template's environment on this box (the script `offbox template build` runs). A recipe that fails
-    is reported. A recipe that times out, or whose kill cannot be confirmed, quarantines the lease and raises:
-    the box is never handed out as ready while its old recipe may still be changing it."""
+    """Build a template's environment on this box (the script `offbox template build` runs). Only a recipe that
+    exits 0 makes the box ready. Any other outcome (failure, error, lost stream, timeout) retires the box and
+    raises, so a half-built box is never marked ready or reused."""
     from . import bases
     from .common import LOGS_DIR
     t = now()
@@ -331,32 +311,22 @@ def run_recipe(box_id: str, name: str) -> None:
             pid = r["processId"]
             event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
-    except Exception as e:  # noqa: BLE001 - reported below; the caller decides what a failed recipe means
+    except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
     touch(box_id)
     event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
-    if code == "timeout":
-        con = db()
-        _quarantine(box_id, f"{name} recipe timed out")
-        stopped = False
-        if pid is not None:
-            try:
-                api.cmd_kill(box_id, pid)
-            except OffboxError as e:
-                say(f"warning: could not stop the recipe process on {box_id}: {e}")
-            stopped = _recipe_stopped(box_id, pid)
-        if stopped:
-            release_quarantine(con, box_id)
-        raise OffboxError(f"recipe {name} did not finish within {RECIPE_TIMEOUT_S // 60} min on {box_id}; "
-                          f"the box is quarantined until its recipe is confirmed stopped "
-                          f"({'stopped' if stopped else 'kill not confirmed'})")
-    if code != 0:
-        say(f"warning: {name} recipe did not finish on {box_id} ({code}); log {log_path}")
+    if code == 0:
+        return
+    what = (f"did not finish within {RECIPE_TIMEOUT_S // 60} min" if code == "timeout"
+            else f"failed ({str(code)[:200]})")
+    gone = _retire_recipe_box(box_id, pid, f"{name} recipe {what}")
+    raise OffboxError(f"recipe {name} {what} on {box_id}; log {log_path}. "
+                      + ("The box was deleted." if gone else "The box is quarantined until the reaper deletes it."))
 
 
 def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
-    """follow() in a helper thread, joined up to timeout_s. 'timeout' means the follower (and its TTL keeper) is
-    still running: they are signalled to stop, then joined briefly, and the caller must not treat the box as idle."""
+    """follow() in a helper thread, joined up to timeout_s. On timeout the follower is told to stop and joined
+    (it notices within one frame, or when its stream read times out); its TTL keeper is joined inside follow()."""
     import threading
     from .runs import follow
     result: dict = {}
@@ -373,9 +343,14 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
     th.join(timeout_s)
     if th.is_alive():
         stop_evt.set()
-        th.join(10)
+        th.join(_FOLLOW_STOP_S)
         return "timeout"
     return result.get("code")
+
+
+# A follower sees the stop signal at its next frame, or when its stream read times out (api.cmd_attach: 90 s), then
+# joins its TTL keeper (runs._KEEPER_JOIN_S).
+_FOLLOW_STOP_S = 160
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:

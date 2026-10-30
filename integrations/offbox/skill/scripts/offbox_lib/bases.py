@@ -131,19 +131,16 @@ def _slots_left(allowance: dict) -> int:
     return int(included) - int(allowance.get("used") or 0)
 
 
-# Saves that boat accepted (or that we sent) but whose wait ended before boat reported them ready. boat may already
-# count them as used, and it may not yet, so they are counted against the free slots until they show up as saved
-# or the record is older than _PENDING_S. Shared across processes through the kv table, under _SLOT_LOCK.
+# Saves we sent that boat has not settled yet. A lost response can leave an accepted save that boat's allowance
+# doesn't count yet, so each one holds a free slot until boat itself settles it: its list shows the name ready or
+# failed, or, past _PRESENT_GRACE_S, a GET of the name answers 404. Never released by age alone. Shared across
+# processes through the kv table, under _SLOT_LOCK.
 _SLOT_LOCK = "saved-slots"
-_PENDING_S = 6 * 3600
-# A reservation whose name never shows in boat's list is released only after this long: longer than any single
-# save wait, so an accepted save still in flight can't lose its slot to a racing list read.
 _PRESENT_GRACE_S = 30 * 60
 
 
 def _pending_load(con) -> dict:
-    p = kv_get(con, "saved_pending") or {}
-    return {k: v for k, v in p.items() if now() - v.get("ts", 0) < _PENDING_S}
+    return kv_get(con, "saved_pending") or {}
 
 
 def _pending_put(con, sname: str, box_id: str | None) -> None:
@@ -156,19 +153,28 @@ def _pending_put(con, sname: str, box_id: str | None) -> None:
 
 
 def _reconcile_pending(con, snaps: list[dict]) -> None:
-    """Drop a pending reservation only when boat's list proves it is not taking a slot: the name is absent (the
-    save never landed or was removed) and the reservation is older than the wait it could still be in flight.
-    A name present with status 'failed' or still pending keeps its reservation."""
-    p = kv_get(con, "saved_pending") or {}
-    names = {s.get("name") for s in snaps}
+    """Release a reservation only on boat's word: the list shows the name ready or failed, or (past the grace an
+    accepted save can still be in flight) GET of the name answers 404. A failed read or any other answer keeps it."""
+    p = _pending_load(con)
+    listed = {s.get("name"): s.get("status") for s in snaps}
     changed = False
     for sname, v in list(p.items()):
-        if sname in names:
+        if listed.get(sname) in ("ready", "failed"):
+            why = f"boat lists it {listed[sname]}"
+        elif sname in listed:
+            continue  # still pending on boat: its allowance may not count it yet
+        elif now() - v.get("ts", 0) > _PRESENT_GRACE_S:
+            try:
+                if api.saved_get(sname) is not None:
+                    continue
+            except OffboxError:
+                continue
+            why = "boat has no such snapshot"
+        else:
             continue
-        if now() - v.get("ts", 0) > _PRESENT_GRACE_S:
-            p.pop(sname, None)
-            changed = True
-            event(con, v.get("box"), "saved_reservation_released", sname)
+        p.pop(sname, None)
+        changed = True
+        event(con, v.get("box"), "saved_reservation_released", f"{sname}: {why}")
     if changed:
         kv_set(con, "saved_pending", p)
 
@@ -186,11 +192,14 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
         with file_lock(_SLOT_LOCK, timeout=lock_wait):
             snaps, allowance = api.saved_list()
             _reconcile_pending(con, snaps)
-            ready_names = {s.get("name") for s in snaps if s.get("status") == "ready"}
-            pending = {k for k in _pending_load(con) if k not in ready_names and k != sname}
-            used = int((allowance or {}).get("used") or 0) + len(pending)
+            listed = {s.get("name") for s in snaps if s.get("name")}
+            held = {k for k in _pending_load(con) if k != sname}
+            # boat's allowance can lag a save it lists or accepted: take the higher of its count and the number of
+            # snapshots it lists, plus every save still reserved (pending or unlisted). That may count a pending
+            # save twice, which only delays a free save; it never lets one become paid.
+            used = max(int((allowance or {}).get("used") or 0), len(listed)) + len(held)
             left = int((allowance or {}).get("included") or (allowance or {}).get("free") or 0) - used
-            if not any(s.get("name") == sname for s in snaps) and left <= 0:
+            if sname not in listed and left <= 0:
                 say(f"note: no free saved-snapshot slot for {table[:-1]} {name}; the reaper keeps its box alive instead")
                 event(con, box_id, "saved_no_slot", f"{name} {sname}")
                 return False
@@ -203,7 +212,7 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
                     _pending_put(con, sname, None)  # definitive refusal: boat took nothing
                 raise
             # Any other failure (timeout, 5xx, lost response) is ambiguous: the reservation stays until
-            # _reconcile_pending sees the snapshot list without it.
+            # _reconcile_pending has boat's word on it.
             deadline = now() + timeout
             while True:
                 snap = api.saved_get(sname) or {}
@@ -213,7 +222,7 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
                 if snap.get("status") == "failed":
                     raise OffboxError(f"saved snapshot {sname}: failed {snap.get('error') or ''}")
                 if now() > deadline or (api.left() is not None and api.left() < 3):
-                    # Still counted as pending (see _pending_load) until boat reports it or it ages out.
+                    # The reservation stays until _reconcile_pending has boat's word on it.
                     raise OffboxError(f"saved snapshot {sname}: still {snap.get('status') or 'pending'}")
                 time.sleep(2)
     except OffboxError as e:

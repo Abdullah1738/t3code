@@ -600,20 +600,37 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             return
 
 
+def _close(frames) -> None:
+    close = getattr(frames, "close", None)
+    if close:
+        close()
+
+
+# Upper bound for joining the TTL keeper when a follower ends: its ensure_ttl call can be inside a 60 s request.
+_KEEPER_JOIN_S = 65
+
+
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None) -> int | None:
+    """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
+    return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper."""
     out_off, err_off = start_offsets
-    # A caller may pass its own event to stop the follower and its TTL keeper from outside (see lease._follow_bounded).
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
     keeper.start()
     lf = open(log_path, "ab") if log_path else None
     failures = 0
+    frames = None
     try:
         while True:
+            if stop_evt.is_set():
+                return None
             try:
                 again = False
-                for fr in api.cmd_attach(box_id, pid, out_off, err_off):
+                frames = api.cmd_attach(box_id, pid, out_off, err_off)
+                for fr in frames:
+                    if stop_evt.is_set():
+                        return None
                     t = fr.get("type")
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -640,9 +657,12 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         raise OffboxError(f"attach error: {fr.get('error')} {fr.get('message')}")
                     failures = 0
                 if again:
+                    _close(frames)
                     continue
                 raise OffboxError("output stream closed without an exit frame")
             except (OffboxError, OSError, TimeoutError) as e:
+                if stop_evt.is_set():
+                    return None
                 failures += 1
                 st = None
                 try:
@@ -656,9 +676,12 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         return st.get("exitCode")
                 if failures > 20:
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
-                time.sleep(min(10, 1 + failures))
+                if stop_evt.wait(min(10, 1 + failures)):
+                    return None
     finally:
         stop_evt.set()
+        _close(frames)  # closes the HTTP response (api.stream reads it inside `with`)
+        keeper.join(_KEEPER_JOIN_S)
         if lf:
             lf.close()
 

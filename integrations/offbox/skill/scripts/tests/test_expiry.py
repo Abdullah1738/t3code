@@ -24,6 +24,16 @@ class ExpiryTests(Isolated):
     def setUp(self):
         super().setUp()
         self.quiet = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        # Offline only: any request a test did not mock fails here and fails the test, instead of reaching boat.
+        self.net = []
+
+        def offline(req, *a, **k):
+            self.net.append(getattr(req, "full_url", str(req)))
+            raise OSError("offline test: network denied")
+
+        self.stack.enter_context(patch("urllib.request.urlopen", side_effect=offline))
+        self.stack.enter_context(patch.object(api, "_key", return_value="test-key"))
+        self.addCleanup(lambda: self.assertEqual(self.net, [], "unexpected boat API calls"))
 
     def template(self, name="crpko-node", box="bx_tpl", saved=None, expired_at=None, size="large"):
         self.con.execute("INSERT INTO templates (name, box_id, size, built_at, recipe_sha, note, saved, expired_at) "
@@ -243,6 +253,33 @@ class ExpiryTests(Isolated):
             self.assertFalse(bases.keep_saved(self.con, "bases", "repo:b", "bx_b", "offbox-base-b-000000"))
         save.assert_not_called()
 
+    def test_aged_accepted_save_keeps_its_slot_until_boat_settles_it(self):
+        # An accepted save whose response was lost, hours ago: boat's list doesn't show it and its allowance still
+        # says 49/50. Age alone must not free the slot; only boat's word (listed, or 404 on GET) does.
+        self.template()
+        bases._pending_put(self.con, "offbox-template-a", "bx_tpl")
+        p = bases._pending_load(self.con)
+        p["offbox-template-a"]["ts"] = common.now() - 7 * 3600
+        common.kv_set(self.con, "saved_pending", p)
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 49})), \
+                patch.object(api, "saved_get", side_effect=common.OffboxError("boat down")), \
+                patch.object(api, "save") as save:
+            self.assertFalse(bases.keep_saved(self.con, "bases", "repo:b", "bx_b", "offbox-base-b-000000"))
+        save.assert_not_called()
+        self.assertIn("offbox-template-a", bases._pending_load(self.con))
+        # boat lists it, still pending: the list counts it, the slot stays taken.
+        listed = [{"name": "offbox-template-a", "status": "pending"}]
+        with patch.object(api, "saved_list", return_value=(listed, {"included": 50, "used": 49})), \
+                patch.object(api, "save") as save:
+            self.assertFalse(bases.keep_saved(self.con, "bases", "repo:b", "bx_b", "offbox-base-b-000000"))
+        save.assert_not_called()
+        # GET answers 404: boat never took it, so the slot is free again.
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 49})), \
+                patch.object(api, "saved_get", return_value=None):
+            bases._reconcile_pending(self.con, [])
+        self.assertNotIn("offbox-template-a", bases._pending_load(self.con))
+        self.assertIn("saved_reservation_released", self.kinds("bx_tpl"))
+
     def test_definitive_refusal_releases_the_reservation(self):
         self.template()
         with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})), \
@@ -260,18 +297,40 @@ class ExpiryTests(Isolated):
 
     def test_retry_sleep_respects_the_budget(self):
         # A connect failure with a near-spent budget must not sleep past the deadline or retry six times.
+        import urllib.error
         calls = []
 
-        def boom(*a, **k):
-            calls.append(1)
-            raise api.ApiError(502, "sandbox_direct_failed", "connect EADDRNOTAVAIL")
+        def boom(req, timeout=None):
+            calls.append(timeout)
+            body = json.dumps({"code": "sandbox_direct_failed", "message": "connect EADDRNOTAVAIL 10.0.0.1:443"})
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(body.encode()))
 
-        with patch("urllib.request.urlopen", side_effect=lambda *a, **k: boom()), \
-                patch.object(api, "_key", return_value="k"), patch.object(api.time, "sleep") as sleep:
+        with patch("urllib.request.urlopen", side_effect=boom), patch.object(api.time, "sleep") as sleep:
             with api.budget(0.5):
-                with self.assertRaises(Exception):
-                    api.call("POST", "/sandboxes", {}, {"Idempotency-Key": "x"})
-        self.assertEqual(sleep.call_count, 0)
+                with self.assertRaises(api.ApiError):
+                    api.call("POST", "/sandboxes/bx/commands", {"command": "true"})
+        self.assertEqual((len(calls), sleep.call_count), (1, 0))
+
+    def test_connect_retry_shrinks_the_request_timeout_to_what_is_left(self):
+        # A slow 502 sandbox_direct_failed takes the HTTPError retry branch: the retry gets the budget that is
+        # left after the first attempt, not the first attempt's timeout.
+        import threading
+        import urllib.error
+        timeouts = []
+
+        def slow_502(req, timeout=None):
+            timeouts.append(timeout)
+            threading.Event().wait(0.5)
+            body = json.dumps({"code": "sandbox_direct_failed", "message": "connect EADDRNOTAVAIL 10.0.0.1:443"})
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(body.encode()))
+
+        with patch("urllib.request.urlopen", side_effect=slow_502), patch.object(api.time, "sleep") as sleep:
+            with api.budget(4):
+                with self.assertRaises(api.ApiError):
+                    api.call("POST", "/sandboxes/bx/commands", {"command": "true"})
+        self.assertGreaterEqual(len(timeouts), 2, timeouts)
+        self.assertGreaterEqual(sleep.call_count, 1)
+        self.assertLessEqual(timeouts[1], timeouts[0] - 0.4, timeouts)
 
     def test_keep_saved_lock_wait_is_capped_by_the_budget(self):
         # The reap budget has seconds left: the slot lock must not block for the 60 s default.
@@ -289,27 +348,87 @@ class ExpiryTests(Isolated):
             bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-w", timeout=300)
         self.assertTrue(seen and seen[0] <= 8, seen)
 
-    def test_recipe_timeout_with_lost_kill_stays_quarantined(self):
-        # The follower never ends and the kill response is lost: the lease must stay quarantined, never 'stopped'
-        # or 'running', so pool/reuse cannot hand it out, and it is not released without a confirmed stop.
-        con = common.db()
-        con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, size, source, state, "
-                    "created_at, last_used_at) VALUES ('bx_q','o','/r','rk','d','small','recipe:generic',"
-                    "'running',0,0)")
-        con.commit()
-        with patch.object(lease, "RECIPE_TIMEOUT_S", 0), \
-                patch.object(bases, "recipe", return_value=("echo", "sha")), \
+    def recipe_lease(self, bid):
+        self.con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, size, source, state, "
+                         "created_at, last_used_at) VALUES (?,'pool:repo','/r','repo','d','large',"
+                         "'recipe:crpko-node','running',0,0)", (bid,))
+        self.con.execute("INSERT INTO pool_members VALUES (?,'repo')", (bid,))
+        self.con.commit()
+
+    def run_recipe(self, bid, outcome, delete_error=None):
+        with patch.object(bases, "recipe", return_value=("echo", "sha")), \
                 patch.object(lease.ssh_sync, "put_file"), patch.object(bases, "template_uploads"), \
-                patch.object(lease.api, "cmd_start", return_value={"processId": 9}), \
-                patch.object(lease, "_follow_bounded", return_value="timeout"), \
-                patch.object(lease.api, "cmd_kill", side_effect=api.ApiError(500, "x", "lost")), \
-                patch.object(lease.api, "cmd_status", return_value=None):
-            with self.assertRaises(common.OffboxError):
-                lease.run_recipe("bx_q", "generic")
-        self.assertEqual(con.execute("SELECT state FROM leases WHERE box_id='bx_q'").fetchone()[0], "quarantined")
-        self.assertFalse(lease.release_quarantine(con, "bx_q"))
-        self.assertNotIn("bx_q", [r["box_id"] for r in con.execute(
-            "SELECT box_id FROM leases WHERE state IN ('running','stopped')")])
+                patch.object(api, "cmd_start", return_value={"processId": 9}), \
+                patch.object(lease, "_follow_bounded", return_value=outcome), \
+                patch.object(api, "cmd_kill") as kill, patch.object(api, "usage", return_value=None), \
+                patch.object(api, "delete", side_effect=delete_error, return_value={}) as delete:
+            with self.assertRaises(common.OffboxError) as cm:
+                lease.run_recipe(bid, "crpko-node")
+        return kill, delete, str(cm.exception)
+
+    def state(self, bid):
+        return self.con.execute("SELECT state FROM leases WHERE box_id=?", (bid,)).fetchone()[0]
+
+    def test_recipe_timeout_kills_and_deletes_the_box_so_no_pool_reuses_it(self):
+        self.recipe_lease("bx_q")
+        kill, delete, msg = self.run_recipe("bx_q", "timeout")
+        kill.assert_called_once_with("bx_q", 9)
+        delete.assert_called_once_with("bx_q")
+        self.assertIn("deleted", msg)
+        self.assertEqual(self.state("bx_q"), "deleted")
+        self.assertEqual(pool.candidates(self.con, "repo", None, "template:crpko-node")[0], [])
+        # The next acquisition creates a new box instead of resuming the half-built one.
+        with patch.object(lease, "_reuse") as reuse, \
+                patch.object(lease, "acquire_private", return_value={"box_id": "bx_new", "size": "large"}):
+            row = pool.acquire(self.me, template="crpko-node")
+            pool.release_guard(row)
+        reuse.assert_not_called()
+        self.assertEqual(row["box_id"], "bx_new")
+
+    def test_failed_recipe_is_never_marked_ready(self):
+        self.recipe_lease("bx_f")
+        _kill, delete, _msg = self.run_recipe("bx_f", 1)
+        delete.assert_called_once_with("bx_f")
+        self.assertEqual(self.state("bx_f"), "deleted")
+
+    def test_recipe_box_whose_delete_fails_stays_quarantined_until_the_reaper_deletes_it(self):
+        self.recipe_lease("bx_q")
+        _kill, _delete, msg = self.run_recipe("bx_q", "timeout", delete_error=common.OffboxError("boat down"))
+        self.assertIn("quarantined", msg)
+        self.assertEqual(self.state("bx_q"), "quarantined")
+        self.assertEqual(pool.candidates(self.con, "repo", None, "template:crpko-node")[0], [])
+        self.recipe_lease("bx_gone")
+        self.con.execute("UPDATE leases SET state='quarantined' WHERE box_id='bx_gone'")
+        self.con.commit()
+        with patch.object(api, "delete", return_value={}) as delete, patch.object(api, "usage", return_value=None):
+            actions = self.reap([{"id": "bx_q", "state": "stopped", "name": "offbox-x"}])
+        delete.assert_called_once_with("bx_q")
+        self.assertEqual(self.state("bx_q"), "deleted")
+        self.assertEqual(self.state("bx_gone"), "deleted")
+        self.assertTrue(any(a.startswith("delete bx_q") for a in actions), actions)
+
+    def test_bounded_follow_stops_a_stream_that_never_ends(self):
+        # The real follow loop on an endless stdout stream: on timeout it must close the stream and end, with its
+        # TTL keeper, instead of leaving a helper thread reading forever.
+        import threading
+        closed = threading.Event()
+
+        def endless(box_id, pid, out_off=0, err_off=0):
+            n = out_off
+            try:
+                while True:
+                    threading.Event().wait(0.01)
+                    n += 1
+                    yield {"type": "stdout", "data": "x", "nextOffset": n}
+            finally:
+                closed.set()
+
+        before = set(threading.enumerate())
+        with patch.object(api, "cmd_attach", side_effect=endless), patch.object(lease, "ensure_ttl"), \
+                patch.object(api, "get", return_value={}), patch.object(api, "cmd_status", return_value=None):
+            self.assertEqual(lease._follow_bounded("bx_f", 5, None, 0.3), "timeout")
+        self.assertTrue(closed.is_set())
+        self.assertEqual([t for t in threading.enumerate() if t not in before and t.is_alive()], [])
 
     def test_rm_base_deletes_its_saved_snapshot(self):
         self.base(saved="offbox-base-x")

@@ -154,6 +154,18 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             refreshes += 1
             act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
                 lambda bid=bid: lease.refresh_box(con, bid))
+    # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
+    for r in con.execute("SELECT box_id FROM leases WHERE state='quarantined'").fetchall():
+        bid = r["box_id"]
+        if bid in live:
+            act(bid, "delete", "recipe cancelled, box quarantined",
+                lambda bid=bid: lease.delete_box(con, bid, "reap: quarantined recipe box"))
+        else:
+            actions.append(f"{'would forget' if dry else 'forget'} {bid}: quarantined and gone from boat")
+            if not dry:
+                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
+                con.commit()
+                event(con, bid, "reap_forget", "quarantined box no longer exists on boat")
     # Templates/bases: make sure they are stopped (they are free when stopped).
     for bid in protected:
         b = live.get(bid)
