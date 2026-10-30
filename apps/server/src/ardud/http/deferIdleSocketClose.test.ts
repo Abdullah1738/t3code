@@ -12,7 +12,9 @@ const clients: NodeNet.Socket[] = [];
 afterEach(async () => {
   for (const client of clients.splice(0)) client.destroy();
   await Promise.all(
-    servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+    servers
+      .splice(0)
+      .map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
   );
 });
 

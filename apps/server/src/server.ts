@@ -301,7 +301,10 @@ const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     return NodeHttpServer.layer(
-      () => rejectRequestsUntilServing(guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer()))),
+      () =>
+        rejectRequestsUntilServing(
+          guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer())),
+        ),
       {
         host: config.host ?? "127.0.0.1",
         port: config.port,
