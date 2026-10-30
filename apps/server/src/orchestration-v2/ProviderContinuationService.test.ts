@@ -54,7 +54,10 @@ const layerNoHold = ProviderContinuationService.layerWithOptions({
 
 const delegatedProjection = (
   disposition: "open" | "stopped" | "disposed" = "open",
-  taskIds: ReadonlyArray<string> = ["node-provider-continuation-first", "node-provider-continuation-second"],
+  taskIds: ReadonlyArray<string> = [
+    "node-provider-continuation-first",
+    "node-provider-continuation-second",
+  ],
   extraRuns: ReadonlyArray<unknown> = [],
 ) =>
   ({
@@ -421,9 +424,7 @@ describe("ProviderContinuationService", () => {
   it.effect("merges a sibling that completes during the hold", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();
-      const taskIds = yield* Ref.make<ReadonlyArray<string>>([
-        "node-provider-continuation-first",
-      ]);
+      const taskIds = yield* Ref.make<ReadonlyArray<string>>(["node-provider-continuation-first"]);
       yield* Effect.gen(function* () {
         const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
         const offer = requests.offer({

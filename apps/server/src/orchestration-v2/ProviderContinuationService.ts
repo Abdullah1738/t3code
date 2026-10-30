@@ -69,280 +69,282 @@ export const layerWithOptions = (
   options: { readonly delegatedCompletionHold?: Duration.Duration } = {},
 ) =>
   Layer.effectDiscard(
-  Effect.gen(function* () {
-    const ids = yield* IdAllocator.IdAllocatorV2;
-    const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-    const threads = yield* ThreadManagementService.ThreadManagementService;
-    const delegatedCompletionHold = options.delegatedCompletionHold ?? DELEGATED_COMPLETION_HOLD;
-    const retryAttempts = yield* Ref.make(new Map<string, number>());
-    const holds = yield* Ref.make(new Map<string, "holding" | "released">());
+    Effect.gen(function* () {
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const delegatedCompletionHold = options.delegatedCompletionHold ?? DELEGATED_COMPLETION_HOLD;
+      const retryAttempts = yield* Ref.make(new Map<string, number>());
+      const holds = yield* Ref.make(new Map<string, "holding" | "released">());
 
-    const clearRetryAttempt = (key: string) =>
-      Effect.all([
-        Ref.update(retryAttempts, (current) => {
-          if (!current.has(key)) return current;
+      const clearRetryAttempt = (key: string) =>
+        Effect.all([
+          Ref.update(retryAttempts, (current) => {
+            if (!current.has(key)) return current;
+            const updated = new Map(current);
+            updated.delete(key);
+            return updated;
+          }),
+          Ref.update(holds, (current) => {
+            if (!current.has(key)) return current;
+            const updated = new Map(current);
+            updated.delete(key);
+            return updated;
+          }),
+        ]).pipe(Effect.asVoid);
+
+      const nextRetryDelay = (key: string) =>
+        Ref.modify(retryAttempts, (current) => {
+          const attempt = current.get(key) ?? 0;
           const updated = new Map(current);
-          updated.delete(key);
-          return updated;
-        }),
-        Ref.update(holds, (current) => {
-          if (!current.has(key)) return current;
-          const updated = new Map(current);
-          updated.delete(key);
-          return updated;
-        }),
-      ]).pipe(Effect.asVoid);
+          updated.set(key, attempt + 1);
+          return [Math.min(100 * 2 ** Math.min(attempt, 6), 5_000), updated] as const;
+        });
 
-    const nextRetryDelay = (key: string) =>
-      Ref.modify(retryAttempts, (current) => {
-        const attempt = current.get(key) ?? 0;
-        const updated = new Map(current);
-        updated.set(key, attempt + 1);
-        return [Math.min(100 * 2 ** Math.min(attempt, 6), 5_000), updated] as const;
-      });
-
-    const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
-      function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
-        const projection = yield* threads.getThreadRecords(
-          request.threadId,
-          ["messages", "runs", "providerTurns"],
-          {
-            messageIds:
-              request.delegatedCompletion === undefined
-                ? []
-                : [request.delegatedCompletion.messageId],
-          },
-        );
-        if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
-          yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
-            threadId: request.threadId,
-            providerThreadId: request.providerThreadId,
-          });
-          if (request.delegatedCompletion !== undefined) {
-            yield* clearRetryAttempt(
-              delegatedCompletionRetryKey(request, request.delegatedCompletion),
-            );
-          }
-          if (request.clearIfCurrent !== undefined) {
-            yield* request.clearIfCurrent();
-          } else if (request.dispatchIfCurrent !== undefined) {
-            yield* request.dispatchIfCurrent(Effect.void);
-          }
-          return;
-        }
-        if (request.delegatedCompletion !== undefined) {
-          const retryKey = delegatedCompletionRetryKey(request, request.delegatedCompletion);
-          const delivery = currentDelegatedCompletionDelivery(
-            projection,
-            request.delegatedCompletion,
+      const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
+        function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
+          const projection = yield* threads.getThreadRecords(
+            request.threadId,
+            ["messages", "runs", "providerTurns"],
+            {
+              messageIds:
+                request.delegatedCompletion === undefined
+                  ? []
+                  : [request.delegatedCompletion.messageId],
+            },
           );
-          if (delivery === undefined) {
+          if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
+            yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
+              threadId: request.threadId,
+              providerThreadId: request.providerThreadId,
+            });
+            if (request.delegatedCompletion !== undefined) {
+              yield* clearRetryAttempt(
+                delegatedCompletionRetryKey(request, request.delegatedCompletion),
+              );
+            }
+            if (request.clearIfCurrent !== undefined) {
+              yield* request.clearIfCurrent();
+            } else if (request.dispatchIfCurrent !== undefined) {
+              yield* request.dispatchIfCurrent(Effect.void);
+            }
+            return;
+          }
+          if (request.delegatedCompletion !== undefined) {
+            const retryKey = delegatedCompletionRetryKey(request, request.delegatedCompletion);
+            const delivery = currentDelegatedCompletionDelivery(
+              projection,
+              request.delegatedCompletion,
+            );
+            if (delivery === undefined) {
+              yield* clearRetryAttempt(retryKey);
+              return;
+            }
+            const holdState = (yield* Ref.get(holds)).get(retryKey);
+            if (holdState === "holding") return;
+            const parentBusy = projection.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status));
+            if (
+              holdState === undefined &&
+              Duration.toMillis(delegatedCompletionHold) > 0 &&
+              !parentBusy
+            ) {
+              yield* Ref.update(holds, (current) => new Map(current).set(retryKey, "holding"));
+              yield* Effect.sleep(delegatedCompletionHold).pipe(
+                Effect.andThen(
+                  Ref.update(holds, (current) => new Map(current).set(retryKey, "released")),
+                ),
+                Effect.andThen(requests.offer(request)),
+                Effect.forkScoped,
+              );
+              return;
+            }
+            const commandId = yield* ids.allocate.command({
+              fixtureName: "delegated-completion",
+              commandName: "dispatch",
+            });
+            yield* threads
+              .dispatch({
+                type: "message.dispatch",
+                commandId,
+                threadId: request.threadId,
+                messageId: delivery.messageId,
+                text: delegatedCompletionText(delivery.taskIds),
+                attachments: [],
+                dispatchMode: { type: "queue_after_active" },
+                createdBy: "agent",
+                creationSource: "server",
+                delegatedCompletion: {
+                  parentRunId: request.delegatedCompletion.parentRunId,
+                  generation: delivery.generation,
+                  taskIds: delivery.taskIds,
+                },
+              })
+              .pipe(
+                Effect.catchTags({
+                  ThreadManagementProviderInstanceDisabledError: (error) =>
+                    Effect.logInfo(
+                      "orchestration-v2.provider-continuation.delegated-completion-disabled",
+                      {
+                        threadId: request.threadId,
+                        projectId: error.projectId,
+                        instanceId: error.instanceId,
+                      },
+                    ).pipe(
+                      Effect.andThen(
+                        Effect.forEach(
+                          delivery.taskIds,
+                          (taskId) =>
+                            ids.allocate
+                              .command({
+                                fixtureName: "delegated-completion",
+                                commandName: "acknowledge-disabled",
+                              })
+                              .pipe(
+                                Effect.flatMap((ackCommandId) =>
+                                  threads.dispatch({
+                                    type: "delegated_task.completion-delivery.acknowledge",
+                                    commandId: ackCommandId,
+                                    parentThreadId: request.threadId,
+                                    taskId,
+                                    observedByRunId: null,
+                                  }),
+                                ),
+                              ),
+                          { discard: true },
+                        ),
+                      ),
+                      Effect.andThen(
+                        request.clearIfCurrent !== undefined
+                          ? request.clearIfCurrent()
+                          : request.dispatchIfCurrent !== undefined
+                            ? request.dispatchIfCurrent(Effect.void)
+                            : Effect.void,
+                      ),
+                    ),
+                }),
+              );
             yield* clearRetryAttempt(retryKey);
             return;
           }
-          const holdState = (yield* Ref.get(holds)).get(retryKey);
-          if (holdState === "holding") return;
-          const parentBusy = projection.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status));
-          if (
-            holdState === undefined &&
-            Duration.toMillis(delegatedCompletionHold) > 0 &&
-            !parentBusy
-          ) {
-            yield* Ref.update(holds, (current) => new Map(current).set(retryKey, "holding"));
-            yield* Effect.sleep(delegatedCompletionHold).pipe(
+          const messageId =
+            request.messageId ??
+            (yield* ids.allocate.message({
+              threadId: request.threadId,
+              ordinal: projection.messages.length + 1,
+            }));
+          const commandId = CommandId.make(`provider-continuation:${messageId}`);
+          const dispatch = threads.dispatch({
+            type: "message.dispatch",
+            commandId,
+            threadId: request.threadId,
+            messageId,
+            text: request.detail ?? CONTINUATION_MESSAGE_TEXT,
+            notification: request.notification ?? {
+              source: { kind: "background_task" },
+              outcome: "updated",
+              summary: "Background activity updated",
+            },
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            // "provider" marks an adapter-buffered wake, which ClaudeAdapterV2
+            // detects to attach the buffered CLI output and drop this text. A
+            // message_text wake has no buffered output, so it must not carry that
+            // marker or the turn settles immediately having prompted nothing.
+            creationSource: request.delivery === "message_text" ? "server" : "provider",
+          });
+          // This catch sits outside dispatchIfCurrent so an adapter that clears
+          // its own sticky offer flag on dispatch failure (inside
+          // dispatchIfCurrent) observes the raw failure first. Not every adapter
+          // self-clears that way, so the explicit callback is called here too;
+          // clearIfCurrent implementations are idempotent, so a source that
+          // already cleared is unaffected.
+          const logInstanceDisabled = (
+            error: ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
+          ) =>
+            Effect.logInfo("orchestration-v2.provider-continuation.instance-disabled", {
+              threadId: request.threadId,
+              providerThreadId: request.providerThreadId,
+              projectId: error.projectId,
+              instanceId: error.instanceId,
+            }).pipe(
               Effect.andThen(
-                Ref.update(holds, (current) => new Map(current).set(retryKey, "released")),
+                request.clearIfCurrent !== undefined ? request.clearIfCurrent() : Effect.void,
               ),
-              Effect.andThen(requests.offer(request)),
-              Effect.forkScoped,
+            );
+          if (request.dispatchIfCurrent === undefined) {
+            yield* dispatch.pipe(
+              Effect.catchTags({
+                ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
+              }),
             );
             return;
           }
-          const commandId = yield* ids.allocate.command({
-            fixtureName: "delegated-completion",
-            commandName: "dispatch",
-          });
-          yield* threads
-            .dispatch({
-              type: "message.dispatch",
-              commandId,
-              threadId: request.threadId,
-              messageId: delivery.messageId,
-              text: delegatedCompletionText(delivery.taskIds),
-              attachments: [],
-              dispatchMode: { type: "queue_after_active" },
-              createdBy: "agent",
-              creationSource: "server",
-              delegatedCompletion: {
-                parentRunId: request.delegatedCompletion.parentRunId,
-                generation: delivery.generation,
-                taskIds: delivery.taskIds,
-              },
-            })
-            .pipe(
-              Effect.catchTags({
-                ThreadManagementProviderInstanceDisabledError: (error) =>
-                  Effect.logInfo(
-                    "orchestration-v2.provider-continuation.delegated-completion-disabled",
-                    {
-                      threadId: request.threadId,
-                      projectId: error.projectId,
-                      instanceId: error.instanceId,
-                    },
-                  ).pipe(
-                    Effect.andThen(
-                      Effect.forEach(
-                        delivery.taskIds,
-                        (taskId) =>
-                          ids.allocate
-                            .command({
-                              fixtureName: "delegated-completion",
-                              commandName: "acknowledge-disabled",
-                            })
-                            .pipe(
-                              Effect.flatMap((ackCommandId) =>
-                                threads.dispatch({
-                                  type: "delegated_task.completion-delivery.acknowledge",
-                                  commandId: ackCommandId,
-                                  parentThreadId: request.threadId,
-                                  taskId,
-                                  observedByRunId: null,
-                                }),
-                              ),
-                            ),
-                        { discard: true },
-                      ),
-                    ),
-                    Effect.andThen(
-                      request.clearIfCurrent !== undefined
-                        ? request.clearIfCurrent()
-                        : request.dispatchIfCurrent !== undefined
-                          ? request.dispatchIfCurrent(Effect.void)
-                          : Effect.void,
-                    ),
-                  ),
-              }),
-            );
-          yield* clearRetryAttempt(retryKey);
-          return;
-        }
-        const messageId =
-          request.messageId ??
-          (yield* ids.allocate.message({
-            threadId: request.threadId,
-            ordinal: projection.messages.length + 1,
-          }));
-        const commandId = CommandId.make(`provider-continuation:${messageId}`);
-        const dispatch = threads.dispatch({
-          type: "message.dispatch",
-          commandId,
-          threadId: request.threadId,
-          messageId,
-          text: request.detail ?? CONTINUATION_MESSAGE_TEXT,
-          notification: request.notification ?? {
-            source: { kind: "background_task" },
-            outcome: "updated",
-            summary: "Background activity updated",
-          },
-          attachments: [],
-          dispatchMode: { type: "queue_after_active" },
-          createdBy: "agent",
-          // "provider" marks an adapter-buffered wake, which ClaudeAdapterV2
-          // detects to attach the buffered CLI output and drop this text. A
-          // message_text wake has no buffered output, so it must not carry that
-          // marker or the turn settles immediately having prompted nothing.
-          creationSource: request.delivery === "message_text" ? "server" : "provider",
-        });
-        // This catch sits outside dispatchIfCurrent so an adapter that clears
-        // its own sticky offer flag on dispatch failure (inside
-        // dispatchIfCurrent) observes the raw failure first. Not every adapter
-        // self-clears that way, so the explicit callback is called here too;
-        // clearIfCurrent implementations are idempotent, so a source that
-        // already cleared is unaffected.
-        const logInstanceDisabled = (
-          error: ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
-        ) =>
-          Effect.logInfo("orchestration-v2.provider-continuation.instance-disabled", {
-            threadId: request.threadId,
-            providerThreadId: request.providerThreadId,
-            projectId: error.projectId,
-            instanceId: error.instanceId,
-          }).pipe(
-            Effect.andThen(
-              request.clearIfCurrent !== undefined ? request.clearIfCurrent() : Effect.void,
-            ),
-          );
-        if (request.dispatchIfCurrent === undefined) {
-          yield* dispatch.pipe(
+          yield* request.dispatchIfCurrent(dispatch).pipe(
             Effect.catchTags({
               ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
             }),
           );
-          return;
-        }
-        yield* request.dispatchIfCurrent(dispatch).pipe(
-          Effect.catchTags({
-            ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
-          }),
-        );
-      },
-    );
-
-    // ardud: archive-if-idle reads the offered requests. The finalizer goes on
-    // as soon as a request is taken, so nothing in between can leave it
-    // pending. A wake still owed after a failed dispatch stays with its adapter.
-    const handle = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
-      dispatchContinuation(request).pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
-              threadId: request.threadId,
-              providerThreadId: request.providerThreadId,
-              cause,
-            });
-            if (request.delegatedCompletion === undefined) return;
-            const completion = request.delegatedCompletion;
-            const retryKey = delegatedCompletionRetryKey(request, completion);
-            const retryDelay = yield* nextRetryDelay(retryKey);
-            yield* Effect.gen(function* () {
-              yield* Effect.sleep(`${retryDelay} millis`);
-              const projection = yield* threads.getThreadRecords(
-                request.threadId,
-                ["messages", "runs", "providerTurns"],
-                {
-                  messageIds:
-                    request.delegatedCompletion === undefined
-                      ? []
-                      : [request.delegatedCompletion.messageId],
-                },
-              );
-              if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
-                yield* requests.offer(request);
-              } else {
-                yield* clearRetryAttempt(retryKey);
-              }
-            }).pipe(
-              Effect.catchCause((retryCause) =>
-                Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
-                  threadId: request.threadId,
-                  providerThreadId: request.providerThreadId,
-                  cause: retryCause,
-                }).pipe(Effect.andThen(requests.offer(request))),
-              ),
-              Effect.forkScoped,
-            );
-          }),
-        ),
+        },
       );
 
-    yield* Effect.uninterruptibleMask((restore) =>
-      restore(requests.take).pipe(
-        Effect.flatMap((request) =>
-          restore(handle(request)).pipe(Effect.ensuring(requests.settle?.(request) ?? Effect.void)),
+      // ardud: archive-if-idle reads the offered requests. The finalizer goes on
+      // as soon as a request is taken, so nothing in between can leave it
+      // pending. A wake still owed after a failed dispatch stays with its adapter.
+      const handle = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
+        dispatchContinuation(request).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
+                threadId: request.threadId,
+                providerThreadId: request.providerThreadId,
+                cause,
+              });
+              if (request.delegatedCompletion === undefined) return;
+              const completion = request.delegatedCompletion;
+              const retryKey = delegatedCompletionRetryKey(request, completion);
+              const retryDelay = yield* nextRetryDelay(retryKey);
+              yield* Effect.gen(function* () {
+                yield* Effect.sleep(`${retryDelay} millis`);
+                const projection = yield* threads.getThreadRecords(
+                  request.threadId,
+                  ["messages", "runs", "providerTurns"],
+                  {
+                    messageIds:
+                      request.delegatedCompletion === undefined
+                        ? []
+                        : [request.delegatedCompletion.messageId],
+                  },
+                );
+                if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
+                  yield* requests.offer(request);
+                } else {
+                  yield* clearRetryAttempt(retryKey);
+                }
+              }).pipe(
+                Effect.catchCause((retryCause) =>
+                  Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
+                    threadId: request.threadId,
+                    providerThreadId: request.providerThreadId,
+                    cause: retryCause,
+                  }).pipe(Effect.andThen(requests.offer(request))),
+                ),
+                Effect.forkScoped,
+              );
+            }),
+          ),
+        );
+
+      yield* Effect.uninterruptibleMask((restore) =>
+        restore(requests.take).pipe(
+          Effect.flatMap((request) =>
+            restore(handle(request)).pipe(
+              Effect.ensuring(requests.settle?.(request) ?? Effect.void),
+            ),
+          ),
         ),
-      ),
-    ).pipe(Effect.forever, Effect.forkScoped);
-  }),
+      ).pipe(Effect.forever, Effect.forkScoped);
+    }),
   );
 
 export const layer = layerWithOptions();
