@@ -99,18 +99,62 @@ show_preview() {
   print -r -- "$3"
   print -r -- "Send: wa $2 --approved $1"
 }
-# Message id from a JSON reply on stdin: wacli's {"success":true,"data":{"id":...}} or wa-sendtext's {"id":...}.
-# Piped to python through the print builtin, so no external process gets the reply on its argv.
-msgid() {
-  print -r -- "$1" | /usr/bin/python3 -c '
+# Reads a send's result: sets SR_OK (1 sent, 0 not), SR_ID (message id, may be empty) and SR_MSG (error, already redacted).
+# Args: exit code, message text, output. The text and output reach python on stdin (text on the first line, which
+# callers keep single-line, then the output), never on argv or in env. Each output line is parsed on its own, so a
+# warning before the JSON envelope doesn't hide the id. Every form the text takes in an error (plain, JSON-escaped,
+# or Go-escaped <>&) is replaced with [message hidden].
+RESULT_PY='
 import json, sys
-try:
-    d = json.load(sys.stdin)
-except ValueError:
-    d = {}
-if isinstance(d, dict) and isinstance(d.get("data"), dict):
-    d = d["data"]
-print(d.get("id", "") if isinstance(d, dict) else "")' 2>/dev/null
+data = sys.stdin.buffer.read().decode("utf-8", "replace")
+text, _, out = data.partition(chr(10))
+rc = int(sys.argv[1])
+body = json.dumps(text)[1:-1]
+body_u = json.dumps(text, ensure_ascii=False)[1:-1]
+def go(s):
+    return s.replace("<", chr(92) + "u003c").replace(">", chr(92) + "u003e").replace("&", chr(92) + "u0026")
+variants = {text, body, body_u, go(body), go(body_u)} - {""}
+def red(s):
+    for v in sorted(variants, key=len, reverse=True):
+        s = s.replace(v, "[message hidden]")
+    return s
+ok, ids, errs, rest = False, [], [], []
+for line in out.splitlines():
+    s = line.strip()
+    d = None
+    if s.startswith("{"):
+        try:
+            d = json.loads(s)
+        except ValueError:
+            d = None
+    if not isinstance(d, dict):
+        if s:
+            rest.append(line)
+        continue
+    if d.get("success") is True or d.get("sent") is True:
+        ok = True
+        dd = d["data"] if isinstance(d.get("data"), dict) else d
+        if dd.get("id"):
+            ids.append(str(dd["id"]))
+    elif d.get("error") or d.get("success") is False:
+        errs.append(str(d.get("error") or "unknown error"))
+    elif s:
+        rest.append(line)
+if rc == 0 and ok and not errs:
+    print("OK " + (ids[0] if ids else ""))
+else:
+    parts = [red(e) for e in errs] + [red(r) for r in rest]
+    msg = "\n".join(parts) if parts else red(out.strip())
+    print("ERR " + (msg or "wacli reported no result"))
+'
+wacli_result() {
+  local v
+  v=$({ print -r -- "$2"; print -r -- "$3"; } | /usr/bin/python3 -c "$RESULT_PY" "$1" 2>/dev/null) || v=""
+  case $v in
+    OK*) SR_OK=1; SR_ID=${v#OK}; SR_ID=${SR_ID# }; SR_MSG= ;;
+    ERR*) SR_OK=0; SR_ID=; SR_MSG=${v#ERR } ;;
+    *) SR_OK=0; SR_ID=; SR_MSG="wa: no result from the send; it may still have gone through. Check with wa ids <chat> 3 before sending again." ;;
+  esac
 }
 # Printed after a send to someone other than the owner. Stderr, so stdout stays the sent line.
 tip() { [[ ${1%%@*} == $OWNER ]] || print -r -- "Tip: when a message speaks for Abdullah with new wording, money, dates or a commitment, show him a wa draft preview first." >&2; }
@@ -367,13 +411,14 @@ if not ok:
       jid=$(jget "$CLAIMED" jid); text=$(jget "$CLAIMED" text)
       self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
       out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
-      if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then
+      wacli_result $rc "$text" "$out"
+      if (( SR_OK )); then
         settle sent
-        if (( quiet )); then print -r -- "(sent) id $(msgid "$out")"
+        if (( quiet )); then print -r -- "(sent) id $SR_ID"
         else print -r -- "(sent) Me: $text"; fi
         tip "$jid"
       else
-        settle failed; print -r -- "${out//"$text"/[message hidden]}" >&2; exit 1
+        settle failed; print -r -- "$SR_MSG" >&2; exit 1
       fi
       exit 0
     fi
@@ -401,7 +446,8 @@ if not ok:
       WS=${WA_SENDTEXT:-${0:A:h}/wa-sendtext}
       out=$(print -rn -- "$text" | "$WS" --to "$jid" $self); rc=$?
       if (( rc == 0 )); then
-        print -r -- "(sent) id $(msgid "$out")"; tip "$jid"; exit 0
+        wacli_result 0 "" "$out"
+        print -r -- "(sent) id $SR_ID"; tip "$jid"; exit 0
       fi
       exit $rc
     fi
@@ -410,11 +456,12 @@ if not ok:
     [[ -n $text ]] || die "error: empty text"
     self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
     out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
-    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then
-      if (( quiet )); then print -r -- "(sent) id $(msgid "$out")"; else print -r -- "(sent) Me: $text"; fi
+    wacli_result $rc "$text" "$out"
+    if (( SR_OK )); then
+      if (( quiet )); then print -r -- "(sent) id $SR_ID"; else print -r -- "(sent) Me: $text"; fi
       tip "$jid"
     else
-      print -r -- "${out//"$text"/[message hidden]}" >&2; exit 1
+      print -r -- "$SR_MSG" >&2; exit 1
     fi ;;
   sendfile)
     if [[ ${1:-} == --approved ]]; then

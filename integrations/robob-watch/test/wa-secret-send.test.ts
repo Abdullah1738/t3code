@@ -19,13 +19,20 @@ const daemonPy = join(box, "daemon.py");
 const waBin = join(box, "wa");
 const pkg = join(import.meta.dir, "../helpers");
 
-// Fake wacli: logs argv to FAKE_CALLS. FAKE_MODE=id prints a message id; FAKE_MODE=fail echoes its argv and exits 1.
+// Fake wacli: logs argv to FAKE_CALLS. Modes (FAKE_MODE):
+//   id       success envelope with a message id
+//   warnid   a warning line, then the success envelope (wacli's store_warning path)
+//   fail     raw echo of argv, exit 1 (text in the clear)
+//   jsonfail a real JSON error envelope that carries the text, escaped by wacli's encoder (python json.dumps
+//            of FAKE_TEXT). FAKE_TEXT is set by the test, so the fake never builds JSON from shell strings.
 writeFileSync(
   fakeWacli,
   `#!/bin/sh\necho "$@" >> "$FAKE_CALLS"\n` +
     `case "$FAKE_MODE" in\n` +
     `  id) echo '{"success":true,"data":{"id":"3EB0POS0001"}}' ;;\n` +
+    `  warnid) echo 'warning: store slow, retrying'; echo '{"success":true,"data":{"id":"3EB0WARN01"}}' ;;\n` +
     `  fail) echo "boom: $@"; exit 1 ;;\n` +
+    `  jsonfail) /usr/bin/python3 -c 'import json,os,sys; print(json.dumps({"success":False,"error":"could not send "+json.dumps(os.environ["FAKE_TEXT"])+": bad"}))'; exit 1 ;;\n` +
     `  *) echo '{"success":true}' ;;\nesac\n`,
 );
 writeFileSync(
@@ -251,6 +258,47 @@ test("h. --quiet with positional text prints only the id; the text never reaches
   expect(failing.err).toContain("[message hidden]");
   expect(failing.err).not.toContain(s);
   expect(failing.out).not.toContain(s);
+});
+
+// A secret whose JSON-escaped form differs from the raw text: quote, backslash, and <>& (wacli escapes these).
+const tricky = () => `Password: Q"x\\y<z>&-${globalThis.crypto.randomUUID()}`;
+
+test("h2. --quiet positional: a JSON error that echoes escaped text is redacted (raw match would miss it)", () => {
+  const s = tricky();
+  const r = waEnv({ FAKE_MODE: "jsonfail", FAKE_TEXT: s }, "send", "--quiet", BOB, s);
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("[message hidden]");
+  expect(r.err).not.toContain(s);
+  expect(r.err).not.toContain(JSON.stringify(s).slice(1, -1));
+  expect(r.err).not.toContain("u003c");
+  expect(r.out).not.toContain(s);
+});
+
+test("h3. successful --quiet positional with a warning line before the JSON envelope prints the id", () => {
+  const s = secret();
+  const r = waEnv({ FAKE_MODE: "warnid" }, "send", "--quiet", BOB, s);
+  expect(r.code).toBe(0);
+  expect(r.out).toBe("(sent) id 3EB0WARN01");
+  expect(r.out).not.toContain(s);
+  expect(r.err).not.toContain(s);
+});
+
+test("h4. --approved --quiet with a warning line before the JSON envelope prints the id", () => {
+  const id = idFrom(waEnv({}, "draft", BOB, "warn me").out);
+  const r = waEnv({ FAKE_MODE: "warnid" }, "send", "--approved", id, "--quiet");
+  expect(r.code).toBe(0);
+  expect(r.out).toBe("(sent) id 3EB0WARN01");
+});
+
+test("h5. --approved --quiet with a JSON error that echoes escaped text is redacted", () => {
+  const s = tricky();
+  const id = idFrom(waEnv({}, "draft", BOB, s).out);
+  const r = waEnv({ FAKE_MODE: "jsonfail", FAKE_TEXT: s }, "send", "--approved", id, "--quiet");
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("[message hidden]");
+  expect(r.err).not.toContain(s);
+  expect(r.err).not.toContain(JSON.stringify(s).slice(1, -1));
+  expect(r.out).not.toContain(s);
 });
 
 test("i. --approved <id> --quiet prints only the id", () => {
