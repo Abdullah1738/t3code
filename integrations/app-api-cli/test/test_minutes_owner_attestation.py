@@ -1,3 +1,6 @@
+import os as _os, tempfile as _tempfile
+# commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
+_os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
 from contextlib import contextmanager
 from decimal import Decimal
 from types import SimpleNamespace
