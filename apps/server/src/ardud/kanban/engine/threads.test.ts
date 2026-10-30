@@ -5,7 +5,6 @@ import { RuntimeRequestId } from "@t3tools/contracts";
 import { viewStateOf } from "./threads.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
-const RUN_STARTED = "2026-10-25T00:00:00.000Z";
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
 const FINISHED_AT = "2026-10-25T00:20:00.000Z";
 const SHARED_UPDATED = "2026-10-25T00:50:00.000Z";
