@@ -641,6 +641,10 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
     keeper.start()
     lf = open(log_path, "ab") if log_path else None
+    if lf:
+        # Checkpoint before the first byte: a holder that dies inside its first chunk still leaves one, so a waiter
+        # never prints bytes that its takeover will replay (no checkpoint at all = a holder from before checkpoints).
+        _commit(log_path, out_off, err_off, lf.tell())
     failures = 0
     frames = None
 
@@ -704,6 +708,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                     _close(frames)
                     continue
                 raise OffboxError("output stream closed without an exit frame")
+            except api.StreamDeadline:
+                # api.stream shut the socket at `until`: the deadline, not a broken stream to retry.
+                raise timed_out()
             except (OffboxError, OSError, TimeoutError) as e:
                 if stop_evt.is_set():
                     return None

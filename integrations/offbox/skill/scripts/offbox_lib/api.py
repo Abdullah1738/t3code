@@ -6,7 +6,9 @@ import contextlib
 import json
 import re
 import os
+import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -191,9 +193,31 @@ class StreamDeadline(OffboxError):
     """The caller's absolute deadline passed while reading a stream (possibly during silence or keepalives)."""
 
 
+def _shut_at(r, deadline: float, fired: threading.Event) -> threading.Timer | None:
+    """Shut the stream's socket down at `deadline`. A read blocked in recv (silence, or a partial line trickling in a
+    byte at a time) wakes at once; the socket's own timeout restarts on every byte, so it cannot bound a read.
+    shutdown, not close: closing a socket does not wake a recv already blocked on it."""
+    sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+    if sock is None:
+        return None
+
+    def fire():
+        fired.set()
+        try:
+            # The base method: SSLSocket.shutdown would also drop the SSL object under the blocked reader.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except OSError:
+            pass
+    t = threading.Timer(max(0.0, deadline - time.time()), fire)
+    t.daemon = True
+    t.start()
+    return t
+
+
 def stream(path: str, timeout: float = 120, deadline: float | None = None):
-    """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): every
-    line read, blank keepalives included, is checked against it, so a stream that keeps talking cannot outlive it."""
+    """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): the
+    socket is shut at that moment (see _shut_at) and every line is checked against it, so no read, keepalive or
+    partial line outlives it; the stream then raises StreamDeadline."""
     req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + _key(),
                                                       "Accept": "application/x-ndjson"})
     if deadline is not None:
@@ -207,19 +231,38 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
         except Exception:  # noqa: BLE001
             d = {}
         raise ApiError(e.code, d.get("code") or f"http_{e.code}", d.get("message") or "")
-    with r:
-        for line in r:
-            if deadline is not None and time.time() >= deadline:
-                raise StreamDeadline(f"deadline passed while reading {path}")
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if deadline is not None and time.time() >= deadline:
-                raise StreamDeadline(f"deadline passed while reading {path}")
+    fired = threading.Event()
+
+    def expired() -> bool:
+        return fired.is_set() or (deadline is not None and time.time() >= deadline)
+    dog = _shut_at(r, deadline, fired) if deadline is not None else None
+    try:
+        with r:
+            for line in r:
+                if expired():
+                    raise StreamDeadline(f"deadline passed while reading {path}")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if expired():
+                    raise StreamDeadline(f"deadline passed while reading {path}")
+    except StreamDeadline:
+        raise
+    except Exception as e:  # noqa: BLE001
+        # A read cut off at the deadline ends in whatever the transport makes of a shut socket (IncompleteRead, an
+        # SSL or OS error): past the deadline that is the deadline, not a broken stream.
+        if deadline is not None and expired():
+            raise StreamDeadline(f"deadline passed while reading {path}") from e
+        raise
+    finally:
+        if dog:
+            dog.cancel()
+    if deadline is not None and expired():
+        raise StreamDeadline(f"deadline passed while reading {path}")
 
 
 # ---------------------------------------------------------------- sandboxes

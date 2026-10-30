@@ -1,10 +1,13 @@
 """Offline tests: `offbox wait` / `logs --follow` on a run whose own `offbox run` still holds the box lock
 (29 Oct, Crpko #455: run-1029-062330-4b76 on bx_ebdpf5qa; `offbox wait --timeout 7200` died on the lock with 90)."""
 import contextlib
+import http.server
 import io
 from pathlib import Path
 import sys
+import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -153,6 +156,102 @@ class WaitLockTests(Isolated):
         self.assertIn('run-x: done exit=0', out)
 
 
+    def follow_out(self, argv, clock):
+        """cli_wait with streams that have .buffer: a takeover follow echoes bytes through sys.stdout/stderr.buffer."""
+        out, err = (io.TextIOWrapper(io.BytesIO(), write_through=True) for _ in range(2))
+        with patch.object(misc, 'time', clock.time), patch.object(misc, 'now', clock.now), \
+                patch.object(runs, 'now', clock.now), patch.object(runs, '_ttl_keeper'), \
+                patch.object(api, 'get', return_value={'state': 'running'}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.buffer.getvalue().decode(), err.buffer.getvalue().decode()
+
+    def test_logs_follow_takeover_after_first_chunk_death_has_every_byte_once(self):
+        # A holder flushes its first chunk to the local log and dies before committing it. Its follow committed a
+        # zero-length checkpoint before writing, so the waiter prints nothing past it, and the takeover cuts the
+        # log back and replays the run once: output and stored log each hold every byte exactly once.
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        guard = common.file_lock('box-bx_a', timeout=0)
+        guard.__enter__()
+        real_commit = runs._commit
+        calls = {'n': 0}
+
+        def dying_commit(path, out_off, err_off, log_bytes):
+            calls['n'] += 1
+            if calls['n'] == 2:  # the first chunk's commit: o1 is flushed to the log, then the holder dies
+                raise SystemExit('holder died')
+            real_commit(path, out_off, err_off, log_bytes)
+        with patch.object(runs, '_ttl_keeper'), patch.object(runs, '_commit', dying_commit), \
+                patch.object(runs.api, 'cmd_attach', lambda *a, **kw: iter([{'type': 'stdout', 'data': 'o1\n'}])):
+            with self.assertRaises(SystemExit):
+                runs.follow('bx_a', 7, log, echo=False, run_id='run-x')
+        self.assertEqual(log.read_bytes(), b'o1\n')
+        self.assertEqual(common.checkpoint(log), {'stdoutOffset': 0, 'stderrOffset': 0, 'logBytes': 0})
+        held = [guard]
+
+        def holder_gone(t):
+            if held:
+                held.pop().__exit__(None, None, None)  # the dead holder's lock is released
+        asked = {}
+
+        def takeover_attach(box, pid, o, e, **kw):
+            asked.update(o=o, e=e)
+            return iter([{'type': 'stdout', 'data': 'o1\n', 'nextOffset': 3},
+                         {'type': 'stderr', 'data': 'e1\n', 'nextOffset': 3}, {'type': 'exit', 'exitCode': 0}])
+        with patch.object(runs.api, 'cmd_attach', takeover_attach):
+            rc, out, err = self.follow_out(['logs', 'run-x', '--follow'], Clock(on_sleep=holder_gone))
+        self.assertEqual(rc, 0)
+        self.assertEqual(asked, dict(o=0, e=0))
+        self.assertEqual(out.count('o1'), 1, out)
+        self.assertEqual(err.count('e1'), 1, err)
+        self.assertEqual(log.read_bytes(), b'o1\ne1\n')
+
+    def test_logs_follow_legacy_log_without_checkpoint_is_not_printed_twice(self):
+        # A run started before checkpoints existed: its holder writes the log with no sidecar. The waiter can't tell
+        # which bytes a takeover would replay, so it prints none while the run can still be taken over; the
+        # takeover empties the log and replays from offset 0.
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_bytes(b'o1\ne1\n')
+        guard = common.file_lock('box-bx_a', timeout=0)
+        guard.__enter__()
+        held = [guard]
+
+        def holder_gone(t):
+            if t >= 1010 and held:
+                held.pop().__exit__(None, None, None)
+
+        def takeover_attach(box, pid, o, e, **kw):
+            self.assertEqual((o, e), (0, 0))
+            return iter([{'type': 'stdout', 'data': 'o1\n', 'nextOffset': 3},
+                         {'type': 'stderr', 'data': 'e1\n', 'nextOffset': 3},
+                         {'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}])
+        with patch.object(runs.api, 'cmd_attach', takeover_attach):
+            rc, out, err = self.follow_out(['logs', 'run-x', '--follow'], Clock(on_sleep=holder_gone))
+        self.assertEqual(rc, 0)
+        self.assertEqual((out.count('o1'), out.count('o2'), err.count('e1')), (1, 1, 1), (out, err))
+        self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
+
+    def test_logs_follow_legacy_log_settled_by_its_holder_prints_it_once(self):
+        # Same legacy holder, but it finishes: the whole log is printed once when the run settles.
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_bytes(b'o1\n')
+        self.hold_box()
+
+        def holder_finishes(t):
+            if t >= 1010:
+                with open(log, 'ab') as f:
+                    f.write(b'o2\n')
+                self.end_run(0)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, _ = self.follow_out(['logs', 'run-x', '--follow'], Clock(on_sleep=holder_finishes))
+        self.assertEqual(rc, 0)
+        self.assertEqual((out.count('o1'), out.count('o2')), (1, 1), out)
+        self.assertIn('run-x: done exit=0', out)
+
+
 class FollowUntilTests(unittest.TestCase):
     def test_follow_stops_at_until_without_killing(self):
         clock = Clock()
@@ -216,8 +315,10 @@ class FollowUntilTests(unittest.TestCase):
         # End to end: a holder follows stdout and stderr interleaved. It dies after flushing a chunk to the local log
         # but before committing its checkpoint. A waiter takes over: the committed bytes are not repeated, the
         # uncommitted chunk is dropped and replayed once, and the stream offsets resume per stream.
-        log = common.LOGS_DIR / 'run-z.log'
-        log.parent.mkdir(parents=True, exist_ok=True)
+        # A temp dir, not common.LOGS_DIR: this class isn't Isolated, so that would be the live ~/.local/share/offbox.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = Path(tmp.name) / 'run-z.log'
         log.write_bytes(b'')
         frames_holder = [
             {'type': 'stdout', 'data': 'o1\n', 'nextOffset': 3},
@@ -229,7 +330,9 @@ class FollowUntilTests(unittest.TestCase):
 
         def dying_commit(path, out_off, err_off, log_bytes):
             calls['n'] += 1
-            if calls['n'] == 3:  # the third chunk: flushed to the log, then the holder dies before committing it
+            # Call 1 is follow's zero-length checkpoint before any byte; call 4 is the third chunk: flushed to the
+            # log, then the holder dies before committing it.
+            if calls['n'] == 4:
                 raise SystemExit('holder died')
             real_commit(path, out_off, err_off, log_bytes)
 
@@ -263,6 +366,102 @@ class FollowUntilTests(unittest.TestCase):
         self.assertEqual(asked, dict(o=3, e=3))
         # Each line exactly once, in the order it was confirmed.
         self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
+
+
+class _Boat(http.server.BaseHTTPRequestHandler):
+    """A local ndjson stream that misbehaves on purpose: /quiet sends one frame late, then goes silent; /trickle sends
+    a line one byte at a time and never finishes it. ?plain=1 answers HTTP/1.0 without chunking."""
+    protocol_version = 'HTTP/1.1'
+    stop = threading.Event()
+    frame_at = 0.0
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        plain = 'plain=1' in self.path
+        if plain:
+            self.protocol_version = 'HTTP/1.0'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/x-ndjson')
+        if not plain:
+            self.send_header('Transfer-Encoding', 'chunked')
+        self.end_headers()
+
+        def send(b):
+            self.wfile.write(b if plain else b'%x\r\n%s\r\n' % (len(b), b))
+            self.wfile.flush()
+        try:
+            if '/trickle' in self.path:
+                send(b'{')
+                for _ in range(100):  # 10 s of one byte per 0.1 s, never a newline
+                    if self.stop.wait(0.1):
+                        return
+                    send(b' ')
+            else:
+                if self.stop.wait(self.frame_at):
+                    return
+                send(b'{"type": "stdout", "data": "hi\\n", "nextOffset": 3}\n')
+                self.stop.wait(10)
+        except OSError:
+            pass
+
+
+class StreamDeadlineTests(unittest.TestCase):
+    """Through the real api.stream / cmd_attach over a local socket: the deadline cuts a blocked read itself."""
+
+    def setUp(self):
+        _Boat.stop = threading.Event()
+        self.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Boat)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.addCleanup(_Boat.stop.set)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(api, 'API', f'http://127.0.0.1:{self.srv.server_address[1]}'))
+        stack.enter_context(patch.object(api, '_key', return_value='k'))
+
+    def read_until(self, path, deadline_in):
+        t0 = time.time()
+        got = []
+        with self.assertRaises(api.StreamDeadline):
+            for fr in api.stream(path, timeout=90, deadline=t0 + deadline_in):
+                got.append(fr)
+        return got, time.time() - t0
+
+    def test_output_near_the_deadline_then_silence(self):
+        # Before: the socket timeout was fixed at open (3 s), so a frame at 2.5 s let the next read block to ~5.5 s.
+        _Boat.frame_at = 2.5
+        for path in ('/quiet', '/quiet?plain=1'):
+            got, took = self.read_until(path, 3.0)
+            self.assertEqual([f.get('data') for f in got], ['hi\n'], path)
+            self.assertLess(took, 3.8, path)
+
+    def test_partial_line_trickling_bytes(self):
+        # Before: every byte restarted the socket timeout, so the read never ended while bytes kept coming.
+        for path in ('/trickle', '/trickle?plain=1'):
+            got, took = self.read_until(path, 2.0)
+            self.assertEqual(got, [], path)
+            self.assertLess(took, 2.8, path)
+
+    def test_follow_wait_timeout_ends_on_time_through_the_real_stream(self):
+        # offbox wait --timeout 3 on a run whose output stops just before the deadline: 124 at the deadline, the
+        # frame logged once, nothing stopped.
+        _Boat.frame_at = 2.5
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'run-q.log'
+            t0 = time.time()
+            with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_status', return_value=None), \
+                    patch.object(runs.api, 'cmd_kill', side_effect=AssertionError('must not stop the run')):
+                with self.assertRaises(common.OffboxError) as caught:
+                    runs.follow('bx_a', 7, log, echo=False, run_id='run-q', until=t0 + 3.0)
+            took = time.time() - t0
+            self.assertEqual(caught.exception.code, 124)
+            self.assertLess(took, 3.8)
+            self.assertEqual(log.read_bytes(), b'hi\n')
+            self.assertEqual(common.checkpoint(log), {'stdoutOffset': 3, 'stderrOffset': 0, 'logBytes': 3})
 
 
 if __name__ == '__main__':

@@ -280,7 +280,9 @@ def _truncate(path, size: int) -> None:
 def _wait_locked(r, echo, timeout=None):
     """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
     holds the lock, poll the run row (and tail the local log) instead of failing on the lock.
-    `pos` is the local-log byte count already delivered (printed when echoing, or appended by the takeover follow)."""
+    `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
+    over, only checkpointed bytes are delivered (see runs.follow): a takeover replays everything past the checkpoint,
+    and a log with no checkpoint at all (a holder from before checkpoints) is replayed whole into an emptied log."""
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     pos, said = 0, False
@@ -292,30 +294,32 @@ def _wait_locked(r, echo, timeout=None):
             pass
         else:
             try:
-                # The holder writes its last output before it records the end and releases the lock: drain the
-                # committed part of it first. Bytes past the checkpoint were never confirmed and are not printed.
-                ck = checkpoint(log_path)
-                limit = ck["logBytes"] if ck else None
-                pos = _tail(log_path, pos, echo, limit)
                 cur = _run_row(r['run_id'])
                 if cur['status'] not in ('starting', 'running'):
+                    # The holder wrote its last output, recorded the end and released the lock between two polls.
+                    # Nothing will be replayed now, so drain the whole rest of the log.
+                    _tail(log_path, pos, echo)
                     return _settled(cur)
+                ck = checkpoint(log_path)
                 if ck:
+                    _tail(log_path, pos, echo, ck["logBytes"])
                     # Drop the uncommitted tail so the takeover's replay appends it exactly once.
                     _truncate(log_path, ck["logBytes"])
                     start = (ck["stdoutOffset"], ck["stderrOffset"])
                 else:
+                    # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
+                    _truncate(log_path, 0)
                     start = (0, 0)
                 return _wait_run(cur, echo, until=deadline, start_offsets=start)
             finally:
                 guard.__exit__(None, None, None)
         ck = checkpoint(log_path)
-        pos = _tail(log_path, pos, echo, ck["logBytes"] if ck else None)
+        if ck:
+            pos = _tail(log_path, pos, echo, ck["logBytes"])
         cur = _run_row(r['run_id'])
         if cur['status'] not in ('starting', 'running'):
-            # Drain the committed bytes that landed after the poll above, then report the recorded end.
-            ck = checkpoint(log_path)
-            _tail(log_path, pos, echo, ck["logBytes"] if ck else None)
+            # Settled: nothing will be replayed, so drain the whole rest of the log.
+            _tail(log_path, pos, echo)
             return _settled(cur)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
