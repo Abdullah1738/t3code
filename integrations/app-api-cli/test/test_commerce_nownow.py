@@ -57,8 +57,8 @@ class NowNowFlowTests(unittest.TestCase):
         flow.account_hash=fingerprint('customer');flow.address_hash=fingerprint('home','key')
         flow.snapshot=AuthSnapshot('nownow',flow.account_hash,flow.address_hash,time.time(),
             {'x-addresscode':'home','x-addresskey':'key','cookie':'synthetic=secret'},time.monotonic()+30)
-        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx5542','mastercard')
-        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx5542','ccType':'mastercard','isDeleted':False}
+        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx2342','mastercard')
+        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx2342','ccType':'mastercard','isDeleted':False}
         from noon_nownow_controller import CardSyncBinding
         flow.card_binding=CardSyncBinding(flow.account_hash,flow.address_hash,fingerprint('owned'),
             fingerprint('synthetic-token'),'1'*64,'2'*64,time.time())

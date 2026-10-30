@@ -217,7 +217,7 @@ class ItemNoteContractTests(unittest.TestCase):
 
     def test_intent_scope_binds_note_but_preserves_old_empty_note_hash(self):
         original = {'branch':44444,'vertical':'restaurants','items':[(12345,2)],
-                    'home':'Banyantree2104','card':'5542','quiet':True,'extras':False}
+                    'home':'Banyantree2104','card':'2342','quiet':True,'extras':False}
         empty = commerce.intent_scope('restaurants',44444,(h.Item(12345,2),))
         self.assertEqual(empty,journal.digest(original))
         noted = commerce.intent_scope('restaurants',44444,(h.Item(12345,2,note=NOTE),))
@@ -226,7 +226,7 @@ class ItemNoteContractTests(unittest.TestCase):
 )
     def test_intent_scope_binds_choices_without_touching_old_hashes(self):
         original = {'branch':44444,'vertical':'restaurants','items':[(12345,2)],
-                    'home':'Banyantree2104','card':'5542','quiet':True,'extras':False}
+                    'home':'Banyantree2104','card':'2342','quiet':True,'extras':False}
         empty = commerce.intent_scope('restaurants',44444,(h.Item(12345,2),))
         self.assertEqual(empty,journal.digest(original))
         chosen = commerce.intent_scope('restaurants',44444,

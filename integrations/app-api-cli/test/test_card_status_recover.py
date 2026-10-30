@@ -66,7 +66,7 @@ class RecoverDeclineTimeTests(unittest.TestCase):
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
     def stored(self):
-        return json.loads(self.card_file.read_text())['5542']
+        return json.loads(self.card_file.read_text())['2342']
 
     def test_journal_reports_when_the_payment_error_was_observed(self):
         now = time.time()
@@ -96,7 +96,7 @@ class RecoverDeclineTimeTests(unittest.TestCase):
         self.assertEqual(record['at'], math.ceil(occurred))
         self.assertGreaterEqual(record['recorded_at'], int(now))
         self.assertEqual(record['events'], [self.flow])
-        self.assertFalse(cs.check('5542')['blocked'])
+        self.assertFalse(cs.check('2342')['blocked'])
 
     def test_recent_decline_blocks_until_12h_after_it_happened(self):
         now = time.time()
@@ -108,8 +108,8 @@ class RecoverDeclineTimeTests(unittest.TestCase):
         self.assertTrue(result['card_status']['blocked'])
         at = self.stored()['at']
         self.assertEqual(at, math.ceil(occurred))
-        self.assertTrue(cs.check('5542', now=at + 12 * HOUR - 1)['blocked'])
-        self.assertFalse(cs.check('5542', now=at + 12 * HOUR)['blocked'])
+        self.assertTrue(cs.check('2342', now=at + 12 * HOUR - 1)['blocked'])
+        self.assertFalse(cs.check('2342', now=at + 12 * HOUR)['blocked'])
         # The same flow re-read again is not a second decline.
         self.assertFalse(self.recover()[1]['card_status']['recorded'])
 
@@ -140,7 +140,7 @@ class RecoverDeclineTimeTests(unittest.TestCase):
         now = time.time()
         occurred = now - 2 * HOUR
         self.journal_flow(created=occurred - 45, declined=occurred)
-        cs.record_ok('5542', note='topped up', now=now - HOUR)
+        cs.record_ok('2342', note='topped up', now=now - HOUR)
         code, result = self.recover()
         self.assertEqual(code, 1)
         self.assertFalse(result['card_status']['recorded'])

@@ -93,7 +93,7 @@ class CheckoutTests(unittest.TestCase):
         client = self.client([CART] * 6 + [{'data': {'session': None, 'order': {'orderNr': ORDER}}},
                             {'status': 'PAYMENT_PENDING'}], receipt=lambda r: receipts.append(r) or True)
         before = Mock(return_value=True)
-        card = nn.SavedCard('fake-token', 'xxxx 5542', 'mastercard')
+        card = nn.SavedCard('fake-token', 'xxxx 2342', 'mastercard')
         operations = [
             lambda: client.get_cart('store', before_send=before),
             lambda: client.create_cart(store_code='store', product_code='product', modifiers={}, before_send=before),
@@ -218,7 +218,7 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_payment_payload_does_not_copy_minutes_provider_or_total_fields(self):
-        card = nn.SavedCard('fake-token', 'xxxx 5542', 'mastercard')
+        card = nn.SavedCard('fake-token', 'xxxx 2342', 'mastercard')
         selected = nn.payment_payload('session', card)
         self.assertEqual(selected['paymentMethodCode'], 'prepaid')
         self.assertEqual(selected['prepaid_payment_method_code'], 'cc_noonpay')
@@ -338,7 +338,7 @@ class CheckoutTests(unittest.TestCase):
         client = self.client([{'status': 'REDIRECT_REQUIRED', 'redirect_url': 'https://challenge.invalid/private'}],
                              receipt=lambda r: records.append(r) or True)
         snap = client.complete_payment(order=ORDER, client_secret='private-intent',
-            card=nn.SavedCard('fake-token', 'xxxx 5542', 'mastercard'),
+            card=nn.SavedCard('fake-token', 'xxxx 2342', 'mastercard'),
             cvv_encryption={'encCvv': 'fake', 'publicKeyName': 'key'}, before_send=lambda *a: True)
         self.assertEqual(records[0]['outcome'], 'CHALLENGE_REQUIRED')
         self.assertTrue(client._mutation_fenced)
@@ -359,7 +359,7 @@ class CheckoutTests(unittest.TestCase):
         records = []
         client = self.client([{'status': 'success', 'data': 'private-intent'}],
                              receipt=lambda r: records.append(r) or True)
-        card = nn.SavedCard('fake-token', 'xxxx 5542', 'mastercard')
+        card = nn.SavedCard('fake-token', 'xxxx 2342', 'mastercard')
         with self.assertRaisesRegex(nn.NowNowError, 'ADDRESS_BINDING_MISMATCH'):
             client.create_payment_subscription(address_code='other', address_version=1,
                 card=card, before_send=lambda *a: True)
@@ -378,7 +378,7 @@ class CheckoutTests(unittest.TestCase):
     def test_preorder_payment_continuation_does_not_invent_wire_binding(self):
         client = self.client([{'status': 'PAYMENT_PENDING'}], receipt=lambda r: True)
         client.complete_payment(order=None, session_code='session', client_secret='intent',
-            card=nn.SavedCard('fake-token', 'xxxx 5542', 'mastercard'),
+            card=nn.SavedCard('fake-token', 'xxxx 2342', 'mastercard'),
             cvv_encryption={'encCvv': 'fake', 'publicKeyName': 'key'}, before_send=lambda *a: True)
         self.assertNotIn('sessionCode', self.calls[0][2])
         self.assertNotIn('orderNr', self.calls[0][2])

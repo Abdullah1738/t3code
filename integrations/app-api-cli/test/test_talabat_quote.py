@@ -19,11 +19,11 @@ def fixture():
 
 
 def card_fixture():
-    card = {'cardNumber':'****5542','CountryId':4,'isExpired':False,
+    card = {'cardNumber':'****2342','CountryId':4,'isExpired':False,
             'isValidCard':True,'isForceCvv':False,'expireYear':'2099','expireMonth':'12',
             'token':'synthetic-token','tokenId':'synthetic-token-id'}
     config = {'supportedFeatures':{'paySupportsTPro':True},'paymentMethods':[{
-        'isEnabled':True,'isSelected':False,'title':'Mastercard 5542',
+        'isEnabled':True,'isSelected':False,'title':'Mastercard 2342',
         'supportedFeatures':{k:True for k in q.CARD_FEATURES},
         'events':{'payment':{'method':{'paymentMethod':2,'addTPayMethod':7},
                             'card':{'cardId':card['tokenId'],'binNumber':'123456',

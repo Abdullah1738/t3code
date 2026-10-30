@@ -71,7 +71,7 @@ def cart_state(*, empty=False, offer=OFFER, sku=SKU, quantity=2):
 
 def session_state(*, total=19.8, quantity=2, address=HEADERS['x-addresskey'],
                   silent=True, card_default=True, credits=False):
-    cards = [{'id': '<secret>', 'type': 'MASTERCARD', 'mask': '52287301xxxx5542',
+    cards = [{'id': '<secret>', 'type': 'MASTERCARD', 'mask': '52287301xxxx2342',
               'isSelected': card_default, 'isDefault': card_default},
              {'id': '<secret>', 'type': 'VISA', 'mask': '419649xxxxxx9963',
               'isSelected': False, 'isDefault': False}]
@@ -178,7 +178,7 @@ class CapturedContractTests(unittest.TestCase):
         cc = next(m for m in data['paymentMethods'] if m['code'] == 'cc_noonpay')
         self.assertEqual(cc['status'], 'active')
         default = [card for card in cc['cards']
-                   if card['mask'].endswith('5542') and card['isDefault'] is True
+                   if card['mask'].endswith('2342') and card['isDefault'] is True
                    and card['isSelected'] is True]
         self.assertEqual(len(default), 1)
 
@@ -279,6 +279,27 @@ class LaneTests(unittest.TestCase):
             with self.assertRaisesRegex(j.JournalError, 'SILENT_DELIVERY_NOT_ACTIVE'):
                 flow.review_session()
             self.assertNotIn('place', [name for name, _, _ in harness.calls])
+
+    def test_5542_default_card_refused(self):
+        # A session whose default+selected card is the cancelled 5542 must fail like any other non-order card.
+        state = session_state()
+        cards = state['paymentMethods'][1]['cards']
+        for card in cards:
+            card['mask'] = card['mask'].replace('2342', '5542')
+        self.assertTrue(any(card['mask'].endswith('5542') and card['isDefault'] for card in cards))
+        responses = happy_responses(session=state)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                patch.object(c.receipts, 'ROOT', Path(temp).resolve() / 'commerce'):
+            flow, harness = make_flow(responses)
+            with patch.object(c, 'active_marketplace_orders', return_value=[]), \
+                    patch.object(c.urllib.request, 'build_opener',
+                                 return_value=patched_resolve(FIXTURE['search'])()):
+                flow.guard()
+            flow.add()
+            flow.checkout_session()
+            with self.assertRaisesRegex(j.JournalError, 'DEFAULT_CARD_NOT_SELECTED'):
+                flow.review_session()
 
     def test_default_card_not_selected_refused(self):
         responses = happy_responses(session=session_state(card_default=False))

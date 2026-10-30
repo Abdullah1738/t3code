@@ -54,7 +54,7 @@ def nn_state(*, session='S-SESSION-1', store=STORE, product=PRODUCT, qty=1.0,
 
     return {'data': {'checkoutSessionCode': session, 'channelCode': 'noon',
                      'paymentMethodCode': 'prepaid' if payment else None,
-                     'creditCardMask': '52287301xxxx5542' if payment else None,
+                     'creditCardMask': '52287301xxxx2342' if payment else None,
                      'hasPaymentSubscription': payment, 'addressCode': address,
                      'addressVersion': 1, 'storeCode': store,
                      'storeInfo': {'storeCode': store, 'nameEn': 'Spinneys'},
@@ -81,7 +81,7 @@ def place_state(order=SYNTHETIC_ORDER):
         'customerStatusCode': 'placed', 'orderSubtotal': 20.5, 'orderDeliveryFee': 6.45,
         'orderServiceFee': 4.5, 'orderTotal': 31.45, 'orderPaymentAmount': 31.45,
         'orderWalletAmount': 0.0, 'paymentMethodCode': 'prepaid',
-        'creditCardMask': '52287301xxxx5542',
+        'creditCardMask': '52287301xxxx2342',
         'prepaidPaymentMisc': {'isCvvRequired': False, 'prepaidPaymentMethodCode': 'cc_noonpay'},
         'products': [{'productCode': PRODUCT, 'qty': 1.0}]}}}
 
@@ -107,7 +107,7 @@ def happy_responses(**overrides):
     responses = {
         'home': {'data': {'active': []}},
         'carts_recent': {'data': {'carts': []}},
-        'payment_cards': {'data': [{'id': int(SYNTHETIC_TOKEN), 'ccMasked': '52287301xxxx5542',
+        'payment_cards': {'data': [{'id': int(SYNTHETIC_TOKEN), 'ccMasked': '52287301xxxx2342',
                                     'ccType': 'MASTERCARD', 'isDefault': True,
                                     'isDeleted': False}]},
         'payment_subscription_list': {'data': [{'paymentToken': SYNTHETIC_TOKEN},
@@ -166,7 +166,7 @@ class CapturedContractTests(unittest.TestCase):
             flow._guard_state(row)
 
     def test_edit_payment_body_matches_capture(self):
-        card = native.SavedCard(SYNTHETIC_TOKEN, '52287301xxxx5542', 'MASTERCARD')
+        card = native.SavedCard(SYNTHETIC_TOKEN, '52287301xxxx2342', 'MASTERCARD')
         body = native.payment_payload(FIXTURE['edit_payment_req']['sessionCode'], card)
         expected = dict(FIXTURE['edit_payment_req'], paymentToken=SYNTHETIC_TOKEN)
         self.assertEqual(body, expected)
@@ -244,9 +244,9 @@ class GuardTests(unittest.TestCase):
             flow.guard()
 
     def test_ambiguous_saved_card_refused(self):
-        cards = {'data': [{'id': 1111111111, 'ccMasked': '52287301xxxx5542',
+        cards = {'data': [{'id': 1111111111, 'ccMasked': '52287301xxxx2342',
                            'ccType': 'MASTERCARD', 'isDefault': True, 'isDeleted': False},
-                          {'id': 2222222222, 'ccMasked': '111122xxxxxx5542',
+                          {'id': 2222222222, 'ccMasked': '111122xxxxxx2342',
                            'ccType': 'MASTERCARD', 'isDefault': False, 'isDeleted': False}]}
         flow, _ = make_flow(happy_responses(payment_cards=cards))
         with self.assertRaisesRegex(j.JournalError, 'SAVED_CARD_NOT_UNIQUE'):

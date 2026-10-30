@@ -61,7 +61,7 @@
   }
  },
  "edit_payment_req": {
-  "creditCardMask": "52287301xxxx5542",
+  "creditCardMask": "52287301xxxx2342",
   "paymentMethodCode": "prepaid",
   "paymentToken": "<secret>",
   "prepaid_payment_method_code": "cc_noonpay",
@@ -74,7 +74,7 @@
    "addressVersion": 1,
    "channelCode": "noon",
    "checkoutSessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
-   "creditCardMask": "52287301xxxx5542",
+   "creditCardMask": "52287301xxxx2342",
    "currencyCode": "AED",
    "deliveryPreference": {
     "dont_ring_the_bell": true,
@@ -140,7 +140,7 @@
  "paymentcards": {
   "data": [
    {
-    "ccMasked": "52287301xxxx5542",
+    "ccMasked": "52287301xxxx2342",
     "ccType": "MASTERCARD",
     "id": "<secret>",
     "isDefault": true,
@@ -183,7 +183,7 @@
  "place_resp": {
   "data": {
    "order": {
-    "creditCardMask": "52287301xxxx5542",
+    "creditCardMask": "52287301xxxx2342",
     "customerStatusCode": "placed",
     "logisticsStatusCode": "not_initiated",
     "orderDeliveryFee": 6.45,
@@ -378,7 +378,7 @@
    "addressVersion": 1,
    "channelCode": "noon",
    "checkoutSessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
-   "creditCardMask": "52287301xxxx5542",
+   "creditCardMask": "52287301xxxx2342",
    "currencyCode": "AED",
    "deliveryPreference": {
     "dont_ring_the_bell": false,
