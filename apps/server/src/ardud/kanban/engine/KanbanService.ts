@@ -2528,6 +2528,37 @@ const make = Effect.gen(function* () {
     for (const card of nudge) yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
   });
 
+  /** A reviewer whose turn ended with no verdict: nudged once, then flagged and its slot freed. */
+  const reviewerStopped = Effect.fn("KanbanService.reviewerStopped")(function* (
+    card: KanbanCard,
+    threadId: ThreadId,
+  ) {
+    const at = yield* nowIso;
+    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    if (card.nudgedAt === null) {
+      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
+      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+      return;
+    }
+    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
+    const reason = "Reviewer stopped without a verdict";
+    const next: KanbanCard = {
+      ...release(card),
+      stage: "needs_review",
+      stalled: { reason, by: system, at },
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    yield* logEvent(next, system, "flagged", {
+      fromStage: card.stage,
+      toStage: next.stage,
+      body: reason,
+    });
+    yield* saveCard(next);
+    yield* kick;
+  });
+
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
   ) {
@@ -2690,6 +2721,8 @@ const make = Effect.gen(function* () {
       const view = yield* threads.view(threadId);
       // A repeated run event can arrive while the thread runs again.
       if (view === null || view.state !== "idle") return;
+      // A worker waiting on its own subagents hasn't stopped.
+      if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       yield* nudgeWorker(threadId, carried);
       return;
     }
@@ -2746,28 +2779,9 @@ const make = Effect.gen(function* () {
     // chain step before the one now running in this thread.
     const latest = yield* threads.view(threadId);
     if (latest !== null && latest.state !== "idle") return;
-    if (card.nudgedAt === null) {
-      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
-      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
-      return;
-    }
-    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
-    const reason = "Reviewer stopped without a verdict";
-    const next: KanbanCard = {
-      ...release(card),
-      stage: "needs_review",
-      stalled: { reason, by: system, at },
-      nudgedAt: null,
-      movedAt: at,
-      updatedAt: at,
-    };
-    yield* logEvent(next, system, "flagged", {
-      fromStage: card.stage,
-      toStage: next.stage,
-      body: reason,
-    });
-    yield* saveCard(next);
-    yield* kick;
+    // Its own subagents still run: their results wake it, so it hasn't stopped.
+    if (latest !== null && Rules.waitingOnBackground(latest, yield* nowMillis)) return;
+    yield* reviewerStopped(card, threadId);
   });
 
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
@@ -2862,7 +2876,7 @@ const make = Effect.gen(function* () {
         // A paused worker waits for probeOutages, not a nudge.
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
-        if (view === null || !Rules.workerQuietDue(card, view, now)) continue;
+        if (view === null || Rules.waitingOnBackground(view, now) || !Rules.workerQuietDue(card, view, now)) continue;
         if (view.state === "needs-input") {
           // Its turn end after the interrupt brings the nudge.
           yield* threads.interrupt(threadId, "Stuck on its own question; the board nudges it");
@@ -2874,6 +2888,16 @@ const make = Effect.gen(function* () {
           continue;
         }
         yield* nudgeWorker(threadId, [card]);
+      }
+      // Backstop for a reviewer left idle with no verdict: a turn end skipped while
+      // its own background work ran, or one that never arrived.
+      for (const card of yield* store.cards(board.id)) {
+        const threadId = card.activeThreadId;
+        if (threadId === null || card.activeRole !== "review") continue;
+        if ((yield* store.threadLink(threadId))?.paused) continue;
+        const view = yield* threads.view(threadId);
+        if (view === null || Rules.waitingOnBackground(view, now) || !Rules.reviewerQuietDue(card, view, now)) continue;
+        yield* reviewerStopped(card, threadId);
       }
       // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
       for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {

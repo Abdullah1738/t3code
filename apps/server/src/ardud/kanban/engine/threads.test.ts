@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import { RuntimeRequestId } from "@t3tools/contracts";
 
-import { viewStateOf } from "./threads.ts";
+import { backgroundWorkOf, viewStateOf } from "./threads.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";

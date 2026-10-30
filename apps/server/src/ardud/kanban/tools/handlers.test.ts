@@ -84,6 +84,7 @@ const fakeThreads = () => {
           updatedAt: "2026-10-26T08:00:00.000Z",
           quietSince: "2026-10-26T08:00:00.000Z",
           runStartedAt: null,
+          backgroundWork: 0,
           prs: [],
           archived: false,
         }),

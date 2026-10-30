@@ -54,6 +54,7 @@ interface FakeThread {
   runStartedAt?: string;
   stuck?: boolean;
   quietSince?: string;
+  background?: number;
   archived: boolean;
 }
 
@@ -84,6 +85,7 @@ const makeFake = Effect.gen(function* () {
             updatedAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
             quietSince: thread.quietSince ?? "2026-10-25T13:00:00.000Z",
             runStartedAt: thread.runStartedAt ?? null,
+            backgroundWork: thread.background ?? 0,
             prs: prs.get(threadId) ?? [],
             archived: thread.archived,
           };
@@ -1127,6 +1129,12 @@ const toyBoard = Effect.gen(function* () {
   yield* kanban.setPool(chained.id, chained.defaultCardModel, 1);
   return { kanban, board: chained };
 });
+
+const setBackground = (fake: Effect.Success<typeof makeFake>, threadId: string, count: number) =>
+  Ref.update(fake.threads, (all) => {
+    all.get(threadId)!.background = count;
+    return all;
+  });
 
 const setRunning = (fake: Effect.Success<typeof makeFake>, threadId: string, running: boolean) =>
   Ref.update(fake.threads, (all) => {

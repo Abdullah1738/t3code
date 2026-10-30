@@ -189,6 +189,37 @@ export function workerQuietDue(
   return nowMs - since >= WORKER_QUIET_MS;
 }
 
+/** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
+export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
+
+/** A thread whose turn ended while its own subagents or background tasks still run, within the grace. */
+export function waitingOnBackground(
+  view: { readonly state: string; readonly quietSince: string; readonly backgroundWork: number },
+  nowMs: number,
+): boolean {
+  return (
+    view.state === "idle" &&
+    view.backgroundWork > 0 &&
+    nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS
+  );
+}
+
+/** An In Review card whose reviewer sat idle with no verdict for WORKER_QUIET_MS (a turn end skipped for background work, or missed). */
+export function reviewerQuietDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly quietSince: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "in_review" || card.activeRole !== "review" || card.activeThreadId === null || card.stalled !== null) return false;
+  if (view.state !== "idle") return false;
+  const since = Math.max(
+    Date.parse(view.quietSince),
+    Date.parse(card.movedAt),
+    card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+  );
+  return nowMs - since >= WORKER_QUIET_MS;
+}
+
 // Words a provider uses when it is out of usage or down, not when the request is wrong.
 const OUTAGE_TEXT =
   /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired/i;

@@ -31,6 +31,9 @@ import {
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  reviewerQuietDue,
+  waitingOnBackground,
+  BACKGROUND_GRACE_MS,
 } from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
@@ -864,6 +867,56 @@ describe("workerQuietDue", () => {
       ),
     ).toBe(false);
     expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
+  });
+});
+
+describe("waitingOnBackground and reviewerQuietDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const START_ISO = "2026-10-25T00:00:00.000Z";
+  const at = (minutes: number) => START + minutes * 60 * 1000;
+  const bg = (state: string, background: number) => ({
+    state,
+    quietSince: START_ISO,
+    backgroundWork: background,
+  });
+
+  it("holds an idle thread with background work for the grace only", () => {
+    expect(BACKGROUND_GRACE_MS).toBe(60 * 60 * 1000);
+    expect(waitingOnBackground(bg("idle", 1), at(59))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1), at(61))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0), at(59))).toBe(false);
+    expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
+  });
+
+  const reviewing = card({
+    stage: "in_review",
+    activeRole: "review",
+    activeThreadId: ThreadId.make("t1"),
+    movedAt: START_ISO,
+  });
+  const idle = { state: "idle", quietSince: START_ISO };
+
+  it("is due for an idle reviewer with no verdict after 30 minutes", () => {
+    expect(reviewerQuietDue(reviewing, idle, at(31))).toBe(true);
+    expect(reviewerQuietDue(reviewing, idle, at(29))).toBe(false);
+  });
+
+  it("counts from the last nudge", () => {
+    const nudged = { ...reviewing, nudgedAt: "2026-10-25T00:20:00.000Z" };
+    expect(reviewerQuietDue(nudged, idle, at(31))).toBe(false);
+    expect(reviewerQuietDue(nudged, idle, at(51))).toBe(true);
+  });
+
+  it("skips stalled, worker and running reviewers", () => {
+    expect(
+      reviewerQuietDue(
+        { ...reviewing, stalled: { reason: "x", by: { _tag: "owner" }, at: START_ISO } },
+        idle,
+        at(31),
+      ),
+    ).toBe(false);
+    expect(reviewerQuietDue({ ...reviewing, activeRole: "work" }, idle, at(31))).toBe(false);
+    expect(reviewerQuietDue(reviewing, { ...idle, state: "running" }, at(31))).toBe(false);
   });
 });
 
