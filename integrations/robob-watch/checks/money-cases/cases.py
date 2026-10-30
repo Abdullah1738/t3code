@@ -8,6 +8,9 @@
   money-cases update ID [--merchant M] [--amount A] [--currency C] [--reference R]
                   [--state S] [--next N] [--deadline D] [--why TEXT] [--who W]
                   [--add-watcher ID] [--drop-watcher ID] [--note TEXT]
+                  [--because TEXT | --reply ID]   required with --deadline
+  money-cases add ... --unmatched     no merchant match: recorded as "unmatched", never guessed
+                  [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
   money-cases brief    one line for the morning brief, nothing when no case is open
@@ -33,6 +36,7 @@ DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases
 WATCH_ROOT = Path(os.environ.get('ROBOB_WATCH_ROOT', '~/.local/share/robob-watch')).expanduser()
 LIVE = WATCH_ROOT / 'watchers' / 'money-cases'
 SOON = dt.timedelta(hours=24)
+ASK_AFTER = dt.timedelta(days=2)
 BRIEF_DUE = dt.timedelta(hours=48)
 BRIEF_CHANGED = dt.timedelta(hours=24)
 QUIET = (23, 8)  # Dubai hours: no pings from 23:00 until 08:00
@@ -155,6 +159,59 @@ def check_watcher(watcher_id, root=None):
     return watcher_id
 
 
+UNMATCHED = 'unmatched'
+KINDS = ('charge', 'hold')
+# Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
+ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
+       'I stay quiet on it until you answer')
+
+
+def check_charged(text):
+    try:
+        dt.date.fromisoformat(text)
+    except ValueError:
+        raise CaseError(f'charged {text!r} is not a date (YYYY-MM-DD)')
+    return text
+
+
+def charge_key(case):
+    """Merchant, amount, currency and day, normalised the way the CLI stores them (trim, case, 2 places)."""
+    amount = format(Decimal(str(case['amount'])).normalize(), 'f')
+    return (' '.join(str(case['merchant']).split()).lower(), amount, str(case['currency']).upper(),
+            case.get('charged') or case['opened'][:10])
+
+
+def same_charge(cases, new):
+    """Id of a recorded charge with the same merchant, amount, currency and day, or None.
+
+    That is the one rule for a charge seen in mail and again by SMS: the references differ (email
+    vs SMS), so they are not compared. An unmatched charge can't be told apart from another one,
+    so it is never a duplicate."""
+    if new['merchant'] == UNMATCHED:
+        return None
+    key = charge_key(new)
+    for c in cases:
+        if c.get('merchant') == UNMATCHED:
+            continue
+        if charge_key(c) == key:
+            return c['id']
+    return None
+
+
+def moment(text):
+    try:
+        t = dt.datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=TZ)).astimezone(TZ)
+
+
+def answered_at(case):
+    """When he last answered: a close, a reopen, or an update with --because or --reply. Else when it opened."""
+    owned = [m for m in (moment(h.get('at')) for h in case.get('history', []) if h.get('owner')) if m]
+    return max(owned) if owned else moment(case['opened'])
+
+
 def money(case):
     return f"{case['currency']} {Decimal(case['amount']):,}"
 
@@ -237,11 +294,20 @@ def find(book, case_id):
 
 
 def add(data, case_id, merchant, amount, currency, state, next_action, deadline, who,
-        reference='', why='', watchers=(), at=None, root=None):
+        reference='', why='', watchers=(), at=None, root=None, charged='', kind='charge', unmatched=False):
     if not ID.fullmatch(case_id):
         raise CaseError(f'id {case_id!r} must be lowercase letters, digits and dashes')
+    if kind not in KINDS:
+        raise CaseError(f'kind {kind!r} must be one of: {", ".join(KINDS)}')
+    if unmatched:
+        if (merchant or '').strip():
+            raise CaseError('give --unmatched or --merchant, not both: an unmatched charge has no merchant name')
+        merchant = UNMATCHED
+    else:
+        merchant = check_text('merchant', merchant)
     case = {
-        'id': case_id, 'merchant': check_text('merchant', merchant), 'amount': check_amount(amount),
+        'id': case_id, 'merchant': merchant, 'amount': check_amount(amount), 'kind': kind,
+        'charged': check_charged(charged) if charged else stamp(at)[:10],
         'currency': check_currency(currency), 'reference': check_text('reference', reference, False),
         'state': check_text('state', state), 'next': check_text('next', next_action),
         'deadline': check_deadline(deadline), 'why': check_text('why', why, False), 'who': check_text('who', who),
@@ -253,15 +319,20 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
     with Locked(data) as book:
         if any(c['id'] == case_id for c in book['cases']):
             raise CaseError(f'case {case_id!r} already exists')
+        dup = same_charge(book['cases'], case)
+        if dup:
+            raise CaseError(f'this charge is already recorded as {dup!r}; update that case instead')
         book['cases'].append(case)
     return case
 
 
-def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None):
+def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None,
+           because='', reply=''):
     checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline}
     with Locked(data) as book:
         case = find(book, case_id)
         said = []
+        moved = False
         for field, value in changes.items():
             if value is None:
                 continue
@@ -275,6 +346,15 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
                 if field == 'deadline':
                     # A new revision re-arms deadline pings, even when the date goes back to an earlier one.
                     case['rev'] = case.get('rev', 0) + 1
+                    moved = True
+        because = check_text('because', because, False)
+        reply = check_text('reply', reply, False)
+        if moved and not (because or reply):
+            raise CaseError('a deadline change needs --because (the reason) or --reply (his reply id); nothing was changed')
+        if because:
+            said.append(f'because: {because}')
+        if reply:
+            said.append(f'owner reply {reply}')
         for w in add_watchers:
             check_watcher(w, root)
             if w not in case['watchers']:
@@ -289,7 +369,10 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
         if not said:
             raise CaseError('nothing to change')
         case['updated'] = stamp(at)
-        case['history'].append({'at': stamp(at), 'text': '; '.join(said)})
+        entry = {'at': stamp(at), 'text': '; '.join(said)}
+        if because or reply:
+            entry['owner'] = True
+        case['history'].append(entry)
     return case
 
 
@@ -298,8 +381,11 @@ def close(data, case_id, outcome, at=None):
         case = find(book, case_id)
         if case['status'] == 'closed':
             raise CaseError(f'case {case_id!r} is already closed')
-        case.update(status='closed', closed=stamp(at), outcome=check_text('outcome', outcome), updated=stamp(at))
-        case['history'].append({'at': stamp(at), 'text': 'closed: ' + case['outcome']})
+        outcome = check_text('outcome', outcome)
+        case.update(status='closed', closed=stamp(at), outcome=outcome, updated=stamp(at))
+        # A pre-auth hold that drops off was released, not refunded.
+        word = 'released' if case.get('kind') == 'hold' else 'closed'
+        case['history'].append({'at': stamp(at), 'text': f'{word}: {outcome}', 'owner': True})
     return case
 
 
@@ -311,7 +397,7 @@ def reopen(data, case_id, deadline, note, at=None):
         note = check_text('note', note)
         case.update(status='open', closed=None, outcome=None, deadline=check_deadline(deadline), updated=stamp(at),
                     rev=case.get('rev', 0) + 1, cycle=case.get('cycle', 0) + 1)
-        case['history'].append({'at': stamp(at), 'text': 'reopened: ' + note})
+        case['history'].append({'at': stamp(at), 'text': 'reopened: ' + note, 'owner': True})
     return case
 
 
@@ -382,16 +468,29 @@ def attention(cases, now, sent, root=None):
                 found.append((f'{cid}|c{cycle}|watcher|{w}|{end[1]}',
                               f'reply watcher {w} {clip(redact(end[1]), 120)} while the case is still open. '
                               f'Options: chase again with a new reply watcher, take the next step, or close the case'))
+        answer = answered_at(case)
+        ask_key = f'{cid}|ask|{answer.isoformat()}'
+        if ask_key in sent:
+            # The yes/no is out; the case stays quiet until he answers (a new answer time changes the key).
+            continue
         found = [(k, t) for k, t in found if k not in sent]
-        if found:
-            tail = (f"Next: {clip(redact(case['next']))}. Who: {clip(redact(case['who']), 60)}. "
-                    f"State: {clip(redact(case['state']))}")
-            entries.append((head, found, tail))
+        # The yes/no goes last, so every reminder still pending is sent before the case goes quiet.
+        if now - answer >= ASK_AFTER:
+            found.append((ask_key, ASK))
+        if not found:
+            continue
+        day_key = f'{cid}|day|{now.date()}'
+        if day_key in sent:
+            # At most one reminder per case per day.
+            continue
+        tail = (f"Next: {clip(redact(case['next']))}. Who: {clip(redact(case['who']), 60)}. "
+                f"State: {clip(redact(case['state']))}")
+        entries.append((head, found, tail, day_key))
     return entries
 
 
 def case_line(head, texts, tail):
-    return redact(f"{head}: {'; '.join(texts)}. {tail}")
+    return redact(f"{head}: {'; '.join(texts)}." + (f" {tail}" if tail else ''))
 
 
 def fit(text, n):
@@ -430,14 +529,15 @@ def delivered(out, wd):
 
 
 def live_keys(cases):
-    """Keys that still stop a repeat: the one-shot pings of each open case's current deadline and reopen cycle.
+    """Keys that still stop a repeat: the one-shot pings of each open case's current deadline and reopen cycle,
+    and its yes/no ask until he answers.
 
     A tuple, so str.startswith matches the watcher-ending keys of the current cycle too."""
     keys = []
     for case in cases:
         if case.get('status') == 'open':
             cid, rev, cycle = case['id'], case.get('rev', 0), case.get('cycle', 0)
-            keys += [f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|']
+            keys += [f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|']
     return tuple(keys)
 
 
@@ -461,11 +561,13 @@ def run_check(wd, run, data=None, root=None, now=None):
         if entries:
             header = f'Money cases: {len(entries)} need attention.'
             footer = 'Details: money-cases show ID.'
-            more = f'{len(entries)} more need attention; they follow in the next check (money-cases list).'
+            # Reserve for the longest overflow line that can be printed (its count is at most len(entries)).
+            more = (f'{len(entries)} more need attention; they follow in a later check '
+                    f'(one reminder per case a day; money-cases list).')
             room = EVENT_LIMIT - units(header) - units(more) - units(footer) - 3
             shown, taken, full = [], [], 0
             # Only what fits is recorded as sent; a case with more pings than fit gets the rest next check.
-            for head, items, tail in entries:
+            for head, items, tail, day in entries:
                 texts = []
                 for key, text in items:
                     if units(case_line(head, texts + [text], tail)) + 1 > room:
@@ -480,13 +582,14 @@ def run_check(wd, run, data=None, root=None, now=None):
                     line = fit(case_line(head, texts, tail), room - 1)
                     shown.append(line)
                     room -= units(line) + 1
+                    taken.append(day)
                 if len(texts) < len(items):
                     break
                 full += 1
             tail = ['Details: money-cases show ID.']
             if full < len(entries):
-                tail.insert(0, f'{len(entries) - full} more need attention; they follow in the next check '
-                               f'(money-cases list).')
+                tail.insert(0, f'{len(entries) - full} more need attention; they follow in a later check '
+                               f'(one reminder per case a day; money-cases list).')
             event = '\n'.join([header, *shown, *tail])
             state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd)}
     write_json(pings, state)
@@ -543,13 +646,21 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('id')
         for field in FIELDS:
-            p.add_argument('--' + field, required=name == 'add' and field not in ('reference', 'why'))
+            # merchant is optional on add: --unmatched stands in for it.
+            required = name == 'add' and field not in ('reference', 'why', 'merchant')
+            p.add_argument('--' + field, required=required)
         if name == 'add':
+            p.add_argument('--unmatched', action='store_true',
+                           help='the merchant/order was not matched; say so rather than guess one')
+            p.add_argument('--charged', default='', help='charge date YYYY-MM-DD (default: today)')
+            p.add_argument('--kind', default='charge', choices=KINDS)
             p.add_argument('--watcher', action='append', default=[])
         else:
             p.add_argument('--add-watcher', action='append', default=[])
             p.add_argument('--drop-watcher', action='append', default=[])
             p.add_argument('--note', default='')
+            p.add_argument('--because', default='', help='reason for a deadline change (required with --deadline)')
+            p.add_argument('--reply', default='', help="his reply id for a deadline change (or use --because)")
     p = sub.add_parser('close')
     p.add_argument('id')
     p.add_argument('--outcome', required=True)
@@ -585,11 +696,13 @@ def main(argv=None):
             print(json.dumps(redact_all(find(load(), args.id)), ensure_ascii=False, indent=1))
         elif args.command == 'add':
             add(DATA, args.id, args.merchant, args.amount, args.currency, args.state, args.next,
-                args.deadline, args.who, args.reference, args.why, args.watcher)
+                args.deadline, args.who, args.reference, args.why, args.watcher, charged=args.charged,
+                kind=args.kind, unmatched=args.unmatched)
             print(table([find(load(), args.id)]))
         elif args.command == 'update':
             changes = {f: getattr(args, f) for f in FIELDS}
-            update(DATA, args.id, changes, args.add_watcher, args.drop_watcher, args.note)
+            update(DATA, args.id, changes, args.add_watcher, args.drop_watcher, args.note,
+                   because=args.because, reply=args.reply)
             print(table([find(load(), args.id)]))
         elif args.command == 'close':
             close(DATA, args.id, args.outcome)

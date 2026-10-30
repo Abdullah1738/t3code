@@ -69,7 +69,8 @@ class Book(Base):
         self.case()
         self.watcher('acme-reply', 'active')
         mc.update(self.data, 'acme', {'state': 'Acme replied', 'deadline': '2026-10-27'}, ['acme-reply'],
-                  note='support answered', at=at('2026-10-24T12:00'), root=self.root)
+                  note='support answered', because='Acme asked for a week', at=at('2026-10-24T12:00'),
+                  root=self.root)
         with self.assertRaises(mc.CaseError):
             mc.update(self.data, 'acme', {'state': 'Acme replied'})
         mc.close(self.data, 'acme', 'refund received', at=at('2026-10-26T10:00'))
@@ -97,16 +98,16 @@ class Pings(Base):
         event = self.check('2026-10-24T18:30')
         self.assertIn('Money cases: 1 need attention.', event)
         self.assertIn('acme: Acme AED 120.50: due Sun 25 Oct 18:00. Next: dispute on the card. Who: Abdullah', event)
-        self.assertEqual(self.check('2026-10-25T10:00', 'r2'), '')
-        late = self.check('2026-10-25T18:30', 'r3')
-        self.assertIn('OVERDUE since Sun 25 Oct 18:00', late)
+        self.assertEqual(self.check('2026-10-24T20:00', 'r2'), '')
+        # Overdue pings come once a day, on the day they are due.
+        self.assertIn('OVERDUE since Sun 25 Oct 18:00', self.check('2026-10-25T18:30', 'r3'))
         self.assertEqual(self.check('2026-10-25T21:00', 'r4'), '')
         self.assertIn('OVERDUE', self.check('2026-10-26T09:00', 'r5'))
 
     def test_new_deadline_rearms_and_closed_cases_stay_quiet(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, at=at('2026-10-24T11:00'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, because='owner said Wed', at=at('2026-10-24T11:00'))
         self.assertEqual(self.check('2026-10-24T12:00', 'r2'), '')
         self.assertIn('due Wed 28 Oct', self.check('2026-10-27T10:00', 'r3'))
         mc.close(self.data, 'acme', 'refunded')
@@ -136,7 +137,8 @@ class Pings(Base):
         self.assertNotIn('due', event)
         self.assertEqual(self.check('2026-10-24T11:00', 'r2'), '')
         self.watcher('live-reply', 'expired', fires=0)
-        self.assertIn('live-reply expired after 0 fire(s)', self.check('2026-10-24T12:00', 'r3'))
+        # One reminder a day, so the next ending goes out on the next day.
+        self.assertIn('live-reply expired after 0 fire(s)', self.check('2026-10-25T10:00', 'r3'))
         # Cleaning up a finished watcher with `robob-watch remove` is not a second ending.
         self.archive('host-reply')
         self.assertEqual(self.check('2026-10-24T13:00', 'r4'), '')
@@ -179,7 +181,7 @@ class Pings(Base):
         self.assertIn('bolt', self.check('2026-10-24T22:59', 'r1', ack=False))
         self.assertEqual(self.check('2026-10-24T23:15', 'r2', ack=False), '')
         mc.close(self.data, 'bolt', 'refunded')
-        mc.update(self.data, 'acme', {'deadline': '2026-10-30'}, at=at('2026-10-25T07:00'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-30'}, because='owner said Fri', at=at('2026-10-25T07:00'))
         self.assertEqual(self.check('2026-10-25T08:05', 'r3', ack=False), '')
         self.assertEqual(self.sent(), {})
 
@@ -194,10 +196,11 @@ class Pings(Base):
 
     def test_big_batches_stay_under_the_runner_limit_and_the_rest_follow(self):
         for n in range(80):
-            self.case(f'case-{n:02d}', merchant=f'Merchant {n:02d} ' + 'x' * 40, deadline='2026-10-25')
+            self.case(f'case-{n:02d}', merchant=f'Merchant {n:02d} ' + 'x' * 40, deadline='2026-10-25',
+                      reference=f'ref-{n:02d}')
         first = self.check('2026-10-24T10:00')
         self.assertLess(len(first), 6000)
-        self.assertIn('more need attention; they follow in the next check', first)
+        self.assertIn('more need attention; they follow in a later check', first)
         seen = first.count('\n- ')
         rest = ''
         for n in range(1, 10):
@@ -211,15 +214,16 @@ class Pings(Base):
         self.assertGreater(seen, 0)
 
     def test_one_case_with_many_endings_is_split_and_nothing_is_lost(self):
-        names = [f'reply-{n:02d}-' + 'w' * 30 for n in range(35)]
+        names = [f'reply-{n:02d}-' + 'w' * 32 for n in range(35)]
         for w in names:
             self.watcher(w, 'active')
         self.case(deadline='2026-11-01', watchers=names, merchant='Acme ' + 'é' * 70)
         for w in names:
             self.watcher(w, 'done', fires=2)
         mentioned, events = set(), []
+        # One reminder a case a day, so the overflow of each day follows on the next day.
         for n in range(10):
-            event = self.check(f'2026-10-24T1{n}:00', f'r{n}')
+            event = self.check(f'2026-10-{24 + n:02d}T10:00', f'r{n}')
             if not event:
                 break
             events.append(event)
@@ -231,7 +235,7 @@ class Pings(Base):
 
     def test_wide_characters_count_like_the_runner(self):
         for n in range(40):
-            self.case(f'case-{n:02d}', merchant='💸' * 40, deadline='2026-10-25')
+            self.case(f'case-{n:02d}', merchant='💸' * 40 + f'{n:02d}', deadline='2026-10-25')
         event = self.check('2026-10-24T10:00')
         self.assertLessEqual(mc.units(event), mc.EVENT_LIMIT)
         self.assertGreater(mc.units(event), len(event))
@@ -239,13 +243,16 @@ class Pings(Base):
     def test_going_back_to_an_earlier_deadline_or_reopening_pings_again(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00', 'r1'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, at=at('2026-10-24T10:30'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, because='owner: Mon', at=at('2026-10-24T10:30'))
         self.assertTrue(self.check('2026-10-25T10:00', 'r2'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-25'}, at=at('2026-10-24T10:30'))
-        self.assertIn('OVERDUE', self.check('2026-10-25T11:00', 'r3'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-25'}, because='owner: back to Sun', at=at('2026-10-24T10:30'))
+        # Moving the deadline re-arms the ping, but the day's one reminder already went out at 10:00.
+        self.assertEqual(self.check('2026-10-25T11:00', 'r3'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-26T09:00', 'r4'))
         mc.close(self.data, 'acme', 'refunded')
         mc.reopen(self.data, 'acme', '2026-10-25', 'refund bounced')
-        self.assertIn('OVERDUE', self.check('2026-10-25T12:00', 'r4'))
+        self.assertEqual(self.check('2026-10-26T12:00', 'r5'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-27T09:00', 'r6'))
 
     def test_card_numbers_and_codes_are_refused_and_never_printed(self):
         for bad in (dict(reference='card 4111 1111 1111 1111'), dict(state='OTP 482913 sent'),
@@ -323,7 +330,7 @@ class Pings(Base):
         self.case(deadline='2027-06-01', watchers=['host-reply'])
         self.watcher('host-reply', 'done', fires=3)
         self.assertIn('host-reply done', self.check('2026-10-24T10:00'))
-        self.case('later', deadline='2027-06-01')
+        self.case('later', merchant='Later Co', deadline='2027-06-01')
         book = json.loads((self.data / 'cases.json').read_text())
         book['cases'][1]['deadline'] = 'soon'
         (self.data / 'cases.json').write_text(json.dumps(book))
@@ -344,6 +351,119 @@ class Pings(Base):
             r = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
                                env=env, capture_output=True, text=True, timeout=20)
         self.assertEqual((r.returncode, r.stdout), (75, ''))
+
+
+class Rules(Base):
+    """The 2026-10-25 fixes: deadline guard, one reminder a day, one yes/no, mail+SMS dedupe, released, unmatched."""
+
+    def test_deadline_change_without_a_reason_is_refused_and_changes_nothing(self):
+        self.case(deadline='2026-10-25')
+        before = mc.load(self.data)['cases'][0]
+        with self.assertRaises(mc.CaseError) as err:
+            mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, at=at('2026-10-24T10:00'))
+        self.assertIn('--because', str(err.exception))
+        after = mc.load(self.data)['cases'][0]
+        self.assertEqual((after['deadline'], after['rev'], after['history']),
+                         (before['deadline'], before['rev'], before['history']))
+
+    def test_deadline_change_with_because_is_recorded_in_history(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, because='Acme agreed to Wed',
+                      at=at('2026-10-24T10:00'))
+        self.assertEqual(c['deadline'], '2026-10-28')
+        self.assertIn('because: Acme agreed to Wed', c['history'][-1]['text'])
+        self.assertIn('deadline: 2026-10-28', c['history'][-1]['text'])
+
+    def test_deadline_change_with_his_reply_id_is_accepted_and_recorded(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, reply='msg-4471', at=at('2026-10-24T10:00'))
+        self.assertIn('owner reply msg-4471', c['history'][-1]['text'])
+
+    def test_other_field_edits_need_no_reason(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'state': 'chasing'}, at=at('2026-10-24T10:00'))
+        self.assertEqual(c['state'], 'chasing')
+
+    def test_second_reminder_the_same_day_is_suppressed(self):
+        self.case(deadline='2026-10-25T18:00:00+04:00')
+        self.assertIn('due Sun 25 Oct 18:00', self.check('2026-10-24T18:00', 'r1'))
+        # A new ending from a reply watcher the same day is held until the next day.
+        self.assertEqual(self.check('2026-10-24T20:00', 'r2'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-25T19:00', 'r3'))
+
+    def test_after_two_unanswered_days_exactly_one_yes_no_then_silence(self):
+        # The case is opened 24 Oct (the answer clock starts there); from 26 Oct the yes/no is due.
+        self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
+        seen = []
+        for day in range(24, 32):
+            event = self.check(f'2026-10-{day}T10:00', f'r{day}')
+            if 'Yes or no' in event:
+                seen.append(day)
+        self.assertEqual(seen, [26])
+        self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
+                              if '|ask|' in k]), 1)
+
+    def test_answering_restarts_the_yes_no_clock(self):
+        self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
+        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r1'))
+        # An owner answer (a deadline change with a reason) starts a fresh two-day clock.
+        mc.update(self.data, 'acme', {'deadline': '2026-12-01'}, because='owner: keep chasing',
+                  at=at('2026-10-27T09:00'))
+        self.assertEqual(self.check('2026-10-28T10:00', 'r2'), '')
+        self.assertIn('Yes or no', self.check('2026-10-29T10:00', 'r3'))
+
+    def test_email_and_sms_of_the_same_charge_count_once(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='email 09:13')
+        with self.assertRaises(mc.CaseError) as err:
+            self.case('boat-sms', merchant='Boat.dev ', amount='25', currency='usd', deadline='2026-11-10',
+                      charged='2026-10-25', reference='sms 10:45')
+        self.assertIn('boat-mail', str(err.exception))
+        self.assertEqual([c['id'] for c in mc.load(self.data)['cases']], ['boat-mail'])
+
+    def test_a_different_amount_or_day_is_a_different_charge(self):
+        self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        self.case('boat-b', merchant='boat.dev', amount='26.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        self.case('boat-c', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-26')
+        self.assertEqual(len(mc.load(self.data)['cases']), 3)
+
+    def test_hold_that_drops_off_is_released_not_refunded(self):
+        self.case('hold-1', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25', kind='hold')
+        mc.close(self.data, 'hold-1', 'pre-auth dropped off', at=at('2026-10-27T10:00'))
+        c = mc.find(mc.load(self.data), 'hold-1')
+        self.assertEqual(c['history'][-1]['text'], 'released: pre-auth dropped off')
+        self.assertNotIn('refund', c['history'][-1]['text'])
+
+    def test_a_charge_is_closed_as_closed_not_released(self):
+        self.case('charge-1', merchant='Shop', amount='10', currency='AED', deadline='2026-11-05')
+        mc.close(self.data, 'charge-1', 'refund landed', at=at('2026-10-27T10:00'))
+        self.assertEqual(mc.find(mc.load(self.data), 'charge-1')['history'][-1]['text'], 'closed: refund landed')
+
+    def test_unmatched_charge_says_unmatched_and_is_never_named(self):
+        c = mc.add(self.data, 'talabat-2792', None, '90.30', 'AED', 'charge seen on 2792', 'ask owner', '2026-11-05',
+                   'Abdullah', unmatched=True, charged='2026-10-25', at=at('2026-10-25T10:00'))
+        self.assertEqual(c['merchant'], 'unmatched')
+        self.assertIn('unmatched', mc.table([c]))
+        self.assertNotIn('Talabat', mc.table([c]))
+
+    def test_unmatched_and_merchant_together_are_refused(self):
+        with self.assertRaises(mc.CaseError):
+            mc.add(self.data, 'x-1', 'Talabat', '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True)
+
+    def test_a_merchant_is_required_unless_unmatched(self):
+        with self.assertRaises(mc.CaseError):
+            mc.add(self.data, 'x-2', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A')
+
+    def test_unmatched_charges_are_never_treated_as_duplicates(self):
+        mc.add(self.data, 'u-1', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True,
+               charged='2026-10-25', at=at('2026-10-25T10:00'))
+        mc.add(self.data, 'u-2', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True,
+               charged='2026-10-25', at=at('2026-10-25T11:00'))
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
 
 
 class Brief(Base):
