@@ -2546,7 +2546,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
         // Scheduled on every move while registered: an in-flight add reconciles against the latest directory.
         if (state.mcp !== undefined) {
-          yield* Effect.forkIn(sessionGates.withLock(state.sessionId, followMove(state)), sessionScope);
+          yield* Effect.forkIn(
+            sessionGates.withLock(state.sessionId, followMove(state)),
+            sessionScope,
+          );
         }
         return;
       }
