@@ -3,8 +3,10 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CARD = os.path.join(HERE, "..", "helpers", "convo-card", "convo_card.py")
@@ -33,8 +35,10 @@ args = sys.argv[1:]
 with open(os.environ["FAKE_BRIDGE_LOG"], "a") as f:
     f.write(json.dumps(args) + "\\n")
 if args[0] == "share":
-    print(json.dumps({"url": "https://x.trycloudflare.com/" + args[2] + "/", "created": True,
-                      "metadataWarnings": json.loads(os.environ.get("FAKE_BRIDGE_WARN") or "[]")}))
+    if os.environ.get("FAKE_SHARE_FAIL"):
+        print("tunnel not up", file=sys.stderr); sys.exit(3)
+    print(json.dumps({"url": os.environ.get("FAKE_SHARE_URL") or "https://x.trycloudflare.com/" + args[2] + "/",
+                      "created": True, "metadataWarnings": json.loads(os.environ.get("FAKE_BRIDGE_WARN") or "[]")}))
 elif args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "app":
@@ -741,12 +745,77 @@ class WatchTest(Base):
         share = os.path.join(self.wdir, "share.json")
         with open(share, "w") as f:
             json.dump({"last_probe": 0, "fails": 1}, f)
-        run = lambda rid, now: self.watch("--now", now, env=dict(self.env, WATCH_RUN=rid)).stdout
+        env = dict(self.env, FAKE_SHARE_FAIL="1")   # the re-share fails too, so the alert is printed
+        run = lambda rid, now: self.watch("--now", now, env=dict(env, WATCH_RUN=rid)).stdout
         first = run("r1", "1000")
         self.assertEqual(first.count("CONVO_CARD_SHARE_DOWN"), 1)
         with open(share, "w") as f:
             json.dump({"last_probe": 0, "fails": 1}, f)   # died after the outbox write, before share.json
         self.assertEqual(run("r2", "2000").count("CONVO_CARD_SHARE_DOWN"), 1)
+
+    def dead_moni_link(self, url):
+        with open(os.path.join(self.card(), ".sent.json"), "w") as f:
+            json.dump({"moni": {"url": url, "card_url": url + "/?v=1", "key": "k", "last_id": "R1"}}, f)
+
+    def test_dead_link_is_reshared_quietly_and_the_new_link_is_probed(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        hits = []
+
+        class Live(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Live)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        new = "http://127.0.0.1:%d/" % srv.server_address[1]
+        old = "file:///nonexistent/convo-card-old-share"
+        self.dead_moni_link(old)
+        with open(os.path.join(self.card(), ".sent.json")) as f:
+            before = f.read()
+        with open(os.path.join(self.wdir, "share.json"), "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        env = dict(self.env, FAKE_SHARE_URL=new)
+        # The second failed probe re-shares: no output, nothing sent, the new link is the one probed.
+        self.assertEqual(self.watch("--now", "1000", env=env).stdout, "")
+        self.assertEqual([c[0] for c in self.log("bridge")], ["share"])
+        self.assertEqual(self.log("bridge")[0], ["share", "--app", "lydia-chat", "--days", "30"])
+        with open(os.path.join(self.card(), ".sent.json")) as f:
+            self.assertEqual(f.read(), before)
+        with open(os.path.join(self.wdir, "share.json")) as f:
+            share = json.load(f)
+        self.assertEqual(share["moved"], {"moni": {"old": old, "url": new}})
+        # Next probe (after PROBE_S) targets the new link: it answers, so nothing is printed or re-shared.
+        self.assertEqual(self.watch("--now", "1700", env=env).stdout, "")
+        self.assertEqual(len(self.log("bridge")), 1)
+        self.assertGreaterEqual(len(hits), 2)
+        self.assertEqual(set(hits), {"/"})
+
+    def test_failed_reshare_alerts_once_and_never_sends(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.dead_moni_link("file:///nonexistent/convo-card-old-share")
+        with open(os.path.join(self.wdir, "share.json"), "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        env = dict(self.env, FAKE_SHARE_FAIL="1")
+        # One failed probe is still quiet; the second triggers the failed re-share and the single alert.
+        out = self.watch("--now", "1000", env=env).stdout
+        self.assertEqual(out.count("CONVO_CARD_SHARE_DOWN"), 1)
+        self.assertIn("Do not send a card", out)
+        self.assertNotIn("run `convo-card send", out)
+        self.assertEqual(self.watch("--now", "1700", env=env).stdout, "")
+        self.assertEqual(self.watch("--now", "2400", env=env).stdout, "")
+        self.assertEqual([c[0] for c in self.log("bridge")], ["share"])
+        self.assertNotIn("app", [c[0] for c in self.log("bridge")])
 
 
 if __name__ == "__main__":
