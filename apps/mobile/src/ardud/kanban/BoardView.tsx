@@ -227,7 +227,7 @@ export function BoardView(props: {
 
   // Threads is one view per layout: the stage tabs (phone) or columns (wide)
   // give way to it, so iPad widths reach it too.
-  if (boardLayout(props.width).kind === "tabs") {
+  if (columnsLayout.kind === "tabs") {
     return (
       <TabsBoard
         board={board}
