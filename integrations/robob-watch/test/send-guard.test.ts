@@ -63,6 +63,31 @@ test("src telegram() refuses a real notify under a test run", () => {
   expect(r.stdout.toString()).toContain("refused: test run");
 });
 
+// Override set after import: the guard reads the env at call time, and so does the command, so the stub is used.
+test("an override installed after import is honoured by the guard and the command", () => {
+  const code = `import { imessage } from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))};
+process.env.ROBOB_WATCH_SPECTRUM_CLI = "/nonexistent/stub-cli.ts";
+console.log(JSON.stringify(await imessage("hi", "k")));`;
+  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare({ ROBOB_TEST: "1" }) });
+  expect(r.stdout.toString()).not.toContain("refused: test run");
+});
+
+// runCheck: a check that runs wa send, with no stub, is refused under the test markers the parent carries.
+test("a check child under a test run inherits the markers and is refused a real wa send", () => {
+  const code = `import { runCheck } from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))};
+const w = { id: "t", title: "t", serial: false, check: "/bin/zsh -c 'exec ${join(helpers, "wa")} send 971500000002 hi'" } as any;
+const r = await runCheck(w, "/tmp");
+console.log(JSON.stringify(r.stderr + r.stdout));`;
+  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare({ ROBOB_TEST: "1" }) });
+  expect(r.stdout.toString()).toContain("refused: test run");
+});
+
+// An ordinary fixture (no stub) refuses: the regression that the shared setup must stop.
+test("a fixture with no stub refuses a real send", () => {
+  const r = Bun.spawnSync([join(helpers, "wa"), "send", "971500000002", "hi"], { env: bare({ ROBOB_TEST: "1" }) });
+  expect(r.stderr.toString()).toContain("refused: test run");
+});
+
 // ride-card and convo-card look up their card before they reach the bridge, so call bridge() directly.
 const bridgeGuard = (file: string) => {
   const code = `from importlib.machinery import SourceFileLoader; m = SourceFileLoader("h", ${JSON.stringify(file)}).load_module(); m.bridge("send", "--text", "x")`;

@@ -22,7 +22,9 @@ D = os.environ.get("MAILSEND_DRAFT_DIR") or os.path.join(HOME, ".local/state/mai
 HERE = os.path.dirname(os.path.realpath(__file__))
 SA = os.environ.get("MAILSEND_SEND_APPROVAL") or os.path.join(HERE, "send-approval")
 # himalaya through the XOAUTH2 retry wrapper (absolute path inside, so agent PATH shims don't apply).
-HIMALAYA = shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
+def himalaya_cmd():
+    """Read at call time: the guard and the command come from the same environment."""
+    return shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
                        f"/usr/bin/python3 {HOME}/.local/libexec/mail/mail_oauth.py himalaya")
 def under_test():
     """True under `ROBOB_TEST=1`, bun test (NODE_ENV=test) or pytest (PYTEST_CURRENT_TEST)."""
@@ -45,7 +47,10 @@ def die(msg, code=2):
 
 def run(argv, timeout=120):
     try:
-        return subprocess.run(HIMALAYA + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # Under a test, never fall back to the live himalaya: an override must be set (checked in main() too).
+        if under_test() and not os.environ.get("MAILSEND_HIMALAYA"):
+            die("refused: test run; himalaya would reach email (set MAILSEND_HIMALAYA to a stub)")
+        return subprocess.run(himalaya_cmd() + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None
 

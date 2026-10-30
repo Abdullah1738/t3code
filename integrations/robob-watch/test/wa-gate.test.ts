@@ -47,6 +47,7 @@ const reset = () => {
 const env = (extra: Record<string, string> = {}) => ({
   HOME: box,
   PATH: "/usr/bin:/bin",
+  ROBOB_TEST: "1",
   WA_WACLI: fakeWacli,
   WA_DRAFT_DIR: draftDir,
   WA_SEND_APPROVAL: fakeApproval,

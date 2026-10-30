@@ -119,7 +119,7 @@ class SendApprovalTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def env(self):
-        return {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "SEND_APPROVAL_LOG": self.log,
+        return {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "ROBOB_TEST": "1", "SEND_APPROVAL_LOG": self.log,
                 "SEND_APPROVAL_FORMATTER": FORMATTER, "SEND_APPROVAL_BUN": BUN}
 
     def run_check(self, *args, judge=None, session=None, drafted=DRAFTED):

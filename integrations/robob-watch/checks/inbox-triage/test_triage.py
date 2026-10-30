@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -748,6 +749,17 @@ class SourceHealthTests(unittest.TestCase):
         self.assertIn('outlook', state['source_health'])
         t.track_health(state, {}, later + t.HEALTH_REALERT)
         self.assertNotIn('outlook', state['source_health'])
+
+    def test_a_test_run_never_calls_the_live_telegram_cli(self):
+        # Card #14: even in the live directory, a test-marked run refuses the Telegram notify and never spawns it.
+        state = {'health_pending': {'text': 'outlook down', 'key': 'k', 'sources': ['outlook']}}
+        env = {k: v for k, v in os.environ.items() if k not in ('ROBOB_WATCH_TELEGRAM_CLI', 'NODE_ENV', 'PYTEST_CURRENT_TEST')}
+        env['ROBOB_TEST'] = '1'
+        with patch.dict('os.environ', env, clear=True), patch.object(t.subprocess, 'run') as run:
+            out = t.send_health(state, ['outlook'], t.LIVE, 0)
+        run.assert_not_called()
+        self.assertIn('refused: test run', out.get('health_alert_error', ''))
+        self.assertIn('health_pending', state)
 
     def tick(self, state, wd, errors, now):
         due = t.track_health(state, errors, now)
