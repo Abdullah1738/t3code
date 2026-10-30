@@ -11,7 +11,7 @@ import sys
 import time
 
 from . import api, capacity, lease, pool, ssh_sync
-from .common import (CAP_PATH, EXEMPTIONS, LOGS_DIR, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
+from .common import (CAP_PATH, EXEMPTIONS, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
                      month_key, now, read_json, say)
 
 
@@ -71,8 +71,9 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
+        note = f"  [{d['note']}]" if (d.get("note") or "").startswith(TOO_BIG_NOTE) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
-              f"ago runs:{d['active_runs']}{pin}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
+              f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
 
 def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
@@ -251,7 +252,7 @@ def _wait_locked(r, echo):
 
 
 def _wait_run(r, echo):
-    from .runs import do_pulls, finish, follow, recover_lost_exit
+    from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo)
@@ -267,5 +268,6 @@ def _wait_run(r, echo):
                                (r["run_id"],)).fetchone())
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
+    go_std_glitch(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", code)
     print(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code

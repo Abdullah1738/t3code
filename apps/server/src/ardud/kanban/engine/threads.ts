@@ -16,13 +16,16 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
-import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ProviderFailure,
+  OrchestrationV2ThreadShell,
+} from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
-import { type ControlThreadState, stateFromShell } from "../../control/model.ts";
+import { type ControlThreadState, stateFromRunStatus } from "../../control/model.ts";
 
 export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
   "KanbanThreadError",
@@ -43,6 +46,8 @@ export interface KanbanThreadView {
   readonly title: string;
   readonly state: ControlThreadState;
   readonly updatedAt: string;
+  /** When the thread itself last did something: its open question, else its last finished run. updatedAt also moves on shared provider-session updates. */
+  readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
@@ -95,6 +100,27 @@ const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCry
 const detailOf = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
 
+/**
+ * The state and quiet-since of a thread from the shell fields that matter here.
+ * An async question (blocking false) doesn't stop the run, so it counts as no question at all.
+ */
+export const viewStateOf = (
+  shell: Pick<
+    OrchestrationV2ThreadShell,
+    | "pendingRuntimeRequest"
+    | "activityRunStatus"
+    | "status"
+    | "updatedAt"
+    | "latestRunCompletedAt"
+  >,
+): { readonly state: ControlThreadState; readonly quietSince: DateTime.Utc } => {
+  const request = shell.pendingRuntimeRequest;
+  const blocking = request !== null && request.blocking !== false ? request : null;
+  const state = stateFromRunStatus(shell.activityRunStatus ?? shell.status, blocking !== null);
+  const quietSince = blocking?.createdAt ?? shell.latestRunCompletedAt ?? shell.updatedAt;
+  return { state, quietSince };
+};
+
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
@@ -108,8 +134,9 @@ const make = Effect.gen(function* () {
               threadId: shell.id,
               projectId: shell.projectId,
               title: shell.title,
-              state: stateFromShell(shell),
+              state: viewStateOf(shell).state,
               updatedAt: DateTime.formatIso(shell.updatedAt),
+              quietSince: DateTime.formatIso(viewStateOf(shell).quietSince),
               runStartedAt: shell.activityRunStartedAt
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,

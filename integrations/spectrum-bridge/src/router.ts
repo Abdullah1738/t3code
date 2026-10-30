@@ -103,6 +103,8 @@ type Options = {
   watchMs?: number;
   /** Hold before sending a "something went wrong" notice (default 5 min). */
   failureNoticeMs?: number;
+  /** How long dropped-row notices wait so close ones go out together. Tests use 0. */
+  droppedBatchMs?: number;
   /** Fixed event names and safe codes only; never message text. */
   log?: (event: string, code?: string) => void;
   /** Sendblue mode: which chat this router serves and who is in it. chatGuid is then the ChatKey. Unset in Photon mode. */
@@ -270,11 +272,15 @@ function typingFailure(error: unknown): string {
 const resetRow = (id: string) => id.startsWith("reset:");
 /**
  * Delivery tries per synthetic row before the owner hears it did not arrive.
- * Retries back off from SYNTHETIC_RETRY_MS. A turn that was accepted and then
- * failed while running is never retried.
+ * Retries back off from SYNTHETIC_RETRY_MS. A turn that errored before any tool
+ * ran (the model call itself failed) is retried from ERRORED_RETRY_MS. A turn
+ * that ran a tool is never retried.
  */
 export const MAX_SYNTHETIC_ATTEMPTS = 3;
 export const SYNTHETIC_RETRY_MS = 30_000;
+const ERRORED_RETRY_MS = 120_000;
+/** Dropped-row notices closer together than this go out as one message. */
+const DROPPED_BATCH_MS = 10 * 60_000;
 /**
  * Owner text whose prompt OpenCode never confirmed (it was briefly
  * unresponsive, say) is sent again rather than lost. Entry n is how long
@@ -291,24 +297,47 @@ const UNDELIVERED_MS = 120_000;
 const UNDELIVERED_TEXT = "I didn't catch that last message. Mind sending it again?";
 /** A prompt POSTed for a synthetic row. It is checked again before any further POST for that row. */
 type SentPrompt = { sessionId: string; directory: string; generation?: number; messageId: string; startedAt: number };
-type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: "undelivered" | "failed" };
+type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason };
+type DropReason = "undelivered" | "failed" | "errored";
+/** A dropped synthetic row waiting to be sent in the combined notice. */
+type DroppedNotice = { id: string; label: string; reason: DropReason; text: string; at: number };
 const clip = (text: string, max: number) => {
   const flat = text.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 3).trimEnd()}...`;
 };
 /** Honest wording once a synthetic row is given up on. It never implies the owner sent anything. */
-export function syntheticDropped(id: string, text: string, reason: "undelivered" | "failed" = "undelivered"): string {
-  let label: string;
+/**
+ * Whether a failed turn may have run a tool. A tool part in the record counts, and so does a
+ * step the backend could not classify (`unknown`): only a step proven tool-free can be retried.
+ */
+export function turnRanTools(replies: readonly MessageRecord[]): boolean {
+  return replies.some(m => m.type === "assistant" && (
+    (Array.isArray(m.content) && m.content.some(p => p?.type === "tool")) || m.toolEvidence === "ran" || m.toolEvidence === "unknown"
+  ));
+}
+function syntheticLabel(id: string, text: string): string {
   if (id.startsWith("wake:")) {
     const [frame = "", title = ""] = text.split("\n");
-    label = `watcher: ${clip(title.replace(/^\[TEST FIRE[^\]]*\]\s*/, ""), 80)
+    return `watcher: ${clip(title.replace(/^\[TEST FIRE[^\]]*\]\s*/, ""), 80)
       || clip(/^\[Watcher event from (.+?), not typed by the owner\./.exec(frame)?.[1] ?? "", 80) || "unnamed"}`;
-  } else {
-    label = `secure form: ${clip(/^Filled in the secure form "([\s\S]*?)" \(fields:/.exec(text)?.[1] ?? "", 80) || "unnamed"}`;
   }
-  return reason === "failed"
-    ? `A background update (${label}) hit an error on my end while I was handling it, so it may be only partly done.`
-    : `A background update (${label}) didn't reach me after ${MAX_SYNTHETIC_ATTEMPTS} tries. I'll recheck it on my next turn.`;
+  return `secure form: ${clip(/^Filled in the secure form "([\s\S]*?)" \(fields:/.exec(text)?.[1] ?? "", 80) || "unnamed"}`;
+}
+export function syntheticDropped(id: string, text: string, reason: DropReason = "undelivered"): string {
+  const label = syntheticLabel(id, text);
+  if (reason === "failed") return `A background update (${label}) hit an error on my end while I was handling it, so it may be only partly done.`;
+  if (reason === "errored") return `A background update (${label}) failed on my end ${MAX_SYNTHETIC_ATTEMPTS} times before it started, so it didn't run. I'll pick it up on my next turn.`;
+  return `A background update (${label}) didn't reach me after ${MAX_SYNTHETIC_ATTEMPTS} tries. I'll recheck it on my next turn.`;
+}
+/** One message for dropped rows that landed close together: one entry keeps its own text, several are listed. */
+function droppedBatchText(list: DroppedNotice[]): string {
+  if (list.length === 1) return list[0]!.text;
+  const why: Record<DropReason, string> = {
+    failed: "hit an error while running, may be partly done",
+    errored: "the model errored before it started, so it didn't run; I'll pick it up next turn",
+    undelivered: "didn't reach me; I'll pick it up next turn",
+  };
+  return ["These background updates didn't go through on my end:", ...list.map(n => `- ${n.label}: ${why[n.reason]}`)].join("\n");
 }
 /** Synthetic rows given up on, carried into the next submitted turn as quoted data. */
 type Missed = { id: string; text: string };
@@ -329,8 +358,6 @@ export function providerRefusal(record: MessageRecord): boolean {
 }
 /** An auto-generated session title that is itself the provider's refusal text. */
 export const refusalTitle = (title: unknown) => typeof title === "string" && REFUSAL_TEXT.test(title);
-/** A quoted reply needs a real provider message to point at. */
-const replyTarget = (id: string | undefined) => id === undefined || synthetic(id) ? {} : { replyTo: id };
 const CLI = `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
 // The short consent grammar for a runtime request: only these phrases plus please
 // or thanks, and never a question mark.
@@ -554,7 +581,7 @@ export class Router {
         else this.retrySynthetic(id, "undelivered");
         return;
       }
-      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...replyTarget(id) });
+      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
       this.store.updateInbound(id, state);
     }).immediate();
   }
@@ -576,6 +603,23 @@ export class Router {
     return ids.every(synthetic) ? ids : undefined;
   }
 
+  /**
+   * The message a reply quotes: the batch's first typed message. iMessage can't thread onto a tapback
+   * (Sendblue fails it minutes later with 5504 and the reply never arrives), so reactions are skipped;
+   * a batch of only reactions gets an unthreaded reply.
+   */
+  private replyTarget(id: string | undefined): { replyTo?: string } {
+    if (id === undefined || synthetic(id)) return {};
+    const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
+    for (const member of ids) {
+      if (synthetic(member)) continue;
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(member);
+      const text = row ? (JSON.parse(row.payload) as NormalizedInbound).text ?? "" : "";
+      if (!row || !isTapback(text)) return { replyTo: member };
+    }
+    return {};
+  }
+
   private retryKey(id: string): string {
     return `synthetic-retry:${id}`;
   }
@@ -593,7 +637,7 @@ export class Router {
    * landed and then failed while running gets the honest notice at once. Call
    * inside a transaction.
    */
-  private retrySynthetic(leader: string, reason: "undelivered" | "failed"): void {
+  private retrySynthetic(leader: string, reason: DropReason): void {
     const ids = this.syntheticBatch(leader) ?? [leader];
     this.store.set(`batch:${leader}`, null);
     this.store.set(`batch-phase:${leader}`, null);
@@ -610,29 +654,52 @@ export class Router {
         this.options.log?.("context-reset-dropped", reason);
         continue;
       }
+      const text = (JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound>).text ?? "";
       if (reason === "failed") {
         // The agent had it and started work: running it again could repeat side
         // effects, and the event is already in the session's history.
         this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
-        const text = (JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound>).text ?? "";
-        const notice = `synthetic-dropped:${hash(id)}`;
-        if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: syntheticDropped(id, text, reason) });
+        this.queueDropped(id, text, reason);
         this.store.updateInbound(id, "failed");
         continue;
       }
+      // "errored": the model call failed before any tool ran, so a retry is safe.
+      // It waits longer than an undelivered row: the failure is usually a provider outage.
+      const limit = reason === "errored" ? ERRORED_RETRY_MS : SYNTHETIC_RETRY_MS;
       if (attempts < MAX_SYNTHETIC_ATTEMPTS) {
-        this.store.set(key, { ...state, attempts, reason, nextAt: Date.now() + SYNTHETIC_RETRY_MS * 2 ** (attempts - 1) } satisfies SyntheticRetry);
+        this.store.set(key, { ...state, attempts, reason, nextAt: Date.now() + limit * 2 ** (attempts - 1) } satisfies SyntheticRetry);
         this.store.updateInbound(id, "pending");
         continue;
       }
       this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
-      const text = (JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound>).text ?? "";
-      const notice = `synthetic-dropped:${hash(id)}`;
-      if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: syntheticDropped(id, text, reason) });
+      this.queueDropped(id, text, reason);
       const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
       this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
       this.store.updateInbound(id, "failed");
     }
+  }
+
+  /** Adds a dropped row to the combined notice list, once per id. Call inside a transaction. */
+  private queueDropped(id: string, text: string, reason: DropReason): void {
+    const list = this.store.get<DroppedNotice[] | null>("droppedNotices") ?? [];
+    if (list.some(n => n.id === id)) return;
+    this.store.set("droppedNotices", [...list, { id, label: syntheticLabel(id, text), reason, text: syntheticDropped(id, text, reason), at: Date.now() }]);
+  }
+
+  /**
+   * Sends the queued dropped-row notices as one control message once the
+   * oldest has waited out the batch window. The list lives in kv, so a bridge
+   * restart keeps it.
+   */
+  private flushDropped(): void {
+    const list = this.store.get<DroppedNotice[] | null>("droppedNotices") ?? [];
+    if (list.length === 0) return;
+    if (Date.now() - list[0]!.at < (this.options.droppedBatchMs ?? DROPPED_BATCH_MS)) return;
+    this.store.db.transaction(() => {
+      const notice = `synthetic-dropped:${hash(list.map(n => n.id).join(","))}`;
+      if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: droppedBatchText(list) });
+      this.store.set("droppedNotices", null);
+    }).immediate();
   }
 
   /** The turn's prompt is confirmed admitted: it is no longer uncertain, and what it carried was delivered. Call inside a transaction. */
@@ -667,7 +734,7 @@ export class Router {
   private notice(turn: Turn, key: string, text: string): void {
     const id = `turn:${turn.generation}:${turn.messageId}:${key}`;
     if (!this.store.getOperation(id)) this.store.enqueue({
-      id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...replyTarget(turn.inboundId),
+      id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...this.replyTarget(turn.inboundId),
     });
   }
 
@@ -707,6 +774,7 @@ export class Router {
       await this.watch();
       await this.nudgeDue();
       this.flushNotice();
+      this.flushDropped();
       if (this.isGroup()) await this.gateGroup();
       await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
@@ -1220,7 +1288,7 @@ export class Router {
       this.store.db.transaction(() => {
         this.store.updateInbound(inboundId, "pending", { ...input, detached: true } satisfies Detachable);
         this.store.enqueue({
-          id: `nudge:${hash(inboundId)}`, kind: "control", replyTo: inboundId,
+          id: `nudge:${hash(inboundId)}`, kind: "control", ...this.replyTarget(inboundId),
           text: "Got it, I'll come back to that. I still need a yes or no on the check above before I can keep going.",
         });
       }).immediate();
@@ -1431,7 +1499,7 @@ export class Router {
       if (!existing || !["pending", "sending", "sent", "uncertain"].includes(existing.state)) {
         this.store.enqueue({
           id, kind: "control", text, sessionId: turn.id, generation: turn.generation,
-          ...(poll ? { poll } : {}), ...(poll ? {} : replyTarget(turn.inboundId)),
+          ...(poll ? { poll } : {}), ...(poll ? {} : this.replyTarget(turn.inboundId)),
         });
       }
       this.store.set("pendingApprovals", entries);
@@ -2501,7 +2569,12 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
-        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id);
+        // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
+        // A backend without run evidence (none declared) leaves the reply list as the only proof.
+        const ran = turnRanTools(replies) || (this.backend.runToolEvidence
+          ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
+          : false);
+        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, ran ? "failed" : "errored");
         return;
       }
       // `start >= 0`: the watermark record is on the page read, so `after` is
@@ -2552,12 +2625,12 @@ export class Router {
           const words = replyText(assistantText(reply));
           if (words) this.store.enqueue({
             id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn!.id, generation: turn!.generation,
-            ...replyTarget(turn!.inboundId),
+            ...this.replyTarget(turn!.inboundId),
           });
         }
         if (text) this.store.enqueue({
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
-          ...replyTarget(turn!.inboundId),
+          ...this.replyTarget(turn!.inboundId),
         });
         const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
@@ -2650,12 +2723,12 @@ export class Router {
     }
   }
 
-  private fail(turn: Turn, text: string, watermark?: string, reason: "undelivered" | "failed" = "failed"): void {
+  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed"): void {
     this.store.db.transaction(() => {
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
       if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
       else {
-        if (!turn.background && reason === "failed") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
+        if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
         if (turn.inboundId) this.store.updateInbound(turn.inboundId, "failed");
       }

@@ -109,6 +109,10 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
   if [ -n "$_offbox_reason" ]; then
     [[ $_offbox_version =~ ^go1\.[0-9]+\.[0-9]+$ ]] || _offbox_fail "unsupported release $_offbox_version"
     [ "$_offbox_goroot" = /usr/local/go ] && [ ! -L /usr/local/go ] || _offbox_fail "refusing to replace unmanaged GOROOT $_offbox_goroot"
+    if [ ! -f "$_offbox_goroot/.offbox-manifest" ]; then _offbox_old=missing
+    elif _offbox_manifest_matches "$_offbox_goroot"; then _offbox_old=ok
+    else _offbox_old=mismatch; fi
+    echo "offbox: Go repair: old tree manifest=$_offbox_old installed=$(stat -c %y "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16)" >&2
     # Stage beside GOROOT: /tmp may be on another filesystem, making mv a partial copy.
     _offbox_stage=$(sudo -n mktemp -d /usr/local/.offbox-go.XXXXXX) || _offbox_fail 'cannot create staging directory'
     _offbox_saved=0
@@ -225,6 +229,9 @@ LDCACHE_REPAIR = r'''(
 ) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
+# Go failing to read its own std tree (a box read glitch, not the user's code). User module paths never match.
+GO_STD_GLITCH = re.compile(r"package (unsafe|internal/\S+|runtime(/\S+)?) is not in std \(/usr/local/go/src/|"
+                           r"build constraints exclude all Go files in /usr/local/go/src/(internal|runtime|unsafe)\b")
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
 
 
@@ -436,7 +443,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
 
 
 def build_env(extra: list[str]) -> tuple[dict, list[str]]:
-    env = {"CI": "1"}
+    # Boxes have no AWS instance metadata (169.254.169.254 is blackholed); boto3 without credentials waits ~2 s per lookup.
+    env = {"CI": "1", "AWS_EC2_METADATA_DISABLED": "true"}
     for k in ENV_ALLOW:
         if os.environ.get(k):
             env[k] = os.environ[k]
@@ -695,6 +703,25 @@ def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:
             say(f"pull {p} failed: {st.get('error')}")
 
 
+def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int | None) -> bool:
+    """Hint and record a Go std-tree read glitch. Exit codes stay unchanged: no retry, no remapping."""
+    if code in (None, 0) or not log_path or not Path(log_path).exists():
+        return False
+    if not GO_STD_GLITCH.search(Path(log_path).read_text(errors="replace")):
+        return False
+    con = db()
+    since = None
+    if box:
+        row = con.execute("SELECT max(ts) FROM events WHERE box_id=? AND kind IN ('lease_resume','lease_new')",
+                          (box,)).fetchone()
+        since = row[0] if row else None
+    secs = round(now() - since) if since is not None else "unknown"
+    event(con, box, "go_std_glitch", f"{run_id} {secs}s after resume")
+    say(f"Go could not read its own standard library on {box} ('is not in std'). This is a box glitch seen "
+        "right after a resume, not your code. Rerun the same command.")
+    return True
+
+
 def finish(run_id: str, code: int | None, status: str | None = None) -> None:
     con = db()
     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -782,6 +809,7 @@ def _run_remote(a, rn) -> int:
         con = db()
         do_pulls(rn.box, dict(con.execute("SELECT * FROM runs WHERE run_id=?", (rn.run_id,)).fetchone()), a.pull)
     finish(rn.run_id, code)
+    go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     steps = getattr(a, "steps", None) or []

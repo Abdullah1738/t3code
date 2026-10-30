@@ -91,7 +91,7 @@ class MailsendTest(unittest.TestCase):
         self.file = os.path.join(t, "menu.pdf")
         with open(self.file, "wb") as fh:
             fh.write(b"%PDF fake")
-        self.env = {"HOME": t, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "MAILSEND_DRAFT_DIR": self.drafts,
+        self.env = {"HOME": t, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "ROBOB_TEST": "1", "MAILSEND_DRAFT_DIR": self.drafts,
                     "MAILSEND_HIMALAYA": f"/usr/bin/python3 {fake}", "MAILSEND_SEND_APPROVAL": sa,
                     "FAKE_LOG": self.log, "FAKE_APPROVALS": self.approvals}
 

@@ -185,6 +185,7 @@ import { loopbackUrlHostForAddress } from "./startupAccess.ts";
 import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
+import { deferIdleSocketClose } from "./ardud/http/deferIdleSocketClose.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
@@ -300,7 +301,10 @@ const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     return NodeHttpServer.layer(
-      () => rejectRequestsUntilServing(guardHttpResponseWriteErrors(NodeHttp.createServer())),
+      () =>
+        rejectRequestsUntilServing(
+          guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer())),
+        ),
       {
         host: config.host ?? "127.0.0.1",
         port: config.port,

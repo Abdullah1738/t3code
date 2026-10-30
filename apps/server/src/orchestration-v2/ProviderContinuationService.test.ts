@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -47,7 +48,18 @@ const request = (
   ...(dispatchIfCurrent === undefined ? {} : { dispatchIfCurrent }),
 });
 
-const delegatedProjection = (disposition: "open" | "stopped" | "disposed" = "open") =>
+const layerNoHold = ProviderContinuationService.layerWithOptions({
+  delegatedCompletionHold: Duration.zero,
+});
+
+const delegatedProjection = (
+  disposition: "open" | "stopped" | "disposed" = "open",
+  taskIds: ReadonlyArray<string> = [
+    "node-provider-continuation-first",
+    "node-provider-continuation-second",
+  ],
+  extraRuns: ReadonlyArray<unknown> = [],
+) =>
   ({
     ...projection,
     runs: [
@@ -59,10 +71,11 @@ const delegatedProjection = (disposition: "open" | "stopped" | "disposed" = "ope
           delivery: {
             generation: 1,
             messageId: delegatedMessageId,
-            taskIds: ["node-provider-continuation-first", "node-provider-continuation-second"],
+            taskIds,
           },
         },
       },
+      ...extraRuns,
     ],
   }) as unknown as OrchestrationV2ThreadProjection;
 
@@ -98,6 +111,8 @@ function layerTest(input: {
   readonly dispatchGate?: Deferred.Deferred<void>;
   /** How many of the first dispatches fail once recorded. */
   readonly failingDispatches?: number;
+  /** Uses the production 30 s hold instead of the no-hold layer. */
+  readonly hold?: boolean;
 }) {
   let failures = input.failingDispatches ?? 0;
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -115,7 +130,7 @@ function layerTest(input: {
         Effect.as({} as never),
       ),
   });
-  const layerWorker = ProviderContinuationService.layer.pipe(
+  const layerWorker = (input.hold === true ? ProviderContinuationService.layer : layerNoHold).pipe(
     Layer.provide(
       Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
     ),
@@ -366,6 +381,160 @@ describe("ProviderContinuationService", () => {
     });
   });
 
+  it.effect("holds an idle parent's delegated completion, then dispatches it once", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        yield* Effect.yieldNow;
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        yield* TestClock.adjust(Duration.seconds(29));
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        yield* TestClock.adjust(Duration.seconds(1));
+        const command = (yield* Queue.take(dispatched)) as {
+          readonly delegatedCompletion: { readonly taskIds: ReadonlyArray<string> };
+        };
+        assert.deepEqual(command.delegatedCompletion.taskIds, [
+          "node-provider-continuation-first",
+          "node-provider-continuation-second",
+        ]);
+        yield* TestClock.adjust(Duration.minutes(2));
+        assert.equal(yield* Queue.size(dispatched), 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(delegatedProjection()),
+            hold: true,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("merges a sibling that completes during the hold", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const taskIds = yield* Ref.make<ReadonlyArray<string>>(["node-provider-continuation-first"]);
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const offer = requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        yield* offer;
+        yield* Effect.yieldNow;
+        yield* Ref.set(taskIds, [
+          "node-provider-continuation-first",
+          "node-provider-continuation-second",
+        ]);
+        yield* offer;
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust(Duration.seconds(30));
+        const command = (yield* Queue.take(dispatched)) as {
+          readonly delegatedCompletion: { readonly taskIds: ReadonlyArray<string> };
+        };
+        assert.deepEqual(command.delegatedCompletion.taskIds, [
+          "node-provider-continuation-first",
+          "node-provider-continuation-second",
+        ]);
+        yield* TestClock.adjust(Duration.minutes(2));
+        assert.equal(yield* Queue.size(dispatched), 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () =>
+              Ref.get(taskIds).pipe(Effect.map((ids) => delegatedProjection("open", ids))),
+            hold: true,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("dispatches at once when the parent is busy", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        const command = (yield* Queue.take(dispatched)) as {
+          readonly dispatchMode: { readonly type: string };
+        };
+        assert.deepEqual(command.dispatchMode, { type: "queue_after_active" });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () =>
+              Effect.succeed(
+                delegatedProjection("open", undefined, [
+                  { id: RunId.make("run-busy"), status: "running" },
+                ]),
+              ),
+            hold: true,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("drops a held wake whose delivery closed", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const disposition = yield* Ref.make<"open" | "disposed">("open");
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        yield* Effect.yieldNow;
+        yield* Ref.set(disposition, "disposed");
+        yield* TestClock.adjust(Duration.seconds(30));
+        yield* TestClock.adjust(Duration.minutes(2));
+        assert.equal(yield* Queue.size(dispatched), 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () =>
+              Ref.get(disposition).pipe(Effect.map((state) => delegatedProjection(state))),
+            hold: true,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("retries a delegated completion after a transient dispatch failure", () => {
     return Effect.gen(function* () {
       const attempts = yield* Ref.make(0);
@@ -381,7 +550,7 @@ describe("ProviderContinuationService", () => {
             ),
           ),
       });
-      const layerWorker = ProviderContinuationService.layer.pipe(
+      const layerWorker = layerNoHold.pipe(
         Layer.provide(
           Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
         ),
@@ -430,7 +599,7 @@ describe("ProviderContinuationService", () => {
             Effect.andThen(Effect.fail(new Error("simulated persistent failure") as never)),
           ),
       });
-      const layerWorker = ProviderContinuationService.layer.pipe(
+      const layerWorker = layerNoHold.pipe(
         Layer.provide(
           Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
         ),
@@ -505,7 +674,7 @@ describe("ProviderContinuationService", () => {
               Effect.andThen(Effect.fail(new Error("simulated persistent failure") as never)),
             ),
         });
-        const layerWorker = ProviderContinuationService.layer.pipe(
+        const layerWorker = layerNoHold.pipe(
           Layer.provide(
             Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
           ),
@@ -568,7 +737,7 @@ describe("ProviderContinuationService", () => {
             Effect.andThen(Effect.fail(new Error("simulated dispatch failure") as never)),
           ),
       });
-      const layerWorker = ProviderContinuationService.layer.pipe(
+      const layerWorker = layerNoHold.pipe(
         Layer.provide(
           Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
         ),
@@ -629,7 +798,7 @@ describe("ProviderContinuationService", () => {
             return Queue.offer(acknowledged, command).pipe(Effect.as({} as never));
           },
         });
-        const layerWorker = ProviderContinuationService.layer.pipe(
+        const layerWorker = layerNoHold.pipe(
           Layer.provide(
             Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
           ),
@@ -695,7 +864,7 @@ describe("ProviderContinuationService", () => {
               }) as never,
             ),
         });
-        const layerWorker = ProviderContinuationService.layer.pipe(
+        const layerWorker = layerNoHold.pipe(
           Layer.provide(
             Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
           ),
@@ -748,7 +917,7 @@ describe("ProviderContinuationService", () => {
               }) as never,
             ),
         });
-        const layerWorker = ProviderContinuationService.layer.pipe(
+        const layerWorker = layerNoHold.pipe(
           Layer.provide(
             Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
           ),

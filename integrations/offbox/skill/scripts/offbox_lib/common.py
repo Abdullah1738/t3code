@@ -44,6 +44,7 @@ DATA_KEEP_S = 14 * 86400       # boat deletes a stopped box's data this long aft
 KEEPALIVE_S = 12 * 86400       # resume + stop a box that must survive, once it has been stopped this long
 SIZES = ("small", "default", "large", "xlarge")
 TEMPLATES = ("crpko-go", "crpko-node", "crpko-harness", "generic")
+TOO_BIG_NOTE = "too-big:"        # leases.note prefix: a stopped box whose disk outgrew its machine size
 
 
 def now() -> float:

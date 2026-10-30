@@ -299,7 +299,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
@@ -354,18 +354,43 @@ export function headsUpText(watcher: Watcher, event: string): string {
 /** Telegram accepts only a short plain source label. */
 const telegramSource = (text: string) => (text.replace(/[^A-Za-z0-9 ._-]/g, " ").replace(/\s+/g, " ").trim() || "Watcher").slice(0, 40);
 
+/** Card #14: under a test run a real iMessage/Telegram send is refused unless the test overrode its CLI path.
+ * The CLI path and the refusal are both read at call time, so an override set after import still counts. */
+export function underTest(): boolean {
+  return Boolean(process.env.ROBOB_TEST) || process.env.NODE_ENV === "test" || Boolean(process.env.PYTEST_CURRENT_TEST);
+}
+const refused = (what: string) => ({ ok: false, out: `refused: test run; ${what} would reach a real app` });
+const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
+const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
+
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
-  return run([BUN, SPECTRUM_CLI, "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
+  return run([BUN, spectrumCli(), "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
+  const cli = spectrumCli();
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, SPECTRUM_CLI, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
-  return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+  if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
+  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+}
+
+/** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
+ * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
+const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
+  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
+  "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB"];
+export function testEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
+  return out;
 }
 
 const WA_SENDS = /\bwa\s+(draft|send|sendfile)\b/;

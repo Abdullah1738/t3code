@@ -344,6 +344,35 @@ class BuildTest(Base):
         self.run_card("build", "--slug", "lid-chat")
         self.assertEqual([m["id"] for m in self.data("lid-chat")["messages"]], ["L1", "L2", "L3"])
 
+    def test_second_card_for_the_same_chat_is_refused(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        p = self.run_card("build", "--chat", "971500000001", "--slug", "other-chat", code=2)
+        self.assertIn("lydia-chat already shows this chat", p.stderr)
+        self.assertFalse(os.path.exists(self.card("other-chat")))
+        p = self.run_card("build", "--chat", LID, "--slug", "other-chat", code=2)
+        self.assertIn("lydia-chat already shows this chat", p.stderr)
+        self.assertFalse(os.path.exists(self.card("other-chat")))
+        self.build()
+
+    def test_sent_card_keeps_its_window(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        with open(os.path.join(self.card(), ".sent.json"), "w") as f:
+            json.dump({"moni": {"url": "https://x", "key": "k"}}, f)
+        before = json.load(open(os.path.join(self.card(), ".convo.json")))["since"]
+        p = self.run_card("build", "--slug", "lydia-chat", "--days", "1", code=2)
+        self.assertIn("already sent to moni", p.stderr)
+        self.assertEqual(json.load(open(os.path.join(self.card(), ".convo.json")))["since"], before)
+        self.run_card("build", "--slug", "lydia-chat", "--since", "2026-10-20T00:00+04:00")
+        self.run_card("build", "--slug", "lydia-chat", "--days", "1", "--narrow")
+
+    def test_never_sent_card_can_be_narrowed(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.run_card("build", "--slug", "lydia-chat", "--days", "1")
+        self.assertTrue(os.path.exists(self.card()))
+
     def test_help_says_use_the_defaults(self):
         p = self.run_card("--help")
         self.assertIn("Use the defaults", p.stdout)
@@ -584,6 +613,33 @@ class WatchTest(Base):
         both = run("r8", "2100")
         self.assertIn("msgid T3", both)
         self.assertIn("msgid T4", both)
+
+    def test_window_change_is_not_reported(self):
+        self.msg(PHONE, "OLD", T0 - 3 * 86400, text="older")
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.assertIn("since", json.load(open(os.path.join(self.wdir, "cursor.json"))))
+        self.build("--since", "2026-10-20T00:00+04:00")
+        self.assertEqual(self.watch("--now", "1001", "--force").stdout, "")
+        self.msg(PHONE, "T2", T0 + 10, text="new one")
+        out = self.watch("--now", "1002", "--force").stdout
+        self.assertIn("1 new message(s)", out)
+        self.assertIn("msgid T2", out)
+        self.assertNotIn("OLD", out)
+        self.build("--since", SINCE)   # never sent, so narrowing is allowed
+        self.assertEqual(self.watch("--now", "1003", "--force").stdout, "")
+
+    def test_cursor_without_since_is_kept(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        path = os.path.join(self.wdir, "cursor.json")
+        cur = json.load(open(path))
+        del cur["since"]
+        json.dump(cur, open(path, "w"))
+        self.assertEqual(self.watch("--now", "1001", "--force").stdout, "")
+        self.assertIn("since", json.load(open(path)))
 
     def test_daemon_down_fails_the_check(self):
         self.msg(PHONE, "T1", T0, text="hi")

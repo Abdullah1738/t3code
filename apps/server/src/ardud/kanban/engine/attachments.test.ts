@@ -47,6 +47,7 @@ const makeFake = Effect.gen(function* () {
               title: thread.title,
               state: "idle",
               updatedAt: "2026-10-27T10:00:00.000Z",
+              quietSince: "2026-10-27T10:00:00.000Z",
               runStartedAt: null,
               prs: [],
               archived: false,

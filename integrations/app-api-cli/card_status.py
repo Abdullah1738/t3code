@@ -29,7 +29,7 @@ EXIT_USAGE = 2
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 TEXT_LIMIT = 200
 EVENT_LIMIT = 50
-STATES = ('declined', 'ok')
+STATES = ('declined', 'ok', 'cancelled')
 # Anything shaped like a full card number: 13-19 digits, optionally split by
 # single spaces or dashes. Flow UUIDs and short order ids never match.
 _FULL_NUMBER = re.compile(r'(?<![\w-])[0-9](?:[ -]?[0-9]){12,18}(?![\w-])')
@@ -145,8 +145,13 @@ def declined_message(last4, record):
             f"Ask Abdullah before trying it again; clear with: card-status ok {last4}")
 
 
+def cancelled_message(last4, record):
+    return (f"Card {last4} was cancelled ({record.get('reason') or 'no reason given'}). "
+            f"Ask Abdullah for the new card; clear only with: card-status replace {last4}")
+
+
 def check(last4, *, now=None):
-    """Status for one card. Blocked when the last record is a decline under 12h old.
+    """Status for one card. Blocked when cancelled (no time limit), or when the last record is a decline under 12h old.
 
     An unreadable state file blocks too: a broken record must not read as ok.
     """
@@ -163,6 +168,8 @@ def check(last4, *, now=None):
     result = {**_public(last4, record), 'blocked': False, 'error': None}
     if record is None:
         result['message'] = f'card {last4}: no decline on record'
+    elif record['state'] == 'cancelled':
+        result.update(blocked=True, error='CARD_CANCELLED', message=cancelled_message(last4, record))
     elif record['state'] == 'declined' and now - record['at'] < BLOCK_SECONDS:
         result.update(blocked=True, error='CARD_RECENTLY_DECLINED', message=declined_message(last4, record))
     elif record['state'] == 'declined':
@@ -212,11 +219,17 @@ def record_declined(last4, *, reason, source=None, event=None, not_before=None, 
         events = list(previous.get('events') or [])
         if event is not None and event in events:
             return {**_public(last4, previous), 'recorded': False, 'duplicate_event': event}
+        if event is not None:
+            events = (events + [event])[-EVENT_LIMIT:]
+        if previous.get('state') == 'cancelled':
+            # A cancelled card stays cancelled; a late decline only adds its event.
+            record = {**previous, 'events': events} if events else previous
+            data[last4] = record
+            _save(path, data)
+            return {**_public(last4, record), 'recorded': False, 'cancelled': True}
         if previous and ((not_before is not None and previous['at'] > not_before)
                          or (occurred_at is not None and previous['at'] > stamp)):
             return {**_public(last4, previous), 'recorded': False, 'superseded': True}
-        if event is not None:
-            events = (events + [event])[-EVENT_LIMIT:]
         record = {'state': 'declined', 'reason': reason, 'source': source, 'at': stamp,
                   'recorded_at': recorded, 'note': None}
         if events:
@@ -226,6 +239,33 @@ def record_declined(last4, *, reason, source=None, event=None, not_before=None, 
     return {**_public(last4, record), 'recorded': True}
 
 
+def _write_state(last4, *, state, reason, source, note, now):
+    last4 = _last4(last4)
+    path = state_path()
+    with _locked(path):
+        data = _load(path)
+        previous = data.get(last4) or {}
+        record = {'state': state, 'reason': reason, 'source': source,
+                  'at': int(time.time() if now is None else now), 'note': note}
+        if previous.get('events'):
+            record['events'] = previous['events']
+        data[last4] = record
+        _save(path, data)
+    return {**_public(last4, record), 'recorded': True}
+
+
+def record_cancelled(last4, *, reason, source=None, now=None):
+    """Permanent block: the card stays refused until `record_replaced`."""
+    return _write_state(last4, state='cancelled', reason=_text(reason, 'reason', required=True),
+                        source=_text(source, 'source'), note=None, now=now)
+
+
+def record_replaced(last4, *, note=None, source=None, now=None):
+    note = _text(note, 'note')
+    return _write_state(last4, state='ok', reason=None, source=_text(source, 'source'),
+                        note=f'replaced: {note}' if note else 'replaced', now=now)
+
+
 def record_ok(last4, *, note=None, source=None, now=None):
     last4 = _last4(last4)
     note = _text(note, 'note')
@@ -233,6 +273,8 @@ def record_ok(last4, *, note=None, source=None, now=None):
     path = state_path()
     with _locked(path):
         data = _load(path)
+        if (data.get(last4) or {}).get('state') == 'cancelled':
+            raise CardStatusError(f'card {last4} is cancelled; use card-status replace {last4}')
         previous = data.get(last4) or {}
         record = {'state': 'ok', 'reason': None, 'source': source,
                   'at': int(time.time() if now is None else now), 'note': note}
@@ -260,7 +302,15 @@ def main(argv=None):
     ok.add_argument('last4')
     ok.add_argument('--note')
     ok.add_argument('--source')
-    check_cmd = commands.add_parser('check', help='exit 3 when the card was declined in the last 12h')
+    cancel = commands.add_parser('cancel', help='permanently refuse a cancelled card until it is replaced')
+    cancel.add_argument('last4')
+    cancel.add_argument('--reason', required=True)
+    cancel.add_argument('--source')
+    replace = commands.add_parser('replace', help='clear a cancelled card after its replacement (owner says so)')
+    replace.add_argument('last4')
+    replace.add_argument('--note')
+    replace.add_argument('--source')
+    check_cmd = commands.add_parser('check', help='exit 3 when the card is cancelled or was declined in the last 12h')
     check_cmd.add_argument('last4')
     check_cmd.add_argument('--json', action='store_true')
     list_cmd = commands.add_parser('list')
@@ -283,6 +333,10 @@ def main(argv=None):
             return 0
         if args.command == 'declined':
             result = record_declined(args.last4, reason=args.reason, source=args.source, event=args.event)
+        elif args.command == 'cancel':
+            result = record_cancelled(args.last4, reason=args.reason, source=args.source)
+        elif args.command == 'replace':
+            result = record_replaced(args.last4, note=args.note, source=args.source)
         else:
             result = record_ok(args.last4, note=args.note, source=args.source)
         print(json.dumps(result))

@@ -22,6 +22,7 @@ import {
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
   type KanbanCard,
+  type KanbanSubtask,
   type KanbanCardEvent,
   type KanbanCardModel,
   type KanbanChange,
@@ -296,6 +297,17 @@ export interface KanbanServiceShape {
     note: string | null,
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * A board script hands its open subtask back to the card's evaluator with
+   * what failed: the subtask becomes the evaluator's and the evaluator is
+   * woken once, with the note.
+   */
+  readonly handBack: (
+    cardId: KanbanCard["id"],
+    subtaskId: string,
+    note: string,
+    actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /** `head` is the reviewed commit, stored on the review event. */
   readonly reviewResult: (
@@ -631,7 +643,18 @@ const make = Effect.gen(function* () {
   // Pool keys whose model is out of usage or down, with when to probe next. In memory:
   // after a restart seedDown rebuilds it from the paused thread links.
   const down = yield* Ref.make<
-    ReadonlyMap<string, { readonly delayMs: number; readonly nextAt: number }>
+    ReadonlyMap<
+      string,
+      {
+        readonly delayMs: number;
+        readonly nextAt: number;
+        // Boards whose "Provider outages" post for this outage landed. Per board, so a
+        // board that failed later is still announced by a later probe.
+        readonly announced: ReadonlySet<KanbanBoard["id"]>;
+        // Boards that already got their "answers again" post for this outage.
+        readonly recovered: ReadonlySet<KanbanBoard["id"]>;
+      }
+    >
   >(new Map());
   const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
@@ -866,9 +889,13 @@ const make = Effect.gen(function* () {
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
-  const saveCard = Effect.fn("KanbanService.saveCard")(function* (card: KanbanCard) {
+  // `by` is set when a move saved the card, so a script's own move doesn't re-trigger a card.moved script.
+  const saveCard = Effect.fn("KanbanService.saveCard")(function* (
+    card: KanbanCard,
+    by?: KanbanActor,
+  ) {
     yield* store.putCard(card);
-    yield* publish(card.boardId, { _tag: "card", card });
+    yield* publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by });
   });
 
   const logEvent = Effect.fn("KanbanService.logEvent")(function* (
@@ -1006,7 +1033,7 @@ const make = Effect.gen(function* () {
       toStage: to,
       body: options.note ?? null,
     });
-    yield* saveCard(next);
+    yield* saveCard(next, actor);
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator" || !(yield* liveEvaluator(ask.by.threadId))) continue;
       yield* threads
@@ -1723,7 +1750,7 @@ const make = Effect.gen(function* () {
         ((card.stage === "todo" && card.wakeNote === null) ||
           card.stage === "in_review" ||
           (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
-          ? Subtasks.subtaskIds(kanbanStepSubtasks(card))
+          ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
           : null;
       const now = turn(after);
       if (now === null) return;
@@ -1732,8 +1759,16 @@ const make = Effect.gen(function* () {
         // An evaluator's change never starts an evaluator: one is already on the card.
         if (before === null || after.discussionId === null) return;
         // Part of a step its evaluator already heard about got done: nothing new.
-        const told = turn(before) === null ? null : new Set(kanbanStepSubtasks(before).map((subtask) => subtask.id));
-        if (told !== null && kanbanStepSubtasks(after).every((subtask) => told.has(subtask.id))) return;
+        const told =
+          turn(before) === null
+            ? null
+            : new Set(kanbanStepSubtasks(before, "evaluator").map((subtask) => subtask.id));
+        if (
+          told !== null &&
+          kanbanStepSubtasks(after, "evaluator").every((subtask) => told.has(subtask.id))
+        ) {
+          return;
+        }
         const discussion = yield* store.discussion(after.discussionId);
         const own = discussion?.evaluatorThreadId ?? null;
         if (discussion === null || own === null || own === actor.threadId) return;
@@ -1800,7 +1835,17 @@ const make = Effect.gen(function* () {
       const asked = yield* askedBy(card);
       const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
       const back = asked?.fromStage ?? "todo";
-      const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
+      // A card asked about mid-review reruns its step; one whose chain already
+      // passed was only waiting (on its PRs or the evaluator) and goes back to
+      // waiting, so the last reviewer isn't woken for a step it cleared.
+      const reviewed =
+        back === "in_review" &&
+        Rules.reviewFinished(
+          card,
+          Rules.chainFor(yield* boardOf(card.boardId), card)?.steps.length ?? 1,
+        );
+      const stage =
+        back === "working" ? "todo" : back === "in_review" && !reviewed ? "needs_review" : back;
       const workThread = card.workThreadId;
       const wake =
         workThread !== null &&
@@ -2276,7 +2321,13 @@ const make = Effect.gen(function* () {
     yield* Ref.update(down, (map) => {
       const next = new Map(map);
       for (const key of keys) {
-        if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now });
+        if (!next.has(key))
+          next.set(key, {
+            delayMs: Rules.PROBE_FIRST_MS,
+            nextAt: now,
+            announced: new Set(),
+            recovered: new Set(),
+          });
       }
       return next;
     });
@@ -2302,8 +2353,56 @@ const make = Effect.gen(function* () {
     yield* Ref.update(down, (map) =>
       map.has(key)
         ? map
-        : new Map(map).set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: now + Rules.PROBE_FIRST_MS }),
+        : new Map(map).set(key, {
+            delayMs: Rules.PROBE_FIRST_MS,
+            nextAt: now + Rules.PROBE_FIRST_MS,
+            announced: new Set(),
+            recovered: new Set(),
+          }),
     );
+  });
+
+  const OUTAGE_TITLE = "Provider outages";
+  const outageActor: KanbanActor = { _tag: "system", component: "provider-watch" };
+
+  /**
+   * Posts to the "Provider outages" discussion of each board in `only` that has threads
+   * waiting on `key`, with how many. Returns the boards whose post landed. A failed post
+   * is logged and left out, so the caller retries it next time; it never fails the probe.
+   */
+  const alertBoards = Effect.fn("KanbanService.alertBoards")(function* (
+    key: string,
+    only: ReadonlySet<KanbanBoard["id"]>,
+    text: (count: number) => string,
+  ) {
+    const counts = new Map<KanbanBoard["id"], number>();
+    for (const { link, board } of yield* pausedLinks) {
+      if (linkKey(link, board) === key && only.has(board.id)) {
+        counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
+      }
+    }
+    const delivered = new Set<KanbanBoard["id"]>();
+    for (const [boardId, count] of counts) {
+      const posted = yield* Effect.gen(function* () {
+        const existing = (yield* store.discussions(boardId)).find(
+          (discussion) =>
+            discussion.cardId === null &&
+            discussion.archivedAt === null &&
+            discussion.title === OUTAGE_TITLE,
+        );
+        const discussion = existing ?? (yield* newDiscussion(boardId, OUTAGE_TITLE, null, outageActor));
+        yield* postUnlocked(discussion.id, outageActor, [{ _tag: "md", text: text(count) }], false);
+      }).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban outage alert failed", { boardId, cause }).pipe(
+            Effect.as(false),
+          ),
+        ),
+      );
+      if (posted) delivered.add(boardId);
+    }
+    return delivered;
   });
 
   /**
@@ -2312,6 +2411,36 @@ const make = Effect.gen(function* () {
    * Callers hold the lock.
    */
   const resumeKey = Effect.fn("KanbanService.resumeKey")(function* (key: string) {
+    // Only boards that were announced get a "back" message, once per outage: a board
+    // is recorded as recovered as soon as its post lands, so a rejected wake below
+    // doesn't repeat it on the next probe.
+    // The whole step is optional: a failed read here (boards or links) must not abort
+    // the wakes below, or the other probe keys in this run.
+    yield* Effect.gen(function* () {
+      const state = (yield* Ref.get(down)).get(key);
+      if (state === undefined) return;
+      const pending = new Set<KanbanBoard["id"]>();
+      for (const id of state.announced) if (!state.recovered.has(id)) pending.add(id);
+      if (pending.size === 0) return;
+      const backed = yield* alertBoards(
+        key,
+        pending,
+        (count) =>
+          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
+      );
+      yield* Ref.update(down, (map) => {
+        const entry = map.get(key);
+        if (!entry) return map;
+        return new Map(map).set(key, {
+          ...entry,
+          recovered: new Set([...entry.recovered, ...backed]),
+        });
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban outage recovery alert failed", { key, cause }),
+      ),
+    );
     let failed = false;
     for (const { link, board } of yield* pausedLinks) {
       if (link.paused === null || linkKey(link, board) !== key) continue;
@@ -2544,6 +2673,11 @@ const make = Effect.gen(function* () {
       yield* kick;
       return;
     }
+    // Run updates repeat after a run ends (its checkpoint lands later), so an
+    // end heard while the thread runs again is an earlier turn's, such as the
+    // chain step before the one now running in this thread.
+    const latest = yield* threads.view(threadId);
+    if (latest !== null && latest.state !== "idle") return;
     if (card.nudgedAt === null) {
       yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
       yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
@@ -2877,7 +3011,13 @@ const make = Effect.gen(function* () {
           const next = new Map([...map].filter(([key]) => found.has(key)));
           for (const key of found.keys()) {
             // nextAt is now: the loop below probes it right away.
-            if (!next.has(key)) next.set(key, { delayMs: Rules.PROBE_FIRST_MS, nextAt: seededAt });
+            if (!next.has(key))
+              next.set(key, {
+                delayMs: Rules.PROBE_FIRST_MS,
+                nextAt: seededAt,
+                announced: new Set(),
+                recovered: new Set(),
+              });
           }
           return next;
         });
@@ -2896,7 +3036,51 @@ const make = Effect.gen(function* () {
       }
       const delayMs =
         state === undefined ? Rules.PROBE_FIRST_MS : Rules.nextProbeDelay(state.delayMs);
-      yield* Ref.update(down, (map) => new Map(map).set(key, { delayMs, nextAt: now + delayMs }));
+      yield* Ref.update(down, (map) =>
+        new Map(map).set(key, {
+          delayMs,
+          nextAt: now + delayMs,
+          announced: state?.announced ?? new Set(),
+          recovered: state?.recovered ?? new Set(),
+        }),
+      );
+      // The whole announcement is optional: a failed read here must not skip the next model's probe.
+      yield* Effect.gen(function* () {
+        // One alert per board per outage, after the first failed probe, so threads that die in the same minutes are counted.
+        // A board whose post failed is not marked announced and is retried by the next failed probe.
+        const unannounced = yield* lock.withPermits(1)(
+          Effect.gen(function* () {
+            const boards = new Set<KanbanBoard["id"]>();
+            for (const { link, board } of yield* pausedLinks) {
+              if (linkKey(link, board) === key) boards.add(board.id);
+            }
+            const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
+            const unannounced = new Set<KanbanBoard["id"]>();
+            for (const id of boards) if (!announced.has(id)) unannounced.add(id);
+            return unannounced;
+          }),
+        );
+        if (unannounced.size > 0) {
+          const posted = yield* lock.withPermits(1)(
+            alertBoards(
+              key,
+              unannounced,
+              (count) =>
+                `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
+            ),
+          );
+          yield* Ref.update(down, (map) => {
+            const entry = map.get(key);
+            if (!entry) return map;
+            return new Map(map).set(key, {
+              ...entry,
+              announced: new Set([...entry.announced, ...posted]),
+            });
+          });
+        }
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { key, cause })),
+      );
     }
   });
 
@@ -3040,6 +3224,7 @@ const make = Effect.gen(function* () {
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
     const plan = Subtasks.planSubtasks([], input.subtasks ?? []);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
+    yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
       boardId,
@@ -3403,6 +3588,7 @@ const make = Effect.gen(function* () {
           ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
+        if (plan?.ok) yield* checkScriptNames(card.boardId, plan.subtasks);
         const removeUrls = (patch.removeLinks ?? []).map((url) => url.trim());
         for (const url of removeUrls) {
           if (!card.links.some((link) => link.url === url))
@@ -3517,6 +3703,11 @@ const make = Effect.gen(function* () {
               `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`,
             );
           }
+        }
+        if ((to === "completed" || to === "deployed") && role !== "owner") {
+          const board = yield* boardOf(card.boardId);
+          const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
+          if (blocked !== null) return yield* failWith("denied", blocked);
         }
         if (role === "evaluator" && to === "todo" && kanbanEvaluatorStep(card)) {
           return yield* failWith(
@@ -3709,7 +3900,9 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        const check = Subtasks.checkMark(card, subtaskId, state, role, note);
+        const scriptName =
+          role === "script" ? (yield* scriptFor(card, actor)).name : null;
+        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
         if (!check.ok) return yield* failWith("denied", check.reason);
         const at = yield* nowIso;
         const marked: KanbanCard = {
@@ -3762,12 +3955,109 @@ const make = Effect.gen(function* () {
             body: to === "todo" ? "Next step is the worker's" : "Next step is the review",
           });
         }
-        yield* saveCard(next);
+        // The actor goes with the save: a card a script's subtask moved is a move by that script.
+        yield* saveCard(next, to !== null && card.stage !== to ? actor : undefined);
         yield* evaluatorTurn(card, next, actor);
         yield* kick;
         return next;
       }),
     );
+
+  /** Only a board script does a script's subtask, and only on its own board. */
+  const scriptFor = Effect.fn("KanbanService.scriptFor")(function* (
+    card: KanbanCard,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "script") return yield* failWith("denied", "only a board script does this");
+    const script = yield* store.script(actor.scriptId);
+    if (script === null || script.boardId !== card.boardId) {
+      return yield* failWith("denied", `card #${card.number} isn't on this script's board`);
+    }
+    return script;
+  });
+
+  const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const script = yield* scriptFor(card, actor);
+        const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
+        if (!check.ok) return yield* failWith("denied", check.reason);
+        const at = yield* nowIso;
+        const trimmed = note.trim();
+        const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
+        const next: KanbanCard = {
+          ...card,
+          subtasks: Subtasks.handBack(card.subtasks, subtaskId, trimmed),
+          updatedAt: at,
+        };
+        yield* logEvent(next, actor, "subtask", {
+          body: `${subtaskId} handed back to the evaluator: ${text} (${trimmed})`,
+        });
+        yield* saveCard(next);
+        // One wake for the hand-back itself: the evaluator hears the note once.
+        yield* noteDiscussion(next, Briefs.handBackText(next, subtaskId, script.name, trimmed)).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban hand-back note failed", cause),
+          ),
+        );
+        yield* kick;
+        return next;
+      }),
+    );
+
+  /** A script's subtask names a script on this board: a misspelt name would leave its step waiting for good. */
+  const checkScriptNames = Effect.fn("KanbanService.checkScriptNames")(function* (
+    boardId: KanbanBoard["id"],
+    subtasks: ReadonlyArray<KanbanSubtask>,
+  ) {
+    const names = new Set(
+      (yield* store.scripts(boardId)).map((script) => script.name.toLowerCase()),
+    );
+    for (const subtask of subtasks) {
+      if (subtask.state !== "open" || subtask.script === undefined) continue;
+      if (!names.has(subtask.script.toLowerCase())) {
+        return yield* failWith(
+          "invalid",
+          `subtask ${subtask.id}: no script named "${subtask.script}" on this board`,
+        );
+      }
+    }
+  });
+
+
+  /**
+   * A reviewer that lost its slot mid-review (the dispatcher's no-verdict flag,
+   * or its own card_flag) still owns the step while nothing has moved the card
+   * since, so its verdict counts. A recorded verdict or any later move closes it.
+   */
+  const lateReviewer = Effect.fn("KanbanService.lateReviewer")(function* (
+    card: KanbanCard,
+    threadId: ThreadId,
+  ) {
+    if (
+      card.stage !== "needs_review" ||
+      card.activeThreadId !== null ||
+      card.reviewThreadId !== threadId ||
+      card.settledAt !== null
+    ) {
+      return false;
+    }
+    const events = yield* store.cardEvents(card.id);
+    // A recorded verdict closes the window even when it leaves the stage as is
+    // (a late clear logs needs_review -> needs_review), so it counts as a move.
+    const left = events.findLast(
+      (event) =>
+        event.kind === "review" ||
+        (event.fromStage !== null && event.toStage !== null && event.fromStage !== event.toStage),
+    );
+    return (
+      left?.kind === "flagged" &&
+      left.fromStage === "in_review" &&
+      (left.actor._tag === "system" ||
+        (left.actor._tag === "thread" && left.actor.threadId === threadId))
+    );
+  });
 
   const reviewResult: KanbanServiceShape["reviewResult"] = (
     threadId,
@@ -3782,7 +4072,9 @@ const make = Effect.gen(function* () {
           return yield* failWith("denied", "only a card's review thread records a review result");
         }
         const card = yield* cardOf(link.cardId);
-        if (card.activeThreadId !== threadId || card.stage !== "in_review") {
+        const live = card.activeThreadId === threadId && card.stage === "in_review";
+        const late = !live && (yield* lateReviewer(card, threadId));
+        if (!live && !late) {
           return yield* failWith(
             "conflict",
             `card #${card.number} is not in review with this thread`,
@@ -3813,6 +4105,9 @@ const make = Effect.gen(function* () {
         const moreWork = passed && Subtasks.workAfterReview({ subtasks });
         const next: KanbanCard = {
           ...release(card),
+          // The dispatcher's no-verdict flag is answered by the verdict; a
+          // reviewer's own flag stays for the evaluator.
+          stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
           subtasks,
           stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
           reviewStep: moreWork ? 0 : outcome.reviewStep,
@@ -4314,6 +4609,7 @@ const make = Effect.gen(function* () {
     flagCard,
     settleCard,
     markSubtask,
+    handBack,
     askOwner,
     changeAsk,
     reviewResult,

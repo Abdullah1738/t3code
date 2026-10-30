@@ -903,8 +903,12 @@ def send_health(state, due, wd, now):
     pending = state.get('health_pending')
     if not pending:
         return {}
+    # Card #14: a test run never sends a live Telegram alert; it needs its own stub CLI (read at call time).
+    stub = os.environ.get('ROBOB_WATCH_TELEGRAM_CLI')
+    if (os.environ.get('ROBOB_TEST') or os.environ.get('NODE_ENV') == 'test' or os.environ.get('PYTEST_CURRENT_TEST')) and not stub:
+        return {'health_alert_error': 'refused: test run; telegram notify would reach a real app'}
     try:
-        out = subprocess.run([str(BUN), str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
+        out = subprocess.run([str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
                               '--text', pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
                              env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
         if out.returncode:

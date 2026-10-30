@@ -4,9 +4,13 @@
 Use the defaults. Every option has one; don't stop to ask which to pick.
 
     convo-card build --chat NUMBER|JID [--slug SLUG] [--title T] [--me NAME] [--them NAME]
-                     [--subtitle T] [--since ISO | --days N] [--dry-run]
+                     [--subtitle T] [--since ISO | --days N] [--narrow] [--dry-run]
         Read the chat from wacli's store (read only), download its photos and rebuild the card folder.
-        Later runs need only --slug; options you pass are saved for next time.
+        Later runs need only --slug; options you pass are saved for next time. A chat gets one card: a second
+        slug for the same chat is refused. A sent card keeps its earlier messages unless --narrow (Abdullah
+        asked for a shorter window).
+        The card shows recent history by design. For a longer one run `build --slug SLUG --since ISO`, then
+        translate anything pending; the open card picks it up within 25 s, no resend.
     convo-card translate --slug SLUG --id MSGID (--text ENGLISH | --none) [--caption LABEL] [--by WHO]
         Store the English for one message, bound to that exact message (its id + sha256 of its exact text,
         caption or photo bytes). If the message changes, the translation stops showing and send refuses again.
@@ -23,8 +27,9 @@ Use the defaults. Every option has one; don't stop to ask which to pick.
     convo-card show --slug SLUG       config, pending items (with photo paths), send journal
     convo-card watch --slug SLUG      watcher check (state in $WATCH_DIR): prints CONVO_CARD_UPDATE once
         new, edited or deleted messages have been quiet for 2 min, CONVO_CARD_SHARE_DOWN when a shared
-        link fails twice in a row. Exits 1 while the wacli sync daemon is down. Under robob-watch
-        ($WATCH_RUN) an event the runner never recorded is printed again (.convo-outbox.json in the state dir).
+        link fails twice in a row. Changing a card's window (--since/--days) is not reported. Exits 1 while
+        the wacli sync daemon is down. Under robob-watch ($WATCH_RUN) an event the runner never recorded is
+        printed again (.convo-outbox.json in the state dir).
 
 Card folder ~/.local/share/imessage-apps/<slug>/ (served): index.html, data.json, preview.png, media/.
 The page re-reads data.json every 25s, so a rebuild shows up on the open card by itself.
@@ -77,6 +82,11 @@ def root():
 
 def wacli_cmd():
     return _cmd("CONVO_CARD_WACLI", [str(HOME / ".local/bin/wacli")])
+
+
+def under_test():
+    """True under `ROBOB_TEST=1`, bun test (NODE_ENV=test) or pytest (PYTEST_CURRENT_TEST)."""
+    return bool(os.environ.get("ROBOB_TEST")) or os.environ.get("NODE_ENV") == "test" or bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
 def bridge_cmd():
@@ -297,6 +307,24 @@ def identify(chat):
     return main, jids, clean(name, 40)
 
 
+def when(ts):
+    t = local(ts)
+    return f"{t:%a} {t.day} {t:%b}, {t:%H:%M}"
+
+
+def other_card_showing(d, chats):
+    """(slug, saved since) of another card folder already showing one of these chat JIDs, else None."""
+    for p in sorted(root().glob("*/.convo.json")):
+        if p.parent == d:
+            continue
+        other = read_json(p, {})
+        if not isinstance(other, dict) or not other.get("chat"):
+            continue
+        if {other["chat"], *(other.get("jids") or [])} & chats:
+            return p.parent.name, other.get("since")
+    return None
+
+
 def resolve_config(a, d, ident=None):
     """Saved config + whatever this run passed. First build needs --chat; the rest has defaults."""
     cfg = read_json(d / ".convo.json", {})
@@ -305,6 +333,12 @@ def resolve_config(a, d, ident=None):
         mine = {cfg["chat"], *cfg.get("jids", [])} if cfg.get("chat") else set()
         if mine and not mine & {main, *jids}:
             die(f"{d.name} already belongs to {cfg['chat']}; pick another --slug for {main}")
+        if not cfg.get("chat"):   # a new card: a chat gets one card, not a second slug
+            hit = other_card_showing(d, {main, *jids})
+            if hit:
+                slug, s = hit
+                since_txt = f" (since {when(s)})" if isinstance(s, int) else ""
+                die(f"{slug} already shows this chat{since_txt}: use --slug {slug} instead of making a second card")
         cfg["chat"], cfg["jids"] = main, list(dict.fromkeys([*jids, *cfg.get("jids", [])]))
         cfg.setdefault("them", name)
     if not cfg.get("chat"):
@@ -317,16 +351,25 @@ def resolve_config(a, d, ident=None):
     cfg.setdefault("title", cfg["them"])
     cfg.setdefault("subtitle", "via Abdullah's WhatsApp")
     since = getattr(a, "since", None)
+    new_since = None
     if since:
         try:
             dt = datetime.fromisoformat(since)
         except ValueError:
             die(f"bad --since {since!r}: ISO time like 2026-10-24T00:00+04:00")
-        cfg["since"] = int((dt if dt.tzinfo else dt.replace(tzinfo=DXB)).timestamp())
+        new_since = int((dt if dt.tzinfo else dt.replace(tzinfo=DXB)).timestamp())
     elif "since" not in cfg or getattr(a, "days", None):
         days = getattr(a, "days", None) or 3
         start = datetime.now(DXB).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
-        cfg["since"] = int(start.timestamp())
+        new_since = int(start.timestamp())
+    if new_since is not None:
+        # A card someone has already been sent keeps its earlier messages unless Abdullah asked for less.
+        sent = sorted(read_json(d / ".sent.json", {}) or {})
+        was = cfg.get("since")
+        if was is not None and new_since > was and sent and not getattr(a, "narrow", False):
+            die(f"this would take messages before {when(new_since)} off a card already sent to {', '.join(sent)}: "
+                f"leave out --since/--days to keep the window, or pass --narrow if Abdullah asked for a shorter one")
+        cfg["since"] = new_since
     return cfg
 
 
@@ -662,6 +705,10 @@ def cmd_translate(a):
 
 
 def bridge(*args, timeout=60):
+    # Under a test, only an injected stub bridge may run: the real one would send iMessage.
+    if under_test() and not os.environ.get("CONVO_CARD_BRIDGE"):
+        sys.exit(f"refused: test run; convo-card would send via the real bridge ({args[0] if args else '?'}); "
+                 "set CONVO_CARD_BRIDGE to a stub")
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
     p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
                        stdin=subprocess.DEVNULL)
@@ -835,7 +882,7 @@ def cmd_watch(a):
         pre.append(lambda: write_json(state / "cursor.json", oc))
     if cur is None:
         if not a.dry_run:
-            write_json(state / "cursor.json", {"rowid": top, "seq": 0, "fps": fps})
+            write_json(state / "cursor.json", {"rowid": top, "seq": 0, "fps": fps, "since": cfg["since"]})
         return
     carry = []
     if run and ob.get("batches"):
@@ -845,6 +892,12 @@ def cmd_watch(a):
             carry = [dict(b, replays=b.get("replays", 0) + 1) for b in ob["batches"]
                      if now - b.get("at", 0) < OUTBOX_TTL and b.get("replays", 0) < OUTBOX_MAX_REPLAYS]
     out, nc = [], None
+    prev_fps, prev_since = cur.get("fps"), cur.get("since")
+    if prev_fps is not None and prev_since is not None and prev_since != cfg["since"]:
+        # A window change is not a chat change: a message that entered the window was already in the chat
+        # before the cursor (not new), one that left it isn't reported, and edits to seen messages still are.
+        cur = dict(cur, fps={mid: prev_fps.get(mid, r["fp"]) for mid, r in rows.items()
+                             if mid in prev_fps or r["rowid"] <= cur.get("rowid", 0)})
     changes = watch_changes(cur, rows)
     pend = read_json(state / "pending.json") or {}
     if changes:
@@ -870,14 +923,14 @@ def cmd_watch(a):
                 else:
                     tag = " (edited)" if kind == "edited" else ""
                     out.append(f"- {r['who']}{tag}: {clean(r['body'], 160)} (msgid {mid})")
-            nc = {"rowid": top, "seq": cur.get("seq", 0) + 1, "fps": fps}
+            nc = {"rowid": top, "seq": cur.get("seq", 0) + 1, "fps": fps, "since": cfg["since"]}
             writes.append(lambda: write_json(state / "cursor.json", nc))
             writes.append(lambda: (state / "pending.json").unlink() if (state / "pending.json").exists() else None)
     else:
         if pend:
             writes.append(lambda: (state / "pending.json").unlink() if (state / "pending.json").exists() else None)
-        if cur.get("fps") != fps:   # only silent differences (a message deleted before it was ever reported)
-            quiet = {"rowid": top, "seq": cur.get("seq", 0), "fps": fps}
+        if prev_fps != fps or prev_since != cfg["since"]:   # silent differences, or the card's window moved
+            quiet = {"rowid": top, "seq": cur.get("seq", 0), "fps": fps, "since": cfg["since"]}
             writes.append(lambda: write_json(state / "cursor.json", quiet))
     share = read_json(state / "share.json") or {}
     urls = sorted({v["url"] for k, v in (read_json(d / ".sent.json", {}) or {}).items() if k != "owner" and v.get("url")})
@@ -924,6 +977,8 @@ def main(argv=None):
     b.add_argument("--subtitle", help="header line (default \"via Abdullah's WhatsApp\")")
     b.add_argument("--since", help="ISO start time (default: start of the day 2 days ago, Dubai)")
     b.add_argument("--days", type=int, help="start N days back at midnight instead of --since (default 3)")
+    b.add_argument("--narrow", action="store_true",
+                   help="allow a later start on a card that was already sent (only if Abdullah asked for less)")
     b.add_argument("--dry-run", action="store_true", help="compare with the current data.json, write nothing")
     t = sub.add_parser("translate", help="store the English for one message")
     t.add_argument("--slug", required=True)

@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -710,6 +711,10 @@ class LiveWorkTests(unittest.TestCase):
 
 
 class SourceHealthTests(unittest.TestCase):
+    # Card #14: these tests mock subprocess.run, but a test run still needs the Telegram stub override to send.
+    def stub_telegram(self):
+        return patch.dict('os.environ', {'ROBOB_WATCH_TELEGRAM_CLI': '/nonexistent/telegram-stub.ts'})
+
     def runs(self, errors_per_run, start=10_000, step=300):
         state, due = {}, []
         for n, errors in enumerate(errors_per_run):
@@ -749,10 +754,22 @@ class SourceHealthTests(unittest.TestCase):
         t.track_health(state, {}, later + t.HEALTH_REALERT)
         self.assertNotIn('outlook', state['source_health'])
 
+    def test_a_test_run_never_calls_the_live_telegram_cli(self):
+        # Card #14: even in the live directory, a test-marked run refuses the Telegram notify and never spawns it.
+        state = {'health_pending': {'text': 'outlook down', 'key': 'k', 'sources': ['outlook']}}
+        env = {k: v for k, v in os.environ.items() if k not in ('ROBOB_WATCH_TELEGRAM_CLI', 'NODE_ENV', 'PYTEST_CURRENT_TEST')}
+        env['ROBOB_TEST'] = '1'
+        with patch.dict('os.environ', env, clear=True), patch.object(t.subprocess, 'run') as run:
+            out = t.send_health(state, ['outlook'], t.LIVE, 0)
+        run.assert_not_called()
+        self.assertIn('refused: test run', out.get('health_alert_error', ''))
+        self.assertIn('health_pending', state)
+
     def tick(self, state, wd, errors, now):
         due = t.track_health(state, errors, now)
         t.health_alert(state, due, now)
-        return t.send_health(state, due, wd, now)
+        with self.stub_telegram():
+            return t.send_health(state, due, wd, now)
 
     def test_a_live_run_sends_one_alert_and_retries_exactly_that_alert(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -762,7 +779,7 @@ class SourceHealthTests(unittest.TestCase):
             # The first send may have reached the bridge before it timed out.
             lost = t.subprocess.TimeoutExpired('bun', 4)
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
                 self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
                 self.assertNotIn('alerted_at', state['source_health']['gmail'])
                 # The next run counts another failure, but resends the same text under the same key.
@@ -787,7 +804,7 @@ class SourceHealthTests(unittest.TestCase):
             down = types.SimpleNamespace(returncode=1, stdout='', stderr='bridge down')
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
             both = {'outlook': 'x', 'gmail': 'y'}
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[down, down, sent, sent]) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[down, down, sent, sent]) as run:
                 self.assertIn('health_alert_error', self.tick(state, wd, both, 10_600))
                 self.assertIn('health_alert_error', self.tick(state, wd, both, 10_900))
                 # gmail is due now too, but the pending outlook alert goes out unchanged.
@@ -804,7 +821,7 @@ class SourceHealthTests(unittest.TestCase):
             wd = Path(tmp)
             state, _ = self.runs([{'outlook': 'x'}] * 2)
             down = types.SimpleNamespace(returncode=1, stdout='', stderr='409')
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=down) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=down) as run:
                 self.tick(state, wd, {'outlook': 'x'}, 10_600)
                 first = state['health_pending']['key']
                 self.tick(state, wd, {'outlook': 'x'}, 10_600 + t.HEALTH_REALERT)

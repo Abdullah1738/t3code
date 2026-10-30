@@ -134,7 +134,7 @@ PY
 # added 2-4 GB to restic every run. .dump reads in one transaction (~2 s).
 # Restore: sqlite3 new.sqlite < robob-state.sql. Skipped until Robob is installed.
 ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
-ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_% ardud_mission_%
+ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_% ardud_kanban_% ardud_mission_%
   ardud_opencode_import ardud_opencode_import_state ardud_thread_origin
   orchestration_v2_projection_threads orchestration_v2_projection_provider_threads
   orchestration_v2_projection_provider_session_bindings

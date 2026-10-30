@@ -28,6 +28,7 @@ import {
   poolKey,
   prsLanded,
   relatedCandidates,
+  reviewGate,
   workerQuietDue,
 } from "./rules.ts";
 
@@ -131,6 +132,44 @@ describe("checkMove", () => {
       checkMove("owner", card({ stage: "verified", settledAt: "2026-10-25T01:00:00Z" }), "todo").ok,
     ).toBe(false);
   });
+
+  it("lets a script move a card only to completed, deployed or verified, off a quiet stage", () => {
+    expect(checkMove("script", card({ stage: "todo" }), "deployed").ok).toBe(true);
+    expect(checkMove("script", card({ stage: "completed" }), "verified").ok).toBe(true);
+    expect(checkMove("script", card({ stage: "todo" }), "todo").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "needs_review" }), "needs_review").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "completed" }), "needs_review").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "completed" }), "needs_owner").ok).toBe(false);
+    expect(checkMove("script", card({ stage: "working" }), "completed").ok).toBe(false);
+    expect(
+      checkMove("script", card({ stage: "completed", settledAt: "2026-10-25T01:00:00Z" }), "verified").ok,
+    ).toBe(false);
+  });
+});
+
+describe("reviewGate", () => {
+  const reviewSub = {
+    id: "s2",
+    step: 2,
+    text: "r",
+    owner: "review",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  } as unknown as KanbanCard["subtasks"][number];
+
+  it("names an open review subtask", () => {
+    const result = reviewGate(card({ subtasks: [reviewSub] }), 1);
+    expect(result).not.toBeNull();
+    expect(result).toContain("s2");
+  });
+
+  it("waits for the whole chain", () => {
+    expect(reviewGate(card({ reviewStep: 0 }), 1)).not.toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 1)).toBeNull();
+    expect(reviewGate(card({ reviewStep: 1 }), 2)).not.toBeNull();
+  });
 });
 
 describe("applyReviewResult", () => {
@@ -212,6 +251,25 @@ describe("planDispatch", () => {
       setup: { ...setupRunning.setup!, status: "done", finishedAt: "2026-10-28T01:00:00Z" },
     };
     expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
+  });
+
+  it("leaves a todo card alone while its step is a board script's", () => {
+    const scriptStep = card({
+      subtasks: [
+        {
+          id: "s1",
+          step: 1,
+          text: "Merge the PR",
+          owner: "script",
+          script: "land",
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    });
+    expect(planDispatch(board, [scriptStep], pools([[opus, 2]]))).toEqual([]);
   });
 
   it("takes reviews before work and todo by priority", () => {
@@ -778,13 +836,19 @@ describe("workerQuietDue", () => {
     movedAt: START_ISO,
   });
   const at = (minutes: number) => START + minutes * 60 * 1000;
-  const view = (state: string) => ({ state, updatedAt: START_ISO });
+  const view = (state: string) => ({ state, quietSince: START_ISO });
 
   it("is due for an idle or stuck worker after 30 minutes", () => {
     expect(workerQuietDue(working, view("idle"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("idle"), at(29))).toBe(false);
     expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
+  });
+
+  it("counts from quietSince", () => {
+    const quiet = { state: "idle", quietSince: "2026-10-25T00:20:00.000Z" };
+    expect(workerQuietDue(working, quiet, at(31))).toBe(false);
+    expect(workerQuietDue(working, quiet, at(51))).toBe(true);
   });
 
   it("counts from the last nudge and skips stalled or review cards", () => {

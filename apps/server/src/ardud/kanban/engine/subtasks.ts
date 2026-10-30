@@ -20,6 +20,8 @@ export interface SubtaskInput {
   readonly step?: number | undefined;
   readonly text: string;
   readonly owner: KanbanSubtask["owner"];
+  /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
+  readonly script?: string | undefined;
 }
 
 /**
@@ -51,7 +53,7 @@ export type SubtaskPlan =
  * Who is marking a subtask. Evaluators can mark any; a worker only its own
  * kind. A reviewer marks none: its verdict ticks the review's subtasks.
  */
-export type SubtaskRole = "work" | "review" | "evaluator";
+export type SubtaskRole = "work" | "review" | "evaluator" | "script";
 
 export type MarkCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
@@ -81,6 +83,13 @@ export function planSubtasks(
     if (text.length > MAX_TEXT) {
       return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
     }
+    const script = input.script?.trim() || undefined;
+    if (script && input.owner !== "script") {
+      return {
+        ok: false,
+        reason: `subtask "${text}" names a script, so its owner must be "script"`,
+      };
+    }
     if (input.step !== undefined && (!Number.isInteger(input.step) || input.step < 1)) {
       return { ok: false, reason: "a subtask's step is a whole number from 1" };
     }
@@ -91,7 +100,8 @@ export function planSubtasks(
       if (!known) return { ok: false, reason: `the card has no subtask ${id}` };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
-      planned.push({ ...known, step, text, owner: input.owner });
+      const { script: _old, ...rest } = known;
+      planned.push({ ...rest, step, text, owner: input.owner, ...(script ? { script } : {}) });
     } else {
       nextId += 1;
       planned.push({
@@ -99,6 +109,7 @@ export function planSubtasks(
         step,
         text,
         owner: input.owner,
+        ...(script ? { script } : {}),
         state: "open",
         note: null,
         doneBy: null,
@@ -121,6 +132,7 @@ export function checkMark(
   state: KanbanSubtask["state"],
   role: SubtaskRole,
   note: string | null,
+  scriptName: string | null = null,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
   if (!subtask) return { ok: false, reason: `card #${card.number} has no subtask ${id}` };
@@ -142,6 +154,13 @@ export function checkMark(
       reason: `subtask ${id} is for the ${OWNER_NAMES[subtask.owner]}, not you`,
     };
   }
+  if (
+    role === "script" &&
+    subtask.script !== undefined &&
+    subtask.script.toLowerCase() !== (scriptName ?? "").toLowerCase()
+  ) {
+    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+  }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
@@ -150,6 +169,47 @@ export function checkMark(
   }
   return { ok: true };
 }
+
+/** A script hands its subtask back to the evaluator: it must be an open one of its own, on the open step. */
+export function checkHandBack(
+  card: Pick<KanbanCard, "number" | "subtasks">,
+  id: string,
+  scriptName: string,
+  note: string,
+): MarkCheck {
+  const subtask = card.subtasks.find((candidate) => candidate.id === id);
+  if (!subtask) return { ok: false, reason: `card #${card.number} has no subtask ${id}` };
+  if (!note.trim()) return { ok: false, reason: "say what failed or didn't match" };
+  if (subtask.owner !== "script") return { ok: false, reason: `subtask ${id} isn't a script's` };
+  if (subtask.state !== "open") {
+    return { ok: false, reason: `subtask ${id} is already ${subtask.state}` };
+  }
+  if (
+    subtask.script !== undefined &&
+    subtask.script.toLowerCase() !== scriptName.toLowerCase()
+  ) {
+    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+  }
+  if (subtask.step !== kanbanOpenStep(card)) {
+    return {
+      ok: false,
+      reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
+    };
+  }
+  return { ok: true };
+}
+
+/** Gives a script's open subtask to the evaluator, with the note saying what failed. */
+export const handBack = (
+  subtasks: ReadonlyArray<KanbanSubtask>,
+  id: string,
+  note: string,
+): ReadonlyArray<KanbanSubtask> =>
+  subtasks.map((subtask) => {
+    if (subtask.id !== id) return subtask;
+    const { script: _script, ...rest } = subtask;
+    return { ...rest, owner: "evaluator", note };
+  });
 
 export const markSubtask = (
   subtasks: ReadonlyArray<KanbanSubtask>,
@@ -203,6 +263,7 @@ export const OWNER_NAMES: Record<KanbanSubtask["owner"], string> = {
   work: "worker",
   review: "reviewer",
   evaluator: "evaluator",
+  script: "script",
 };
 
 /** The plan as brief lines, with what's done and what's next. */
@@ -219,7 +280,11 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
             ? "now"
             : "later";
     const note = subtask.note ? `: ${subtask.note}` : "";
-    return `- ${subtask.id} step ${subtask.step}, ${OWNER_NAMES[subtask.owner]} (${mark}${note}): ${subtask.text}`;
+    const owner =
+      subtask.script === undefined
+        ? OWNER_NAMES[subtask.owner]
+        : `${OWNER_NAMES[subtask.owner]} "${subtask.script}"`;
+    return `- ${subtask.id} step ${subtask.step}, ${owner} (${mark}${note}): ${subtask.text}`;
   });
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }
