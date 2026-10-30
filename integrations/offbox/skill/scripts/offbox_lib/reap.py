@@ -31,6 +31,40 @@ def reap(dry: bool = False) -> list[str]:
         raise
 
 
+def _still_bringing_up(con, box_id: str) -> bool:
+    row = con.execute("SELECT state FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    return bool(row) and row["state"] == "bringing_up"
+
+
+def _bringup_lock(row) -> str:
+    """The lock a live acquisition holds for its whole bring-up (lease.acquire_private)."""
+    return f"lease-{row['owner']}-{row['repo_root']}"
+
+
+def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
+    actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from boat")
+    if not dry:
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        con.commit()
+        event(con, box_id, "reap_forget", "recipe box no longer exists on boat")
+
+
+def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
+    """Delete a quarantined or abandoned bring-up box. The bring-up lock is taken first (no wait), then the row is
+    re-read: a live acquisition that finished meanwhile is left alone. act() takes the box lock itself."""
+    if dry:
+        actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
+        return
+    try:
+        with file_lock(_bringup_lock(row), timeout=0):
+            if row["state"] == "bringing_up" and not _still_bringing_up(con, bid):
+                return
+            act(bid, "delete", "recipe cancelled, box quarantined or bring-up abandoned",
+                lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
+    except OffboxError:
+        return  # a live acquisition holds the bring-up lock: skip it this pass
+
+
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
     # Local runs (local-first or fallback) whose offbox process died without recording an end.
@@ -157,17 +191,27 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
     # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
     # recipe cannot be trusted, so the box is retired like a quarantined one.
-    for r in con.execute("SELECT box_id FROM leases WHERE state IN ('quarantined','bringing_up')").fetchall():
+    # A live acquisition holds lease-<owner>-<repo> for its whole bring-up (acquire_private), so cleanup takes that same
+    # lock without waiting and re-reads the row under it. A selection made before the lock is stale: a row that became
+    # running (or was reused) is skipped, never deleted.
+    for r in con.execute("SELECT box_id, owner, repo_root, state FROM leases "
+                         "WHERE state IN ('quarantined','bringing_up')").fetchall():
         bid = r["box_id"]
+        if r["state"] == "bringing_up" and not dry and not _still_bringing_up(con, bid):
+            continue
         if bid in live:
-            act(bid, "delete", "recipe cancelled, box quarantined",
-                lambda bid=bid: lease.delete_box(con, bid, "reap: quarantined recipe box"))
+            _retire_locked(con, bid, r, dry, act, actions)
         else:
-            actions.append(f"{'would forget' if dry else 'forget'} {bid}: quarantined and gone from boat")
-            if not dry:
-                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                con.commit()
-                event(con, bid, "reap_forget", "quarantined box no longer exists on boat")
+            if r["state"] == "bringing_up" and not dry:
+                try:
+                    with file_lock(_bringup_lock(r), timeout=0):
+                        if not _still_bringing_up(con, bid):
+                            continue
+                        _forget(con, bid, actions)
+                except OffboxError:
+                    continue  # a live acquisition holds the lock: leave it to that process
+            else:
+                _forget(con, bid, actions, dry=dry)
     # Templates/bases: make sure they are stopped (they are free when stopped).
     for bid in protected:
         b = live.get(bid)

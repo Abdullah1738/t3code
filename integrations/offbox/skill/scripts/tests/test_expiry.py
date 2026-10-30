@@ -429,6 +429,75 @@ class ExpiryTests(Isolated):
         delete.assert_called_once()
         self.assertEqual(delete.call_args.args[1], "bx_int")
 
+    def _bringing_up_row(self, bid, state="bringing_up"):
+        self.con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, size, source, state, "
+                         "created_at, last_used_at) VALUES (?,'o','/r','rk','d','large','recipe:crpko-node',?,0,0)",
+                         (bid, state))
+        self.con.commit()
+
+    def _reap_with(self, live_ids):
+        """Mocks for a reap pass over the given live boxes. Returns (ExitStack, the delete_box mock)."""
+        live = [{"id": b, "state": "running"} for b in live_ids]
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(api, "list_boxes", return_value=live))
+        stack.enter_context(patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})))
+        stack.enter_context(patch.object(api, "cmd_kill"))
+        stack.enter_context(patch.object(api, "get", side_effect=lambda bid: next((x for x in live if x["id"] == bid), None)))
+        stack.enter_context(patch.object(api, "usage", return_value=None))
+        stack.enter_context(patch.object(reap, "thread_get", return_value=("ok", None)))
+        stack.enter_context(patch.object(lease, "ensure_ttl"))
+        stack.enter_context(patch.object(lease, "stop_box"))
+        delete = stack.enter_context(patch.object(lease, "delete_box", return_value=True))
+        return stack, delete
+
+    def test_reap_during_pre_recipe_ssh_setup_leaves_the_live_acquisition_alone(self):
+        # acquire_private is still in wait_ssh: it holds lease-<owner>-<repo> and the row is bringing_up. A reap pass
+        # must not delete the box; the lock says the bring-up is live.
+        self._bringing_up_row("bx_live")
+        stack, delete = self._reap_with(["bx_live"])
+        with stack, common.file_lock("lease-o-/r", timeout=5):
+            reap.reap()
+        delete.assert_not_called()
+        self.assertEqual(self.state("bx_live"), "bringing_up")
+
+    def test_reap_just_after_recipe_success_does_not_delete_a_ready_box(self):
+        # The recipe exited 0 and the acquisition promoted the row to running before the reaper's cleanup query was
+        # re-checked under the lock. The reaper must re-read the state and skip the now-ready box.
+        self._bringing_up_row("bx_ready", state="running")
+        stack, delete = self._reap_with(["bx_ready"])
+        with stack:
+            reap.reap()
+        delete.assert_not_called()
+        self.assertEqual(self.state("bx_ready"), "running")
+
+    def test_stale_cleanup_selection_after_ready_is_not_deleted(self):
+        # Selection (bringing_up) happened before the acquisition finished; the row is running by the time the
+        # reaper gets the lock. _still_bringing_up under the lock must refuse the delete.
+        self._bringing_up_row("bx_stale")
+
+        class Flipping:
+            """Delegates to the real connection; flips the row to running right after the cleanup SELECT."""
+
+            def __init__(self, con):
+                self._con, self._flipped = con, False
+
+            def execute(self, sql, *a, **k):
+                cur = self._con.execute(sql, *a, **k)
+                if not self._flipped and "SELECT box_id, owner" in sql:
+                    self._flipped = True
+                    self._con.execute("UPDATE leases SET state='running' WHERE box_id='bx_stale'")
+                    self._con.commit()
+                return cur
+
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+
+        stack, delete = self._reap_with(["bx_stale"])
+        with stack, patch.object(reap, "db", return_value=Flipping(self.con)):
+            reap.reap()
+        delete.assert_not_called()
+        self.assertEqual(self.state("bx_stale"), "running")
+
     def test_ssh_bring_up_failure_retires_the_recipe_box_before_any_reuse(self):
         # The box fails before the recipe starts (SSH never comes up). It is blank: it must be retired, not left as a
         # pool candidate that a later acquisition would return as recipe:crpko-node without building Node.
