@@ -24,6 +24,10 @@ RECOVERY_NOT_REORDER=('Still unconfirmed. Do not place another order. Check "com
                       'and "commerce reconcile-order {flow}"; rerun recover-payment later.')
 # Every paying lane is pinned to this saved card (reviews refuse any other).
 ORDER_CARD_LAST4='5542'
+# Owner pause on all ordering: while this file exists, money commands refuse (exit 4).
+PAUSE_FILE=Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home()/'.local/state/ordering-paused')
+PAUSED_COMMANDS=frozenset({'order','test-talabat-shops','await-payment','marketplace-cart','cart','recover-payment'})
+EXIT_PAUSED=4
 # Only outcomes that clearly mean the card itself was refused.
 CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
                                 'PAYMENT_DECLINED_BY_ISSUER_NO_RETRY'})
@@ -1041,6 +1045,12 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
+    if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
+        print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',
+                          'message':f"Ordering is paused: {PAUSE_FILE.read_text().strip()}",
+                          'financial_send':False,'financial_retry':False}))
+        return EXIT_PAUSED
     # Checked before any network call or money step. --chat wins; a Moni order's
     # --moni-chat (where she gave the go) is the order's chat too.
     chat=getattr(args,'chat',None) or (getattr(args,'moni_chat',None) if getattr(args,'recipient','owner')=='moni' else None)

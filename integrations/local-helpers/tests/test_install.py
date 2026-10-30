@@ -371,6 +371,28 @@ exit 0
         self.assertEqual(r.stdout.strip(), f"node {js} --version")
         self.assertNotIn("uber", self.run_install("--check")[2])
 
+    def test_uber_wrapper_refuses_ride_requests_while_ordering_is_paused(self):
+        self.nvm_uber("v26.2.0")
+        os.makedirs(self.live(".local/bin"))
+        uber = self.live(".local/bin/uber")
+        self.run_install()
+        pause = self.live(".local/state/ordering-paused")
+        os.makedirs(os.path.dirname(pause), exist_ok=True)
+        with open(pause, "w") as fh:
+            fh.write("card cancelled by owner 29 Oct\n")
+        env = {"PATH": "/usr/bin:/bin", "HOME": self.home}
+        r = subprocess.run([uber, "rides", "request"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("ORDERING_PAUSED: card cancelled by owner 29 Oct", r.stderr)
+        self.assertNotIn("node", r.stdout)
+        r = subprocess.run([uber, "rides", "estimate"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("rides estimate", r.stdout)
+        os.remove(pause)
+        r = subprocess.run([uber, "rides", "request"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("rides request", r.stdout)
+
     def test_uber_wrapper_never_replaces_someone_elses_file(self):
         self.nvm_uber("v26.2.0")
         os.makedirs(self.live(".local/bin"))

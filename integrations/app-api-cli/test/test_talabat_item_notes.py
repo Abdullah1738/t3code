@@ -2,6 +2,9 @@
 
 All transports and state roots are isolated; no live account calls or purchases.
 """
+import os as _os, tempfile as _tempfile
+# commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
+_os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
 import contextlib
 import copy
 import io
