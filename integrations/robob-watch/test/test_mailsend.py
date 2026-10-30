@@ -366,6 +366,61 @@ class MailsendTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("already sent or attempted", err)
 
+    def card_env(self, **extra):
+        # A stub renderer: writes the HTML it was given next to the PNG path, so the test can read what was drawn.
+        stub = os.path.join(self.tmp.name, "stub_render.py")
+        with open(stub, "w") as fh:
+            fh.write("import shutil, sys\nhtml, out, w, h = sys.argv[1:5]\n"
+                     "shutil.copy(html, out + '.html')\nopen(out, 'wb').write(b'\\x89PNG fake')\n")
+        return {"MAILSEND_CARD_RENDERER": f"/usr/bin/python3 {stub}", **extra}
+
+    def test_card_writes_a_png_named_for_the_draft_and_sends_nothing(self):
+        i, _ = self.draft("--cc", "moni@example.com", "--attach", self.file)
+        before = self.state(i)
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        png = os.path.join(self.drafts, "cards", f"{i}.png")
+        self.assertEqual(out.strip(), png)
+        self.assertTrue(os.path.isfile(png))
+        with open(png + ".html") as fh:
+            page = fh.read()
+        for want in ("Booking", "icloud@example.com", "host@example.com", "moni@example.com", "menu.pdf", "Can we move it to Friday?",
+                     f"draft {i}"):
+            self.assertIn(want, page)
+        self.assertEqual(self.calls("send"), [])
+        self.assertEqual(self.state(i), before)
+
+    def test_card_folds_the_quoted_original_and_splits_long_mail(self):
+        code, out, err = self.ms("reply", "-a", "gmail", "-m", "Inbox", "262282", "--body", "Thanks!")
+        i = out.split()[1]
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        with open(os.path.join(self.drafts, "cards", f"{i}.png") + ".html") as fh:
+            page = fh.read()
+        self.assertIn("+ quoted original, 1 line", page)
+        self.assertNotIn("the original secret line", page)
+        # A long body (over one card's worth of lines) comes out as card 1 and card 2, both printed.
+        long_body = "\n".join(f"line {k}" for k in range(120))
+        j, _ = self.draft(body=long_body)
+        code, out, err = self.ms("card", j, **self.card_env())
+        self.assertEqual(code, 0, err)
+        paths = out.split()
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(paths[1].endswith(f"{j}-2.png"))
+
+    def test_card_refuses_an_unknown_or_bad_id(self):
+        code, _, err = self.ms("card", "0123456789", **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("no pending draft", err)
+        code, _, err = self.ms("card", "../../etc", **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("bad draft id", err)
+        i, _ = self.draft()
+        self.ms("send", "--approved", i, "--inbound", "X1")
+        code, _, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("no pending draft", err)
+
     def test_failed_sent_copy_is_only_a_warning(self):
         i, _ = self.draft()
         code, out, err = self.ms("send", "--approved", i, "--inbound", "X1", FAKE_ADD_RC="1")

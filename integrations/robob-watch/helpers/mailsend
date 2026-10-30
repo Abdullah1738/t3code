@@ -5,6 +5,7 @@
   mailsend reply -a ACCT -m MAILBOX ID (--body TEXT | --body-file PATH) [--cc ADDR]... [--attach PATH]...
   mailsend forward -a ACCT -m MAILBOX ID -t ADDR [-t ADDR]... [--cc ADDR]... [--body TEXT | --body-file PATH] [--attach PATH]...
   mailsend show ID
+  mailsend card ID     (renders the pending draft as designed PNG card(s); prints their paths; sends nothing)
   mailsend send --approved ID [--inbound ID | --app]   (--inbound/--app are optional and not checked)
 
 draft, reply and forward build the exact message with himalaya (nothing is sent), keep it and print its preview:
@@ -15,7 +16,7 @@ new id; so does the same email drafted again after the old draft expired (it is 
 No Bcc: himalaya 2.1 leaves the Bcc header in the sent mail, so every recipient would see it.
 icloud and outlook get a copy in Sent after sending; Google accounts save their own.
 """
-import argparse, email, email.policy, fcntl, hashlib, json, os, re, shlex, subprocess, sys, time
+import argparse, email, email.policy, fcntl, hashlib, html, json, os, re, shlex, subprocess, sys, tempfile, textwrap, time
 
 HOME = os.path.expanduser("~")
 D = os.environ.get("MAILSEND_DRAFT_DIR") or os.path.join(HOME, ".local/state/mail-drafts")
@@ -38,6 +39,17 @@ TIP = "Tip: when a message speaks for Abdullah with new wording, money, dates or
 ADDR = re.compile(r"^[^\s<>@,;\"']+@[^\s<>@,;\"']+\.[^\s<>@,;\"']+$")
 RE_ID = re.compile(r"^[0-9a-f]{10}$")
 USED = ("sent", "sending", "failed", "uncertain", "expired")
+# Card rendering: the shared Robob card helper (headless Chrome shell). MAILSEND_CARD_RENDERER overrides it with
+# a command taking: html_path png_path width height (tests use it; nothing else does).
+CARD_LIB = os.environ.get("MAILSEND_CARD_LIB") or os.path.join(HOME, ".local/libexec/card-preview")
+CARD_RENDERER = os.environ.get("MAILSEND_CARD_RENDERER")
+CARD_W = 720       # px; the chat shows it ~300pt wide, so 30px body text reads at ~12pt
+CARD_FONT = '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif'
+WRAP = 34          # body characters per line in a 560px column (30px text, ~15.6px per char)
+SUBJ_WRAP = 26     # subject characters per line at 46px bold
+VAL_WRAP = 40      # address characters per line at 30px (for the height estimate)
+PAGE_LINES = 44    # body lines per card image; a longer email is split into card-2.png, card-3.png ...
+LINE = 42          # body line height in px
 
 
 def die(msg, code=2):
@@ -249,6 +261,143 @@ def cmd_build(a):
     held.close()
 
 
+def card_items(text):
+    """Display lines of the body: wrapped text, blank lines once, each quoted run folded to one line."""
+    items, quote = [], 0
+
+    def flush():
+        nonlocal quote
+        if quote:
+            items.append(("fold", f"+ quoted original, {quote} line{'s' if quote != 1 else ''}"))
+            quote = 0
+
+    for line in text.strip("\n").expandtabs(4).split("\n"):
+        if line.lstrip().startswith(">"):
+            quote += 1
+            continue
+        flush()
+        if not line.strip():
+            if items and items[-1][0] != "gap":
+                items.append(("gap", ""))
+            continue
+        for w in textwrap.wrap(line, WRAP, break_long_words=True, break_on_hyphens=False) or [""]:
+            items.append(("line", w))
+    flush()
+    while items and items[-1][0] == "gap":
+        items.pop()
+    return items or [("line", "(no text)")]
+
+
+def card_pages(items):
+    return [items[k:k + PAGE_LINES] for k in range(0, len(items), PAGE_LINES)] or [[]]
+
+
+def card_html(d, page, n, total, h):
+    e = html.escape
+    if n == 1:
+        rows = [("From", d["from"]), ("To", ", ".join(d["to"]))] + ([("Cc", ", ".join(d["cc"]))] if d["cc"] else [])
+        meta = "".join(f'<div class="row"><span class="k">{e(k)}</span><span class="v">{e(v)}</span></div>'
+                       for k, v in rows)
+        chips = "".join(f'<span class="chip">{e(f["name"])}</span>' for f in d["attachments"])
+        head = (f'<div class="subj">{e(d["subject"])}</div>{meta}'
+                + (f'<div class="chips">{chips}</div>' if chips else ""))
+    else:
+        head = f'<div class="cont">{e(d["subject"])} (continued)</div>'
+    body = "".join(f'<div class="{cls}">{e(txt)}</div>' if txt else '<div class="gap"></div>'
+                   for cls, txt in page)
+    foot = f"draft {d['id']}" + (f" · {n}/{total}" if total > 1 else "")
+    return f"""<!doctype html><html><head><meta charset="utf-8"><style>
+*{{box-sizing:border-box;margin:0}}
+html,body{{width:{CARD_W}px;height:{h}px;overflow:hidden;background:#fff}}
+body{{color:#111;font-family:{CARD_FONT};padding:34px 36px 26px;display:flex;flex-direction:column;
+-webkit-font-smoothing:antialiased}}
+.subj{{font-size:46px;font-weight:700;line-height:1.14;letter-spacing:-.02em;margin-bottom:22px}}
+.cont{{font-size:26px;font-weight:600;color:#6b7078;margin-bottom:18px}}
+.row{{display:flex;gap:18px;font-size:28px;line-height:1.36;margin-bottom:6px}}
+.k{{width:70px;flex:none;color:#6b7078}}
+.v{{min-width:0;overflow-wrap:anywhere}}
+.chips{{display:flex;flex-wrap:wrap;gap:12px;margin-top:16px}}
+.chip{{font-size:26px;font-weight:600;background:#eef0f3;border-radius:999px;padding:8px 20px;max-width:100%;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.body{{margin-top:26px;background:#f5f6f8;border-radius:24px;padding:26px 28px 22px;flex:1}}
+.line,.fold{{font-size:30px;line-height:{LINE}px;white-space:pre}}
+.fold{{color:#6b7078;font-style:italic}}
+.gap{{height:{LINE // 2}px}}
+.foot{{margin-top:18px;font-size:22px;color:#8a8f98}}
+</style></head><body>{head}
+<div class="body">{body}</div>
+<div class="foot">{e(foot)}</div>
+</body></html>"""
+
+
+def card_height(d, page, n):
+    """Estimated frame height for one page, so a long email gets a tall card and a short one a short card."""
+    h = 34 + 26 + 26 + 22 + 18 + 26 + 20       # padding, body panel padding, footer
+    if n == 1:
+        h += -(-len(d["subject"]) // SUBJ_WRAP) * 56 + 22
+        rows = [d["from"], ", ".join(d["to"])] + ([", ".join(d["cc"])] if d["cc"] else [])
+        h += sum(max(1, -(-len(v) // VAL_WRAP)) * 38 + 6 for v in rows)
+        if d["attachments"]:
+            h += 16 + 56
+    else:
+        h += 70
+    return h + len(page) * LINE + 30
+
+
+def render_card(doc, out, h):
+    if CARD_RENDERER:
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as fh:
+            fh.write(doc)
+            tmp = fh.name
+        try:
+            r = subprocess.run(shlex.split(CARD_RENDERER) + [tmp, out, str(CARD_W), str(h)], capture_output=True,
+                               timeout=120)
+        finally:
+            os.unlink(tmp)
+        if r.returncode != 0:
+            die(f"error: card renderer failed: {(r.stderr or b'').decode(errors='replace').strip()[:300]}", 1)
+        return
+    if not os.path.isfile(os.path.join(CARD_LIB, "cardpreview.py")):
+        die(f"error: card helper missing at {CARD_LIB} (nothing was sent)", 1)
+    sys.path.insert(0, CARD_LIB)
+    import cardpreview as cp
+    if not os.path.isfile(cp.CHROME):
+        die("error: headless Chrome not found, so the card can't be drawn (nothing was sent)", 1)
+    cp.render_html(doc, out, CARD_W, h)
+
+
+def cmd_card(a):
+    """Render a pending draft as PNG card(s) in the draft dir. Sends nothing, changes no draft."""
+    i = a.draft
+    if not RE_ID.match(i):
+        die(f"error: bad draft id: {i}")
+    held = lock(i)
+    if not os.path.isfile(draft_path(i)):
+        die(f"no pending draft {i}")
+    d = load(i)
+    try:
+        with open(d["eml"], "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        die(f"Refused: the stored message for draft {i} is gone. Write a new draft.")
+    if hashlib.sha256(raw).hexdigest() != d["eml_sha256"]:
+        die(f"Refused: the stored message for draft {i} changed. Write a new draft.")
+    # Same text as the preview: every text/plain part of the stored message, quoted original included.
+    text = text_of(email.message_from_bytes(raw, policy=email.policy.default))
+    items = card_items(text)
+    pages = card_pages(items)
+    os.makedirs(os.path.join(D, "cards"), exist_ok=True)
+    paths = []
+    for n, page in enumerate(pages, 1):
+        out = os.path.join(D, "cards", f"{i}.png" if n == 1 else f"{i}-{n}.png")
+        h = card_height(d, page, n)
+        render_card(card_html(d, page, n, len(pages), h), out, h)
+        paths.append(out)
+    held.close()
+    for p in paths:
+        print(p)
+
+
 def cmd_show(a):
     if not RE_ID.match(a.draft):
         die(f"error: bad draft id: {a.draft}")
@@ -331,6 +480,9 @@ def main():
     p = sub.add_parser("show")
     p.add_argument("draft")
     p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("card")
+    p.add_argument("draft")
+    p.set_defaults(fn=cmd_card)
     p = sub.add_parser("send")
     p.add_argument("--approved", required=True)
     # Accepted for old callers; nothing checks them any more.
