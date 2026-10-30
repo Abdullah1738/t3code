@@ -4873,6 +4873,10 @@ const failingLinkProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
           Layer.mock(TextGeneration.TextGeneration)({
             generateJson: (() => {
               probe.calls += 1;
+              if (probe.ok) {
+                linkFailures.remaining = linkFailures.afterPass;
+                linkFailures.afterPass = 0;
+              }
               return probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
             }) as never,
           }),
@@ -4888,7 +4892,7 @@ const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake, true)));
 
 // Fails the next `linkFailures.remaining` threadLinks reads (the recovery scan reads them first).
-const linkFailures = { remaining: 0 };
+const linkFailures = { remaining: 0, afterPass: 0 };
 const failingLinkStore = Layer.effect(
   KanbanStore.KanbanStore,
   Effect.gen(function* () {
@@ -4938,7 +4942,7 @@ it.effect("a failed recovery-alert read still wakes the paused thread on a passi
 
       // The probe passes, but the recovery-alert scan's threadLinks read fails once.
       probe.ok = true;
-      linkFailures.remaining = 1;
+      linkFailures.afterPass = 1;
       yield* TestClock.adjust("20 minutes");
       yield* kanban.probeOutages;
       assert.strictEqual(linkFailures.remaining, 0);
