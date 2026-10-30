@@ -539,6 +539,8 @@ export const KanbanBoard = Schema.Struct({
   /** Writes titles, descriptions, goal stories and groups. */
   managerModel: ModelSelection,
   evaluatorModel: ModelSelection,
+  /** Model for the shared packets evaluator; null uses evaluatorModel. */
+  packetsModel: Schema.NullOr(ModelSelection).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   defaultCardModel: ModelSelection,
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),

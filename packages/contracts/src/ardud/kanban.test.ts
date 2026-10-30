@@ -210,6 +210,7 @@ describe("kanbanBoardIcon", () => {
     defaultProjectId: null,
     managerModel: opus,
     evaluatorModel: opus,
+    packetsModel: null,
     defaultCardModel: opus,
     reviewChains: [],
     defaultReviewChain: null,

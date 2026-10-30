@@ -26,6 +26,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
+import { Button } from "../../components/ui/button";
 import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
 import { BOARD_ICONS, BoardIcon } from "./boardIcon";
@@ -228,6 +229,18 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           disabled={!canEdit}
           disabledReason={editNote}
           onChange={(defaultCardModel) => update({ defaultCardModel })}
+        />
+        <ModelPickerRow
+          label="Packets"
+          value={board.packetsModel ?? board.evaluatorModel}
+          environmentId={environmentId}
+          instanceEntries={instanceEntries}
+          settings={settings}
+          providers={providers}
+          disabled={!canEdit}
+          disabledReason={editNote}
+          onChange={(packetsModel) => update({ packetsModel })}
+          onReset={board.packetsModel ? () => update({ packetsModel: null }) : undefined}
         />
       </Section>
       <Section title="Review">
@@ -518,6 +531,8 @@ function ModelPickerRow(props: {
   disabled: boolean;
   disabledReason: string | undefined;
   onChange: (model: ModelSelection) => void;
+  /** Shows a "Use evaluator model" button; used by the Packets row while it has its own model. */
+  onReset?: (() => void) | undefined;
 }) {
   const instanceId = props.value.instanceId;
   const modelOptions = getCustomModelOptionsByInstance(
@@ -560,6 +575,11 @@ function ModelPickerRow(props: {
               props.onChange(createModelSelection(instanceId, props.value.model, options))
             }
           />
+        ) : null}
+        {props.onReset ? (
+          <Button variant="ghost" size="xs" disabled={props.disabled} onClick={props.onReset}>
+            Use evaluator model
+          </Button>
         ) : null}
       </div>
     </div>
