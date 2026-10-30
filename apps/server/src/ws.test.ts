@@ -4,17 +4,29 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION,
   AuthSessionId,
   EnvironmentId,
+  EventId,
+  MessageId,
+  OrchestrationV2GetThreadProjectionError,
   ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderSessionId,
+  RunId,
   ThreadId,
   WS_METHODS,
   WsSubscribeServerConfigRpc,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderSession,
+  type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadStreamItem,
   type OrchestrationProjectShell,
   type ServerConfig,
   type ServerConfigStreamEvent,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -24,6 +36,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
@@ -106,12 +119,15 @@ import * as Keybindings from "./keybindings.ts";
 import * as ServerSettings from "./serverSettings.ts";
 
 import * as EventStore from "./orchestration-v2/EventStore.ts";
+import * as EventSink from "./orchestration-v2/EventSink.ts";
+import { CodexProviderCapabilitiesV2 } from "./orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
+import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
@@ -334,6 +350,748 @@ const ReplayTestLayer = OrchestrationEventStore.layer.pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
 
+const layerNoThreadSessionUpdates = Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+  observeThreadSessionUpdates: () => Effect.void,
+  refreshThreadSessionUpdates: () => Effect.void,
+});
+
+const ResumeSessionTestLayer = Layer.merge(ReplayTestLayer, ProjectionStore.layerMemory);
+
+const makeSessionResumeFixture = Effect.fn("makeSessionResumeFixture")(function* (
+  options: {
+    readonly pauseRefresh?: boolean;
+    readonly interveningEvent?: boolean;
+    readonly failAt?: "initial-head" | "refreshed-head" | "refresh-read" | "refresh-commit";
+    readonly binding?: "missing" | "deleted" | "archived" | "unbound" | "codex" | "opencode-v1";
+  } = {},
+) {
+  const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const sql = yield* SqlClient.SqlClient;
+  const now = DateTime.makeUnsafe("2026-10-30T10:00:00.000Z");
+  const threadId = ThreadId.make("thread:resume:C");
+  const carrierId = ThreadId.make("thread:resume:A");
+  const instanceId = ProviderInstanceId.make("resume-provider");
+  const driver = ProviderDriverKind.make(options.binding === "codex" ? "codex" : "opencode");
+  const modelSelection = { instanceId, model: "resume-model" };
+  const session: OrchestrationV2ProviderSession = {
+    id: ProviderSessionId.make("session:resume"),
+    driver,
+    providerInstanceId: instanceId,
+    status: "ready",
+    cwd: "/resume-fixture",
+    model: modelSelection.model,
+    capabilities: {
+      ...CodexProviderCapabilitiesV2,
+      sessions: {
+        ...CodexProviderCapabilitiesV2.sessions,
+        supportsMultipleProviderThreadsPerSession: options.binding !== "opencode-v1",
+      },
+    },
+    createdAt: now,
+    updatedAt: now,
+    lastError: null,
+  };
+  const thread: OrchestrationV2ThreadProjection["thread"] = {
+    id: threadId,
+    projectId: ProjectId.make("project:resume"),
+    title: "Restored C",
+    providerInstanceId: instanceId,
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    activeProviderThreadId: null,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    forkedFrom: null,
+    createdBy: "user",
+    creationSource: "web",
+    createdAt: now,
+    updatedAt: now,
+    archivedAt: options.binding === "archived" ? now : null,
+    settledOverride: null,
+    settledAt: null,
+    lastVisitedAt: null,
+    deletedAt: options.binding === "deleted" ? now : null,
+  };
+  const message: OrchestrationV2ThreadProjection["messages"][number] = {
+    id: MessageId.make("message:restored"),
+    threadId,
+    runId: RunId.make("run:restored"),
+    nodeId: null,
+    role: "user",
+    text: "Authoritative restored message",
+    attachments: [],
+    streaming: false,
+    createdBy: "user",
+    creationSource: "web",
+    createdAt: now,
+    updatedAt: now,
+  };
+  const run: OrchestrationV2ThreadProjection["runs"][number] = {
+    id: RunId.make("run:restored"),
+    threadId,
+    ordinal: 1,
+    providerInstanceId: instanceId,
+    modelSelection,
+    providerThreadId: null,
+    userMessageId: message.id,
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "completed",
+    requestedAt: now,
+    startedAt: now,
+    completedAt: now,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  let eventOrdinal = 0;
+  const eventBase = (id = threadId) => ({
+    id: EventId.make(`resume:event:${++eventOrdinal}`),
+    threadId: id,
+    occurredAt: now,
+  });
+  const append = Effect.fn("sessionResumeFixture.append")(function* (
+    event: OrchestrationV2DomainEvent,
+  ) {
+    const committed = yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const events = yield* store.appendAgentEvents({ events: [event] });
+        if (!(options.binding === "missing" && event.threadId === threadId)) {
+          yield* projections.apply(event);
+        }
+        return events;
+      }),
+    );
+    yield* store.publishCommitted(committed);
+    return committed[0]!;
+  });
+  // SQLite allocates every sequence, including the unrelated gap. A misplaced
+  // refresh really advances C from 40 to 1001 and masks its stale cursor 50.
+  const padThrough = Effect.fn("sessionResumeFixture.padThrough")(function* (head: number) {
+    const current = yield* store.latestApplicationSequence;
+    const count = head - current;
+    assert.isAbove(count, 0);
+    yield* sql`
+      WITH RECURSIVE padding(n) AS (
+        SELECT 1 UNION ALL SELECT n + 1 FROM padding WHERE n < ${count}
+      )
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) SELECT
+        'resume:padding:' || ${current} || ':' || n, 'thread', ${carrierId}, ${current} + n,
+        'provider-session.detached', ${DateTime.formatIso(now)}, 'server',
+        ${JSON.stringify({ providerSessionId: "session:unrelated", detachedAt: DateTime.formatIso(now) })},
+        '{}', 2
+      FROM padding
+    `;
+  });
+  yield* append({ ...eventBase(), type: "thread.created", payload: thread });
+  yield* append({ ...eventBase(), type: "message.updated", payload: message });
+  yield* append({ ...eventBase(), type: "run.created", payload: run });
+  if (options.binding !== "unbound") {
+    yield* append({ ...eventBase(), type: "provider-session.attached", payload: session });
+  }
+  const cachedProjection =
+    options.binding === "missing" ? null : yield* projections.getThreadProjection(threadId);
+  yield* padThrough(39);
+  yield* append({ ...eventBase(), type: "message.updated", payload: message });
+  yield* append({
+    ...eventBase(carrierId),
+    type: "thread.created",
+    payload: {
+      ...thread,
+      id: carrierId,
+      lineage: { ...thread.lineage, rootThreadId: carrierId },
+      archivedAt: null,
+      deletedAt: null,
+    },
+  });
+  yield* append({
+    ...eventBase(carrierId),
+    type: "provider-session.attached",
+    payload: session,
+  });
+  yield* padThrough(999);
+  yield* append({
+    ...eventBase(carrierId),
+    type: "provider-session.updated",
+    payload: { ...session, status: "running" },
+  });
+  assert.equal(yield* store.latestAgentSequence(threadId), 40);
+  assert.equal(yield* store.latestAgentSequence(carrierId), 1000);
+  assert.equal(yield* store.latestApplicationSequence, 1000);
+
+  const calls: string[] = [];
+  const observers = { active: 0 };
+  const refreshStarted = yield* Queue.unbounded<void>();
+  const refreshGate = yield* Deferred.make<void>();
+  if (!options.pauseRefresh) yield* Deferred.succeed(refreshGate, undefined);
+  let headReads = 0;
+  const readError = new PersistenceSqlError({ operation: "resume-fixture.read" });
+  const commitError = new EventSink.EventSinkWriteError({ eventCount: 1 });
+  const appendMessage = Effect.fn("sessionResumeFixture.appendMessage")(function* (text: string) {
+    return yield* append({
+      ...eventBase(),
+      type: "message.updated",
+      payload: { ...message, text },
+    });
+  });
+  const snapshot = (method: "full" | "bounded") =>
+    Effect.gen(function* () {
+      calls.push(`snapshot:${method}`);
+      return {
+        schemaVersion: 2,
+        snapshotSequence: yield* store.latestAgentSequence(threadId),
+        projection: yield* projections.getThreadProjection(threadId),
+      };
+    }).pipe(Effect.orDie);
+  const layers = Layer.mergeAll(
+    Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+      observeThreadSessionUpdates: (observedId) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            assert.equal(observedId, threadId);
+            calls.push(`observe:${++observers.active}`);
+          }),
+          () => Effect.sync(() => calls.push(`release:${--observers.active}`)),
+        ).pipe(Effect.asVoid),
+      refreshThreadSessionUpdates: (refreshedId) =>
+        Effect.gen(function* () {
+          assert.equal(refreshedId, threadId);
+          calls.push("refresh:start");
+          yield* Queue.offer(refreshStarted, undefined);
+          yield* Deferred.await(refreshGate);
+          if (options.failAt === "refresh-read") return yield* Effect.fail(readError);
+          const records = yield* projections
+            .getThreadRecords(threadId, ["providerSessions"])
+            .pipe(
+              Effect.catchTag("ProjectionStoreThreadNotFoundError", () => Effect.succeed(null)),
+            );
+          if (
+            records === null ||
+            records.thread.deletedAt !== null ||
+            records.thread.archivedAt !== null
+          ) {
+            calls.push("refresh:skipped");
+            return;
+          }
+          for (const canonical of records.providerSessions) {
+            if (
+              canonical.driver !== "opencode" ||
+              !canonical.capabilities.sessions.supportsMultipleProviderThreadsPerSession
+            )
+              continue;
+            if (options.failAt === "refresh-commit") return yield* Effect.fail(commitError);
+            const stored = yield* append({
+              ...eventBase(),
+              type: "provider-session.updated",
+              driver: canonical.driver,
+              providerInstanceId: canonical.providerInstanceId,
+              payload: canonical,
+            });
+            calls.push(`refresh:commit:${stored.sequence}`);
+          }
+          if (options.interveningEvent) {
+            const stored = yield* appendMessage("Ordinary event between refresh and second head");
+            calls.push(`intervening:commit:${stored.sequence}`);
+          }
+        }).pipe(
+          Effect.mapError(
+            (cause) => new ProviderSessionManager.ProviderSessionRefreshError({ threadId, cause }),
+          ),
+        ),
+    }),
+    Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+      ...store,
+      latestAgentSequence: (requestedId) =>
+        Effect.gen(function* () {
+          assert.equal(requestedId, threadId);
+          headReads++;
+          if (
+            (headReads === 1 && options.failAt === "initial-head") ||
+            (headReads === 2 && options.failAt === "refreshed-head")
+          ) {
+            calls.push(`head:error:${headReads}`);
+            return yield* Effect.fail(readError);
+          }
+          const head = yield* store.latestAgentSequence(requestedId);
+          calls.push(`head:${head}`);
+          return head;
+        }),
+      getAgentReplayStats: (input) => {
+        assert.equal(input.threadId, threadId);
+        calls.push(`stats:${input.afterSequence}:${input.throughSequence}`);
+        return store.getAgentReplayStats(input);
+      },
+      readAgentEvents: (input) => {
+        assert.equal(input?.threadId, threadId);
+        calls.push(`replay:${input?.afterSequence}:${input?.throughSequence}`);
+        return store.readAgentEvents(input);
+      },
+    }),
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      ensureLegacyTranscript: (hydratedId) =>
+        Effect.sync(() => {
+          assert.equal(hydratedId, threadId);
+          calls.push("legacy");
+        }),
+      getThreadSnapshot: () => snapshot("full"),
+      getThreadSnapshotWindow: () => snapshot("bounded"),
+      streamStoredEventsFrom: (input) => {
+        assert.equal(input?.threadId, threadId);
+        calls.push(`tail:${input?.afterSequence}`);
+        return store.streamApplicationEvents({ afterSequence: input?.afterSequence ?? 0 }).pipe(
+          Stream.filter(
+            (stored): stored is OrchestrationV2StoredEvent =>
+              "event" in stored && stored.event.threadId === threadId,
+          ),
+          Stream.mapError(
+            (cause) => new Orchestrator.OrchestratorDomainEventStreamError({ cause }),
+          ),
+        );
+      },
+    }),
+  );
+  const open = (input: Omit<Parameters<typeof subscribeOrchestrationV2Thread>[0], "threadId">) =>
+    subscribeOrchestrationV2Thread({ threadId, ...input }).pipe(Effect.provide(layers));
+  const throughSync = (input: Parameters<typeof open>[0]) =>
+    open(input).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil((item) => item.kind === "synchronized"),
+          Stream.runCollect,
+        ),
+      ),
+    );
+  return {
+    threadId,
+    cachedProjection,
+    calls,
+    observers,
+    readError,
+    commitError,
+    open,
+    throughSync,
+    appendMessage,
+    refreshStarted: Queue.take(refreshStarted),
+    releaseRefresh: Deferred.succeed(refreshGate, undefined),
+    head: store.latestAgentSequence(threadId),
+    events: (afterSequence = 40) =>
+      store.readAgentEvents({ threadId, afterSequence }).pipe(Stream.runCollect),
+  };
+});
+
+it.live.each([false, true])(
+  "ahead-of-head OpenCode 2 resume snapshots before refresh despite a higher unrelated global head (bounded=%s)",
+  (acceptBoundedSnapshot) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSessionResumeFixture();
+      let tailSequence = 0;
+      const items = yield* fixture
+        .open({
+          afterSequence: 50,
+          requestCompletionMarker: true,
+          acceptBoundedSnapshot,
+        })
+        .pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap((item) =>
+                Effect.gen(function* () {
+                  if (item.kind !== "synchronized") return;
+                  assert.equal(fixture.observers.active, 1);
+                  tailSequence = (yield* fixture.appendMessage("Live after restored snapshot"))
+                    .sequence;
+                }),
+              ),
+              Stream.takeUntil((item) => item.kind === "event" && item.sequence === tailSequence),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.scoped,
+        );
+      assert.deepEqual(
+        items.map((item) => item.kind),
+        ["snapshot", "synchronized", "event"],
+      );
+      const snapshot = items[0];
+      assert.equal(snapshot?.kind, "snapshot");
+      if (snapshot?.kind !== "snapshot") return yield* Effect.die("Missing restored snapshot");
+      assert.equal(snapshot.snapshotSequence, 40);
+      assert.deepEqual(
+        snapshot.projection.messages.map(({ id, text }) => ({ id, text })),
+        [
+          {
+            id: MessageId.make("message:restored"),
+            text: "Authoritative restored message",
+          },
+        ],
+      );
+      assert.deepEqual(
+        snapshot.projection.runs.map(({ id, status }) => ({ id, status })),
+        [
+          {
+            id: RunId.make("run:restored"),
+            status: "completed",
+          },
+        ],
+      );
+      assert.equal(snapshot.projection.providerSessions[0]?.status, "running");
+      assert.deepEqual(fixture.calls, [
+        "observe:1",
+        "legacy",
+        "head:40",
+        `snapshot:${acceptBoundedSnapshot ? "bounded" : "full"}`,
+        "tail:40",
+        "release:0",
+      ]);
+      assert.equal(fixture.observers.active, 0);
+      assert.equal(tailSequence, 1001);
+      assert.deepEqual(
+        (yield* fixture.events()).map((stored) => stored.event.type),
+        ["message.updated"],
+      );
+    }).pipe(Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live.each([
+  { acceptBoundedSnapshot: false, interveningEvent: false },
+  { acceptBoundedSnapshot: true, interveningEvent: false },
+  { acceptBoundedSnapshot: false, interveningEvent: true },
+  { acceptBoundedSnapshot: true, interveningEvent: true },
+])("valid restored cursor replays through the post-refresh thread head (%j)", (options) =>
+  Effect.gen(function* () {
+    const fixture = yield* makeSessionResumeFixture(options);
+    const highWater = options.interveningEvent ? 1002 : 1001;
+    let tailSequence = 0;
+    const items = yield* fixture
+      .open({
+        afterSequence: 40,
+        requestCompletionMarker: true,
+        acceptBoundedSnapshot: options.acceptBoundedSnapshot,
+      })
+      .pipe(
+        Effect.flatMap((stream) =>
+          stream.pipe(
+            Stream.tap((item) =>
+              Effect.gen(function* () {
+                if (item.kind !== "synchronized") return;
+                tailSequence = (yield* fixture.appendMessage("Buffered live tail")).sequence;
+              }),
+            ),
+            Stream.takeUntil((item) => item.kind === "event" && item.sequence === tailSequence),
+            Stream.runCollect,
+          ),
+        ),
+        Effect.scoped,
+      );
+    assert.deepEqual(fixture.calls, [
+      "observe:1",
+      "legacy",
+      "head:40",
+      "refresh:start",
+      "refresh:commit:1001",
+      ...(options.interveningEvent ? ["intervening:commit:1002"] : []),
+      `head:${highWater}`,
+      `stats:40:${highWater}`,
+      `replay:40:${highWater}`,
+      `tail:${highWater}`,
+      "release:0",
+    ]);
+    assert.deepEqual(
+      items.map((item) => item.kind),
+      options.interveningEvent
+        ? ["event", "event", "synchronized", "event"]
+        : ["event", "synchronized", "event"],
+    );
+    assert.deepEqual(
+      items.flatMap((item) => (item.kind === "event" ? [item.sequence] : [])),
+      options.interveningEvent ? [1001, 1002, 1003] : [1001, 1002],
+    );
+    const refreshed = items[0];
+    assert.equal(refreshed?.kind, "event");
+    if (refreshed?.kind !== "event") return yield* Effect.die("Missing session refresh");
+    assert.equal(refreshed.event.type, "provider-session.updated");
+    if (refreshed.event.type !== "provider-session.updated")
+      return yield* Effect.die("Wrong refresh type");
+    assert.equal(refreshed.event.threadId, fixture.threadId);
+    assert.equal(refreshed.event.payload.status, "running");
+    assert.deepEqual(refreshed.event.payload, {
+      ...fixture.cachedProjection!.providerSessions[0]!,
+      status: "running",
+    });
+    if (options.interveningEvent) {
+      const ordinary = items[1];
+      assert.equal(
+        ordinary?.kind === "event" && ordinary.event.type === "message.updated"
+          ? ordinary.event.payload.text
+          : null,
+        "Ordinary event between refresh and second head",
+      );
+    }
+    assert.equal(fixture.observers.active, 0);
+  }).pipe(Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live.each([false, true])(
+  "OpenCode 2 resume replays a canonical session refresh without replacing history (bounded=%s)",
+  (acceptBoundedSnapshot) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSessionResumeFixture({ pauseRefresh: true });
+      assert.equal(fixture.cachedProjection?.providerSessions[0]?.status, "ready");
+      const firstItems = yield* Queue.unbounded<OrchestrationV2ThreadStreamItem>();
+      const secondItems = yield* Queue.unbounded<OrchestrationV2ThreadStreamItem>();
+      const subscribe = (
+        afterSequence: number,
+        items: Queue.Queue<OrchestrationV2ThreadStreamItem>,
+      ) =>
+        fixture.open({ afterSequence, requestCompletionMarker: true, acceptBoundedSnapshot }).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(Stream.runForEach((item) => Queue.offer(items, item))),
+          ),
+          Effect.scoped,
+          Effect.forkChild,
+        );
+      const first = yield* subscribe(40, firstItems);
+      yield* fixture.refreshStarted;
+      assert.deepEqual(fixture.calls, ["observe:1", "legacy", "head:40", "refresh:start"]);
+      assert.equal(fixture.observers.active, 1);
+      assert.equal(yield* fixture.head, 40);
+      assert.isEmpty(yield* fixture.events());
+      yield* fixture.releaseRefresh;
+      const refresh = yield* Queue.take(firstItems);
+      assert.equal(refresh.kind, "event");
+      if (refresh.kind !== "event") return yield* Effect.die("Missing canonical refresh");
+      assert.equal(refresh.sequence, 1001);
+      assert.equal(
+        refresh.event.type === "provider-session.updated" ? refresh.event.payload.status : null,
+        "running",
+      );
+      assert.equal((yield* Queue.take(firstItems)).kind, "synchronized");
+      assert.deepEqual(fixture.calls, [
+        "observe:1",
+        "legacy",
+        "head:40",
+        "refresh:start",
+        "refresh:commit:1001",
+        "head:1001",
+        "stats:40:1001",
+        "replay:40:1001",
+        "tail:1001",
+      ]);
+
+      const live = yield* fixture.appendMessage("First client's live tail");
+      const firstTail = yield* Queue.take(firstItems);
+      assert.equal(firstTail.kind === "event" ? firstTail.sequence : null, live.sequence);
+      const second = yield* subscribe(1001, secondItems);
+      yield* fixture.refreshStarted;
+      const secondReplay = yield* Queue.take(secondItems);
+      const secondRefresh = yield* Queue.take(secondItems);
+      assert.equal(secondReplay.kind === "event" ? secondReplay.sequence : null, 1002);
+      assert.equal(secondRefresh.kind === "event" ? secondRefresh.sequence : null, 1003);
+      assert.equal((yield* Queue.take(secondItems)).kind, "synchronized");
+      const sharedTail = yield* Queue.take(firstItems);
+      assert.equal(sharedTail.kind === "event" ? sharedTail.sequence : null, 1003);
+      assert.equal(fixture.observers.active, 2);
+      yield* Fiber.interrupt(first);
+      assert.equal(fixture.observers.active, 1);
+      assert.equal(fixture.calls.at(-1), "release:1");
+      const remainingLive = yield* fixture.appendMessage("Second client stays subscribed");
+      const secondTail = yield* Queue.take(secondItems);
+      assert.equal(
+        secondTail.kind === "event" ? secondTail.sequence : null,
+        remainingLive.sequence,
+      );
+      yield* Fiber.interrupt(second);
+      assert.equal(fixture.observers.active, 0);
+
+      let cursor = remainingLive.sequence;
+      for (const reason of ["application-active", "application-active-probe", "navigation-back"]) {
+        const callStart = fixture.calls.length;
+        const items = yield* fixture
+          .throughSync({
+            afterSequence: cursor,
+            requestCompletionMarker: true,
+            acceptBoundedSnapshot,
+          })
+          .pipe(Effect.scoped);
+        assert.deepEqual(
+          items.map((item) => item.kind),
+          ["event", "synchronized"],
+          reason,
+        );
+        assert.deepEqual(
+          fixture.calls.slice(callStart),
+          [
+            "observe:1",
+            "legacy",
+            `head:${cursor}`,
+            "refresh:start",
+            `refresh:commit:${cursor + 1}`,
+            `head:${cursor + 1}`,
+            `stats:${cursor}:${cursor + 1}`,
+            `replay:${cursor}:${cursor + 1}`,
+            `tail:${cursor + 1}`,
+            "release:0",
+          ],
+          reason,
+        );
+        const item = items[0];
+        assert.equal(
+          item?.kind === "event" && item.event.type === "provider-session.updated"
+            ? item.event.payload.status
+            : null,
+          "running",
+          reason,
+        );
+        cursor++;
+      }
+      assert.isFalse(fixture.calls.some((call) => call.startsWith("snapshot:")));
+      assert.equal(fixture.observers.active, 0);
+    }).pipe(Effect.scoped, Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live.each(["initial-head", "refreshed-head", "refresh-read", "refresh-commit"] as const)(
+  "thread resume fails without synchronizing and releases its observer on %s failure",
+  (failAt) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSessionResumeFixture({ failAt });
+      const items: OrchestrationV2ThreadStreamItem[] = [];
+      const error = yield* fixture.open({ afterSequence: 40, requestCompletionMarker: true }).pipe(
+        Effect.flatMap((stream) =>
+          stream.pipe(
+            Stream.runForEach((item) =>
+              Effect.sync(() => {
+                items.push(item);
+              }),
+            ),
+          ),
+        ),
+        Effect.scoped,
+        Effect.flip,
+      );
+      assert.instanceOf(error, OrchestrationV2GetThreadProjectionError);
+      assert.isEmpty(items);
+      assert.equal(fixture.observers.active, 0);
+      assert.isFalse(fixture.calls.some((call) => /^(snapshot|stats|replay|tail):/.test(call)));
+      if (failAt === "initial-head") {
+        assert.deepEqual(fixture.calls, ["observe:1", "legacy", "head:error:1", "release:0"]);
+        assert.equal(error.cause, fixture.readError);
+      } else if (failAt === "refreshed-head") {
+        assert.deepEqual(fixture.calls, [
+          "observe:1",
+          "legacy",
+          "head:40",
+          "refresh:start",
+          "refresh:commit:1001",
+          "head:error:2",
+          "release:0",
+        ]);
+        assert.equal(error.cause, fixture.readError);
+      } else {
+        assert.deepEqual(fixture.calls, [
+          "observe:1",
+          "legacy",
+          "head:40",
+          "refresh:start",
+          "release:0",
+        ]);
+        assert.instanceOf(error.cause, ProviderSessionManager.ProviderSessionRefreshError);
+        if (Schema.is(ProviderSessionManager.ProviderSessionRefreshError)(error.cause)) {
+          assert.equal(
+            error.cause.cause,
+            failAt === "refresh-read" ? fixture.readError : fixture.commitError,
+          );
+        }
+      }
+      assert.equal((yield* fixture.events()).length, failAt === "refreshed-head" ? 1 : 0);
+    }).pipe(Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live.each(["missing", "deleted", "archived", "unbound", "codex", "opencode-v1"] as const)(
+  "thread resume keeps ordinary replay when session refresh has no eligible binding (%s)",
+  (binding) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSessionResumeFixture({ binding });
+      const items = yield* fixture
+        .throughSync({ afterSequence: 39, requestCompletionMarker: true })
+        .pipe(Effect.scoped);
+      assert.deepEqual(
+        items.map((item) => item.kind),
+        ["event", "synchronized"],
+      );
+      const replayed = items[0];
+      assert.equal(replayed?.kind === "event" ? replayed.sequence : null, 40);
+      assert.equal(
+        replayed?.kind === "event" && replayed.event.type === "message.updated"
+          ? replayed.event.payload.text
+          : null,
+        "Authoritative restored message",
+      );
+      assert.deepEqual(fixture.calls, [
+        "observe:1",
+        "legacy",
+        "head:40",
+        "refresh:start",
+        ...(["missing", "deleted", "archived"].includes(binding) ? ["refresh:skipped"] : []),
+        "head:40",
+        "stats:39:40",
+        "replay:39:40",
+        "tail:40",
+        "release:0",
+      ]);
+      assert.isEmpty(yield* fixture.events());
+      assert.equal(fixture.observers.active, 0);
+    }).pipe(Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live.each([false, true])(
+  "cold thread detail observes before snapshot without refreshing (bounded=%s)",
+  (acceptBoundedSnapshot) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSessionResumeFixture();
+      const items = yield* fixture
+        .throughSync({ requestCompletionMarker: true, acceptBoundedSnapshot })
+        .pipe(Effect.scoped);
+      assert.deepEqual(
+        items.map((item) => item.kind),
+        ["snapshot", "synchronized"],
+      );
+      assert.deepEqual(fixture.calls, [
+        "observe:1",
+        "legacy",
+        `snapshot:${acceptBoundedSnapshot ? "bounded" : "full"}`,
+        "tail:40",
+        "release:0",
+      ]);
+      assert.isEmpty(yield* fixture.events());
+    }).pipe(Effect.provide(ResumeSessionTestLayer)),
+);
+
+it.live("cancelling a paused resume refresh releases the thread observer without a write", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeSessionResumeFixture({ pauseRefresh: true });
+    const fiber = yield* fixture
+      .throughSync({ afterSequence: 40, requestCompletionMarker: true })
+      .pipe(Effect.scoped, Effect.forkChild);
+    yield* fixture.refreshStarted;
+    assert.equal(fixture.observers.active, 1);
+    yield* Fiber.interrupt(fiber);
+    assert.deepEqual(fixture.calls, [
+      "observe:1",
+      "legacy",
+      "head:40",
+      "refresh:start",
+      "release:0",
+    ]);
+    assert.equal(fixture.observers.active, 0);
+    assert.isEmpty(yield* fixture.events());
+  }).pipe(Effect.scoped, Effect.provide(ResumeSessionTestLayer)),
+);
+
 it.live.each(["thread", "shell"] as const)(
   "%s resume skips unknown types, synchronizes, and receives the live tail",
   (scope) =>
@@ -443,7 +1201,10 @@ it.live.each(["thread", "shell"] as const)(
         items.flatMap((item) => (item.sequence === undefined ? [] : [item.sequence])),
         [after!.sequence, liveSequence],
       );
-    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(ReplayTestLayer, layerNoThreadSessionUpdates)),
+    ),
 );
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
@@ -485,7 +1246,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
   Layer.mock(ProviderLatestVersions.ProviderLatestVersions)({}),
   Layer.mock(ProviderMaintenanceRunner.ProviderMaintenanceRunner)({}),
-  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+  layerNoThreadSessionUpdates,
   Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
   Layer.mock(PullRequestService.PullRequestService)({}),
   Layer.mock(PullRequestSyncReactor.PullRequestSyncReactor)({}),
@@ -776,6 +1537,8 @@ it.effect("thread resume across compacted history keeps message order and final 
       ],
     );
   }).pipe(
+    Effect.scoped,
+    Effect.provide(layerNoThreadSessionUpdates),
     Effect.provide(
       ProjectionMaintenance.layer.pipe(
         Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),

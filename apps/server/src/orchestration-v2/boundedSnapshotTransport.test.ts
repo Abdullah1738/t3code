@@ -43,6 +43,7 @@ import { subscribeOrchestrationV2Thread } from "../ws.ts";
 import * as OrchestrationHttp from "./http.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
+import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
 const decodeBounded = Schema.decodeUnknownSync(
@@ -230,6 +231,10 @@ const TestLayer = Layer.mergeAll(
   }),
   Layer.effectDiscard(seed),
   Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
+  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+    observeThreadSessionUpdates: () => Effect.void,
+    refreshThreadSessionUpdates: () => Effect.void,
+  }),
   Layer.mock(ProjectStore.ProjectStoreV2)({}),
   Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({}),
 ).pipe(Layer.provideMerge(store));
