@@ -4544,6 +4544,11 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // The apps never show a card's prompt (they read one card in full through card), and on big boards prompts are most of the feed.
+  const feedCard = (card: KanbanCard): KanbanCard => ({ ...card, prompt: "" });
+  const feedChange = (change: KanbanChange): KanbanChange =>
+    change._tag === "card" ? { ...change, card: feedCard(change.card) } : change;
+
   const watch: KanbanServiceShape["watch"] = (boardId) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -4551,10 +4556,18 @@ const make = Effect.gen(function* () {
         const snapshot = yield* read(snapshotOf(boardId));
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
-          Stream.map((entry): KanbanWatchEvent => ({ _tag: "change", change: entry.change })),
+          Stream.map(
+            (entry): KanbanWatchEvent => ({
+              _tag: "change",
+              change: feedChange(entry.change),
+            }),
+          ),
         );
         return Stream.concat(
-          Stream.succeed<KanbanWatchEvent>({ _tag: "snapshot", snapshot }),
+          Stream.succeed<KanbanWatchEvent>({
+            _tag: "snapshot",
+            snapshot: { ...snapshot, cards: snapshot.cards.map(feedCard) },
+          }),
           live,
         );
       }),

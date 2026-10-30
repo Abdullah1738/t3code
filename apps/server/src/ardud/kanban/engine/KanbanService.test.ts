@@ -1397,6 +1397,40 @@ it.effect("board summaries count running, waiting and unread, and list the board
   }),
 );
 
+it.effect("the board feed leaves prompts out; card reads and snapshots keep them", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Packet text", title: "A" },
+        owner,
+      );
+      const pull = yield* Stream.toPull(kanban.watch(board.id));
+      const firstEvents = Array.from(yield* pull);
+      const snapshotEvent = firstEvents.find((event) => event._tag === "snapshot");
+      assert.isDefined(snapshotEvent);
+      if (snapshotEvent?._tag !== "snapshot") return;
+      assert.strictEqual(snapshotEvent.snapshot.cards[0]!.prompt, "");
+      assert.strictEqual(snapshotEvent.snapshot.cards[0]!.title, "A");
+
+      yield* kanban.editCard(card.id, { priority: 2 }, owner);
+      const nextEvents = Array.from(yield* pull);
+      const changed = nextEvents.find(
+        (event) => event._tag === "change" && event.change._tag === "card",
+      );
+      assert.isDefined(changed);
+      if (changed?._tag !== "change" || changed.change._tag !== "card") return;
+      assert.strictEqual(changed.change.card.prompt, "");
+      assert.strictEqual(changed.change.card.priority, 2);
+
+      assert.strictEqual((yield* kanban.card(card.id)).card.prompt, "Packet text");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).cards[0]!.prompt, "Packet text");
+    }).pipe(Effect.scoped, Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a thread can't reword or replace a flag someone else set", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
