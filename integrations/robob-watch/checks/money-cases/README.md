@@ -12,8 +12,11 @@ money-cases add acme-refund --merchant Acme --amount 120.50 --currency AED \
   --next "card dispute" --deadline 2026-10-25 --who Abdullah --watcher acme-refund-reply
 money-cases list [--all] [--json]
 money-cases show ID
-money-cases update ID --state "..." --next "..." --deadline 2026-10-28 --because "owner: Wed ok" [--add-watcher ID] [--note "..."]
+money-cases update ID --state "..." --next "..." --deadline 2026-10-28 --because "Acme agreed to Wed" [--add-watcher ID] [--note "..."]
 # a deadline change needs --because (the reason) or --reply (his reply id); it is refused otherwise and recorded in history
+money-cases update ID --state "..." --reply msg-9001      # his answer: restarts the two-day clock
+money-cases corroborate ID --merchant boat.dev --amount 25 --currency USD --charged 2026-10-25 --observation "SMS 10:45"
+# another channel saw the same charge: counted once; refused if the charge does not match exactly
 money-cases add talabat-2792 --unmatched --amount 90.30 --currency AED --charged 2026-10-25 --kind charge \
   --state "charge on 2792, merchant not matched" --next "owner: which order?" --deadline 2026-10-28 --who Abdullah
 # --unmatched records merchant "unmatched"; an unmatched charge is never named or matched to a guess
@@ -29,8 +32,8 @@ A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open c
 Rules added 2026-10-30 (money-cases fixes, card #10):
 - **No self-moved deadlines.** A deadline change without `--because` or `--reply` is refused and changes nothing. The reason goes into `history`.
 - **One reminder a case a day.** A second reminder the same day is held until the next day.
-- **One yes/no after two silent days.** When a case has had no answer from him for 2 days, the check sends a single yes/no and then stays quiet on that case until he answers. An answer is a `close`, a `reopen`, or a deadline change with `--because`/`--reply`; the two-day clock restarts from it.
-- **One charge, however it was seen.** A charge with the same merchant, amount, currency and day is one charge, whether it came by email or SMS (the references differ, so they are not compared). A charge still `unmatched` is never merged.
+- **One yes/no after two silent days.** The clock starts at the first reminder delivered after his last answer, not at case creation, so a case that was never reminded is never asked about. After two days with no answer the check sends one yes/no and then stays quiet until he answers. An answer is a `close`, a `reopen`, or an update with `--reply` (his reply id). A `--because` reason is recorded but is not an answer, so a process that moves a deadline leaves the case quiet.
+- **Charges are not merged by the check.** A second charge with the same merchant, amount, currency, day and kind is refused by `add` unless its reference differs (then it is a second transaction). To record that another channel saw the same charge, use `corroborate`, which only succeeds on an exact match. Two real same-day equal-value charges with different references both stay. A charge still `unmatched` is never merged.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 

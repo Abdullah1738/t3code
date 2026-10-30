@@ -181,21 +181,45 @@ def charge_key(case):
             case.get('charged') or case['opened'][:10])
 
 
-def same_charge(cases, new):
-    """Id of a recorded charge with the same merchant, amount, currency and day, or None.
+def norm_ref(text):
+    return ' '.join(str(text or '').split()).lower()
 
-    That is the one rule for a charge seen in mail and again by SMS: the references differ (email
-    vs SMS), so they are not compared. An unmatched charge can't be told apart from another one,
-    so it is never a duplicate."""
+
+def same_charge(cases, new):
+    """Id of a recorded charge that the new one could be a repeat of, or None.
+
+    Same merchant, amount, currency, day and kind, and no distinct reference on either side. Two
+    references that differ are two transactions, so they are kept apart. Nothing is merged here:
+    a repeat is only linked with an explicit `corroborate`. An unmatched charge is never a repeat."""
     if new['merchant'] == UNMATCHED:
         return None
-    key = charge_key(new)
+    key, kind, ref = charge_key(new), new.get('kind', 'charge'), norm_ref(new.get('reference'))
     for c in cases:
-        if c.get('merchant') == UNMATCHED:
+        if c.get('merchant') == UNMATCHED or c.get('kind', 'charge') != kind or charge_key(c) != key:
             continue
-        if charge_key(c) == key:
-            return c['id']
+        other = norm_ref(c.get('reference'))
+        if ref and other and ref != other:
+            continue
+        return c['id']
     return None
+
+
+def corroborate(data, case_id, merchant, amount, currency, charged, kind, observation, at=None):
+    """Record that another channel (say SMS after mail) saw the same charge. Counts it once.
+
+    Refuses unless the charge matches the case exactly, so a corroboration can never merge two charges."""
+    candidate = {'merchant': check_text('merchant', merchant), 'amount': check_amount(amount),
+                 'currency': check_currency(currency), 'charged': check_charged(charged), 'kind': kind}
+    with Locked(data) as book:
+        case = find(book, case_id)
+        if case.get('status') != 'open':
+            raise CaseError(f'case {case_id!r} is closed; reopen it first')
+        if case.get('merchant') == UNMATCHED or charge_key(case) != charge_key(candidate) \
+                or case.get('kind', 'charge') != kind:
+            raise CaseError(f'{case_id!r} is not this charge (merchant, amount, currency, day or kind differ)')
+        case['updated'] = stamp(at)
+        case['history'].append({'at': stamp(at), 'text': 'seen again: ' + check_text('observation', observation)})
+    return case
 
 
 def moment(text):
@@ -207,7 +231,9 @@ def moment(text):
 
 
 def answered_at(case):
-    """When he last answered: a close, a reopen, or an update with --because or --reply. Else when it opened."""
+    """When he last answered: a close, a reopen, or an update with --reply (his reply id). Else when it opened.
+
+    A --because reason is recorded but is not an answer: it can come from a process, not from him."""
     owned = [m for m in (moment(h.get('at')) for h in case.get('history', []) if h.get('owner')) if m]
     return max(owned) if owned else moment(case['opened'])
 
@@ -370,7 +396,8 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
             raise CaseError('nothing to change')
         case['updated'] = stamp(at)
         entry = {'at': stamp(at), 'text': '; '.join(said)}
-        if because or reply:
+        if reply:
+            # Only his reply id is an owner answer; a --because reason alone is recorded, not answered.
             entry['owner'] = True
         case['history'].append(entry)
     return case
@@ -441,8 +468,12 @@ def clip(text, n=160):
     return text if len(text) <= n else text[:n - 1] + '…'
 
 
-def attention(cases, now, sent, root=None):
-    """(head, items, tail) for each open case with pings it hasn't had; items are (key, text) pairs."""
+def attention(cases, now, sent, root=None, since=None):
+    """(head, items, tail, day) for each open case with pings it hasn't had; items are (key, text) pairs.
+
+    `since` maps a case id to {'answer': <answer time>, 'at': <when its first reminder was delivered>}. The
+    two-day clock for the yes/no starts there, so a case with no reminder yet is never asked about."""
+    since = since or {}
     entries = []
     for case in cases:
         if case.get('status') != 'open':
@@ -475,7 +506,11 @@ def attention(cases, now, sent, root=None):
             continue
         found = [(k, t) for k, t in found if k not in sent]
         # The yes/no goes last, so every reminder still pending is sent before the case goes quiet.
-        if now - answer >= ASK_AFTER:
+        # Its clock starts at the first reminder delivered since his last answer, not at case creation.
+        clock = since.get(cid)
+        started = moment(clock.get('at')) if clock and clock.get('answer') == answer.isoformat() else None
+        # A start only counts when its reminder went out after his answer, not before it.
+        if started and started >= answer and now - started >= ASK_AFTER:
             found.append((ask_key, ASK))
         if not found:
             continue
@@ -547,9 +582,14 @@ def run_check(wd, run, data=None, root=None, now=None):
     state = read_json(pings, {'sent': {}})
     state.setdefault('sent', {})
     out = state.pop('outbox', None)
+    clock = state.setdefault('clock', {})
     if out and delivered(out, wd):
         for key in out['keys']:
             state['sent'][key] = out['at']
+        # Start the two-day yes/no clock at the first reminder actually delivered since the last answer.
+        for cid, answer in out.get('clock', {}).items():
+            if clock.get(cid, {}).get('answer') != answer['answer']:
+                clock[cid] = {'answer': answer['answer'], 'at': out['at']}
     # An event the runner never took is rebuilt from the book, so it skips quiet hours and closed or moved cases.
     cases = load(data)['cases']
     cutoff = stamp(now - KEEP_SENT)
@@ -557,7 +597,7 @@ def run_check(wd, run, data=None, root=None, now=None):
     state['sent'] = {k: v for k, v in state['sent'].items() if v >= cutoff or k in live or k.startswith(live)}
     event = ''
     if not quiet(now):
-        entries = attention(cases, now, state['sent'], root)
+        entries = attention(cases, now, state['sent'], root, clock)
         if entries:
             header = f'Money cases: {len(entries)} need attention.'
             footer = 'Details: money-cases show ID.'
@@ -591,7 +631,15 @@ def run_check(wd, run, data=None, root=None, now=None):
                 tail.insert(0, f'{len(entries) - full} more need attention; they follow in a later check '
                                f'(one reminder per case a day; money-cases list).')
             event = '\n'.join([header, *shown, *tail])
-            state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd)}
+            # The clock start for any case whose first reminder is in this event (only when it is delivered).
+            by_id = {c['id']: c for c in cases}
+            starts = {}
+            for key in taken:
+                cid = key.split('|', 1)[0]
+                if cid in by_id and cid not in starts:
+                    starts[cid] = {'answer': answered_at(by_id[cid]).isoformat()}
+            state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
+                               'clock': starts}
     write_json(pings, state)
     return event
 
@@ -668,6 +716,14 @@ def main(argv=None):
     p.add_argument('id')
     p.add_argument('--deadline', required=True)
     p.add_argument('--note', required=True)
+    p = sub.add_parser('corroborate', help='another channel saw this same charge: counted once, not added again')
+    p.add_argument('id')
+    p.add_argument('--merchant', required=True)
+    p.add_argument('--amount', required=True)
+    p.add_argument('--currency', required=True)
+    p.add_argument('--charged', required=True, help='charge date YYYY-MM-DD')
+    p.add_argument('--kind', default='charge', choices=KINDS)
+    p.add_argument('--observation', required=True, help='where it was seen, e.g. "SMS 10:45"')
     sub.add_parser('brief')
     sub.add_parser('check')
     args = parser.parse_args(argv)
@@ -703,6 +759,10 @@ def main(argv=None):
             changes = {f: getattr(args, f) for f in FIELDS}
             update(DATA, args.id, changes, args.add_watcher, args.drop_watcher, args.note,
                    because=args.because, reply=args.reply)
+            print(table([find(load(), args.id)]))
+        elif args.command == 'corroborate':
+            corroborate(DATA, args.id, args.merchant, args.amount, args.currency, args.charged, args.kind,
+                        args.observation)
             print(table([find(load(), args.id)]))
         elif args.command == 'close':
             close(DATA, args.id, args.outcome)

@@ -334,7 +334,11 @@ class Pings(Base):
         book = json.loads((self.data / 'cases.json').read_text())
         book['cases'][1]['deadline'] = 'soon'
         (self.data / 'cases.json').write_text(json.dumps(book))
-        self.assertIn('later', self.check('2026-12-24T13:00', 'r2'))
+        # The 'later' case is first reminded when its deadline is near, not earlier. The acme watcher ending is
+        # still raised once, on this check, as the case is open.
+        event = self.check('2026-12-24T13:00', 'r2')
+        self.assertIn('acme', event)
+        self.assertIn('later', self.check('2027-06-01T10:00', 'r2b'))
         # Months later both keys are past the 60-day prune, but the case is still open on the same cycle.
         self.assertEqual(self.check('2027-03-01T10:00', 'r3'), '')
         self.assertEqual(self.check('2027-05-01T10:00', 'r4'), '')
@@ -392,8 +396,8 @@ class Rules(Base):
         self.assertIn('OVERDUE', self.check('2026-10-25T19:00', 'r3'))
 
     def test_after_two_unanswered_days_exactly_one_yes_no_then_silence(self):
-        # The case is opened 24 Oct (the answer clock starts there); from 26 Oct the yes/no is due.
-        self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
+        # Deadline inside the 24h window, so the first reminder is delivered 24 Oct and starts the clock.
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
         seen = []
         for day in range(24, 32):
             event = self.check(f'2026-10-{day}T10:00', f'r{day}')
@@ -403,23 +407,71 @@ class Rules(Base):
         self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
                               if '|ask|' in k]), 1)
 
-    def test_answering_restarts_the_yes_no_clock(self):
+    def test_a_future_case_is_not_asked_before_its_first_reminder(self):
         self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
-        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r1'))
-        # An owner answer (a deadline change with a reason) starts a fresh two-day clock.
-        mc.update(self.data, 'acme', {'deadline': '2026-12-01'}, because='owner: keep chasing',
+        for day in range(24, 28):
+            self.assertNotIn('Yes or no', self.check(f'2026-10-{day}T10:00', f'q{day}'))
+
+    def test_answering_restarts_the_yes_no_clock(self):
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.assertIn('due Sun 25 Oct', self.check('2026-10-24T10:00', 'r1'))
+        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r2'))
+        # His reply id is an owner answer: a fresh two-day clock starts from the next delivered reminder.
+        mc.update(self.data, 'acme', {'state': 'keep chasing'}, reply='msg-9001', at=at('2026-10-27T09:00'))
+        # The answer on 27 Oct restarts the clock from the first reminder after it (28 Oct), so the next
+        # yes/no is due 30 Oct, two days later. Nothing is asked in between.
+        self.assertNotIn('Yes or no', self.check('2026-10-28T10:00', 'r3'))
+        self.assertNotIn('Yes or no', self.check('2026-10-29T10:00', 'r4'))
+        self.assertIn('Yes or no', self.check('2026-10-30T10:00', 'r5'))
+        self.assertEqual(self.check('2026-10-31T10:00', 'r6'), '')
+
+    def test_reason_only_update_after_the_yes_no_leaves_the_case_quiet(self):
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.check('2026-10-24T10:00', 'r1')
+        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r2'))
+        # The merchant asked for more time: a process, not him, so the case stays quiet.
+        mc.update(self.data, 'acme', {'deadline': '2026-12-15'}, because='merchant requested more time',
                   at=at('2026-10-27T09:00'))
-        self.assertEqual(self.check('2026-10-28T10:00', 'r2'), '')
-        self.assertIn('Yes or no', self.check('2026-10-29T10:00', 'r3'))
+        for day in range(28, 32):
+            self.assertNotIn('Yes or no', self.check(f'2026-10-{day}T10:00', f'q{day}'))
+        self.assertEqual(self.check('2026-11-20T10:00', 'q-later'), '')
 
     def test_email_and_sms_of_the_same_charge_count_once(self):
         self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
-                  charged='2026-10-25', reference='email 09:13')
+                  charged='2026-10-25')
         with self.assertRaises(mc.CaseError) as err:
             self.case('boat-sms', merchant='Boat.dev ', amount='25', currency='usd', deadline='2026-11-10',
-                      charged='2026-10-25', reference='sms 10:45')
+                      charged='2026-10-25')
         self.assertIn('boat-mail', str(err.exception))
-        self.assertEqual([c['id'] for c in mc.load(self.data)['cases']], ['boat-mail'])
+        mc.corroborate(self.data, 'boat-mail', 'boat.dev', '25', 'USD', '2026-10-25', 'charge',
+                       'SMS 10:45', at=at('2026-10-25T10:45'))
+        book = mc.load(self.data)['cases']
+        self.assertEqual([c['id'] for c in book], ['boat-mail'])
+        self.assertIn('seen again: SMS 10:45', book[0]['history'][-1]['text'])
+
+    def test_corroborate_refuses_a_different_charge(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        for args in (dict(amount='26'), dict(charged='2026-10-26'), dict(merchant='Other Co')):
+            with self.subTest(args=args), self.assertRaises(mc.CaseError):
+                base = dict(merchant='boat.dev', amount='25', currency='USD', charged='2026-10-25')
+                base.update(args)
+                mc.corroborate(self.data, 'boat-mail', base['merchant'], base['amount'], base['currency'],
+                               base['charged'], 'charge', 'SMS', at=at('2026-10-25T10:45'))
+
+    def test_two_real_same_day_charges_of_equal_value_both_stay(self):
+        self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='invoice 1001')
+        self.case('boat-b', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='invoice 1002')
+        self.assertEqual(sorted(c['id'] for c in mc.load(self.data)['cases']), ['boat-a', 'boat-b'])
+
+    def test_a_hold_and_a_charge_of_the_same_amount_stay_apart(self):
+        self.case('shop-charge', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25')
+        self.case('shop-hold', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25', kind='hold')
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
 
     def test_a_different_amount_or_day_is_a_different_charge(self):
         self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
