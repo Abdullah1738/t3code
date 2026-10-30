@@ -141,6 +141,9 @@ sync filters, so staged changes appear as unstaged remotely. A committed HEAD an
 are required (no automatic fetch). Committed content in the exported history remains available to Git,
 including paths excluded from the working-file sync. The local Git state is read-only. Submodule git-dirs
 are not materialized. Each `--git` sync rebuilds and replaces the remote metadata; `--no-sync` retains it.
+A partial clone (`--filter=blob:none`, e.g. the board's mobile review worktrees) usually lacks old blobs: `--git`
+then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If even HEAD's files aren't local
+(a `--no-checkout` partial clone) it stops before syncing and tells you to run without `--git`.
 
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
