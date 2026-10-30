@@ -13,6 +13,7 @@ HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM inst
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
   offbox logs <run> [--follow] | wait <run>     for --bg runs
+  offbox kill <run>                 stop a hung starting/running box run (confirmed on boat), then release works
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
@@ -62,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     li = sp.add_parser("list")
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
+    kl = sp.add_parser("kill", help="stop a hung box run by run id")
+    kl.add_argument("run_id")
     rl = sp.add_parser("release")
     rl.add_argument("box_id", nargs="?")
     rl.add_argument("--mine", action="store_true")
@@ -200,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
         elif a.sub == "list":
             misc.list_leases(me, a.all, a.json)
+        elif a.sub == "kill":
+            return misc.kill_run(a.run_id)
         elif a.sub == "release":
             misc.release(me, a.box_id, a.mine, a.delete)
         elif a.sub == "ssh":

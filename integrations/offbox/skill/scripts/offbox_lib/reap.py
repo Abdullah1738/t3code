@@ -76,6 +76,17 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             con.execute("UPDATE runs SET status='lost', end_at=? WHERE run_id=?", (now(), rid))
     if stale and not dry:
         con.commit()
+    # Foreground/--bg runs that never got a box (client died while waiting in the pool): nothing remote to check.
+    # Two hours is past any pool wait, so live waiters are never touched.
+    nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
+                        "AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
+    for (rid,) in nobox:
+        actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
+        if not dry:
+            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=?",
+                        (now(), "client ended before it got a box", rid))
+    if nobox and not dry:
+        con.commit()
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
     protected = _protected(con)

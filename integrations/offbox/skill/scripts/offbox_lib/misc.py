@@ -97,7 +97,10 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
 
 def _release_one(con, r, delete):
         if lease.active_runs(con, r["box_id"]):
-            say(f"{r['box_id']}: run in progress, not released")
+            ids = [x[0] for x in con.execute("SELECT run_id FROM runs WHERE box_id=? AND status IN ('starting','running') "
+                                             "ORDER BY start_at", (r["box_id"],))]
+            say(f"{r['box_id']}: run in progress, not released: {', '.join(ids)}. If it is hung, stop it with "
+                f"`offbox kill <run>` and release again.")
             return
         if delete:
             lease.delete_box(con, r["box_id"], "release --delete")
@@ -106,6 +109,41 @@ def _release_one(con, r, delete):
             if r["state"] == "running":
                 lease.stop_box(con, r["box_id"], "release")
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
+
+
+def kill_run(run_id: str) -> int:
+    """Stop a hung starting/running box run. The row is marked killed only after boat confirms the process is gone.
+    No box lock: the hung run's client may be holding it."""
+    from .runs import finish
+    r = _run_row(run_id)
+    rid = r["run_id"]
+    if r["status"] not in ("starting", "running"):
+        raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
+    if r["mode"] == "local":
+        raise OffboxError(f"run {rid} is a local run (no box); kill its process on this Mac instead", code=2)
+    if not r["box_id"] or not r["process_id"]:
+        raise OffboxError(f"run {rid} never got a box process (no box_id/process_id). Nothing remote to stop; "
+                          "if the client is gone the reaper marks it lost (`offbox reap`).", code=2)
+    box, pid = r["box_id"], r["process_id"]
+    kill_err = None
+    try:
+        api.cmd_kill(box, pid)
+    except OffboxError as e:
+        kill_err = str(e)
+    try:
+        st = api.cmd_status(box, pid)
+    except OffboxError as e:
+        st, kill_err = None, kill_err or str(e)
+    if st is not None and st.get("running"):
+        say(f"run {rid}: boat still reports process {pid} on {box} running; row left as {r['status']}"
+            + (f" (kill error: {kill_err})" if kill_err else ""))
+        return 1
+    if st is None and kill_err:
+        say(f"run {rid}: could not confirm process {pid} on {box} stopped ({kill_err}); row left as {r['status']}")
+        return 1
+    finish(rid, 143, "killed")
+    print(f"killed run {rid} (process {pid} on box {box}). `offbox release [--delete]` works now.")
+    return 0
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:

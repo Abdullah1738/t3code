@@ -170,6 +170,9 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
 
 - `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
   `offbox whoami`, `offbox status`.
+- `offbox kill <run>` stops a hung starting/running box run and marks it `killed` once boat confirms the process
+  stopped. Release refuses while a run is active and names the run ids. Use kill, not pkill on the box.
+  Local runs and runs with no box process are refused.
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.
 
@@ -227,7 +230,9 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
   `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
-- Hung or weird box: `offbox release --delete`, then rerun (fresh lease from base/template).
+- Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
+  is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
+- Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
 - Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
