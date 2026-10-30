@@ -101,6 +101,39 @@ class DeadMountTests(Isolated):
         self.assertTrue(self.lease_row("bxA")["note"].startswith("dead-mount:"))
         self.assertEqual(push.call_args_list[-1][0][0], "bxB")
 
+    def test_git_metadata_enotconn_is_classified_dead_mount(self):
+        # rsync's stderr from the --git transfer must reach the error text, or the dead box is not set aside.
+        rsync_fail = subprocess.CompletedProcess([], 23, "", ENOTCONN_MKSTEMP)
+        ok = subprocess.CompletedProcess([], 0, b"", b"")
+        with patch.object(ssh_sync, "ssh", return_value=ok), \
+                patch.object(ssh_sync.subprocess, "run", return_value=rsync_fail):
+            with self.assertRaises(OffboxError) as cm:
+                ssh_sync._push_git("bxA", Path(self.tmp.name), "w/r", 60)
+        self.assertIn("Transport endpoint is not connected", str(cm.exception))
+        self.assertIsNotNone(ssh_sync.dead_mount(str(cm.exception)))
+
+    def test_simultaneous_push_error_and_env_enotconn_still_sets_aside(self):
+        # The env upload hit the dead mount while push failed with an ordinary error: the dead box must still go.
+        self.box('bxA', member=True)
+        self.box('bxB', member=True)
+        rows = [dict(self.lease_row('bxA'), remote_dir='w/r'), dict(self.lease_row('bxB'), remote_dir='w/r')]
+        env_dead = OffboxError("ssh bxA failed (255): Transport endpoint is not connected")
+        push_plain = OffboxError("rsync to bxA failed (12): connection unexpectedly closed")
+        rn = self.runner()
+        with patch.object(runs.pool, "acquire", side_effect=rows), \
+                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
+                patch.object(runs.prune, "run", return_value=0), \
+                patch.object(runs.ssh_sync, "put_file", side_effect=[env_dead, None]), \
+                patch.object(runs.ssh_sync, "push", side_effect=[push_plain, {}]), \
+                patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \
+                patch.object(lease.ssh_sync, "close_master"), \
+                patch.object(lease.api, "stop", return_value={}) as stop, \
+                patch.object(api, "cmd_start", return_value={"processId": 7, "commandId": "c"}):
+            row = rn.start()
+        self.assertEqual(row["box_id"], "bxB")
+        self.assertTrue(self.lease_row('bxA')["note"].startswith("dead-mount:"))
+        stop.assert_called_once_with("bxA")
+
     def test_two_dead_boxes_fail_90_nothing_started(self):
         rn, acquire, prune, push, stop, cmd = self.run_start(
             pushes=[], probes=[ENOTCONN_CHDIR, ENOTCONN_CHDIR])

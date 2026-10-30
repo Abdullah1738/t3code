@@ -268,7 +268,8 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
                f"{gitdir}/", f"{box_id}:{staging}/"]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
-            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode})")
+            # Keep rsync's stderr: a dead mount reported here must still classify as dead-mount.
+            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
         ssh(box_id, f"rm -rf -- {qdest} && mv -- {qstage} {qdest}", check=True)
         return _stats(p.stdout)
     finally:

@@ -606,15 +606,10 @@ class Runner:
         err: list = []
         tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
         tw.start()
+        push_exc = None
         try:
             if not a.no_sync:
-                try:
-                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
-                except OffboxError as e:
-                    reason = ssh_sync.dead_mount(str(e))
-                    if reason:
-                        raise lease.DeadMount(self.box, reason) from e
-                    raise
+                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -622,12 +617,18 @@ class Runner:
                 if skipped:
                     say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
                         f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
+        except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
+            push_exc = e
         finally:
             tw.join()
-        if err:
-            reason = ssh_sync.dead_mount(str(err[0]))
+        # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
+        for e in (push_exc, err[0] if err else None):
+            reason = ssh_sync.dead_mount(str(e)) if e is not None else None
             if reason:
-                raise lease.DeadMount(self.box, reason) from err[0]
+                raise lease.DeadMount(self.box, reason) from e
+        if push_exc is not None:
+            raise push_exc
+        if err:
             raise err[0]
 
     # ------------------------------------------------------------ streaming
