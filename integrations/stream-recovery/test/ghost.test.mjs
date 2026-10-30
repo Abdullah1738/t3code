@@ -243,3 +243,61 @@ test('a no_active_run answer clears with no note: the next scan finishes it as c
   assert.equal(fake.calls.sendToThread.length, 0);
   assert.deepEqual(fake.calls.unexpected, []);
 });
+
+test('a ghost is never interrupted directly in OpenCode, even when a newer run starts on the same session', async () => {
+  const fake = fakeIo();
+  const state = freshState();
+  const { log } = logs();
+  await stallScan({ state, now: T0, log }, fake.io);
+  await stallScan({ state, now: T0 + 20 * MIN, log }, fake.io);
+  assert.equal(fake.calls.interruptThread.length, 1);
+
+  // Run 9 starts on the same session and OpenCode now shows it active, but its tail read fails.
+  fake.setThreads([ghostThread({ activeRunId: 'run:9' })]);
+  fake.io.activeThreads = async () => [ghostThread({ activeRunId: 'run:9' })];
+  fake.io.activeSessions = async () => new Set([SES]);
+  fake.io.ocTail = async () => { throw new Error('tail unavailable'); };
+  await stallScan({ state, now: T0 + 40 * MIN, log }, fake.io);
+  await stallScan({ state, now: T0 + 45 * MIN, log }, fake.io);
+  assert.equal(fake.calls.interruptThread.length, 1);
+  assert.deepEqual(fake.calls.unexpected, []);
+  assert.equal(state.stalls[STALL_ID].ocTries, undefined);
+});
+
+test('a run that starts OpenCode-active during the tail read is not interrupted', async () => {
+  let activeSet = new Set();
+  let liveThreads = [ghostThread()];
+  const calls = { interruptThread: [], unexpected: [] };
+  const io = {
+    activeSessions: async () => new Set(activeSet),
+    ocTail: async (ses) => {
+      // Run 9 begins and OpenCode picks the session up while the tail is being read.
+      liveThreads = [ghostThread({ activeRunId: 'run:9' })];
+      activeSet = new Set([ses]);
+      return idleTail(T0 - 60 * MIN);
+    },
+    activeThreads: async () => liveThreads,
+    getThread: async () => liveThreads[0] ?? null,
+    interruptThread: async (threadId, opts) => { calls.interruptThread.push({ threadId, ...opts }); return { result: 'interrupt_requested', runId: 'run:9' }; },
+    sendToThread: async () => ({ ok: true }),
+    telegram: () => {},
+    installerResumePendingMs: () => null,
+    ocSession: async () => { calls.unexpected.push('ocSession'); return null; },
+    ocForms: async () => { calls.unexpected.push('ocForms'); return []; },
+    ocPermissions: async () => { calls.unexpected.push('ocPermissions'); return []; },
+    threadByNative: async () => { calls.unexpected.push('threadByNative'); return null; },
+    ocChildren: async () => { calls.unexpected.push('ocChildren'); return []; },
+    ocInterrupt: async () => { calls.unexpected.push('ocInterrupt'); return false; },
+  };
+  const state = freshState();
+  const { log } = logs();
+  // Get the ghost past its 15 min window: the first scan only records `since`.
+  await stallScan({ state, now: T0, log }, io);
+  activeSet = new Set();
+  liveThreads = [ghostThread()];
+  // Scan 2 reads the tail, which flips run 9 to OpenCode-active; the re-check must skip it.
+  await stallScan({ state, now: T0 + 20 * MIN, log }, io);
+  assert.equal(calls.interruptThread.length, 0);
+  assert.deepEqual(calls.unexpected, []);
+  assert.equal(state.ghosts['thread:433'], undefined);
+});

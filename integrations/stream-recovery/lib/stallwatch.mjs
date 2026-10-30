@@ -95,7 +95,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         // Robob can't be read, but the OpenCode fallback doesn't need it.
         if (verbose) log(`stall ${id}: thread read failed: ${errText(err)}`);
         if (age >= GIVE_UP_MS) finish(id, stall, "failed", `could not read the Robob thread: ${errText(err)}`);
-        else if (!ocDone && !stall.ocTried && age >= FALLBACK_MS && !dryRun) await ocStop(stall);
+        else if (!ocDone && !stall.ocTried && age >= FALLBACK_MS && !dryRun && stall.kind !== "ghost") await ocStop(stall);
         report.push({ id, ...stall });
         continue;
       }
@@ -113,7 +113,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         }
       }
       finish(id, stall, "cleared");
-    } else if (!c.ocDone && !stall.ocTried && age >= FALLBACK_MS) {
+    } else if (!c.ocDone && !stall.ocTried && age >= FALLBACK_MS && stall.kind !== "ghost") {
       const after = stall.ocTries ? "a failed OpenCode interrupt" : "the Robob interrupt";
       log(`stall ${id}: OpenCode still running ${Math.round(age / 1000)}s after ${after}, interrupting the session`);
       if (!dryRun) await ocStop(stall);
@@ -207,6 +207,19 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     const ghosts = ghostCandidates(live, active);
     state.ghosts = observeGhosts(state.ghosts, ghosts, now);
     const installing = io.installerResumePendingMs() != null;
+    // The tail read is awaited after the snapshots above, so the run may have moved
+    // on or OpenCode may have picked the session up. Re-check just before acting.
+    const stillGhost = async (t, g) => {
+      try {
+        const [fresh, freshActive] = await Promise.all([io.activeThreads(), io.activeSessions()]);
+        const cur = fresh.find((x) => x.threadId === t.threadId);
+        return cur !== undefined && ghostCandidates([cur], freshActive).length === 1
+          && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses;
+      } catch (err) {
+        if (verbose) log(`stall: ghost re-check failed: ${errText(err)}`);
+        return false;
+      }
+    };
     for (const t of ghosts) {
       const g = state.ghosts[t.threadId];
       const quietMs = now - g.since;
@@ -222,6 +235,11 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       }
       // The session did something recently, so this is not a dead turn.
       if (now - lastMs < GHOST_RUN_MS) continue;
+      if (!(await stillGhost(t, g))) {
+        // Start the 15 min clock again from the next scan.
+        delete state.ghosts[t.threadId];
+        continue;
+      }
       const recent = Object.values(state.stalls).filter(
         (s) => s.ses === g.ses && (s.action === "robob" || s.action === "opencode") && now - Date.parse(s.at) < DAY_MS,
       ).length;
@@ -243,8 +261,13 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       try {
         const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}` });
         stall.robobResult = res.result ?? null;
-        if (res.result === "interrupt_requested") stall.runId = res.runId ?? stall.runId;
-        else Object.assign(stall, { runId: null, note: false });
+        if (res.result === "interrupt_requested") {
+          // Track the run we verified, not whatever run the server reports back.
+          if (res.runId && res.runId !== t.activeRunId) stall.errors.push(`interrupted ${res.runId}, expected ${t.activeRunId}`);
+          stall.runId = t.activeRunId;
+        } else {
+          Object.assign(stall, { runId: null, note: false });
+        }
       } catch (err) {
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
