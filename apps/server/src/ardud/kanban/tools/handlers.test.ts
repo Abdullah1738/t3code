@@ -272,6 +272,54 @@ it.effect("evaluator_start gives a sweep its text and refuses a second running s
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a card thread may start only a request evaluator, stamped with its card", () => {
+  const { launches, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.ensureBoard({
+      slug: "tools",
+      name: "Tools",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+    const card = (yield* kanban.card(first.id)).card;
+    const before = launches.length;
+
+    const stalled = yield* call(thread, "evaluator_start", { boardId: "tools", kind: "stalled" });
+    assert.isTrue(stalled.isError);
+    assert.include(stalled.text, 'kind "request"');
+    assert.strictEqual(launches.length, before);
+
+    const handed = yield* call(thread, "evaluator_start", {
+      boardId: "tools",
+      kind: "request",
+      text: "offbox lost run-1",
+    });
+    assert.isFalse(handed.isError, handed.text);
+    const brief = launches.at(-1) ?? "";
+    assert.include(brief, "offbox lost run-1");
+    assert.include(brief, `kanban-card/${first.id}`);
+    assert.include(brief, `#${card.number}`);
+    assert.include(brief, thread);
+    assert.include(brief, 'the "Toy" board');
+
+    const empty = yield* call(thread, "evaluator_start", {
+      boardId: "tools",
+      kind: "request",
+      text: "  ",
+    });
+    assert.isTrue(empty.isError);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("card_search finds cards by words or number and hides settled ones by default", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {

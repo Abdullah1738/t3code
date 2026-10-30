@@ -41,7 +41,8 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
     "",
     "How the board works:",
-    "- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read.",
+    "- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, evaluator_start (kind \"request\" only).",
+    "- If a tool, CLI or Robob itself fails you, use a workaround and keep going, then hand the problem to the Robob board: evaluator_start with boardId \"robob\", kind \"request\", and what failed with the evidence (error text, run ids, log paths).",
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
