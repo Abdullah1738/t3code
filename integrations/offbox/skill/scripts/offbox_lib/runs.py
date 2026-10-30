@@ -112,7 +112,9 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     if [ ! -f "$_offbox_goroot/.offbox-manifest" ]; then _offbox_old=missing
     elif _offbox_manifest_matches "$_offbox_goroot"; then _offbox_old=ok
     else _offbox_old=mismatch; fi
-    echo "offbox: Go repair: old tree manifest=$_offbox_old installed=$(stat -c %y "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16)" >&2
+    _offbox_marks=no
+    { [ -f "$_offbox_goroot/src/strconv/ctoa.go" ] || [ -f "$_offbox_goroot/src/syscall/syscall_linux_accept4.go" ]; } && _offbox_marks=yes
+    echo "offbox: Go repair: old tree manifest=$_offbox_old old-release-files=$_offbox_marks version_written=$(stat -c %z "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16) manifest_written=$(stat -c %z "$_offbox_goroot/.offbox-manifest" 2>/dev/null | cut -c1-16)" >&2
     # Stage beside GOROOT: /tmp may be on another filesystem, making mv a partial copy.
     _offbox_stage=$(sudo -n mktemp -d /usr/local/.offbox-go.XXXXXX) || _offbox_fail 'cannot create staging directory'
     _offbox_saved=0

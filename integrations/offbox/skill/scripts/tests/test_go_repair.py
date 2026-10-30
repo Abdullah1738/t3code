@@ -330,6 +330,9 @@ class GoSwapTests(unittest.TestCase):
         result = self.fx.run()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('old tree manifest=missing', result.stderr)
+        self.assertIn('old-release-files=no', result.stderr)
+        self.assertIn('version_written=', result.stderr)
+        self.assertIn('manifest_written=', result.stderr)
 
         extra = tempfile.TemporaryDirectory()
         self.addCleanup(extra.cleanup)
@@ -340,6 +343,17 @@ class GoSwapTests(unittest.TestCase):
         result = self.fx.run()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('old tree manifest=mismatch', result.stderr)
+
+        marks = tempfile.TemporaryDirectory()
+        self.addCleanup(marks.cleanup)
+        self.fx = RepairFixture(marks.name)
+        (self.fx.root / 'src/strconv').mkdir(parents=True, exist_ok=True)
+        (self.fx.root / 'src/strconv/ctoa.go').write_text('package strconv\n')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('old-release-files=yes', result.stderr)
+        self.assertIn('replacing mixed', result.stderr)
+        self.assertFalse((self.fx.root / 'src/strconv/ctoa.go').exists())
 
     def test_healthy_tree_prints_no_old_tree_line(self):
         result = self.fx.run()
