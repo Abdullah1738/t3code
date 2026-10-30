@@ -3,6 +3,7 @@ import {
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
+  type ProviderSessionId,
   OrchestrationV2StoredEvent,
   ProviderThreadId,
   RunAttemptId,
@@ -67,6 +68,8 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
   readonly write: (input: {
+    /** Restate still-bound canonical session rows inside the write transaction. */
+    readonly refreshBoundProviderSessions?: true;
     /** Return no events if another thread owns this native session at commit time. */
     readonly unlessNativeThreadOwned?: Pick<
       OrchestrationV2ProviderThread,
@@ -77,6 +80,8 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeWithEffects: (input: {
+    /** Restate still-bound canonical session rows inside the write transaction. */
+    readonly refreshBoundProviderSessions?: true;
     /**
      * Rebuilds each run.updated from the stored row with only its delegatedCompletion replaced.
      * The batch must not also change that run's lifecycle.
@@ -391,6 +396,79 @@ const layerBase: Layer.Layer<
 
       return yield* commitThenPublish(
         Effect.gen(function* () {
+          let sourceEvents = input.events;
+          if (input.refreshBoundProviderSessions === true) {
+            const requests = input.events.filter(
+              (
+                event,
+              ): event is Extract<
+                OrchestrationV2DomainEvent,
+                { type: "provider-session.updated" }
+              > => event.type === "provider-session.updated",
+            );
+            if (
+              requests.length !== input.events.length ||
+              input.effects.length > 0 ||
+              input.unlessNativeThreadOwned !== undefined ||
+              input.guardPendingUserInputCancellations !== undefined ||
+              input.updateDelegatedCompletionOnly !== undefined
+            ) {
+              return yield* new EventSinkWriteError({
+                eventCount: input.events.length,
+                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                cause: "Session refresh cannot include other events, effects or write guards.",
+              });
+            }
+            // The preflight payload only identifies a binding. A read outside this
+            // transaction could overwrite a newer status or resurrect a detached session.
+            const recordsByThread = new Map(
+              yield* Effect.forEach(
+                new Set(requests.map((event) => event.threadId)),
+                (threadId) =>
+                  projectionStore.getThreadRecords(threadId, ["providerSessions"]).pipe(
+                    Effect.catchIf(
+                      Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError),
+                      () => Effect.succeed(undefined),
+                    ),
+                    Effect.map((records) => [threadId, records] as const),
+                  ),
+                { concurrency: 1 },
+              ),
+            );
+            const seenByThread = new Map<ThreadId, Set<ProviderSessionId>>();
+            const refreshed: Array<OrchestrationV2DomainEvent> = [];
+            const occurredAt = yield* DateTime.now;
+            for (const event of requests) {
+              const seen = seenByThread.get(event.threadId) ?? new Set<ProviderSessionId>();
+              if (seen.has(event.payload.id)) continue;
+              seen.add(event.payload.id);
+              seenByThread.set(event.threadId, seen);
+              const records = recordsByThread.get(event.threadId);
+              if (
+                records === undefined ||
+                records.thread.deletedAt !== null ||
+                records.thread.archivedAt !== null
+              )
+                continue;
+              const session = records.providerSessions.find(
+                (session) => session.id === event.payload.id,
+              );
+              if (
+                session?.driver !== "opencode" ||
+                !session.capabilities.sessions.supportsMultipleProviderThreadsPerSession
+              )
+                continue;
+              refreshed.push({
+                ...event,
+                payload: session,
+                driver: session.driver,
+                providerInstanceId: session.providerInstanceId,
+                occurredAt,
+              });
+            }
+            sourceEvents = refreshed;
+            if (sourceEvents.length === 0) return [];
+          }
           // Check ownership in the same transaction that claims the native session.
           const imported = input.unlessNativeThreadOwned;
           if (imported?.nativeThreadRef != null) {
@@ -408,7 +486,7 @@ const layerBase: Layer.Layer<
           // Checkpoint capture can finish after a cohort writer reads its parent run.
           // Merge in this transaction so the event log and projection keep that completion.
           const events = input.updateDelegatedCompletionOnly
-            ? yield* Effect.forEach(input.events, (event) =>
+            ? yield* Effect.forEach(sourceEvents, (event) =>
                 Effect.gen(function* () {
                   if (event.type !== "run.updated") return event;
                   const { runs } = yield* projectionStore.getThreadRecords(
@@ -428,7 +506,7 @@ const layerBase: Layer.Layer<
                       };
                 }),
               )
-            : input.events;
+            : sourceEvents;
           const normalized = yield* normalizeEvents(
             input.guardPendingUserInputCancellations === true
               ? yield* guardUserInputCancellations(events)
