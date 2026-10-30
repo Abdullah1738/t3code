@@ -84,11 +84,26 @@ def _room(pause: float) -> bool:
     return _DEADLINE is None or _DEADLINE - time.time() > pause + 1.0
 
 
+def _in_deadline(deadline: float | None, pause: float) -> bool:
+    """True when a retry that sleeps `pause` seconds still ends before the caller's absolute `deadline`."""
+    return deadline is None or deadline - time.time() > pause
+
+
+def _check_deadline(deadline: float, method: str, path: str) -> None:
+    if time.time() >= deadline:
+        raise OffboxError(f"deadline passed before {method} {path}")
+
+
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
-         retries: int = 2, ok404: bool = False):
-    """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable)."""
+         retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable).
+    `deadline` (time.time()-style) caps every attempt, the retry pauses and the connect retries; past it the call
+    raises OffboxError without sending. `connect_retries=0` disables the not-delivered connect retries."""
     if _DEADLINE is not None:
         retries = 0
+    if deadline is not None:
+        _check_deadline(deadline, method, path)
+    max_connect = CONNECT_RETRIES if connect_retries is None else connect_retries
     url = API + path
     h = {"Authorization": "Bearer " + _key(), "Content-Type": "application/json", "Accept": "application/json"}
     h.update(headers or {})
@@ -104,6 +119,9 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if room <= 0:
                 raise OffboxError(f"boat API budget spent before {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
+        if deadline is not None:
+            _check_deadline(deadline, method, path)
+            req_timeout = min(req_timeout, max(1.0, deadline - time.time()))
         req = urllib.request.Request(url, data=data, method=method, headers=h)
         request_id = capacity.reserve(path.rsplit("/", 1)[-1],
                                       path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
@@ -142,14 +160,15 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if e.code == 404 and ok404:
                 return None
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
-            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and _room(1.5 * attempt):
+            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and _room(1.5 * attempt) \
+                    and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
             # boat's proxy failed to *connect* to the sandbox host, so the request never
             # reached the box: safe to retry even for non-idempotent POSTs (e.g. 2026-10-14
             # "502 sandbox_direct_failed: connect EADDRNOTAVAIL", ~7% of calls for an hour).
-            if _never_delivered(e.code, code, msg) and attempt <= max(retries, CONNECT_RETRIES) \
-                    and _room(min(2.0 * attempt, 8)):
+            if _never_delivered(e.code, code, msg) and attempt <= max(retries, max_connect) \
+                    and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
                 log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
                 time.sleep(min(2.0 * attempt, 8))
                 continue
@@ -159,17 +178,27 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if request_id:
                 capacity.complete(request_id, "uncertain")
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
-            if attempt <= retries and safe_method and _room(1.5 * attempt):
+            if attempt <= retries and safe_method and _room(1.5 * attempt) and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
+            if deadline is not None and time.time() >= deadline:
+                raise OffboxError(f"deadline passed during {method} {path}: {e}")
             log(f"api {method} {path} -> network {e}")
             raise OffboxError(f"boat API unreachable ({method} {path}): {e}")
 
 
-def stream(path: str, timeout: float = 120):
-    """Open an ndjson stream; yields dicts. Caller handles reconnects."""
+class StreamDeadline(OffboxError):
+    """The caller's absolute deadline passed while reading a stream (possibly during silence or keepalives)."""
+
+
+def stream(path: str, timeout: float = 120, deadline: float | None = None):
+    """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): every
+    line read, blank keepalives included, is checked against it, so a stream that keeps talking cannot outlive it."""
     req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + _key(),
                                                       "Accept": "application/x-ndjson"})
+    if deadline is not None:
+        _check_deadline(deadline, "GET", path)
+        timeout = max(0.5, min(timeout, deadline - time.time()))
     try:
         r = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
@@ -180,6 +209,8 @@ def stream(path: str, timeout: float = 120):
         raise ApiError(e.code, d.get("code") or f"http_{e.code}", d.get("message") or "")
     with r:
         for line in r:
+            if deadline is not None and time.time() >= deadline:
+                raise StreamDeadline(f"deadline passed while reading {path}")
             line = line.strip()
             if not line:
                 continue
@@ -187,6 +218,8 @@ def stream(path: str, timeout: float = 120):
                 yield json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if deadline is not None and time.time() >= deadline:
+                raise StreamDeadline(f"deadline passed while reading {path}")
 
 
 # ---------------------------------------------------------------- sandboxes
@@ -337,19 +370,22 @@ def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
     return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
 
 
-def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2) -> dict | None:
+def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2,
+               deadline: float | None = None) -> dict | None:
     return call("GET", f"/sandboxes/{box_id}/commands/{pid}?tailBytes=4096", timeout=timeout, retries=retries,
-                ok404=True)
+                ok404=True, connect_retries=0 if deadline is not None else None, deadline=deadline)
 
 
 def cmd_kill(box_id: str, pid: int) -> dict | None:
     return call("DELETE", f"/sandboxes/{box_id}/commands/{pid}", ok404=True, retries=1)
 
 
-def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeout: float = 90):
+def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeout: float = 90,
+               deadline: float | None = None):
     # `timeout` is the socket read timeout: a quiet stream returns control to follow() after at most this long.
+    # `deadline` (absolute) additionally ends the stream the moment it passes, even while lines keep arriving.
     return stream(f"/sandboxes/{box_id}/commands/{pid}/stream?stdoutOffset={out_off}&stderrOffset={err_off}",
-                  timeout=timeout)
+                  timeout=timeout, deadline=deadline)
 
 
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0) -> dict:

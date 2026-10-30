@@ -236,6 +236,22 @@ def file_lock(name: str, timeout: float = 600):
         f.close()
 
 
+def offsets_path(log_path: Path) -> Path:
+    return Path(str(log_path) + ".offsets")
+
+
+def checkpoint(log_path: Path | None) -> dict | None:
+    """The last committed checkpoint of a local log (remote stream offsets and the log length they match), or None
+    when there is no log or the run never committed one. Shared by `runs` (writer) and `misc` (takeover reader)."""
+    if not log_path:
+        return None
+    d = read_json(offsets_path(Path(log_path)), None)
+    if not isinstance(d, dict) or d.get("logBytes") is None:
+        return None
+    return {"stdoutOffset": int(d.get("stdoutOffset") or 0), "stderrOffset": int(d.get("stderrOffset") or 0),
+            "logBytes": int(d["logBytes"])}
+
+
 def atomic_write_json(path: Path, data) -> None:
     ensure_dirs()
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")

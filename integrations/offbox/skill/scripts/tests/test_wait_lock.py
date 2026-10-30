@@ -72,7 +72,9 @@ class WaitLockTests(Isolated):
             rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
         self.assertEqual(rc, 1)
         self.assertIn('run-x: failed exit=1', out)
-        self.assertNotIn('timed out waiting for lock', err)
+        # Match the CLI's own lock diagnostic line, not any text in captured stderr (other warnings may mention it).
+        self.assertFalse(any(l.startswith('offbox:') and 'timed out waiting for lock' in l
+                             for l in err.splitlines()), err)
         self.assertEqual(err.count('still followed by another offbox process'), 1)
 
     def test_wait_timeout_while_lock_held_is_124_and_run_untouched(self):
@@ -175,7 +177,7 @@ class FollowUntilTests(unittest.TestCase):
         seen = {}
         clock = Clock()
 
-        def quiet(box, pid, o, e, timeout=90):
+        def quiet(box, pid, o, e, timeout=90, **kw):
             seen.setdefault('timeouts', []).append(timeout)
             clock.t += timeout  # a socket read that times out after `timeout` seconds
             raise TimeoutError('read timed out')
@@ -193,11 +195,11 @@ class FollowUntilTests(unittest.TestCase):
         seen = {}
         clock = Clock()
 
-        def broken(box, pid, o, e, timeout=90):
+        def broken(box, pid, o, e, timeout=90, **kw):
             clock.t = 1012  # the stream fails with 3 s left
             raise OSError('reset')
 
-        def status(box, pid, timeout=60, retries=2):
+        def status(box, pid, timeout=60, retries=2, deadline=None):
             seen.update(timeout=timeout, retries=retries)
             clock.t = 1020  # a status request that runs out the clock
             return None
@@ -210,28 +212,57 @@ class FollowUntilTests(unittest.TestCase):
         self.assertLessEqual(seen['timeout'], 3.0)
         self.assertEqual(seen['retries'], 0)
 
-    def test_takeover_resumes_from_the_holders_offsets(self):
-        # A holder wrote stdout up to 6 and stderr up to 4 before it died; a takeover must ask for exactly those
-        # offsets, so neither stream's delivered bytes are replayed into the echo or the local log.
-        log = common.LOGS_DIR / 'run-y.log'
+    def test_mixed_stream_takeover_after_death_between_flush_and_commit(self):
+        # End to end: a holder follows stdout and stderr interleaved. It dies after flushing a chunk to the local log
+        # but before committing its checkpoint. A waiter takes over: the committed bytes are not repeated, the
+        # uncommitted chunk is dropped and replayed once, and the stream offsets resume per stream.
+        log = common.LOGS_DIR / 'run-z.log'
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_bytes(b'')
-        runs._save_offsets(log, 6, 4)
-        self.assertEqual(misc_offsets(log), (6, 4))
+        frames_holder = [
+            {'type': 'stdout', 'data': 'o1\n', 'nextOffset': 3},
+            {'type': 'stderr', 'data': 'e1\n', 'nextOffset': 3},
+            {'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6},
+        ]
+        real_commit = runs._commit
+        calls = {'n': 0}
+
+        def dying_commit(path, out_off, err_off, log_bytes):
+            calls['n'] += 1
+            if calls['n'] == 3:  # the third chunk: flushed to the log, then the holder dies before committing it
+                raise SystemExit('holder died')
+            real_commit(path, out_off, err_off, log_bytes)
+
+        def holder_attach(box, pid, o, e, **kw):
+            return iter(frames_holder)
+        with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_attach', holder_attach), \
+                patch.object(runs, '_commit', dying_commit), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                runs.follow('bx_a', 7, log, echo=False, run_id='run-z')
+        # The log holds o2 (flushed) but the checkpoint stops after e1.
+        self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
+        self.assertEqual(common.checkpoint(log), {'stdoutOffset': 3, 'stderrOffset': 3, 'logBytes': 6})
+
+        # Takeover: truncate to the committed 6 bytes, then resume each stream from its committed offset.
         asked = {}
+        takeover_frames = [
+            {'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6},
+            {'type': 'exit', 'exitCode': 0},
+        ]
 
-        def attach(box, pid, o, e, **kw):
+        def takeover_attach(box, pid, o, e, **kw):
             asked.update(o=o, e=e)
-            return iter([{'type': 'exit', 'exitCode': 0}])
-        with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_attach', attach), \
+            return iter(takeover_frames)
+        ck = common.checkpoint(log)
+        misc._truncate(log, ck['logBytes'])
+        with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_attach', takeover_attach), \
                 contextlib.redirect_stdout(io.StringIO()):
-            rc = runs.follow('bx_a', 7, log, echo=False, run_id='run-y', start_offsets=misc_offsets(log))
+            rc = runs.follow('bx_a', 7, log, echo=False, run_id='run-z',
+                             start_offsets=(ck['stdoutOffset'], ck['stderrOffset']))
         self.assertEqual(rc, 0)
-        self.assertEqual(asked, dict(o=6, e=4))
-
-
-def misc_offsets(log):
-    return runs.load_offsets(log)
+        self.assertEqual(asked, dict(o=3, e=3))
+        # Each line exactly once, in the order it was confirmed.
+        self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
 
 
 if __name__ == '__main__':

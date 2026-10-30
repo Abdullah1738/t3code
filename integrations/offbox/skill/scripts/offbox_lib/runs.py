@@ -17,7 +17,7 @@ from pathlib import Path
 from . import api, lease, node_version, pool, ssh_sync
 from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError,
-                     atomic_write_json, db, event, new_id, now, read_json, say)
+                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say)
 
 BG_TTL_S = 6 * 3600
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -619,24 +619,14 @@ def _close(frames) -> None:
 _KEEPER_JOIN_S = 65
 
 
-def offsets_path(log_path: Path) -> Path:
-    return Path(str(log_path) + ".offsets")
-
-
-def _save_offsets(log_path: Path, out_off: int, err_off: int) -> None:
-    """Record each stream's remote offset next to the local log. Best effort: a missing sidecar only means a
-    takeover starts from the attach offsets it was given."""
+def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
+    """Commit a checkpoint after a chunk is flushed to the local log: the remote offsets and the log length they match.
+    A holder that dies before this write leaves the chunk past logBytes, so a takeover trusts only logBytes."""
     try:
-        atomic_write_json(offsets_path(Path(log_path)), {"stdoutOffset": out_off, "stderrOffset": err_off})
+        atomic_write_json(offsets_path(Path(log_path)),
+                          {"stdoutOffset": out_off, "stderrOffset": err_off, "logBytes": log_bytes})
     except OSError:
         pass
-
-
-def load_offsets(log_path: Path | None) -> tuple[int, int]:
-    if not log_path:
-        return (0, 0)
-    d = read_json(offsets_path(Path(log_path)), {}) or {}
-    return (int(d.get("stdoutOffset") or 0), int(d.get("stderrOffset") or 0))
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
@@ -673,10 +663,13 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 again = False
                 # A quiet stream must not hold the caller past its deadline: the socket read times out at the deadline.
                 read_s = 90 if until is None else max(1.0, min(90.0, left()))
-                frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s)
+                frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s, deadline=until)
                 for fr in frames:
                     if stop_evt.is_set():
                         return None
+                    # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
+                    if until is not None and now() >= until:
+                        raise timed_out()
                     t = fr.get("type")
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -684,16 +677,16 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         if echo:
                             (sys.stdout if t == "stdout" else sys.stderr).buffer.write(b)
                             (sys.stdout if t == "stdout" else sys.stderr).flush()
-                        if lf:
-                            lf.write(b)
-                            lf.flush()
                         nxt = fr.get("nextOffset")
                         if t == "stdout":
                             out_off = nxt if nxt is not None else out_off + len(b)
                         else:
                             err_off = nxt if nxt is not None else err_off + len(b)
-                        if log_path:
-                            _save_offsets(log_path, out_off, err_off)
+                        if lf:
+                            lf.write(b)
+                            lf.flush()
+                            # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
+                            _commit(log_path, out_off, err_off, lf.tell())
                     elif t == "reconnect":
                         out_off, err_off = fr.get("stdoutOffset", out_off), fr.get("stderrOffset", err_off)
                         again = True
@@ -720,8 +713,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 st = None
                 try:
                     # Status and the retry pause share the deadline: a blocked status request must not outrun it.
-                    st = api.cmd_status(box_id, pid, timeout=max(1.0, min(60.0, left())), retries=0) \
-                        if until is not None else api.cmd_status(box_id, pid)
+                    st = api.cmd_status(box_id, pid, timeout=max(1.0, min(60.0, left())), retries=0,
+                                        deadline=until) if until is not None else api.cmd_status(box_id, pid)
                 except OffboxError:
                     pass
                 if until is not None and now() >= until:

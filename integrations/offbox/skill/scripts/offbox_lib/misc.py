@@ -12,7 +12,7 @@ import time
 
 from . import api, capacity, lease, pool, ssh_sync
 from .common import (CAP_PATH, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago,
-                     atomic_write_json, db, event, file_lock, iso, month_key, now, read_json, say)
+                     atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, read_json, say)
 
 WAIT_POLL_S = 5
 
@@ -252,18 +252,29 @@ def _settled(r) -> int:
     return r["exit_code"] if r["exit_code"] is not None else 90
 
 
-def _tail(path, pos: int, echo: bool) -> int:
-    """Consume the holder's local log from `pos`; print the new bytes only when echoing. Returns the new position."""
+def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
+    """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
+    are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
     try:
         with open(path, "rb") as f:
             f.seek(pos)
-            data = f.read()
+            data = f.read() if limit is None else f.read(max(0, limit - pos))
     except OSError:
         return pos
     if data and echo:
         sys.stdout.write(data.decode(errors="replace"))
         sys.stdout.flush()
     return pos + len(data)
+
+
+def _truncate(path, size: int) -> None:
+    """Cut a local log back to its committed length (a holder died after writing a chunk but before committing it)."""
+    try:
+        if os.path.getsize(path) > size:
+            with open(path, "r+b") as f:
+                f.truncate(size)
+    except OSError:
+        pass
 
 
 def _wait_locked(r, echo, timeout=None):
@@ -281,21 +292,30 @@ def _wait_locked(r, echo, timeout=None):
             pass
         else:
             try:
-                # The holder writes its last output before it records the end and releases the lock: drain that first.
-                pos = _tail(log_path, pos, echo)
+                # The holder writes its last output before it records the end and releases the lock: drain the
+                # committed part of it first. Bytes past the checkpoint were never confirmed and are not printed.
+                ck = checkpoint(log_path)
+                limit = ck["logBytes"] if ck else None
+                pos = _tail(log_path, pos, echo, limit)
                 cur = _run_row(r['run_id'])
                 if cur['status'] not in ('starting', 'running'):
                     return _settled(cur)
-                # Take over the follow from the offsets the holder had reached, so nothing is printed or logged twice.
-                from .runs import load_offsets
-                return _wait_run(cur, echo, until=deadline, start_offsets=load_offsets(log_path))
+                if ck:
+                    # Drop the uncommitted tail so the takeover's replay appends it exactly once.
+                    _truncate(log_path, ck["logBytes"])
+                    start = (ck["stdoutOffset"], ck["stderrOffset"])
+                else:
+                    start = (0, 0)
+                return _wait_run(cur, echo, until=deadline, start_offsets=start)
             finally:
                 guard.__exit__(None, None, None)
-        pos = _tail(log_path, pos, echo)
+        ck = checkpoint(log_path)
+        pos = _tail(log_path, pos, echo, ck["logBytes"] if ck else None)
         cur = _run_row(r['run_id'])
         if cur['status'] not in ('starting', 'running'):
-            # Drain the holder's final bytes that landed after the poll above, then report the recorded end.
-            _tail(log_path, pos, echo)
+            # Drain the committed bytes that landed after the poll above, then report the recorded end.
+            ck = checkpoint(log_path)
+            _tail(log_path, pos, echo, ck["logBytes"] if ck else None)
             return _settled(cur)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
