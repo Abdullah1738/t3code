@@ -241,6 +241,31 @@ class Explain(unittest.TestCase):
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=mine)
         self.assertEqual(r['verdict'], 'owner')
 
+    def test_a_denial_of_a_purchase_from_the_merchant_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+        for denial in ('No Apple orders from me', 'I ordered nothing from Apple'):
+            with self.subTest(denial=denial):
+                def said(since, until, deadline=None, text=denial):
+                    return [('2026-10-24T00:20:00.000Z', text, 'iMessage')]
+                r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+                self.assertEqual(r['verdict'], 'ask')
+
+    def test_buying_a_product_with_the_merchant_brand_from_another_seller_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I ordered an Apple charger from Amazon', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
+    def test_ordering_from_the_merchant_itself_still_explains(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I ordered from Apple, the iCloud one', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'owner')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 

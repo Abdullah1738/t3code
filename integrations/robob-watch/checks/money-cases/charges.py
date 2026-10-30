@@ -70,6 +70,8 @@ RECEIPT_WORDS = re.compile(r"\b(?:(?:receipt|invoice|amount paid|paid on|billed 
 NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fraud|scam|stolen|block|dispute|"
                       r"cancel|refund|who|what|why|which|maybe|perhaps|probably|possibly|might|unsure|think|guess)\b",
                       re.I)
+# A negative statement about buying or owning: "No Apple orders from me", "I ordered nothing from Apple".
+NEGATED = re.compile(r"\b(?:no|none|nothing|never|not|n't|didn't|haven't|hasn't|wasn't|isn't)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
                   re.I)
@@ -325,6 +327,32 @@ _CODES = r'(?:AED|USD|EUR|GBP|INR|JPY|CNY|SAR|QAR|KWD|OMR|BHD|CAD|AUD|CHF|SGD|HK
 MONEY = re.compile(rf'(?:\b{_CODES}\b|[$€£¥₹])\s?\d|\d[\d,.]*\s?(?:\b{_CODES}\b|[$€£¥₹])', re.I)
 
 
+SELLER_FROM = re.compile(r"\b(?:from|at|on|with|via|through)\s+(?P<seller>[\w.*/&' -]+)", re.I)
+
+
+OWNS = re.compile(r"\b(?:(?:is|are|was|it'?s|that'?s) mine|mine)\b", re.I)
+
+
+def buys_from(clause, pattern):
+    """Whether this clause says he bought from the merchant. "I ordered an Apple charger from Amazon"
+    buys from Amazon: the purchase verb is followed by a seller word, and the merchant has to be the
+    seller, not the product brand. "I paid Apple" with no seller word names the merchant itself. Owning
+    it ("the Apple charge is mine") is separate and needs no seller."""
+    if OWNS.search(clause) and pattern.search(clause):
+        return True
+    m = OWNER_BUYS.search(clause)
+    if not m or OWNS.search(clause[m.start():]):
+        return bool(m) and bool(pattern.search(clause))
+    # A purchase noun ("acme order", "order #123") names what he bought without a seller word.
+    if not re.match(r"(?:ordering|ordered|paying|paid|set ?up|subscrib|top|bought|buying)", m.group(0), re.I):
+        return bool(pattern.search(clause))
+    tail = clause[m.end():]
+    seller = SELLER_FROM.search(tail)
+    if seller:
+        return bool(pattern.search(seller.group('seller')))
+    return bool(pattern.search(tail))
+
+
 def owner_said(charge, at, now, said=None, deadline=None):
     said = said or owner_texts
     names = words(charge['merchant'])
@@ -342,8 +370,9 @@ def owner_said(charge, at, now, said=None, deadline=None):
         # Send me the Apple keynote summary." pays Amazon, not Apple. An amount in that statement has to be
         # this charge's: "I paid AED 50 for the Apple cable" isn't a USD 99 Apple charge.
         for clause in parts:
-            if pattern.search(clause) and OWNER_BUYS.search(clause) \
-                    and (not MONEY.search(clause) or money.search(clause)):
+            if NEGATED.search(clause):
+                continue
+            if buys_from(clause, pattern) and (not MONEY.search(clause) or money.search(clause)):
                 return created, text, title
     return None
 
