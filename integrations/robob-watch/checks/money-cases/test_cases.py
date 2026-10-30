@@ -513,6 +513,47 @@ class Questions(Base):
         self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'case')
         self.assertIn("he didn't answer, so it is now money case", event)
 
+    def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
+        pending = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+        at_ = at('2026-10-23T23:47')
+        self.assertEqual(mc.ask(self.data, 'Is the Acme charge yours?', pending, BANK, at_, now=at('2026-10-24T00:37'),
+                                find=finder(HISTORY), said=nobody, root=self.root)[0], mc.DONT_ASK)
+        q = self.questions()[0]
+        self.assertTrue(q['pending'])
+        code, msg = mc.ask(self.data, 'Is the Acme charge yours?', qid=q['id'], now=at('2026-10-24T00:45'),
+                           find=finder(HISTORY), said=nobody, root=self.root)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('wait for the receipt', msg)
+
+    def test_a_second_decline_after_sms_and_its_email_copy_still_reaches_him(self):
+        decline = 'Transaction of AED 120.00 on your Card 1111 at ACME was declined'
+        sms = self.screen(decline, BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:1')
+        email = self.screen(decline, 'alerts@emiratesnbd.example', '2026-10-23T23:47', '2026-10-23T23:48', 'mail:1')
+        self.assertEqual(email['id'], sms['id'])
+        second = self.screen(decline, BANK, '2026-10-23T23:52', '2026-10-23T23:53', 'imsg:2')
+        self.assertNotEqual(second['id'], sms['id'])
+        self.assertEqual(second['verdict'], 'ask')
+
+    def test_a_receipt_behind_21_usage_notices_is_still_found(self):
+        # The receipt is the oldest mail in the window; 21 newer usage notices fill the first page of hits.
+        receipt = {**RECEIPT, 'ts': at('2026-10-23T23:50').timestamp(), 'body': 'Thanks for ordering. Total AED 12.34'}
+        notices = [{'id': 100 + i, 'ts': at('2026-10-23T23:55').timestamp() + i, 'sender': 'Acme <usage@acme.example>',
+                    'subject': 'Usage notice', 'body': 'Usage of AED 12.34 on card 1111', 'source': 'email', 'from_me': 0}
+                   for i in range(21)]
+        seen = []
+
+        def find(query, since, until=None, source=None, n=20, deadline=None):
+            seen.append(n)
+            # Newest first, as msgs search returns them, cut at the requested hit count.
+            rows = sorted([receipt] + notices, key=lambda r: -r['ts'])
+            return rows[:n]
+        aed = 'Purchase of AED 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+        r = mc.charges.receipt(mc.charges.parse(aed, BANK), at('2026-10-24T00:37'), at('2026-10-24T00:45'),
+                               find=find, read=read)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['id'], receipt['id'])
+        self.assertTrue(all(n > 20 for n in seen))
+
     def test_what_it_stores_is_redacted(self):
         def said(since, until, deadline=None):
             return [('2026-10-23T19:50:00.000Z', 'acme order, card 4111 1111 1111 1111 and OTP is 482913',

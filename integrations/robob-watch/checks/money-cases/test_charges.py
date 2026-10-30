@@ -195,6 +195,14 @@ class Explain(unittest.TestCase):
         self.assertEqual(r['verdict'], 'owner')
         self.assertIn('00:46', r['why'])
 
+    def test_talking_about_a_merchant_without_paying_it_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'Summarize the Apple keynote for me', 'Apple talk')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
     def test_his_denials_and_questions_explain_nothing(self):
         for text in ('I do not recognise the ACME charge. It is not mine.', "What's this Acme charge?",
                      "acme isn't me, block the card", 'Dispute the Acme one'):
@@ -268,6 +276,8 @@ class OwnerTexts(unittest.TestCase):
             for tid, title in (('a', 'iMessage 2026-10-24 00:30'), ('m', 'Moni'), ('g', 'Group sb_gro')):
                 db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)', (tid, title, '2026-10-24T00:00:00.000Z'))
             rows = [('a', 'user', {'createdBy': 'user', 'text': 'acme is mine'}),
+                    # The bridge stamps the owner's iMessage turns 'system' (control/http.ts).
+                    ('a', 'user', {'createdBy': 'system', 'text': 'Acme ordering now'}),
                     ('a', 'user', {'createdBy': 'agent', 'text': 'acme agent'}),
                     ('a', 'user', {'createdBy': 'user', 'text': '[Forwarded by the owner from x] acme'}),
                     ('m', 'user', {'createdBy': 'user', 'text': 'acme from moni'}),
@@ -280,7 +290,8 @@ class OwnerTexts(unittest.TestCase):
             db.close()
             with patch.object(ch, 'STATE_DB', path):
                 got = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
-            self.assertEqual([t for _, t, _ in got], ['acme is mine'])
+            # Newest first, as the state DB returns the rows.
+            self.assertEqual([t for _, t, _ in got], ['Acme ordering now', 'acme is mine'])
             with patch.object(ch, 'STATE_DB', Path(tmp) / 'missing.sqlite'), self.assertRaises(ch.Lookup):
                 ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
 

@@ -490,7 +490,9 @@ def merchant_key(merchant):
 
 
 def charge_of(q):
-    return {k: q[k] for k in ('kind', 'currency', 'amount', 'card', 'merchant')}
+    # Questions opened before 'pending' was stored rebuild it from the merchant name.
+    pending = q.get('pending', bool(re.search(r'\b(?:pending|auth)\b', q.get('merchant') or '', re.I)))
+    return {k: q[k] for k in ('kind', 'currency', 'amount', 'card', 'merchant')} | {'pending': pending}
 
 
 def channel(sender):
@@ -560,7 +562,8 @@ def new_question(book, charge, text, at, now, chan='sms', item=None):
     base = '|'.join([charge['kind'], charge['card'], charge['currency'], charge['amount'], key, chan, stamp(at)])
     q = {'id': 'q-' + hashlib.sha256(base.encode()).hexdigest()[:8], 'kind': charge['kind'],
          'card': charge['card'], 'currency': charge['currency'], 'amount': charge['amount'],
-         'merchant': clip(redact(charge['merchant']), 80), 'mkey': key, 'at': stamp(at),
+         'merchant': clip(redact(charge['merchant']), 80), 'pending': bool(charge.get('pending')),
+         'mkey': key, 'at': stamp(at),
          'alert': clip(redact(text or ''), 240), 'alerts': [{'channel': chan, 'at': stamp(at), 'item': item}],
          'status': 'open', 'wait_until': None, 'asks': [], 'passed': False, 'item': None, 'why': '',
          'case': None, 'by': None, 'outcome': None, 'checked': None,
@@ -628,6 +631,13 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     chan = channel(sender)
     q = question_for(load_questions(data), charge, at, chan, item)
     base = {'kind': charge['kind'], 'errors': []}
+    if record and q:
+        # Record the alert before the early returns below, or the next copy of this charge (say the
+        # email after an SMS that was already asked) looks like a new charge and goes to him again.
+        with Locked(data or DATA, 'questions') as book:
+            live = question_for(book, charge, at, chan, item)
+            if live:
+                attach(live, chan, at, item)
     if q and q['status'] == 'closed':
         return {**base, 'verdict': 'explained', 'why': q.get('outcome') or '', 'id': q['id']}
     if q and q['status'] == 'case':

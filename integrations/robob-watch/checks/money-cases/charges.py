@@ -20,6 +20,10 @@ TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
 STATE_DB = Path(os.environ.get('MONEY_CASES_STATE_DB', '~/.robob/userdata/statev2.sqlite')).expanduser()
 RECEIPT_BEFORE = dt.timedelta(hours=2)
+# Hits asked for per receipt search, and mails read from them: a receipt buried under usage notices
+# with the same amount is still found, without an unbounded number of reads.
+RECEIPT_HITS = 60
+RECEIPT_READS = 12
 # A receipt under another name (Stripe's legal entity, a reseller) counts only this close to the
 # charge and only when it shows the same card's last four digits.
 SAME_TIME = dt.timedelta(minutes=15)
@@ -65,6 +69,9 @@ RECEIPT_WORDS = re.compile(r"\b(?:(?:receipt|invoice|amount paid|paid on|billed 
 # His words mention a charge without owning it when he denies it or asks about it.
 NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fraud|scam|stolen|block|dispute|"
                       r"cancel|refund|who|what|why|which)\b", re.I)
+# His words own a payment: he is ordering, paying, subscribing or topping up (not just naming a merchant).
+OWNER_BUYS = re.compile(r"\b(?:order(?:ing|ed|s)?|paying|paid|pay(?:ing)? (?:for|the)|set ?up|subscrib(?:e|ed|ing)|"
+                        r"top(?:ped|ping)? up|bought|buying)\b", re.I)
 
 
 class Lookup(Exception):
@@ -166,8 +173,10 @@ def owner_texts(since, until, deadline=None):
         except ValueError:
             continue
         text = str(p.get('text') or '')
-        # Forwards and Moni's or the group's chats carry user-created turns that aren't his words.
-        if p.get('createdBy') != 'user' or text.startswith('[Forwarded by') or re.match(r'(?:Moni|Group)\b', title or ''):
+        # The bridge stamps the owner's iMessage turns 'system' (control/http.ts), so 'user' alone drops
+        # all of them. Synthetic wakes and other people's chats still don't count as his words.
+        if p.get('createdBy') not in ('user', 'system') or text.startswith('[Forwarded by') \
+                or re.match(r'(?:Moni|Group)\b', title or ''):
             continue
         out.append((created, text, title or ''))
     return out
@@ -229,13 +238,24 @@ def receipt(charge, at, now, find=None, deadline=None, read=None):
                       lambda text: named.search(text) and (RECEIPT_WORDS.search(text) or card.search(text))))
     tries.append((amount, at - SAME_TIME, min(now, at + SAME_TIME),
                   lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
+    reads, seen_bodies = 0, set()
     for query, start, end, proves in tries:
-        for row in find(query, day(start), source='email', deadline=deadline):
+        # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
+        # wider than one page. Reads are capped, and a body already read counts for nothing new: a
+        # run of identical notices must not use up the reads before the receipt.
+        for row in find(query, day(start), source='email', n=RECEIPT_HITS, deadline=deadline):
             ts = row.get('ts') or 0
             if not (start.timestamp() <= ts <= end.timestamp() + 60) or row.get('from_me') \
                     or BANKS.search(str(row.get('sender') or '')):
                 continue
             text = read(row, deadline)
+            key = ' '.join(text.split())
+            if key in seen_bodies:
+                continue
+            if reads >= RECEIPT_READS:
+                return None
+            reads += 1
+            seen_bodies.add(key)
             if money.search(text) and proves(text):
                 return row
     return None
@@ -248,8 +268,10 @@ def owner_said(charge, at, now, said=None, deadline=None):
         return None
     pattern = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I)
     for created, text, title in said(at - OWNER_AROUND, min(now, at + OWNER_AROUND), deadline=deadline):
+        # Naming the merchant isn't enough: "Summarize the Apple keynote" names it without buying
+        # anything. He has to say he is paying or ordering it.
         # "It isn't mine" or "what's the Acme charge?" names the merchant but explains nothing.
-        if pattern.search(text) and not NOT_MINE.search(text):
+        if pattern.search(text) and OWNER_BUYS.search(text) and not NOT_MINE.search(text):
             return created, text, title
     return None
 
