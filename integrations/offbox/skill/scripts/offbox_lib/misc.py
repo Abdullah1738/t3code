@@ -251,7 +251,7 @@ def _wait_locked(r, echo):
 
 
 def _wait_run(r, echo):
-    from .runs import do_pulls, finish, follow, recover_lost_exit
+    from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo)
@@ -267,5 +267,6 @@ def _wait_run(r, echo):
                                (r["run_id"],)).fetchone())
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
+    go_std_glitch(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", code)
     print(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
