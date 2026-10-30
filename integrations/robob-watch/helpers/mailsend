@@ -326,9 +326,11 @@ def block_items(s, quotes):
 def card_items(text, body):
     """Items for what goes out. Only the quoted original the source mail brought (the text after the body the
     agent wrote) is folded; any '>' line the sender typed stays visible."""
+    # A forward with no added body stores body "" and its text starts with the quote, so nothing is authored and the
+    # whole quote folds. A reply/compose stores what the writer typed, and that prefix stays unfolded.
     authored, rest = text, ""
-    b = (body or "").strip()
-    if b and text.startswith(b):
+    b = (body or "").replace("\r\n", "\n").strip()
+    if text.startswith(b):
         authored, rest = b, text[len(b):]
     items = block_items(authored, quotes=False)
     tail = block_items(rest, quotes=True)

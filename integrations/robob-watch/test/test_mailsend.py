@@ -424,6 +424,20 @@ class MailsendTest(unittest.TestCase):
         self.assertIn("+ quoted original, 1 line", page)
         self.assertNotIn("the original secret line", page)
 
+    def test_forward_with_no_body_folds_the_source_quote(self):
+        # Review r2 P2: a forward with no added body has body "", and its whole text used to count as authored text,
+        # so the quote never folded and a long source made several cards.
+        code, out, err = self.ms("forward", "-a", "gmail", "-m", "Inbox", "262282", "-t", "host@example.com")
+        self.assertEqual(code, 0, err)
+        i = out.split()[1]
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        paths = out.split()
+        self.assertEqual(len(paths), 1)
+        page = self.card_html_of(paths[0])
+        self.assertIn("+ quoted original, 1 line", page)
+        self.assertNotIn("the original secret line", page)
+
     def test_wrapping_keeps_every_line_inside_the_text_column(self):
         # Review r1 P2: a 60-character Chinese line is ~970px at 30px; the wrap must split it to fit 586px.
         import importlib.machinery, importlib.util
