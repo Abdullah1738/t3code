@@ -844,6 +844,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const announced = new Map<string, EventOf<"session.created">["data"]>();
     const strays = new Map<string, ThreadState>();
     const busy = new Set<string>();
+    const shells = new Map<string, string>(); // running shell id -> the session that started it
+    const runsShell = (sessionId: string) => [...shells.values()].includes(sessionId);
     const pending = new Map<RuntimeRequestId, PendingRequest>();
     const lock = yield* Semaphore.make(1);
     const clearing = new Map<string, Deferred.Deferred<void>>();
@@ -951,7 +953,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state.wakes.length > 0 ||
       state.reports.size > 0 ||
       (state.subagent !== undefined && busy.has(state.sessionId)) ||
-      [...state.calls.values()].some((call) => call.background);
+      [...state.calls.values()].some((call) => call.background) ||
+      runsShell(state.sessionId);
 
     const hasBackground = (thread: ThreadState) => sessionsOf(thread).some(owesWork);
 
@@ -2538,6 +2541,33 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           (event.type === "permission.replied" && event.data.reply !== "reject");
         return yield* settleRequest(entry, answered ? "resolved" : "cancelled");
       }
+      // A background shell wakes its session when it ends, so it is pending work like a background subagent.
+      if (event.type === "shell.created") {
+        const owner = stringField(event.data.info.metadata, "sessionID");
+        if (owner !== undefined && event.data.info.status === "running")
+          shells.set(event.data.info.id, owner);
+        return;
+      }
+      if (event.type === "shell.exited" || event.type === "shell.deleted") {
+        shells.delete(event.data.id);
+        return;
+      }
+      if (event.type === "location.shutdown") {
+        const directory = event.location?.directory;
+        if (directory === undefined) return;
+        for (const state of threads.values()) {
+          if (state.mcp?.directory !== directory) continue;
+          // Idle eviction also shuts a location down; an idle thread gets its server back from its next prepareTurn.
+          if (state.active === undefined && !busy.has(state.sessionId) && !runsShell(state.sessionId))
+            continue;
+          // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
+          yield* Effect.forkIn(
+            sessionGates.withLock(state.sessionId, readdMcp(state, directory)),
+            sessionScope,
+          );
+        }
+        return;
+      }
       if (sessionId === undefined) return;
       const state = threads.get(sessionId);
       if (state === undefined) return;
@@ -3023,6 +3053,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         state.mcp = undefined;
         state.execution = ++state.executions;
       }
+      // Shell events sent while the stream was down are lost, so a stale entry must not pin a thread forever.
+      shells.clear();
       yield* lock.withPermit(reconcile).pipe(Effect.timeout(RECONCILE_TIMEOUT));
       return stream;
     }).pipe(Effect.retry(RECONNECT_SCHEDULE));
@@ -3426,6 +3458,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           ),
         ),
       );
+
+    // A reload or eviction dropped the location's runtime MCP servers; a running thread needs its own back now.
+    const readdMcp = Effect.fnUntraced(function* (state: ThreadState, directory: string) {
+      const registered = state.mcp;
+      if (registered === undefined || registered.directory !== directory) return;
+      if (!(yield* addMcp(registered))) return;
+      // An unload while the add ran already removed the old copy; drop the one just added.
+      if (threads.get(state.sessionId) !== state) yield* removeMcp(registered);
+    });
 
     // Runs when the agent moved its session: the server must follow it to the new directory.
     // The session may move again while an add is in flight, so each add is checked
