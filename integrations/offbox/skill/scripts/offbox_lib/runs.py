@@ -231,6 +231,9 @@ LDCACHE_REPAIR = r'''(
 ) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
+# boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
+# A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
+SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
 # Go failing to read its own std tree (a box read glitch, not the user's code). User module paths never match.
 GO_STD_GLITCH = re.compile(r"package (unsafe|internal/\S+|runtime(/\S+)?) is not in std \(/usr/local/go/src/|"
                            r"build constraints exclude all Go files in /usr/local/go/src/(internal|runtime|unsafe)\b")
@@ -377,6 +380,14 @@ def steps_summary(results: list[tuple[int, int]], planned: int) -> str:
 
 def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
+
+
+def scope_failed(log_path: Path | None) -> bool:
+    """True when the run's only output is boat's scope error: nothing of ours ran."""
+    if not log_path or not Path(log_path).exists():
+        return False
+    lines = [ln for ln in Path(log_path).read_text(errors="replace").splitlines() if ln.strip()]
+    return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
 
 
 def exit_recording_command(script: str, run_id: str) -> str:
@@ -564,6 +575,15 @@ class Runner:
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             if (e.status or 0) in REFUSED_STATUSES:
                 self.started = False
+                if e.api_code in ("sandbox_not_ready", "machine_not_running"):
+                    # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
+                    # hand-run `boat resume`.
+                    con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (self.box,))
+                    con.commit()
+                    ssh_sync.close_master(self.box)
+                    event(con, self.box, "lease_not_ready", str(e)[:200])
+                    raise OffboxError(f"{e}. Nothing ran; offbox resumes {self.box} on the next run. "
+                                      "Retry; don't run `boat resume` by hand.", code=EXIT_INFRA) from e
                 if "E2BIG" in str(e):
                     # Usage error, not infra: no infra alert, no retry, no fallback.
                     raise OffboxError(f"{e}: the command is too long for one exec; put it in a script file "
@@ -801,6 +821,20 @@ def _run_remote(a, rn) -> int:
         code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
+    if code not in (0, None) and scope_failed(rn.log_path):
+        rn.started = False
+        rn.record(error="box could not start the command (systemd scope)")
+        finish(rn.run_id, None, "infra")
+        con = db()
+        event(con, rn.box, "box_broken", f"{rn.run_id} transient scope failed")
+        try:
+            # images=False: docker-images.sh needs a working systemd and may hang on this box.
+            lease.stop_box(con, rn.box, "broken: transient scope failed", images=False, locked=True)
+            after = "offbox stopped it, so the next run resumes it clean"
+        except OffboxError as e:
+            after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
+        raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
+                          f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False
