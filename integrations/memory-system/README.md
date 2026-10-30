@@ -16,7 +16,9 @@ runtime data.
   appended messages, since `time_updated` does not move). The fingerprint table
   `opencode_sync_progress` starts empty, so the first runs rescan every session
   once; this is resumable (each finished session is recorded, `--deadline` stops
-  between sessions). `OPENCODE_DB` overrides the source db path (tests use a temp db).
+  between sessions). One failing session no longer stops the run: it is logged,
+  not stamped, retried next run, and the run exits 1. `OPENCODE_DB` overrides the
+  source db path (tests use a temp db).
 - `src/sync_muse.py` - incremental Muse Code capture (source `muse`): tails each
   `~/.local/share/muse/sessions/**/session.jsonl` from its last byte offset
   (`muse_sync_files`), projects prompts, answers, reasoning summaries and tool

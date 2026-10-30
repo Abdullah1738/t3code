@@ -140,6 +140,69 @@ class SyncOpencodeTest(unittest.TestCase):
         self.assertEqual(progress, (2, 2))
         m.close()
 
+    def test_lone_surrogate_is_cleaned(self):
+        s = self.load()
+        data = {"agent": "build", "model": {"id": "m", "providerID": "p"},
+                "time": {"created": NOW - 30_000, "completed": NOW - 20_000},
+                "content": [
+                    {"type": "tool", "name": "bash", "id": "call_1",
+                     "state": {"status": "completed", "input": {"cmd": "x"},
+                               "content": [{"type": "text", "text": "before \udc4d after"}]}},
+                    {"type": "text", "text": "smile \U0001F600 done"}]}
+        self.src.execute("INSERT INTO session_message VALUES ('msg_a1', 'ses_a', 'assistant', 2, ?, ?, ?)",
+                         (NOW - 30_000, NOW - 20_000, json.dumps(data)))
+        self.src.commit()
+        self.run_sync(s)
+
+        m = self.mem()
+        rows = dict(m.execute("SELECT content_type, content FROM episodic_events "
+                              "WHERE source='opencode' AND session_id='ses_a' "
+                              "AND content_type IN ('tool_result', 'text') "
+                              "AND speaker IN ('system', 'assistant')").fetchall())
+        self.assertEqual(rows["tool_result"], "before \ufffd after")
+        self.assertIn("smile \U0001F600 done", rows["text"])
+        progress = m.execute("SELECT max_seq, msg_count FROM opencode_sync_progress "
+                             "WHERE session_id='ses_a'").fetchone()
+        self.assertEqual(progress, (2, 2))
+        m.close()
+
+    def test_failing_session_does_not_block_others(self):
+        s = self.load()
+        self.src.execute("INSERT INTO session_v2 VALUES ('ses_b', NULL, '/repo', 'B', NULL, ?, ?)",
+                         (NOW - 120_000, NOW - 120_000))
+        self.src.execute("INSERT INTO session_message VALUES ('msg_b1', 'ses_b', 'user', 1, ?, ?, ?)",
+                         (NOW - 120_000, NOW - 120_000, json.dumps({"text": "b question"})))
+        self.src.commit()
+
+        class Failing(s.Sync):
+            def sync_session(self, sess):
+                if sess["id"] == "ses_b":
+                    raise RuntimeError("boom")
+                return super().sync_session(sess)
+
+        args = type("A", (), {"full": False, "only": None, "limit": 0, "deadline": 0,
+                              "progress": ""})()
+        sync = Failing(args)
+        stats = sync.run()
+        sync.mem.close()
+        sync.raw.close()
+        sync.src.close()
+
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["failed"], ["ses_b"])
+        m = self.mem()
+        texts = [r[0] for r in m.execute(
+            "SELECT content FROM episodic_events WHERE source='opencode' AND session_id='ses_a'")]
+        self.assertIn("first question", texts)
+        self.assertIsNone(m.execute("SELECT 1 FROM opencode_sync_sessions "
+                                    "WHERE session_id='ses_b'").fetchone())
+        m.close()
+        sync = s.Sync(args)
+        self.assertIn("ses_b", [x["id"] for x in sync.changed_sessions()])
+        sync.mem.close()
+        sync.raw.close()
+        sync.src.close()
+
 
 if __name__ == "__main__":
     unittest.main()
