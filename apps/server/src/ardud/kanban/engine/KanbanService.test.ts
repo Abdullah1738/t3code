@@ -4862,8 +4862,47 @@ it.effect("a rejected wake after an announced recovery does not post recovery tw
   }),
 );
 
+const failingLinkProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(
+      fake.pipe(
+        Layer.provideMerge(KanbanModels.layerTest(null)),
+        Layer.provideMerge(failingLinkStore.pipe(Layer.provide(KanbanStore.layer))),
+        Layer.provideMerge(Sqlite.layerMemory),
+        Layer.provideMerge(
+          Layer.mock(TextGeneration.TextGeneration)({
+            generateJson: (() => {
+              probe.calls += 1;
+              return probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
+            }) as never,
+          }),
+        ),
+        Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+        Layer.provideMerge(boardFilesLayer),
+      ),
+    ),
+  );
+
 const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake, true)));
+
+// Fails the next `linkFailures.remaining` threadLinks reads (the recovery scan reads them first).
+const linkFailures = { remaining: 0 };
+const failingLinkStore = Layer.effect(
+  KanbanStore.KanbanStore,
+  Effect.gen(function* () {
+    const real = yield* KanbanStore.KanbanStore;
+    return {
+      ...real,
+      threadLinks: (filter) =>
+        linkFailures.remaining > 0
+          ? ((linkFailures.remaining -= 1),
+            Effect.fail(new KanbanStore.KanbanStoreError({ operation: "read thread links", cause: "injected" })))
+          : real.threadLinks(filter),
+    };
+  }),
+);
 
 // Fails the next `postFailures.remaining` writes of a "provider-watch" outage post.
 const postFailures = { remaining: 0 };
@@ -4879,5 +4918,31 @@ const failingPostStore = Layer.effect(
             Effect.fail(new KanbanStore.KanbanStoreError({ operation: "write message", cause: "injected" })))
           : real.putMessage(message),
     };
+  }),
+);
+
+it.effect("a failed recovery-alert read still wakes the paused thread on a passing probe", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = false;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+
+      // The probe passes, but the recovery-alert scan's threadLinks read fails once.
+      probe.ok = true;
+      linkFailures.remaining = 1;
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      assert.strictEqual(linkFailures.remaining, 0);
+      assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+    }).pipe(Effect.provide(failingLinkProbeLayer(fake.layer)));
   }),
 );

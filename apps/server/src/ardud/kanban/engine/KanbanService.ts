@@ -2400,27 +2400,33 @@ const make = Effect.gen(function* () {
     // Only boards that were announced get a "back" message, once per outage: a board
     // is recorded as recovered as soon as its post lands, so a rejected wake below
     // doesn't repeat it on the next probe.
-    const state = (yield* Ref.get(down)).get(key);
-    if (state !== undefined) {
+    // The whole step is optional: a failed read here (boards or links) must not abort
+    // the wakes below, or the other probe keys in this run.
+    yield* Effect.gen(function* () {
+      const state = (yield* Ref.get(down)).get(key);
+      if (state === undefined) return;
       const pending = new Set<KanbanBoard["id"]>();
       for (const id of state.announced) if (!state.recovered.has(id)) pending.add(id);
-      if (pending.size > 0) {
-        const backed = yield* alertBoards(
-          key,
-          pending,
-          (count) =>
-            `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
-        );
-        yield* Ref.update(down, (map) => {
-          const entry = map.get(key);
-          if (!entry) return map;
-          return new Map(map).set(key, {
-            ...entry,
-            recovered: new Set([...entry.recovered, ...backed]),
-          });
+      if (pending.size === 0) return;
+      const backed = yield* alertBoards(
+        key,
+        pending,
+        (count) =>
+          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
+      );
+      yield* Ref.update(down, (map) => {
+        const entry = map.get(key);
+        if (!entry) return map;
+        return new Map(map).set(key, {
+          ...entry,
+          recovered: new Set([...entry.recovered, ...backed]),
         });
-      }
-    }
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban outage recovery alert failed", { key, cause }),
+      ),
+    );
     let failed = false;
     for (const { link, board } of yield* pausedLinks) {
       if (link.paused === null || linkKey(link, board) !== key) continue;
