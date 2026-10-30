@@ -328,6 +328,91 @@ it.effect("a reviewer's verdict after it lost its slot counts until the card mov
   }),
 );
 
+// A critical chain whose step 1 lost its slot: its late clear moves nothing
+// (needs_review -> needs_review), so a second clear must still be refused, and
+// step 2 has to dispatch into the same thread as usual.
+const chainStepOneLostSlot = (flag: "dispatcher" | "self") =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "high" });
+    const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+    yield* kanban.updateBoard(board.id, {
+      reviewChains: [{ name: "Critical", steps: [sol, astra] }],
+      defaultReviewChain: "Critical",
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    yield* kanban.setPool(board.id, sol, 2);
+    yield* kanban.setPool(board.id, astra, 2);
+    const created = yield* kanban.createCard(
+      board.id,
+      { prompt: "Change fee rounding", title: "Fee rounding", reviewChain: "Critical" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+    yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+      _tag: "thread",
+      threadId: workThread,
+    });
+    yield* kanban.dispatchNow;
+    const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+
+    if (flag === "dispatcher") {
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.turnEnded(reviewThread);
+      assert.strictEqual(
+        (yield* kanban.card(created.id)).card.stalled?.reason,
+        "Reviewer stopped without a verdict",
+      );
+    } else {
+      yield* kanban.flagCard(created.id, "Needs the owner's OK", {
+        _tag: "thread",
+        threadId: reviewThread,
+      });
+    }
+
+    yield* kanban.reviewResult(reviewThread, "clear", []);
+    let card = (yield* kanban.card(created.id)).card;
+    assert.strictEqual(card.stage, "needs_review");
+    assert.strictEqual(card.reviewStep, 1);
+
+    const duplicate = yield* kanban
+      .reviewResult(reviewThread, "clear", [])
+      .pipe(Effect.flip);
+    assert.strictEqual(duplicate.code, "conflict");
+    card = (yield* kanban.card(created.id)).card;
+    assert.strictEqual(card.reviewStep, 1);
+
+    yield* kanban.dispatchNow;
+    card = (yield* kanban.card(created.id)).card;
+    assert.strictEqual(card.activeThreadId, reviewThread);
+    assert.include(card.activePool ?? "", "gpt-6-astra");
+    return { kanban, created, reviewThread };
+  });
+
+it.effect("a step-1 verdict that lost its slot is accepted once, after a dispatcher flag", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* chainStepOneLostSlot("dispatcher");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a step-1 verdict that lost its slot is accepted once, after a self flag", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* chainStepOneLostSlot("self");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("routes owner messages to the live thread, or to an evaluator when none", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

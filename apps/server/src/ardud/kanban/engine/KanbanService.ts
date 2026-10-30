@@ -2700,9 +2700,12 @@ const make = Effect.gen(function* () {
       return false;
     }
     const events = yield* store.cardEvents(card.id);
+    // A recorded verdict closes the window even when it leaves the stage as is
+    // (a late clear logs needs_review -> needs_review), so it counts as a move.
     const left = events.findLast(
       (event) =>
-        event.fromStage !== null && event.toStage !== null && event.fromStage !== event.toStage,
+        event.kind === "review" ||
+        (event.fromStage !== null && event.toStage !== null && event.fromStage !== event.toStage),
     );
     return (
       left?.kind === "flagged" &&
