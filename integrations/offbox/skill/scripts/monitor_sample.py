@@ -14,6 +14,8 @@ PWD = re.compile(r"(?:^|\s)PWD=(.*?)(?=\s[A-Za-z_][A-Za-z0-9_]*=|$)")
 FIELDS = "pid=,ppid=,pcpu=,rss=,command="
 LOCAL_RUN = re.compile(r"\boffbox-local:run-")
 OFFBOX = re.compile(r"(?:^|[\s/'\"])offbox(?:\.py)?(?:\s|$|['\"])|/offbox_lib(?:/|\b)")
+# LaunchServices gives every app it launches (and, by inheritance, the app's children) this name.
+APP = re.compile(r"(?:^|\s)XPC_SERVICE_NAME=application\.")
 
 
 def process_rows(raw):
@@ -50,9 +52,19 @@ def sample_processes(previous, now, raw=None, plain=None):
         row.update(cmd=command, session=session[1] if session else None,
                    cwd=cwd[1] if cwd else None)
         row["remote"] = bool(OFFBOX.search(command))
+        row["app"] = APP.search(env) is not None
         # Local-first runs execute here (their env carries OFFBOX_LOCAL_RUN): real Mac load the monitor must see.
         row["local_run"] = "OFFBOX_LOCAL_RUN=" in env or LOCAL_RUN.search(command) is not None
         row["heavy"] = classify(command, row["cwd"]).get("heavy", False)
+    # `open` hands the caller's env to the app, so a GUI app started from an agent
+    # shell (Robob by its installer, Tailscale) carries that shell's session id and
+    # PWD for its whole life. The id on an app's launch process, and copies of it
+    # in the app's own tree, aren't agent work.
+    stale = {row["session"] for row in rows.values()
+             if row.get("app") and row["ppid"] == 1 and row["session"]}
+    for row in rows.values():
+        if row.get("app") and row["session"] in stale:
+            row.update(session=None, cwd=None)
     # Inherit identity through the OS process tree (children can clear env).
     for row in rows.values():
         current, seen = row, set()
@@ -99,7 +111,8 @@ def sample_processes(previous, now, raw=None, plain=None):
             heavy = current["heavy"]
         if not heavy and not sustained:
             continue
-        if not row["session"]:
+        # An app's cwd says nothing about which agent it works for.
+        if not row["session"] and not row.get("app"):
             cwd = row["cwd"]
             if not cwd:
                 output = run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=2)
