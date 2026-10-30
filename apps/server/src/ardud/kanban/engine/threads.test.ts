@@ -71,3 +71,26 @@ describe("viewStateOf", () => {
     expect(DateTime.formatIso(view.quietSince)).toBe(QUESTION_AT);
   });
 });
+
+describe("backgroundWorkOf", () => {
+  it("counts subagents and background tasks, not commands or pull-request watches", () => {
+    expect(
+      backgroundWorkOf({
+        pendingBackgroundTasks: [
+          { taskId: "a", kind: "subagent" },
+          { taskId: "b", kind: "background_task" },
+          { taskId: "c", kind: "command" },
+          { taskId: "pull-request-watch:github.com/x/y#1", kind: "monitor" },
+        ],
+      }),
+    ).toBe(2);
+  });
+
+  it("is zero for an empty roster", () => {
+    expect(backgroundWorkOf({ pendingBackgroundTasks: [] })).toBe(0);
+  });
+
+  it("is zero when the roster is missing (older shells)", () => {
+    expect(backgroundWorkOf({})).toBe(0);
+  });
+});
