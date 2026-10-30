@@ -74,6 +74,8 @@ offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
 offbox local --list ; offbox local --clear
 ```
 
+The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
+
 ## Your box (lease)
 
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
