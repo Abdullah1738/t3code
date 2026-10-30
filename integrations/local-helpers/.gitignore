@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+lydia-ticks/ticks.db*
+lydia-ticks/history-token
+lydia-ticks/tunnel.json
