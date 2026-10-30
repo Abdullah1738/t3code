@@ -204,6 +204,18 @@ export function isOutage(failure: {
   return OUTAGE_TEXT.test(failure.message);
 }
 
+// Words a provider uses when a thread's history no longer fits the model.
+const CONTEXT_FULL_TEXT =
+  /prompt is too long|input is too long|context[ _]length|maximum context|context window|too many tokens|request_too_large/i;
+
+/** A failed run only a fresh thread gets past: the thread is too long to send again. */
+export function isContextFull(failure: { readonly message: string }): boolean {
+  return CONTEXT_FULL_TEXT.test(failure.message);
+}
+
+/** How long after a fresh start a second context-full run is flagged instead of restarted. */
+export const CONTEXT_FULL_RETRY_MS = 60 * 60 * 1000;
+
 export const PROBE_FIRST_MS = 5 * 60 * 1000;
 export const PROBE_MAX_MS = 30 * 60 * 1000;
 export const nextProbeDelay = (delayMs: number): number => Math.min(delayMs * 2, PROBE_MAX_MS);

@@ -399,11 +399,11 @@ const SubtaskDone = tool(
 
 const CardThread = tool(
   "card_thread",
-  "Steer, stop or wake a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), or wake its last work thread with text.",
+  "Steer, stop, wake or reset a card thread",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
   {
     card: CardRef,
-    action: Schema.Literals(["steer", "stop", "wake"]),
+    action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
   },
   { card: Record },

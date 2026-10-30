@@ -19,6 +19,7 @@ import {
   checkMove,
   discussionSettleDue,
   isBlocked,
+  isContextFull,
   isOutage,
   MAX_BATCH,
   maskDownPools,
@@ -863,6 +864,28 @@ describe("workerQuietDue", () => {
       ),
     ).toBe(false);
     expect(workerQuietDue({ ...working, activeRole: "review" }, view("idle"), at(31))).toBe(false);
+  });
+});
+
+describe("isContextFull", () => {
+  it("treats a thread too long for the model as context-full", () => {
+    expect(
+      isContextFull({
+        message:
+          '[400]: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000528 tokens > 1000000 maximum"}}',
+      }),
+    ).toBe(true);
+    expect(isContextFull({ message: "context_length_exceeded" })).toBe(true);
+    expect(
+      isContextFull({ message: "This model's maximum context length is 200000 tokens" }),
+    ).toBe(true);
+  });
+
+  it("leaves model, variant and empty failures alone", () => {
+    expect(isContextFull({ message: "Variant unavailable for opus/gpt-6-astra: high" })).toBe(
+      false,
+    );
+    expect(isContextFull({ message: "The run failed without an error message." })).toBe(false);
   });
 });
 

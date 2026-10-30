@@ -1308,6 +1308,144 @@ it.effect("a card restarted on a new thread keeps what it was woken with", () =>
   }),
 );
 
+const overflow = {
+  class: "provider_error",
+  code: "provider.invalid-request",
+  message: "[400]: prompt is too long: 1000528 tokens > 1000000 maximum",
+} as never;
+
+it.effect("a work thread that gets too long starts the card on a fresh thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const oldThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(oldThread)!.messages.length;
+      fake.failures.set(oldThread, overflow);
+      yield* kanban.turnEnded(oldThread);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(oldThread)!.messages.length, before);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "todo");
+      assert.isNull(moved.stalled);
+      assert.isNull(moved.workThreadId);
+      assert.isNull(moved.activeThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "working");
+      assert.notStrictEqual(fresh.activeThreadId, oldThread);
+      const first = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(first, "Fresh thread:");
+      assert.include(first, "x");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a second overflow within the hour is flagged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const first = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(first, overflow);
+      yield* kanban.turnEnded(first);
+      yield* kanban.dispatchNow;
+      const second = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.notStrictEqual(second, first);
+      fake.failures.set(second, overflow);
+      yield* kanban.turnEnded(second);
+      const flagged = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(flagged.stage, "todo");
+      assert.match(flagged.stalled?.reason ?? "", /^Run failed: .*prompt is too long/);
+      assert.strictEqual(flagged.workThreadId, second);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a review thread that gets too long gets a fresh review", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.dispatchNow;
+      const oldReview = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(oldReview, overflow);
+      yield* kanban.turnEnded(oldReview);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "needs_review");
+      assert.isNull(moved.stalled);
+      assert.isNull(moved.reviewThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "in_review");
+      assert.notStrictEqual(fresh.activeThreadId, oldReview);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("card_thread reset starts a working card on a fresh thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.cardThread(created.id, "reset", "Pick up at step 3.", owner);
+      const reset = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(reset.stage, "todo");
+      assert.isNull(reset.workThreadId);
+      assert.isNull(reset.stalled);
+      assert.include(fake.interrupted, thread);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.notStrictEqual(fresh.activeThreadId, thread);
+      const first = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(first, "Pick up at step 3.");
+      assert.include(first, "Fresh thread:");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("card_thread reset clears a flagged card's dead thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Variant unavailable for opus/gpt-6-astra: high",
+      } as never);
+      yield* kanban.turnEnded(thread);
+      assert.isNotNull((yield* kanban.card(created.id)).card.stalled);
+      assert.strictEqual((yield* kanban.card(created.id)).card.workThreadId, thread);
+      yield* kanban.cardThread(created.id, "reset", "", owner);
+      const reset = (yield* kanban.card(created.id)).card;
+      assert.isNull(reset.stalled);
+      assert.isNull(reset.workThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "working");
+      assert.notStrictEqual(fresh.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a card that moved to another thread no longer counts as this thread's", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

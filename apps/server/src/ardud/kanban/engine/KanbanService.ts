@@ -319,7 +319,7 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly cardThread: (
     cardId: KanbanCard["id"],
-    action: "steer" | "stop" | "wake",
+    action: "steer" | "stop" | "wake" | "reset",
     text: string,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
@@ -924,6 +924,21 @@ const make = Effect.gen(function* () {
 
   const release = (card: KanbanCard) =>
     ({ ...card, activeThreadId: null, activeRole: null, activePool: null }) satisfies KanbanCard;
+
+  // Logged when a card leaves a thread that got too long; a repeat inside an hour is flagged.
+  const FRESH_START = "Thread too long; the next run starts on a fresh thread";
+  const freshStartedRecently = (card: KanbanCard, at: string) =>
+    store.cardEvents(card.id).pipe(
+      Effect.map((events) =>
+        events.some(
+          (event) =>
+            event.body?.startsWith(FRESH_START) === true &&
+            Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
+        ),
+      ),
+    );
+  const withFreshNote = (note: string | null | undefined) =>
+    [note?.trim(), Briefs.FRESH_THREAD_NOTE].filter((part): part is string => !!part).join("\n\n");
 
   /**
    * A card leaves its live thread. The thread's own move happens mid-turn, so
@@ -2620,6 +2635,27 @@ const make = Effect.gen(function* () {
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
         for (const entry of carried) {
+          // A thread too long to send again can't run the card: the next
+          // dispatch starts it on a fresh thread.
+          if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(entry, at))) {
+            const fresh: KanbanCard = {
+              ...release(entry),
+              stage: "todo",
+              workThreadId: null,
+              stalled: null,
+              nudgedAt: null,
+              wakeNote: withFreshNote(entry.wakeNote),
+              movedAt: at,
+              updatedAt: at,
+            };
+            yield* logEvent(fresh, system, "moved", {
+              fromStage: entry.stage,
+              toStage: "todo",
+              body: `${FRESH_START}: ${failure.message}`,
+            });
+            yield* saveCard(fresh);
+            continue;
+          }
           const next: KanbanCard = {
             ...release(entry),
             stage: "todo",
@@ -2657,6 +2693,25 @@ const make = Effect.gen(function* () {
     }
     if (outage !== null) return;
     if (failure !== null) {
+      if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(card, at))) {
+        const fresh: KanbanCard = {
+          ...release(card),
+          stage: "needs_review",
+          reviewThreadId: null,
+          stalled: null,
+          nudgedAt: null,
+          movedAt: at,
+          updatedAt: at,
+        };
+        yield* logEvent(fresh, system, "moved", {
+          fromStage: card.stage,
+          toStage: "needs_review",
+          body: `${FRESH_START}: ${failure.message}`,
+        });
+        yield* saveCard(fresh);
+        yield* kick;
+        return;
+      }
       const reason = `Run failed: ${failure.message}`;
       const next: KanbanCard = {
         ...release(card),
@@ -4203,6 +4258,30 @@ const make = Effect.gen(function* () {
             body: next.stalled?.reason ?? null,
           });
           yield* saveCard(next);
+          return next;
+        }
+        if (action === "reset") {
+          yield* letGo(card, false, "moved to a fresh thread");
+          const stage: KanbanCard["stage"] =
+            card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage;
+          const next: KanbanCard = {
+            ...release(card),
+            workThreadId: null,
+            reviewThreadId: null,
+            stage,
+            stalled: null,
+            nudgedAt: null,
+            wakeNote: stage === "todo" ? withFreshNote(text.trim() || card.wakeNote) : card.wakeNote,
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(next, actor, "moved", {
+            fromStage: card.stage,
+            toStage: stage,
+            body: text.trim() ? `${FRESH_START}: ${text.trim()}` : FRESH_START,
+          });
+          yield* saveCard(next);
+          yield* kick;
           return next;
         }
         if (card.activeThreadId !== null) {
