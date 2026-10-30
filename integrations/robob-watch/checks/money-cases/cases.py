@@ -566,6 +566,20 @@ def runner_fires(wd):
         return None
 
 
+def runner_owns(wd, out):
+    """Whether the runner has accepted this check's output: it is saved as the runner's pending event.
+
+    The runner saves `pending` (with the event text) before it acks the run, so a match means it will retry
+    the event itself. No match and no delivery means the output was lost before acknowledgement."""
+    try:
+        pending = json.loads((wd / 'state.json').read_text()).get('pending') or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    # An outbox from before this field (or an empty one) has no event to match, so it is never owned.
+    event = (out.get('event') or '').strip()
+    return bool(event) and (pending.get('event') or '').strip() == event
+
+
 def delivery_time(out, wd):
     """When the runner actually delivered this event, or None while it is still pending.
 
@@ -616,9 +630,11 @@ def run_check(wd, run, data=None, root=None, now=None):
             if clock.get(cid, {}).get('answer') != answer['answer']:
                 clock[cid] = {'answer': answer['answer'], 'at': delivered_at.isoformat(timespec='seconds')}
     elif out:
-        # Not delivered yet: keep it as the pending outbox. The runner will retry the same event; it is only
-        # committed to `sent` above once delivery is confirmed.
-        state['outbox'] = out
+        # Not delivered yet. Two cases: the runner took the event (it is in state.json `pending`, and it will
+        # retry it), or the runner never took it (the check died before the runner saved it). Only the first
+        # is kept; the second is dropped and rebuilt below, or it would block every alert for good.
+        if runner_owns(wd, out):
+            state['outbox'] = out
     # An event the runner never took is rebuilt from the book, so it skips quiet hours and closed or moved cases.
     cases = load(data)['cases']
     cutoff = stamp(now - KEEP_SENT)
@@ -670,7 +686,7 @@ def run_check(wd, run, data=None, root=None, now=None):
                 if cid in by_id and cid not in starts:
                     starts[cid] = {'answer': answered_at(by_id[cid]).isoformat()}
             state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
-                               'clock': starts, 'days': list(dict.fromkeys(days))}
+                               'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
     write_json(pings, state)
     return event
 
@@ -786,10 +802,11 @@ def main(argv=None):
         elif args.command == 'show':
             print(json.dumps(redact_all(find(load(), args.id)), ensure_ascii=False, indent=1))
         elif args.command == 'add':
-            add(DATA, args.id, args.merchant, args.amount, args.currency, args.state, args.next,
-                args.deadline, args.who, args.reference, args.why, args.watcher, charged=args.charged,
-                kind=args.kind, unmatched=args.unmatched, repeat=args.repeat, distinct=args.distinct)
-            print(table([find(load(), args.id)]))
+            case = add(DATA, args.id, args.merchant, args.amount, args.currency, args.state, args.next,
+                       args.deadline, args.who, args.reference, args.why, args.watcher, charged=args.charged,
+                       kind=args.kind, unmatched=args.unmatched, repeat=args.repeat, distinct=args.distinct)
+            # With --repeat, add returns the existing case and creates nothing: show that one.
+            print(table([case]))
         elif args.command == 'update':
             changes = {f: getattr(args, f) for f in FIELDS}
             update(DATA, args.id, changes, args.add_watcher, args.drop_watcher, args.note,

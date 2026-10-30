@@ -178,13 +178,24 @@ class Pings(Base):
     def sent(self):
         return json.loads((self.wd / 'pings.json').read_text())['sent']
 
+    def test_an_old_outbox_without_its_event_text_is_rebuilt(self):
+        # An outbox written before the event text was kept can't be matched to the runner's pending event.
+        self.case(deadline='2026-10-25')
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 3}))
+        (self.wd / 'pings.json').write_text(json.dumps({'sent': {}, 'outbox': {
+            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3, 'clock': {}}}))
+        self.assertIn('acme', self.check('2026-10-24T10:00', 'r1'))
+        self.assertEqual(self.check('2026-10-24T10:30', 'r2'), '')
+        self.assertIn('acme|r0|soon', self.sent())
+
     def test_unrecorded_output_is_rebuilt_before_new_work(self):
         self.case(deadline='2026-10-25')
         first = self.check('2026-10-24T10:00', 'r1', ack=False)
         self.assertTrue(first)
-        # While that event is undelivered it is held: the next tick builds nothing new over it.
-        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+        # The runner never took it (no state.pending), so the r2 check rebuilds the event rather than holding it.
+        rebuilt = self.check('2026-10-24T10:15', 'r2', ack=False)
+        self.assertEqual(rebuilt, first)
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
         self.assertEqual(self.sent(), {})
         # Once the runner takes it and delivers, the reminder is recorded as sent at its delivery time.
         (self.wd / '.run-ok').write_text('r2')
@@ -424,6 +435,28 @@ class Rules(Base):
         self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
                               if '|ask|' in k]), 1)
 
+    def test_output_lost_before_the_runner_accepted_it_is_rebuilt_not_stuck(self):
+        # The check printed and wrote its outbox, then died before the runner saved state.pending: the
+        # runner never took it, state.json has no pending and fires never rose.
+        self.case(deadline='2026-10-25')
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        self.assertFalse((self.wd / 'state.json').exists())
+        # A later check must not stay silent forever: it drops the lost output and shows the reminder again.
+        event = self.check('2026-10-24T10:30', 'r2', ack=False)
+        self.assertIn('acme', event)
+        # Nothing is recorded as sent until a delivery is confirmed.
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text()).get('sent', {}), {})
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+
+    def test_a_pending_event_the_runner_owns_is_waited_for_not_rebuilt(self):
+        # The runner saved the event as its pending event, so it will deliver it: the check does not rebuild.
+        self.case(deadline='2026-10-25')
+        event = self.check('2026-10-24T10:00', 'r1', ack=False)
+        self.assertTrue(event)
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'pending': {'event': event, 'key': 'k'}}))
+        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+
     def test_a_reminder_delivered_two_days_late_counts_from_delivery(self):
         # Built 24 Oct 10:00, but the runner only delivers it on 26 Oct at 10:00 (a retry after an outage).
         self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
@@ -499,6 +532,21 @@ class Rules(Base):
         mc.add(self.data, 'boat-b', 'boat.dev', '25.00', 'USD', 's', 'n', '2026-11-10', 'A',
                charged='2026-10-25', reference='invoice 1002', distinct=True, at=at('2026-10-25T10:00'))
         self.assertEqual(sorted(c['id'] for c in mc.load(self.data)['cases']), ['boat-a', 'boat-b'])
+
+    def test_cli_repeat_exits_zero_prints_the_existing_case_and_leaves_one(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='email 09:13')
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), patch.object(mc, 'WATCH_ROOT', self.root), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = mc.main(['add', 'boat-sms', '--merchant', 'boat.dev', '--amount', '25', '--currency', 'USD',
+                            '--state', 's', '--next', 'n', '--deadline', '2026-11-10', '--who', 'A',
+                            '--charged', '2026-10-25', '--reference', 'sms 10:45', '--repeat', 'boat-mail'])
+        self.assertEqual((code, err.getvalue()), (0, ''))
+        self.assertIn('boat-mail: boat.dev USD 25', out.getvalue())
+        self.assertNotIn('boat-sms', out.getvalue())
+        self.assertEqual([c['id'] for c in mc.load(self.data)['cases']], ['boat-mail'])
+        self.assertIn('seen again', mc.load(self.data)['cases'][0]['history'][-1]['text'])
 
     def test_a_hold_and_a_charge_of_the_same_amount_stay_apart(self):
         self.case('shop-charge', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
