@@ -295,7 +295,7 @@ it.effect("a card thread may start only a request evaluator, stamped with its ca
 
     const stalled = yield* call(thread, "evaluator_start", { boardId: "tools", kind: "stalled" });
     assert.isTrue(stalled.isError);
-    assert.include(stalled.text, 'kind "request"');
+    assert.include(stalled.text, "only a request evaluator");
     assert.strictEqual(launches.length, before);
 
     const handed = yield* call(thread, "evaluator_start", {
