@@ -75,7 +75,12 @@ export function classifyDownloadFailure(cause: unknown) {
   return { retryable: failure.retryable, code: failure.code === "unknownSendFailure" ? "attachmentUnavailable" : failure.code };
 }
 
-export type SendResult = { providerId?: string; duplicate?: boolean };
+export type SendResult = {
+  providerId?: string;
+  duplicate?: boolean;
+  /** A recovered copy that is the one a retryOf id named (e.g. the threaded original), not this id's own variant. */
+  original?: boolean;
+};
 export type PollOptionInfo = { optionIdentifier: string; text: string };
 export type PollResult = SendResult & { options?: PollOptionInfo[] };
 export type ReactionKind = "like" | "love" | "dislike" | "laugh" | "emphasize" | "question";

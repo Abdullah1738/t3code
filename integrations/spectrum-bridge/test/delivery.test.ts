@@ -20,6 +20,9 @@ const stableId = (id: string, chunk: number, scope = projectScope) =>
 
 const unthreadedId = (id: string, chunk: number) =>
   `bridge-${createHash("sha256").update(`${projectScope}:${id}:${chunk}:unthreaded`).digest("hex")}`;
+// A late resend gets its own id: an unthreaded retry may have cached a threaded copy under the plain one.
+const lateId = (id: string, chunk: number) =>
+  `bridge-${createHash("sha256").update(`${projectScope}:${id}:${chunk}:unthreaded:late`).digest("hex")}`;
 
 function setup(path = ":memory:") {
   const store = new Store(path);
@@ -1023,4 +1026,164 @@ test("cancellation during file acceptance keeps its checkpoint and alias without
   expect(h.store.get<unknown>("chunk:file:0")).toEqual({ accepted: true, providerId: "file-guid" });
   expect(h.store.byProviderId("file-guid")?.id).toBe("file");
   expect(h.log).not.toHaveBeenCalled();
+});
+
+test("a threaded reply Sendblue fails minutes after accepting goes once more without its thread", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls[0]!.replyTo).toBe("inbound-1");
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+
+  statuses.set("provider-1", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls[1]!.replyTo).toBeUndefined();
+  expect(h.calls[1]!.id).toBe(lateId("reply", 0));
+  expect(h.calls[1]!.retryOf).toBe(stableId("reply", 0));
+  expect(h.calls[1]!.text).toBe("Use 70% alcohol");
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+  expect(h.log).toHaveBeenCalledWith("outbound-async-unthreaded", "error");
+
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 7 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+});
+
+test("a reply whose chunks fail minutes apart has each threaded chunk resent once", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply", { kind: "conversation", text: "a".repeat(3_500) + "b", replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls.map(call => call.replyTo)).toEqual(["inbound-1", "inbound-1"]);
+
+  statuses.set("provider-1", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.calls[2]!.replyTo).toBeUndefined();
+  expect(h.calls[2]!.id).toBe(lateId("reply", 0));
+
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 6 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(4);
+  expect(h.calls[3]!.replyTo).toBeUndefined();
+  expect(h.calls[3]!.id).toBe(lateId("reply", 1));
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+
+  statuses.set("provider-3", "ERROR");
+  statuses.set("provider-4", "ERROR");
+  setSystemTime(now + 7 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(4);
+});
+
+test("delivered replies, unthreaded texts and old sends are left alone", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("a", { kind: "conversation", text: "first", replyTo: "inbound-1" });
+  h.enqueue("b", { kind: "conversation", text: "second" });
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  statuses.set("provider-1", "DELIVERED");
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+
+  setSystemTime(now + 21 * 60_000);
+  check.mockClear();
+  await delivery.tick();
+  expect(check).not.toHaveBeenCalled();
+});
+
+test("a reply Sendblue never accepted as threaded makes no Sendblue history call", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = mock(async (_since: number) => new Map<string, string>());
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses });
+  h.transport.sendText.mockRejectedValueOnce(new TransportError("unauthorized"));
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  setSystemTime(now + 5_000);
+  await delivery.tick();
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]!.replyTo).toBeUndefined();
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+  setSystemTime(now + 2 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(statuses).not.toHaveBeenCalled();
+});
+
+test("review: a delivered sibling stays checkpointed and replacement errors are final after restart", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply%_", { kind: "conversation", text: "word ".repeat(800).trim(), replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  statuses.set("provider-1", "DELIVERED");
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.calls[2]!.id).toBe(lateId("reply%_", 1));
+  expect(h.calls[2]!.text).toBe(h.calls[1]!.text);
+  expect(h.store.get<{ accepted: boolean; providerId: string }>("chunk:reply%_:0")).toEqual({ accepted: true, providerId: "provider-1" });
+  statuses.set("provider-3", "ERROR");
+  setSystemTime(now + 6 * 60_000);
+  const restarted = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  await restarted.tick();
+  await restarted.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.store.getOperation("reply%_")!.state).toBe("sent");
+});
+
+test("review: a deferred status check coalesces with a send tick", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const read = deferred<Map<string, string>>();
+  const entered = deferred<void>();
+  let wait = false;
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: async () => {
+    if (!wait) return new Map();
+    entered.resolve();
+    return read.promise;
+  } });
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  setSystemTime(now + 5 * 60_000);
+  wait = true;
+  const first = delivery.tick();
+  await entered.promise;
+  expect(delivery.tick()).toBe(first);
+  expect(h.calls).toHaveLength(1);
+  read.resolve(new Map([["provider-1", "ERROR"]]));
+  await first;
+  expect(h.store.getOperation("reply")!.state).toBe("pending");
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[1]!.replyTo).toBeUndefined();
 });
