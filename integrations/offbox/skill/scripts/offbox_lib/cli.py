@@ -12,7 +12,7 @@ from .common import EXIT_BUSY, EXIT_CAP, EXIT_INFRA, SIZES, TEMPLATES, OffboxErr
 HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM instead of the Mac.
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
-  offbox logs <run> [--follow] | wait <run>     for --bg runs
+  offbox logs <run> [--follow] | wait <run> [--timeout S]     for --bg runs; also a run another shell follows
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
@@ -51,7 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--follow", "-f", action="store_true")
     w = sp.add_parser("wait")
     w.add_argument("run_id")
-    w.add_argument("--timeout", type=float)
+    w.add_argument("--timeout", type=float, metavar="S",
+                   help="stop waiting after S seconds with exit 124; the run keeps going on its box")
 
     lo = sp.add_parser("local", help="log an exemption to run heavy work locally")
     lo.add_argument("--reason")

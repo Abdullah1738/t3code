@@ -33,6 +33,7 @@ TZ = ZoneInfo("Asia/Dubai")
 EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
+EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
 RUN_TTL_S = 30 * 60            # ttl while a run is in progress, refreshed every TTL_REFRESH_S

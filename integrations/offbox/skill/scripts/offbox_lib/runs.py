@@ -16,7 +16,8 @@ from pathlib import Path
 
 from . import api, lease, node_version, pool, ssh_sync
 from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event, new_id, now, say)
+from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError, db, event,
+                     new_id, now, say)
 
 BG_TTL_S = 6 * 3600
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -619,9 +620,10 @@ _KEEPER_JOIN_S = 65
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
-           start_offsets=(0, 0), stop_evt: threading.Event | None = None) -> int | None:
+           start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
-    return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper."""
+    return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
+    Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone."""
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -633,6 +635,11 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         while True:
             if stop_evt.is_set():
                 return None
+            # Outside the retry try below, so it ends the wait instead of counting as a stream failure.
+            if until is not None and now() >= until:
+                raise OffboxError(f"--timeout reached; {run_id or f'{box_id}:{pid}'} keeps running on {box_id} "
+                                  f"(nothing was stopped). Wait again: offbox wait {run_id or ''}".rstrip(),
+                                  code=EXIT_WAIT_TIMEOUT, started=True)
             try:
                 again = False
                 frames = api.cmd_attach(box_id, pid, out_off, err_off)
@@ -664,6 +671,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                     elif t == "error":
                         raise OffboxError(f"attach error: {fr.get('error')} {fr.get('message')}")
                     failures = 0
+                    if until is not None and now() >= until:
+                        again = True
+                        break
                 if again:
                     _close(frames)
                     continue

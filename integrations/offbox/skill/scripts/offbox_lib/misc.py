@@ -11,8 +11,10 @@ import sys
 import time
 
 from . import api, capacity, lease, pool, ssh_sync
-from .common import (CAP_PATH, EXEMPTIONS, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
-                     month_key, now, read_json, say)
+from .common import (CAP_PATH, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago,
+                     atomic_write_json, db, event, file_lock, iso, month_key, now, read_json, say)
+
+WAIT_POLL_S = 5
 
 
 def parse_ttl(s: str) -> int:
@@ -241,21 +243,71 @@ def logs(run_id: str, do_follow: bool) -> int:
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
     if r["status"] not in ("starting", "running"):
-        print(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
-        return r["exit_code"] if r["exit_code"] is not None else 90
-    return _wait_locked(r, echo=False)
+        return _settled(r)
+    return _wait_locked(r, echo=False, timeout=timeout)
 
 
-def _wait_locked(r, echo):
-    with file_lock('box-'+r['box_id'], timeout=120):
-        return _wait_run(_run_row(r['run_id']), echo)
+def _settled(r) -> int:
+    print(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
+    return r["exit_code"] if r["exit_code"] is not None else 90
 
 
-def _wait_run(r, echo):
+def _tail(path, pos: int) -> int:
+    try:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            data = f.read()
+    except OSError:
+        return pos
+    if data:
+        sys.stdout.write(data.decode(errors="replace"))
+        sys.stdout.flush()
+    return pos + len(data)
+
+
+def _wait_locked(r, echo, timeout=None):
+    """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
+    holds the lock, poll the run row (and tail the local log) instead of failing on the lock."""
+    deadline = None if timeout is None else now() + timeout
+    log_path = LOGS_DIR / f"{r['run_id']}.log"
+    pos, said = 0, False
+    while True:
+        guard = file_lock('box-' + r['box_id'], timeout=0)
+        try:
+            guard.__enter__()
+        except OffboxError:
+            pass
+        else:
+            try:
+                cur = _run_row(r['run_id'])
+                if cur['status'] not in ('starting', 'running'):
+                    return _settled(cur)
+                return _wait_run(cur, echo, until=deadline)
+            finally:
+                guard.__exit__(None, None, None)
+        if echo:
+            pos = _tail(log_path, pos)
+        cur = _run_row(r['run_id'])
+        if cur['status'] not in ('starting', 'running'):
+            if echo:
+                _tail(log_path, pos)
+            return _settled(cur)
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
+                              f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        if not said:
+            say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
+                f"waiting for it to record the end")
+            said = True
+        time.sleep(WAIT_POLL_S)
+
+
+def _wait_run(r, echo, until=None):
     from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
-    code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo)
+    code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo, run_id=r["run_id"],
+                  until=until)
     if code is None:
         code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
         if code is not None:

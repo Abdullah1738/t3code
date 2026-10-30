@@ -123,7 +123,7 @@ offbox local --list ; offbox local --clear
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id>` (exits with its code, does `--pull`) |
+| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates |
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
@@ -131,6 +131,8 @@ offbox local --list ; offbox local --clear
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+`offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
+its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -202,6 +204,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
 - **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
