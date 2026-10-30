@@ -641,9 +641,10 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
     keeper.start()
-    # A takeover replays into `replay_path` (a fresh file) so the original log survives until the replay succeeds.
+    # A takeover replays into `replay_path`, which the caller prepared with the committed prefix. It is opened for
+    # append (never truncated) so that prefix survives, and its checkpoint starts at the length it already holds.
     target = replay_path or log_path
-    lf = open(target, "wb" if replay_path else "ab") if target else None
+    lf = open(target, "ab") if target else None
     if lf:
         # Checkpoint before the first byte: a holder that dies inside its first chunk still leaves one, so a waiter
         # never prints bytes that its takeover will replay (no checkpoint at all = a holder from before checkpoints).

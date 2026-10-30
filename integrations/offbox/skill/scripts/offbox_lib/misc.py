@@ -339,10 +339,11 @@ def _wait_locked(r, echo, timeout=None):
 def _replay_takeover(cur, echo, deadline, start, log_path, keep):
     """Take over a run's follow without touching the original local log until the replay is confirmed.
 
-    The replay writes a temp file beside the log: the committed prefix (`keep` bytes) followed by the bytes the remote
-    run still produces. Only a replay that finishes with a real exit code replaces the original (atomic rename). A
-    deadline, a lost stream or any error leaves the original log and its checkpoint untouched."""
+    The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
+    run still produces. It replaces the original log and checkpoint only when the replay ends with a real exit code.
+    A deadline, a lost stream (unknown exit) or any error removes the temp files and keeps the original."""
     tmp = log_path.with_name(log_path.name + ".takeover")
+    tmp_ck = offsets_path(tmp)
     try:
         prefix = b""
         if keep:
@@ -350,16 +351,17 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep):
                 prefix = src.read(keep)
         with open(tmp, "wb") as dst:
             dst.write(prefix)
-        code = _wait_run(cur, echo, until=deadline, start_offsets=start, replay_path=tmp)
+        # The replay's follow commits checkpoints into tmp: it starts at the committed prefix, then tracks the stream.
+        code = _resolve_exit(cur, log_path, deadline, start, tmp)
         if code is None:
-            raise OffboxError(f"takeover of {cur['run_id']} ended without an exit code; the original log is kept")
+            raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
+        # Publish the replacement log and checkpoint before the run is recorded as settled.
         os.replace(tmp, log_path)
-        # The replay committed its checkpoint beside `tmp`; that checkpoint describes the log it now replaces.
-        if os.path.exists(offsets_path(tmp)):
-            os.replace(offsets_path(tmp), offsets_path(log_path))
-        return code
+        if os.path.exists(tmp_ck):
+            os.replace(tmp_ck, offsets_path(log_path))
+        return _finalize(cur, code, log_path)
     except BaseException:
-        for p in (tmp, offsets_path(tmp)):
+        for p in (tmp, tmp_ck):
             try:
                 os.remove(p)
             except OSError:
@@ -367,17 +369,24 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep):
         raise
 
 
-def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
-    from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
-    if r['status'] not in ('starting','running'):
-        return r['exit_code'] if r['exit_code'] is not None else 90
-    code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo, run_id=r["run_id"],
-                  until=until, start_offsets=start_offsets, replay_path=replay_path)
+def _resolve_exit(r, log_path, until, start_offsets, replay_path):
+    """Attach and follow the run to its end. Returns the real exit code, or None when the outcome is unknown (the
+    stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish."""
+    from .runs import follow, recover_lost_exit
+    code = follow(r["box_id"], r["process_id"], log_path, echo=True, run_id=r["run_id"], until=until,
+                  start_offsets=start_offsets, replay_path=replay_path)
     if code is None:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
         if code is not None:
             print(f"offbox: boat lost track of the remote process after it ended; exit {code} taken from {how}",
                   file=sys.stderr)
+    return code
+
+
+def _finalize(r, code, log_path) -> int:
+    """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
+    describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
+    from .runs import do_pulls, finish, go_std_glitch
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
         con = db()
@@ -385,6 +394,16 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
                                (r["run_id"],)).fetchone())
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
-    go_std_glitch(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", code)
+    go_std_glitch(r["box_id"], r["run_id"], log_path, code)
     print(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
+
+
+def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
+    """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
+    from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
+    if r['status'] not in ('starting','running'):
+        return r['exit_code'] if r['exit_code'] is not None else 90
+    log_path = LOGS_DIR / f"{r['run_id']}.log"
+    code = _resolve_exit(r, log_path, until, start_offsets, replay_path)
+    return _finalize(r, code, log_path)

@@ -132,13 +132,18 @@ class WaitLockTests(Isolated):
         before_ck = common.checkpoint(log)
         self.hold_box()
         clock = Clock()
-        # The lock is free, the replay runs into its temp file and then fails: the stream is lost with no exit code.
+        # The replay's stream is lost: follow() returns None (unknown) and nothing can recover the exit. Real code path:
+        # _resolve_exit -> follow -> recover_lost_exit, no mock of the takeover internals.
         with patch.object(misc, 'now', clock.now), patch.object(misc, 'time', clock.time), \
                 patch.object(runs, 'now', clock.now), \
-                patch.object(misc, '_wait_run', side_effect=OffboxError('stream lost')):
+                patch.object(runs, 'follow', return_value=None) as lost_follow, \
+                patch.object(runs, 'recover_lost_exit', return_value=(None, '')), \
+                patch.object(runs, 'finish') as finished:
             with self.assertRaises(OffboxError):
                 misc._replay_takeover(self.con.execute("SELECT * FROM runs WHERE run_id='run-x'").fetchone(),
                                       False, None, (3, 0), log, len(original))
+        self.assertEqual(lost_follow.call_args.kwargs['replay_path'], log.with_name(log.name + '.takeover'))
+        finished.assert_not_called()
         self.assertEqual(log.read_bytes(), original)
         self.assertEqual(common.checkpoint(log), before_ck)
         self.assertFalse((log.with_name(log.name + '.takeover')).exists())
@@ -404,6 +409,98 @@ class FollowUntilTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(asked, dict(o=3, e=3))
         # Each line exactly once, in the order it was confirmed.
+        self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
+
+
+def _bytes_stdout():
+    """A stdout stand-in that has a byte buffer, as follow()'s echo writes to it through .buffer."""
+    import io as _io
+    return _io.TextIOWrapper(_io.BytesIO(), encoding="utf-8")
+
+
+class TakeoverPublishTests(unittest.TestCase):
+    """Round 5: the takeover keeps a checkpointed prefix, never promotes an unknown exit, and publishes the replacement
+    log before the run is settled. Uses a temp dir, not the live offbox logs folder."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
+        self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
+        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
+        self.row = {'run_id': 'run-p', 'box_id': 'bx_a', 'process_id': 7, 'pulls': '[]', 'status': 'running',
+                    'exit_code': None}
+
+    def test_prefix_survives_a_successful_exit_only_replay(self):
+        # A checkpointed holder committed stdout "o1" and stderr "e1" (6 bytes). The takeover replays only the exit:
+        # the published log must still hold the committed prefix, not an empty suffix.
+        log = self.logs / 'run-p.log'
+        committed = b'o1\ne1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 3, len(committed))
+        with patch.object(runs.api, 'cmd_attach', return_value=iter([{'type': 'exit', 'exitCode': 0}])), \
+                contextlib.redirect_stdout(_bytes_stdout()):
+            rc = misc._replay_takeover(self.row, False, None, (3, 3), log, len(committed))
+        self.assertEqual(rc, 0)
+        self.assertEqual(log.read_bytes(), committed)
+        self.assertEqual(common.checkpoint(log)['logBytes'], len(committed))
+
+    def test_prefix_survives_a_successful_suffix_replay(self):
+        # The replay also delivers new output; the published log is the prefix followed by that output, once each.
+        log = self.logs / 'run-p.log'
+        committed = b'o1\ne1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 3, len(committed))
+        frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
+        with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
+                contextlib.redirect_stdout(_bytes_stdout()):
+            rc = misc._replay_takeover(self.row, False, None, (3, 3), log, len(committed))
+        self.assertEqual(rc, 0)
+        self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
+
+    def test_unknown_exit_never_promotes_the_temp_log(self):
+        # Real lost-process path: the stream yields nothing, the exit cannot be recovered. The original stays.
+        log = self.logs / 'run-p.log'
+        committed = b'o1\ne1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 3, len(committed))
+        before = common.checkpoint(log)
+        with patch.object(runs.api, 'cmd_attach', return_value=iter(())), \
+                patch.object(runs, 'recover_lost_exit', return_value=(None, '')), \
+                contextlib.redirect_stdout(_bytes_stdout()):
+            with self.assertRaises(OffboxError):
+                # A deadline that has already passed when follow() starts: it ends at once, with no exit known.
+                misc._replay_takeover(self.row, False, time.time() - 1, (3, 3), log, len(committed))
+        self.assertEqual(log.read_bytes(), committed)
+        self.assertEqual(common.checkpoint(log), before)
+        self.assertFalse((self.logs / 'run-p.log.takeover').exists())
+
+    def test_second_waiter_paused_at_completion_sees_every_byte_once(self):
+        # The holder's replay publishes the replacement log, then finalizes the run. A second waiter that reads the
+        # settled row while the holder is still between publish and finish must drain the new log, not the old one.
+        log = self.logs / 'run-p.log'
+        committed = b'o1\ne1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 3, len(committed))
+        frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
+        seen = {}
+
+        def pause_at_finish(run_id, code, status=None):
+            # Runs after the replacement log is published and before the row is marked settled. The second waiter
+            # runs now: it must see the replacement, because the row is not settled yet.
+            seen['log_at_finish'] = log.read_bytes()
+        with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
+                patch.object(runs, 'finish', side_effect=pause_at_finish), \
+                contextlib.redirect_stdout(_bytes_stdout()):
+            misc._replay_takeover(self.row, False, None, (3, 3), log, len(committed))
+        self.assertEqual(seen['log_at_finish'], b'o1\ne1\no2\n')
         self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
 
 
