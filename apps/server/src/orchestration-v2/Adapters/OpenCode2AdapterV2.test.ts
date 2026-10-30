@@ -399,6 +399,19 @@ const requestOf = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime) =>
     Effect.map(Option.getOrUndefined),
   );
 
+// Resolves once the adapter has synced the given selected-model variant; a sync event
+// produces no other output, so this is how a test knows an event was handled.
+const variantUpdate = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime, variant: string) =>
+  runtime.events.pipe(
+    Stream.filter(
+      (item) =>
+        item.type === "provider_thread.updated" &&
+        item.providerThread.nativeMetadata?.modelSelection?.options?.[0]?.value === variant,
+    ),
+    Stream.take(1),
+    Stream.runDrain,
+  );
+
 const terminalOf = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime) =>
   runtime.events.pipe(
     Stream.filter(
@@ -5236,6 +5249,8 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           sessionID: SESSION,
           model: { providerID: "opencode", id: "big-pickle", variant: "idle-shutdown" },
         }),
+        out("mcp.remove", { server, "location[directory]": WORK }),
+        reply("mcp.remove", null),
         add,
         reply("mcp.add", null),
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
@@ -5307,18 +5322,11 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         }),
       ]);
       const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      const synced = yield* variantUpdate(runtime, "shell-exited").pipe(Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
       assert.equal((yield* Fiber.join(terminal))?.status, "completed");
       assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
-      yield* Stream.fromQueue(runtime.events).pipe(
-        Stream.filter(
-          (item) =>
-            item.type === "provider_thread.updated" &&
-            item.providerThread.nativeMetadata?.modelSelection?.options?.[0]?.value === "shell-exited",
-        ),
-        Stream.take(1),
-        Stream.runDrain,
-      );
+      yield* Fiber.join(synced);
       assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
     }).pipe(Effect.scoped),
   );
@@ -5365,17 +5373,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         reply("mcp.remove", null),
       ]);
       const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      const synced = yield* variantUpdate(runtime, "shell-shutdown").pipe(Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
       assert.equal((yield* Fiber.join(terminal))?.status, "completed");
-      yield* Stream.fromQueue(runtime.events).pipe(
-        Stream.filter(
-          (item) =>
-            item.type === "provider_thread.updated" &&
-            item.providerThread.nativeMetadata?.modelSelection?.options?.[0]?.value === "shell-shutdown",
-        ),
-        Stream.take(1),
-        Stream.runDrain,
-      );
+      yield* Fiber.join(synced);
       yield* runtime.unloadThread!({ providerThread: thread });
     }).pipe(Effect.scoped),
   );
