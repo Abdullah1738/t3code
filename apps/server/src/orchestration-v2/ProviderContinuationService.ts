@@ -1,4 +1,5 @@
 import { CommandId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -9,6 +10,20 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
 const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
+
+// Sibling delegated tasks of one parent run finish seconds apart. Holding an
+// idle parent's wake this long lets them join one message instead of waking
+// the parent once per task. The hold is in memory: a restart drops it, and
+// startup recovery offers the open delivery again.
+export const DELEGATED_COMPLETION_HOLD = Duration.seconds(30);
+
+const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "preparing",
+  "queued",
+  "starting",
+  "running",
+  "waiting",
+]);
 
 function delegatedCompletionText(taskIds: ReadonlyArray<string>): string {
   const taskList = taskIds.join(", ");
@@ -50,20 +65,33 @@ function delegatedCompletionRetryKey(
   return `${request.threadId}:${completion.parentRunId}:${completion.generation}:${completion.messageId}`;
 }
 
-export const layer = Layer.effectDiscard(
+export const layerWithOptions = (
+  options: { readonly delegatedCompletionHold?: Duration.Duration } = {},
+) =>
+  Layer.effectDiscard(
   Effect.gen(function* () {
     const ids = yield* IdAllocator.IdAllocatorV2;
     const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const delegatedCompletionHold = options.delegatedCompletionHold ?? DELEGATED_COMPLETION_HOLD;
     const retryAttempts = yield* Ref.make(new Map<string, number>());
+    const holds = yield* Ref.make(new Map<string, "holding" | "released">());
 
     const clearRetryAttempt = (key: string) =>
-      Ref.update(retryAttempts, (current) => {
-        if (!current.has(key)) return current;
-        const updated = new Map(current);
-        updated.delete(key);
-        return updated;
-      });
+      Effect.all([
+        Ref.update(retryAttempts, (current) => {
+          if (!current.has(key)) return current;
+          const updated = new Map(current);
+          updated.delete(key);
+          return updated;
+        }),
+        Ref.update(holds, (current) => {
+          if (!current.has(key)) return current;
+          const updated = new Map(current);
+          updated.delete(key);
+          return updated;
+        }),
+      ]).pipe(Effect.asVoid);
 
     const nextRetryDelay = (key: string) =>
       Ref.modify(retryAttempts, (current) => {
@@ -110,6 +138,24 @@ export const layer = Layer.effectDiscard(
           );
           if (delivery === undefined) {
             yield* clearRetryAttempt(retryKey);
+            return;
+          }
+          const holdState = (yield* Ref.get(holds)).get(retryKey);
+          if (holdState === "holding") return;
+          const parentBusy = projection.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status));
+          if (
+            holdState === undefined &&
+            Duration.toMillis(delegatedCompletionHold) > 0 &&
+            !parentBusy
+          ) {
+            yield* Ref.update(holds, (current) => new Map(current).set(retryKey, "holding"));
+            yield* Effect.sleep(delegatedCompletionHold).pipe(
+              Effect.andThen(
+                Ref.update(holds, (current) => new Map(current).set(retryKey, "released")),
+              ),
+              Effect.andThen(requests.offer(request)),
+              Effect.forkScoped,
+            );
             return;
           }
           const commandId = yield* ids.allocate.command({
@@ -297,4 +343,6 @@ export const layer = Layer.effectDiscard(
       ),
     ).pipe(Effect.forever, Effect.forkScoped);
   }),
-);
+  );
+
+export const layer = layerWithOptions();
