@@ -5249,7 +5249,13 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           sessionID: SESSION,
           model: { providerID: "opencode", id: "big-pickle", variant: "idle-shutdown" },
         }),
-        // The next turn's prepareTurn removes the stale server, then adds it at the location.
+        // The next turn switches the model back from the synced variant, then its prepareTurn
+        // removes the stale server and adds it at the location.
+        out("session.switchModel", {
+          sessionID: SESSION,
+          model: { id: "big-pickle", providerID: "opencode" },
+        }),
+        reply("session.switchModel", null),
         out("mcp.remove", { server, "location[directory]": WORK }),
         reply("mcp.remove", null),
         add,
