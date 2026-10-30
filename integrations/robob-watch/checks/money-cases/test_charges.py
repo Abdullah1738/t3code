@@ -54,6 +54,11 @@ class Parse(unittest.TestCase):
                 c = ch.parse(text, sender)
                 self.assertEqual((c['kind'], c['currency'], c['amount'], c['card'], c['merchant'], c['pending']), want)
 
+    def test_over_limit_balance_notice_on_5542_is_never_a_charge_question(self):
+        for sender in ('Wio Bank', 'Wio Personal', ''):
+            with self.subTest(sender=sender):
+                self.assertIsNone(ch.parse('Alert: card ending 5542 available balance is AED -2,345.10 and is over limit', sender))
+
     def test_payments_refunds_prompts_and_other_senders_are_not_charges(self):
         for sender, text in [
             ('EmiratesNBD', 'Payment of AED 900.00 towards your Credit Card ending 1111 has been received.'),
