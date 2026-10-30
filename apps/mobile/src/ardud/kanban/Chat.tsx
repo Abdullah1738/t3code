@@ -9,10 +9,10 @@ import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments"
 import {
   avatarOf,
   canSendChoice,
-  cardView,
   discussionPresence,
   ownerReadSeq,
   parseKanbanLink,
+  STAGE_LABELS,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
@@ -41,7 +41,12 @@ import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
 import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
-import { kanbanClient, useKanbanMessages, useKanbanMessagesFeed } from "./kanbanStore";
+import {
+  kanbanClient,
+  useKanbanBoardCard,
+  useKanbanMessages,
+  useKanbanMessagesFeed,
+} from "./kanbanStore";
 import {
   cardGlyph,
   choiceView,
@@ -216,7 +221,6 @@ export function Chat(props: {
                   boardId={boardId}
                   discussionId={discussionId}
                   message={message}
-                  state={state}
                   nowMs={props.nowMs}
                   onOpenCard={props.onOpenCard}
                 />
@@ -280,12 +284,14 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
 
 /**
  * Links to this board's own cards and discussions open; anything else (another
- * board's link, a missing record) stays inert, as on web.
+ * board's link, a missing record) stays inert, as on web. Read when a link is
+ * pressed, so messages don't redraw on every board change.
  */
-function resolveKanbanLinkFor(boardId: string, state: KanbanBoardState): ResolveKanbanLink {
+function resolveKanbanLinkFor(boardId: string): ResolveKanbanLink {
   return (href) => {
     const link = parseKanbanLink(href);
-    return link === null ? null : kanbanLinkTarget(link, boardId, state);
+    const state = kanbanClient().board(boardId).get();
+    return link === null || state === undefined ? null : kanbanLinkTarget(link, boardId, state);
   };
 }
 
@@ -317,7 +323,6 @@ function MessageView(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
-  readonly state: KanbanBoardState;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
@@ -328,9 +333,7 @@ function MessageView(props: {
       boardId={props.boardId}
       discussionId={props.discussionId}
       message={message}
-      state={props.state}
-      resolveKanbanLink={resolveKanbanLinkFor(props.boardId, props.state)}
-      nowMs={props.nowMs}
+      resolveKanbanLink={resolveKanbanLinkFor(props.boardId)}
       onOpenCard={props.onOpenCard}
     />
   );
@@ -366,9 +369,7 @@ function Blocks(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
-  readonly state: KanbanBoardState;
   readonly resolveKanbanLink: ResolveKanbanLink;
-  readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
   return groupBlockRuns(props.message.blocks).map((run) =>
@@ -391,8 +392,6 @@ function BlockView(props: {
   readonly resolveKanbanLink: ResolveKanbanLink;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
-  readonly state: KanbanBoardState;
-  readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
   const { block } = props;
@@ -428,9 +427,8 @@ function BlockView(props: {
     case "card":
       return (
         <CardBlock
+          boardId={props.boardId}
           cardId={block.cardId}
-          state={props.state}
-          nowMs={props.nowMs}
           onOpenCard={props.onOpenCard}
         />
       );
@@ -827,28 +825,27 @@ interface ChoiceDraft {
 }
 
 function CardBlock(props: {
+  readonly boardId: string;
   readonly cardId: string;
-  readonly state: KanbanBoardState;
-  readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
-  const card = props.state.cards.get(props.cardId);
+  const card = useKanbanBoardCard(props.boardId, props.cardId);
   if (card === undefined) {
     return <Text className="text-[13px] text-foreground-muted">Card not on this board</Text>;
   }
-  const view = cardView(card, props.state, props.nowMs);
+  const stageLabel = STAGE_LABELS[card.stage];
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${view.number}, ${view.title}, ${view.stageLabel}`}
+      accessibilityLabel={`${card.number}, ${card.title}, ${stageLabel}`}
       onPress={() => props.onOpenCard(card.id)}
       className="min-h-10 flex-row items-center gap-2.5 rounded-[12px] bg-screen px-3 py-2"
     >
       <Glyph kind={cardGlyph(card)} />
       <Text numberOfLines={1} className="flex-1 text-[14px] font-t3-medium text-foreground">
-        {view.title}
+        {card.title}
       </Text>
-      <Text className="text-[12px] text-foreground-muted">{view.number}</Text>
+      <Text className="text-[12px] text-foreground-muted">{card.number}</Text>
     </Pressable>
   );
 }

@@ -1,5 +1,6 @@
 import type {
   KanbanBoardSummary,
+  KanbanCard,
   KanbanCardDetail,
   KanbanMessage,
   KanbanThreadRow,
@@ -129,6 +130,12 @@ export function useKanbanBoard(boardId: string): KanbanBoardState | undefined {
 
 export function useKanbanBoardFeed(boardId: string): FeedState {
   return useFeed(kanbanClient().board(boardId));
+}
+
+/** One card of a board, redrawn only when that card changes. */
+export function useKanbanBoardCard(boardId: string, cardId: string): KanbanCard | undefined {
+  const store = kanbanClient().board(boardId);
+  return useSyncExternalStore(store.subscribe, () => store.get()?.cards.get(cardId));
 }
 
 /** A discussion's messages, oldest first; nothing while `discussionId` is null. */
