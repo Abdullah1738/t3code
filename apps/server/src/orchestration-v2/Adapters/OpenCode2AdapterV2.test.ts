@@ -5197,6 +5197,8 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
   it.effect("reconciles T3's MCP server when the session moves back during an add", () =>
     Effect.gen(function* () {
       const MOVED = "/work/opencode2-moved";
+      const gate = makeProviderReplayGate(["land-add"]);
+      const backHome = yield* Deferred.make<void>();
       const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
       yield* mcpSessions.set({
         environmentId: EnvironmentId.make("environment:opencode2-adapter"),
@@ -5228,32 +5230,48 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           location: { directory },
           projectID: "global",
         });
-      // The session moves to MOVED, the add there is held in flight, then the session
-      // moves back to WORK before that add lands. The landed add must be undone and
-      // the server must end at WORK, where the session is.
-      const { runtime, thread } = yield* resumed([
-        add(WORK),
-        reply("mcp.add", null),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        movedTo(MOVED),
-        add(MOVED),
-        movedTo(WORK),
-        reply("mcp.add", null),
-        remove(MOVED),
-        reply("mcp.remove", null),
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        remove(WORK),
-        reply("mcp.remove", null),
-      ]);
-      for (let index = 0; index < 2; index++) {
-        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
-        yield* runtime.startTurn(turnInput(thread));
-        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
-      }
+      // The add at MOVED is held until the adapter has read the move back to
+      // WORK: events are handled in order, so seeing the marker model means the
+      // move back was handled. The landed add must then be undone at MOVED.
+      const { runtime, thread } = yield* resumed(
+        [
+          add(WORK),
+          reply("mcp.add", null),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          movedTo(MOVED),
+          add(MOVED),
+          movedTo(WORK),
+          event("session.model.selected", {
+            sessionID: SESSION,
+            model: { id: "moved-back", providerID: "opencode", variant: "default" },
+          }),
+          event("session.usage.updated", { sessionID: SESSION }, "land-add"),
+          reply("mcp.add", null),
+          remove(MOVED),
+          reply("mcp.remove", null),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          remove(WORK),
+          reply("mcp.remove", null),
+        ],
+        { replayGate: gate },
+      );
+      const terminal = yield* runtime.events.pipe(
+        Stream.tap((event) =>
+          event.type === "provider_thread.updated" &&
+          JSON.stringify(event.providerThread.nativeMetadata).includes("moved-back")
+            ? Deferred.succeed(backHome, undefined)
+            : Effect.void,
+        ),
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+        Effect.map(Option.getOrUndefined),
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      yield* Deferred.await(backHome);
+      gate.release("land-add");
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
       yield* runtime.unloadThread!({ providerThread: thread });
     }).pipe(Effect.scoped),
   );
