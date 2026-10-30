@@ -203,6 +203,44 @@ class Explain(unittest.TestCase):
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
         self.assertEqual(r['verdict'], 'ask')
 
+    def test_a_schedule_bound_to_his_imessage_thread_is_not_his_words(self):
+        # ScheduledTaskService sends a stored prompt into the owner's iMessage thread as 'system', with
+        # no [tag], and the task id in the payload. Only that metadata tells it from his own send.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'state.sqlite'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
+            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
+                       'payload_json TEXT)')
+            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
+                       ('a', 'iMessage 2026-10-24 00:30', '2026-10-24T00:00:00.000Z'))
+            rows = [('2026-10-24T00:10:00.000Z', {'createdBy': 'system', 'text': 'Check my Apple order status',
+                                                  'scheduledTaskId': 'scheduled-task:apple'}),
+                    ('2026-10-24T00:11:00.000Z', {'createdBy': 'system', 'text': 'Ok'})]
+            for created, payload in rows:
+                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
+                           ('a', 'user', created, json.dumps(payload)))
+            db.commit()
+            db.close()
+            with patch.object(ch, 'STATE_DB', path):
+                got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
+            self.assertNotIn('Check my Apple order status', got)
+            self.assertIn('Ok', got)
+
+
+    def test_a_purchase_for_another_merchant_does_not_explain_this_charge(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I paid Amazon AED 50. Send me the Apple keynote summary.', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
+        def mine(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I paid Amazon AED 50. The Apple one is mine.', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=mine)
+        self.assertEqual(r['verdict'], 'owner')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 

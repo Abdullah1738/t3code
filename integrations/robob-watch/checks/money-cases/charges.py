@@ -153,10 +153,17 @@ def iso(t):
     return t.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
-def owner_turn(created_by, text, title=''):
-    """Whether a Robob user turn is his own typing: the app's 'user' in any thread, or the bridge's
-    'system' send in his iMessage thread without a leading [tag]. Kanban, schedule and watcher threads
-    never carry his words, whatever their stamp."""
+# Provenance the scheduler, delegation and notifications stamp on a turn. A scheduled prompt bound to
+# his iMessage thread has no [tag] and a 'system' stamp, so only this metadata tells it apart.
+AUTOMATED_FIELDS = ('scheduledTaskId', 'notification', 'delegatedCompletion')
+
+
+def owner_turn(created_by, text, title='', payload=None):
+    """Whether a Robob user turn is his own typing. Automated turns never are: anything the scheduler,
+    delegation or a notification stamped (checked by metadata, not by its text). Otherwise the app's
+    'user' turn, or the bridge's 'system' send in his iMessage thread without a leading [tag]."""
+    if any((payload or {}).get(k) not in (None, '', False) for k in AUTOMATED_FIELDS):
+        return False
     if created_by == 'user':
         return True
     return created_by == 'system' and str(title or '').startswith('iMessage') \
@@ -189,7 +196,7 @@ def owner_texts(since, until, deadline=None):
         # no owner provenance), so 'system' counts only without a leading [tag]: every automated wake
         # (watchers, bridge requests, kanban, replies) starts with one. Other people's chats and forwards
         # never count.
-        if not owner_turn(p.get('createdBy'), text, title) or text.startswith('[Forwarded by') \
+        if not owner_turn(p.get('createdBy'), text, title, p) or text.startswith('[Forwarded by') \
                 or re.match(r'(?:Moni|Group)\b', title or ''):
             continue
         out.append((created, text, title or ''))
@@ -284,6 +291,11 @@ def receipt(charge, at, now, find=None, deadline=None, read=None):
     return None
 
 
+def clauses(text):
+    """The text split where a sentence or a clause changes its subject."""
+    return [c for c in re.split(r"[.;!?\n]|,\s*(?:and|but|then|so)\s|\s+and\s+", str(text)) if c.strip()]
+
+
 def owner_said(charge, at, now, said=None, deadline=None):
     said = said or owner_texts
     names = words(charge['merchant'])
@@ -294,7 +306,9 @@ def owner_said(charge, at, now, said=None, deadline=None):
         # Naming the merchant isn't enough: "Summarize the Apple keynote" names it without buying
         # anything. He has to say he is paying or ordering it.
         # "It isn't mine" or "what's the Acme charge?" names the merchant but explains nothing.
-        if pattern.search(text) and OWNER_BUYS.search(text) and not NOT_MINE.search(text):
+        # The merchant and his purchase or ownership words must be in the same clause: "I paid Amazon.
+        # Send me the Apple summary" pays for something else.
+        if any(pattern.search(c) and OWNER_BUYS.search(c) and not NOT_MINE.search(c) for c in clauses(text)):
             return created, text, title
     return None
 
