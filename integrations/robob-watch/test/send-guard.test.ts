@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -70,19 +70,33 @@ test("src telegram() refuses a real notify under a test run", () => {
 
 // A stub removed while imessage() is still awaiting liveSession() must not reopen the live bridge: the command
 // is decided before the await. A harmless default-path sentinel records if the live CLI runs.
-test("removing the stub mid-call does not run the live bridge", () => {
-  const dir = mkdtempSync(join(tmpdir(), "imsg-pending-"));
-  const sentinel = join(dir, "live-ran");
-  const liveCli = join(dir, "live-cli.ts");
-  writeFileSync(liveCli, `require("node:fs").writeFileSync(${JSON.stringify(sentinel)}, "ran");`);
-  // Stub set before import (the old code captured the CLI path at import), removed while the check is pending.
-  const code = `process.env.ROBOB_WATCH_SPECTRUM_CLI = ${JSON.stringify(join(dir, "stub-cli.ts"))};
+// A stub removed while imessage() is still awaiting liveSession() must not reopen the live bridge: the command is
+// decided before the await. The fake HOME has a real Bun, a live route and a sentinel at the default bridge path.
+test("removing the stub mid-call runs the stub, never the live bridge", () => {
+  const home = mkdtempSync(join(tmpdir(), "imsg-pending-"));
+  mkdirSync(join(home, ".bun/bin"), { recursive: true });
+  symlinkSync(process.execPath, join(home, ".bun/bin/bun"));
+  mkdirSync(join(home, ".config/spectrum-bridge"), { recursive: true });
+  const db = join(home, ".config/spectrum-bridge/state.sqlite");
+  const mk = Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv(key text primary key, value text); insert into kv values('route', '{"id":"ses_test"}');`]);
+  expect(mk.exitCode).toBe(0);
+  mkdirSync(join(home, ".local/share/spectrum-bridge/src"), { recursive: true });
+  const liveRan = join(home, "live-ran");
+  writeFileSync(join(home, ".local/share/spectrum-bridge/src/cli.ts"), `require("node:fs").writeFileSync(${JSON.stringify(liveRan)}, "ran");`);
+  const stubRan = join(home, "stub-ran");
+  const stub = join(home, "stub-cli.ts");
+  writeFileSync(stub, `require("node:fs").writeFileSync(${JSON.stringify(stubRan)}, process.argv.slice(2).join(" "));`);
+  const code = `process.env.ROBOB_WATCH_SPECTRUM_CLI = ${JSON.stringify(stub)};
 const { imessage } = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
 const p = imessage("hi", "k");
 delete process.env.ROBOB_WATCH_SPECTRUM_CLI;
 console.log(JSON.stringify(await p));`;
-  Bun.spawnSync([process.execPath, "-e", code], { env: bare(), stdout: "pipe" });
-  expect(existsSync(sentinel)).toBe(false);
+  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare({ HOME: home }) });
+  const out = r.stdout.toString() + r.stderr.toString();
+  expect(r.exitCode, out).toBe(0);
+  expect(JSON.parse(r.stdout.toString()).ok, out).toBe(true);
+  expect(existsSync(stubRan), out).toBe(true);
+  expect(existsSync(liveRan), out).toBe(false);
 });
 
 // runCheck: a check that runs wa send, with no stub, is refused under the test markers the parent carries.
