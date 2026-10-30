@@ -1054,6 +1054,41 @@ test("a threaded reply Sendblue fails minutes after accepting goes once more wit
   expect(h.calls).toHaveLength(2);
 });
 
+test("a reply whose chunks fail minutes apart has each threaded chunk resent once", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply", { kind: "conversation", text: "a".repeat(3_500) + "b", replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls.map(call => call.replyTo)).toEqual(["inbound-1", "inbound-1"]);
+
+  statuses.set("provider-1", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.calls[2]!.replyTo).toBeUndefined();
+  expect(h.calls[2]!.id).toBe(unthreadedId("reply", 0));
+
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 6 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(4);
+  expect(h.calls[3]!.replyTo).toBeUndefined();
+  expect(h.calls[3]!.id).toBe(unthreadedId("reply", 1));
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+
+  statuses.set("provider-3", "ERROR");
+  statuses.set("provider-4", "ERROR");
+  setSystemTime(now + 7 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(4);
+});
+
 test("delivered replies, unthreaded texts and old sends are left alone", async () => {
   setSystemTime(now);
   const h = setup();

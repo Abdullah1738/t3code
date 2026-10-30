@@ -261,8 +261,7 @@ export class Delivery {
     ).all(Date.now() - LANDED_WINDOW);
     const candidates = rows.filter(({ id }) => {
       const item = this.store.getOperation(id);
-      return item !== undefined && item.replyTo !== undefined && !item.attachment && !item.poll && !item.app
-        && this.store.get<boolean>(`unthreaded:${id}`) === undefined;
+      return item !== undefined && item.replyTo !== undefined && !item.attachment && !item.poll && !item.app;
     });
     if (!candidates.length) return;
     let statuses: Map<string, string>;
@@ -277,6 +276,8 @@ export class Delivery {
       for (let index = 0; ; index++) {
         const checkpoint = this.store.get<Checkpoint>(`chunk:${id}:${index}`);
         if (!checkpoint) break;
+        // Only chunks accepted with the thread target are checked; a resent copy is final.
+        if (this.store.get<boolean>(`unthreadedChunk:${id}:${index}`) === true) continue;
         const now = checkpoint.providerId ? statuses.get(checkpoint.providerId) : undefined;
         if (now && /^(error|declined|failed)$/i.test(now)) { failed.push(index); status = now; }
       }
@@ -512,6 +513,10 @@ export class Delivery {
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
+          // Marks copies sent without the thread target, so checkLanded never resends them.
+          if (item.replyTo !== undefined && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
+            this.store.set(`unthreadedChunk:${item.id}:${index}`, true);
+          }
           if (final && item.poll && !result.providerId) {
             rememberUnmatchedPoll(this.store, {
               operationId: item.id, title: item.poll.title, choices: [...item.poll.options],
