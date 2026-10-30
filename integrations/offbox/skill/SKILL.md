@@ -100,6 +100,7 @@ offbox local --list ; offbox local --clear
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
   the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
@@ -112,7 +113,7 @@ offbox local --list ; offbox local --clear
 | Flag | Use |
 |---|---|
 | `--size S` / `--template T` | machine size / template for a new lease |
-| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. AWS_*, tokens and keys are **never** forwarded unless you name them. |
+| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. |
 | `--pull PATH` | copy an artifact back after the run (coverage.out, junit.xml, `test-results/`), relative to your cwd |
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
@@ -204,6 +205,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Troubleshooting
 
+- Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
 - Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it.
 - Go `package unsafe is not in std` or nested `/usr/local/go/go`: a half-swapped GOROOT; the next run repairs it under a box-local lock, verifies the replacement, and removes stale repair directories only after verification.

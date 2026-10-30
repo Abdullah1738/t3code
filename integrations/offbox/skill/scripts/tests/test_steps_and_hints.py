@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import cli, runs  # noqa: E402
+from offbox_lib import cli, lease, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -171,6 +171,58 @@ class CliStepTests(Isolated):
 
     def test_setup_failure_error_is_infra_code(self):
         self.assertEqual(OffboxError('x', code=EXIT_INFRA).code, 90)
+
+
+class TypecheckSizeTests(unittest.TestCase):
+
+    def repo(self, with_package=True):
+        d = tempfile.TemporaryDirectory()
+        if with_package:
+            Path(d.name, 'package.json').write_text('{}')
+        return d
+
+    def test_typecheck_gets_xlarge(self):
+        with self.repo() as r:
+            self.assertEqual(lease.typecheck_size('cd apps/server && vp run typecheck', r, None), 'xlarge')
+            self.assertEqual(lease.typecheck_size('npx tsc --noEmit -p apps/server', r, None), 'xlarge')
+
+    def test_explicit_size_wins(self):
+        with self.repo() as r:
+            self.assertEqual(lease.typecheck_size('cd apps/server && vp run typecheck', r, 'large'), 'large')
+
+    def test_non_typecheck_keeps_default(self):
+        with self.repo() as r:
+            self.assertIsNone(lease.typecheck_size('vp test run src/x', r, None))
+
+    def test_no_package_json_keeps_default(self):
+        with self.repo(with_package=False) as r:
+            self.assertIsNone(lease.typecheck_size('npx tsc --noEmit', r, None))
+
+
+class ExitHintTests(unittest.TestCase):
+
+    def test_137_prints_memory_hint_before_exit_line(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runs.report_exit('', 137)
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(lines[-2], 'offbox: exit 137 = the box killed the command for memory. Rerun with --size xlarge.')
+        self.assertEqual(lines[-1], 'offbox: remote exit 137')
+
+    def test_137_in_steps_prints_summary_hint_then_exit_line(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runs.report_exit('', 137, [(1, 0), (2, 137)], 2)
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(lines[0], 'offbox: offbox steps: 1 ok, 1 failed (step 2 rc=137)')
+        self.assertEqual(lines[1], 'offbox: exit 137 = the box killed the command for memory. Rerun with --size xlarge.')
+        self.assertEqual(lines[-1], 'offbox: remote exit 137')
+
+    def test_plain_failure_has_no_memory_hint(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runs.report_exit('', 1)
+        self.assertNotIn('killed the command for memory', err.getvalue())
 
 
 if __name__ == '__main__':

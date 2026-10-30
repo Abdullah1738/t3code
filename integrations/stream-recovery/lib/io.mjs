@@ -369,6 +369,11 @@ export async function interruptThread(threadId, { clientRequestId, reason } = {}
   return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason });
 }
 
+// Live top-level threads (running, waiting, queued, needs-input).
+export async function activeThreads() {
+  return (await ctl("GET", "/threads?active=true&limit=500")).threads ?? [];
+}
+
 // Orchestration command over the Robob WebSocket RPC (same path the web app uses).
 export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
   const { url, token } = control();
@@ -489,11 +494,11 @@ export function telegram({ text, severity = "info", key }) {
 const statePath = () => join(PATHS.dataDir, "state.json");
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {}, servers: [] };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {}, servers: [], ghosts: {} };
   const s = parse(readFileSync(statePath(), "utf8"));
   return {
     handled: s.handled ?? {}, lastScan: s.lastScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
-    servers: s.servers ?? [],
+    servers: s.servers ?? [], ghosts: s.ghosts ?? {},
   };
 }
 

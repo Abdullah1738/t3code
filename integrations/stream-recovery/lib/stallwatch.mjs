@@ -1,11 +1,12 @@
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
-import * as io from "./io.mjs";
+import * as realIo from "./io.mjs";
 import { truncate } from "./detect.mjs";
 import {
-  FALLBACK_MS, GIVE_UP_MS, buildStallNote, buildStallSummary, fingerprint, observe, planStall,
-  quietSince, sessionLetGo, stallCleared, stallId, tailActivity,
+  FALLBACK_MS, GHOST_LABEL, GHOST_RUN_MS, GIVE_UP_MS, buildStallNote, buildStallSummary, fingerprint,
+  ghostCandidates, observe, observeGhosts, planGhost, planStall, quietSince, sessionLetGo, stallCleared,
+  stallId, tailActivity,
 } from "./stall.mjs";
 
 const DAY_MS = 86_400_000;
@@ -21,7 +22,7 @@ async function mapLimit(items, limit, fn) {
 
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
-export async function stallScan({ state, now, dryRun = false, verbose = false, log }) {
+export async function stallScan({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
   const iso = new Date(now).toISOString();
   const active = await io.activeSessions();
   const tails = new Map();
@@ -94,7 +95,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         // Robob can't be read, but the OpenCode fallback doesn't need it.
         if (verbose) log(`stall ${id}: thread read failed: ${errText(err)}`);
         if (age >= GIVE_UP_MS) finish(id, stall, "failed", `could not read the Robob thread: ${errText(err)}`);
-        else if (!ocDone && !stall.ocTried && age >= FALLBACK_MS && !dryRun) await ocStop(stall);
+        else if (!ocDone && !stall.ocTried && age >= FALLBACK_MS && !dryRun && stall.kind !== "ghost") await ocStop(stall);
         report.push({ id, ...stall });
         continue;
       }
@@ -112,7 +113,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         }
       }
       finish(id, stall, "cleared");
-    } else if (!c.ocDone && !stall.ocTried && age >= FALLBACK_MS) {
+    } else if (!c.ocDone && !stall.ocTried && age >= FALLBACK_MS && stall.kind !== "ghost") {
       const after = stall.ocTries ? "a failed OpenCode interrupt" : "the Robob interrupt";
       log(`stall ${id}: OpenCode still running ${Math.round(age / 1000)}s after ${after}, interrupting the session`);
       if (!dryRun) await ocStop(stall);
@@ -187,6 +188,85 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           // A note would start a new run Robob never had, so send none.
           Object.assign(stall, { runId: null, note: false });
           await ocStop(stall);
+        }
+      } catch (err) {
+        stall.errors.push(`robob interrupt: ${errText(err)}`);
+      }
+    }
+  }
+
+  // Runs Robob shows as running while OpenCode's session sits idle never reach
+  // the loop above, which only sees OpenCode's active sessions.
+  let live = null;
+  try {
+    live = await io.activeThreads();
+  } catch (err) {
+    if (verbose) log(`stall: thread list failed: ${errText(err)}`);
+  }
+  if (live) {
+    const ghosts = ghostCandidates(live, active);
+    state.ghosts = observeGhosts(state.ghosts, ghosts, now);
+    const installing = io.installerResumePendingMs() != null;
+    // The tail read is awaited after the snapshots above, so the run may have moved
+    // on or OpenCode may have picked the session up. Re-check just before acting.
+    const stillGhost = async (t, g) => {
+      try {
+        const [fresh, freshActive] = await Promise.all([io.activeThreads(), io.activeSessions()]);
+        const cur = fresh.find((x) => x.threadId === t.threadId);
+        return cur !== undefined && ghostCandidates([cur], freshActive).length === 1
+          && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses;
+      } catch (err) {
+        if (verbose) log(`stall: ghost re-check failed: ${errText(err)}`);
+        return false;
+      }
+    };
+    for (const t of ghosts) {
+      const g = state.ghosts[t.threadId];
+      const quietMs = now - g.since;
+      if (quietMs < GHOST_RUN_MS || installing || openSes.has(g.ses)) continue;
+      const id = stallId(g.ses, g.since);
+      if (state.stalls[id]) continue;
+      let lastMs = 0;
+      try {
+        lastMs = tailActivity((await io.ocTail(g.ses, 2)) ?? []).lastMs;
+      } catch (err) {
+        if (verbose) log(`stall: ${g.ses} tail failed: ${errText(err)}`);
+        continue;
+      }
+      // The session did something recently, so this is not a dead turn.
+      if (now - lastMs < GHOST_RUN_MS) continue;
+      if (!(await stillGhost(t, g))) {
+        // Start the 15 min clock again from the next scan.
+        delete state.ghosts[t.threadId];
+        continue;
+      }
+      const recent = Object.values(state.stalls).filter(
+        (s) => s.ses === g.ses && (s.action === "robob" || s.action === "opencode") && now - Date.parse(s.at) < DAY_MS,
+      ).length;
+      const plan = planGhost({ thread: t, recent });
+      const stall = {
+        at: iso, ses: g.ses, threadId: t.threadId, runId: t.activeRunId, title: t.title || g.ses,
+        origin: t.origin ?? null, parentTitle: null, kind: "ghost", label: GHOST_LABEL,
+        quietSince: g.since, quietMs, fp: null, action: plan.action, note: plan.note,
+        reason: plan.reason, interruptedAt: now, errors: [],
+      };
+      log(`stall ${id}: ${plan.action} | ${truncate(stall.title, 60)} | ghost run ${Math.round(quietMs / 60_000)}m | ${plan.reason}${dryRun ? " (dry run)" : ""}`);
+      report.push({ id, ...stall });
+      if (dryRun) continue;
+      state.stalls[id] = stall;
+      if (plan.action === "report") {
+        finish(id, stall, "report");
+        continue;
+      }
+      try {
+        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}` });
+        stall.robobResult = res.result ?? null;
+        if (res.result === "interrupt_requested") {
+          // Track the run we verified, not whatever run the server reports back.
+          if (res.runId && res.runId !== t.activeRunId) stall.errors.push(`interrupted ${res.runId}, expected ${t.activeRunId}`);
+          stall.runId = t.activeRunId;
+        } else {
+          Object.assign(stall, { runId: null, note: false });
         }
       } catch (err) {
         stall.errors.push(`robob interrupt: ${errText(err)}`);

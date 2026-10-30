@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
 import { metadataWarnings, resolveAppFile, validAppSlug } from "./apps.ts";
-import { loadAppsConfig } from "./config.ts";
+import { loadAppsConfig, stateRoot } from "./config.ts";
+import { editBans, readReplyRules } from "./replyCheck.ts";
 import { type Exec, publish, PUBLISH_MAX, PUBLISH_MIN, PublishError, unpublish } from "./publish.ts";
 import { CARD_FIELDS, parseFieldSpec, SECRET_FIELD_TYPES, type SecretField, validFieldName, validToken } from "./secrets.ts";
 
@@ -15,7 +16,9 @@ type Command = { method: "GET" | "POST"; path: string; body?: Body };
 export type LocalCommand =
   | { command: "publish"; localPort: number }
   | { command: "publish"; app: string }
-  | { command: "unpublish"; port: number };
+  | { command: "unpublish"; port: number }
+  | { command: "ban" | "unban"; slug: string; word: string }
+  | { command: "bans"; slug?: string };
 
 class CliError extends Error {}
 /** A secret value printed verbatim, with no JSON wrapping or trailing newline. */
@@ -23,12 +26,12 @@ class RawOutput {
   constructor(readonly value: string) {}
 }
 
-const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish."
+const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
   + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
-const LOCAL_COMMANDS = ["publish", "unpublish"];
+const LOCAL_COMMANDS = ["publish", "unpublish", "ban", "unban", "bans"];
 
 // Mirrors photon.ts EFFECTS; the CLI must not load the SDK just to validate arguments.
 export const EFFECT_NAMES = ["slam", "loud", "gentle", "invisible", "confetti", "fireworks", "balloons", "heart",
@@ -74,6 +77,9 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
   unpublish: ["port"],
+  ban: ["chat", "word"],
+  unban: ["chat", "word"],
+  bans: ["chat"],
   share: ["app", "days"],
   unshare: ["app"],
   shares: [],
@@ -136,6 +142,19 @@ export const isLocalCommand = (args: string[]): boolean => LOCAL_COMMANDS.includ
 export function parseLocalCommand(args: string[]): LocalCommand {
   if (!isLocalCommand(args)) throw new CliError(COMMANDS_HELP);
   const { command, values } = parseOptions(args);
+  if (command === "ban" || command === "unban") {
+    const slug = required(values.chat, "--chat");
+    if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug)) throw new CliError("Invalid chat slug; list them with chats");
+    const word = required(values.word, "--word");
+    if (!/[\p{L}\p{N}]/u.test(word)) throw new CliError("--word needs a letter or digit");
+    return { command, slug, word };
+  }
+  if (command === "bans") {
+    if (values.chat === undefined) return { command };
+    const slug = required(values.chat, "--chat");
+    if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug)) throw new CliError("Invalid chat slug; list them with chats");
+    return { command, slug };
+  }
   if (command === "unpublish") {
     const port = portOption(values.port, "--port");
     if (port < PUBLISH_MIN || port > PUBLISH_MAX) throw new CliError(`--port must be a tailnet port from ${PUBLISH_MIN} to ${PUBLISH_MAX}`);
@@ -149,8 +168,22 @@ export function parseLocalCommand(args: string[]): LocalCommand {
   return { command: "publish", localPort: portOption(values.port, "--port") };
 }
 
-export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }> } = {}): Promise<unknown> {
+type RulesCommand = Extract<LocalCommand, { command: "ban" | "unban" | "bans" }>;
+const isRulesCommand = (command: LocalCommand): command is RulesCommand =>
+  command.command === "ban" || command.command === "unban" || command.command === "bans";
+
+/** Standing chat-rule edits; they touch only the local rules file, never the bridge socket. */
+function runRulesCommand(command: RulesCommand, rulesPath: string): Promise<unknown> {
+  if (command.command === "bans") {
+    const rules = readReplyRules(rulesPath);
+    return Promise.resolve(command.slug === undefined ? rules : { [command.slug]: rules[command.slug] ?? { banned: [] } });
+  }
+  return editBans(rulesPath, command.slug, command.command, command.word);
+}
+
+export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }>; rulesPath?: string } = {}): Promise<unknown> {
   const deps = options.exec ? { exec: options.exec } : {};
+  if (isRulesCommand(command)) return runRulesCommand(command, options.rulesPath ?? join(stateRoot, "reply-rules.json"));
   try {
     if (command.command === "unpublish") return await unpublish(command.port, deps);
     if ("localPort" in command) {

@@ -427,6 +427,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say(steps_summary(step_res, planned))
     if code == 1 and last_stage_is_grep(cmd):
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
+    if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
+        say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
     if code is None:
         say("remote exit unknown (process lost); offbox exits 90")
     else:
@@ -434,7 +436,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
 
 
 def build_env(extra: list[str]) -> tuple[dict, list[str]]:
-    env = {"CI": "1"}
+    # Boxes have no AWS instance metadata (169.254.169.254 is blackholed); boto3 without credentials waits ~2 s per lookup.
+    env = {"CI": "1", "AWS_EC2_METADATA_DISABLED": "true"}
     for k in ENV_ALLOW:
         if os.environ.get(k):
             env[k] = os.environ[k]
@@ -507,7 +510,10 @@ class Runner:
                      json.dumps(a.pull or []), self.rel, str(self.cwd)))
         con.commit()
         t0 = now()
-        row = pool.acquire(me, size=a.size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+        size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
+        if size != a.size:
+            say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
+        row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
         self.lease_row = row
         self.box = row["box_id"]
         rdir = row["remote_dir"]

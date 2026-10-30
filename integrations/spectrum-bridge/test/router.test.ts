@@ -1508,12 +1508,13 @@ const RESEND = /again\?|resend|sending it|trying again|Mind /i;
 const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
 
 test("a watcher turn that failed while running is reported honestly, never retried or quoted", async () => {
-  const h = setup();
+  const h = setup(":memory:", { droppedBatchMs: 0 });
   const start = Date.parse("2026-09-29T07:00:11Z");
   setSystemTime(start);
   const wake = `wake:${"d".repeat(64)}`;
   h.input(wake, wakeBody());
   await h.router.tick();
+  h.backend.step("checking", "tool-calls").content.push({ type: "tool", id: "call_1", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: "PRIVATE_TOOL" }] } } as never);
   h.backend.failed();
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
@@ -1531,7 +1532,7 @@ test("a watcher turn that failed while running is reported honestly, never retri
 });
 
 test("a wake whose prompt is never accepted is retried without a resend notice, checking acceptance before every POST", async () => {
-  const h = setup();
+  const h = setup(":memory:", { droppedBatchMs: 0 });
   const start = Date.parse("2026-09-29T07:00:11Z");
   setSystemTime(start);
   h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
@@ -1584,6 +1585,131 @@ test("a wake whose prompt is never accepted is retried without a resend notice, 
   h.input("owner_2", "Thanks");
   await h.router.tick();
   expect(h.backend.prompts[4]!.system).not.toContain("Missed background updates");
+});
+
+test("a watcher turn that errored before any tool is retried, then reported once", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"e".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  expect(h.controls()).toEqual([]);
+  // Two minutes, then four: the retry is slower than an undelivered row's.
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts[1]!.text).toBe(wakeBody());
+  h.backend.failed();
+  await h.router.tick();
+  setSystemTime(start + 120_000 + 240_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(3);
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "errored")]);
+  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
+});
+
+test("a first-call provider error with no tool evidence is reported once and never retried, through the backend", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  // The provider returned 400 on the first call: no text, no tool, and no proof either way.
+  Object.assign(h.backend, { runToolEvidence: async () => "unknown" as const });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"k".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  setSystemTime(start + 10 * 60_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test("a first-call provider error with positive no-tool evidence is retried, then reported once", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  Object.assign(h.backend, { runToolEvidence: async () => "none" as const });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"l".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+});
+
+test("a failed turn whose tool use the backend cannot rule out is never retried", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"j".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  // Robob's record for an errored step: no tool part, and no finish to prove that no tool ran.
+  const step = h.backend.step("", "error");
+  step.toolEvidence = "unknown";
+  step.error = { type: "ProviderError", message: "PRIVATE_ERROR" };
+  h.backend.settle("failed");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test("an errored wake that succeeds on retry sends nothing extra", async () => {
+  const h = setup(":memory:", { droppedBatchMs: 0 });
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"g".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
+  expect(h.controls()).toEqual([]);
+});
+
+test("dropped notices close together go out as one", async () => {
+  const h = setup();
+  const start = Date.parse("2026-09-29T07:00:11Z");
+  setSystemTime(start);
+  const first = `wake:${"h".repeat(64)}`;
+  const second = `wake:${"i".repeat(64)}`;
+  h.input(first, wakeBody("Daily board"));
+  await h.router.tick();
+  h.backend.step("checking", "tool-calls").content.push({ type: "tool", id: "call_1", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: "PRIVATE_TOOL" }] } } as never);
+  h.backend.failed();
+  await h.router.tick();
+  h.input(second, wakeBody("HW call David"));
+  await h.router.tick();
+  h.backend.step("checking", "tool-calls").content.push({ type: "tool", id: "call_2", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: "PRIVATE_TOOL" }] } } as never);
+  h.backend.failed();
+  await h.router.tick();
+  // Inside the window nothing is sent yet.
+  expect(h.controls()).toEqual([]);
+  setSystemTime(start + 10 * 60_000);
+  await h.router.tick();
+  expect(h.controls()).toHaveLength(1);
+  expect(h.controls()[0]!.text).toContain("watcher: Daily board");
+  expect(h.controls()[0]!.text).toContain("watcher: HW call David");
 });
 
 test("a retried wake whose earlier prompt landed late is adopted, never POSTed twice", async () => {
@@ -4105,7 +4231,7 @@ test("a reset nudge that fails is dropped quietly", async () => {
   await h.router.tick();
   h.backend.failed();
   await h.router.tick();
-  expect(events).toContainEqual(["context-reset-dropped", "failed"]);
+  expect(events).toContainEqual(["context-reset-dropped", "errored"]);
   expect(h.store.pendingOutbox()).toEqual([]);
   expect(h.store.pendingInbound()).toEqual([]);
   h.input("next", "Still there?");

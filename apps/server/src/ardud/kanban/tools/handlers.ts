@@ -411,7 +411,14 @@ const handlers = {
         if (input.verdict === "findings" && findings.length === 0) {
           return yield* invalid("A findings verdict needs at least one finding.");
         }
-        return { card: yield* service.reviewResult(caller.threadId, input.verdict, findings) };
+        return {
+          card: yield* service.reviewResult(
+            caller.threadId,
+            input.verdict,
+            findings,
+            input.head ?? null,
+          ),
+        };
       }),
     ),
   ),

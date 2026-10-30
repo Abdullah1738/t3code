@@ -13,6 +13,7 @@ import {
   ThreadId,
   type KanbanActor,
   type KanbanBoard,
+  type KanbanCard,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 
@@ -25,6 +26,7 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
+import * as Rules from "./rules.ts";
 import * as ScriptService from "./ScriptService.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -49,17 +51,20 @@ const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-kanban-scripts-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
 
-const testLayer = ScriptService.layer.pipe(
-  Layer.provideMerge(KanbanService.layer),
-  Layer.provideMerge(KanbanModels.layerTest(null)),
-  Layer.provideMerge(threads),
-  Layer.provideMerge(KanbanStore.layer),
-  Layer.provideMerge(Sqlite.layerMemory),
-  Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
-  Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
-  Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
-  Layer.provideMerge(boardFilesLayer),
-);
+const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>) =>
+  ScriptService.layer.pipe(
+    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(threadsLayer),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+const testLayer = makeTestLayer(threads);
 
 const owner: KanbanActor = { _tag: "owner" };
 const manual: KanbanScriptTrigger = { _tag: "manual" };
@@ -79,6 +84,18 @@ const toyBoard = Effect.gen(function* () {
     defaultProjectId: ProjectId.make("project-1"),
   });
 });
+
+// Main's review gate (card #63) holds a non-owner's move to completed or deployed
+// until the card's review passed; these cards stand for reviewed work.
+const markReviewed = (board: KanbanBoard, cardId: KanbanCard["id"]) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const stored = (yield* store.card(cardId))!;
+    yield* store.putCard({
+      ...stored,
+      reviewStep: Rules.chainFor(board, stored)?.steps.length ?? 1,
+    });
+  });
 
 // Event runs start from a background fiber; give it a turn, then wait for the runs.
 const settle = Effect.gen(function* () {
@@ -421,4 +438,187 @@ it.effect("closes runs a stopped server left open", () =>
     assert.isNotNull(records.find((entry) => entry.id === script.id)?.lastRun?.endedAt);
     assert.isNotNull((yield* scripts.runs(other.id, 1))[0]?.endedAt);
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("a script ticks its subtasks, hands one back and moves cards, waking the evaluator only for the hand-back", () => {
+  const sent: Array<string> = [];
+  const recording = Layer.succeed(
+    KanbanThreads,
+    KanbanThreads.of({
+      view: () => Effect.succeed(null),
+      find: () => Effect.succeed(null),
+      lastFailure: () => Effect.succeed(null),
+      launch: (input) => {
+        sent.push(input.text);
+        return Effect.succeed(ThreadId.make("thread-1"));
+      },
+      send: (input) => {
+        sent.push(input.text);
+        return Effect.void;
+      },
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
+      interrupt: () => Effect.void,
+    }),
+  );
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+    // A subtask names a script on the board, so the scripts exist before the card does.
+    yield* register(board, scriptFile("exit 0\n"), manual, "land");
+    yield* register(board, scriptFile("exit 0\n"), manual, "other");
+    yield* register(board, scriptFile("exit 0\n"), manual, "again");
+
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        prompt: "Ship the change",
+        title: "Land it",
+        subtasks: [
+          { text: "Merge the PR", owner: "script", script: "land" },
+          { text: "Deploy", owner: "script", script: "land", step: 2 },
+          { text: "Tell the reporter", owner: "evaluator", step: 3 },
+        ],
+      },
+      owner,
+    );
+    yield* markReviewed(board, card.id);
+    yield* kanban.dispatchNow;
+    assert.strictEqual(sent.length, 0);
+
+    const bad = yield* kanban
+      .createCard(
+        board.id,
+        { prompt: "Oops", title: "Oops", subtasks: [{ text: "Merge", owner: "script", script: "nope" }] },
+        owner,
+      )
+      .pipe(Effect.flip);
+    assert.include(bad.detail, 'no script named "nope" on this board');
+
+    // Each run registers its own script under the given name, then runs it once.
+    const runScript = (name: string, lines: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        const path = scriptFile(`${lines.map((line) => `echo '${line}'`).join("\n")}\n`);
+        const script = yield* register(board, path, manual, name);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        const [done] = yield* scripts.runs(script.id, 1);
+        return done?.output ?? "";
+      });
+
+    const otherOut = yield* runScript("other", [
+      `{"kanban":"subtask","card":${card.number},"subtask":"s1","state":"done"}`,
+    ]);
+    assert.include(
+      otherOut,
+      `Couldn't mark s1 on card #${card.number}: subtask s1 is for the script "land"`,
+    );
+
+    const landOut = yield* runScript("land", [
+      `{"kanban":"subtask","card":${card.number},"subtask":"s1","state":"done","note":"merged abc1234"}`,
+      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"deploy failed: exit 1"}`,
+      `{"kanban":"move","card":${card.number},"to":"deployed","note":"landed"}`,
+      `{"kanban":"move","card":${card.number},"to":"verified"}`,
+      `{"kanban":"move","card":${card.number},"to":"working"}`,
+    ]);
+    assert.include(landOut, `Marked s1 done on card #${card.number}.`);
+    assert.include(landOut, `Handed s2 on card #${card.number} back to the evaluator.`);
+    assert.include(landOut, `Moved card #${card.number} to deployed.`);
+    assert.include(landOut, `Couldn't move card #${card.number}: card #${card.number} still has s2, s3 open`);
+    // The fifth line is `move to working`: no schema allows it, so it's reported, not applied.
+    assert.include(landOut, "Line 5:");
+
+    const after = yield* kanban.snapshot(board.id);
+    const stored = after.cards.find((entry) => entry.number === card.number)!;
+    const s1 = stored.subtasks.find((subtask) => subtask.id === "s1")!;
+    assert.strictEqual(s1.state, "done");
+    assert.strictEqual(s1.note, "merged abc1234");
+    assert.strictEqual(s1.doneBy?._tag, "script");
+    const s2 = stored.subtasks.find((subtask) => subtask.id === "s2")!;
+    assert.strictEqual(s2.owner, "evaluator");
+    assert.strictEqual(s2.state, "open");
+    assert.strictEqual(s2.note, "deploy failed: exit 1");
+    assert.strictEqual(stored.stage, "deployed");
+
+    const wakes = sent.filter((text) => text.includes("deploy failed: exit 1"));
+    assert.strictEqual(wakes.length, 1);
+    assert.notInclude(sent.join("\n"), "waiting on your subtasks");
+
+    const againOut = yield* runScript("again", [
+      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"again"}`,
+    ]);
+    assert.include(againOut, `Couldn't hand s2 on card #${card.number} back: subtask s2 isn't a script's`);
+    assert.strictEqual(sent.filter((text) => text.includes("again")).length, 0);
+  }).pipe(Effect.provide(makeTestLayer(recording)));
+});
+
+it.effect("a subtask a script ticks, which moves a deployed card back to todo, wakes no card.moved script", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+    // Both listeners react to every card.moved; a rerun shows up as a run.
+    const mover = yield* register(
+      board,
+      scriptFile(`echo "$KANBAN_EVENT"\n`),
+      { _tag: "event", event: "card.moved" },
+      "mover",
+    );
+    const watcher = yield* register(
+      board,
+      scriptFile(`echo "$KANBAN_EVENT"\n`),
+      { _tag: "event", event: "card.moved" },
+      "watcher",
+    );
+    // The land script has to exist before a card names it.
+    const ticker = yield* register(
+      board,
+      scriptFile(
+        [
+          `echo '{"kanban":"move","card":1,"to":"deployed","note":"landed"}'`,
+          `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged"}'`,
+          "",
+        ].join("\n"),
+      ),
+      manual,
+      "ticker",
+    );
+    // Step 1: the script's merge. Step 2: the worker's follow-up.
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        prompt: "Land the change",
+        title: "Land",
+        subtasks: [
+          { text: "Merge the PR", owner: "script", script: "ticker" },
+          { text: "Write the follow-up", owner: "work", step: 2 },
+        ],
+      },
+      owner,
+    );
+    assert.strictEqual(card.number, 1);
+    yield* markReviewed(board, card.id);
+    yield* scripts.listen;
+    yield* scripts.run(ticker.id, "manual");
+    yield* scripts.idle;
+    yield* settle;
+
+    const stored = (yield* kanban.snapshot(board.id)).cards.find((entry) => entry.number === card.number)!;
+    // The tick opened the worker's step, so the deployed card went back to todo.
+    assert.strictEqual(stored.stage, "todo");
+    const moves = (yield* kanban.card(card.id)).events.filter((event) => event.kind === "moved");
+    assert.deepStrictEqual(
+      moves.map((event) => [event.toStage, event.actor._tag]),
+      [
+        ["deployed", "script"],
+        ["todo", "script"],
+      ],
+    );
+    // The move and the auto-move both came from the land script: neither listener reruns.
+    assert.strictEqual((yield* scripts.runs(mover.id, 10)).length, 0);
+    assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );

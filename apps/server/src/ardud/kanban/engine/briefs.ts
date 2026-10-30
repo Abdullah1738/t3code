@@ -46,6 +46,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
     "- When the work is done, attach every PR with card_update (links) and call card_move to needs_review with a one-line note. A reviewer picks it up; findings come back to you in this thread.",
+    "- Before card_move to needs_review, check what reviewers keep finding: list the sibling paths and call sites of what you changed (other entry points, clients, providers, the way back) and fix or name each; search skills, watchers and the wiki for rules your change contradicts; name any change needed outside the repo (live config, skills, deploys) in card_update.",
     "- If you need a decision from the owner, ask with card_ask. Don't guess on product or risk calls. Ask async and keep working where you can; his answer comes to this thread. Pass blocking only when you can't go on without it: the card then waits in Needs Owner and comes back to you with the answer. Never use the built-in question tool: nobody sees it and the card stalls.",
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
@@ -110,11 +111,30 @@ export const evaluatorStepFromOtherText = (card: KanbanCard, by: string) =>
 /** Sent to the card discussion's evaluator when the step a card is on becomes its own. */
 export const evaluatorStepText = (card: KanbanCard) =>
   lines(
-    `Card #${card.number} (${card.title || "untitled"}, now in ${card.stage}) is waiting on your subtasks: ${subtaskIds(kanbanStepSubtasks(card))}.`,
+    `Card #${card.number} (${card.title || "untitled"}, now in ${card.stage}) is waiting on your subtasks: ${subtaskIds(kanbanStepSubtasks(card, "evaluator"))}.`,
     "",
     subtaskLines(card),
     "",
+    kanbanStepSubtasks(card, "script").length > 0
+      ? "Subtasks marked script belong to a board script: leave them to it. It hands one back to you if it fails."
+      : null,
+    kanbanStepSubtasks(card, "script").length > 0 ? "" : null,
     "Do them, mark each with subtask_done, then move the card on. Anything outward (a message, a ticket update, a merge or deploy) follows the board's approval rules: ask the owner first where they say so.",
+  );
+
+/** Sent to the card discussion's evaluator once when a board script hands a subtask back. */
+export const handBackText = (
+  card: KanbanCard,
+  subtaskId: string,
+  scriptName: string,
+  note: string,
+) =>
+  lines(
+    `Script "${scriptName}" handed subtask ${subtaskId} of card #${card.number} (${card.title || "untitled"}, now in ${card.stage}) back to you: ${note}`,
+    "",
+    subtaskLines(card),
+    "",
+    "Find out what stopped it. Do the subtask yourself and mark it with subtask_done, or fix the cause and give it back to the script with card_edit (owner script). Anything outward (a message, a ticket update, a merge or deploy) follows the board's approval rules: ask the owner first where they say so.",
   );
 
 /** Sent when the dispatcher wakes an existing work thread. */
@@ -150,9 +170,10 @@ export const reviewBrief = (
     card.subtasks.length > 0
       ? "Check the subtasks the worker marked done really are; a clear verdict ticks off the review's own."
       : null,
-    "Finish by calling card_review_result exactly once:",
+    "Finish by calling card_review_result exactly once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
+    'After that call, end your final message with one line: "Verdict: clear" or "Verdict: changes needed: <top finding>".',
     board.instructions.reviewerRouting.trim()
       ? `\nReviewer routing instructions:\n${board.instructions.reviewerRouting.trim()}`
       : null,
@@ -209,11 +230,11 @@ const purposeText = (purpose: EvaluatorPurpose) => {
     case "stalled":
       return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
     case "completed":
-      return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing.";
+      return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing. Cards are completed and deployed only once the card's review passed. Leave a card alone while its current step is a board script's.";
     case "deployed":
-      return "Deployed batch: for each Deployed card, verify the behaviour in the real environment. Move verified ones to verified; send failures back to todo with the evidence.";
+      return "Deployed batch: for each Deployed card, verify the behaviour in the real environment. Move verified ones to verified; send failures back to todo with the evidence. Cards are completed and deployed only once the card's review passed. Leave a card alone while its current step is a board script's.";
     case "check":
-      return "Board check: read the board and the live threads. Steer threads that drift, split cards that are too big, create cards for follow-ups, give a plan of subtasks to cards that have none, do the evaluator subtasks cards are waiting on, keep goals' Now and Story current.";
+      return "Board check: read the board and the live threads. Steer threads that drift, split cards that are too big, create cards for follow-ups, give a plan of subtasks to cards that have none, do the evaluator subtasks cards are waiting on, keep goals' Now and Story current. Leave a card alone while its current step is a board script's.";
     case "packets":
       return "Packets: threads and scripts made new cards that wait on your packet subtask. Each one is sent to you here, and more may follow while you work. For each: read what it points at, write its packet with card_edit, add the plan, then mark the packet subtask done.";
     case "setup":

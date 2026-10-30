@@ -13,14 +13,14 @@ const poll = { title: "Lunch?", options: ["Pizza", "Sushi"], dedupeKey: "poll-1"
 const app = { url: "https://apps.test/tracker/", caption: "Tracker", subcaption: "Today", trailingCaption: "3",
   trailingSubcaption: "left", summary: "Open tracker", dedupeKey: "app-1", sessionId: "current" };
 
-function setup() {
+function setup(options: Partial<Parameters<typeof createApi>[0]> = {}) {
   setSystemTime(Date.parse("2026-09-10T00:00:00Z"));
   const store = new Store(":memory:");
   stores.push(store);
   const state = { enabled: true, chat: "iMessage;-;+15555550123" as string | undefined, health: {} as Record<string, unknown> };
   const photon: Pick<Photon, "react"> = { async react() { throw new Error("Unexpected reaction"); } };
   const api = createApi({ store, photon, router: () => undefined, chatGuid: () => state.chat, enabled: () => state.enabled,
-    health: () => state.health });
+    health: () => state.health, ...options });
   const post = (path: string, body: unknown) => api(new Request(`http://bridge${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }));
@@ -53,6 +53,74 @@ test("send, poll, and app queue session-bound conversation operations idempotent
     expect(await again.json()).toEqual({ id, created: false });
   }
   expect(h.store.pendingOutbox()).toHaveLength(3);
+});
+
+test("a rule-breaking /send gets one 422 and queues nothing; the retry queues", async () => {
+  const logged: string[] = [];
+  const h = setup({
+    replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined,
+    log: (event, code) => logged.push(`${event}:${code ?? ""}`),
+  });
+  const bad = { ...send, text: "Giardia again?", dedupeKey: "bad-1" };
+  const bounced = await h.post("/send", bad);
+  expect(bounced.status).toBe(422);
+  expect(await bounced.json()).toEqual({ error: 'Nothing was sent: this chat banned "giardia". Rewrite and send again.' });
+  expect(h.store.pendingOutbox()).toHaveLength(0);
+  expect(logged).toEqual(["reply-bounced:banned"]);
+
+  // Same turn, second try: the bounce window still holds, so the check is skipped and the send queues.
+  const retry = await h.post("/send", { ...bad, text: "Got it, here is the answer.", dedupeKey: "bad-2" });
+  expect(retry.status).toBe(202);
+  expect(h.store.pendingOutbox()).toHaveLength(1);
+  expect(logged).toEqual(["reply-bounced:banned"]);
+});
+
+test("an accepted rule-breaking send replays as 200 after the turn changes, and bounce state is untouched", async () => {
+  const h = setup({ replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined });
+  const ok = { ...send, text: "Hello there", dedupeKey: "replay-1" };
+  expect((await h.post("/send", ok)).status).toBe(202);
+  // The accepted text is then replayed with a banned word added to the same key: a conflict, not a bounce.
+  const turn = () => h.store.set("activeTurn", { messageId: "m-2" });
+  const bad = { ...send, text: "Giardia again", dedupeKey: "replay-2" };
+  h.store.set("activeTurn", { messageId: "m-1" });
+  const rejected = await h.post("/send", bad);
+  expect(rejected.status).toBe(422);
+  const bounceBefore = h.store.get<unknown>("reply-bounce");
+  // Identical replay after the turn changed and the bounce window would have expired.
+  turn();
+  const replay = await h.post("/send", ok);
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual({ id: `send:${hash("replay-1")}`, created: false });
+  expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
+  // A different text under an accepted key is a conflict (409) and records no bounce.
+  const conflict = await h.post("/send", { ...ok, text: "Giardia changed it" });
+  expect(conflict.status).toBe(409);
+  expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
+});
+
+test("a stale, null or invalid route is 409 with no bounce or log, and does not consume the live send's bounce", async () => {
+  const logged: string[] = [];
+  const h = setup({
+    replyCheck: text => text.includes("Giardia") ? { rule: "banned", reason: 'this chat banned "giardia"' } : undefined,
+    log: event => logged.push(event),
+  });
+  const bad = (sessionId: string, dedupeKey: string) => ({ ...send, text: "Giardia again?", sessionId, dedupeKey });
+  // Live route is current@5 (setup). Refused sessions: an old generation, a wrong id, and a null route.
+  for (const sessionId of ["current@4", "old@5", "current@9"]) {
+    const res = await h.post("/send", bad(sessionId, `stale-${sessionId}`));
+    expect(res.status).toBe(409);
+  }
+  h.store.set("route", null);
+  expect((await h.post("/send", bad("current@5", "null-route"))).status).toBe(409);
+  // No bounce state, no log, and nothing queued from the refused requests.
+  expect(h.store.get<unknown>("reply-bounce")).toBeUndefined();
+  expect(logged).toEqual([]);
+  expect(h.store.pendingOutbox()).toHaveLength(0);
+  // The next live send still gets its own bounce, so the refused ones did not use it up.
+  h.store.set("route", { id: "current", generation: 5 });
+  const live = await h.post("/send", bad("current@5", "live-1"));
+  expect(live.status).toBe(422);
+  expect(logged).toEqual(["reply-bounced"]);
 });
 
 test("app cards are refused in a group chat with a reason, while send still queues there", async () => {

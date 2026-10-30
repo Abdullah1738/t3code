@@ -76,6 +76,7 @@ import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import * as DesktopBrowserChannel from "./DesktopBrowserChannel.ts";
+import * as PreviewAgentActivity from "./PreviewAgentActivity.ts";
 import * as PreviewManager from "./Manager.ts";
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
@@ -462,6 +463,7 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
   const desktopChannel = yield* DesktopBrowserChannel.DesktopBrowserChannel;
+  const agentTurns = yield* (yield* PreviewAgentActivity.PreviewAgentActivity).changes;
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const launchServices = yield* Effect.context<ChildProcessSpawner.ChildProcessSpawner>();
   const setupCommand = yield* resolveRootCliCommand(PreviewBrowserHost.SETUP_SUBCOMMAND);
@@ -897,7 +899,9 @@ const make = Effect.gen(function* () {
         (desktop || adopted) && page.url() === snapshot.navStatus.url
           ? page.reload(options)
           : page.goto(snapshot.navStatus.url, options)
-      ).then(constVoid);
+      ).then(constVoid, (cause: unknown) => {
+        throw ServerBrowserPage.toOperationError(cause, NAVIGATION_TIMEOUT_MS);
+      });
 
       void tab.initialNavigation.catch(constVoid);
     }
@@ -1444,7 +1448,7 @@ const make = Effect.gen(function* () {
           `Navigation to ${url} failed: ${ServerBrowserPage.parseNetError(message).description}`,
         );
       }
-      throw cause;
+      throw ServerBrowserPage.toOperationError(cause, timeout);
     });
   };
 
@@ -1465,10 +1469,9 @@ const make = Effect.gen(function* () {
       try {
         await encoder.evaluate(ServerBrowserPage.RECORDING_ENCODER_SCRIPT);
         // Seed idle pages before returning so an immediate stop has a frame to encode.
-        const firstFrame = await ServerBrowserPage.captureViewport(tab.page, tab.cdp, {
+        const firstFrame = await ServerBrowserPage.captureViewport(tab.cdp, {
           format: "jpeg",
           quality: RECORDING_SCREENCAST.quality,
-          scale: 1,
         });
         await encoder.evaluate(
           ([data, width]) =>
@@ -1520,7 +1523,6 @@ const make = Effect.gen(function* () {
     return started;
   };
 
-  // Scaled captures repaint every screencast; pause them to avoid leaking that frame.
   const withScreencastsPaused = <A>(tab: ServerTab, capture: () => Promise<A>): Promise<A> =>
     withCaptureLock(tab, async () => {
       tab.capturing += 1;
@@ -1947,7 +1949,10 @@ const make = Effect.gen(function* () {
       }
       case "snapshot": {
         return withScreencastsPaused(tab, () =>
-          ServerBrowserPage.snapshot({ ...tab, renderScale: RENDER_SCALE }),
+          ServerBrowserPage.snapshot({
+            ...tab,
+            renderScale: tab.desktop ? "display" : RENDER_SCALE,
+          }),
         );
       }
       case "click": {
@@ -2314,14 +2319,9 @@ const make = Effect.gen(function* () {
     }
     broadcastControl(tab);
     pushFileChooser(tab);
-    // Full scale: a scaled capture would flash in every other viewer.
     const pushStill = async () => {
       const data = await withCaptureLock(tab, () =>
-        ServerBrowserPage.captureViewport(tab.page, session, {
-          format: "jpeg",
-          quality,
-          scale: 1,
-        }),
+        ServerBrowserPage.captureViewport(session, { format: "jpeg", quality }),
       ).catch(() => null);
       if (data) viewer.push({ _tag: "frame", data: Buffer.from(data, "base64"), ack: Effect.void });
     };
@@ -2440,6 +2440,11 @@ const make = Effect.gen(function* () {
         if (tab?.desktop) dropTab(tab, false);
       }),
     ),
+    Effect.forkScoped,
+  );
+  // The desktop keeps the tabs an agent uses focused until its turn ends, not just per command.
+  yield* Stream.fromSubscription(agentTurns).pipe(
+    Stream.runForEach((change) => desktopChannel.turn(change.threadId, change.active)),
     Effect.forkScoped,
   );
   // The page came back, for example after its DevTools closed. Reconnect now

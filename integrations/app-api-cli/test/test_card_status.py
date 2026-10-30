@@ -28,6 +28,10 @@ class TempState(unittest.TestCase):
         env = patch.dict(os.environ, {'CARD_STATUS_FILE': str(self.path)})
         env.start()
         self.addCleanup(env.stop)
+        # The owner's real pause file must never leak into tests; PAUSE_FILE is read at import.
+        pause = patch.object(cli, 'PAUSE_FILE', self.path.with_name('no-pause'))
+        pause.start()
+        self.addCleanup(pause.stop)
 
     def run_card(self, *argv):
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
@@ -369,6 +373,93 @@ class CommerceCardRefusalTests(TempState):
         self.assertEqual(code, 1)
         self.assertFalse(result['card_status']['recorded'])
         self.assertFalse(cs.check('5542')['blocked'])
+
+    def test_cancelled_card_stays_blocked_after_12h(self):
+        cs.record_cancelled('5542', reason='lost card', source='owner', now=AT)
+        self.assertTrue(cs.check('5542', now=AT + 13 * 3600)['blocked'])
+
+    def test_decline_keeps_a_cancelled_card_cancelled(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT + 60)
+        result = cs.check('5542', now=AT + 13 * 3600)
+        self.assertEqual((result['blocked'], result['error'], result['state']), (True, 'CARD_CANCELLED', 'cancelled'))
+        self.assertEqual(self.stored()['5542']['events'], [FLOW])
+
+    def test_ok_refuses_a_cancelled_card_and_replace_reopens_it(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        with self.assertRaisesRegex(cs.CardStatusError, 'card 5542 is cancelled; use card-status replace 5542'):
+            cs.record_ok('5542', now=AT + 60)
+        self.assertTrue(cs.check('5542', now=AT + 60)['blocked'])
+        cs.record_replaced('5542', note='new card from bank', now=AT + 120)
+        result = cs.check('5542', now=AT + 120)
+        self.assertFalse(result['blocked'])
+        self.assertEqual(self.stored()['5542']['note'], 'replaced: new card from bank')
+
+    def test_cli_cancel_and_replace(self):
+        code, out, _ = self.run_card('cancel', '5542', '--reason', 'lost card', '--source', 'owner')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['state'], 'cancelled')
+        code, out, _ = self.run_card('check', '5542')
+        self.assertEqual(code, cs.EXIT_BLOCKED)
+        self.assertIn('Card 5542 was cancelled (lost card).', out)
+        code, _, err = self.run_card('ok', '5542')
+        self.assertEqual(code, cs.EXIT_USAGE)
+        self.assertIn('use card-status replace 5542', err)
+        code, out, _ = self.run_card('replace', '5542', '--note', 'new card', '--source', 'owner')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['state'], 'ok')
+        code, _, _ = self.run_card('check', '5542')
+        self.assertEqual(code, 0)
+
+    def test_cancelled_card_refuses_every_paying_lane(self):
+        cs.record_cancelled('5542', reason='lost card')
+        forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')
+        for name, (argv, lane) in CommerceCardRefusalTests.LANES.items():
+            with self.subTest(lane=name), \
+                    patch.object(cli, lane, side_effect=forbidden) as run, \
+                    patch.object(cli, 'CommerceAuth', side_effect=forbidden), \
+                    patch.object(cli, 'cvv_from_keychain', side_effect=forbidden), \
+                    patch.object(cli.subprocess, 'run', side_effect=forbidden), \
+                    patch('moni_go.verify', side_effect=forbidden):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    code = cli.main([*argv, '--for', 'moni', '--moni-go', 'yes order it'])
+                result = json.loads(out.getvalue().strip().splitlines()[-1])
+                self.assertEqual(code, 3)
+                self.assertEqual((result['error'], result['card_last4']), ('CARD_CANCELLED', '5542'))
+                self.assertFalse(result['financial_send'])
+                run.assert_not_called()
+
+    def test_ordering_pause_refuses_money_commands_before_anything_else(self):
+        pause = Path(self.path.parent) / 'ordering-paused'
+        pause.parent.mkdir(parents=True, exist_ok=True)
+        pause.write_text('card cancelled by owner 29 Oct\n')
+        forbidden = AssertionError('nothing may run while ordering is paused')
+        paused = ['order', 'test-talabat-shops', 'await-payment', 'marketplace-cart', 'cart', 'recover-payment']
+        argv_for = {'order': ['order', 'talabat', '--vertical', 'restaurants', '--branch', '20515',
+                              '--item', '12345', '--apk-pool', 'unused'],
+                    'test-talabat-shops': CommerceCardRefusalTests.LANES['test-talabat-shops'][0],
+                    'await-payment': ['await-payment', FLOW],
+                    'marketplace-cart': ['marketplace-cart', 'main'],
+                    'cart': ['cart', 'minutes', 'show'],
+                    'recover-payment': ['recover-payment', FLOW]}
+        with patch.object(cli, 'PAUSE_FILE', pause), \
+                patch.object(cli, 'CommerceAuth', side_effect=forbidden), \
+                patch.object(cli, 'cvv_from_keychain', side_effect=forbidden), \
+                patch.object(cli.subprocess, 'run', side_effect=forbidden), \
+                patch.object(cli, 'purchase_talabat', side_effect=forbidden), \
+                patch.object(cli, 'order_minutes', side_effect=forbidden), \
+                patch.object(cli, 'recover_payment', side_effect=forbidden), \
+                patch.object(cli, 'card_preflight', side_effect=forbidden):
+            for command in paused:
+                with self.subTest(command=command):
+                    code, result = self.run_cli(argv_for[command])
+                    self.assertEqual(code, 4)
+                    self.assertEqual(result['error'], 'ORDERING_PAUSED')
+                    self.assertIn('card cancelled by owner 29 Oct', result['message'])
+                    self.assertFalse(result['financial_send'])
+                    self.assertFalse(result['financial_retry'])
+        with patch.object(cli, 'PAUSE_FILE', pause):
+            self.assertEqual(self.run_cli(['capabilities'])[0], 0)
 
 
 if __name__ == '__main__':

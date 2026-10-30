@@ -120,8 +120,9 @@ model stream that died mid tool call and left the session "running" for hours.
 - One Telegram summary per stall (`stream-recovery:st-<ses>-<quiet start>`):
   info when cleared, error when it is still stuck 10 min after the interrupt.
   After 3 interrupts of one session in 24h it only reports.
+- A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob, gets the carry-on note (not crw/iMessage) and one Telegram summary. It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
 
-Stalls are kept in the same state file (`watch`, `stalls`, `servers`).
+Stalls are kept in the same state file (`watch`, `stalls`, `servers`, `ghosts`).
 
 ## Commands
 

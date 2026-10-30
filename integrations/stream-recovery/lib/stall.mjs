@@ -89,6 +89,37 @@ export const quietSince = (watch, lastMs) => Math.max(watch.since, lastMs || 0);
 export const stallId = (ses, sinceMs) =>
   `st-${ses}-` + new Date(sinceMs).toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
 
+// A Robob run that shows as running while its OpenCode session sits idle never
+// reached OpenCode (#433 after the 29 Oct restart). The session tail can't show
+// it, so the watch tracks these from Robob's side and acts after this long.
+export const GHOST_RUN_MS = 15 * 60_000;
+export const GHOST_LABEL = "Robob showed the turn running, but its OpenCode session was idle";
+
+// threads: control-API live threads; active: Set of OpenCode active session ids.
+export function ghostCandidates(threads, active) {
+  return threads.filter((t) =>
+    t.state === "running" && Boolean(t.activeRunId) && typeof t.nativeSessionId === "string"
+    && t.nativeSessionId.startsWith("ses_") && !t.pendingRequest && !t.archived && !active.has(t.nativeSessionId));
+}
+
+// Keeps `since` while the same run and session stay a candidate.
+export function observeGhosts(prev, candidates, now) {
+  const next = {};
+  for (const t of candidates) {
+    const old = prev?.[t.threadId];
+    next[t.threadId] = old && old.runId === t.activeRunId && old.ses === t.nativeSessionId
+      ? old
+      : { runId: t.activeRunId, ses: t.nativeSessionId, since: now };
+  }
+  return next;
+}
+
+export function planGhost({ thread, recent = 0 }) {
+  if (recent >= MAX_PER_DAY) return { action: "report", note: false, reason: `already interrupted ${recent} times in 24h` };
+  const quiet = thread.origin === "crw" || thread.origin === "imessage";
+  return { action: "robob", note: !quiet, reason: quiet ? `${thread.origin} thread, run never reached OpenCode` : "run never reached OpenCode" };
+}
+
 // input: {ses, kind, limitMs, quietMs, waiting, childActive, parentID, thread, recent}
 //  waiting: the session or Robob thread has a pending question/permission
 //  thread: Robob thread from /threads/by-native, or null when unmapped
@@ -138,6 +169,9 @@ export function sessionLetGo({ stall, active, fp }) {
 
 export function buildStallNote(stall) {
   const mins = Math.round(stall.quietMs / 60_000);
+  if (stall.kind === "ghost") {
+    return `[stream-recovery] This thread hung: Robob showed a turn running since ${hhmm(stall.quietSince)}, but its OpenCode session sat idle for ${mins} min, so the stall watch interrupted it. That turn's message may never have reached you. Check where you were and carry on with the task.`;
+  }
   const detail =
     stall.kind === "tool"
       ? `The tool that was running (${stall.label.replace(/^running /, "")}) was stopped, so its result may be missing or partial.`

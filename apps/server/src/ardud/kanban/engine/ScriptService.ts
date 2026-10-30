@@ -3,8 +3,9 @@
 /**
  * Board scripts: owner-approved programs the board runs on a schedule, on a
  * board event, or by hand. They run as plain child processes, with no model.
- * The lines they print with a `kanban` key become cards and discussion posts
- * (see scripts.ts), and every run keeps its output for the scripts page.
+ * The lines they print with a `kanban` key become cards, discussion posts,
+ * pool sizes, subtask ticks, hand-backs and card moves (see scripts.ts), and
+ * every run keeps its output for the scripts page.
  */
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
@@ -283,6 +284,42 @@ const make = Effect.gen(function* () {
       }
       if (command.kanban === "pool") {
         notes.push(yield* resizePool(script, command));
+        continue;
+      }
+      if (command.kanban === "subtask" || command.kanban === "handback" || command.kanban === "move") {
+        const card = cards.find((entry) => entry.number === command.card);
+        if (!card) {
+          notes.push(`Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`);
+          continue;
+        }
+        if (command.kanban === "subtask") {
+          const marked = yield* Effect.result(
+            service.markSubtask(card.id, command.subtask, command.state, command.note ?? null, actor, "script"),
+          );
+          notes.push(
+            Result.isSuccess(marked)
+              ? `Marked ${command.subtask} ${command.state} on card #${command.card}.`
+              : `Couldn't mark ${command.subtask} on card #${command.card}: ${marked.failure.detail}`,
+          );
+        } else if (command.kanban === "handback") {
+          const handed = yield* Effect.result(
+            service.handBack(card.id, command.subtask, command.note, actor),
+          );
+          notes.push(
+            Result.isSuccess(handed)
+              ? `Handed ${command.subtask} on card #${command.card} back to the evaluator.`
+              : `Couldn't hand ${command.subtask} on card #${command.card} back: ${handed.failure.detail}`,
+          );
+        } else {
+          const moved = yield* Effect.result(
+            service.moveCard(card.id, command.to, "script", actor, { note: command.note ?? null }),
+          );
+          notes.push(
+            Result.isSuccess(moved)
+              ? `Moved card #${command.card} to ${command.to}.`
+              : `Couldn't move card #${command.card}: ${moved.failure.detail}`,
+          );
+        }
         continue;
       }
       const posted = yield* Effect.result(

@@ -281,7 +281,7 @@ describe("transport shim", () => {
       await expect(transport.sendText({ id: "threaded-id", chatGuid: "x", text: "Reply", replyTo: "parent" })).rejects.toMatchObject({ ambiguous: true });
       clock = 5_000;
       expect(await transport.sendText({ id: "unthreaded-id", retryOf: "threaded-id", chatGuid: "x", text: "Reply" }))
-        .toEqual({ providerId: "threaded", duplicate: true });
+        .toEqual({ providerId: "threaded", duplicate: true, original: true });
     });
 
     test("a definite failure clears the attempt so the next try sends at once", async () => {
@@ -567,4 +567,140 @@ describe("ingress", () => {
     expect(await handleInbound(d, inbound({ from: "+19362300565" }))).toBe(false);
     expect(accepted).toHaveLength(0);
   });
+});
+
+test("outboundStatuses maps Sendblue's status by handle", async () => {
+  const line = fakeLine({
+    outbound: async () => [
+      { handle: "h1", chat: chatKey.dm(owner), text: "x", sentAt: 1, status: "ERROR" } as LineOutbound,
+      { handle: "", chat: chatKey.dm(owner), text: "y", sentAt: 2, status: "SENT" } as LineOutbound,
+    ],
+  });
+  const transport = sbTransport(line, chatKey.dm(owner), store(), () => 200);
+  expect([...(await transport.outboundStatuses(0))]).toEqual([["h1", "ERROR"]]);
+});
+
+test("a threaded reply whose response was lost but landed is resent unthreaded when Sendblue later fails it", async () => {
+  let clock = Date.parse("2026-10-29T12:00:00Z");
+  setSystemTime(clock);
+  const copies: { handle: string; replyTo?: string; text: string; sentAt: number; status: string }[] = [];
+  const line = fakeLine({
+    sendText: async (_chat, text, options) => {
+      const handle = `out-${copies.length + 1}`;
+      copies.push({ handle, replyTo: options?.replyTo, text, sentAt: clock + 1_000, status: "SENT" });
+      if (copies.length === 1) throw new LineError("timeout", "timeout", true, true);
+      return { handle };
+    },
+    outbound: async () => copies.map(copy => ({ handle: copy.handle, chat: chatKey.dm(owner), text: copy.text, sentAt: copy.sentAt, status: copy.status }) as LineOutbound),
+  });
+  const s = store();
+  const transport = sbTransport(line, chatKey.dm(owner), s, () => Date.now());
+  const delivery = new Delivery(s, transport, {
+    projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true,
+    sleep: async () => {}, statuses: since => transport.outboundStatuses(since),
+  });
+  s.enqueue({ id: "reply", kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  setSystemTime(clock += 5_000);
+  await delivery.tick();
+  expect(copies).toHaveLength(1);
+  expect(s.getOperation("reply")!.state).toBe("sent");
+  copies[0]!.status = "ERROR";
+  setSystemTime(clock += 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(copies).toHaveLength(2);
+  expect(copies[0]!.replyTo).toBe("inbound-1");
+  expect(copies[1]).toMatchObject({ replyTo: undefined, text: "Use 70% alcohol", status: "SENT" });
+  expect(s.getOperation("reply")!.state).toBe("sent");
+  setSystemTime(clock += 10 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(copies).toHaveLength(2);
+  setSystemTime();
+});
+
+test("review: a recovered unthreaded fallback must not get a second unthreaded copy", async () => {
+  const start = Date.parse("2026-10-29T12:00:00Z");
+  setSystemTime(start);
+  try {
+    let posts = 0;
+    let checks = 0;
+    const copies: { handle: string; replyTo?: string; text: string; sentAt: number; status: string }[] = [];
+    const line = fakeLine({
+      sendText: async (_chat, text, options) => {
+        posts++;
+        if (posts === 1) throw new LineError("refused", "http_400", false, false);
+        const handle = `copy-${copies.length + 1}`;
+        copies.push({ handle, replyTo: options?.replyTo, text, sentAt: Date.now() + 1_000, status: "SENT" });
+        if (posts === 2) throw new LineError("timeout", "timeout", true, true);
+        return { handle };
+      },
+      outbound: async () => copies.map(copy => ({ ...copy, chat: chatKey.dm(owner) }) as LineOutbound),
+    });
+    const s = store();
+    const transport = sbTransport(line, chatKey.dm(owner), s);
+    const delivery = new Delivery(s, transport, {
+      projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+      statuses: since => { checks++; return transport.outboundStatuses(since); },
+    });
+    s.enqueue({ id: "reply", kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+    await delivery.tick();
+    setSystemTime(start + 5_000);
+    await delivery.tick();
+    setSystemTime(start + 35_000);
+    await delivery.tick();
+    expect(copies).toHaveLength(1);
+    expect(copies[0]!.replyTo).toBeUndefined();
+    expect(s.getOperation("reply")!.state).toBe("sent");
+    copies[0]!.status = "ERROR";
+    setSystemTime(start + 5 * 60_000);
+    await delivery.tick();
+    await delivery.tick();
+    expect(copies).toHaveLength(1);
+    expect(checks).toBe(0);
+  } finally { setSystemTime(); }
+});
+
+test("review: a recovered late unthreaded copy must not loop back to pending when it fails", async () => {
+  const start = Date.parse("2026-10-29T12:00:00Z");
+  setSystemTime(start);
+  try {
+    const copies: { handle: string; replyTo?: string; text: string; sentAt: number; status: string }[] = [];
+    const events: string[] = [];
+    const line = fakeLine({
+      sendText: async (_chat, text, options) => {
+        const handle = `copy-${copies.length + 1}`;
+        copies.push({ handle, replyTo: options?.replyTo, text, sentAt: Date.now() + 1_000, status: "SENT" });
+        if (copies.length === 2) throw new LineError("timeout", "timeout", true, true);
+        return { handle };
+      },
+      outbound: async () => copies.map(copy => ({ ...copy, chat: chatKey.dm(owner) }) as LineOutbound),
+    });
+    const s = store();
+    const transport = sbTransport(line, chatKey.dm(owner), s);
+    const delivery = new Delivery(s, transport, {
+      projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+      statuses: since => transport.outboundStatuses(since), log: event => events.push(event),
+    });
+    s.enqueue({ id: "reply", kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+    await delivery.tick();
+    copies[0]!.status = "ERROR";
+    setSystemTime(start + 5 * 60_000);
+    await delivery.tick();
+    await delivery.tick();
+    setSystemTime(start + 5 * 60_000 + 30_000);
+    await delivery.tick();
+    expect(copies).toHaveLength(2);
+    expect(copies[1]!.replyTo).toBeUndefined();
+    expect(s.getOperation("reply")!.state).toBe("sent");
+    copies[1]!.status = "ERROR";
+    for (const minutes of [6, 7]) {
+      setSystemTime(start + minutes * 60_000);
+      await delivery.tick();
+      await delivery.tick();
+    }
+    expect(copies).toHaveLength(2);
+    expect(events.filter(event => event === "outbound-async-unthreaded")).toHaveLength(1);
+  } finally { setSystemTime(); }
 });

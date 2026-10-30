@@ -109,6 +109,7 @@ it.layer(TestLayer)("kanban store", (it) => {
         fromStage: null,
         toStage: null,
         body: "hello",
+        head: null,
       });
       assert.isAbove(event.id, 0);
       const events = yield* store.cardEvents(KanbanCardId.make("card-1"));

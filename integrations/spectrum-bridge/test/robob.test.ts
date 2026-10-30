@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,13 +7,17 @@ import { backendKind } from "../src/backend.ts";
 import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
-import { Router } from "../src/router.ts";
+import { opencodeRunEvidence } from "../src/opencode-steps.ts";
+import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
+
+const inbounds = (store: Store) => store.db.query<{ id: string; state: string }, []>("SELECT id, state FROM inbound ORDER BY rowid").all();
+const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
 
 type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string;
   worktreePath: string | null; parentThreadId: string | null; nativeSessionId: string | null;
-  runs: Array<{ runId: string; ordinal: number; status: string }>;
+  runs: Array<{ runId: string; ordinal: number; status: string; requestedAt?: string }>;
   messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
 };
 type Call = { method: string; path: string; body?: any; auth: string | null };
@@ -98,7 +103,7 @@ function fakeControl() {
         }
         if (!thread.messages.some(message => message.messageId === messageId)) {
           const runId = `run:thread:${thread.threadId}:ordinal:${thread.runs.length + 1}`;
-          thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running" });
+          thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running", requestedAt: now() });
           // Robob records a relay as the owner's only when it verified the inbound.
           thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false,
             createdBy: body.inboundId ? "user" : "system", createdAt: now(), updatedAt: now() });
@@ -472,6 +477,309 @@ test("assistant steps carry their OpenCode message id, so blocks of one message 
   expect(marked.map(record => record.type === "assistant" && [record.answer, record.nativeMessage])).toEqual([
     [true, "msg_quiet"], [true, "msg_quiet"], [undefined, undefined],
   ]);
+});
+
+test("a failed run that ran a tool reports tool evidence through messages(), so the router never retries it", async () => {
+  let tick = 0;
+  const now = () => new Date(Date.UTC(2026, 9, 29) + tick++ * 1000).toISOString();
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"b".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "check the board", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // The run made a tool call (step finish `tool-calls`), then a second step errored.
+  const toolStep = `message:provider:opencode:native-item:${encodeURIComponent("msg_tool:text:0")}`;
+  const errorStep = `message:provider:opencode:native-item:${encodeURIComponent("msg_err:text:0")}`;
+  control.threads.get(id)!.messages.push(
+    { messageId: toolStep, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "Checking.", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() },
+    { messageId: errorStep, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() },
+  );
+  control.finishes.set(toolStep, "tool-calls");
+  control.finishes.set(errorStep, "error");
+  control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  const records = await backend.messages(id, directory);
+  const replies = records.filter(record => record.type === "assistant");
+  expect(replies.map(record => record.type === "assistant" && record.toolEvidence)).toEqual(["ran", "unknown"]);
+  expect(turnRanTools(records)).toBe(true);
+});
+
+test("a failed run whose steps all stopped with no tool is classified tool-free, so it may be retried", async () => {
+  const now = () => new Date().toISOString();
+  const control = fakeControl();
+  // Tool-free needs native proof (run rows), not just a `stop` finish on a text step.
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: ids => new Map(ids.map(id => [id, "stop"] as const)), runEvidence: () => "none" });
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"c".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  const step = `message:provider:opencode:native-item:${encodeURIComponent("msg_stop:text:0")}`;
+  control.threads.get(id)!.messages.push({ messageId: step, runId: control.threads.get(id)!.runs.at(-1)!.runId, role: "assistant", text: "", streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() });
+  control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  control.threads.get(id)!.nativeSessionId = "ses_native_stop";
+  const records = await backend.messages(id, directory);
+  expect(turnRanTools(records)).toBe(false);
+});
+
+test("a tool-only run with no text still counts as having run a tool, so an interrupted turn is never retried", async () => {
+  const control = fakeControl();
+  const sawDb: string[][] = [];
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(),
+    runEvidence: (session, since) => { sawDb.push([session, String(since)]); return "ran"; } });
+  const { id, directory } = await backend.createChat();
+  const prompt = `msg_${"d".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "run the check", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // The run called a tool and was interrupted: Robob has no text record for it at all.
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_tool";
+  thread.runs.at(-1)!.status = "interrupted";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("ran");
+  expect(sawDb[0]![0]).toBe("ses_native_tool");
+});
+
+test("a first-call provider error with no native evidence is unproven, so it is reported once and never retried", async () => {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: () => "unknown" });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"e".repeat(64)}`, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  // Robob's record of a 400 on the very first call: the run settled failed, no text, lastError set.
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_400";
+  thread.runs.at(-1)!.status = "failed";
+  thread.lastError = "model returned 400";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("unknown");
+});
+
+test("a first-call provider error with positive no-tool evidence is classified tool-free, so it may be retried", async () => {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: () => "none" });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"f".repeat(64)}`, "hello", "", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  const thread = control.threads.get(id)!;
+  thread.nativeSessionId = "ses_native_none";
+  thread.runs.at(-1)!.status = "failed";
+  thread.lastError = "model returned 400";
+  expect(await backend.runToolEvidence(id, directory, Date.parse("2026-10-29T00:00:00Z"))).toBe("none");
+});
+
+/** A real Robob backend, the real OpenCode run-row reader on `path`, and a router over them. */
+function nativeRouter(path: string) {
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: opencodeRunEvidence(path) });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  };
+  const router = new Router(store, backend, transport, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+    droppedBatchMs: 0,
+  });
+  return { control, store, router };
+}
+
+/** An OpenCode DB at a temp path with one session's rows, written before the test starts. */
+function nativeDb(session: string, rows: [string, unknown][]) {
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-native-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  // Rows are written after the run starts (the run's requestedAt is `base`), as native execution would write them.
+  const base = Date.now();
+  rows.forEach(([id, data], index) => db.query("INSERT INTO session_message VALUES (?, ?, 'assistant', ?, ?, ?)").run(id, session, index, base + 5_000 + index, JSON.stringify(data)));
+  // The run has settled: OpenCode wrote its idle marker after the steps.
+  db.query("INSERT INTO session_message VALUES (?, ?, 'idle', ?, ?, ?)").run(`idle_${session}`, session, rows.length, base + 10_000, JSON.stringify({ outcome: "failed" }));
+  db.close();
+  return { path, base };
+}
+
+/** Drives one wake to a settled failed run on `session`, then returns the router's state after the given offsets. */
+async function failedWake(path: string, session: string, base: number, offsetsMs: number[]) {
+  const { control, store, router } = nativeRouter(path);
+  setSystemTime(base);
+  const wake = `wake:${session.slice(-8).padEnd(64, "0")}`;
+  store.acceptInbound(wake, { id: wake, text: wakeBody(), attachments: [], isAudioMessage: false, source: "typed", receivedAt: base } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.nativeSessionId = session;
+  thread.lastError = "model returned 400";
+  thread.runs.at(-1)!.status = "failed";
+  await router.tick();
+  const states: string[] = [];
+  states.push(inbounds(store).find(row => row.id === wake)?.state ?? "missing");
+  for (const offset of offsetsMs) {
+    setSystemTime(base + offset);
+    await router.tick();
+    states.push(inbounds(store).find(row => row.id === wake)?.state ?? "missing");
+  }
+  return { control, store, router, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
+}
+
+test("an errored step classified between OpenCode's commits, before the native idle marker, is never retried, even when execution later completes a tool", async () => {
+  // Between the two native commits: the step is `error` with no retry yet and the run has no idle marker.
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-between-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  const base = Date.now();
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  db.query("INSERT INTO session_message VALUES ('msg_between', 'ses_between', 'assistant', 0, ?, ?)").run(base + 5_000, JSON.stringify({ finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "provider.internal" } }));
+  db.close();
+  const first = await failedWake(path, "ses_between", base, []);
+  // No idle marker yet: the run is between OpenCode's commits, so it is unsettled and the wake is not retried.
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // Execution carries on: retry.scheduled lands, then a tool completes, then the run settles idle.
+  const later = new Database(path);
+  later.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: base + 120_000 }, error: { type: "provider.internal" } }), "msg_between");
+  later.query("INSERT INTO session_message VALUES ('msg_tool', 'ses_between', 'assistant', 1, ?, ?)").run(base + 60_000, JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }));
+  later.query("INSERT INTO session_message VALUES ('idle_ses_between', 'ses_between', 'idle', 2, ?, ?)").run(base + 90_000, JSON.stringify({ outcome: "succeeded" }));
+  later.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
+
+test("an error step with a pending native retry is never retried, even when that execution later completes a tool", async () => {
+  // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
+  const { path, base } = nativeDb("ses_retry_run", [["msg_retry", { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: Date.now() + 120_000 }, error: { type: "provider.internal" } }]]);
+  const first = await failedWake(path, "ses_retry_run", base, []);
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // During the backoff the same execution carries on and completes a tool. A terminal step does not prove it stopped.
+  const db = new Database(path);
+  db.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }), "msg_retry");
+  db.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
+
+test("an unfinished native step is never retried, even when that run later completes a tool", async () => {
+  // The first call's row has no finish yet: execution may still be running, so it is not provably tool-free.
+  const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);
+  const first = await failedWake(path, "ses_cont_run", base, []);
+  // Robob failed the run, but the native row is unfinished: the wake is reported and not retried.
+  expect(first.states).toEqual(["failed"]);
+  expect(first.sends()).toBe(1);
+  // The same native row keeps running and finishes with a tool call. The router must still not send again.
+  const db = new Database(path);
+  db.query("UPDATE session_message SET data = ? WHERE id = ?").run(JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }), "msg_open");
+  db.close();
+  setSystemTime(base + 120_000);
+  await first.router.tick();
+  setSystemTime(base + 240_000);
+  await first.router.tick();
+  expect(first.sends()).toBe(1);
+});
+
+test("a first-call error that emitted text but ran no tool is retried, end to end", async () => {
+  const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
+  const run = await failedWake(path, "ses_text_400", base, [120_000]);
+  // Retried: the failure left it pending, and the +2 min tick sent it again (in flight, so `processing`).
+  expect(run.states).toEqual(["pending", "processing"]);
+  expect(run.sends()).toBe(2);
+});
+
+test("a first-call error that emitted reasoning but ran no tool is retried, end to end", async () => {
+  const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
+  const run = await failedWake(path, "ses_reason_400", base, [120_000]);
+  expect(run.states).toEqual(["pending", "processing"]);
+  expect(run.sends()).toBe(2);
+});
+
+test("a run whose tool call sits past a truncated scan is never retried, through the real router and OpenCode's run rows", async () => {
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-truncated-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  // 200 stop steps, then the run's tool step: the tool row is past the old 200-row cap.
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  const insert = db.query("INSERT INTO session_message VALUES (?, 'ses_native_long', 'assistant', ?, ?, ?)");
+  const base = Date.now();
+  for (let i = 0; i < 200; i++) insert.run(`msg_s${i}`, i, base + i, JSON.stringify({ finish: "stop", content: [{ type: "text", text: "ok" }] }));
+  insert.run("msg_tool", 200, base + 200, JSON.stringify({ finish: "tool-calls", content: [{ type: "tool", id: "t", name: "bash", state: { status: "completed" } }] }));
+  db.close();
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: opencodeRunEvidence(path) });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  };
+  const router = new Router(store, backend, transport, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+    droppedBatchMs: 0,
+  });
+  const start = base;
+  setSystemTime(start);
+  const wake = `wake:${"n".repeat(64)}`;
+  store.acceptInbound(wake, { id: wake, text: wakeBody(), attachments: [], isAudioMessage: false, source: "typed", receivedAt: start } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.nativeSessionId = "ses_native_long";
+  thread.runs.at(-1)!.status = "interrupted";
+  await router.tick();
+  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("failed");
+  setSystemTime(start + 120_000);
+  await router.tick();
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
+});
+
+test("a first-call provider 400 on Robob is retried after 2 minutes, through the real router and OpenCode's run rows", async () => {
+  const dirPath = mkdtempSync(join(tmpdir(), "robob-first-call-"));
+  dirs.push(dirPath);
+  const path = join(dirPath, "opencode.db");
+  // OpenCode's record of the failed first call: finish error, no content, error aborted.
+  const db = new Database(path);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
+  db.query("INSERT INTO session_message VALUES (?, 'ses_native_400', 'assistant', 0, ?, ?)").run("msg_400", Date.now(), JSON.stringify({ finish: "error", content: [], error: { type: "aborted" } }));
+  // The settled run: OpenCode wrote its idle marker after the failed step.
+  db.query("INSERT INTO session_message VALUES ('idle_400', 'ses_native_400', 'idle', 1, ?, ?)").run(Date.now() + 1000, JSON.stringify({ outcome: "failed" }));
+  db.close();
+  const control = fakeControl();
+  const backend = new RobobBackend({ chatRoot: "/chats", url: control.url, token: "test-token", model: async () => undefined,
+    finishes: () => new Map(), runEvidence: opencodeRunEvidence(path) });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  };
+  const router = new Router(store, backend, transport, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+    droppedBatchMs: 0,
+  });
+  const start = Date.parse("2026-10-29T07:00:11Z");
+  setSystemTime(start);
+  const wake = `wake:${"m".repeat(64)}`;
+  store.acceptInbound(wake, { id: wake, text: wakeBody(), attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  // The first call was answered 400: the run settles failed, with no text and lastError set.
+  const route = store.get<{ id: string }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.nativeSessionId = "ses_native_400";
+  thread.lastError = "model returned 400";
+  thread.runs.at(-1)!.status = "failed";
+  await router.tick();
+  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("pending");
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
+  setSystemTime(start + 120_000);
+  await router.tick();
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
 });
 
 test("a background run's answer before two steered texts reaches the chat along with the last one", async () => {

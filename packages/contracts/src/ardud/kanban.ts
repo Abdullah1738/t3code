@@ -118,8 +118,8 @@ export const KanbanCardModel = Schema.Struct({
 });
 export type KanbanCardModel = typeof KanbanCardModel.Type;
 
-/** Who does a subtask: the card's worker, its reviewer, or an evaluator. */
-export const KanbanSubtaskOwner = Schema.Literals(["work", "review", "evaluator"]);
+/** Who does a subtask: the card's worker, its reviewer, an evaluator, or a board script. */
+export const KanbanSubtaskOwner = Schema.Literals(["work", "review", "evaluator", "script"]);
 export type KanbanSubtaskOwner = typeof KanbanSubtaskOwner.Type;
 
 /**
@@ -132,6 +132,8 @@ export const KanbanSubtask = Schema.Struct({
   step: PositiveInt,
   text: Schema.String,
   owner: KanbanSubtaskOwner,
+  /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
+  script: Schema.optional(Schema.String),
   state: Schema.Literals(["open", "done", "skipped"]),
   /** What was done, or why it was skipped. */
   note: Schema.NullOr(Schema.String),
@@ -248,20 +250,36 @@ export const kanbanStepSubtasks = (
   );
 };
 
-/** True when the step a card is on is only the evaluator's: no worker or reviewer has anything in it. */
+/**
+ * True when the step a card is on needs the evaluator: it has an evaluator
+ * subtask and nothing else but evaluator and script subtasks. A mixed step
+ * still wakes the evaluator, for its own subtasks only.
+ */
 export const kanbanEvaluatorStep = (card: Pick<KanbanCard, "subtasks">): boolean => {
   const open = kanbanStepSubtasks(card);
-  return open.length > 0 && open.every((subtask) => subtask.owner === "evaluator");
+  return (
+    open.some((subtask) => subtask.owner === "evaluator") &&
+    open.every((subtask) => subtask.owner === "evaluator" || subtask.owner === "script")
+  );
+};
+
+/** True when the step a card is on is only board scripts' subtasks. */
+export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean => {
+  const open = kanbanStepSubtasks(card);
+  return open.length > 0 && open.every((subtask) => subtask.owner === "script");
 };
 
 /**
  * A todo card the dispatcher leaves alone because its step is the
- * evaluator's. One with a wake note still goes back to its worker: review
- * findings and the owner's words have to reach it.
+ * evaluator's or a board script's. One with a wake note still goes back to
+ * its worker: review findings and the owner's words have to reach it.
  */
 export const kanbanWaitsOnEvaluator = (
   card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks">,
-): boolean => card.stage === "todo" && card.wakeNote === null && kanbanEvaluatorStep(card);
+): boolean =>
+  card.stage === "todo" &&
+  card.wakeNote === null &&
+  (kanbanEvaluatorStep(card) || kanbanScriptStep(card));
 
 /** Stages past the work: a card here no longer blocks anything or waits on anything. */
 export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -274,10 +292,27 @@ const isOpenCard = (card: KanbanCard) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
+ * A completed card whose evaluator merge subtask is still open: review has
+ * passed, but its work isn't on ardud/main yet. Completed means review-passed;
+ * the merge is a later evaluator subtask.
+ */
+export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">): boolean =>
+  card.stage === "completed" &&
+  card.subtasks.some(
+    (subtask) =>
+      subtask.state === "open" &&
+      (subtask.owner === "evaluator" || subtask.owner === "script") &&
+      // A merge action starts a clause ("merge router.ts into ...", "...; merge; deploy ...");
+      // a check that only mentions a merge ("blocker's merge subtask") doesn't.
+      /(?:^|[;:,.]\s*|\b(?:and|then)\s+)merge\b/i.test(subtask.text),
+  );
+
+/**
  * The first unfinished card holding `card` up, or undefined. A blocker on the
  * same work thread is no block, since that thread does both in order, unless
  * it can't go on itself: stalled, in the backlog, waiting on the owner or the
- * evaluator, or held up in turn.
+ * evaluator, or held up in turn. A completed blocker still holds while its
+ * merge subtask is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -288,8 +323,12 @@ export function kanbanHeldUpBy(
   const heldUp = (waiter: KanbanCard, path: Set<string>): KanbanCard | undefined => {
     for (const id of waiter.blockedBy) {
       const blocker = byId.get(id);
-      if (blocker === undefined || KANBAN_DONE_STAGES.has(blocker.stage)) continue;
+      if (blocker === undefined) continue;
+      const done = KANBAN_DONE_STAGES.has(blocker.stage);
+      if (done && !kanbanAwaitsMerge(blocker)) continue;
       if (thread === null || blocker.workThreadId !== thread) return blocker;
+      // Same thread: it carries the blocker's commits on its own branch, so a finished blocker isn't held.
+      if (done) continue;
       if (
         blocker.stalled !== null ||
         blocker.priority === KANBAN_BACKLOG ||
@@ -395,6 +434,8 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Review events: the commit the reviewer reviewed, when it said. Null otherwise. */
+  head: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanCardEvent = typeof KanbanCardEvent.Type;
 
@@ -763,7 +804,8 @@ export const KanbanBoardListEntry = Schema.Struct({
 export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 
 export const KanbanChange = Schema.Union([
-  Schema.TaggedStruct("card", { card: KanbanCard }),
+  // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
+  Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),

@@ -82,8 +82,14 @@ const SubtasksInput = describe(
       ),
       text: TrimmedNonEmptyString,
       owner: describe(
-        Schema.Literals(["work", "review", "evaluator"]),
-        "Who does it: the worker, the reviewer (ticked when the review passes) or an evaluator.",
+        Schema.Literals(["work", "review", "evaluator", "script"]),
+        "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
+      ),
+      script: Schema.optional(
+        describe(
+          TrimmedNonEmptyString,
+          "For a script's subtask: the name of the board script that does it. Left out, any script on the board can.",
+        ),
       ),
     }),
   ),
@@ -183,7 +189,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns.",
+  "Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
   {
     card: Schema.optional(CardRef),
     to: KanbanStage,
@@ -245,6 +251,12 @@ const CardReviewResult = tool(
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),
+    head: Schema.optional(
+      Schema.String.annotate({
+        description:
+          "The commit you reviewed: the PR's head sha, or `git rev-parse HEAD` on the card's branch. Stored on the review event so scripts land only what was reviewed.",
+      }),
+    ),
   },
   { card: Record },
   { readonly: false },

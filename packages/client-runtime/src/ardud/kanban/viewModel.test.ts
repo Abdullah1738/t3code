@@ -29,6 +29,7 @@ import {
   ownerChoiceAnswer,
   poolViews,
   stageBoard,
+  subtaskOwnerLabel,
   subtaskSteps,
   visibleCards,
 } from "./viewModel.ts";
@@ -176,6 +177,34 @@ describe("stageBoard", () => {
     expect(view.total).toBe(5);
   });
 
+  it("labels a card waiting on a completed blocker's merge", () => {
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, {
+          stage: "completed",
+          subtasks: [
+            {
+              id: "m1",
+              step: 4,
+              text: "Rebase on latest ardud/main, merge into ardud/main, push origin main",
+              owner: "evaluator",
+              state: "open",
+              note: null,
+              doneBy: null,
+              doneAt: null,
+            },
+          ],
+        }),
+        card(2, { blockedBy: ["card-1" as never] }),
+      ]),
+    );
+    const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!;
+    expect(todo.cards[0]!.flag).toEqual({
+      kind: "blocked",
+      label: "Waits for #1 to be merged",
+    });
+  });
+
   it("a card whose thread waits on its own question shows needsInput, not running", () => {
     const state = boardStateFromSnapshot({
       ...snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]),
@@ -304,6 +333,30 @@ describe("stageBoard", () => {
       [1, "past"],
       [2, "now"],
     ]);
+  });
+
+  it("flags a todo card on a script-only step as waiting on a script, and labels script subtasks", () => {
+    const scripted = card(3, {
+      subtasks: [
+        {
+          id: "s1",
+          step: 1,
+          text: "Merge the PR",
+          owner: "script",
+          script: "land",
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    });
+    const state = boardStateFromSnapshot(snapshot([scripted]));
+    const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!.cards;
+    expect(todo[0]!.flag).toEqual({ kind: "blocked", label: "Waits on a script" });
+    expect(subtaskOwnerLabel({ owner: "script", script: "land" })).toBe("Script: land");
+    expect(subtaskOwnerLabel({ owner: "script" })).toBe("Script");
+    expect(subtaskOwnerLabel({ owner: "evaluator" })).toBe("Evaluator");
   });
 
   it("orders a goal's stages and the goal grouping the same way", () => {

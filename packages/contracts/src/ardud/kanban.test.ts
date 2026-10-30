@@ -5,10 +5,17 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanCardEvent,
+  kanbanAwaitsMerge,
   kanbanBlocking,
   kanbanBoardIcon,
+  kanbanEvaluatorStep,
+  kanbanHeldUpBy,
+  kanbanScriptStep,
+  kanbanWaitsOnEvaluator,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
+  KanbanSubtask,
   KanbanThreadLink,
   type KanbanCard,
 } from "./kanban.ts";
@@ -58,6 +65,22 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
   };
 }
 
+describe("KanbanCardEvent", () => {
+  it("decodes an event stored before head existed as head null", () => {
+    const event = Schema.decodeUnknownSync(KanbanCardEvent)({
+      id: 1,
+      cardId: "card-1",
+      at: "2026-10-29T10:00:00.000Z",
+      actor: { _tag: "owner" },
+      kind: "review",
+      fromStage: "in_review",
+      toStage: "completed",
+      body: "clear",
+    });
+    expect(event.head).toBeNull();
+  });
+});
+
 describe("kanbanBlocking", () => {
   it("counts a diamond of waiters once each and takes the most urgent one's priority", () => {
     const blocking = kanbanBlocking([
@@ -83,6 +106,96 @@ describe("kanbanBlocking", () => {
     ]);
     expect(blocking.get("a")).toEqual({ holds: 0, urgency: 3 });
     expect(blocking.get("c")).toEqual({ holds: 1, urgency: KANBAN_BACKLOG });
+  });
+});
+
+describe("kanbanHeldUpBy", () => {
+  const evaluatorSubtask = (text: string, state: "open" | "done" = "open") => ({
+    id: "s1",
+    step: 4,
+    text,
+    owner: "evaluator" as const,
+    state,
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  });
+  const mergeText =
+    "Rebase on latest ardud/main, rerun the box checks if it moved, merge into ardud/main, push origin main";
+  const waiter = card("w", { blockedBy: ["b"], workThreadId: "thread-w" as never });
+  const byId = (blocker: KanbanCard) => new Map([[blocker.id, blocker]]);
+
+  it("holds a waiter on a completed blocker whose merge subtask is open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it("releases the waiter once the blocker's merge subtask is done", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText, "done")],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("releases a waiter once the merge is done, even with a post-install check still open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [
+        evaluatorSubtask(mergeText, "done"),
+        evaluatorSubtask(
+          "After the next Robob install: check a dependent waits until its blocker's merge subtask is done.",
+        ),
+      ],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("holds a waiter on the other merge action forms on the board", () => {
+    for (const text of [
+      "Bring any prefs.md rule text to Abdullah first; merge; deploy robob-watch",
+      "merge router.ts into ardud/main",
+    ]) {
+      const blocker = card("b", {
+        stage: "completed",
+        workThreadId: "thread-b" as never,
+        subtasks: [evaluatorSubtask(text)],
+      });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+    }
+  });
+
+  it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask("Ask Abdullah to deploy spectrum-bridge")],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("doesn't hold a waiter on a verified blocker", () => {
+    const blocker = card("b", {
+      stage: "verified",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it("doesn't hold a waiter on the same thread as a completed blocker awaiting merge", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-w" as never,
+      subtasks: [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 });
 
@@ -150,5 +263,87 @@ describe("KanbanThreadLink", () => {
       endedAt: null,
     });
     expect(decoded.paused).toBeNull();
+  });
+});
+
+const scriptSubtask = (
+  id: string,
+  step: number,
+  text: string,
+  owner: "script" | "evaluator" | "work",
+  state: "open" | "done" = "open",
+) => ({
+  id,
+  step,
+  text,
+  owner,
+  ...(owner === "script" ? { script: "land" } : {}),
+  state,
+  note: null,
+  doneBy: null,
+  doneAt: null,
+});
+
+describe("board script steps", () => {
+  it("a script-only step is the script's, and a mixed one still wakes the evaluator", () => {
+    const scriptOnly = { subtasks: [scriptSubtask("s1", 1, "Merge the PR", "script")] };
+    expect(kanbanScriptStep(scriptOnly)).toBe(true);
+    expect(kanbanEvaluatorStep(scriptOnly)).toBe(false);
+
+    const mixed = {
+      subtasks: [
+        scriptSubtask("s1", 1, "Merge the PR", "script"),
+        scriptSubtask("s2", 1, "Tell the reporter", "evaluator"),
+      ],
+    };
+    expect(kanbanScriptStep(mixed)).toBe(false);
+    expect(kanbanEvaluatorStep(mixed)).toBe(true);
+  });
+
+  it("an evaluator-only step, or evaluator plus script, wakes the evaluator", () => {
+    expect(
+      kanbanEvaluatorStep({ subtasks: [scriptSubtask("s1", 1, "Tell", "evaluator")] }),
+    ).toBe(true);
+    expect(
+      kanbanEvaluatorStep({
+        subtasks: [
+          scriptSubtask("s1", 1, "Merge", "evaluator"),
+          scriptSubtask("s2", 1, "Deploy", "script"),
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("a todo card on a script-only step is left to its script", () => {
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: null,
+        subtasks: [scriptSubtask("s1", 1, "Merge the PR", "script")],
+      }),
+    ).toBe(true);
+  });
+
+  it("a completed card with an open script merge subtask awaits its merge", () => {
+    expect(
+      kanbanAwaitsMerge({
+        stage: "completed",
+        subtasks: [scriptSubtask("s3", 3, "Merge the PR", "script")],
+      }),
+    ).toBe(true);
+  });
+
+  it("a subtask saved without a script name still decodes", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanSubtask)({
+      id: "s1",
+      step: 1,
+      text: "Write the PR",
+      owner: "work",
+      state: "open",
+      note: null,
+      doneBy: null,
+      doneAt: null,
+    });
+    expect(decoded.script).toBeUndefined();
   });
 });

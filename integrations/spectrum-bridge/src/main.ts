@@ -14,6 +14,7 @@ import { backfillOrigins, OriginBackfill } from "./origin-backfill.ts";
 import { canonicalOwnerChat, Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { Router } from "./router.ts";
+import { checkReply, readReplyRules } from "./replyCheck.ts";
 import { serveSendblue } from "./sb-main.ts";
 import { sweepSecrets } from "./secrets.ts";
 import { cloudflaredTunnel, Shares } from "./share.ts";
@@ -184,6 +185,8 @@ async function main(): Promise<void> {
   void shares.restore().catch(() => log("share-sweep-failed"));
   api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid, shares,
     ...(apps ? { secrets: { stateRoot, publishApps } } : {}),
+    replyCheck: text => checkReply({ slug: "owner", kind: "owner" }, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
+    log,
     enabled: ready, health: () => ({
       status: Date.now() - health.photonLastOk < 60_000 && Date.now() - health.backendLastOk < 60_000 ? "healthy" : "degraded",
       photonConnected: Date.now() - health.photonLastOk < 60_000,

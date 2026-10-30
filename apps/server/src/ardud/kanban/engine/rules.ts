@@ -5,6 +5,7 @@ import {
   kanbanCardModels,
   kanbanHeldUpBy,
   kanbanPickOrder,
+  kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
@@ -15,8 +16,11 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 
-/** Who is asking for a move. `cardThread` is the card's own work or review thread. */
-export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "system";
+/**
+ * Who is asking for a move. `cardThread` is the card's own work or review thread.
+ * `script` is a board script, from its output.
+ */
+export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "system" | "script";
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
@@ -52,6 +56,15 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       // Review results and PR merges.
       if (from === "in_review" && (to === "todo" || to === "completed")) return ok;
       return no(`system cannot move ${from} -> ${to}`);
+    case "script":
+      if (card.settledAt !== null) return no("card is settled");
+      if (KANBAN_THREAD_STAGES.includes(from)) {
+        return no(`a script doesn't move a card a thread has (${from})`);
+      }
+      if (!(to === "completed" || to === "deployed" || to === "verified")) {
+        return no(`a script moves a card only to completed, deployed or verified, not ${to}`);
+      }
+      return ok;
     case "evaluator":
     case "owner":
       if (card.settledAt !== null) return no("card is settled");
@@ -113,6 +126,16 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+/** Why a card can't be completed or deployed yet, or null. */
+export function reviewGate(card: KanbanCard, chainLength: number): string | null {
+  const open = card.subtasks.filter((s) => s.owner === "review" && s.state === "open");
+  if (open.length > 0)
+    return `card #${card.number} still has review subtask ${open.map((s) => s.id).join(", ")} open: it closes when its review passes`;
+  if (!reviewFinished(card, chainLength))
+    return `card #${card.number} hasn't passed its review: move it to needs_review`;
+  return null;
+}
+
 /**
  * Every PR the work thread linked is merged or closed. Only those get a state
  * (syncPrs); a PR link without one is context and holds nothing. A card with
@@ -153,13 +176,13 @@ export const WORKER_QUIET_MS = 30 * 60 * 1000;
 /** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
 export function workerQuietDue(
   card: KanbanCard,
-  view: { readonly state: string; readonly updatedAt: string },
+  view: { readonly state: string; readonly quietSince: string },
   nowMs: number,
 ): boolean {
   if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
   if (view.state !== "idle" && view.state !== "needs-input") return false;
   const since = Math.max(
-    Date.parse(view.updatedAt),
+    Date.parse(view.quietSince),
     Date.parse(card.movedAt),
     card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
   );
@@ -395,7 +418,9 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   }
   if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
   if (kanbanWaitsOnEvaluator(card)) {
-    return no(`card #${card.number} waits on an evaluator's subtask first`);
+    return no(
+      `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
+    );
   }
   const runsOn =
     card.workThreadId === null

@@ -18,6 +18,8 @@ type Options = {
   notify?: (severity: "attention" | "info", text: string, key: string) => Promise<boolean>;
   /** Hands an image or card that iMessage keeps refusing to another channel. */
   fallback?: (item: OutboxRecord) => Promise<"sent" | "skip" | "retry">;
+  /** Sendblue's status by handle for this chat's sends updated since sinceMs; lets a late failure be caught. */
+  statuses?: (sinceMs: number) => Promise<Map<string, string>>;
 };
 type Checkpoint = { accepted: boolean; providerId?: string };
 type UploadCheckpoint = { guid: string; sha256: string };
@@ -31,6 +33,9 @@ export const OUTAGE_AFTER = 10 * 60_000;
 const ALERT_COOLDOWN = 60 * 60_000;
 const HOUSEKEEPING_EVERY = 30_000;
 const FALLBACK_RETRY = 5 * 60_000;
+/** Sendblue reports a refused quote-reply about 5 minutes after accepting it. */
+const LANDED_EVERY = 60_000;
+const LANDED_WINDOW = 20 * 60_000;
 type App = NonNullable<OutboxRecord["app"]>;
 
 /** Card text gets the same cleanup as messages; a caption left empty makes the card unsendable. */
@@ -49,6 +54,7 @@ export class Delivery {
   private ticking?: Promise<void>;
   private lastError = "";
   private nextHousekeeping = 0;
+  private nextLandedCheck = 0;
   private readonly fallbackRetry = new Map<string, number>();
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -238,7 +244,63 @@ export class Delivery {
 
   private async run(): Promise<void> {
     await this.send();
+    await this.checkLanded();
     await this.housekeeping();
+  }
+
+  /** Chunks still sent with the thread target: the only ones a late failure can be seen on. */
+  private threadedChunks(id: string): number[] {
+    const indexes: number[] = [];
+    for (let index = 0; this.store.get<Checkpoint>(`chunk:${id}:${index}`); index++) {
+      if (this.store.get<boolean>(`unthreadedChunk:${id}:${index}`) !== true) indexes.push(index);
+    }
+    return indexes;
+  }
+
+  /**
+   * A threaded text Sendblue accepted and then failed (5504, "unable to resolve inline reply thread")
+   * never reached the phone. Send its failed chunks once more without the thread target.
+   */
+  private async checkLanded(): Promise<void> {
+    if (!this.options.statuses || Date.now() < this.nextLandedCheck) return;
+    this.nextLandedCheck = Date.now() + LANDED_EVERY;
+    const rows = this.store.db.query<{ id: string; at: number }, [number]>(
+      "SELECT o.id AS id, CAST(k.value AS INTEGER) AS at FROM kv k JOIN outbox o ON o.id = substr(k.key, 9) "
+      + "WHERE substr(k.key, 1, 8) = 'sent-at:' AND k.value NOT GLOB '*[^0-9]*' AND CAST(k.value AS INTEGER) >= ? AND o.state = 'sent'",
+    ).all(Date.now() - LANDED_WINDOW);
+    const candidates = rows.flatMap(row => {
+      const item = this.store.getOperation(row.id);
+      if (!item || item.replyTo === undefined || item.attachment || item.poll || item.app) return [];
+      const indexes = this.threadedChunks(row.id);
+      return indexes.length ? [{ ...row, indexes }] : [];
+    });
+    if (!candidates.length) return;
+    let statuses: Map<string, string>;
+    try {
+      statuses = await this.options.statuses(Math.min(...candidates.map(row => row.at)) - 60_000);
+    } catch {
+      return; // the next check tries again
+    }
+    for (const { id, indexes } of candidates) {
+      const failed: number[] = [];
+      let status = "";
+      for (const index of indexes) {
+        const providerId = this.store.get<Checkpoint>(`chunk:${id}:${index}`)?.providerId;
+        const now = providerId ? statuses.get(providerId) : undefined;
+        if (now && /^(error|declined|failed)$/i.test(now)) { failed.push(index); status = now; }
+      }
+      if (!failed.length) continue;
+      this.store.db.transaction(() => {
+        if (this.store.getOperation(id)?.state !== "sent") return;
+        this.store.set(`unthreaded:${id}`, true);
+        for (const index of failed) {
+          this.store.db.query("DELETE FROM kv WHERE key = ?").run(`chunk:${id}:${index}`);
+          this.store.set(`lateChunk:${id}:${index}`, true);
+        }
+        this.store.outboxState(id, "pending");
+      }).immediate();
+      this.options.log?.("outbound-async-unthreaded", status.toLowerCase());
+    }
   }
 
   private async send(): Promise<void> {
@@ -419,7 +481,8 @@ export class Delivery {
             // dedupe-blocks the next one, and replays of the same variant stay idempotent.
             const sendChunk = (plain: boolean) => {
               const unthreaded = item.replyTo !== undefined && this.store.get<boolean>(unthreadedKey) === true;
-              const suffix = `${unthreaded ? ":unthreaded" : ""}${plain ? ":plain" : ""}`;
+              const late = this.store.get<boolean>(`lateChunk:${item.id}:${index}`) === true;
+              const suffix = `${unthreaded ? (late ? ":unthreaded:late" : ":unthreaded") : ""}${plain ? ":plain" : ""}`;
               return this.photon.sendText(Object.freeze({
                 ...(unthreaded ? { chatGuid } : input),
                 // retryOf lets a Sendblue retry find a copy an earlier variant may have sent.
@@ -462,6 +525,10 @@ export class Delivery {
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
+          // A recovered threaded original keeps its thread target, so a late failure of it still gets a resend.
+          if (item.replyTo !== undefined && !result.original && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
+            this.store.set(`unthreadedChunk:${item.id}:${index}`, true);
+          }
           if (final && item.poll && !result.providerId) {
             rememberUnmatchedPoll(this.store, {
               operationId: item.id, title: item.poll.title, choices: [...item.poll.options],

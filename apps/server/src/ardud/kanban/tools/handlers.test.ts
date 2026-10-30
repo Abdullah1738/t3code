@@ -82,6 +82,8 @@ const fakeThreads = () => {
           title: "thread",
           state: running.has(threadId) ? "running" : "idle",
           updatedAt: "2026-10-26T08:00:00.000Z",
+          quietSince: "2026-10-26T08:00:00.000Z",
+          runStartedAt: null,
           prs: [],
           archived: false,
         }),

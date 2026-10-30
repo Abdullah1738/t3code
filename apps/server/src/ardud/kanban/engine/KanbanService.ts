@@ -22,6 +22,7 @@ import {
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
   type KanbanCard,
+  type KanbanSubtask,
   type KanbanCardEvent,
   type KanbanCardModel,
   type KanbanChange,
@@ -297,10 +298,23 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * A board script hands its open subtask back to the card's evaluator with
+   * what failed: the subtask becomes the evaluator's and the evaluator is
+   * woken once, with the note.
+   */
+  readonly handBack: (
+    cardId: KanbanCard["id"],
+    subtaskId: string,
+    note: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** `head` is the reviewed commit, stored on the review event. */
   readonly reviewResult: (
     threadId: ThreadId,
     verdict: "clear" | "findings",
     findings: ReadonlyArray<string>,
+    head?: string | null,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly cardThread: (
     cardId: KanbanCard["id"],
@@ -459,6 +473,9 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+// An evaluator turn that has run this long is asked for a one-line status, then again every hour.
+const STATUS_FIRST_MS = 45 * 60_000;
+const STATUS_EVERY_MS = 60 * 60_000;
 // A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
@@ -601,6 +618,10 @@ const make = Effect.gen(function* () {
    * or that outlived HOLD_MAX_MS.
    */
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
+  // Evaluator threads asked for a status: the run it was asked in and when. A new run starts over.
+  const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
+    new Map(),
+  );
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
@@ -868,9 +889,13 @@ const make = Effect.gen(function* () {
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
-  const saveCard = Effect.fn("KanbanService.saveCard")(function* (card: KanbanCard) {
+  // `by` is set when a move saved the card, so a script's own move doesn't re-trigger a card.moved script.
+  const saveCard = Effect.fn("KanbanService.saveCard")(function* (
+    card: KanbanCard,
+    by?: KanbanActor,
+  ) {
     yield* store.putCard(card);
-    yield* publish(card.boardId, { _tag: "card", card });
+    yield* publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by });
   });
 
   const logEvent = Effect.fn("KanbanService.logEvent")(function* (
@@ -881,6 +906,7 @@ const make = Effect.gen(function* () {
       readonly fromStage?: KanbanStage | null;
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
+      readonly head?: string | null;
     } = {},
   ) {
     return yield* store.addCardEvent({
@@ -891,6 +917,7 @@ const make = Effect.gen(function* () {
       fromStage: extra.fromStage ?? null,
       toStage: extra.toStage ?? null,
       body: extra.body ?? null,
+      head: extra.head ?? null,
     });
   });
 
@@ -1006,7 +1033,7 @@ const make = Effect.gen(function* () {
       toStage: to,
       body: options.note ?? null,
     });
-    yield* saveCard(next);
+    yield* saveCard(next, actor);
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator" || !(yield* liveEvaluator(ask.by.threadId))) continue;
       yield* threads
@@ -1623,23 +1650,6 @@ const make = Effect.gen(function* () {
     return !!view && !view.archived;
   });
 
-  /** The newest live board-channel evaluator (no card), if any. */
-  const boardEvaluator = Effect.fn("KanbanService.boardEvaluator")(function* (
-    boardId: KanbanBoard["id"],
-  ) {
-    // Ended links stay sendable: a setup or request evaluator is ended at its
-    // turn's end but its thread still takes messages.
-    const links = yield* store.threadLinks({ boardId, open: false });
-    const boardLevel = links
-      .filter((link) => link.role === "evaluator" && link.cardId === null)
-      .toReversed()
-      .slice(0, 20);
-    for (const link of boardLevel) {
-      if (yield* liveEvaluator(link.threadId)) return link.threadId;
-    }
-    return null;
-  });
-
   /**
    * The discussion's evaluator gets the text: an existing one is steered,
    * otherwise one starts. A `note` owes no reply in the discussion.
@@ -1666,20 +1676,6 @@ const make = Effect.gen(function* () {
         yield* threads.interrupt(
           discussion.evaluatorThreadId,
           `Replaced as evaluator of "${discussion.title}"`,
-        );
-      }
-    }
-    // Board channels share the board's live evaluator; card discussions start their own.
-    if (discussion.cardId === null) {
-      const live = yield* boardEvaluator(discussion.boardId);
-      if (live !== null) {
-        return yield* deliver(
-          withParticipant({ ...discussion, evaluatorThreadId: live }, actorOf(live), "Evaluator", {}),
-          actorOf(live),
-          "Evaluator",
-          live,
-          text,
-          note,
         );
       }
     }
@@ -1754,7 +1750,7 @@ const make = Effect.gen(function* () {
         ((card.stage === "todo" && card.wakeNote === null) ||
           card.stage === "in_review" ||
           (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
-          ? Subtasks.subtaskIds(kanbanStepSubtasks(card))
+          ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
           : null;
       const now = turn(after);
       if (now === null) return;
@@ -1763,8 +1759,16 @@ const make = Effect.gen(function* () {
         // An evaluator's change never starts an evaluator: one is already on the card.
         if (before === null || after.discussionId === null) return;
         // Part of a step its evaluator already heard about got done: nothing new.
-        const told = turn(before) === null ? null : new Set(kanbanStepSubtasks(before).map((subtask) => subtask.id));
-        if (told !== null && kanbanStepSubtasks(after).every((subtask) => told.has(subtask.id))) return;
+        const told =
+          turn(before) === null
+            ? null
+            : new Set(kanbanStepSubtasks(before, "evaluator").map((subtask) => subtask.id));
+        if (
+          told !== null &&
+          kanbanStepSubtasks(after, "evaluator").every((subtask) => told.has(subtask.id))
+        ) {
+          return;
+        }
         const discussion = yield* store.discussion(after.discussionId);
         const own = discussion?.evaluatorThreadId ?? null;
         if (discussion === null || own === null || own === actor.threadId) return;
@@ -1831,7 +1835,17 @@ const make = Effect.gen(function* () {
       const asked = yield* askedBy(card);
       const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
       const back = asked?.fromStage ?? "todo";
-      const stage = back === "working" ? "todo" : back === "in_review" ? "needs_review" : back;
+      // A card asked about mid-review reruns its step; one whose chain already
+      // passed was only waiting (on its PRs or the evaluator) and goes back to
+      // waiting, so the last reviewer isn't woken for a step it cleared.
+      const reviewed =
+        back === "in_review" &&
+        Rules.reviewFinished(
+          card,
+          Rules.chainFor(yield* boardOf(card.boardId), card)?.steps.length ?? 1,
+        );
+      const stage =
+        back === "working" ? "todo" : back === "in_review" && !reviewed ? "needs_review" : back;
       const workThread = card.workThreadId;
       const wake =
         workThread !== null &&
@@ -2659,6 +2673,11 @@ const make = Effect.gen(function* () {
       yield* kick;
       return;
     }
+    // Run updates repeat after a run ends (its checkpoint lands later), so an
+    // end heard while the thread runs again is an earlier turn's, such as the
+    // chain step before the one now running in this thread.
+    const latest = yield* threads.view(threadId);
+    if (latest !== null && latest.state !== "idle") return;
     if (card.nudgedAt === null) {
       yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
       yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
@@ -2787,6 +2806,52 @@ const make = Effect.gen(function* () {
           continue;
         }
         yield* nudgeWorker(threadId, [card]);
+      }
+      // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
+      for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
+        if (link.role !== "evaluator") continue;
+        // A failed read skips this thread and keeps its ask record, so a blip
+        // can't make the next healthy tick ask again inside the hour.
+        const read = yield* Effect.result(threads.find(link.threadId));
+        if (read._tag === "Failure") continue;
+        const view = read.success;
+        if (view?.state !== "running" || view.runStartedAt === null) {
+          yield* Ref.update(statusAsked, (all) => {
+            if (!all.has(link.threadId)) return all;
+            const next = new Map(all);
+            next.delete(link.threadId);
+            return next;
+          });
+          continue;
+        }
+        const run = view.runStartedAt;
+        const started = Date.parse(run);
+        const asked = (yield* Ref.get(statusAsked)).get(link.threadId);
+        const due =
+          asked?.run === run
+            ? now - asked.at >= STATUS_EVERY_MS
+            : now - started >= STATUS_FIRST_MS;
+        if (!due) continue;
+        const minutes = Math.round((now - started) / 60_000);
+        const sent = yield* threads
+          .send({
+            threadId: link.threadId,
+            text: `Board check: this turn has been running for ${minutes} minutes. Post a one-line status where Abdullah reads it (your discussion, with discussion_post): what you're doing and when you expect to finish. Then carry on; don't stop for this.`,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban evaluator status ask failed", {
+                threadId: link.threadId,
+                cause,
+              }).pipe(Effect.as(false)),
+            ),
+          );
+        if (sent) {
+          yield* Ref.update(statusAsked, (all) =>
+            new Map(all).set(link.threadId, { run, at: now }),
+          );
+        }
       }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {
@@ -3159,6 +3224,7 @@ const make = Effect.gen(function* () {
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
     const plan = Subtasks.planSubtasks([], input.subtasks ?? []);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
+    yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
       boardId,
@@ -3522,6 +3588,7 @@ const make = Effect.gen(function* () {
           ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
+        if (plan?.ok) yield* checkScriptNames(card.boardId, plan.subtasks);
         const removeUrls = (patch.removeLinks ?? []).map((url) => url.trim());
         for (const url of removeUrls) {
           if (!card.links.some((link) => link.url === url))
@@ -3636,6 +3703,11 @@ const make = Effect.gen(function* () {
               `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`,
             );
           }
+        }
+        if ((to === "completed" || to === "deployed") && role !== "owner") {
+          const board = yield* boardOf(card.boardId);
+          const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
+          if (blocked !== null) return yield* failWith("denied", blocked);
         }
         if (role === "evaluator" && to === "todo" && kanbanEvaluatorStep(card)) {
           return yield* failWith(
@@ -3828,7 +3900,9 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        const check = Subtasks.checkMark(card, subtaskId, state, role, note);
+        const scriptName =
+          role === "script" ? (yield* scriptFor(card, actor)).name : null;
+        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
         if (!check.ok) return yield* failWith("denied", check.reason);
         const at = yield* nowIso;
         const marked: KanbanCard = {
@@ -3881,14 +3955,116 @@ const make = Effect.gen(function* () {
             body: to === "todo" ? "Next step is the worker's" : "Next step is the review",
           });
         }
-        yield* saveCard(next);
+        // The actor goes with the save: a card a script's subtask moved is a move by that script.
+        yield* saveCard(next, to !== null && card.stage !== to ? actor : undefined);
         yield* evaluatorTurn(card, next, actor);
         yield* kick;
         return next;
       }),
     );
 
-  const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings) =>
+  /** Only a board script does a script's subtask, and only on its own board. */
+  const scriptFor = Effect.fn("KanbanService.scriptFor")(function* (
+    card: KanbanCard,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "script") return yield* failWith("denied", "only a board script does this");
+    const script = yield* store.script(actor.scriptId);
+    if (script === null || script.boardId !== card.boardId) {
+      return yield* failWith("denied", `card #${card.number} isn't on this script's board`);
+    }
+    return script;
+  });
+
+  const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const script = yield* scriptFor(card, actor);
+        const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
+        if (!check.ok) return yield* failWith("denied", check.reason);
+        const at = yield* nowIso;
+        const trimmed = note.trim();
+        const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
+        const next: KanbanCard = {
+          ...card,
+          subtasks: Subtasks.handBack(card.subtasks, subtaskId, trimmed),
+          updatedAt: at,
+        };
+        yield* logEvent(next, actor, "subtask", {
+          body: `${subtaskId} handed back to the evaluator: ${text} (${trimmed})`,
+        });
+        yield* saveCard(next);
+        // One wake for the hand-back itself: the evaluator hears the note once.
+        yield* noteDiscussion(next, Briefs.handBackText(next, subtaskId, script.name, trimmed)).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban hand-back note failed", cause),
+          ),
+        );
+        yield* kick;
+        return next;
+      }),
+    );
+
+  /** A script's subtask names a script on this board: a misspelt name would leave its step waiting for good. */
+  const checkScriptNames = Effect.fn("KanbanService.checkScriptNames")(function* (
+    boardId: KanbanBoard["id"],
+    subtasks: ReadonlyArray<KanbanSubtask>,
+  ) {
+    const names = new Set(
+      (yield* store.scripts(boardId)).map((script) => script.name.toLowerCase()),
+    );
+    for (const subtask of subtasks) {
+      if (subtask.state !== "open" || subtask.script === undefined) continue;
+      if (!names.has(subtask.script.toLowerCase())) {
+        return yield* failWith(
+          "invalid",
+          `subtask ${subtask.id}: no script named "${subtask.script}" on this board`,
+        );
+      }
+    }
+  });
+
+
+  /**
+   * A reviewer that lost its slot mid-review (the dispatcher's no-verdict flag,
+   * or its own card_flag) still owns the step while nothing has moved the card
+   * since, so its verdict counts. A recorded verdict or any later move closes it.
+   */
+  const lateReviewer = Effect.fn("KanbanService.lateReviewer")(function* (
+    card: KanbanCard,
+    threadId: ThreadId,
+  ) {
+    if (
+      card.stage !== "needs_review" ||
+      card.activeThreadId !== null ||
+      card.reviewThreadId !== threadId ||
+      card.settledAt !== null
+    ) {
+      return false;
+    }
+    const events = yield* store.cardEvents(card.id);
+    // A recorded verdict closes the window even when it leaves the stage as is
+    // (a late clear logs needs_review -> needs_review), so it counts as a move.
+    const left = events.findLast(
+      (event) =>
+        event.kind === "review" ||
+        (event.fromStage !== null && event.toStage !== null && event.fromStage !== event.toStage),
+    );
+    return (
+      left?.kind === "flagged" &&
+      left.fromStage === "in_review" &&
+      (left.actor._tag === "system" ||
+        (left.actor._tag === "thread" && left.actor.threadId === threadId))
+    );
+  });
+
+  const reviewResult: KanbanServiceShape["reviewResult"] = (
+    threadId,
+    verdict,
+    findings,
+    head,
+  ) =>
     guard(
       Effect.gen(function* () {
         const link = yield* store.threadLink(threadId);
@@ -3896,7 +4072,9 @@ const make = Effect.gen(function* () {
           return yield* failWith("denied", "only a card's review thread records a review result");
         }
         const card = yield* cardOf(link.cardId);
-        if (card.activeThreadId !== threadId || card.stage !== "in_review") {
+        const live = card.activeThreadId === threadId && card.stage === "in_review";
+        const late = !live && (yield* lateReviewer(card, threadId));
+        if (!live && !late) {
           return yield* failWith(
             "conflict",
             `card #${card.number} is not in review with this thread`,
@@ -3904,6 +4082,13 @@ const make = Effect.gen(function* () {
         }
         if (verdict === "findings" && findings.length === 0) {
           return yield* failWith("invalid", "findings need at least one line");
+        }
+        const sha = head?.trim().toLowerCase() || null;
+        if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
+          return yield* failWith(
+            "invalid",
+            "head is the commit you reviewed: 7 to 40 hex characters",
+          );
         }
         const board = yield* boardOf(card.boardId);
         const chain = Rules.chainFor(board, card);
@@ -3920,6 +4105,9 @@ const make = Effect.gen(function* () {
         const moreWork = passed && Subtasks.workAfterReview({ subtasks });
         const next: KanbanCard = {
           ...release(card),
+          // The dispatcher's no-verdict flag is answered by the verdict; a
+          // reviewer's own flag stays for the evaluator.
+          stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
           subtasks,
           stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
           reviewStep: moreWork ? 0 : outcome.reviewStep,
@@ -3938,9 +4126,26 @@ const make = Effect.gen(function* () {
           fromStage: card.stage,
           toStage: next.stage,
           body,
+          head: sha,
         });
         yield* saveCard(next);
         yield* evaluatorTurn(card, next, { _tag: "thread", threadId });
+        if (verdict === "findings" && next.reviewRound === 3) {
+          // Third findings round: the evaluator decides scope rather than the loop running on.
+          // A failed note must not fail the review result, so it only logs.
+          yield* cardDiscussionUnlocked(next.id).pipe(
+            Effect.flatMap((discussion) =>
+              toEvaluator(
+                discussion,
+                `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`,
+                true,
+              ),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban third review round note failed", { cardId: next.id, cause }),
+            ),
+          );
+        }
         yield* kick;
         return next;
       }),
@@ -4035,17 +4240,23 @@ const make = Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const key = Rules.poolKey(model);
         const count = Math.max(0, Math.round(slots));
-        const existing = (yield* store.pools(board.id)).some((pool) => pool.key === key);
+        const existing = (yield* store.pools(board.id)).find((pool) => pool.key === key);
         // Pausing an existing pool must always work, even when its model has left the
         // provider's catalog: the pool is being stopped, not started.
-        const pausing = count === 0 && existing;
+        const pausing = count === 0 && existing !== undefined;
+        // A pause that names a variant the provider doesn't offer keeps the pool's stored
+        // model, so the board's model for this pool is never replaced by an unoffered one.
+        const stored =
+          pausing && existing !== undefined && Result.isFailure(yield* Effect.result(checkModel(model)))
+            ? existing.model
+            : model;
         if (!pausing) yield* checkModel(model);
         // Unknown (null) never blocks; only a model the composer is known not to offer does.
         const listed = isListed(yield* models.listed, model);
         if (listed === false && !pausing) {
           return yield* failWith("invalid", `${key} isn't in the model list; pick a model the composer offers`);
         }
-        yield* store.putPool(boardId, { key, model, slots: count });
+        yield* store.putPool(boardId, { key, model: stored, slots: count });
         const pools = yield* store.pools(boardId);
         yield* publish(boardId, { _tag: "pools", pools });
         yield* kick;
@@ -4398,6 +4609,7 @@ const make = Effect.gen(function* () {
     flagCard,
     settleCard,
     markSubtask,
+    handBack,
     askOwner,
     changeAsk,
     reviewResult,
