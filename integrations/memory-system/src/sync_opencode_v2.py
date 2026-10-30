@@ -24,6 +24,9 @@ starts empty, so the first runs rescan every session once. This is resumable:
 each finished session is recorded as it completes, and --deadline still stops
 between sessions.
 
+One failing session is logged and not stamped (so the next run retries it), the
+run continues with the rest, and the process exits 1.
+
 Messages already present in memory from the v1 import (turn_id=<msg_id>, not in
 the sync ledger) are adopted as legacy rows and left alone unless they change.
 
@@ -39,6 +42,7 @@ import os
 import sqlite3
 import sys
 import time
+import traceback
 import zlib
 
 HOME = os.path.expanduser("~")
@@ -114,6 +118,16 @@ def text_of(items):
         elif isinstance(it, dict) and it.get("type") == "file":
             out.append("[file {} {}]".format(it.get("mime") or "", it.get("uri") or ""))
     return "\n".join(out)
+
+
+def clean_text(s):
+    # json.loads turns a lone \udXXX escape into a lone surrogate, which sqlite
+    # can't encode; re-pair valid halves and replace lone ones with U+FFFD
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 def settled(mtype, data, time_updated):
@@ -256,7 +270,7 @@ class Sync:
         self.mem.commit()
         self.att = Attachments(self.mem)
         self.stats = dict(sessions=0, raw_upserts=0, projected=0, reprojected=0,
-                          legacy=0, unsettled=0, rows=0)
+                          legacy=0, unsettled=0, rows=0, errors=0, failed=[])
 
     # ------------------------------------------------------------ source reads
     def changed_sessions(self):
@@ -393,8 +407,8 @@ class Sync:
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,"
                     "content,content_type,model,tokens_used,metadata_json)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (SOURCE, sid, turn_id, ts, speaker, content or "", ctype, model, tokens,
-                     json.dumps(meta, ensure_ascii=False)))
+                    (SOURCE, sid, turn_id, ts, speaker, clean_text(content or ""), ctype,
+                     model, tokens, clean_text(json.dumps(meta, ensure_ascii=False))))
                 self.stats["rows"] += 1
             m.execute("INSERT OR REPLACE INTO opencode_sync_messages VALUES (?,?,?,?,?,?)",
                       (mid, sid, tu, 1, 0, int(time.time())))
@@ -425,7 +439,19 @@ class Sync:
         self.stats["remaining"] = 0
         self.write_progress(0, len(sessions), t0)
         for i, s in enumerate(sessions, 1):
-            self.sync_session(s)
+            # one bad session must not stop the rest: it is not stamped, so the
+            # next run retries it, and the run exits 1 (see main)
+            try:
+                self.sync_session(s)
+            except Exception as e:
+                self.stats["errors"] += 1
+                if len(self.stats["failed"]) < 20:
+                    self.stats["failed"].append(s["id"])
+                print("session {} failed: {}: {}".format(s["id"], type(e).__name__, e), flush=True)
+                print(traceback.format_exc(), flush=True)
+                if self.stats["errors"] >= 20:
+                    print("too many failed sessions, stopping", flush=True)
+                    break
             if i % 200 == 0:
                 print("  {}/{} {}".format(i, len(sessions), self.stats), flush=True)
             if i % 10 == 0:
@@ -453,7 +479,8 @@ def main():
     p.add_argument("--progress", default="",
                    help="write a JSON progress marker here every 10 sessions")
     args = p.parse_args()
-    Sync(args).run()
+    stats = Sync(args).run()
+    sys.exit(1 if stats.get("errors") else 0)
 
 
 if __name__ == "__main__":
