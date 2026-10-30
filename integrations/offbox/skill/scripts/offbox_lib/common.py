@@ -42,6 +42,7 @@ UNUSED_DELETE_S = 30 * 86400   # delete an unpinned lease unused for 30 days
 BASES_SOFT_LIMIT = 50
 SIZES = ("small", "default", "large", "xlarge")
 TEMPLATES = ("crpko-go", "crpko-node", "crpko-harness", "generic")
+TOO_BIG_NOTE = "too-big:"        # leases.note prefix: a stopped box whose disk outgrew its machine size
 
 
 def now() -> float:

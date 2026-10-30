@@ -6,7 +6,7 @@ import hashlib
 import time
 
 from . import capacity
-from .common import EXIT_BUSY, EXIT_INFRA, SIZES, OffboxError, db, file_lock, now, say
+from .common import EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, now, say
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
@@ -43,23 +43,31 @@ def lock_name(key: str) -> str:
     return "pool-" + hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
+TOO_BIG_LIKE = f"{TOO_BIG_NOTE}%"  # a box marked too big frees its pool slot and is never offered again
+
+
 def members(con, key):
-    return con.execute("""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
-        WHERE p.pool_key=? AND l.state IN ('running','stopped')
-        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key,)).fetchall()
+    return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
+        WHERE p.pool_key=? AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
+        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE)).fetchall()
+
+
+def _room(con, key) -> bool:
+    return len(members(con, key)) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
 
 
 def candidates(con, key, size, source, me=None):
     # Existing boxes count toward the cap once adopted; surplus legacy boxes are left intact.
     rows = con.execute("""SELECT l.*, p.pool_key FROM leases l LEFT JOIN pool_members p USING(box_id)
         WHERE l.repo_key=? AND l.state IN ('running','stopped')
+        AND COALESCE(l.note,'') NOT LIKE ?
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running'))
         AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)
-        ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""", (key, size)).fetchall()
-    cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
-    full = len(members(con, key)) >= cap
+        ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""",
+        (key, TOO_BIG_LIKE, size)).fetchall()
+    full = not _room(con, key)
     out = []
     for r in rows:
         if r["pool_key"] not in (None, key) or (full and r["pool_key"] is None):
@@ -167,6 +175,15 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         if row['state'] != 'running':
                             stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
                         say(f"skipping pool box {row['box_id']}: {e}")
+                        continue
+                    except lease.DiskTooBig as e:
+                        # Marked and left stopped: it no longer counts toward the pool. Not stopped_error, so a
+                        # still-full pool queues (exit 92) instead of failing with the resume error (exit 90).
+                        stopped_failed = True
+                        can_create = _room(con, key)
+                        say(f"skipping {row['box_id']}: its disk needs {e.need} GiB but '{e.size}' holds {e.holds} GiB. "
+                            f"It stays stopped with its disk and no longer counts toward the pool (remove it with: "
+                            f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
                         if row['state'] == 'running' or e.code != EXIT_INFRA:

@@ -107,6 +107,9 @@ offbox local --list ; offbox local --clear
   or base size, at least large; generic stays default) the next time it resumes. While starts are plentiful an
   oversized running box is skipped for a stopped one so it can stop on its short timer, except the box you used
   last. A live box is never stopped just to shrink it, and a shrink boat refuses resumes at the old size.
+  A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
+  stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
+  lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
 
 ## Options
 

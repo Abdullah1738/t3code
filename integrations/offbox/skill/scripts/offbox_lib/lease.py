@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event,
+from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
@@ -17,6 +17,8 @@ from .identity import remote_dir_for
 ARCHIVING_WAIT_S = 120
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
+DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
+                          re.I)  # boat's 409 for a stopped box whose disk outgrew every machine of its size
 DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
 
 
@@ -290,6 +292,28 @@ class ArchivingSkip(OffboxError):
     """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
 
 
+class DiskTooBig(OffboxError):
+    """A stopped box's disk outgrew every machine of its size, so boat refuses the resume. The box is marked
+    (leases.note) and left stopped and untouched; pool callers skip it and stop counting it toward the pool."""
+
+    def __init__(self, box_id: str, need: str, size: str, holds: str):
+        super().__init__(f"{box_id} needs {need} GiB of disk but '{size}' holds {holds} GiB")
+        self.need, self.size, self.holds = need, size, holds
+
+
+def _too_big(con, box_id: str, e: api.ApiError):
+    """DiskTooBig for boat's 'disk outgrew its machine size' refusal (marks the lease), else None."""
+    m = DISK_TOO_BIG.search(str(e)) if (e.status or 0) in SHRINK_REFUSED else None
+    if not m:
+        return None
+    need, size, holds = m.group(1), m.group(2), m.group(3)
+    con.execute("UPDATE leases SET note=? WHERE box_id=?",
+                (f"{TOO_BIG_NOTE} needs {need} GiB, {size} holds {holds} GiB", box_id))
+    con.commit()
+    event(con, box_id, "lease_too_big", f"needs {need} GiB, {size} holds {holds} GiB")
+    return DiskTooBig(box_id, need, size, holds)
+
+
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
@@ -370,10 +394,19 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
             # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
             if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
                     or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
+                tb = _too_big(con, box_id, e)
+                if tb:
+                    raise tb from e
                 raise
             say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
             want = s.get("type")
-            api.resume(box_id, RUN_TTL_S, None)
+            try:
+                api.resume(box_id, RUN_TTL_S, None)
+            except api.ApiError as e2:
+                tb = _too_big(con, box_id, e2)
+                if tb:
+                    raise tb from e2
+                raise
         up = _bring_up(box_id)
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
