@@ -5259,12 +5259,6 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     Effect.gen(function* () {
       const MOVED = "/work/opencode2-moved";
       const { runtime, thread } = yield* resumed([
-        out("session.instructions.entry.put", {
-          sessionID: SESSION,
-          key: "t3-code",
-          value: "<any>",
-        }),
-        reply("session.instructions.entry.put", null),
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
         promptAccepted,
         event("session.moved", {
