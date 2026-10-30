@@ -399,6 +399,15 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual([i['id'] for i in model.call_args[0][0]], ['imsg:1'])
         self.assertEqual(runs[-1]['dropped']['charge_asked'], 1)
 
+    def test_a_decline_after_the_receipt_budget_is_spent_still_reaches_him(self):
+        decline = {'id': 'imsg:9', 'source': 'imessage', 'sender': 'EmiratesNBD', 'subject': '', 'ts': self.now - 60,
+                   'preview': 'Transaction of AED 120.00 on your Card 1111 at GLOBEX was declined'}
+        # A deadline already in the past means the receipt budget is spent.
+        reasons, held, error = t.charge_checks([decline], self.now, False, self.now - 1)
+        self.assertEqual((reasons, held), ({}, set()))
+        self.assertIsNotNone(decline.get('charge_question'))
+        self.assertNotIn(t.UNCHECKED, error or '')
+
     def test_alerts_the_budget_never_reached_wait_unless_they_are_old(self):
         items = [self.alert(1, '20.00', 'GLOBEX', 60), self.alert(2, '30.00', 'INITECH', 2 * t.CHARGE_STALL)]
         with patch.object(t, 'late', return_value=True):

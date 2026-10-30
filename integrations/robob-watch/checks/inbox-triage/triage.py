@@ -349,7 +349,9 @@ def charge_checks(items, now, dry, deadline=None, wd=None):
         if not charge:
             continue
         age = now - item['ts'] if isinstance(item.get('ts'), (int, float)) else None
-        if late(deadline):
+        # A decline always goes to him: when the budget is spent it isn't held or left to the
+        # classifier (which could drop it silently), it is passed on unchecked.
+        if late(deadline) and charge['kind'] != 'decline':
             if not dry and age is not None and age < CHARGE_STALL:
                 held.add(item['id'])
             else:
