@@ -119,6 +119,7 @@ class RefusedStartTests(Isolated):
         with patch.object(pool, 'acquire', return_value=row), patch.object(ssh_sync, 'put_file'), \
                 patch.object(ssh_sync, 'push'), patch.object(ssh_sync, 'tracked_secret_matches', return_value=[]), \
                 patch.object(runs.prune, 'run'), patch.object(api, 'cmd_start', side_effect=err), \
+                patch.object(ssh_sync, 'probe_home', return_value=None), \
                 patch.object(ssh_sync, 'close_master') as close, patch.object(runs.lease, 'typecheck_size', return_value='large'):
             with self.assertRaises(OffboxError) as cm:
                 rn.start()
