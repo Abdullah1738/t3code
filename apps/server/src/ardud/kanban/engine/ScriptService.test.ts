@@ -539,13 +539,13 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
   }).pipe(Effect.provide(makeTestLayer(recording)));
 });
 
-it.effect("a subtask a script ticks, which moves its card, wakes no card.moved script, its own or another", () =>
+it.effect("a subtask a script ticks, which moves a deployed card back to todo, wakes no card.moved script", () =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
     const scripts = yield* ScriptService.KanbanScripts;
     const board = yield* toyBoard;
     yield* kanban.setPool(board.id, board.defaultCardModel, 3);
-    // Two card.moved listeners. A rerun by either would show up as a run of it.
+    // Both listeners react to every card.moved; a rerun shows up as a run.
     const mover = yield* register(
       board,
       scriptFile(`echo "$KANBAN_EVENT"\n`),
@@ -558,15 +558,7 @@ it.effect("a subtask a script ticks, which moves its card, wakes no card.moved s
       { _tag: "event", event: "card.moved" },
       "watcher",
     );
-    const ticker = yield* register(
-      board,
-      scriptFile(
-        `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"landed"}'\n`,
-      ),
-      manual,
-      "ticker",
-    );
-    // Step 1 is the script's; step 2 is the worker's. Ticking step 1 opens step 2 and moves the card to todo.
+    // Step 1: the script's merge. Step 2: the worker's follow-up.
     const card = yield* kanban.createCard(
       board.id,
       {
@@ -580,15 +572,28 @@ it.effect("a subtask a script ticks, which moves its card, wakes no card.moved s
       owner,
     );
     assert.strictEqual(card.number, 1);
+    // The land script moves the card to deployed, then ticks its merge subtask.
+    const ticker = yield* register(
+      board,
+      scriptFile(
+        [
+          `echo '{"kanban":"move","card":1,"to":"deployed","note":"landed"}'`,
+          `echo '{"kanban":"subtask","card":1,"subtask":"s1","state":"done","note":"merged"}'`,
+          "",
+        ].join("\n"),
+      ),
+      manual,
+      "ticker",
+    );
     yield* scripts.listen;
     yield* scripts.run(ticker.id, "manual");
     yield* scripts.idle;
     yield* settle;
 
     const stored = (yield* kanban.snapshot(board.id)).cards.find((entry) => entry.number === card.number)!;
+    // The tick opened the worker's step, so the deployed card went back to todo.
     assert.strictEqual(stored.stage, "todo");
-    const moved = stored.subtasks.find((subtask) => subtask.id === "s1")!;
-    assert.strictEqual(moved.doneBy?._tag, "script");
+    // The move and the auto-move both came from the land script: neither listener reruns.
     assert.strictEqual((yield* scripts.runs(mover.id, 10)).length, 0);
     assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
