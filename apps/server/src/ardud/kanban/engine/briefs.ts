@@ -171,7 +171,9 @@ export const reviewBrief = (
     continuing ? null : "",
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
-    freshThread && card.wakeNote?.trim() ? `\nNote for this review:\n${card.wakeNote.trim()}` : null,
+    freshThread && card.wakeNote?.trim()
+      ? `\nNote for this review:\n${card.wakeNote.trim()}`
+      : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
