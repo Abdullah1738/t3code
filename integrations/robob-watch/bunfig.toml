@@ -1,0 +1,3 @@
+# Card #14: every bun test runs with the test-run marker, so a real send is refused unless a test injects its stub.
+[test]
+preload = ["./test/setup-test-run.ts"]

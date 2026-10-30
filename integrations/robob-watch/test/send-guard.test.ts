@@ -1,19 +1,24 @@
 import { expect, test } from "bun:test";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // Card #14: a real send or draft refuses under a test run; a stub injected by the test still works.
-// Every spawn strips the ambient env and sets ROBOB_TEST itself, so the guard is tested without relying on the caller's env.
+// The test-run marker comes from the shared preload (test/setup-test-run.ts via bunfig.toml).
 const helpers = join(import.meta.dir, "../helpers");
+// The test-run marker comes from the shared setup (bunfig.toml preload), not from each fixture. A child env built
+// here keeps it only when the parent has it, so a missing shared setup shows up as a real send, not a pass.
 const bare = (extra: Record<string, string> = {}) => ({
   PATH: "/usr/bin:/bin",
   LANG: "en_US.UTF-8",
   HOME: join(import.meta.dir, ".."),
+  ...(process.env.ROBOB_TEST ? { ROBOB_TEST: process.env.ROBOB_TEST } : {}),
   ...extra,
 });
 
 test("wa send refuses a real send under ROBOB_TEST without touching wacli", () => {
   const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "send", "971500000002", "hi"], {
-    env: bare({ ROBOB_TEST: "1" }),
+    env: bare(),
   });
   expect(r.exitCode).toBe(2);
   expect(r.stderr.toString()).toContain("refused: test run");
@@ -37,7 +42,7 @@ test("wa sendfile refuses under PYTEST_CURRENT_TEST", () => {
 
 test("wa send still runs its stubbed wacli under a test run", () => {
   const r = Bun.spawnSync(["/bin/zsh", join(helpers, "wa"), "send", "971500000002", "hi"], {
-    env: bare({ ROBOB_TEST: "1", WA_WACLI: "/usr/bin/false" }),
+    env: bare({ WA_WACLI: "/usr/bin/false" }),
   });
   // The guard let it through: the stub (false) ran and failed, so the refusal text is absent.
   expect(r.stderr.toString()).not.toContain("refused: test run");
@@ -46,7 +51,7 @@ test("wa send still runs its stubbed wacli under a test run", () => {
 // src/lib.ts sends iMessage and Telegram through the bridge CLIs; a test run must refuse without a stub CLI.
 const libGuard = (expr: string) => Bun.spawnSync([process.execPath, "-e",
   `import { imessage, wake, telegram } from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))}; console.log(JSON.stringify(await (${expr})))`],
-  { env: bare({ ROBOB_TEST: "1" }) });
+  { env: bare() });
 
 test("src imessage() refuses a real send under a test run", () => {
   const r = libGuard(`imessage("hi", "k")`);
@@ -63,13 +68,21 @@ test("src telegram() refuses a real notify under a test run", () => {
   expect(r.stdout.toString()).toContain("refused: test run");
 });
 
-// Override set after import: the guard reads the env at call time, and so does the command, so the stub is used.
-test("an override installed after import is honoured by the guard and the command", () => {
-  const code = `import { imessage } from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))};
-process.env.ROBOB_WATCH_SPECTRUM_CLI = "/nonexistent/stub-cli.ts";
-console.log(JSON.stringify(await imessage("hi", "k")));`;
-  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare({ ROBOB_TEST: "1" }) });
-  expect(r.stdout.toString()).not.toContain("refused: test run");
+// A stub removed while imessage() is still awaiting liveSession() must not reopen the live bridge: the command
+// is decided before the await. A harmless default-path sentinel records if the live CLI runs.
+test("removing the stub mid-call does not run the live bridge", () => {
+  const dir = mkdtempSync(join(tmpdir(), "imsg-pending-"));
+  const sentinel = join(dir, "live-ran");
+  const liveCli = join(dir, "live-cli.ts");
+  writeFileSync(liveCli, `require("node:fs").writeFileSync(${JSON.stringify(sentinel)}, "ran");`);
+  // Stub set before import (the old code captured the CLI path at import), removed while the check is pending.
+  const code = `process.env.ROBOB_WATCH_SPECTRUM_CLI = ${JSON.stringify(join(dir, "stub-cli.ts"))};
+const { imessage } = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+const p = imessage("hi", "k");
+delete process.env.ROBOB_WATCH_SPECTRUM_CLI;
+console.log(JSON.stringify(await p));`;
+  Bun.spawnSync([process.execPath, "-e", code], { env: bare(), stdout: "pipe" });
+  expect(existsSync(sentinel)).toBe(false);
 });
 
 // runCheck: a check that runs wa send, with no stub, is refused under the test markers the parent carries.
@@ -78,20 +91,20 @@ test("a check child under a test run inherits the markers and is refused a real 
 const w = { id: "t", title: "t", serial: false, check: "/bin/zsh -c 'exec ${join(helpers, "wa")} send 971500000002 hi'" } as any;
 const r = await runCheck(w, "/tmp");
 console.log(JSON.stringify(r.stderr + r.stdout));`;
-  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare({ ROBOB_TEST: "1" }) });
+  const r = Bun.spawnSync([process.execPath, "-e", code], { env: bare() });
   expect(r.stdout.toString()).toContain("refused: test run");
 });
 
 // An ordinary fixture (no stub) refuses: the regression that the shared setup must stop.
 test("a fixture with no stub refuses a real send", () => {
-  const r = Bun.spawnSync([join(helpers, "wa"), "send", "971500000002", "hi"], { env: bare({ ROBOB_TEST: "1" }) });
+  const r = Bun.spawnSync([join(helpers, "wa"), "send", "971500000002", "hi"], { env: bare() });
   expect(r.stderr.toString()).toContain("refused: test run");
 });
 
 // ride-card and convo-card look up their card before they reach the bridge, so call bridge() directly.
 const bridgeGuard = (file: string) => {
   const code = `from importlib.machinery import SourceFileLoader; m = SourceFileLoader("h", ${JSON.stringify(file)}).load_module(); m.bridge("send", "--text", "x")`;
-  return Bun.spawnSync(["/usr/bin/python3", "-c", code], { env: bare({ ROBOB_TEST: "1" }) });
+  return Bun.spawnSync(["/usr/bin/python3", "-c", code], { env: bare() });
 };
 
 test("ride-card bridge() refuses a real send under a test run", () => {

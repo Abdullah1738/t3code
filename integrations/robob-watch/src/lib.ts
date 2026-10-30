@@ -369,10 +369,12 @@ export function wake(source: string, text: string, key: string): Promise<{ ok: b
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
+  const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, spectrumCli(), "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
