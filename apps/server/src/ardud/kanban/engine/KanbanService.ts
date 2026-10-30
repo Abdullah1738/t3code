@@ -2224,7 +2224,14 @@ const make = Effect.gen(function* () {
             event.body !== "clear",
         )
         .map((event) => event.body ?? "");
-      text = Briefs.reviewBrief(board, synced, goal, Rules.chainFor(board, synced), findings);
+      text = Briefs.reviewBrief(
+        board,
+        synced,
+        goal,
+        Rules.chainFor(board, synced),
+        findings,
+        threadId === null,
+      );
     }
     if (threadId) {
       yield* threads.send({ threadId, text, model: dispatch.model });
@@ -4271,7 +4278,10 @@ const make = Effect.gen(function* () {
             stage,
             stalled: null,
             nudgedAt: null,
-            wakeNote: stage === "todo" ? withFreshNote(text.trim() || card.wakeNote) : card.wakeNote,
+            wakeNote:
+              stage === "todo"
+                ? withFreshNote(text.trim() || card.wakeNote)
+                : text.trim() || card.wakeNote,
             movedAt: at,
             updatedAt: at,
           };

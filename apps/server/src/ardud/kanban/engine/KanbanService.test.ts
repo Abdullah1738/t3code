@@ -1394,6 +1394,92 @@ it.effect("a review thread that gets too long gets a fresh review", () =>
   }),
 );
 
+it.effect("a later chain step that gets too long restarts on a complete fresh brief", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Critical", steps: [sol, astra] }],
+        defaultReviewChain: "Critical",
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.setPool(board.id, sol, 2);
+      yield* kanban.setPool(board.id, astra, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Change fee rounding", title: "Fee rounding", reviewChain: "Critical" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      yield* kanban.dispatchNow;
+      const firstReview = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.reviewResult(firstReview, "clear", []);
+      yield* kanban.dispatchNow;
+      const stepTwo = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(stepTwo.reviewStep, 1);
+      const oldStepTwo = stepTwo.activeThreadId!;
+      fake.failures.set(oldStepTwo, overflow);
+      yield* kanban.turnEnded(oldStepTwo);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "needs_review");
+      assert.strictEqual(moved.reviewStep, 1);
+      assert.isNull(moved.reviewThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.notStrictEqual(fresh.activeThreadId, oldStepTwo);
+      assert.strictEqual(fresh.reviewStep, 1);
+      const brief = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(brief, "What the card asked for:");
+      assert.include(brief, "Change fee rounding");
+      assert.include(brief, "step 2 of 2");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a reset on a review card delivers its note to the fresh review", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      yield* kanban.turnEnded(workThread);
+      yield* kanban.dispatchNow;
+      const oldReview = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* kanban.cardThread(created.id, "reset", "Check the rounding path.", owner);
+      const reset = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(reset.stage, "needs_review");
+      assert.isNull(reset.reviewThreadId);
+      assert.include(fake.interrupted, oldReview);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "in_review");
+      assert.notStrictEqual(fresh.activeThreadId, oldReview);
+      const brief = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(brief, "Check the rounding path.");
+      assert.include(brief, "What the card asked for:");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("card_thread reset starts a working card on a fresh thread", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

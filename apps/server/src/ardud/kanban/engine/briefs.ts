@@ -156,10 +156,12 @@ export const reviewBrief = (
   goal: KanbanGoal | null,
   chain: KanbanReviewChain | null,
   priorFindings: ReadonlyArray<string>,
+  /** A new thread has no earlier step in it, so it gets the whole brief even on a later step. */
+  freshThread = false,
 ) => {
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
-  const continuing = card.reviewStep > 0;
+  const continuing = card.reviewStep > 0 && !freshThread;
   return lines(
     continuing
       ? `The previous review step came back clear. This is step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, on a different model: check the same change again with fresh eyes, using the context above.`
@@ -169,6 +171,7 @@ export const reviewBrief = (
     continuing ? null : "",
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
+    freshThread && card.wakeNote?.trim() ? `\nNote for this review:\n${card.wakeNote.trim()}` : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
