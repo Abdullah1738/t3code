@@ -460,8 +460,8 @@ it.effect("an earlier step's turn end doesn't stop the chain step running in the
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
-      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "high" });
-      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
       yield* kanban.updateBoard(board.id, {
         reviewChains: [{ name: "Critical", steps: [sol, astra] }],
         defaultReviewChain: "Critical",
@@ -577,8 +577,8 @@ const chainStepOneLostSlot = (flag: "dispatcher" | "self") =>
       name: "Toy",
       defaultProjectId: ProjectId.make("project-1"),
     });
-    const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "high" });
-    const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" });
+    const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+    const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
     yield* kanban.updateBoard(board.id, {
       reviewChains: [{ name: "Critical", steps: [sol, astra] }],
       defaultReviewChain: "Critical",
