@@ -6041,7 +6041,8 @@ it.effect("a failed outage-alert count scan does not skip the next model's probe
 const verdictNudges = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
   Ref.get(fake.threads).pipe(
     Effect.map(
-      (all) => all.get(threadId)!.messages.filter((text) => text.includes("record your verdict")).length,
+      (all) =>
+        all.get(threadId)!.messages.filter((text) => text.includes("record your verdict")).length,
     ),
   );
 
@@ -6062,34 +6063,36 @@ const reviewerOf = Effect.fn("reviewerOf")(function* (
   return { cardId: card.id, reviewThread: (yield* kanban.card(card.id)).card.activeThreadId! };
 });
 
-it.effect("a reviewer waiting on its own subagents isn't nudged or flagged when its turn ends", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
-      const { kanban, board } = yield* toyBoard;
-      const { cardId, reviewThread } = yield* reviewerOf(kanban, board.id);
-      yield* setBackground(fake, reviewThread, 2);
-      yield* kanban.turnEnded(reviewThread);
-      yield* kanban.turnEnded(reviewThread);
-      let card = (yield* kanban.card(cardId)).card;
-      assert.strictEqual(card.stage, "in_review");
-      assert.strictEqual(card.activeThreadId, reviewThread);
-      assert.isNull(card.stalled);
-      assert.isNull(card.nudgedAt);
-      assert.strictEqual(yield* verdictNudges(fake, reviewThread), 0);
+it.effect(
+  "a reviewer waiting on its own subagents isn't nudged or flagged when its turn ends",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const { cardId, reviewThread } = yield* reviewerOf(kanban, board.id);
+        yield* setBackground(fake, reviewThread, 2);
+        yield* kanban.turnEnded(reviewThread);
+        yield* kanban.turnEnded(reviewThread);
+        let card = (yield* kanban.card(cardId)).card;
+        assert.strictEqual(card.stage, "in_review");
+        assert.strictEqual(card.activeThreadId, reviewThread);
+        assert.isNull(card.stalled);
+        assert.isNull(card.nudgedAt);
+        assert.strictEqual(yield* verdictNudges(fake, reviewThread), 0);
 
-      yield* setBackground(fake, reviewThread, 0);
-      yield* kanban.turnEnded(reviewThread);
-      card = (yield* kanban.card(cardId)).card;
-      assert.isNotNull(card.nudgedAt);
-      assert.strictEqual(yield* verdictNudges(fake, reviewThread), 1);
-      yield* kanban.turnEnded(reviewThread);
-      card = (yield* kanban.card(cardId)).card;
-      assert.strictEqual(card.stage, "needs_review");
-      assert.strictEqual(card.stalled?.reason, "Reviewer stopped without a verdict");
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+        yield* setBackground(fake, reviewThread, 0);
+        yield* kanban.turnEnded(reviewThread);
+        card = (yield* kanban.card(cardId)).card;
+        assert.isNotNull(card.nudgedAt);
+        assert.strictEqual(yield* verdictNudges(fake, reviewThread), 1);
+        yield* kanban.turnEnded(reviewThread);
+        card = (yield* kanban.card(cardId)).card;
+        assert.strictEqual(card.stage, "needs_review");
+        assert.strictEqual(card.stalled?.reason, "Reviewer stopped without a verdict");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("background work past the grace no longer holds a reviewer", () =>

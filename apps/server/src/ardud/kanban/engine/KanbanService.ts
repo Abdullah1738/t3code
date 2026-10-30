@@ -2876,7 +2876,12 @@ const make = Effect.gen(function* () {
         // A paused worker waits for probeOutages, not a nudge.
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
-        if (view === null || Rules.waitingOnBackground(view, now) || !Rules.workerQuietDue(card, view, now)) continue;
+        if (
+          view === null ||
+          Rules.waitingOnBackground(view, now) ||
+          !Rules.workerQuietDue(card, view, now)
+        )
+          continue;
         if (view.state === "needs-input") {
           // Its turn end after the interrupt brings the nudge.
           yield* threads.interrupt(threadId, "Stuck on its own question; the board nudges it");
@@ -2896,7 +2901,12 @@ const make = Effect.gen(function* () {
         if (threadId === null || card.activeRole !== "review") continue;
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
-        if (view === null || Rules.waitingOnBackground(view, now) || !Rules.reviewerQuietDue(card, view, now)) continue;
+        if (
+          view === null ||
+          Rules.waitingOnBackground(view, now) ||
+          !Rules.reviewerQuietDue(card, view, now)
+        )
+          continue;
         yield* reviewerStopped(card, threadId);
       }
       // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.

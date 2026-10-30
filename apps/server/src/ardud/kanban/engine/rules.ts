@@ -210,7 +210,13 @@ export function reviewerQuietDue(
   view: { readonly state: string; readonly quietSince: string },
   nowMs: number,
 ): boolean {
-  if (card.stage !== "in_review" || card.activeRole !== "review" || card.activeThreadId === null || card.stalled !== null) return false;
+  if (
+    card.stage !== "in_review" ||
+    card.activeRole !== "review" ||
+    card.activeThreadId === null ||
+    card.stalled !== null
+  )
+    return false;
   if (view.state !== "idle") return false;
   const since = Math.max(
     Date.parse(view.quietSince),
