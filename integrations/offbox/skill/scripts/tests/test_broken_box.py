@@ -43,6 +43,11 @@ class ScopeFailedHelperTests(Isolated):
 class BrokenBoxRunTests(Isolated):
     def setUp(self):
         super().setUp()
+        # runs.LOGS_DIR is imported separately from common.LOGS_DIR, so Isolated doesn't redirect it. Without this the
+        # fake follower writes into the real ~/.local/share/offbox/logs and fails when that directory is missing.
+        logs = Path(self.tmp.name) / 'LOGS_DIR'
+        logs.mkdir(parents=True, exist_ok=True)
+        self.stack.enter_context(patch.object(runs, 'LOGS_DIR', logs))
         self.me = dict(owner='worker', repo_key='repo', repo_root='/checkout/repo', session='s', thread='t')
 
     def run_cli_full(self, follow_text, code):
