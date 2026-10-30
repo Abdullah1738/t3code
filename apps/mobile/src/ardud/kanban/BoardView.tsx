@@ -3,13 +3,17 @@ import { AsyncResult } from "effect/reactivity";
 import {
   activeFilterCount,
   activeGoals,
+  BOARD_COLUMN_LABELS,
   boardFilter,
   clearFilters,
   filterFacets,
+  sanitizeBoardColumnPrefs,
   sanitizeBoardFilterPrefs,
   setupBanner,
   stageBoard,
   toggleFilterValue,
+  type BoardColumnKey,
+  type BoardColumnPrefs,
   type BoardFilterPrefs,
   type CardView,
   type SetupBannerView,
@@ -22,6 +26,7 @@ import type { KanbanThreadRow } from "@t3tools/contracts";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
+import { WorkspacePaneDivider } from "../../features/layout/workspace-pane-divider";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Menu } from "../../components/ui/Menu";
@@ -31,14 +36,19 @@ import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/
 import { confirmAction } from "../common/hooks";
 import { ChoiceRow, LinkButton } from "../common/parts";
 import {
+  applyColumnAction,
   BOARD_PAD,
   type BoardLayout,
   type BoardTab,
   boardTabs,
   COLUMN_GAP,
+  COLUMN_RAIL_LABELS,
+  columnActionId,
   defaultBoardTab,
   filterActionId,
+  parseColumnAction,
   parseFilterAction,
+  type ColumnAction,
   type FilterAction,
 } from "./logic";
 import { useKanbanBoardThreads } from "./kanbanStore";
@@ -100,7 +110,8 @@ export function SetupStrip(props: {
  */
 export function BoardView(props: {
   readonly state: KanbanBoardState;
-  readonly layout: BoardLayout;
+  /** Measured width of the board area; picks the phone tabs or the columns layout. */
+  readonly width: number;
   readonly nowMs: number;
   readonly selectedCardId: string | null;
   readonly bottomInset: number;
@@ -119,6 +130,16 @@ export function BoardView(props: {
     : undefined;
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const prefs = sanitizeBoardFilterPrefs(storedFilters?.[boardId]);
+  const storedColumns = AsyncResult.isSuccess(preferencesResult)
+    ? preferencesResult.value.kanbanBoardColumns
+    : undefined;
+  const columnPrefs = sanitizeBoardColumnPrefs(storedColumns?.[boardId]);
+  const setColumnPrefs = (next: BoardColumnPrefs) =>
+    savePreferences({
+      transform: (current) => ({
+        kanbanBoardColumns: { ...current.kanbanBoardColumns, [boardId]: next },
+      }),
+    });
   const setPrefs = (next: BoardFilterPrefs) =>
     savePreferences({
       transform: (current) => ({
@@ -135,6 +156,8 @@ export function BoardView(props: {
   const pickedGoalIds = filter.goalIds ?? [];
   const board = stageBoard(props.state, props.nowMs, filter);
   const picked = activeFilterCount(prefs);
+  // The route measures the board and passes its layout; columns need the saved prefs too.
+  const columnsLayout = boardLayout(props.width, columnPrefs);
   const menuActions = filterMenuActions(props.state, prefs);
   const onFilterAction = (id: string) => {
     const action = parseFilterAction(id);
@@ -201,7 +224,7 @@ export function BoardView(props: {
 
   // Threads is one view per layout: the stage tabs (phone) or columns (wide)
   // give way to it, so iPad widths reach it too.
-  if (props.layout.kind === "tabs") {
+  if (boardLayout(props.width).kind === "tabs") {
     return (
       <TabsBoard
         board={board}
@@ -230,7 +253,9 @@ export function BoardView(props: {
           ? goals.filter((entry) => pickedGoalIds.includes(entry.goal.id))
           : goals
       }
-      layout={props.layout}
+      layout={columnsLayout}
+      columnPrefs={columnPrefs}
+      onColumnPrefs={setColumnPrefs}
       filterRow={filterRow}
       hideGoal={pickedGoalIds.length > 0}
       selectedCardId={props.selectedCardId}
@@ -524,6 +549,8 @@ function ColumnsBoard(props: {
   readonly goals: ReadonlyArray<GoalSummary>;
   readonly nowMs: number;
   readonly layout: Extract<BoardLayout, { kind: "columns" }>;
+  readonly columnPrefs: BoardColumnPrefs;
+  readonly onColumnPrefs: (next: BoardColumnPrefs) => void;
   readonly mode: BoardMode;
   readonly onSelectMode: (mode: BoardMode) => void;
   readonly filterRow: React.ReactNode;
@@ -536,40 +563,135 @@ function ColumnsBoard(props: {
   readonly state: KanbanBoardState;
 }) {
   const { board, layout } = props;
-  const columnStyle = { width: layout.column };
-  const stages = (
-    <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
-      {board.active.map((column) => (
-        <View key={column.stage} style={columnStyle}>
-          <StageHead label={column.label} count={column.cards.length} />
-          <ColumnScroll bottomInset={props.bottomInset}>
-            <CardList
-              cards={column.cards}
-              hideGoal={props.hideGoal}
-              selectedCardId={props.selectedCardId}
-              onOpenCard={props.onOpenCard}
-            />
-          </ColumnScroll>
-        </View>
-      ))}
-      <View style={columnStyle}>
-        <ColumnScroll bottomInset={props.bottomInset}>
-          {board.shipped.map((column) => (
-            <View key={column.stage} className="gap-1">
-              <StageHead label={column.label} count={column.cards.length} />
-              {column.cards.map((view) => (
-                <ShippedRow
-                  key={view.id}
-                  view={view}
-                  selected={view.id === props.selectedCardId}
-                  onOpen={props.onOpenCard}
-                />
-              ))}
-            </View>
-          ))}
-        </ColumnScroll>
+  const prefs = props.columnPrefs;
+  // Live widths while a divider is dragged: the saved layout stays put until the drag ends.
+  const [drag, setDrag] = useState<{
+    readonly key: BoardColumnKey;
+    readonly start: number;
+    readonly width: number;
+  } | null>(null);
+  const widthOf = (key: BoardColumnKey) =>
+    drag !== null && drag.key === key ? drag.width : (layout.columns[key] ?? 0);
+
+  const saveWidth = (key: BoardColumnKey, width: number) =>
+    props.onColumnPrefs({ ...prefs, widths: { ...prefs.widths, [key]: Math.round(width) } });
+
+  // A divider's drag resizes its column from where the drag started.
+  const resizeBy = (key: BoardColumnKey, delta: number) => {
+    setDrag((current) => {
+      const start = current?.key === key ? current.start : widthOf(key);
+      return { key, start, width: start + delta };
+    });
+  };
+  // Saves the final width once, when the drag ends, not on every move.
+  const endResize = () => {
+    if (drag !== null) saveWidth(drag.key, drag.width);
+    setDrag(null);
+  };
+  const beginResize = (key: BoardColumnKey) => {
+    setDrag({ key, start: layout.columns[key] ?? 0, width: layout.columns[key] ?? 0 });
+  };
+
+  const columnMenu = columnMenuActions(prefs, layout);
+  const onColumnAction = (id: string) => {
+    const action = parseColumnAction(id);
+    if (action === null) return;
+    props.onColumnPrefs(applyColumnAction(prefs, action));
+  };
+
+  // A hidden column's rail shows it again.
+  const showColumn = (key: BoardColumnKey) => onColumnAction(columnActionId({ kind: "toggle", key }));
+
+  const stageColumn = (key: BoardColumnKey, label: string, count: number, body: React.ReactNode) => (
+    <View key={key} className="flex-row" style={{ gap: COLUMN_GAP }}>
+      <View style={{ width: widthOf(key) }}>
+        <StageHead label={label} count={count} />
+        <ColumnScroll bottomInset={props.bottomInset}>{body}</ColumnScroll>
       </View>
+      <WorkspacePaneDivider
+        accessibilityLabel={`Resize ${label} column`}
+        currentWidth={widthOf(key)}
+        resizeDirection={1}
+        onResizeStart={() => beginResize(key)}
+        onResizeBy={(delta) => resizeBy(key, delta)}
+        onResizeEnd={endResize}
+      />
     </View>
+  );
+
+  const railFor = (key: BoardColumnKey) => {
+    const label = COLUMN_RAIL_LABELS[key];
+    return (
+      <Pressable
+        key={`rail-${key}`}
+        accessibilityRole="button"
+        accessibilityLabel={`Show ${BOARD_COLUMN_LABELS[key]} column`}
+        onPress={() => showColumn(key)}
+        className="items-center rounded-lg bg-grouped-card py-2"
+        style={{ width: COLUMN_RAIL_WIDTH }}
+      >
+        <Text className="text-[11px] font-t3-medium text-foreground-muted">{label}</Text>
+      </Pressable>
+    );
+  };
+
+  const stageBody = (key: BoardColumnKey) => {
+    const column = board.active.find((entry) => entry.stage === key);
+    if (key === "shipped") {
+      return board.shipped.map((entry) => (
+        <View key={entry.stage} className="gap-1">
+          <StageHead label={entry.label} count={entry.cards.length} />
+          {entry.cards.map((view) => (
+            <ShippedRow
+              key={view.id}
+              view={view}
+              selected={view.id === props.selectedCardId}
+              onOpen={props.onOpenCard}
+            />
+          ))}
+        </View>
+      ));
+    }
+    return (
+      <CardList
+        cards={column?.cards ?? []}
+        hideGoal={props.hideGoal}
+        selectedCardId={props.selectedCardId}
+        onOpenCard={props.onOpenCard}
+      />
+    );
+  };
+
+  const shippedCount = board.shipped.reduce((total, column) => total + column.cards.length, 0);
+  const stageCount = (key: BoardColumnKey) =>
+    key === "shipped"
+      ? shippedCount
+      : (board.active.find((entry) => entry.stage === key)?.cards.length ?? 0);
+
+  const stageItems = STAGE_COLUMN_KEYS.map((key) => {
+    if (prefs.hidden.includes(key)) return railFor(key);
+    return stageColumn(key, BOARD_COLUMN_LABELS[key], stageCount(key), stageBody(key));
+  });
+
+  const stages = <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>{stageItems}</View>;
+
+  const ownerContent = (
+    <ColumnScroll bottomInset={props.bottomInset}>
+      {board.owner.cards.length === 0 ? (
+        <Empty />
+      ) : (
+        board.owner.cards.map((view) => (
+          <CardTile
+            key={view.id}
+            view={view}
+            tone="band"
+            hideGoal={props.hideGoal}
+            selected={view.id === props.selectedCardId}
+            onOpen={props.onOpenCard}
+          />
+        ))
+      )}
+    </ColumnScroll>
   );
 
   return (
@@ -580,46 +702,88 @@ function ColumnsBoard(props: {
           <GoalStrip goals={props.goals} onOpenGoal={props.onOpenGoal} />
         ) : null}
         {props.filterRow}
-      </View>
-      {props.mode === "threads" ? null : (
-      <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
-        {layout.scrolls ? (
-          <ScrollView
-            horizontal
-            className="flex-1"
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ paddingLeft: BOARD_PAD }}
+        <View className="flex-row items-center">
+          <Menu
+            accessibilityLabel="Columns"
+            shouldOpenOnLongPress={false}
+            title="Columns"
+            actions={columnMenu}
+            onPressAction={({ nativeEvent }) => onColumnAction(nativeEvent.event)}
           >
-            {stages}
-          </ScrollView>
-        ) : (
-          <View className="flex-1" style={{ paddingLeft: BOARD_PAD }}>
-            {stages}
-          </View>
-        )}
-        <View
-          className="rounded-tl-[16px] bg-warning px-2.5 pt-1.5"
-          style={{ width: layout.owner }}
-        >
-          <StageHead label={board.owner.label} count={board.owner.cards.length} owner />
-          <ColumnScroll bottomInset={props.bottomInset}>
-            {board.owner.cards.length === 0 ? (
-              <Empty />
-            ) : (
-              board.owner.cards.map((view) => (
-                <CardTile
-                  key={view.id}
-                  view={view}
-                  tone="band"
-                  hideGoal={props.hideGoal}
-                  selected={view.id === props.selectedCardId}
-                  onOpen={props.onOpenCard}
-                />
-              ))
-            )}
-          </ColumnScroll>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={
+                prefs.hidden.length > 0 ? `Columns, ${prefs.hidden.length} hidden` : "Columns"
+              }
+              className={cn(
+                "min-h-9 justify-center rounded-full px-4",
+                prefs.hidden.length > 0 || Object.keys(prefs.widths).length > 0
+                  ? "bg-foreground"
+                  : "bg-grouped-card",
+              )}
+            >
+              <Text
+                className={cn(
+                  "text-[13px] font-t3-semibold",
+                  prefs.hidden.length > 0 || Object.keys(prefs.widths).length > 0
+                    ? "text-screen"
+                    : "text-foreground",
+                )}
+              >
+                {prefs.hidden.length > 0 ? `Columns · ${prefs.hidden.length} hidden` : "Columns"}
+              </Text>
+            </Pressable>
+          </Menu>
         </View>
       </View>
+      {props.mode === "threads" ? null : (
+        <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
+          {layout.scrolls ? (
+            <ScrollView
+              horizontal
+              className="flex-1"
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingLeft: BOARD_PAD }}
+            >
+              {stages}
+            </ScrollView>
+          ) : (
+            <View className="flex-1" style={{ paddingLeft: BOARD_PAD }}>
+              {stages}
+            </View>
+          )}
+          {layout.ownerHidden ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Show ${board.owner.label} column`}
+              onPress={() => showColumn("needs_owner")}
+              className="items-center rounded-tl-[16px] bg-warning pt-2"
+              style={{ width: layout.owner }}
+            >
+              <Text className="text-[11px] font-t3-medium text-foreground">
+                {board.owner.cards.length}
+              </Text>
+            </Pressable>
+          ) : (
+            <View className="flex-row">
+              <WorkspacePaneDivider
+                accessibilityLabel="Resize Needs Owner column"
+                currentWidth={widthOf("needs_owner")}
+                resizeDirection={-1}
+                onResizeStart={() => beginResize("needs_owner")}
+                onResizeBy={(delta) => resizeBy("needs_owner", delta)}
+                onResizeEnd={endResize}
+              />
+              <View
+                className="rounded-tl-[16px] bg-warning px-2.5 pt-1.5"
+                style={{ width: drag?.key === "needs_owner" ? drag.width : layout.owner }}
+              >
+                <StageHead label={board.owner.label} count={board.owner.cards.length} owner />
+                {ownerContent}
+              </View>
+            </View>
+          )}
+        </View>
       )}
       {props.mode === "threads" ? (
         <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}>
@@ -635,6 +799,31 @@ function ColumnsBoard(props: {
       ) : null}
     </View>
   );
+}
+
+/**
+ * The Columns menu: one on/off item per column (Needs Owner too), then Show
+ * all and Reset widths. Hidden columns stay hidden through a width reset.
+ */
+function columnMenuActions(prefs: BoardColumnPrefs, layout: Extract<BoardLayout, { kind: "columns" }>) {
+  const keys: ReadonlyArray<BoardColumnKey> = [...STAGE_COLUMN_KEYS, "needs_owner"];
+  const items = keys.map((key) => {
+    const hidden = prefs.hidden.includes(key);
+    return {
+      id: columnActionId({ kind: "toggle", key }),
+      title: BOARD_COLUMN_LABELS[key],
+      state: hidden ? ("off" as const) : ("on" as const),
+      attributes: { keepsMenuPresented: true },
+    };
+  });
+  const sized = Object.keys(prefs.widths).length > 0;
+  return [
+    ...items,
+    { id: columnActionId({ kind: "show-all" }), title: "Show all", attributes: { keepsMenuPresented: true } },
+    ...(sized || layout.hidden.length > 0
+      ? [{ id: columnActionId({ kind: "reset" }), title: "Reset widths" }]
+      : []),
+  ];
 }
 
 function ColumnScroll(props: { readonly bottomInset: number; readonly children: React.ReactNode }) {
