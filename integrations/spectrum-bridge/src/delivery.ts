@@ -248,6 +248,15 @@ export class Delivery {
     await this.housekeeping();
   }
 
+  /** Chunks still sent with the thread target: the only ones a late failure can be seen on. */
+  private threadedChunks(id: string): number[] {
+    const indexes: number[] = [];
+    for (let index = 0; this.store.get<Checkpoint>(`chunk:${id}:${index}`); index++) {
+      if (this.store.get<boolean>(`unthreadedChunk:${id}:${index}`) !== true) indexes.push(index);
+    }
+    return indexes;
+  }
+
   /**
    * A threaded text Sendblue accepted and then failed (5504, "unable to resolve inline reply thread")
    * never reached the phone. Send its failed chunks once more without the thread target.
@@ -259,9 +268,11 @@ export class Delivery {
       "SELECT o.id AS id, CAST(k.value AS INTEGER) AS at FROM kv k JOIN outbox o ON o.id = substr(k.key, 9) "
       + "WHERE substr(k.key, 1, 8) = 'sent-at:' AND k.value NOT GLOB '*[^0-9]*' AND CAST(k.value AS INTEGER) >= ? AND o.state = 'sent'",
     ).all(Date.now() - LANDED_WINDOW);
-    const candidates = rows.filter(({ id }) => {
-      const item = this.store.getOperation(id);
-      return item !== undefined && item.replyTo !== undefined && !item.attachment && !item.poll && !item.app;
+    const candidates = rows.flatMap(row => {
+      const item = this.store.getOperation(row.id);
+      if (!item || item.replyTo === undefined || item.attachment || item.poll || item.app) return [];
+      const indexes = this.threadedChunks(row.id);
+      return indexes.length ? [{ ...row, indexes }] : [];
     });
     if (!candidates.length) return;
     let statuses: Map<string, string>;
@@ -270,22 +281,22 @@ export class Delivery {
     } catch {
       return; // the next check tries again
     }
-    for (const { id } of candidates) {
+    for (const { id, indexes } of candidates) {
       const failed: number[] = [];
       let status = "";
-      for (let index = 0; ; index++) {
-        const checkpoint = this.store.get<Checkpoint>(`chunk:${id}:${index}`);
-        if (!checkpoint) break;
-        // Only chunks accepted with the thread target are checked; a resent copy is final.
-        if (this.store.get<boolean>(`unthreadedChunk:${id}:${index}`) === true) continue;
-        const now = checkpoint.providerId ? statuses.get(checkpoint.providerId) : undefined;
+      for (const index of indexes) {
+        const providerId = this.store.get<Checkpoint>(`chunk:${id}:${index}`)?.providerId;
+        const now = providerId ? statuses.get(providerId) : undefined;
         if (now && /^(error|declined|failed)$/i.test(now)) { failed.push(index); status = now; }
       }
       if (!failed.length) continue;
       this.store.db.transaction(() => {
         if (this.store.getOperation(id)?.state !== "sent") return;
         this.store.set(`unthreaded:${id}`, true);
-        for (const index of failed) this.store.db.query("DELETE FROM kv WHERE key = ?").run(`chunk:${id}:${index}`);
+        for (const index of failed) {
+          this.store.db.query("DELETE FROM kv WHERE key = ?").run(`chunk:${id}:${index}`);
+          this.store.set(`lateChunk:${id}:${index}`, true);
+        }
         this.store.outboxState(id, "pending");
       }).immediate();
       this.options.log?.("outbound-async-unthreaded", status.toLowerCase());
@@ -470,7 +481,8 @@ export class Delivery {
             // dedupe-blocks the next one, and replays of the same variant stay idempotent.
             const sendChunk = (plain: boolean) => {
               const unthreaded = item.replyTo !== undefined && this.store.get<boolean>(unthreadedKey) === true;
-              const suffix = `${unthreaded ? ":unthreaded" : ""}${plain ? ":plain" : ""}`;
+              const late = this.store.get<boolean>(`lateChunk:${item.id}:${index}`) === true;
+              const suffix = `${unthreaded ? (late ? ":unthreaded:late" : ":unthreaded") : ""}${plain ? ":plain" : ""}`;
               return this.photon.sendText(Object.freeze({
                 ...(unthreaded ? { chatGuid } : input),
                 // retryOf lets a Sendblue retry find a copy an earlier variant may have sent.
@@ -513,8 +525,8 @@ export class Delivery {
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
-          // Marks copies sent without the thread target, so checkLanded never resends them.
-          if (item.replyTo !== undefined && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
+          // A duplicate may be the threaded copy an unthreaded retry recovered, so only a fresh unthreaded send is marked.
+          if (item.replyTo !== undefined && !result.duplicate && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
             this.store.set(`unthreadedChunk:${item.id}:${index}`, true);
           }
           if (final && item.poll && !result.providerId) {

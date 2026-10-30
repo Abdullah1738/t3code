@@ -20,6 +20,9 @@ const stableId = (id: string, chunk: number, scope = projectScope) =>
 
 const unthreadedId = (id: string, chunk: number) =>
   `bridge-${createHash("sha256").update(`${projectScope}:${id}:${chunk}:unthreaded`).digest("hex")}`;
+// A late resend gets its own id: an unthreaded retry may have cached a threaded copy under the plain one.
+const lateId = (id: string, chunk: number) =>
+  `bridge-${createHash("sha256").update(`${projectScope}:${id}:${chunk}:unthreaded:late`).digest("hex")}`;
 
 function setup(path = ":memory:") {
   const store = new Store(path);
@@ -1041,7 +1044,7 @@ test("a threaded reply Sendblue fails minutes after accepting goes once more wit
   await delivery.tick();
   await delivery.tick();
   expect(h.calls[1]!.replyTo).toBeUndefined();
-  expect(h.calls[1]!.id).toBe(unthreadedId("reply", 0));
+  expect(h.calls[1]!.id).toBe(lateId("reply", 0));
   expect(h.calls[1]!.retryOf).toBe(stableId("reply", 0));
   expect(h.calls[1]!.text).toBe("Use 70% alcohol");
   expect(h.store.getOperation("reply")!.state).toBe("sent");
@@ -1070,7 +1073,7 @@ test("a reply whose chunks fail minutes apart has each threaded chunk resent onc
   await delivery.tick();
   expect(h.calls).toHaveLength(3);
   expect(h.calls[2]!.replyTo).toBeUndefined();
-  expect(h.calls[2]!.id).toBe(unthreadedId("reply", 0));
+  expect(h.calls[2]!.id).toBe(lateId("reply", 0));
 
   statuses.set("provider-2", "ERROR");
   setSystemTime(now + 6 * 60_000);
@@ -1078,7 +1081,7 @@ test("a reply whose chunks fail minutes apart has each threaded chunk resent onc
   await delivery.tick();
   expect(h.calls).toHaveLength(4);
   expect(h.calls[3]!.replyTo).toBeUndefined();
-  expect(h.calls[3]!.id).toBe(unthreadedId("reply", 1));
+  expect(h.calls[3]!.id).toBe(lateId("reply", 1));
   expect(h.store.getOperation("reply")!.state).toBe("sent");
 
   statuses.set("provider-3", "ERROR");
@@ -1110,4 +1113,23 @@ test("delivered replies, unthreaded texts and old sends are left alone", async (
   check.mockClear();
   await delivery.tick();
   expect(check).not.toHaveBeenCalled();
+});
+
+test("a reply Sendblue never accepted as threaded makes no Sendblue history call", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = mock(async (_since: number) => new Map<string, string>());
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses });
+  h.transport.sendText.mockRejectedValueOnce(new TransportError("unauthorized"));
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  setSystemTime(now + 5_000);
+  await delivery.tick();
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]!.replyTo).toBeUndefined();
+  expect(h.store.getOperation("reply")!.state).toBe("sent");
+  setSystemTime(now + 2 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(statuses).not.toHaveBeenCalled();
 });
