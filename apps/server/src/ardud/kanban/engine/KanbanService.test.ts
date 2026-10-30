@@ -4892,18 +4892,23 @@ const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake, true)));
 
 // Fails the next `linkFailures.remaining` threadLinks reads (the recovery scan reads them first).
-const linkFailures = { remaining: 0, afterPass: 0 };
+const linkFailures = { skip: 0, remaining: 0, afterPass: 0 };
 const failingLinkStore = Layer.effect(
   KanbanStore.KanbanStore,
   Effect.gen(function* () {
     const real = yield* KanbanStore.KanbanStore;
     return {
       ...real,
-      threadLinks: (filter) =>
-        linkFailures.remaining > 0
+      threadLinks: (filter) => {
+        if (linkFailures.skip > 0) {
+          linkFailures.skip -= 1;
+          return real.threadLinks(filter);
+        }
+        return linkFailures.remaining > 0
           ? ((linkFailures.remaining -= 1),
             Effect.fail(new KanbanStore.KanbanStoreError({ operation: "read thread links", cause: "injected" })))
-          : real.threadLinks(filter),
+          : real.threadLinks(filter);
+      },
     };
   }),
 );
@@ -4950,3 +4955,80 @@ it.effect("a failed recovery-alert read still wakes the paused thread on a passi
     }).pipe(Effect.provide(failingLinkProbeLayer(fake.layer)));
   }),
 );
+
+// Two models: A (the board default) fails, B (Sol) passes. The model-aware probe arms the
+// threadLinks failure when A's probe fails, so the read lands in the announcement scan that
+// runs right after the failed probe, not in the snapshot read before it.
+const twoModelProbeLayer = (fake: Layer.Layer<KanbanThreads>, armAfterA: () => void) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(
+      fake.pipe(
+        Layer.provideMerge(KanbanModels.layerTest(null)),
+        Layer.provideMerge(failingLinkStore.pipe(Layer.provide(KanbanStore.layer))),
+        Layer.provideMerge(Sqlite.layerMemory),
+        Layer.provideMerge(
+          Layer.mock(TextGeneration.TextGeneration)({
+            generateJson: ((input: { readonly modelSelection: ModelSelection }) => {
+              probe.calls += 1;
+              // Sol is down until the test sets probe.ok; A stays down throughout.
+              if (input.modelSelection.model === "opus/cx/gpt-6.1-sol") {
+                return probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
+              }
+              armAfterA();
+              return Effect.die("out of usage");
+            }) as never,
+          }),
+        ),
+        Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+        Layer.provideMerge(boardFilesLayer),
+      ),
+    ),
+  );
+
+const twoModelScenario = (skip: number) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    linkFailures.skip = 0;
+    linkFailures.remaining = 0;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.setPool(board.id, sol, 2);
+      // Thread A runs the default model and thread B runs Sol; both pause on their own model.
+      const cardA = yield* kanban.createCard(board.id, { prompt: "a", title: "a" }, owner);
+      const cardB = yield* kanban.createCard(board.id, { prompt: "b", title: "b" }, owner);
+      yield* kanban.dispatchNow;
+      const threadA = (yield* kanban.card(cardA.id)).card.activeThreadId!;
+      const threadB = (yield* kanban.card(cardB.id)).card.activeThreadId!;
+      yield* kanban.editCard(cardB.id, { model: sol }, owner);
+      fake.failures.set(threadA, outage);
+      fake.failures.set(threadB, outage);
+      yield* kanban.turnEnded(threadA);
+      yield* kanban.turnEnded(threadB);
+      assert.isNotNull((yield* kanban.caller(threadA))?.paused);
+      assert.isNotNull((yield* kanban.caller(threadB))?.paused);
+      // Scenario: after A's probe fails, the next threadLinks reads skip `skip` and fail once.
+      probe.ok = false;
+      linkFailures.remaining = 0;
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNotNull((yield* kanban.caller(threadA))?.paused);
+      assert.isNotNull((yield* kanban.caller(threadB))?.paused);
+      // Next run: A still fails, B's probe passes and must still wake B.
+      probe.ok = true;
+      yield* TestClock.adjust("20 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(threadB))?.paused ?? null);
+      assert.isNotNull((yield* kanban.caller(threadA))?.paused);
+    }).pipe(Effect.provide(twoModelProbeLayer(fake.layer, () => {
+      linkFailures.skip = skip;
+      linkFailures.remaining = 1;
+    })));
+  });
+
+it.effect("a failed outage-alert scan does not skip the next model's probe", () => twoModelScenario(0));
+it.effect("a failed outage-alert count scan does not skip the next model's probe", () => twoModelScenario(1));

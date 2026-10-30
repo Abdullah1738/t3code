@@ -2979,38 +2979,43 @@ const make = Effect.gen(function* () {
           recovered: state?.recovered ?? new Set(),
         }),
       );
-      // One alert per board per outage, after the first failed probe, so threads that die in the same minutes are counted.
-      // A board whose post failed is not marked announced and is retried by the next failed probe.
-      const unannounced = yield* lock.withPermits(1)(
-        Effect.gen(function* () {
-          const boards = new Set<KanbanBoard["id"]>();
-          for (const { link, board } of yield* pausedLinks) {
-            if (linkKey(link, board) === key) boards.add(board.id);
-          }
-          const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
-          const unannounced = new Set<KanbanBoard["id"]>();
-          for (const id of boards) if (!announced.has(id)) unannounced.add(id);
-          return unannounced;
-        }),
-      );
-      if (unannounced.size > 0) {
-        const posted = yield* lock.withPermits(1)(
-          alertBoards(
-            key,
-            unannounced,
-            (count) =>
-              `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
-          ),
+      // The whole announcement is optional: a failed read here must not skip the next model's probe.
+      yield* Effect.gen(function* () {
+        // One alert per board per outage, after the first failed probe, so threads that die in the same minutes are counted.
+        // A board whose post failed is not marked announced and is retried by the next failed probe.
+        const unannounced = yield* lock.withPermits(1)(
+          Effect.gen(function* () {
+            const boards = new Set<KanbanBoard["id"]>();
+            for (const { link, board } of yield* pausedLinks) {
+              if (linkKey(link, board) === key) boards.add(board.id);
+            }
+            const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
+            const unannounced = new Set<KanbanBoard["id"]>();
+            for (const id of boards) if (!announced.has(id)) unannounced.add(id);
+            return unannounced;
+          }),
         );
-        yield* Ref.update(down, (map) => {
-          const entry = map.get(key);
-          if (!entry) return map;
-          return new Map(map).set(key, {
-            ...entry,
-            announced: new Set([...entry.announced, ...posted]),
+        if (unannounced.size > 0) {
+          const posted = yield* lock.withPermits(1)(
+            alertBoards(
+              key,
+              unannounced,
+              (count) =>
+                `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
+            ),
+          );
+          yield* Ref.update(down, (map) => {
+            const entry = map.get(key);
+            if (!entry) return map;
+            return new Map(map).set(key, {
+              ...entry,
+              announced: new Set([...entry.announced, ...posted]),
+            });
           });
-        });
-      }
+        }
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("kanban outage alert failed", { key, cause })),
+      );
     }
   });
 
