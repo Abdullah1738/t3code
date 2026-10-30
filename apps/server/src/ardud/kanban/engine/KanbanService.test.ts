@@ -3135,62 +3135,6 @@ it.effect("new cards from a script share one packets evaluator", () =>
   }),
 );
 
-const packetsEvaluator = (fake: { readonly threads: Ref.Ref<Map<string, FakeThread>> }) =>
-  Effect.gen(function* () {
-    const evaluators = [...(yield* Ref.get(fake.threads)).entries()].filter(
-      ([, view]) => view.title === "Evaluator: packets",
-    );
-    assert.strictEqual(evaluators.length, 1);
-    const [threadId, view] = evaluators[0]!;
-    return { threadId: ThreadId.make(threadId), model: view.model };
-  });
-
-it.effect("packets evaluator runs on the board's packets model", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const packets = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
-      yield* kanban.updateBoard(board.id, { packetsModel: packets });
-      const thread: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker-1") };
-      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, thread);
-      const evaluator = yield* packetsEvaluator(fake);
-      assert.deepStrictEqual(evaluator.model, packets);
-      assert.deepStrictEqual((yield* kanban.caller(evaluator.threadId))?.model, packets);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
-);
-
-it.effect("packets evaluator falls back to the evaluator model", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const thread: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker-1") };
-      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, thread);
-      const evaluator = yield* packetsEvaluator(fake);
-      assert.deepStrictEqual(evaluator.model, board.evaluatorModel);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
-);
-
-it.effect("clearing the packets model goes back to the evaluator model", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const packets = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
-      yield* kanban.updateBoard(board.id, { packetsModel: packets });
-      const cleared = yield* kanban.updateBoard(board.id, { packetsModel: null });
-      assert.isNull(cleared.packetsModel);
-      const thread: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker-1") };
-      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, thread);
-      const evaluator = yield* packetsEvaluator(fake);
-      assert.deepStrictEqual(evaluator.model, board.evaluatorModel);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
-);
-
 it.effect("a sweep gets its text, and a board runs one sweep of a kind at a time", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

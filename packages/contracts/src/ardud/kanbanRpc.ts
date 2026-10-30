@@ -119,7 +119,6 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   defaultProjectId: Schema.optional(Schema.NullOr(ProjectId)),
   managerModel: Schema.optional(ModelSelection),
   evaluatorModel: Schema.optional(ModelSelection),
-  packetsModel: Schema.optional(Schema.NullOr(ModelSelection)),
   defaultCardModel: Schema.optional(ModelSelection),
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),

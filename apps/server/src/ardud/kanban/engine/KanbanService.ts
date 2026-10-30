@@ -171,7 +171,6 @@ export type BoardPatch = Partial<
     | "defaultProjectId"
     | "managerModel"
     | "evaluatorModel"
-    | "packetsModel"
     | "defaultCardModel"
     | "reviewChains"
     | "defaultReviewChain"
@@ -1542,16 +1541,11 @@ const make = Effect.gen(function* () {
     }
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
-    // A packets evaluator runs on the board's packets model when it has one; null keeps the evaluator model.
-    const model =
-      purpose.kind === "packets"
-        ? (board.packetsModel ?? board.evaluatorModel)
-        : board.evaluatorModel;
     const threadId = yield* threads.launch({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${at}`,
       projectId: board.defaultProjectId,
       title,
-      model,
+      model: board.evaluatorModel,
       text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
     yield* linkThread(
@@ -1565,7 +1559,7 @@ const make = Effect.gen(function* () {
           purpose.kind === "discussion"
             ? KanbanDiscussionId.make(purpose.discussionId)
             : (setupDiscussion?.id ?? null),
-        model,
+        model: board.evaluatorModel,
         startedAt: at,
         endedAt: null,
         paused: null,
@@ -3201,7 +3195,6 @@ const make = Effect.gen(function* () {
     };
     add(board.managerModel);
     add(board.evaluatorModel);
-    if (board.packetsModel) add(board.packetsModel);
     add(board.defaultCardModel);
     for (const chain of board.reviewChains) for (const step of chain.steps) add(step);
     return [...seen.values()];
@@ -3256,7 +3249,6 @@ const make = Effect.gen(function* () {
       defaultProjectId: input.defaultProjectId,
       managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
       evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
-      packetsModel: null,
       defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
       reviewChains: [],
       defaultReviewChain: null,
@@ -3287,7 +3279,6 @@ const make = Effect.gen(function* () {
         const next: KanbanBoard = { ...board, ...patch };
         if (patch.managerModel) yield* checkModel(patch.managerModel);
         if (patch.evaluatorModel) yield* checkModel(patch.evaluatorModel);
-        if (patch.packetsModel) yield* checkModel(patch.packetsModel);
         if (patch.defaultCardModel) yield* checkModel(patch.defaultCardModel);
         // Only steps that differ from the stored chain are checked. A step already saved
         // (even if its model has since left the catalog) must not block fixing another step.
@@ -4416,7 +4407,6 @@ const make = Effect.gen(function* () {
         const boardUses: Array<[string, ModelSelection | undefined]> = [
           ["the manager model", board.managerModel],
           ["the evaluator model", board.evaluatorModel],
-          ["the packets model", board.packetsModel ?? undefined],
           ["the default card model", board.defaultCardModel],
         ];
         for (const [label, used] of boardUses) {

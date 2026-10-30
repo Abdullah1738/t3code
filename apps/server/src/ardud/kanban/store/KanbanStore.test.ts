@@ -31,7 +31,6 @@ const board: KanbanBoard = {
   defaultProjectId: null,
   managerModel: model,
   evaluatorModel: model,
-  packetsModel: null,
   defaultCardModel: model,
   reviewChains: [],
   defaultReviewChain: null,

@@ -132,7 +132,6 @@ const BoardBody = Schema.Struct({
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   managerModel: Schema.optional(ModelBody),
   evaluatorModel: Schema.optional(ModelBody),
-  packetsModel: Schema.optional(Schema.NullOr(ModelBody)),
   defaultCardModel: Schema.optional(ModelBody),
   reviewChains: Schema.optional(
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
@@ -286,11 +285,6 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(input.managerModel ? { managerModel: modelSelectionOf(input.managerModel) } : {}),
           ...(input.evaluatorModel
             ? { evaluatorModel: modelSelectionOf(input.evaluatorModel) }
-            : {}),
-          ...(input.packetsModel !== undefined
-            ? {
-                packetsModel: input.packetsModel ? modelSelectionOf(input.packetsModel) : null,
-              }
             : {}),
           ...(input.defaultCardModel
             ? { defaultCardModel: modelSelectionOf(input.defaultCardModel) }

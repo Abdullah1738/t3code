@@ -54,7 +54,6 @@ const board: KanbanBoard = {
   defaultProjectId: null,
   managerModel: haiku,
   evaluatorModel: opus,
-  packetsModel: null,
   defaultCardModel: opus,
   reviewChains: [
     { name: "Critical", steps: [sol, astra] },
