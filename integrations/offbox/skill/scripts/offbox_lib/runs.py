@@ -601,9 +601,10 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
-           start_offsets=(0, 0)) -> int | None:
+           start_offsets=(0, 0), stop_evt: threading.Event | None = None) -> int | None:
     out_off, err_off = start_offsets
-    stop_evt = threading.Event()
+    # A caller may pass its own event to stop the follower and its TTL keeper from outside (see lease._follow_bounded).
+    stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
     keeper.start()
     lf = open(log_path, "ab") if log_path else None

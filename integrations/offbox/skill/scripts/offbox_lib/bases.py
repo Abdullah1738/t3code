@@ -136,6 +136,9 @@ def _slots_left(allowance: dict) -> int:
 # or the record is older than _PENDING_S. Shared across processes through the kv table, under _SLOT_LOCK.
 _SLOT_LOCK = "saved-slots"
 _PENDING_S = 6 * 3600
+# A reservation whose name never shows in boat's list is released only after this long: longer than any single
+# save wait, so an accepted save still in flight can't lose its slot to a racing list read.
+_PRESENT_GRACE_S = 30 * 60
 
 
 def _pending_load(con) -> dict:
@@ -152,17 +155,37 @@ def _pending_put(con, sname: str, box_id: str | None) -> None:
     kv_set(con, "saved_pending", p)
 
 
+def _reconcile_pending(con, snaps: list[dict]) -> None:
+    """Drop a pending reservation only when boat's list proves it is not taking a slot: the name is absent (the
+    save never landed or was removed) and the reservation is older than the wait it could still be in flight.
+    A name present with status 'failed' or still pending keeps its reservation."""
+    p = kv_get(con, "saved_pending") or {}
+    names = {s.get("name") for s in snaps}
+    changed = False
+    for sname, v in list(p.items()):
+        if sname in names:
+            continue
+        if now() - v.get("ts", 0) > _PRESENT_GRACE_S:
+            p.pop(sname, None)
+            changed = True
+            event(con, v.get("box"), "saved_reservation_released", sname)
+    if changed:
+        kv_set(con, "saved_pending", p)
+
+
 def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[dict] | None = None,
                allowance: dict | None = None, timeout: float = 300) -> bool:
     """Save box_id as boat saved snapshot sname and record it. Only replaces a snapshot of that name or uses a
     free included slot: never one that costs money. Never raises.
 
-    With snaps=None the allowance is read fresh under _SLOT_LOCK, so concurrent callers (reaper, template builds,
-    base saves in other processes) see each other's accepted saves and serialize their checks."""
+    The list and allowance are always read under _SLOT_LOCK (the arguments are ignored), so every caller in every
+    process sees the saves the others accepted. The lock wait and every boat call are capped by the active budget."""
+    del snaps, allowance  # a caller's cached list is stale by the time it gets the lock
+    lock_wait = max(1.0, min(max(60, timeout), (api.left() or max(60, timeout)) - 5))
     try:
-        with file_lock(_SLOT_LOCK, timeout=max(60, timeout)):
-            if snaps is None:
-                snaps, allowance = api.saved_list()
+        with file_lock(_SLOT_LOCK, timeout=lock_wait):
+            snaps, allowance = api.saved_list()
+            _reconcile_pending(con, snaps)
             ready_names = {s.get("name") for s in snaps if s.get("status") == "ready"}
             pending = {k for k in _pending_load(con) if k not in ready_names and k != sname}
             used = int((allowance or {}).get("used") or 0) + len(pending)
@@ -171,12 +194,16 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
                 say(f"note: no free saved-snapshot slot for {table[:-1]} {name}; the reaper keeps its box alive instead")
                 event(con, box_id, "saved_no_slot", f"{name} {sname}")
                 return False
+            # Written before the request: an accepted save whose response is lost must still hold its slot.
             _pending_put(con, sname, box_id)
             try:
                 api.save(box_id, sname)
-            except OffboxError:
-                _pending_put(con, sname, None)  # boat refused: nothing was taken
+            except api.ApiError as e:
+                if 400 <= e.status < 500 and e.status not in (408, 409, 429):
+                    _pending_put(con, sname, None)  # definitive refusal: boat took nothing
                 raise
+            # Any other failure (timeout, 5xx, lost response) is ambiguous: the reservation stays until
+            # _reconcile_pending sees the snapshot list without it.
             deadline = now() + timeout
             while True:
                 snap = api.saved_get(sname) or {}
@@ -184,11 +211,10 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
                     _pending_put(con, sname, None)
                     break
                 if snap.get("status") == "failed":
-                    _pending_put(con, sname, None)
                     raise OffboxError(f"saved snapshot {sname}: failed {snap.get('error') or ''}")
-                if now() > deadline:
+                if now() > deadline or (api.left() is not None and api.left() < 3):
                     # Still counted as pending (see _pending_load) until boat reports it or it ages out.
-                    raise OffboxError(f"saved snapshot {sname}: still {snap.get('status') or 'pending'} after {int(timeout)}s")
+                    raise OffboxError(f"saved snapshot {sname}: still {snap.get('status') or 'pending'}")
                 time.sleep(2)
     except OffboxError as e:
         say(f"warning: could not keep {table[:-1]} {name} as saved snapshot {sname}: {e}")
@@ -469,11 +495,8 @@ def _upkeep(con, live: dict, dry: bool, actions: list[str], act) -> None:
                     continue
                 saves -= 1
                 kind = table[:-1]
-                if keep_saved(con, table, r["name"], r["box_id"], saved_name(kind, r["name"]), snaps, allowance,
-                              timeout=30):
+                if keep_saved(con, table, r["name"], r["box_id"], saved_name(kind, r["name"]), timeout=30):
                     actions.append(f"saved {kind} {r['name']} as {saved_name(kind, r['name'])}")
-                    snaps = snaps + [{"name": saved_name(kind, r["name"])}]
-                    allowance = dict(allowance, used=int(allowance.get("used") or 0) + 1)
             rows = _reread(con, rows)
     for table, r in rows:
         if r["saved"]:

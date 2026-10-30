@@ -270,12 +270,53 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 RECIPE_TIMEOUT_S = 15 * 60
 
 
+def _recipe_stopped(box_id: str, pid: int) -> bool:
+    """True only when boat confirms the recipe process is no longer running (a failed read is not confirmation)."""
+    try:
+        st = api.cmd_status(box_id, pid)
+    except OffboxError:
+        return False
+    return bool(st) and not st.get("running") and st.get("status") in ("exited", "lost", "killed")
+
+
+def _quarantine(box_id: str, why: str) -> None:
+    """The box stays out of pools and reuse until its recipe is confirmed stopped (see _release_quarantine)."""
+    con = db()
+    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
+    con.commit()
+    event(con, box_id, "lease_quarantined", why[:300])
+
+
+def release_quarantine(con, box_id: str) -> bool:
+    """Return a quarantined lease to 'stopped' (never 'running': it must be reused via bring-up again). Only when
+    the recipe is confirmed stopped; a lost kill response leaves it quarantined."""
+    row = con.execute("SELECT state FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    if not row or row["state"] != "quarantined":
+        return False
+    pid = _quarantined_pid(con, box_id)
+    if pid is None or not _recipe_stopped(box_id, pid):
+        return False
+    con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+    con.commit()
+    event(con, box_id, "lease_quarantine_released", f"recipe pid {pid} confirmed stopped")
+    return True
+
+
+def _quarantined_pid(con, box_id: str):
+    r = con.execute("SELECT detail FROM events WHERE box_id=? AND kind='lease_recipe_pid' ORDER BY ts DESC LIMIT 1",
+                    (box_id,)).fetchone()
+    try:
+        return int(r["detail"]) if r else None
+    except (TypeError, ValueError):
+        return None
+
+
 def run_recipe(box_id: str, name: str) -> None:
-    """Build a template's environment on this box (the script `offbox template build` runs). Best effort: a
-    recipe that fails or times out is reported and the lease is not used as ready (see _bring_up)."""
+    """Build a template's environment on this box (the script `offbox template build` runs). A recipe that fails
+    is reported. A recipe that times out, or whose kill cannot be confirmed, quarantines the lease and raises:
+    the box is never handed out as ready while its old recipe may still be changing it."""
     from . import bases
     from .common import LOGS_DIR
-    from .runs import follow
     t = now()
     log_path = LOGS_DIR / f"recipe-{name}-{box_id}.log"
     pid = None
@@ -288,39 +329,53 @@ def run_recipe(box_id: str, name: str) -> None:
             bases.template_uploads(name, box_id)
             r = api.cmd_start(box_id, "bash -lc " + shlex.quote("bash ~/.offbox/recipe.sh"))
             pid = r["processId"]
+            event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - reported below; the caller decides what a failed recipe means
         code = f"error: {e}"
     touch(box_id)
     event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
     if code == "timeout":
-        try:
-            if pid is not None:
+        con = db()
+        _quarantine(box_id, f"{name} recipe timed out")
+        stopped = False
+        if pid is not None:
+            try:
                 api.cmd_kill(box_id, pid)
-        except OffboxError as e:
-            say(f"warning: could not stop the recipe process on {box_id}: {e}")
+            except OffboxError as e:
+                say(f"warning: could not stop the recipe process on {box_id}: {e}")
+            stopped = _recipe_stopped(box_id, pid)
+        if stopped:
+            release_quarantine(con, box_id)
         raise OffboxError(f"recipe {name} did not finish within {RECIPE_TIMEOUT_S // 60} min on {box_id}; "
-                          "its process was stopped, the lease is not ready")
+                          f"the box is quarantined until its recipe is confirmed stopped "
+                          f"({'stopped' if stopped else 'kill not confirmed'})")
     if code != 0:
         say(f"warning: {name} recipe did not finish on {box_id} ({code}); log {log_path}")
 
 
 def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
-    """follow() in a helper thread, returning 'timeout' if the deadline passes first."""
+    """follow() in a helper thread, joined up to timeout_s. 'timeout' means the follower (and its TTL keeper) is
+    still running: they are signalled to stop, then joined briefly, and the caller must not treat the box as idle."""
     import threading
     from .runs import follow
     result: dict = {}
+    stop_evt = threading.Event()
 
     def run():
         try:
-            result["code"] = follow(box_id, pid, log_path, echo=False)
+            result["code"] = follow(box_id, pid, log_path, echo=False, stop_evt=stop_evt)
         except Exception as e:  # noqa: BLE001
             result["code"] = f"error: {e}"
 
     th = threading.Thread(target=run, daemon=True)
     th.start()
     th.join(timeout_s)
-    return "timeout" if th.is_alive() else result.get("code")
+    if th.is_alive():
+        stop_evt.set()
+        th.join(10)
+        return "timeout"
+    return result.get("code")
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:

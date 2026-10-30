@@ -209,25 +209,107 @@ class ExpiryTests(Isolated):
     def test_keep_saved_never_spends_beyond_the_included_slots(self):
         self.template()
         full = {"included": 50, "used": 50}
-        with patch.object(api, "save") as save:
-            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-x",
-                                              [], full))
+        with patch.object(api, "saved_list", return_value=([], full)), patch.object(api, "save") as save:
+            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-x"))
         save.assert_not_called()
         # Replacing a snapshot of the same name doesn't take a new slot.
-        with patch.object(api, "save") as save, \
+        with patch.object(api, "saved_list", return_value=([{"name": "offbox-template-x", "status": "ready"}], full)), \
+                patch.object(api, "save") as save, \
                 patch.object(api, "saved_get", return_value={"status": "ready", "sourceSandboxId": "bx_tpl"}):
-            self.assertTrue(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-x",
-                                             [{"name": "offbox-template-x"}], full))
+            self.assertTrue(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-x"))
         save.assert_called_once_with("bx_tpl", "offbox-template-x")
         self.assertEqual(self.con.execute("SELECT saved FROM templates").fetchone()[0], "offbox-template-x")
 
+    def test_stale_cached_list_cannot_take_the_last_slot(self):
+        # upkeep listed 49 of 50 used; another save finished after that list but before our lock. The fresh read
+        # under the lock shows 50 used, so the second save must be refused (no paid snapshot #51).
+        self.template()
+        fresh = {"included": 50, "used": 50}
+        with patch.object(api, "saved_list", return_value=([], fresh)), patch.object(api, "save") as save:
+            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-x",
+                                              [], {"included": 50, "used": 49}))
+        save.assert_not_called()
+
+    def test_ambiguous_save_keeps_its_slot_until_reconciled(self):
+        # The save was accepted but the response was lost (5xx/timeout): boat counts a slot, the list is stale.
+        # The reservation must survive, so the next check sees 50 used and refuses.
+        self.template()
+        lost = api.ApiError(502, "upstream", "response lost")
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 49})), \
+                patch.object(api, "save", side_effect=lost):
+            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-a"))
+        self.assertIn("offbox-template-a", bases._pending_load(self.con))
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 49})), patch.object(api, "save") as save:
+            self.assertFalse(bases.keep_saved(self.con, "bases", "repo:b", "bx_b", "offbox-base-b-000000"))
+        save.assert_not_called()
+
+    def test_definitive_refusal_releases_the_reservation(self):
+        self.template()
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})), \
+                patch.object(api, "save", side_effect=api.ApiError(400, "credit_required", "no credit")):
+            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-r"))
+        self.assertNotIn("offbox-template-r", bases._pending_load(self.con))
+
     def test_keep_saved_failure_is_only_a_warning(self):
         self.template()
-        with patch.object(api, "save", side_effect=api.ApiError(400, "credit_required", "no credit")):
-            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "n", [],
-                                              {"included": 50, "used": 0}))
+        with patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})), \
+                patch.object(api, "save", side_effect=api.ApiError(400, "credit_required", "no credit")):
+            self.assertFalse(bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "n"))
         self.assertIsNone(self.con.execute("SELECT saved FROM templates").fetchone()[0])
         self.assertIn("saved_failed", self.kinds("bx_tpl"))
+
+    def test_retry_sleep_respects_the_budget(self):
+        # A connect failure with a near-spent budget must not sleep past the deadline or retry six times.
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise api.ApiError(502, "sandbox_direct_failed", "connect EADDRNOTAVAIL")
+
+        with patch("urllib.request.urlopen", side_effect=lambda *a, **k: boom()), \
+                patch.object(api, "_key", return_value="k"), patch.object(api.time, "sleep") as sleep:
+            with api.budget(0.5):
+                with self.assertRaises(Exception):
+                    api.call("POST", "/sandboxes", {}, {"Idempotency-Key": "x"})
+        self.assertEqual(sleep.call_count, 0)
+
+    def test_keep_saved_lock_wait_is_capped_by_the_budget(self):
+        # The reap budget has seconds left: the slot lock must not block for the 60 s default.
+        self.template()
+        real = bases.file_lock
+        seen = []
+
+        def spy(name, timeout=600):
+            seen.append(timeout)
+            return real(name, timeout=0.5)  # keep the test fast: the real lock is free anyway
+
+        with api.budget(8), patch.object(bases, "file_lock", side_effect=spy), \
+                patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})), \
+                patch.object(api, "save", side_effect=api.ApiError(400, "x", "refused")):
+            bases.keep_saved(self.con, "templates", "crpko-node", "bx_tpl", "offbox-template-w", timeout=300)
+        self.assertTrue(seen and seen[0] <= 8, seen)
+
+    def test_recipe_timeout_with_lost_kill_stays_quarantined(self):
+        # The follower never ends and the kill response is lost: the lease must stay quarantined, never 'stopped'
+        # or 'running', so pool/reuse cannot hand it out, and it is not released without a confirmed stop.
+        con = common.db()
+        con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, size, source, state, "
+                    "created_at, last_used_at) VALUES ('bx_q','o','/r','rk','d','small','recipe:generic',"
+                    "'running',0,0)")
+        con.commit()
+        with patch.object(lease, "RECIPE_TIMEOUT_S", 0), \
+                patch.object(bases, "recipe", return_value=("echo", "sha")), \
+                patch.object(lease.ssh_sync, "put_file"), patch.object(bases, "template_uploads"), \
+                patch.object(lease.api, "cmd_start", return_value={"processId": 9}), \
+                patch.object(lease, "_follow_bounded", return_value="timeout"), \
+                patch.object(lease.api, "cmd_kill", side_effect=api.ApiError(500, "x", "lost")), \
+                patch.object(lease.api, "cmd_status", return_value=None):
+            with self.assertRaises(common.OffboxError):
+                lease.run_recipe("bx_q", "generic")
+        self.assertEqual(con.execute("SELECT state FROM leases WHERE box_id='bx_q'").fetchone()[0], "quarantined")
+        self.assertFalse(lease.release_quarantine(con, "bx_q"))
+        self.assertNotIn("bx_q", [r["box_id"] for r in con.execute(
+            "SELECT box_id FROM leases WHERE state IN ('running','stopped')")])
 
     def test_rm_base_deletes_its_saved_snapshot(self):
         self.base(saved="offbox-base-x")

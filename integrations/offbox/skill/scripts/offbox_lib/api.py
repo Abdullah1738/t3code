@@ -79,6 +79,11 @@ def left() -> float | None:
     return None if _DEADLINE is None else _DEADLINE - time.time()
 
 
+def _room(pause: float) -> bool:
+    """True when a retry that sleeps `pause` seconds still fits the budget (always True without one)."""
+    return _DEADLINE is None or _DEADLINE - time.time() > pause + 1.0
+
+
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable)."""
@@ -125,13 +130,14 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if e.code == 404 and ok404:
                 return None
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
-            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)):
+            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and _room(1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
             # boat's proxy failed to *connect* to the sandbox host, so the request never
             # reached the box: safe to retry even for non-idempotent POSTs (e.g. 2026-10-14
             # "502 sandbox_direct_failed: connect EADDRNOTAVAIL", ~7% of calls for an hour).
-            if _never_delivered(e.code, code, msg) and attempt <= max(retries, CONNECT_RETRIES):
+            if _never_delivered(e.code, code, msg) and attempt <= max(retries, CONNECT_RETRIES) \
+                    and _room(min(2.0 * attempt, 8)):
                 log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
                 time.sleep(min(2.0 * attempt, 8))
                 continue
@@ -141,7 +147,7 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if request_id:
                 capacity.complete(request_id, "uncertain")
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
-            if attempt <= retries and safe_method:
+            if attempt <= retries and safe_method and _room(1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
             log(f"api {method} {path} -> network {e}")
