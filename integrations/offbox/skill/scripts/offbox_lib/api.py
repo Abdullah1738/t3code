@@ -107,6 +107,15 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
         req = urllib.request.Request(url, data=data, method=method, headers=h)
         request_id = capacity.reserve(path.rsplit("/", 1)[-1],
                                       path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
+        if _DEADLINE is not None:
+            # capacity.reserve may wait on SQLite (BEGIN IMMEDIATE, 30 s busy timeout): recompute what is left now,
+            # and never send a request whose budget is already gone.
+            room = _DEADLINE - time.time()
+            if room <= 0:
+                if request_id:
+                    capacity.complete(request_id, "not_sent")
+                raise OffboxError(f"boat API budget spent before sending {method} {path}")
+            req_timeout = min(timeout, max(1.0, room))
         try:
             with urllib.request.urlopen(req, timeout=req_timeout) as r:
                 raw = r.read()

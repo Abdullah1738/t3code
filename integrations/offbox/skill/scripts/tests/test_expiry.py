@@ -332,6 +332,24 @@ class ExpiryTests(Isolated):
         self.assertGreaterEqual(sleep.call_count, 1)
         self.assertLessEqual(timeouts[1], timeouts[0] - 0.4, timeouts)
 
+    def test_reservation_wait_is_charged_to_the_request_budget(self):
+        # capacity.reserve (SQLite, BEGIN IMMEDIATE) waits before the request is sent. Here it consumes the budget:
+        # the request must be aborted unsent, and urlopen must never run with the stale timeout.
+        def reserve_that_takes_the_budget(*a, **k):
+            # Model 0.6 s of SQLite waiting: the reservation returns after the deadline has moved on.
+            api._DEADLINE -= 0.6
+            return 42
+
+        with patch.object(api.capacity, "reserve", side_effect=reserve_that_takes_the_budget), \
+                patch.object(api.capacity, "complete") as complete, \
+                patch("urllib.request.urlopen") as urlopen, patch.object(api.time, "sleep"):
+            with api.budget(0.5):
+                with self.assertRaises(common.OffboxError) as cm:
+                    api.call("POST", "/sandboxes", {"type": "large"}, {"Idempotency-Key": "k"})
+        urlopen.assert_not_called()
+        complete.assert_called_once_with(42, "not_sent")
+        self.assertIn("budget spent", str(cm.exception))
+
     def test_keep_saved_lock_wait_is_capped_by_the_budget(self):
         # The reap budget has seconds left: the slot lock must not block for the 60 s default.
         self.template()
@@ -384,6 +402,24 @@ class ExpiryTests(Isolated):
             pool.release_guard(row)
         reuse.assert_not_called()
         self.assertEqual(row["box_id"], "bx_new")
+
+    def test_ssh_bring_up_failure_retires_the_recipe_box_before_any_reuse(self):
+        # The box fails before the recipe starts (SSH never comes up). It is blank: it must be retired, not left as a
+        # pool candidate that a later acquisition would return as recipe:crpko-node without building Node.
+        with patch.object(api, "create", return_value={"id": "bx_ssh"}), patch.object(api, "rename"), \
+                patch.object(lease, "pick_template", return_value="crpko-node"), \
+                patch.object(lease, "_bring_up", side_effect=common.OffboxError("ssh never came up")), \
+                patch.object(api, "cmd_kill"), patch.object(api, "usage", return_value=None), \
+                patch.object(api, "delete", return_value={}) as delete, \
+                patch.object(lease, "_reuse") as reuse, \
+                patch.object(lease, "ssh_sync"):
+            self.template(expired_at=common.now())
+            with self.assertRaises(common.OffboxError):
+                lease.acquire_private(self.me, template="crpko-node")
+        delete.assert_called_once_with("bx_ssh")
+        self.assertEqual(self.state("bx_ssh"), "deleted")
+        self.assertEqual(pool.candidates(self.con, "repo", None, "template:crpko-node")[0], [])
+        reuse.assert_not_called()
 
     def test_failed_recipe_is_never_marked_ready(self):
         self.recipe_lease("bx_f")

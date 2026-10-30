@@ -404,9 +404,10 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
                      me["repo_root"], me["repo_key"], rdir, sz, source, t, t))
         con.commit()
         event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
+        is_recipe = source.startswith("recipe:")
         try:
             _bring_up(box_id, fresh=(source == "fresh"),
-                      recipe=source.split(":", 1)[1] if source.startswith("recipe:") else None)
+                      recipe=source.split(":", 1)[1] if is_recipe else None)
             try:
                 api.rename(box_id, box_name(me, me["repo_key"]))
             except OffboxError:
@@ -414,7 +415,11 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             if base_dir and base_dir != rdir:
                 ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
                                      f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
-        except OffboxError:
+        except OffboxError as e:
+            # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
+            # half built. It must not stay a pool candidate, or a later acquisition would hand it out as ready.
+            if is_recipe:
+                _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
             raise
         event(con, box_id, "lease_ready", f"{round(now() - t, 1)}s")
         con.execute("UPDATE leases SET ssh_ready_at=? WHERE box_id=?", (now(), box_id))
