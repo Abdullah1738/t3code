@@ -51,7 +51,6 @@ import {
   filterActionId,
   parseColumnAction,
   parseFilterAction,
-  type ColumnAction,
   type FilterAction,
 } from "./logic";
 import { useKanbanBoardThreads } from "./kanbanStore";
