@@ -4556,12 +4556,10 @@ const make = Effect.gen(function* () {
         const snapshot = yield* read(snapshotOf(boardId));
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
-          Stream.map(
-            (entry): KanbanWatchEvent => ({
-              _tag: "change",
-              change: feedChange(entry.change),
-            }),
-          ),
+          Stream.map((entry): KanbanWatchEvent => ({
+            _tag: "change",
+            change: feedChange(entry.change),
+          })),
         );
         return Stream.concat(
           Stream.succeed<KanbanWatchEvent>({
