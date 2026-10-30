@@ -1032,6 +1032,7 @@ class RunnerHookTests(NoNetwork):
                 patch.object(runs.ssh_sync, "put_file"), \
                 patch.object(runs.ssh_sync, "push", side_effect=lambda *a, **k: order.append("push") or {}), \
                 patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \
+                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
                 patch.object(runs.prune, "run", side_effect=lambda con, box, d: order.append(("prune", box, d)) or 0) as pr, \
                 patch.object(api, "cmd_start", side_effect=api.ApiError(400, "x", "y")), \
                 contextlib.redirect_stderr(io.StringIO()):

@@ -11,7 +11,7 @@ import sys
 import time
 
 from . import api, capacity, lease, pool, ssh_sync
-from .common import (CAP_PATH, EXEMPTIONS, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
+from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
                      month_key, now, read_json, say)
 
 
@@ -71,7 +71,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if (d.get("note") or "").startswith(TOO_BIG_NOTE) else ""
+        note = f"  [{d['note']}]" if (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 

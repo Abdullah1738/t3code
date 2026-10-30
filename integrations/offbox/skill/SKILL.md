@@ -114,6 +114,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
   A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
   stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
   lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
+  A box whose filesystem has died (`Transport endpoint is not connected`) is caught by a write check before the sync, or by the sync itself: it is stopped, marked `dead-mount:` and taken out of the pool, and the run moves to another box (once). `offbox list --all` shows it; `offbox release <id> --delete` removes it.
 
 ## Options
 
@@ -126,7 +127,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id>` (exits with its code, does `--pull`) |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |

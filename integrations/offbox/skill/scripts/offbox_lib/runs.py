@@ -533,32 +533,30 @@ class Runner:
         size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
         if size != a.size:
             say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
-        row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
-        self.lease_row = row
-        self.box = row["box_id"]
-        rdir = row["remote_dir"]
-        self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
-                    docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
-        prune.run(con, self.box, rdir)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
-        err: list = []
-        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
-        tw.start()
-        if not a.no_sync:
-            st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
-            self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
-            say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
-                f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
-            skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
-            if skipped:
-                say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
-                    f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
-        tw.join()
-        if err:
-            raise err[0]
+        for attempt in (1, 2):
+            row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+            self.lease_row = row
+            self.box = row["box_id"]
+            rdir = row["remote_dir"]
+            self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
+                        docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            try:
+                self._prepare_box(con, a, rdir, env_file, body)
+                break
+            except lease.DeadMount as e:
+                dead = self.box
+                self.record(box_id=None)  # our run row must not point at the box we stop
+                lease.set_aside_dead_mount(con, dead, e.reason)
+                pool.release_guard(row)
+                self.lease_row = self.box = None
+                if attempt == 2:
+                    raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
+                                      "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+                say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
+                    "Trying another box")
         try:
             w = node_version.want(self.root, self.cwd)
             node_block = node_version.block(w) if w else ""
@@ -596,6 +594,41 @@ class Runner:
         event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
                                           f"cmd={cmd_text[:200]}")
         return row
+
+    def _prepare_box(self, con, a, rdir, env_file, body) -> None:
+        """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
+        # The probe goes before prune: prune's ssh hangs on a dead filesystem.
+        reason = ssh_sync.probe_home(self.box)
+        if reason:
+            raise lease.DeadMount(self.box, reason)
+        prune.run(con, self.box, rdir)
+        # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
+        err: list = []
+        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
+        tw.start()
+        try:
+            if not a.no_sync:
+                try:
+                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                except OffboxError as e:
+                    reason = ssh_sync.dead_mount(str(e))
+                    if reason:
+                        raise lease.DeadMount(self.box, reason) from e
+                    raise
+                self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
+                say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
+                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
+                if skipped:
+                    say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
+                        f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
+        finally:
+            tw.join()
+        if err:
+            reason = ssh_sync.dead_mount(str(err[0]))
+            if reason:
+                raise lease.DeadMount(self.box, reason) from err[0]
+            raise err[0]
 
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
