@@ -27,7 +27,7 @@ export function DatabaseStorageNotice({ target }: { readonly target: SettingsTar
   return (
     <SettingsSection title={`Reclaim ${gib} GiB on ${target.label}`}>
       <View className="gap-3 p-4">
-        <Text className="text-sm text-muted-foreground">
+        <Text className="text-sm text-foreground-muted">
           Old history is cleaned up automatically, but this database still holds the freed space.
           Run this command on {target.label} to return it to disk; it pauses and restarts the
           background service. Quit the desktop app first if it hosts this environment.

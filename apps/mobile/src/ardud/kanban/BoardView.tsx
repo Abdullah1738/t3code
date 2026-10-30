@@ -364,7 +364,7 @@ function BoardThreadsList(props: {
 }) {
   const rows = useKanbanBoardThreads(props.boardId);
   if (rows === undefined) return null;
-  if (rows.length === 0) return <Text className="text-sm text-muted-foreground">No threads yet.</Text>;
+  if (rows.length === 0) return <Text className="text-sm text-foreground-muted">No threads yet.</Text>;
   return (
     <View className="gap-5">
       <ThreadGroup
@@ -396,9 +396,9 @@ function ThreadGroup(props: {
   const ended = props.rows.filter((row) => !row.running);
   return (
     <View className="gap-2">
-      <Text className="text-sm font-medium text-muted-foreground">{props.title}</Text>
+      <Text className="text-sm font-t3-medium text-foreground-muted">{props.title}</Text>
       {props.rows.length === 0 ? (
-        <Text className="text-sm text-muted-foreground">{props.empty}</Text>
+        <Text className="text-sm text-foreground-muted">{props.empty}</Text>
       ) : (
         <>
           {running.map((row) => (
@@ -458,10 +458,10 @@ function ThreadRow(props: {
       onPress={() => props.onOpenThread(row.threadId)}
       className="gap-1 rounded-xl border border-border px-3 py-2"
     >
-      <Text numberOfLines={1} className="text-sm font-medium text-foreground">
+      <Text numberOfLines={1} className="text-sm font-t3-medium text-foreground">
         {row.title ?? identity}
       </Text>
-      <Text numberOfLines={1} className="text-xs text-muted-foreground">
+      <Text numberOfLines={1} className="text-xs text-foreground-muted">
         {identity}
         {row.model === null ? "" : ` · ${row.model.model}`}
         {activity === null ? "" : ` · ${activity.label} ago`}
