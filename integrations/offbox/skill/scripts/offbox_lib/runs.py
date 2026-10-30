@@ -436,7 +436,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
 
 
 def build_env(extra: list[str]) -> tuple[dict, list[str]]:
-    env = {"CI": "1"}
+    # Boxes have no AWS instance metadata (169.254.169.254 is blackholed); boto3 without credentials waits ~2 s per lookup.
+    env = {"CI": "1", "AWS_EC2_METADATA_DISABLED": "true"}
     for k in ENV_ALLOW:
         if os.environ.get(k):
             env[k] = os.environ[k]
