@@ -2543,8 +2543,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       if (state === undefined) return;
       if (event.type === "session.moved") {
         state.directory = event.data.location.directory;
-        if (state.mcp !== undefined && state.mcp.directory !== state.directory) {
-          // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
+        // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
+        // Scheduled on every move while registered: an in-flight add reconciles against the latest directory.
+        if (state.mcp !== undefined) {
           yield* Effect.forkIn(sessionGates.withLock(state.sessionId, followMove(state)), sessionScope);
         }
         return;
@@ -3424,18 +3425,25 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       );
 
     // Runs when the agent moved its session: the server must follow it to the new directory.
+    // The session may move again while an add is in flight, so each add is checked
+    // against the directory the session is in when it lands, not the one it started for.
     const followMove = Effect.fnUntraced(function* (state: ThreadState) {
-      const registered = state.mcp;
-      if (registered === undefined || registered.directory === state.directory) return;
-      const moved = { ...registered, directory: state.directory };
-      // state.mcp stays on the old directory; the next prepareTurn removes it and re-adds at the new one.
-      if (!(yield* addMcp(moved))) return;
-      if (threads.get(state.sessionId) !== state) {
-        yield* removeMcp(moved);
+      for (;;) {
+        const registered = state.mcp;
+        if (registered === undefined || registered.directory === state.directory) return;
+        const target = state.directory;
+        const moved = { ...registered, directory: target };
+        // state.mcp stays on the old directory; the next prepareTurn removes it and re-adds at the new one.
+        if (!(yield* addMcp(moved))) return;
+        if (threads.get(state.sessionId) !== state || state.directory !== target) {
+          yield* removeMcp(moved);
+          if (threads.get(state.sessionId) !== state) return;
+          continue;
+        }
+        state.mcp = moved;
+        yield* removeMcp(registered);
         return;
       }
-      state.mcp = moved;
-      yield* removeMcp(registered);
     });
 
     yield* Effect.addFinalizer(() =>
