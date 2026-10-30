@@ -20,6 +20,8 @@ state_dir="$HOME/.local/state/local-helpers"
 typeset -A restarts=(
   local.ardud.otp-idle "$state_dir/restart-otp-idle"
   com.abdullah.juno-proxy "$state_dir/restart-juno-proxy"
+  com.ardud.lydia-ticks-server "$state_dir/restart-lydia-ticks-server"
+  com.ardud.lydia-ticks-tunnel "$state_dir/restart-lydia-ticks-tunnel"
 )
 # Same for plists: reload-<label> is set before a new plist lands and cleared once launchd has loaded it,
 # so a run that dies between the copy and the reload leaves the reload for the next run. It holds
@@ -60,11 +62,12 @@ typeset -A live=(
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"
   juno-proxy "$HOME/.local/share/juno-proxy"
+  lydia-ticks "$HOME/.local/share/lydia-ticks"
   bin "$HOME/.local/bin"
   launchd "$HOME/Library/LaunchAgents"
 )
 # Modes git can't keep: the keychain helpers and the OTP watcher stay private.
-typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1)
+typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"
@@ -207,6 +210,8 @@ for p in "${pairs[@]}"; do
     */libexec/mail/mail_oauth.py|*/libexec/mail/otp-idle.py|*/libexec/mail/otp-watch.py)
       mkdir -p "$state_dir"; : > "${restarts[local.ardud.otp-idle]}" ;;
     */juno-proxy/juno_proxy.py) mkdir -p "$state_dir"; : > "${restarts[com.abdullah.juno-proxy]}" ;;
+    */lydia-ticks/server.ts) mkdir -p "$state_dir"; : > "${restarts[com.ardud.lydia-ticks-server]}" ;;
+    */lydia-ticks/tunnel.sh) mkdir -p "$state_dir"; : > "${restarts[com.ardud.lydia-ticks-tunnel]}" ;;
     */LaunchAgents/*.plist)
       mkdir -p "$state_dir" "${dst:h}"
       backup "$dst" || exit 1
@@ -302,7 +307,7 @@ for f in "${plists[@]}"; do
     agent_fail=1; print -u2 "local-helpers: $label is not loaded and failed to load"
   fi
 done
-# otp-idle and the Juno proxy stay running, so their new code needs a restart; the other agents are short runs.
+# otp-idle, the Juno proxy and the Lydia server and tunnel stay running, so their new code needs a restart; the other agents are short runs.
 for label marker in "${(@kv)restarts}"; do
   [[ -e "$marker" ]] && loaded "$label" || continue
   if "$lctl" kickstart -k "$domain/$label"; then
@@ -328,6 +333,7 @@ smoke env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -c "import sys; sys.path[:0
 smoke env PYTHONDONTWRITEBYTECODE=1 "$HOME/.local/bin/qcard" templates
 for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
+smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health; do
   smoke zsh -n "$HOME/.local/bin/$f"
 done
