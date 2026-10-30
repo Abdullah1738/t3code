@@ -12,7 +12,8 @@ import time
 
 from . import api, capacity, lease, pool, ssh_sync
 from .common import (CAP_PATH, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago,
-                     atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, read_json, say)
+                     atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, offsets_path, read_json,
+                     say)
 
 WAIT_POLL_S = 5
 
@@ -301,16 +302,19 @@ def _wait_locked(r, echo, timeout=None):
                     _tail(log_path, pos, echo)
                     return _settled(cur)
                 ck = checkpoint(log_path)
+                # Nothing below may touch the original log before the replay is confirmed. A deadline that has already
+                # passed ends the wait here, with the log and its checkpoint exactly as they were.
+                if deadline is not None and now() >= deadline:
+                    raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                                      f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
                 if ck:
                     _tail(log_path, pos, echo, ck["logBytes"])
-                    # Drop the uncommitted tail so the takeover's replay appends it exactly once.
-                    _truncate(log_path, ck["logBytes"])
                     start = (ck["stdoutOffset"], ck["stderrOffset"])
+                    keep = ck["logBytes"]
                 else:
                     # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
-                    _truncate(log_path, 0)
-                    start = (0, 0)
-                return _wait_run(cur, echo, until=deadline, start_offsets=start)
+                    start, keep = (0, 0), 0
+                return _replay_takeover(cur, echo, deadline, start, log_path, keep)
             finally:
                 guard.__exit__(None, None, None)
         ck = checkpoint(log_path)
@@ -332,12 +336,43 @@ def _wait_locked(r, echo, timeout=None):
         time.sleep(pause)
 
 
-def _wait_run(r, echo, until=None, start_offsets=(0, 0)):
+def _replay_takeover(cur, echo, deadline, start, log_path, keep):
+    """Take over a run's follow without touching the original local log until the replay is confirmed.
+
+    The replay writes a temp file beside the log: the committed prefix (`keep` bytes) followed by the bytes the remote
+    run still produces. Only a replay that finishes with a real exit code replaces the original (atomic rename). A
+    deadline, a lost stream or any error leaves the original log and its checkpoint untouched."""
+    tmp = log_path.with_name(log_path.name + ".takeover")
+    try:
+        prefix = b""
+        if keep:
+            with open(log_path, "rb") as src:
+                prefix = src.read(keep)
+        with open(tmp, "wb") as dst:
+            dst.write(prefix)
+        code = _wait_run(cur, echo, until=deadline, start_offsets=start, replay_path=tmp)
+        if code is None:
+            raise OffboxError(f"takeover of {cur['run_id']} ended without an exit code; the original log is kept")
+        os.replace(tmp, log_path)
+        # The replay committed its checkpoint beside `tmp`; that checkpoint describes the log it now replaces.
+        if os.path.exists(offsets_path(tmp)):
+            os.replace(offsets_path(tmp), offsets_path(log_path))
+        return code
+    except BaseException:
+        for p in (tmp, offsets_path(tmp)):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        raise
+
+
+def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
     from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo, run_id=r["run_id"],
-                  until=until, start_offsets=start_offsets)
+                  until=until, start_offsets=start_offsets, replay_path=replay_path)
     if code is None:
         code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
         if code is not None:

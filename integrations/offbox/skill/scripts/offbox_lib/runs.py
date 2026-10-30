@@ -630,7 +630,8 @@ def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
-           start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None) -> int | None:
+           start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
+           replay_path: Path | None = None) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
@@ -640,11 +641,13 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
     keeper.start()
-    lf = open(log_path, "ab") if log_path else None
+    # A takeover replays into `replay_path` (a fresh file) so the original log survives until the replay succeeds.
+    target = replay_path or log_path
+    lf = open(target, "wb" if replay_path else "ab") if target else None
     if lf:
         # Checkpoint before the first byte: a holder that dies inside its first chunk still leaves one, so a waiter
         # never prints bytes that its takeover will replay (no checkpoint at all = a holder from before checkpoints).
-        _commit(log_path, out_off, err_off, lf.tell())
+        _commit(target, out_off, err_off, lf.tell())
     failures = 0
     frames = None
 
@@ -690,7 +693,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                             lf.write(b)
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
-                            _commit(log_path, out_off, err_off, lf.tell())
+                            _commit(target, out_off, err_off, lf.tell())
                     elif t == "reconnect":
                         out_off, err_off = fr.get("stdoutOffset", out_off), fr.get("stderrOffset", err_off)
                         again = True

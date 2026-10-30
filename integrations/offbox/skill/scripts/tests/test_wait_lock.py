@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import api, cli, common, misc, runs  # noqa: E402
+from offbox_lib.common import OffboxError  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
 
@@ -92,7 +93,7 @@ class WaitLockTests(Isolated):
     def test_wait_follows_itself_when_lock_is_free(self):
         seen = {}
 
-        def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0), until=None):
+        def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0), until=None, **kw):
             seen.update(box=box, pid=pid, until=until, run_id=run_id)
             return 0
         clock = Clock()
@@ -104,6 +105,44 @@ class WaitLockTests(Isolated):
         # the box lock is released afterwards
         with common.file_lock('box-bx_a', timeout=0):
             pass
+
+    def test_timeout_before_attach_leaves_a_legacy_log_untouched(self):
+        # A running legacy run (no checkpoint) with captured output and a free lock. `wait --timeout 0` must end
+        # before any remote attach, leaving the original log bytes and the run exactly as they were.
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        original = b'legacy output line\n'
+        log.write_bytes(original)
+        self.assertIsNone(common.checkpoint(log))
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach before the deadline')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '0'], Clock())
+        self.assertEqual(rc, 124)
+        self.assertEqual(log.read_bytes(), original)
+        self.assertIsNone(common.checkpoint(log))
+        self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-x'").fetchone()[0], 'running')
+
+    def test_failed_replay_keeps_the_original_log_and_checkpoint(self):
+        # A checkpointed run whose takeover replay fails (the stream is lost, no exit code). The original log bytes
+        # and checkpoint must survive, and the run must still be running.
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        original = b'o1\ncommitted\n'
+        log.write_bytes(original)
+        runs._commit(log, 3, 0, len(original))
+        before_ck = common.checkpoint(log)
+        self.hold_box()
+        clock = Clock()
+        # The lock is free, the replay runs into its temp file and then fails: the stream is lost with no exit code.
+        with patch.object(misc, 'now', clock.now), patch.object(misc, 'time', clock.time), \
+                patch.object(runs, 'now', clock.now), \
+                patch.object(misc, '_wait_run', side_effect=OffboxError('stream lost')):
+            with self.assertRaises(OffboxError):
+                misc._replay_takeover(self.con.execute("SELECT * FROM runs WHERE run_id='run-x'").fetchone(),
+                                      False, None, (3, 0), log, len(original))
+        self.assertEqual(log.read_bytes(), original)
+        self.assertEqual(common.checkpoint(log), before_ck)
+        self.assertFalse((log.with_name(log.name + '.takeover')).exists())
+        self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-x'").fetchone()[0], 'running')
 
     def test_wait_on_a_settled_run_prints_its_code(self):
         self.end_run(3)
