@@ -127,6 +127,7 @@ done
 uber_want=''
 [[ -n "$uber_node" ]] && uber_want="#!/bin/sh
 $uber_mark: watchers run with a short PATH, so node is pinned here.
+if [ -f \"\$HOME/.local/state/ordering-paused\" ] && [ \"\$1\" = rides ] && [ \"\$2\" = request ]; then echo \"ORDERING_PAUSED: \$(cat \"\$HOME/.local/state/ordering-paused\")\" >&2; exit 4; fi
 exec \"$uber_node\" \"$uber_js\" \"\$@\""
 uber_ours() { [[ -f "$uber" && ! -L "$uber" ]] && [[ "$(sed -n 2p "$uber")" == "$uber_mark"* ]]; }
 
