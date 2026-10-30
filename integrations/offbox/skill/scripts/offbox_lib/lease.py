@@ -397,14 +397,18 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)
         box_id = s["id"]
         rdir = remote_dir_for(me["repo_root"])
+        is_recipe = source.startswith("recipe:")
+        # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
+        # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
+        # one can hand out as ready. The reaper deletes such rows (see reap._reap).
+        state = "bringing_up" if is_recipe else "running"
         con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
                        repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,'running',?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
-                     me["repo_root"], me["repo_key"], rdir, sz, source, t, t))
+                     me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
         con.commit()
         event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
-        is_recipe = source.startswith("recipe:")
         try:
             _bring_up(box_id, fresh=(source == "fresh"),
                       recipe=source.split(":", 1)[1] if is_recipe else None)
@@ -422,7 +426,9 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
                 _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
             raise
         event(con, box_id, "lease_ready", f"{round(now() - t, 1)}s")
-        con.execute("UPDATE leases SET ssh_ready_at=? WHERE box_id=?", (now(), box_id))
+        # Only now is a recipe box reusable: the recipe finished (exit 0) and the bring-up completed.
+        con.execute("UPDATE leases SET ssh_ready_at=?, state=CASE WHEN state='bringing_up' THEN 'running' ELSE state END "
+                    "WHERE box_id=?", (now(), box_id))
         con.commit()
         return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
 

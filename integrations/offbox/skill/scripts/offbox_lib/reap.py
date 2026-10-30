@@ -155,7 +155,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
                 lambda bid=bid: lease.refresh_box(con, bid))
     # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
-    for r in con.execute("SELECT box_id FROM leases WHERE state='quarantined'").fetchall():
+    # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
+    # recipe cannot be trusted, so the box is retired like a quarantined one.
+    for r in con.execute("SELECT box_id FROM leases WHERE state IN ('quarantined','bringing_up')").fetchall():
         bid = r["box_id"]
         if bid in live:
             act(bid, "delete", "recipe cancelled, box quarantined",

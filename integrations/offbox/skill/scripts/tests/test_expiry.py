@@ -403,6 +403,32 @@ class ExpiryTests(Isolated):
         reuse.assert_not_called()
         self.assertEqual(row["box_id"], "bx_new")
 
+    def test_interrupted_recipe_bring_up_is_never_reacquired_as_ready(self):
+        # Ctrl-C (KeyboardInterrupt) while the recipe runs: no Exception/OffboxError handler sees it, so the row must
+        # already be a non-reusable state. The next acquisition must not get the box back; the reaper retires it.
+        with patch.object(api, "create", return_value={"id": "bx_int"}), patch.object(api, "rename"), \
+                patch.object(lease, "pick_template", return_value="crpko-node"), \
+                patch.object(lease, "_bring_up", side_effect=KeyboardInterrupt), \
+                patch.object(lease, "ssh_sync"):
+            self.template(expired_at=common.now())
+            with self.assertRaises(KeyboardInterrupt):
+                lease.acquire_private(self.me, template="crpko-node")
+        self.assertEqual(self.state("bx_int"), "bringing_up")
+        self.assertEqual(pool.candidates(self.con, "repo", None, "template:crpko-node")[0], [])
+        with patch.object(lease, "_reuse") as reuse, \
+                patch.object(lease, "acquire_private", return_value={"box_id": "bx_new", "size": "large"}):
+            row = pool.acquire(self.me, template="crpko-node")
+            pool.release_guard(row)
+        reuse.assert_not_called()
+        # The reaper retires the interrupted row (its box lock is free because the process is gone).
+        with patch.object(api, "list_boxes", return_value=[{"id": "bx_int", "state": "running"}]), \
+                patch.object(lease, "delete_box", return_value=True) as delete, \
+                patch.object(api, "cmd_kill"), \
+                patch.object(api, "saved_list", return_value=([], {"included": 50, "used": 0})):
+            reap.reap()
+        delete.assert_called_once()
+        self.assertEqual(delete.call_args.args[1], "bx_int")
+
     def test_ssh_bring_up_failure_retires_the_recipe_box_before_any_reuse(self):
         # The box fails before the recipe starts (SSH never comes up). It is blank: it must be retired, not left as a
         # pool candidate that a later acquisition would return as recipe:crpko-node without building Node.
