@@ -874,6 +874,37 @@ class WatchTest(Base):
         with open(share) as f:
             self.assertNotIn("alerted_url", json.load(f))
 
+    def test_live_link_behind_cloudflare_is_not_called_dead(self):
+        # cards.abdullah.fund's Cloudflare answers Python-urllib's default agent with 403 (error 1010).
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        agents = []
+
+        class Cloudflare(BaseHTTPRequestHandler):
+            def do_GET(self):
+                ua = self.headers.get("User-Agent", "")
+                agents.append(ua)
+                self.send_response(403 if ua.startswith("Python-urllib") else 200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Cloudflare)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.dead_moni_link("http://127.0.0.1:%d/" % srv.server_address[1])
+        share = os.path.join(self.wdir, "share.json")
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        self.assertEqual(self.watch("--now", "1000", env=dict(self.env, FAKE_SHARE_FAIL="1")).stdout, "")
+        self.assertEqual(self.log("bridge"), [])
+        self.assertTrue(agents)
+        with open(share) as f:
+            self.assertEqual(json.load(f)["fails"], 0)
+
     def test_failed_reshare_alerts_once_and_never_sends(self):
         self.msg(PHONE, "T1", T0, text="hi")
         self.build()

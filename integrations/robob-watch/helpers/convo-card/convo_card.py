@@ -804,9 +804,14 @@ def cmd_show(a):
 
 # ---------- watcher check ----------
 
+# Cloudflare in front of cards.abdullah.fund answers Python's default agent (Python-urllib/x) with 403, error 1010.
+PROBE_UA = "Mozilla/5.0 (compatible; convo-card-probe)"
+
+
 def probe(url, timeout=15):
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout) as r:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": PROBE_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
