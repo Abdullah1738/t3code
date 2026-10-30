@@ -5133,6 +5133,153 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("keeps T3's MCP server with a session the agent moved", () =>
+    Effect.gen(function* () {
+      const MOVED = "/work/opencode2-moved";
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      yield* mcpSessions.set({
+        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+        threadId,
+        providerSessionId: "mcp:opencode2-adapter",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:3773/mcp",
+        authorizationHeader: "Bearer thread-credential",
+        browserToolsAvailable: false,
+      });
+      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+      const server = "t3-code-thread_opencode2-adapter";
+      const add = (directory: string) =>
+        out("mcp.add", {
+          server,
+          "location[directory]": directory,
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:3773/mcp",
+            headers: { Authorization: "Bearer thread-credential" },
+            oauth: false,
+          },
+        });
+      const remove = (directory: string) =>
+        out("mcp.remove", { server, "location[directory]": directory });
+      const moved = event("session.moved", {
+        sessionID: SESSION,
+        location: { directory: MOVED },
+        projectID: "global",
+      });
+      const { runtime, thread } = yield* resumed([
+        add(WORK),
+        reply("mcp.add", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        moved,
+        add(MOVED),
+        reply("mcp.add", null),
+        remove(WORK),
+        reply("mcp.remove", null),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        add(MOVED),
+        reply("mcp.add", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        remove(MOVED),
+        reply("mcp.remove", null),
+      ]);
+      for (let index = 0; index < 2; index++) {
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+      }
+      yield* runtime.unloadThread!({ providerThread: thread });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("re-adds T3's MCP server at the moved directory when adding on the move fails", () =>
+    Effect.gen(function* () {
+      const MOVED = "/work/opencode2-moved";
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      yield* mcpSessions.set({
+        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+        threadId,
+        providerSessionId: "mcp:opencode2-adapter",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:3773/mcp",
+        authorizationHeader: "Bearer thread-credential",
+        browserToolsAvailable: false,
+      });
+      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+      const server = "t3-code-thread_opencode2-adapter";
+      const add = (directory: string) =>
+        out("mcp.add", {
+          server,
+          "location[directory]": directory,
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:3773/mcp",
+            headers: { Authorization: "Bearer thread-credential" },
+            oauth: false,
+          },
+        });
+      const remove = (directory: string) =>
+        out("mcp.remove", { server, "location[directory]": directory });
+      const moved = event("session.moved", {
+        sessionID: SESSION,
+        location: { directory: MOVED },
+        projectID: "global",
+      });
+      const { runtime, thread } = yield* resumed([
+        add(WORK),
+        reply("mcp.add", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        moved,
+        add(MOVED),
+        reply("mcp.add", { status: 500, body: { message: "MCP unavailable" } }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        remove(WORK),
+        reply("mcp.remove", null),
+        add(MOVED),
+        reply("mcp.add", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        remove(MOVED),
+        reply("mcp.remove", null),
+      ]);
+      for (let index = 0; index < 2; index++) {
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+      }
+      yield* runtime.unloadThread!({ providerThread: thread });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("follows a moved session without MCP calls when T3 MCP isn't set up", () =>
+    Effect.gen(function* () {
+      const MOVED = "/work/opencode2-moved";
+      const { runtime, thread } = yield* resumed([
+        out("session.instructions.entry.put", {
+          sessionID: SESSION,
+          key: "t3-code",
+          value: "<any>",
+        }),
+        reply("session.instructions.entry.put", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.moved", {
+          sessionID: SESSION,
+          location: { directory: MOVED },
+          projectID: "global",
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(turnInput(thread));
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("registers a long thread id's MCP server under a name OpenCode accepts", () =>
     Effect.gen(function* () {
       const child = ThreadId.make(
