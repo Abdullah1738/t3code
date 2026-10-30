@@ -57,6 +57,8 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9:_@.-]{6,200}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 QUIET_S = 120
 PROBE_S = 600
+WATCH_BUDGET_S = float(os.environ.get("CONVO_CARD_WATCH_BUDGET") or 48)   # robob-watch SIGKILLs a check at 60 s
+T_START = time.monotonic()
 OUTBOX_TTL = 3600         # an event the runner never recorded is printed again for up to an hour,
 OUTBOX_MAX_REPLAYS = 3    # at most this many times (same rule as wa-db's whatsapp-new-message outbox)
 LABELS = {"audio": "Voice message", "ptt": "Voice message", "video": "Video", "gif": "GIF",
@@ -802,18 +804,23 @@ def cmd_show(a):
 
 # ---------- watcher check ----------
 
-def probe(url):
+def probe(url, timeout=15):
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=15) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
 
 
-def reshare(slug):
+def left():
+    """Seconds left in this watch run's budget, so the probes, the re-share and the alert all finish in time."""
+    return WATCH_BUDGET_S - (time.monotonic() - T_START)
+
+
+def reshare(slug, timeout):
     """The page's new share link, or None. Same bridge call send makes; no card is sent."""
     try:
-        pub = bridge("share", "--app", slug, "--days", "30")
+        pub = bridge("share", "--app", slug, "--days", "30", timeout=timeout)
     except (RuntimeError, OSError, subprocess.TimeoutExpired):
         return None
     url = pub.get("publicURL") or pub.get("url") or ""
@@ -956,27 +963,36 @@ def cmd_watch(a):
         targets[k] = m["url"] if m and m.get("old") == v["url"] else v["url"]
     urls = sorted(set(targets.values()))
     if urls and now - share.get("last_probe", 0) >= PROBE_S:
-        bad = [u for u in urls if not probe(u)]
+        bad = [u for u in urls if not probe(u, timeout=max(1, min(15, left() - 5)))]
         share["last_probe"] = now
         share["fails"] = share.get("fails", 0) + 1 if bad else 0
         why = "it still doesn't answer after a re-share"
-        if bad and share["fails"] == 2:
-            # Dead twice in a row (the bridge restarted and made a new link): re-share the page as send does and
-            # probe the link it returns from now on. Nothing is sent; a card goes out only on a real chat change.
-            fresh = reshare(a.slug)
+        if bad:
+            # The link is dead (the bridge restarted and made a new one). Re-share the page as send does and probe
+            # the link it returns from now on. Nothing is sent; a card goes out only on a real chat change. This
+            # runs at the first failed probe, so links already dead before this change get it too.
+            fresh = None
+            budget = left() - 10          # leave room to probe, alert and save before robob-watch's 60 s kill
+            if a.dry_run:
+                why = "a dry run does not re-share"
+            elif budget >= 5:
+                fresh = reshare(a.slug, timeout=min(30, budget))
+            else:
+                why = "the watch check ran out of time"
             if fresh is None:
-                why = "the bridge could not re-share it"
+                if budget >= 5 and not a.dry_run:
+                    why = "the bridge could not re-share it"
             else:
                 for k, u in targets.items():
                     if u in bad:
                         moved[k] = {"old": sent[k]["url"], "url": fresh}
                 share["moved"] = moved
-                if probe(fresh):
+                if probe(fresh, timeout=max(1, min(15, left() - 5))):
                     bad, share["fails"] = [], 0
                 else:
                     bad = [fresh]
                     why = f"the new link {fresh} doesn't answer either"
-        if bad and share["fails"] >= 2 and share.get("alerted_url") != bad[0]:
+        if bad and share.get("alerted_url") != bad[0]:
             head = f"CONVO_CARD_SHARE_DOWN {a.slug}: {bad[0]} "
             # A run that died after its outbox write but before share.json is being replayed with this alert.
             if not any(x.startswith(head) for b in carry for x in b["lines"]):

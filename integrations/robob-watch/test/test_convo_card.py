@@ -37,6 +37,8 @@ with open(os.environ["FAKE_BRIDGE_LOG"], "a") as f:
 if args[0] == "share":
     if os.environ.get("FAKE_SHARE_FAIL"):
         print("tunnel not up", file=sys.stderr); sys.exit(3)
+    if os.environ.get("FAKE_SHARE_SLEEP"):
+        import time; time.sleep(float(os.environ["FAKE_SHARE_SLEEP"]))
     print(json.dumps({"url": os.environ.get("FAKE_SHARE_URL") or "https://x.trycloudflare.com/" + args[2] + "/",
                       "created": True, "metadataWarnings": json.loads(os.environ.get("FAKE_BRIDGE_WARN") or "[]")}))
 elif args[0] == "publish":
@@ -799,6 +801,79 @@ class WatchTest(Base):
         self.assertGreaterEqual(len(hits), 2)
         self.assertEqual(set(hits), {"/"})
 
+    def live_url(self):
+        class Live(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Live)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d/" % srv.server_address[1]
+
+    def test_legacy_dead_link_with_high_fail_count_is_reshared(self):
+        # State written before this change: 37 failed probes, the old link already alerted.
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        old = "file:///nonexistent/convo-card-old-share"
+        self.dead_moni_link(old)
+        new = self.live_url()
+        share = os.path.join(self.wdir, "share.json")
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 37, "alerted_url": old}, f)
+        env = dict(self.env, FAKE_SHARE_URL=new)
+        self.assertEqual(self.watch("--now", "1000", env=env).stdout, "")
+        self.assertEqual([c[0] for c in self.log("bridge")], ["share"])
+        with open(share) as f:
+            state = json.load(f)
+        self.assertEqual(state["moved"], {"moni": {"old": old, "url": new}})
+        self.assertEqual(state["fails"], 0)
+        self.assertNotIn("alerted_url", state)
+
+    def test_dry_run_never_calls_the_bridge_or_saves_state(self):
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.dead_moni_link("file:///nonexistent/convo-card-old-share")
+        share = os.path.join(self.wdir, "share.json")
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        with open(share) as f:
+            before = f.read()
+        self.watch("--now", "1000", "--dry-run")
+        self.assertEqual(self.log("bridge"), [])
+        with open(share) as f:
+            self.assertEqual(f.read(), before)
+
+    def test_stalled_reshare_still_alerts_and_saves_state(self):
+        # The bridge hangs; the watch budget is tight so the re-share times out inside it. The alert still prints
+        # once and is saved, so the next run does not repeat it.
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.dead_moni_link("file:///nonexistent/convo-card-old-share")
+        share = os.path.join(self.wdir, "share.json")
+        with open(share, "w") as f:
+            json.dump({"last_probe": 0, "fails": 1}, f)
+        env = dict(self.env, FAKE_SHARE_SLEEP="60", CONVO_CARD_WATCH_BUDGET="18")
+        out = self.watch("--now", "1000", env=env).stdout
+        self.assertEqual(out.count("CONVO_CARD_SHARE_DOWN"), 1)
+        self.assertIn("could not re-share", out)
+        with open(share) as f:
+            state = json.load(f)
+        self.assertEqual(state["alerted_url"], "file:///nonexistent/convo-card-old-share")
+        # The bridge answers next time with a live link: the watch recovers silently and clears the saved alert.
+        recovered = dict(self.env, FAKE_SHARE_URL=self.live_url())
+        self.assertEqual(self.watch("--now", "1700", env=recovered).stdout, "")
+        with open(share) as f:
+            self.assertNotIn("alerted_url", json.load(f))
+
     def test_failed_reshare_alerts_once_and_never_sends(self):
         self.msg(PHONE, "T1", T0, text="hi")
         self.build()
@@ -812,9 +887,10 @@ class WatchTest(Base):
         self.assertEqual(out.count("CONVO_CARD_SHARE_DOWN"), 1)
         self.assertIn("Do not send a card", out)
         self.assertNotIn("run `convo-card send", out)
+        # Each later probe retries the bridge re-share (a share call, never a card); the alert stays printed once.
         self.assertEqual(self.watch("--now", "1700", env=env).stdout, "")
         self.assertEqual(self.watch("--now", "2400", env=env).stdout, "")
-        self.assertEqual([c[0] for c in self.log("bridge")], ["share"])
+        self.assertEqual([c[0] for c in self.log("bridge")], ["share", "share", "share"])
         self.assertNotIn("app", [c[0] for c in self.log("bridge")])
 
 
