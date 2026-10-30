@@ -13,6 +13,7 @@ import {
   ThreadId,
   type KanbanActor,
   type KanbanBoard,
+  type KanbanCard,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 
@@ -25,6 +26,7 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
+import * as Rules from "./rules.ts";
 import * as ScriptService from "./ScriptService.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -82,6 +84,18 @@ const toyBoard = Effect.gen(function* () {
     defaultProjectId: ProjectId.make("project-1"),
   });
 });
+
+// Main's review gate (card #63) holds a non-owner's move to completed or deployed
+// until the card's review passed; these cards stand for reviewed work.
+const markReviewed = (board: KanbanBoard, cardId: KanbanCard["id"]) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const stored = (yield* store.card(cardId))!;
+    yield* store.putCard({
+      ...stored,
+      reviewStep: Rules.chainFor(board, stored)?.steps.length ?? 1,
+    });
+  });
 
 // Event runs start from a background fiber; give it a turn, then wait for the runs.
 const settle = Effect.gen(function* () {
@@ -470,6 +484,7 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
       },
       owner,
     );
+    yield* markReviewed(board, card.id);
     yield* kanban.dispatchNow;
     assert.strictEqual(sent.length, 0);
 
@@ -585,6 +600,7 @@ it.effect("a subtask a script ticks, which moves a deployed card back to todo, w
       owner,
     );
     assert.strictEqual(card.number, 1);
+    yield* markReviewed(board, card.id);
     yield* scripts.listen;
     yield* scripts.run(ticker.id, "manual");
     yield* scripts.idle;
@@ -593,6 +609,14 @@ it.effect("a subtask a script ticks, which moves a deployed card back to todo, w
     const stored = (yield* kanban.snapshot(board.id)).cards.find((entry) => entry.number === card.number)!;
     // The tick opened the worker's step, so the deployed card went back to todo.
     assert.strictEqual(stored.stage, "todo");
+    const moves = (yield* kanban.card(card.id)).events.filter((event) => event.kind === "moved");
+    assert.deepStrictEqual(
+      moves.map((event) => [event.toStage, event.actor._tag]),
+      [
+        ["deployed", "script"],
+        ["todo", "script"],
+      ],
+    );
     // The move and the auto-move both came from the land script: neither listener reruns.
     assert.strictEqual((yield* scripts.runs(mover.id, 10)).length, 0);
     assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
