@@ -525,8 +525,8 @@ export class Delivery {
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
-          // A duplicate may be the threaded copy an unthreaded retry recovered, so only a fresh unthreaded send is marked.
-          if (item.replyTo !== undefined && !result.duplicate && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
+          // A recovered threaded original keeps its thread target, so a late failure of it still gets a resend.
+          if (item.replyTo !== undefined && !result.original && this.store.get<boolean>(`unthreaded:${item.id}`) === true) {
             this.store.set(`unthreadedChunk:${item.id}:${index}`, true);
           }
           if (final && item.poll && !result.providerId) {

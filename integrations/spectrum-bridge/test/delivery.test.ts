@@ -1133,3 +1133,57 @@ test("a reply Sendblue never accepted as threaded makes no Sendblue history call
   await delivery.tick();
   expect(statuses).not.toHaveBeenCalled();
 });
+
+test("review: a delivered sibling stays checkpointed and replacement errors are final after restart", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const statuses = new Map<string, string>();
+  const check = mock(async (_since: number) => statuses);
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  h.enqueue("reply%_", { kind: "conversation", text: "word ".repeat(800).trim(), replyTo: "inbound-1" });
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  statuses.set("provider-1", "DELIVERED");
+  statuses.set("provider-2", "ERROR");
+  setSystemTime(now + 5 * 60_000);
+  await delivery.tick();
+  await delivery.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.calls[2]!.id).toBe(lateId("reply%_", 1));
+  expect(h.calls[2]!.text).toBe(h.calls[1]!.text);
+  expect(h.store.get<{ accepted: boolean; providerId: string }>("chunk:reply%_:0")).toEqual({ accepted: true, providerId: "provider-1" });
+  statuses.set("provider-3", "ERROR");
+  setSystemTime(now + 6 * 60_000);
+  const restarted = new Delivery(h.store, h.transport, { ...h.options, statuses: check });
+  await restarted.tick();
+  await restarted.tick();
+  expect(h.calls).toHaveLength(3);
+  expect(h.store.getOperation("reply%_")!.state).toBe("sent");
+});
+
+test("review: a deferred status check coalesces with a send tick", async () => {
+  setSystemTime(now);
+  const h = setup();
+  const read = deferred<Map<string, string>>();
+  const entered = deferred<void>();
+  let wait = false;
+  const delivery = new Delivery(h.store, h.transport, { ...h.options, statuses: async () => {
+    if (!wait) return new Map();
+    entered.resolve();
+    return read.promise;
+  } });
+  h.enqueue("reply", { kind: "conversation", text: "Use 70% alcohol", replyTo: "inbound-1" });
+  await delivery.tick();
+  setSystemTime(now + 5 * 60_000);
+  wait = true;
+  const first = delivery.tick();
+  await entered.promise;
+  expect(delivery.tick()).toBe(first);
+  expect(h.calls).toHaveLength(1);
+  read.resolve(new Map([["provider-1", "ERROR"]]));
+  await first;
+  expect(h.store.getOperation("reply")!.state).toBe("pending");
+  await delivery.tick();
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[1]!.replyTo).toBeUndefined();
+});

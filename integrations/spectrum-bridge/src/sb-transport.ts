@@ -60,9 +60,9 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
    * only fails again as `sendUnconfirmed`; after that the send goes out again.
    */
   const once = async (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean,
-    send: () => Promise<{ handle: string }>): Promise<{ providerId?: string; duplicate?: boolean }> => {
-    const saved = store.get<{ handle: string }>(sentKey(id));
-    if (saved) return { providerId: saved.handle, duplicate: true };
+    send: () => Promise<{ handle: string }>): Promise<{ providerId?: string; duplicate?: boolean; original?: boolean }> => {
+    const saved = store.get<{ handle: string; original?: boolean }>(sentKey(id));
+    if (saved) return { providerId: saved.handle, duplicate: true, ...(saved.original ? { original: true } : {}) };
     const own = attempts(id);
     const earlier = [own, retryOf === undefined ? undefined : attempts(retryOf)].filter(value => value !== undefined);
     if (earlier.length) {
@@ -74,8 +74,10 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       const match = sent.find(message => message.handle && message.sentAt >= first && !UNSENT.test(message.status)
         && store.byProviderId(message.handle) === undefined && landed(message));
       if (match) {
-        store.set(sentKey(id), { handle: match.handle });
-        return { providerId: match.handle, duplicate: true };
+        // Only retryOf's copies can predate this id's own first attempt; a later one is this variant's.
+        const original = retryOf !== undefined && (own === undefined || match.sentAt < own.first);
+        store.set(sentKey(id), { handle: match.handle, ...(original ? { original } : {}) });
+        return { providerId: match.handle, duplicate: true, ...(original ? { original } : {}) };
       }
       if (now() < last + SETTLE_MS) throw new TransportError("sendUnconfirmed", true, true);
     }
@@ -134,7 +136,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       return { chatGuids: [chat], content: { text: message.text }, isFromMe: outbound };
     },
     async sendText(input: { id: string; chatGuid: string; text: string; replyTo?: string; effect?: string; subject?: string; retryOf?: string }):
-      Promise<{ providerId?: string; duplicate?: boolean }> {
+      Promise<{ providerId?: string; duplicate?: boolean; original?: boolean }> {
       const text = sameText(input.text);
       return once(input.id, input.retryOf, message => !message.mediaUrl && !message.card && sameText(message.text) === text,
         () => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined));
