@@ -149,11 +149,29 @@ def thread_for_session(ses_id, timeout=30):
     return body.get("thread")
 
 
-def archive_thread(thread_id, timeout=30):
-    code, body = control("PATCH", "/threads/" + q(thread_id), {"archived": True}, timeout=timeout)
-    if code != 200:
-        raise RuntimeError(f"archive {thread_id}: HTTP {code} {_err(body)}")
-    return body
+def archive_if_idle(thread_id, expected_session=None, timeout=30):
+    """Archive a Robob thread only if the server finds it idle (and, with
+    expected_session, still on that native session). Returns
+    {"archived": True, "reason": None} or {"archived": False, "reason": <why>}
+    on a 409 refusal (archived, running, queued, background-work, ...).
+    Any other status, including 404 for an unknown thread, raises."""
+    body_in = {"expectedSession": expected_session} if expected_session else {}
+    code, body = control("POST", "/threads/" + q(thread_id) + "/archive-if-idle", body_in, timeout=timeout)
+    if code == 200:
+        return {"archived": True, "reason": None}
+    if code == 409:
+        return {"archived": False, "reason": _refusal_reason(body)}
+    raise RuntimeError(f"archive-if-idle {thread_id}: HTTP {code} {_err(body)}")
+
+
+def _refusal_reason(body):
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("reason"):
+            return str(err["reason"])
+        if body.get("reason"):
+            return str(body["reason"])
+    return "unknown"
 
 
 def _err(body):

@@ -22,8 +22,15 @@ D = os.environ.get("MAILSEND_DRAFT_DIR") or os.path.join(HOME, ".local/state/mai
 HERE = os.path.dirname(os.path.realpath(__file__))
 SA = os.environ.get("MAILSEND_SEND_APPROVAL") or os.path.join(HERE, "send-approval")
 # himalaya through the XOAUTH2 retry wrapper (absolute path inside, so agent PATH shims don't apply).
-HIMALAYA = shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
+def himalaya_cmd():
+    """Read at call time: the guard and the command come from the same environment."""
+    return shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
                        f"/usr/bin/python3 {HOME}/.local/libexec/mail/mail_oauth.py himalaya")
+def under_test():
+    """True under `ROBOB_TEST=1`, bun test (NODE_ENV=test) or pytest (PYTEST_CURRENT_TEST)."""
+    return bool(os.environ.get("ROBOB_TEST")) or os.environ.get("NODE_ENV") == "test" or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 SAVE_COPY = {"icloud", "outlook"}
 MAX_AGE = 86400
 SEND_TIMEOUT = int(os.environ.get("MAILSEND_SEND_TIMEOUT") or 180)
@@ -40,7 +47,10 @@ def die(msg, code=2):
 
 def run(argv, timeout=120):
     try:
-        return subprocess.run(HIMALAYA + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # Under a test, never fall back to the live himalaya: an override must be set (checked in main() too).
+        if under_test() and not os.environ.get("MAILSEND_HIMALAYA"):
+            die("refused: test run; himalaya would reach email (set MAILSEND_HIMALAYA to a stub)")
+        return subprocess.run(himalaya_cmd() + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None
 
@@ -331,6 +341,9 @@ def main():
     if not getattr(a, "fn", None):
         print(__doc__)
         sys.exit(2)
+    # Test runs never reach email: a draft or send under a test needs a stub himalaya injected via MAILSEND_HIMALAYA.
+    if under_test() and not os.environ.get("MAILSEND_HIMALAYA"):
+        sys.exit(f"refused: test run; mailsend {a.cmd} would reach email (set MAILSEND_HIMALAYA to a stub)")
     a.fn(a)
 
 

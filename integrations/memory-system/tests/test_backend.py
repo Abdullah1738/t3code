@@ -393,21 +393,35 @@ class ReaperProtection(unittest.TestCase):
         q = "2026-09-22T00:00:00.000Z"
         with clean_env(MEMORY_BACKEND="robob"), \
                 mock.patch.object(backend, "thread_for_session", return_value=None):
-            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), (None, False))
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), (None, False, None))
         current = {"threadId": "t1", "archived": False}
         with clean_env(MEMORY_BACKEND="robob"), \
                 mock.patch.object(backend, "thread_for_session", return_value=current), \
                 mock.patch.object(backend, "current_native_session", return_value="ses_x") as cur, \
-                mock.patch.object(backend, "archive_thread") as arch:
-            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), ("t1", True))
+                mock.patch.object(backend, "archive_if_idle",
+                                  return_value={"archived": True, "reason": None}) as arch:
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), ("t1", True, None))
             cur.assert_called_once_with("t1", q)
-            arch.assert_called_once_with("t1")
+            arch.assert_called_once_with("t1", expected_session="ses_x")
         with clean_env(MEMORY_BACKEND="robob"), \
                 mock.patch.object(backend, "thread_for_session", return_value={**current, "archived": True}), \
                 mock.patch.object(backend, "current_native_session", return_value="ses_x"), \
-                mock.patch.object(backend, "archive_thread") as arch:
-            session_reaper.archive_robob_thread("ses_x", q)
+                mock.patch.object(backend, "archive_if_idle") as arch:
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), ("t1", True, None))
             arch.assert_not_called()
+
+    def test_reaper_keeps_busy_thread_on_409(self):
+        # The server refuses a busy thread: the reaper keeps it and reports the reason.
+        q = "2026-09-22T00:00:00.000Z"
+        with clean_env(MEMORY_BACKEND="robob"), \
+                mock.patch.object(backend, "thread_for_session",
+                                  return_value={"threadId": "t1", "archived": False}), \
+                mock.patch.object(backend, "current_native_session", return_value="ses_x"), \
+                mock.patch.object(backend, "control",
+                                  return_value=(409, {"ok": False, "archived": False,
+                                                      "error": {"code": "not_idle", "reason": "background-work"}})):
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q),
+                             ("t1", False, "background-work"))
 
     def test_archive_skips_thread_that_moved_on(self):
         # A context reset or provider switch leaves the old session bound to the live thread.
@@ -416,10 +430,36 @@ class ReaperProtection(unittest.TestCase):
                     mock.patch.object(backend, "thread_for_session",
                                       return_value={"threadId": "t1", "archived": False}), \
                     mock.patch.object(backend, "current_native_session", return_value=active), \
-                    mock.patch.object(backend, "archive_thread") as arch:
+                    mock.patch.object(backend, "archive_if_idle") as arch:
                 self.assertEqual(session_reaper.archive_robob_thread("ses_old", "2026-09-22T00:00:00.000Z"),
-                                 ("t1", False))
+                                 ("t1", False, "thread moved on"))
                 arch.assert_not_called()
+
+    def test_archive_if_idle_statuses(self):
+        seen = []
+
+        def fake(status, body):
+            def control(method, path, body_in=None, timeout=30):
+                seen.append((method, path, body_in))
+                return status, body
+            return control
+
+        with mock.patch.object(backend, "control", side_effect=fake(200, {"ok": True, "archived": True})):
+            self.assertEqual(backend.archive_if_idle("t1", expected_session="ses_x"),
+                             {"archived": True, "reason": None})
+        self.assertEqual(seen[-1], ("POST", "/threads/t1/archive-if-idle", {"expectedSession": "ses_x"}))
+        with mock.patch.object(backend, "control", side_effect=fake(200, {"ok": True, "archived": True})):
+            backend.archive_if_idle("t1")
+        self.assertEqual(seen[-1][2], {})
+        refusal = {"ok": False, "archived": False, "error": {"code": "not_idle", "reason": "running"}}
+        with mock.patch.object(backend, "control", side_effect=fake(409, refusal)):
+            self.assertEqual(backend.archive_if_idle("t1"), {"archived": False, "reason": "running"})
+        with mock.patch.object(backend, "control", side_effect=fake(404, {"ok": False})):
+            with self.assertRaises(RuntimeError):
+                backend.archive_if_idle("t1")
+        with mock.patch.object(backend, "control", side_effect=fake(500, {"ok": False})):
+            with self.assertRaises(RuntimeError):
+                backend.archive_if_idle("t1")
 
     def test_by_native_404_is_no_thread(self):
         with mock.patch.object(backend, "control", return_value=(404, {"ok": False})):

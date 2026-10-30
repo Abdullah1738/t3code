@@ -238,30 +238,27 @@ def control_gate():
 
 def archive_robob_thread(ses_id, quiet_before):
     """Archive the Robob thread bound to a deleted root session. Returns
-    (thread id, archived), (None, False) when no thread is bound, or raises.
+    (thread id, archived, reason), (None, False, None) when no thread is bound,
+    or raises. reason says why a kept thread was kept.
 
     by-native also resolves sessions a thread used before a context reset,
     rebind or provider switch, so a stale old session can map to a thread that
     is still in use. Only archive when the deleted session is the one the
-    thread runs on now (backend.current_native_session). The control API's
-    nativeSessionId can't decide this: it skips non-OpenCode providers and
-    subagent child threads.
-
-    The check and the archive aren't atomic, and unarchiving can't undo an
-    archive (it cancels queued runs and detaches sessions). So the thread must
-    also have been quiet since quiet_before (the stale cutoff): no live run and
-    no run or attempt requested, started or finished since. What's left is work
-    arriving during this one request on a thread idle for a month whose current
-    session was deleted just before; the control API has no conditional archive."""
+    thread runs on now (backend.current_native_session), and the thread has
+    been quiet since quiet_before (the stale cutoff). The control API's
+    archive-if-idle then refuses a busy thread (running, queued, background
+    work, pending request or wake) under the thread's dispatch lock, so the
+    server, not this check, decides whether the archive happens."""
     thread = backend.thread_for_session(ses_id)
     if not thread:
-        return None, False
+        return None, False, None
     tid = thread["threadId"]
     if backend.current_native_session(tid, quiet_before) != ses_id:
-        return tid, False
-    if not thread.get("archived"):
-        backend.archive_thread(tid)
-    return tid, True
+        return tid, False, "thread moved on"
+    if thread.get("archived"):
+        return tid, True, None
+    res = backend.archive_if_idle(tid, expected_session=ses_id)
+    return tid, res["archived"], res["reason"]
 
 
 # ------------------------------------------------------------------ candidates
@@ -496,10 +493,10 @@ def main():
             rec["delete_secs"] = round(dt, 2)
             if backend.is_robob():
                 try:
-                    thread_id, archived = archive_robob_thread(root["id"], quiet_before)
+                    thread_id, archived, reason = archive_robob_thread(root["id"], quiet_before)
                     rec["robob_thread"] = thread_id
                     if thread_id and not archived:
-                        rec["robob_thread_kept"] = "thread moved on or not idle"
+                        rec["robob_thread_kept"] = reason
                         st["kept_threads"] = st.get("kept_threads", 0) + 1
                 except Exception as e:
                     rec["robob_thread_error"] = str(e)[:200]
