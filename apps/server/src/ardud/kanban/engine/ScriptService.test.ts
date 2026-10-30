@@ -558,7 +558,6 @@ it.effect("a subtask a script ticks, which moves its card, wakes no card.moved s
       { _tag: "event", event: "card.moved" },
       "watcher",
     );
-    // The ticker's card has one script subtask; ticking it moves the card to completed.
     const ticker = yield* register(
       board,
       scriptFile(
@@ -567,12 +566,16 @@ it.effect("a subtask a script ticks, which moves its card, wakes no card.moved s
       manual,
       "ticker",
     );
+    // Step 1 is the script's; step 2 is the worker's. Ticking step 1 opens step 2 and moves the card to todo.
     const card = yield* kanban.createCard(
       board.id,
       {
         prompt: "Land the change",
         title: "Land",
-        subtasks: [{ text: "Merge and deploy", owner: "script", script: "ticker" }],
+        subtasks: [
+          { text: "Merge the PR", owner: "script", script: "ticker" },
+          { text: "Write the follow-up", owner: "work", step: 2 },
+        ],
       },
       owner,
     );
@@ -583,7 +586,9 @@ it.effect("a subtask a script ticks, which moves its card, wakes no card.moved s
     yield* settle;
 
     const stored = (yield* kanban.snapshot(board.id)).cards.find((entry) => entry.number === card.number)!;
-    assert.strictEqual(stored.stage, "completed");
+    assert.strictEqual(stored.stage, "todo");
+    const moved = stored.subtasks.find((subtask) => subtask.id === "s1")!;
+    assert.strictEqual(moved.doneBy?._tag, "script");
     assert.strictEqual((yield* scripts.runs(mover.id, 10)).length, 0);
     assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
