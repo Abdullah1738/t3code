@@ -8,6 +8,8 @@ import {
   CheckpointScopeId,
   MessageId,
   type ModelSelection,
+  type OrchestrationV2ProviderSession,
+  OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2TurnItem,
   type OrchestrationV2ThreadShellSnapshot,
@@ -30,6 +32,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
@@ -37,6 +40,9 @@ import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EventSink from "./EventSink.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   buildBoundedThreadProjection,
@@ -1221,6 +1227,213 @@ it.effect("memory shell snapshots scope to one project", () =>
     Effect.provide(ProjectionStore.layerMemory),
   ),
 );
+
+it.effect("one shared session update carrier survives SQL rebuild and memory replay", () => {
+  const database = SqlitePersistence.layerMemory;
+  const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
+    Layer.provideMerge(database),
+  );
+  const isolated = Layer.mergeAll(EventSink.layer, ProjectionMaintenance.layer).pipe(
+    Layer.provideMerge(stores),
+  );
+  return Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const events = yield* EventStore.EventStoreV2;
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const sql = yield* SqlClient.SqlClient;
+    const createdAt = DateTime.makeUnsafe("2026-10-30T12:00:00.000Z");
+    const updatedAt = DateTime.add(createdAt, { minutes: 1 });
+    const boundThreadIds = Array.from({ length: 16 }, (_, index) =>
+      ThreadId.make(`thread:session-carrier:${String(index).padStart(2, "0")}`),
+    );
+    const unboundThreadId = ThreadId.make("thread:session-carrier:unbound");
+    const threadIds = [...boundThreadIds, unboundThreadId];
+    const session: OrchestrationV2ProviderSession = {
+      id: ProviderSessionId.make("session:single-carrier"),
+      driver: ProviderDriverKind.make("opencode"),
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      status: "ready",
+      cwd: "/workspace/carrier-replay",
+      model: "gpt-6-astra",
+      capabilities: {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsMultipleProviderThreadsPerSession: true,
+        },
+      },
+      createdAt,
+      updatedAt: createdAt,
+      lastError: null,
+    };
+    for (const threadId of threadIds) {
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${threadId}:created`),
+            type: "thread.created",
+            threadId,
+            occurredAt: createdAt,
+            payload: {
+              id: threadId,
+              projectId: ProjectId.make("project:session-carrier"),
+              title: threadId,
+              providerInstanceId: session.providerInstanceId,
+              modelSelection: { instanceId: session.providerInstanceId, model: session.model! },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt,
+              updatedAt: createdAt,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          },
+        ],
+      });
+      if (threadId !== unboundThreadId) {
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`event:${threadId}:attached`),
+              type: "provider-session.attached",
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: createdAt,
+              payload: session,
+            },
+          ],
+        });
+      }
+    }
+    const readBindings = sql<{
+      readonly provider_session_id: string;
+      readonly thread_id: string;
+    }>`SELECT provider_session_id, thread_id
+      FROM orchestration_v2_projection_provider_session_bindings
+      ORDER BY thread_id, provider_session_id`;
+    const bindings = yield* readBindings;
+    assert.deepEqual(
+      bindings,
+      boundThreadIds.map((threadId) => ({
+        provider_session_id: session.id,
+        thread_id: threadId,
+      })),
+    );
+    const heads = yield* Effect.forEach(threadIds, (threadId) =>
+      events.latestSequence({ threadId }),
+    );
+    const previousHead = yield* events.latestSequence();
+    const running = { ...session, status: "running" as const, updatedAt };
+    const committed = yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:session-carrier:running"),
+          type: "provider-session.updated",
+          threadId: boundThreadIds[0]!,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: updatedAt,
+          payload: running,
+        },
+      ],
+    });
+    assert.lengthOf(committed, 1);
+    const carrier = committed[0]!;
+    assert.isAbove(carrier.sequence, previousHead);
+    assert.equal(carrier.event.threadId, boundThreadIds[0]);
+    assert.deepEqual(
+      yield* events.read({ afterSequence: previousHead }).pipe(Stream.runCollect),
+      committed,
+    );
+    for (const [index, threadId] of threadIds.entries()) {
+      assert.equal(
+        yield* events.latestSequence({ threadId }),
+        index === 0 ? carrier.sequence : heads[index],
+      );
+    }
+
+    const readBoundSessions = (projectionStore: ProjectionStore.ProjectionStoreV2Shape) =>
+      Effect.forEach(threadIds, (threadId) =>
+        projectionStore
+          .getThreadRecords(threadId, ["providerSessions"])
+          .pipe(Effect.map((records) => ({ threadId, sessions: records.providerSessions }))),
+      );
+    const expected = threadIds.map((threadId) => ({
+      threadId,
+      sessions: threadId === unboundThreadId ? [] : [running],
+    }));
+    const sqlSessions = yield* readBoundSessions(store);
+    assert.deepEqual(sqlSessions, expected);
+    assert.deepEqual(yield* readBindings, bindings);
+    const decodeSession = Schema.decodeUnknownEffect(
+      Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+    );
+    const canonicalRows = yield* sql<{ readonly payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_provider_sessions
+      ORDER BY provider_session_id`;
+    assert.deepEqual(
+      yield* Effect.forEach(canonicalRows, (row) => decodeSession(row.payload_json)),
+      [running],
+    );
+
+    const wholeLog = yield* events.read().pipe(Stream.runCollect);
+    assert.lengthOf(wholeLog, boundThreadIds.length * 2 + 2);
+    assert.deepEqual(
+      wholeLog.filter((stored) => stored.event.type === "provider-session.updated"),
+      committed,
+    );
+    const memorySessions = yield* Effect.gen(function* () {
+      const memory = yield* ProjectionStore.ProjectionStoreV2;
+      for (const stored of wholeLog) yield* memory.apply(stored.event);
+      return yield* readBoundSessions(memory);
+    }).pipe(Effect.provide(ProjectionStore.layerMemory));
+    assert.deepEqual(memorySessions, sqlSessions);
+    assert.deepEqual(
+      memorySessions.flatMap(({ threadId, sessions }) =>
+        sessions.map((value) => ({
+          provider_session_id: value.id,
+          thread_id: threadId,
+        })),
+      ),
+      bindings,
+    );
+
+    // Remove one binding so a no-op maintenance call cannot pass as a rebuild.
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings
+      WHERE thread_id = ${boundThreadIds.at(-1)!}`;
+    assert.lengthOf(yield* readBindings, boundThreadIds.length - 1);
+    const rebuilt = yield* maintenance.rebuild;
+    assert.deepEqual(rebuilt, {
+      valid: true,
+      schemaVersion: ProjectionStore.ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+      expectedSequence: carrier.sequence,
+      projectionSequence: carrier.sequence,
+      unreadableThreadIds: [],
+      missingThreadIds: [],
+      unexpectedThreadIds: [],
+    });
+    assert.deepEqual(yield* readBoundSessions(store), memorySessions);
+    assert.deepEqual(yield* readBindings, bindings);
+    assert.deepEqual(
+      yield* sql`SELECT payload_json FROM orchestration_v2_projection_provider_sessions
+        ORDER BY provider_session_id`,
+      canonicalRows,
+    );
+    assert.deepEqual(yield* events.read().pipe(Stream.runCollect), wholeLog);
+  }).pipe(Effect.provide(isolated));
+});
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect("returns a typed read error for malformed stored plan JSON", () =>

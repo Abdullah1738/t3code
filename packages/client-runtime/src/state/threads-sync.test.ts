@@ -3,8 +3,13 @@ import {
   EventId,
   MessageId,
   ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2ThreadHistoryPage,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderSessionId,
   ThreadId,
   TurnItemId,
+  type OrchestrationV2ProviderSession,
   type OrchestrationV2ThreadDetailSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
@@ -19,6 +24,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -68,6 +74,12 @@ const BASE_PROJECTION: OrchestrationV2ThreadProjection = {
 };
 
 type TestThreadInput = OrchestrationV2ThreadStreamItem | Error;
+type TestThreadSubscribeInput = {
+  readonly afterSequence?: number;
+  readonly requestCompletionMarker?: true;
+  readonly acceptBoundedSnapshot?: true;
+  readonly acceptCompactTurnItems?: true;
+};
 
 function testSession(
   client: WsRpcProtocolClient,
@@ -118,6 +130,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const latest = yield* Ref.make<EnvironmentThreadState>(EMPTY_ENVIRONMENT_THREAD_STATE);
   const retryCount = yield* Ref.make(0);
   const subscriptionCount = yield* Ref.make(0);
+  const subscriptions = yield* Queue.unbounded<TestThreadSubscribeInput>();
   const loaderCalls = yield* Ref.make(0);
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
   const lastRequestCompletionMarker = yield* Ref.make(false);
@@ -136,12 +149,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       ),
     );
   const client = {
-    [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input: {
-      readonly afterSequence?: number;
-      readonly requestCompletionMarker?: true;
-      readonly acceptBoundedSnapshot?: true;
-      readonly acceptCompactTurnItems?: true;
-    }) =>
+    [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input: TestThreadSubscribeInput) =>
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
           Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
@@ -150,6 +158,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           ),
           Effect.andThen(Ref.set(lastAcceptBoundedSnapshot, input.acceptBoundedSnapshot)),
           Effect.andThen(Ref.set(lastAcceptCompactTurnItems, input.acceptCompactTurnItems)),
+          Effect.andThen(Queue.offer(subscriptions, input)),
           Effect.as(streamFrom(inputs)),
         ),
       ),
@@ -261,6 +270,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     latest,
     retryCount,
     subscriptionCount,
+    subscriptions,
     loaderCalls,
     lastSubscribeAfterSequence,
     lastRequestCompletionMarker,
@@ -319,7 +329,415 @@ const deleted = (sequence = 3): OrchestrationV2ThreadStreamItem => {
   };
 };
 
+const SESSION_REFRESH_SESSION: OrchestrationV2ProviderSession = {
+  id: ProviderSessionId.make("session:history-refresh"),
+  driver: ProviderDriverKind.make("opencode"),
+  providerInstanceId: ProviderInstanceId.make("opencode"),
+  status: "ready",
+  cwd: "/workspace/project",
+  model: "gpt-6-astra",
+  createdAt: v2Projection.updatedAt,
+  updatedAt: v2Projection.updatedAt,
+  lastError: null,
+  capabilities: {
+    sessions: {
+      supportsMultipleProviderThreadsPerSession: true,
+      supportsModelSwitchInSession: true,
+      supportsProviderSwitchingViaHandoff: true,
+      supportsRuntimeModeSwitchInSession: true,
+      pendingRequestsSurviveRestart: false,
+    },
+    threads: {
+      canCreateEmptyThread: true,
+      canReadThreadSnapshot: true,
+      canRollbackThread: true,
+      canForkThread: true,
+      canForkFromTurn: true,
+      canForkFromSubagentThread: false,
+      exposesNativeThreadId: true,
+    },
+    turns: {
+      exposesNativeTurnId: false,
+      emitsTurnStarted: true,
+      emitsTurnCompleted: true,
+      supportsInterrupt: true,
+      supportsActiveSteering: true,
+      supportsSteeringByInterruptRestart: true,
+      supportsQueuedMessages: true,
+      terminalStatusQuality: "strong",
+    },
+    streaming: {
+      streamsAssistantText: true,
+      streamsReasoning: true,
+      streamsToolOutput: false,
+      streamsPlanText: false,
+      emitsMessageCompleted: true,
+    },
+    tools: {
+      exposesToolItemIds: true,
+      emitsToolStarted: true,
+      emitsToolCompleted: true,
+      emitsToolOutput: true,
+      supportsMcpTools: false,
+      supportsDynamicToolCallbacks: false,
+    },
+    approvals: {
+      supportsCommandApproval: true,
+      supportsFileReadApproval: true,
+      supportsFileChangeApproval: true,
+      supportsApplyPatchApproval: true,
+      approvalsHaveNativeRequestIds: true,
+      approvalCallbacksAreLiveOnly: true,
+      approvalsCanOriginateFromSubagents: true,
+    },
+    planning: {
+      emitsPlanUpdated: false,
+      emitsTodoList: false,
+      emitsProposedPlan: false,
+      supportsStructuredQuestions: true,
+      planDeltasHaveItemIds: false,
+    },
+    subagents: {
+      supportsSubagents: true,
+      exposesSubagentThreadIds: true,
+      emitsSubagentLifecycle: true,
+      canWaitForSubagents: true,
+      canCloseSubagents: false,
+      canForkSubagentThread: false,
+    },
+    context: {
+      acceptsSystemContext: false,
+      acceptsDeveloperContext: false,
+      acceptsSyntheticUserContext: true,
+      canGenerateSummaries: false,
+      canConsumeHandoffSummaries: true,
+      supportsDeltaHandoff: true,
+      supportsFullThreadHandoff: true,
+      maxRecommendedHandoffChars: null,
+    },
+    checkpointing: {
+      appCanCheckpointFilesystem: true,
+      supportsNestedCheckpointScopes: true,
+      providerCanRollbackConversation: true,
+      providerRollbackReturnsSnapshot: true,
+      providerCanReadConversationSnapshot: true,
+    },
+    identity: {
+      nativeThreadIds: "strong",
+      nativeTurnIds: "weak",
+      nativeItemIds: "strong",
+      nativeRequestIds: "strong",
+    },
+    runtimePolicy: { enforcement: "native" },
+  },
+};
+
+const sessionRefresh = (
+  status: "running" | "waiting",
+  sequence: number,
+): Extract<OrchestrationV2ThreadStreamItem, { readonly kind: "event" }> => {
+  const occurredAt = DateTime.add(v2Projection.updatedAt, { hours: sequence });
+  return {
+    kind: "event",
+    sequence,
+    event: {
+      id: EventId.make(`event:session-refresh:${sequence}`),
+      threadId: THREAD_ID,
+      type: "provider-session.updated",
+      driver: SESSION_REFRESH_SESSION.driver,
+      providerInstanceId: SESSION_REFRESH_SESSION.providerInstanceId,
+      occurredAt,
+      payload: { ...SESSION_REFRESH_SESSION, status, updatedAt: occurredAt },
+    },
+  };
+};
+
+const sessionHistoryItems = [1, 2, 3, 4].map(
+  (ordinal): OrchestrationV2TurnItem => ({
+    id: TurnItemId.make(`item:session-history:${ordinal}`),
+    threadId: THREAD_ID,
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal,
+    status: "completed",
+    title: null,
+    startedAt: v2Projection.updatedAt,
+    completedAt: v2Projection.updatedAt,
+    updatedAt: v2Projection.updatedAt,
+    type: "assistant_message",
+    messageId: MessageId.make(`message:session-history:${ordinal}`),
+    text: `History page ${ordinal}`,
+    streaming: false,
+  }),
+);
+
+const sessionHistoryRows = sessionHistoryItems.map((item, position) => ({
+  position,
+  visibility: "local" as const,
+  sourceThreadId: THREAD_ID,
+  sourceItemId: item.id,
+  item,
+}));
+
+function expectSessionRefreshOnly(
+  before: EnvironmentThreadState,
+  after: EnvironmentThreadState,
+  refresh: ReturnType<typeof sessionRefresh>,
+) {
+  expect(refresh.event.type).toBe("provider-session.updated");
+  expect(Option.getOrThrow(after.data)).toEqual({
+    ...Option.getOrThrow(before.data),
+    providerSessions: [refresh.event.payload],
+    updatedAt: refresh.event.occurredAt,
+  });
+  expect(after.history).toEqual(before.history);
+  expect(Option.isNone(after.error)).toBe(true);
+}
+
 describe("EnvironmentThreads", () => {
+  it.effect.each(["application-active", "application-active-probe", "warm navigation"] as const)(
+    "session refresh on foreground and warm navigation preserves expanded and in-flight history (%s)",
+    (resume) =>
+      Effect.gen(function* () {
+        const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+          snapshot: undefined,
+          owner: undefined,
+        };
+        const heldPageStarted = yield* Deferred.make<void>();
+        const releaseHeldPage = yield* Deferred.make<void>();
+        const requestedCursors: string[] = [];
+        const encodePage = Schema.encodeEffect(Schema.toCodecJson(OrchestrationV2ThreadHistoryPage));
+        const historyHttpClient = HttpClient.make((request, url) =>
+          Effect.gen(function* () {
+            const cursor = url.searchParams.get("cursor");
+            expect(cursor).toMatch(/^session-history:[123]$/);
+            requestedCursors.push(cursor!);
+            const ordinal = Number(cursor!.split(":")[1]);
+            if (ordinal === 2) {
+              yield* Deferred.succeed(heldPageStarted, undefined);
+              yield* Deferred.await(releaseHeldPage);
+            }
+            const page = yield* encodePage({
+              snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+              items: [sessionHistoryRows[ordinal - 1]!],
+              nextCursor: ordinal === 1 ? null : `session-history:${ordinal - 1}`,
+              hasMoreHistory: ordinal > 1,
+            }).pipe(Effect.orDie);
+            return HttpClientResponse.fromWeb(request, Response.json(page));
+          }),
+        );
+        const options = {
+          resumeCache,
+          historyHttpClient,
+          completionMarker: true,
+          historyPaging: "enabled" as const,
+        };
+        let scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+          Scope.close(scope, Exit.void),
+        );
+        let h = yield* makeHarness({
+          ...options,
+          cached: {
+            ...BASE_PROJECTION,
+            providerSessions: [SESSION_REFRESH_SESSION],
+            turnItems: sessionHistoryItems.slice(-1),
+            visibleTurnItems: [{ ...sessionHistoryRows[3]!, position: 0 }],
+          },
+          cachedHistory: {
+            historyCursor: "session-history:3",
+            hasMoreHistory: true,
+            latestLocalTurnOrdinal: 4,
+          },
+        }).pipe(Effect.provideService(Scope.Scope, scope));
+        expect((yield* Queue.take(h.subscriptions)).afterSequence).toBe(CACHED_SNAPSHOT_SEQUENCE);
+        yield* Queue.offer(h.inputs, titleUpdated("Last applied event", 8));
+        yield* Queue.offer(h.inputs, synchronized());
+        yield* awaitThreadState(h.observed, (state) => state.status === "live");
+        expect(yield* h.loadEarlier()).toEqual({ _tag: "loaded" });
+        const expanded = yield* SubscriptionRef.get(h.threadState);
+        expect(expanded.history).toEqual({
+          historyCursor: "session-history:2",
+          hasMoreHistory: true,
+          latestLocalTurnOrdinal: 4,
+          expanded: true,
+          loading: false,
+          error: null,
+        });
+        expect(
+          Option.getOrThrow(expanded.data).visibleTurnItems.map((row) => row.sourceItemId),
+        ).toEqual(sessionHistoryItems.slice(2).map((item) => item.id));
+
+        const heldPage = yield* h.loadEarlier().pipe(Effect.forkScoped);
+        yield* Deferred.await(heldPageStarted);
+        const inFlight = yield* SubscriptionRef.get(h.threadState);
+        expect(inFlight.history).toEqual({ ...expanded.history, loading: true });
+        expect(Option.getOrThrow(inFlight.data)).toEqual(Option.getOrThrow(expanded.data));
+        if (resume === "warm navigation") {
+          // A request belongs to its scope; finish it before retaining the navigation cache.
+          yield* Deferred.succeed(releaseHeldPage, undefined);
+          expect(yield* Fiber.join(heldPage)).toEqual({ _tag: "loaded" });
+        }
+        const before = yield* SubscriptionRef.get(h.threadState);
+        const resubscribe = Effect.fn("TestSessionRefresh.resubscribe")(function* (sequence: number) {
+          expect(yield* Ref.get(h.loaderCalls)).toBe(0);
+          if (resume === "warm navigation") {
+            yield* Scope.close(scope, Exit.void);
+            scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+              Scope.close(scope, Exit.void),
+            );
+            h = yield* makeHarness(options).pipe(Effect.provideService(Scope.Scope, scope));
+          } else {
+            yield* Queue.offer(h.wakeups, resume);
+          }
+          expect(yield* Queue.take(h.subscriptions)).toMatchObject({
+            afterSequence: sequence,
+            requestCompletionMarker: true,
+            acceptBoundedSnapshot: true,
+          });
+          expect(yield* Ref.get(h.loaderCalls)).toBe(0);
+        });
+        yield* resubscribe(8);
+        const resumed = yield* SubscriptionRef.get(h.threadState);
+        expect(resumed.history).toEqual(before.history);
+        expect(Option.getOrThrow(resumed.data)).toEqual(Option.getOrThrow(before.data));
+
+        const refresh = sessionRefresh("running", 9);
+        yield* Queue.offer(h.inputs, refresh);
+        const refreshing = yield* awaitThreadState(h.observed, (state) =>
+          Option.getOrNull(state.data)?.providerSessions[0]?.status === "running",
+        );
+        expect(refreshing.status).toBe("synchronizing");
+        expectSessionRefreshOnly(before, refreshing, refresh);
+        yield* Queue.offer(h.inputs, synchronized());
+        const refreshed = yield* awaitThreadState(h.observed, (state) => state.status === "live");
+        expectSessionRefreshOnly(before, refreshed, refresh);
+        if (resume !== "warm navigation") {
+          expect(refreshed.history.loading).toBe(true);
+          expect(refreshed.history.historyCursor).toBe("session-history:2");
+          yield* Deferred.succeed(releaseHeldPage, undefined);
+          expect(yield* Fiber.join(heldPage)).toEqual({ _tag: "loaded" });
+        }
+        const secondPage = yield* SubscriptionRef.get(h.threadState);
+        expect(secondPage.history).toEqual({
+          ...expanded.history,
+          historyCursor: "session-history:1",
+        });
+        expect(
+          Option.getOrThrow(secondPage.data).visibleTurnItems.map((row) => row.sourceItemId),
+        ).toEqual(sessionHistoryItems.slice(1).map((item) => item.id));
+        expect(Option.getOrThrow(secondPage.data).turnItems.map((item) => item.id)).toEqual(
+          sessionHistoryItems
+            .slice(1)
+            .toReversed()
+            .map((item) => item.id),
+        );
+        expect(Option.getOrThrow(secondPage.data).providerSessions[0]?.status).toBe("running");
+
+        expect(yield* h.loadEarlier()).toEqual({ _tag: "loaded" });
+        const complete = yield* SubscriptionRef.get(h.threadState);
+        expect(complete.history).toEqual({
+          ...expanded.history,
+          historyCursor: null,
+          hasMoreHistory: false,
+        });
+        expect(
+          Option.getOrThrow(complete.data).visibleTurnItems.map((row) => row.sourceItemId),
+        ).toEqual(sessionHistoryItems.map((item) => item.id));
+        expect(Option.getOrThrow(complete.data).turnItems.map((item) => item.id)).toEqual(
+          sessionHistoryItems.toReversed().map((item) => item.id),
+        );
+        expect(requestedCursors).toEqual([
+          "session-history:3",
+          "session-history:2",
+          "session-history:1",
+        ]);
+
+        yield* resubscribe(9);
+        const finalRefresh = sessionRefresh("waiting", 10);
+        yield* Queue.offer(h.inputs, finalRefresh);
+        yield* Queue.offer(h.inputs, synchronized());
+        const final = yield* awaitThreadState(
+          h.observed,
+          (state) =>
+            state.status === "live" &&
+            Option.getOrNull(state.data)?.providerSessions[0]?.status === "waiting",
+        );
+        expectSessionRefreshOnly(complete, final, finalRefresh);
+        expect(yield* h.loadEarlier()).toEqual({ _tag: "noop" });
+        expect(requestedCursors).toHaveLength(3);
+        yield* resubscribe(10);
+        yield* Queue.offer(h.inputs, synchronized());
+        const retained = yield* awaitThreadState(h.observed, (state) => state.status === "live");
+        expectSessionRefreshOnly(complete, retained, finalRefresh);
+      }),
+  );
+
+  it.effect.each(["application-active", "application-active-probe", "warm navigation"] as const)(
+    "session refresh preserves a legacy full-history cache (%s)",
+    (resume) =>
+      Effect.gen(function* () {
+        const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+          snapshot: undefined,
+          owner: undefined,
+        };
+        const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+          Scope.close(scope, Exit.void),
+        );
+        let h = yield* makeHarness({
+          resumeCache,
+          completionMarker: true,
+          historyPaging: "enabled",
+          cached: {
+            ...BASE_PROJECTION,
+            providerSessions: [SESSION_REFRESH_SESSION],
+            turnItems: sessionHistoryItems,
+            visibleTurnItems: sessionHistoryRows,
+          },
+        }).pipe(Effect.provideService(Scope.Scope, scope));
+        yield* Queue.take(h.subscriptions);
+        yield* Queue.offer(h.inputs, titleUpdated("Last legacy event", 8));
+        yield* Queue.offer(h.inputs, synchronized());
+        const before = yield* awaitThreadState(h.observed, (state) => state.status === "live");
+        expect(before.history).toEqual({
+          historyCursor: null,
+          hasMoreHistory: false,
+          latestLocalTurnOrdinal: null,
+          expanded: false,
+          loading: false,
+          error: null,
+        });
+        expect(yield* Ref.get(h.loaderCalls)).toBe(0);
+        if (resume === "warm navigation") {
+          yield* Scope.close(scope, Exit.void);
+          h = yield* makeHarness({ resumeCache, completionMarker: true, historyPaging: "enabled" });
+        } else {
+          yield* Queue.offer(h.wakeups, resume);
+        }
+        expect(yield* Queue.take(h.subscriptions)).toMatchObject({
+          afterSequence: 8,
+          requestCompletionMarker: true,
+        });
+        const refresh = sessionRefresh("running", 9);
+        yield* Queue.offer(h.inputs, refresh);
+        yield* Queue.offer(h.inputs, synchronized());
+        const after = yield* awaitThreadState(
+          h.observed,
+          (state) =>
+            state.status === "live" &&
+            Option.getOrNull(state.data)?.providerSessions[0]?.status === "running",
+        );
+        expectSessionRefreshOnly(before, after, refresh);
+        expect(yield* h.loadEarlier()).toEqual({ _tag: "noop" });
+        expect(yield* Ref.get(h.loaderCalls)).toBe(0);
+        yield* h.replaceSession;
+        expect((yield* Queue.take(h.subscriptions)).afterSequence).toBe(9);
+      }),
+  );
+
   it.effect("loads the server thread when its local cache read fails", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness({
