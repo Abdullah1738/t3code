@@ -6828,3 +6828,187 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 });
+
+const pullRequestCandidateFixture = {
+  branch: "feature/pr-candidate",
+  branchPullRequest: {
+    number: 42,
+    url: "https://github.com/example/repo/pull/42",
+    state: "open",
+  },
+} as const;
+
+it.effect("PR candidate shell selection preserves default snapshots and fork counts", () =>
+  Effect.gen(function* () {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* DateTime.now;
+    const projectId = ProjectId.make("project:pr-candidates");
+    const threadIds = {
+      branchOnly: ThreadId.make("thread:pr-candidates:branch-only"),
+      prOnly: ThreadId.make("thread:pr-candidates:pr-only"),
+      neither: ThreadId.make("thread:pr-candidates:neither"),
+      archivedBranch: ThreadId.make("thread:pr-candidates:archived-branch"),
+      settledBranch: ThreadId.make("thread:pr-candidates:settled-branch"),
+      forkSource: ThreadId.make("thread:pr-candidates:fork-source"),
+      forkNeither: ThreadId.make("thread:pr-candidates:fork-neither"),
+    } as const;
+    const runId = RunId.make("run:pr-candidates:fork-source");
+    const rootNodeId = NodeId.make("node:pr-candidates:fork-source");
+    const pullRequest = {
+      projectId,
+      repository: "example/repo",
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+    };
+
+    const created = (threadId: ThreadId, overrides: Record<string, unknown> = {}) =>
+      projectionStore.apply({
+        id: EventId.make(`event:pr-candidates:${threadId}`),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId,
+          title: threadId,
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+          ...overrides,
+        } as never,
+      });
+
+    yield* created(threadIds.branchOnly, { branch: "feature/a" });
+    yield* created(threadIds.prOnly, { branchPullRequest: pullRequest });
+    yield* created(threadIds.neither);
+    yield* created(threadIds.archivedBranch, { branch: "feature/archived", archivedAt: now });
+    yield* created(threadIds.settledBranch, {
+      branch: "feature/settled",
+      settledOverride: "settled",
+      settledAt: now,
+    });
+    yield* created(threadIds.forkSource);
+    yield* created(threadIds.forkNeither, {
+      branch: "feature/fork",
+      forkedFrom: { type: "run", threadId: threadIds.forkSource, runId },
+      lineage: {
+        parentThreadId: threadIds.forkSource,
+        relationshipToParent: "fork",
+        rootThreadId: threadIds.forkSource,
+      },
+    });
+    yield* projectionStore.apply({
+      id: EventId.make("event:pr-candidates:fork-source-run"),
+      type: "run.created",
+      threadId: threadIds.forkSource,
+      runId,
+      nodeId: rootNodeId,
+      driver,
+      occurredAt: now,
+      payload: {
+        id: runId,
+        threadId: threadIds.forkSource,
+        ordinal: 1,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make("message:pr-candidates:fork-source"),
+        rootNodeId,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    } as never);
+
+    const ids = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
+      threads.map((thread) => thread.id).toSorted();
+
+    const defaultSnapshot = yield* projectionStore.getShellSnapshot();
+    const readDefault = yield* yield* sql.withTransaction(projectionStore.readShellSnapshot());
+    assert.deepEqual(ids(readDefault.threads), ids(defaultSnapshot.threads));
+    assert.isTrue(defaultSnapshot.threads.some((thread) => thread.id === threadIds.neither));
+
+    for (const unsettledOnly of [false, true]) {
+      const unfiltered = yield* projectionStore.getShellSnapshot({
+        location: "active",
+        unsettledOnly,
+      });
+      const filtered = yield* projectionStore.getShellSnapshot({
+        location: "active",
+        unsettledOnly,
+        pullRequestCandidatesOnly: true,
+      });
+      const expected = unfiltered.threads.filter(
+        (thread) => thread.branch !== null || thread.branchPullRequest != null,
+      );
+      assert.deepEqual(ids(filtered.threads), ids(expected));
+      assert.strictEqual(filtered.snapshotSequence, unfiltered.snapshotSequence);
+      for (const expectedThread of expected) {
+        const retained = filtered.threads.find((thread) => thread.id === expectedThread.id);
+        assert.deepEqual(retained, expectedThread);
+      }
+      const forkFiltered = filtered.threads.find((thread) => thread.id === threadIds.forkNeither);
+      const forkUnfiltered = unfiltered.threads.find(
+        (thread) => thread.id === threadIds.forkNeither,
+      );
+      assert.isDefined(forkUnfiltered);
+      assert.strictEqual(forkFiltered?.visibleItemCount, forkUnfiltered?.visibleItemCount);
+    }
+
+    const { statements, tracer } = traceSqlStatements();
+    yield* projectionStore
+      .getShellSnapshot({ location: "active", pullRequestCandidatesOnly: true })
+      .pipe(Effect.withTracer(tracer));
+    assert.isAtLeast(
+      statements.filter((statement) => statement.includes("'$.branchPullRequest'")).length,
+      1,
+    );
+
+    const [stored] = yield* sql<{ readonly payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_threads
+      WHERE thread_id = ${threadIds.neither}
+    `;
+    yield* sql`UPDATE orchestration_v2_projection_threads
+      SET payload_json = json_set(payload_json, '$.title', 123)
+      WHERE thread_id = ${threadIds.neither}`;
+    const filteredRead = yield* sql
+      .withTransaction(
+        projectionStore.readShellSnapshot({ location: "active", pullRequestCandidatesOnly: true }),
+      )
+      .pipe(
+        Effect.flatMap((decode) => decode),
+        Effect.exit,
+      );
+    const unfilteredRead = yield* sql
+      .withTransaction(projectionStore.readShellSnapshot({ location: "active" }))
+      .pipe(
+        Effect.flatMap((decode) => decode),
+        Effect.exit,
+      );
+    yield* sql`UPDATE orchestration_v2_projection_threads
+      SET payload_json = ${stored!.payload_json}
+      WHERE thread_id = ${threadIds.neither}`;
+    assert.isTrue(filteredRead._tag === "Success");
+    assert.isTrue(unfilteredRead._tag === "Failure");
+  }).pipe(Effect.provide(layerTest)),
+);
