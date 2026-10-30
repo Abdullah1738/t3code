@@ -117,10 +117,13 @@ describe("boardLayout", () => {
       groupWidth: null,
     });
     if (layout.kind !== "columns") throw new Error("columns");
-    // 300 is above the 280 cap, 100 below the 140 floor.
-    expect(layout.columns.working).toBe(280);
+    // Saved widths clamp to the shared range (140-560): 300 stays, 100 rises to 140.
+    expect(layout.columns.working).toBe(300);
     expect(layout.columns.todo).toBe(140);
     expect(layout.columns.needs_review).toBe(207);
+    const capped = boardLayout(1366, { widths: { in_review: 900 }, hidden: [], groupWidth: null });
+    if (capped.kind !== "columns") throw new Error("columns");
+    expect(capped.columns.in_review).toBe(560);
   });
 
   it("drops hidden columns and lets the rest reflow", () => {

@@ -38,6 +38,9 @@ import { ChoiceRow, LinkButton } from "../common/parts";
 import {
   applyColumnAction,
   BOARD_PAD,
+  boardLayout,
+  COLUMN_RAIL_WIDTH,
+  STAGE_COLUMN_KEYS,
   type BoardLayout,
   type BoardTab,
   boardTabs,
