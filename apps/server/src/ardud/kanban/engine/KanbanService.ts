@@ -2803,12 +2803,9 @@ const make = Effect.gen(function* () {
         yield* evaluatorGiveUp(link, failure.message);
         return;
       }
+      const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
       yield* Ref.update(evaluatorFailures, (all) =>
-        new Map(all).set(threadId, {
-          dueAt: (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS,
-          message: failure.message,
-          state: "retry",
-        }),
+        new Map(all).set(threadId, { dueAt, message: failure.message, state: "retry" }),
       );
       return;
     }
