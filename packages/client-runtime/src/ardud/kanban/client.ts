@@ -56,6 +56,9 @@ interface BoardFeed {
   close: Unsubscribe | null;
   failed: boolean;
   error: unknown;
+  // A completed empty read is retried only after its discussion advances.
+  readonly previewTried: Map<string, number>;
+  readonly previewPending: Set<string>;
 }
 
 export interface KanbanClient {
@@ -281,6 +284,8 @@ export function createKanbanClient(
         close: null,
         failed: false,
         error: undefined,
+        previewTried: new Map(),
+        previewPending: new Set(),
       };
       feed = created;
       feeds.set(boardId, created);
@@ -434,23 +439,25 @@ export function createKanbanClient(
   }, options);
 
   const previewWatchers = new Map<string, number>();
-  // The discussion seq each preview was last read for, so a read that brings
-  // nothing newer is not repeated until the discussion moves on.
-  const previewTried = new Map<string, number>();
   const loadPreviews = (boardId: string) => {
     if ((previewWatchers.get(boardId) ?? 0) === 0) return;
-    const state = feeds.get(boardId)?.state;
-    if (state === undefined) return;
+    const feed = feeds.get(boardId);
+    const state = feed?.state;
+    if (feed === undefined || state === undefined) return;
+    const room = PREVIEW_FETCH_LIMIT - feed.previewPending.size;
+    if (room <= 0) return;
     const behind = [...state.discussions.values()]
       .filter(
         (discussion) =>
           discussion.lastSeq > (state.lastMessages.get(discussion.id)?.seq ?? 0) &&
-          (previewTried.get(discussion.id) ?? 0) < discussion.lastSeq,
+          !feed.previewPending.has(discussion.id) &&
+          (feed.previewTried.get(discussion.id) ?? 0) < discussion.lastSeq,
       )
       .sort((a, b) => (b.lastMessageAt ?? "").localeCompare(a.lastMessageAt ?? ""))
-      .slice(0, PREVIEW_FETCH_LIMIT);
+      .slice(0, room);
     for (const discussion of behind) {
-      previewTried.set(discussion.id, discussion.lastSeq);
+      feed.previewTried.set(discussion.id, discussion.lastSeq);
+      feed.previewPending.add(discussion.id);
       void transport
         .request(M.messages, {
           discussionId: discussion.id,
@@ -459,11 +466,15 @@ export function createKanbanClient(
         })
         .then(
           (page) => {
+            feed.previewPending.delete(discussion.id);
+            if (feeds.get(boardId) !== feed) return;
             if (page.length > 0) update(boardId, (current) => withDiscussions(current, [], page));
+            else loadPreviews(boardId);
           },
           () => {
+            feed.previewPending.delete(discussion.id);
             // Try again on the next change.
-            previewTried.delete(discussion.id);
+            feed.previewTried.delete(discussion.id);
           },
         );
     }
