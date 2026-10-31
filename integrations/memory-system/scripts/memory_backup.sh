@@ -193,6 +193,31 @@ if [ -d "$MUSE_SESSIONS" ]; then
 fi
 /opt/homebrew/bin/rsync -a "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist \
   "$HOME/Library/LaunchAgents/com.abdullah.recall.plist" "$STAGE/files/" 2>/dev/null
+# Harness transcripts (Claude Code and Codex homes). Only transcript dirs are
+# copied; auth/credential files and SQLite/WAL files are excluded. The manifest
+# below must match the staged copy, or the run fails.
+HARNESS="${ROBOB_HARNESS_HOMES:-$HOME/.robob/harness-homes}"
+TSTAGE="$STAGE/files/transcripts"
+mkdir -p "$TSTAGE"
+for pair in "claude/projects" "codex/sessions" "codex/archived_sessions" "codex-cu/sessions" "codex-cu/archived_sessions"; do
+  src="$HARNESS/$pair"
+  [ -d "$src" ] || continue
+  dst="$TSTAGE/$pair"
+  # --delete keeps the staged copy equal to the live dir (no stale transcripts
+  # in the backup); rm is avoided on the SSD under launchd (see above).
+  /opt/homebrew/bin/rsync -a --delete \
+    --exclude='.credentials.json' --exclude='auth.json' --exclude='settings.local.json' \
+    --exclude='*.key' --exclude='*.sqlite*' --exclude='*.db' --exclude='*.db-*' --exclude='*-wal' --exclude='*-shm' \
+    "$src/" "$dst/" >>"$LOG" 2>&1 || fail files "rsync harness transcripts $pair"
+done
+MANIFEST_DIR="$DATA/backup-manifests"
+mkdir -p "$MANIFEST_DIR"
+mout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" build "$TSTAGE" "$MANIFEST_DIR" 2>&1) \
+  || fail files "transcript manifest build: $(printf '%s' "$mout" | tail -1)"
+MPATH="$mout"
+vout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" verify "$MPATH" "$TSTAGE" 2>&1) \
+  || fail files "transcript manifest mismatch: $(printf '%s' "$vout" | tail -1)"
+log "transcript manifest $(basename "$MPATH") verified ($(printf '%s' "$vout" | wc -l | tr -d ' ') problems)"
 
 # 2. snapshot
 excl=(--exclude "$STAGE/robob-state.sql.tmp")

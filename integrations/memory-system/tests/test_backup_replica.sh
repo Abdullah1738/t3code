@@ -19,6 +19,8 @@ setup() { # fake-or-real sqlite3_rsync
   touch "$R/HANDOFF.md"
   echo x > "$T/repo/live/config"
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
+  # the live install ships src/ (incl. the transcript manifest tool) next to the script
+  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$R/src/"
   old=$(( $(date +%s) - 3 * 86400 ))
   "$SQLITE" "$R/data/memory.db" "PRAGMA journal_mode=wal;
     CREATE TABLE episodic_events(id INTEGER PRIMARY KEY, timestamp INTEGER);
