@@ -74,7 +74,9 @@ NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fra
 NEGATED = re.compile(r"\b(?:no|none|nothing|never|not|n't|didn't|haven't|hasn't|wasn't|isn't)\b", re.I)
 # A denial or correction in the whole message: "I paid Apple. No, I ordered nothing from Apple." The later
 # denial vetoes the earlier affirmation, so it is checked on the message before any clause is accepted.
-VETO = re.compile(r"\b(?:no|nope|nah|wrong|incorrect|actually|correction|not\s+me|that\s+wasn'?t|it\s+wasn'?t)\b"
+# Only a denial of buying or owning vetoes: a bare "no", "actually" or "no need to ask" is discourse, not a denial.
+VETO = re.compile(r"\b(?:not\s+me|not\s+mine|wasn'?t\s+(?:me|mine)|isn'?t\s+(?:me|mine)|that\s+wasn'?t|"
+                  r"it\s+wasn'?t|wrong\s+(?:charge|one|order|account)|incorrect\s+(?:charge|one))\b"
                   r"|\b(?:none|nothing|never|not|n't)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
