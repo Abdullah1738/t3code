@@ -23,7 +23,8 @@ offbox run --size xlarge -- make test-integration
 ```
 
 offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
-gitignored files, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent), `cd`s into the same relative
+gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
+file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
 **Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
@@ -243,8 +244,11 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
 - Sync fails with rsync 23 `delete_file: unlink(...) failed: Permission denied (13)`: a container wrote root-owned files into the checkout on the box (LocalStack's `tmp/localstack`). offbox gives them back to the box user (`sudo chown -R`) and syncs once more by itself. If that fails too it exits 90 before your command and names the `offbox ssh <box> -- sudo chown ...` to run.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
-- Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
-  `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+- Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
+  ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+  Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
+  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
+  lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
