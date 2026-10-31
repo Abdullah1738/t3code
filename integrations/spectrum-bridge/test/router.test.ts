@@ -75,7 +75,9 @@ class Backend extends OpenChamber {
     this.reads.push(["messages", id, directory]);
     return this.messagesBehavior ? this.messagesBehavior() : this.records;
   }
-  override async statuses() { this.reads.push(["statuses"]); return this.states; }
+  /** Runs during an awaited status read, so a test can inject an arrival mid-preparation. */
+  onStatuses?: () => void;
+  override async statuses() { this.reads.push(["statuses"]); this.onStatuses?.(); return this.states; }
   titles: Record<string, string> = {};
   override async getSession(id: string, directory: string) {
     this.reads.push(["session", id, directory]);
@@ -4237,6 +4239,84 @@ test("a refused /new waits while a busy child of the root is still running", asy
   setSystemTime(start + 40 * 60_000);
   await h.router.tick();
   await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("owner text that arrives while a queued deferred /new is being prepared cancels that reset", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  // The owner writes during the awaited status read that prepares the queued reset, before its POST.
+  h.backend.onStatuses = () => {
+    h.backend.onStatuses = undefined;
+    h.input("owner", "Actually, keep this chat");
+  };
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  expect(h.store.pendingInbound().some(row => row.id.startsWith("reset:"))).toBe(false);
+});
+
+test("a deferred /new is consumed once its retry is submitted: a full idle window after a successful NO_REPLY asks nothing more", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The deferred retry is asked once and the agent resets silently.
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  // The initial /new nudge plus the one deferred retry.
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  // A whole new idle window later, nothing is re-asked: the deferral was consumed.
+  setSystemTime(start + 60 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("a failed deferred retry does not leave the old deferral eligible for another ask", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  // The initial /new nudge plus the one deferred retry.
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+  // The retry turn fails outright: it is not a fresh refusal, so nothing asks again.
+  h.backend.failed("PRIVATE_TEXT");
+  await h.router.tick();
+  setSystemTime(start + 60 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
 });
 

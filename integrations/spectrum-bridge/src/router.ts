@@ -1218,18 +1218,36 @@ export class Router {
   private cancelQueuedNew(): void {
     const queued = this.store.get<{ id: string; since: number } | null>("newQueued");
     if (!queued) return;
-    const row = this.store.db.query<{ state: string; payload: string }, [string]>("SELECT state, payload FROM inbound WHERE id = ?").get(queued.id);
+    const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(queued.id);
     if (!row || row.state !== "pending") {
       // Already POSTed (or retired): the deferral is consumed.
       this.store.set("newQueued", null);
       return;
     }
+    this.dropQueuedNewIfMovedOn();
+  }
+
+  /**
+   * Cancels a queued deferred reset when the conversation moved on since the
+   * deferral was recorded. Returns true when it did. Called at the batch seal
+   * and again inside the final pre-POST transaction, so an arrival during
+   * preparation (awaited status or config reads) is never missed. Call inside a transaction.
+   */
+  private dropQueuedNewIfMovedOn(): boolean {
+    const queued = this.store.get<{ id: string; since: number } | null>("newQueued");
+    if (!queued) return false;
     const deferred = this.store.get<NewDeferred | null>("newDeferred");
-    if (!this.movedOn(queued.since) && !(deferred && this.sentSince(deferred.generation, deferred.outbox))) return;
+    if (!this.movedOn(queued.since) && !(deferred && this.sentSince(deferred.generation, deferred.outbox))) return false;
     this.store.updateInbound(queued.id, "cancelled");
+    this.clearDeferredNew();
+    this.options.log?.("context-reset-dropped", "moved-on");
+    return true;
+  }
+
+  /** Forgets the deferred /new and its queued retry: consumed, superseded, or moved on. Call inside a transaction. */
+  private clearDeferredNew(): void {
     this.store.set("newQueued", null);
     this.store.set("newDeferred", null);
-    this.options.log?.("context-reset-dropped", "moved-on");
   }
 
   /**
@@ -2303,6 +2321,16 @@ export class Router {
     // Commit the final arrival check and acceptance fence together, before POST.
     const submitting = this.store.db.transaction(() => {
       if (interrupted() || !this.current(turn)) return false;
+      // A deferred /new whose conversation moved on during preparation is dropped here, not sent late.
+      const queued = this.store.get<{ id: string } | null>("newQueued");
+      if (queued && members.includes(queued.id)) {
+        if (this.dropQueuedNewIfMovedOn()) {
+          this.store.updateInbound(row.id, "cancelled");
+          return false;
+        }
+        // Submitted: the deferral is consumed here, so only a fresh refusal can recreate it.
+        this.clearDeferredNew();
+      }
       this.store.set(`batch-phase:${row.id}`, "submitting");
       if (this.options.swipes) this.freezeSwipe(row.id);
       this.store.set("activeTurn", turn);
