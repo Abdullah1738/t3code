@@ -574,13 +574,14 @@ function ColumnsBoard(props: {
     readonly start: number;
     width: number;
   } | null>(null);
-  const [, setDragTick] = useState(0);
+  // What renders: the live drag width while a divider moves, else the saved size.
+  const [live, setLive] = useState<{ readonly key: BoardColumnKey; readonly width: number } | null>(
+    null,
+  );
   const sizeOf = (key: BoardColumnKey) =>
     key === "needs_owner" ? layout.owner : (layout.columns[key] ?? 0);
   const widthOf = (key: BoardColumnKey) =>
-    dragRef.current !== null && dragRef.current.key === key
-      ? dragRef.current.width
-      : sizeOf(key);
+    live !== null && live.key === key ? live.width : sizeOf(key);
 
   const saveWidth = (key: BoardColumnKey, width: number) =>
     props.onColumnPrefs({
@@ -590,20 +591,21 @@ function ColumnsBoard(props: {
 
   const beginResize = (key: BoardColumnKey) => {
     dragRef.current = { key, start: sizeOf(key), width: sizeOf(key) };
-    setDragTick((tick) => tick + 1);
+    setLive({ key, width: sizeOf(key) });
   };
   // A divider's drag resizes from where the drag started, clamped to the column's range.
   const resizeBy = (key: BoardColumnKey, delta: number) => {
     const current = dragRef.current;
     const start = current !== null && current.key === key ? current.start : sizeOf(key);
-    dragRef.current = { key, start, width: clampColumnWidth(key, start + delta) };
-    setDragTick((tick) => tick + 1);
+    const width = clampColumnWidth(key, start + delta);
+    dragRef.current = { key, start, width };
+    setLive({ key, width });
   };
   // Saves once when the drag ends. Reads the ref, so it sees moves made this tick.
   const endResize = () => {
     const current = dragRef.current;
     dragRef.current = null;
-    setDragTick((tick) => tick + 1);
+    setLive(null);
     if (current !== null) saveWidth(current.key, current.width);
   };
 
