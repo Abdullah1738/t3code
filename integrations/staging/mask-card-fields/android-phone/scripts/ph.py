@@ -72,10 +72,12 @@ def nodes():
 # Masks card numbers, CVC/CVV and expiry before screen text reaches an agent.
 # Mirrors dia-agent-bridge/src/redact.js: keep the two rule sets in step.
 _CARD_RUN = re.compile(r"(?<![0-9])[0-9](?:[ -]*[0-9]){12,18}(?![0-9])")
-_CVC_LABEL = re.compile(r"(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)(\D{0,12}?)([0-9]{3,4})(?![0-9])", re.I | re.A)
-_EXP_LABEL = re.compile(r"(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*/\s*yy(?:yy)?)\b)(\D{0,12}?)([0-9]{1,2}\s*[/-]\s*(?:[0-9]{4}|[0-9]{2}))(?![0-9])", re.I | re.A)
+# Up to three non-digit words (or ':', '=', '-') between a label and its value. Newlines count as separators.
+_GAP = r"((?:[\s:=\-]*[A-Za-z]{1,20}){0,3}[\s:=\-]*)"
+_CVC_LABEL = re.compile(r"(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)" + _GAP + r"([0-9]{3,4})(?![0-9])", re.I | re.A)
+_EXP_LABEL = re.compile(r"(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*/\s*yy(?:yy)?)\b)" + _GAP + r"([0-9]{1,2}\s*[/-]\s*(?:[0-9]{4}|[0-9]{2}))(?![0-9])", re.I | re.A)
 # A field whose name/id/label says it is a CVC or expiry; its node value is the secret.
-_SENSITIVE_FIELD = re.compile(r"(?<![a-z])(cvc|cvv|csc|cvn|security[\s_-]*code|card[\s_-]*number|cardnumber|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|expir\w*|valid[\s_-]*thru|exp)(?![a-z])", re.I)
+_SENSITIVE_FIELD = re.compile(r"(?<![a-z])(cvc|cvv|csc|cvn|security[\s_-]*code|card[\s_-]*number|cardnumber|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|expir\w*|valid[\s_-]*thru|exp|mm\s*/\s*yy(?:yy)?)(?![a-z])", re.I)
 def _luhn(digits):
     total, double = 0, False
     for ch in reversed(digits):
@@ -103,8 +105,7 @@ def redact(text, field=""):
     CVC or expiry field and the text is a bare value ('123', '12/29'), mask it: a bare value has
     no label of its own, so the node's context is the only way to know it is a secret."""
     if field and is_sensitive_field(field) and text:
-        bare = re.fullmatch(r"\s*[0-9][0-9/ -]{0,6}\s*", text)
-        if bare: return "••/••" if re.search(r"[/-]", text) else "•••"
+        if re.fullmatch(r"\s*[0-9][0-9/ -]{0,6}\s*", text): return "••/••" if re.search(r"[/-]", text) else "•••"
     return redact_text(text)
 NOISE = re.compile(r"notification:|signal|Battery|clock|key_pos|Location requests active", re.I)
 def show(allnodes=False):

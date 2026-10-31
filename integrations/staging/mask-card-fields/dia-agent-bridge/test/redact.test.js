@@ -76,3 +76,27 @@ test("CDP RemoteObject descriptors redact nested values for cvc and expiry", () 
     [{ name: "cvc", value: { type: "string", value: "[redacted]" } }, { name: "email", value: { type: "string", value: "a@b.co" } }],
   );
 });
+
+test("MM/YY and MM/YYYY format labels mark an expiry value", () => {
+  assert.deepEqual(redactValue({ placeholder: "MM/YY", value: "12/29" }), { placeholder: "MM/YY", value: "[redacted]" });
+  assert.deepEqual(
+    redactValue(["placeholder", "MM/YYYY", "value", "12/2029"]),
+    ["placeholder", "MM/YYYY", "value", "[redacted]"],
+  );
+});
+
+test("nested CDP preview values under a sensitive wrapper are fully masked", () => {
+  const value = {
+    name: "cvc",
+    value: { type: "object", subtype: "node", preview: { type: "object", properties: [{ name: "cardNumber", type: "string", value: "4111111111111111" }, { name: "cvc", type: "string", value: "123" }] } },
+  };
+  const out = JSON.stringify(redactValue(value));
+  assert.ok(!out.includes("4111111111111111"));
+  assert.ok(!out.includes('"123"'));
+  assert.ok(out.includes('"type":"object"'));
+});
+
+test("CVC label up to three words before the value is masked", () => {
+  assert.equal(redactText("CVC for card is 123"), "CVC for card is •••");
+  assert.equal(redactText("CVC for card is one two three 123"), "CVC for card is one two three 123");
+});

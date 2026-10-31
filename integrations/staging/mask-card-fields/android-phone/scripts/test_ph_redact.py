@@ -112,3 +112,22 @@ class FieldContextTests(unittest.TestCase):
     def test_plain_labels_unaffected_by_context(self):
         out = self._show([self._node("Pay now", "Button", "submit_btn")])
         self.assertIn("'Pay now'", out)
+
+
+class ThreeFixesTests(unittest.TestCase):
+    def _node(self, t, c, rid):
+        return dict(t=t, c=c, rid=rid, x=1, y=2, b=(0, 0, 1, 1), clk=False, edit=True, chk=False, sel=False, pkg="com.uber")
+
+    def test_mm_yy_format_label_marks_expiry_field(self):
+        import io, contextlib
+        buf = io.StringIO()
+        orig = ph.nodes; ph.nodes = lambda: [self._node("12/29", "MM/YY", "text_input")]
+        try:
+            with contextlib.redirect_stdout(buf): ph.show(True)
+        finally:
+            ph.nodes = orig
+        self.assertNotIn("12/29", buf.getvalue()); self.assertIn("••/••", buf.getvalue())
+
+    def test_three_word_gap_masks_cvc_value(self):
+        self.assertEqual(ph.redact("CVC for card is 123"), "CVC for card is •••")
+        self.assertEqual(ph.redact("CVC for card is one two three 123"), "CVC for card is one two three 123")

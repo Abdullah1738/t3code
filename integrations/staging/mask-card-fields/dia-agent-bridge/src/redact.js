@@ -1,11 +1,13 @@
 // Masks card numbers, CVC/CVV and expiry before tool output reaches an agent.
-// Mirrors android-phone/scripts/ph.py redact()/node_texts(): keep the two rule sets in step.
+// Mirrors android-phone/scripts/ph.py redact(): keep the two rule sets in step.
 
 const CARD_RUN = /(?<!\d)\d(?:[ -]*\d){12,18}(?!\d)/g;
-const CVC_LABEL = /(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)(\D{0,12}?)(\d{3,4})(?!\d)/gi;
-const EXP_LABEL = /(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*\/\s*yy(?:yy)?)\b)(\D{0,12}?)(\d{1,2}\s*[\/-]\s*(?:\d{4}|\d{2}))(?!\d)/gi;
+// Up to three non-digit words (or ':', '=', '-') between a label and its value. Newlines count as separators.
+const GAP = String.raw`((?:[\s:=\-]*[A-Za-z]{1,20}){0,3}[\s:=\-]*)`;
+const CVC_LABEL = new RegExp(String.raw`(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)` + GAP + String.raw`(\d{3,4})(?!\d)`, "gi");
+const EXP_LABEL = new RegExp(String.raw`(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*\/\s*yy(?:yy)?)\b)` + GAP + String.raw`(\d{1,2}\s*[\/-]\s*(?:\d{4}|\d{2}))(?!\d)`, "gi");
 const SECRET_KEY = /cvc|cvv|csc|securitycode|card.?number|cardnumber|cc-?number|cc-?csc|cc-?exp|expiry|expiration/i;
-const SENSITIVE_FIELD = /(?<![a-z])(cvc|cvv|csc|cvn|security[\s_-]*code|card[\s_-]*number|cardnumber|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|expir\w*|valid[\s_-]*thru|exp)(?![a-z])/i;
+const SENSITIVE_FIELD = /(?<![a-z])(cvc|cvv|csc|cvn|security[\s_-]*code|card[\s_-]*number|cardnumber|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|expir\w*|valid[\s_-]*thru|exp|mm\s*\/\s*yy(?:yy)?)(?![a-z])/i;
 // Attribute names whose values describe a field (CDP attribute lists and field descriptor objects).
 const FIELD_ATTRS = new Set(["name", "id", "autocomplete", "placeholder", "aria-label", "label", "title"]);
 
@@ -36,15 +38,20 @@ function isSensitiveField(values) {
   return values.some(v => typeof v === "string" && SENSITIVE_FIELD.test(v));
 }
 
-// A sensitive field's value. CDP RemoteObjects nest it as {type, value, description, unserializableValue}.
-const REMOTE_VALUE_KEYS = ["value", "description", "unserializableValue"];
+// Everything under a sensitive value is secret, including CDP previews that nest the real value
+// (preview.properties[].value). Only RemoteObject type names survive.
+const SAFE_TYPE_KEYS = new Set(["type", "subtype"]);
+const SAFE_TYPE_VALUE = /^[A-Za-z]{1,20}$/;
 function maskSecret(item) {
-  if (item && typeof item === "object" && !Array.isArray(item)) {
-    const out = { ...item };
-    for (const k of REMOTE_VALUE_KEYS) if (k in out && out[k] !== undefined && out[k] !== null) out[k] = "[redacted]";
+  if (Array.isArray(item)) return item.map(maskSecret);
+  if (item && typeof item === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(item)) {
+      out[k] = SAFE_TYPE_KEYS.has(k) && typeof v === "string" && SAFE_TYPE_VALUE.test(v) ? v : maskSecret(v);
+    }
     return out;
   }
-  return "[redacted]";
+  return item === null || item === undefined ? item : "[redacted]";
 }
 
 function redactArray(arr) {
@@ -61,7 +68,7 @@ export function redactValue(value) {
     const sensitive = isSensitiveField(Object.entries(value).filter(([k]) => FIELD_ATTRS.has(k)).map(([, v]) => v));
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      if (SECRET_KEY.test(key) && item !== null && typeof item !== "object") out[key] = "[redacted]";
+      if (SECRET_KEY.test(key)) out[key] = maskSecret(item);
       else if (sensitive && key === "value") out[key] = maskSecret(item);
       else out[key] = redactValue(item);
     }
