@@ -2787,9 +2787,10 @@ const make = Effect.gen(function* () {
       const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
       // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
       if (failure === null) {
-        // lastFailure is also null while the latest run is still going, and a delayed
-        // terminal event for an older run must not clear a live retry's streak.
-        if ((yield* threads.view(threadId))?.state === "running") return;
+        // lastFailure is also null while the latest run is still going or waiting on
+        // input/approval, and a delayed terminal event for an older run must not clear
+        // a live retry's streak. Only a thread that is idle has finished its run.
+        if ((yield* threads.view(threadId))?.state !== "idle") return;
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
           next.delete(threadId);

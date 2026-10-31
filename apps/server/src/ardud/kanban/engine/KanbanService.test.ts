@@ -4219,6 +4219,36 @@ const stopping = {
   message: "OpenCode is still stopping the previous turn. Send the message again in a moment.",
 } as never;
 
+it.effect("a stale turn end while the retry waits on input does not clear the failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      fake.failures.delete(e);
+      const retry = (yield* Ref.get(fake.threads)).get(e)!;
+      retry.running = true;
+      retry.stuck = true;
+      yield* kanban.turnEnded(e);
+      retry.stuck = false;
+      retry.running = false;
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(retry.messages.filter((text) => text.includes("one automatic retry")).length, 1);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("review135r2: a stale turn end while retry runs does not clear the failure streak", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
