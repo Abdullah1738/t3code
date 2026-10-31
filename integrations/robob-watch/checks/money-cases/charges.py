@@ -357,7 +357,15 @@ def buys_from(clause, pattern):
     seller = SELLER_FROM.search(tail)
     if seller:
         return bool(pattern.search(seller.group('seller')))
-    return bool(pattern.search(tail))
+    # No seller phrase: only the payee right after the verb counts ("I paid Apple", "ordered Apple").
+    # Anything else in the tail ("with Apple Pay", "Apple gear through the Amazon store") is ambiguous
+    # and leaves the charge unexplained.
+    # The payee is the whole phrase right after the verb: it ends the clause, so "Apple Pay" or "Apple gear"
+    # after it is a different thing (the instrument, the product), not the payee.
+    # After the payee only an amount and his payment instrument may follow ("Apple USD 99 with my ENBD card").
+    after = r"(?:\s+(?:" + MONEY.pattern + r"|[$€£¥₹]\s?\d[\d,.]*|\d[\d,.]*|for\s+(?:my|the|his|our)?\s*[\w.*/&'-]+(?:\s+[\w.*/&'-]+){0,2}|(?:with|using|on)\s+(?:my|the|his|our)?\s*[\w.*/&'-]*\s*(?:card|account|wallet|pay)\b.*?))*"
+    payee = re.match(r"\s*(?:(?:the|my|his|our)\s+)?(?P<payee>[\w.*/&'-]+(?:\s+[\w.*/&'-]+){0,2}?)" + after + r"\s*$", tail, re.I)
+    return bool(payee) and bool(pattern.search(payee.group('payee')))
 
 
 def owner_said(charge, at, now, said=None, deadline=None):
