@@ -4,6 +4,8 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   type ChatAttachment,
+  ContextHandoffId,
+  ContextTransferId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -64,6 +66,7 @@ import {
   CODEX_MODEL_SELECTION,
   CURSOR_MODEL_SELECTION,
   GROK_MODEL_SELECTION,
+  OPENCODE2_MODEL_SELECTION,
 } from "./fixtures/shared.ts";
 import * as ProviderReplayHarness from "./ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -80,6 +83,7 @@ const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 const GROK_DRIVER = ProviderDriverKind.make("acp");
+const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
 
 interface CapturedTurn {
   readonly driver: ProviderDriverKind;
@@ -1212,6 +1216,222 @@ describe("orchestration v2 provider switching", () => {
               ProviderReplayHarness.layerWithRegistry(
                 {
                   name: `handoff-retry-${failure}`,
+                  runtimePolicyOverride: {
+                    cwd,
+                    approvalPolicy: "never",
+                    sandboxPolicy: { type: "readOnly" },
+                  },
+                },
+                layerRegistry,
+              ),
+            ),
+          );
+        }),
+      ),
+  );
+
+  it.live(
+    "an interrupted run on a nearly full thread restarts in a fresh native session (Crpko #16)",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace("handoff-crpko-16");
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const failStartOnce = yield* Ref.make(false);
+          const generation = yield* Ref.make(0);
+          const usage = { usedTokens: 428_388, maxTokens: 500_000 };
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            // OpenCode delivers history inline (no injectHistory). Its capability
+            // table isn't exported; the fake runtime only needs handoff support.
+            makeTestAdapter({
+              instanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+              driver: OPENCODE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: OPENCODE2_MODEL_SELECTION,
+              responseByRunOrdinal: { 1: "Original partial work" },
+              capturedTurns,
+              failStartOnce,
+              nativeThreadGeneration: generation,
+              getModelContextWindow: () => usage.maxTokens,
+              interruptedRunOrdinals: new Set([2]),
+              tokenUsageByRunOrdinal: { 2: usage },
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const eventSink = yield* EventSink.EventSinkV2;
+            const dispatch = (ordinal: number, text: string) =>
+              orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`crpko-16:${ordinal}`),
+                threadId,
+                messageId: MessageId.make(`crpko-16:${ordinal}`),
+                createdBy: "user",
+                creationSource: "web",
+                text,
+                attachments: [],
+                modelSelection: OPENCODE2_MODEL_SELECTION,
+                dispatchMode: { type: "start_immediately" },
+              });
+            const settle = (ordinal: number, status: "completed" | "failed" | "interrupted") =>
+              orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.ordinal === ordinal &&
+                    ["completed", "failed", "interrupted"].includes(event.payload.status),
+                ),
+                Stream.runHead,
+                Effect.andThen(worker.drain()),
+                Effect.andThen(orchestrator.getThreadProjection(threadId)),
+                Effect.tap((projection) =>
+                  Effect.sync(() => assert.equal(projection.runs.at(-1)?.status, status)),
+                ),
+              );
+            const targetOf = (projection: {
+              providerThreads: ReadonlyArray<OrchestrationV2ProviderThread>;
+            }) =>
+              projection.providerThreads.find(
+                (thread) => thread.providerInstanceId === OPENCODE2_MODEL_SELECTION.instanceId,
+              )!;
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("crpko-16:create"),
+              threadId,
+              projectId,
+              createdBy: "user",
+              creationSource: "web",
+              title: "Nearly full OpenCode thread",
+              modelSelection: OPENCODE2_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            yield* dispatch(1, "Original request with constraints");
+            yield* settle(1, "completed");
+
+            // Run 49: cut by the OpenCode crash after reporting 428,388 of 500,000.
+            yield* dispatch(2, "Work that the crash cut off");
+            const interrupted = yield* settle(2, "interrupted");
+            const interruptedRun = interrupted.runs.at(-1)!;
+            const target = targetOf(interrupted);
+            const now = yield* DateTime.now;
+            const transferId = ContextTransferId.make("transfer:crpko-16-subagent-result");
+            // Older builds also stored each delegated result as a ready history
+            // handoff aimed at the parent's run. These pointed at run 49.
+            yield* eventSink.write({
+              events: [
+                {
+                  id: EventId.make("crpko-16-usage"),
+                  type: "provider-thread.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: { ...target, contextUsage: usage },
+                },
+                {
+                  id: EventId.make("crpko-16-subagent-transfer"),
+                  type: "context-transfer.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: transferId,
+                    type: "subagent_result",
+                    sourceThreadId: ThreadId.make("thread:crpko-16-child"),
+                    targetThreadId: threadId,
+                    sourcePoint: { threadId: ThreadId.make("thread:crpko-16-child") },
+                    basePoint: null,
+                    sourceProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    targetProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    targetRunId: interruptedRun.id,
+                    status: "consumed",
+                    resolution: null,
+                    createdBy: "system",
+                    error: null,
+                    createdAt: now,
+                    updatedAt: now,
+                    consumedAt: null,
+                  },
+                },
+                {
+                  id: EventId.make("crpko-16-subagent-handoff"),
+                  type: "context-handoff.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: ContextHandoffId.make("handoff:crpko-16-subagent-result"),
+                    transferId,
+                    threadId,
+                    targetRunId: interruptedRun.id,
+                    fromProviderThreadIds: [
+                      ProviderThreadId.make("provider-thread:crpko-16-child"),
+                    ],
+                    toProviderThreadId: target.id,
+                    coveredRunOrdinals: { from: 1, to: 1 },
+                    strategy: "manual_context",
+                    status: "ready",
+                    summaryMessageId: null,
+                    summaryText: "Legacy delegated result for the cut run",
+                    createdByProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                },
+              ],
+            });
+
+            // Runs 50-52 never reached the provider. One refused start leaves the
+            // same missed run for the next turn to replay.
+            yield* Ref.set(failStartOnce, true);
+            yield* dispatch(3, "Pick up after the restart");
+            yield* settle(3, "failed");
+
+            // Run 53: OpenCode's /compact reports no token usage, so the stored
+            // reading stays at 428,388 and still leaves no handoff budget.
+            yield* dispatch(4, "/compact");
+            const compacted = yield* settle(4, "completed");
+            assert.deepEqual(targetOf(compacted).contextUsage, usage);
+            assert.equal(yield* Ref.get(generation), 1);
+
+            yield* dispatch(5, "Carry on with the plan");
+            const recovered = yield* settle(5, "completed");
+            const turns = yield* Ref.get(capturedTurns);
+            const recoveredTurn = turns.at(-1)!;
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.notEqual(recoveredTurn.nativeThreadId, turns[0]!.nativeThreadId);
+            const handoff = recovered.contextHandoffs.at(-1)!;
+            assert.equal(handoff.strategy, "full_thread_summary");
+            assert.equal(handoff.delivery?.status, "inline");
+            assert.equal(handoff.delivery?.nativeThreadId, recoveredTurn.nativeThreadId);
+            assert.include(recoveredTurn.text, "Original request with constraints");
+            assert.include(recoveredTurn.text, "Original partial work");
+            assert.include(recoveredTurn.text, "Pick up after the restart");
+            assert.isTrue(recoveredTurn.text.endsWith("User message:\nCarry on with the plan"));
+            assert.notInclude(recoveredTurn.text, "Legacy delegated result");
+            assert.isUndefined(
+              recovered.contextHandoffs.find(
+                (candidate) => candidate.id === "handoff:crpko-16-subagent-result",
+              )?.delivery,
+            );
+            assert.isNull(targetOf(recovered).contextUsage);
+            assert.notExists(
+              recovered.turnItems.find(
+                (item) =>
+                  item.type === "error" &&
+                  /too little context|Insufficient context allowance/.test(item.failure.message),
+              ),
+            );
+
+            yield* dispatch(6, "Next step");
+            yield* settle(6, "completed");
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.equal((yield* Ref.get(capturedTurns)).at(-1)!.text, "Next step");
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                {
+                  name: "handoff-crpko-16",
                   runtimePolicyOverride: {
                     cwd,
                     approvalPolicy: "never",
