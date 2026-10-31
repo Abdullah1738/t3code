@@ -1538,13 +1538,12 @@ const make = Effect.gen(function* () {
    * Records an evaluator turn the board started, keyed to the run it started in
    * (the thread's current run, when it has one).
    */
-  const admit = (threadId: ThreadId, boardId: string) =>
-    Effect.gen(function* () {
-      const at = yield* nowMillis;
-      const view = yield* threads.view(threadId);
-      const run = view?.runStartedAt ?? `admitted:${at}:${NodeCrypto.randomUUID()}`;
-      yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn: run }));
-    });
+  const admit = Effect.fn("KanbanService.admit")(function* (threadId: ThreadId, boardId: string) {
+    const at = yield* nowMillis;
+    const view = yield* threads.view(threadId);
+    const run = view?.runStartedAt ?? `admitted:${at}:${NodeCrypto.randomUUID()}`;
+    yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn: run }));
+  });
 
   /**
    * Releases a thread's admission when `turn` (the run that ended) is the one it
