@@ -662,6 +662,48 @@ class CardSwap(Base):
         with self.assertRaisesRegex(mc.CaseError, 'exactly the last 4 digits'):
             mc.card_swap(self.data, '5542', '2342', also=('75',))
 
+    def test_rejected_last4_never_echoes_the_value(self):
+        full = '4242424242424242'
+        cases_argv = {
+            '--old': ['card-swap', '--old', full, '--new', '2342'],
+            '--new': ['card-swap', '--old', '5542', '--new', full],
+            '--also': ['card-swap', '--old', '5542', '--new', '2342', '--also', full],
+        }
+        for flag, argv in cases_argv.items():
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+                self.assertEqual(mc.main(argv), 2)
+            self.assertNotIn(full, err.getvalue() + out.getvalue(), flag)
+            self.assertIn('exactly the last 4 digits', err.getvalue())
+        with self.assertRaises(mc.CaseError) as ctx:
+            mc.card_swap(self.data, full, '2342')
+        self.assertNotIn(full, str(ctx.exception))
+
+    def test_card_swap_output_redacts_full_card_numbers_in_dry_run_and_write(self):
+        full = '4242 4242 4242 4242'
+        self.case('acme', next_action='dispute on card 5542')
+        self.case('ref', merchant='Other Shop', next_action='dispute on card 5542')
+        # A hand-edited book can hold a card number in next, which add() would refuse.
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        for case in book['cases']:
+            if case['id'] == 'acme':
+                case['next'] = f'dispute {full} on card 5542'
+            else:
+                case['id'] = f'ref-{full.replace(" ", "")}'
+                case['state'] = 'card 5542 flagged'
+                case['next'] = f'dispute {full} on card 5542'
+        path.write_text(json.dumps(book))
+        for dry in (True, False):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
+            text = out.getvalue()
+            self.assertNotIn('4242', text.replace('[card number removed]', ''), f'dry={dry}')
+            self.assertNotIn(full.replace(' ', ''), text, f'dry={dry}')
+            self.assertIn('[card number removed]', text, f'dry={dry}')
+            self.assertIn('2342', text, f'dry={dry}')
+
     def test_cli_card_swap_prints_moves_and_dry_run_says_would_update(self):
         self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')
         out, err = io.StringIO(), io.StringIO()

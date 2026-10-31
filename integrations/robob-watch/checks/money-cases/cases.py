@@ -419,7 +419,8 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
 
 def last4_arg(name, value):
     if type(value) is not str or not re.fullmatch(r'[0-9]{4}', value):
-        raise CaseError(f'{name} {value!r} must be exactly the last 4 digits of the card')
+        # Never echo the value: a full card number passed by mistake must not reach stderr or logs.
+        raise CaseError(f'{name} must be exactly the last 4 digits of the card (value not shown)')
     return value
 
 
@@ -870,10 +871,12 @@ def main(argv=None):
         elif args.command == 'card-swap':
             changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run)
             for c in changes:
+                # Same redaction as show/list: a hand-edited case may hold a card number or code in next.
+                cid = redact(c['id'])
                 if c['after'] is None:
-                    print(f"{c['id']}: names {args.old}, check by hand")
+                    print(f"{cid}: names {args.old}, check by hand")
                 else:
-                    print(f"{c['id']}: next {c['before']!r} -> {c['after']!r}")
+                    print(f"{cid}: next {redact(c['before'])!r} -> {redact(c['after'])!r}")
             updated = sum(1 for c in changes if c['after'] is not None)
             verb = 'would update' if args.dry_run else 'updated'
             print(f'{updated} case(s) {verb}')
