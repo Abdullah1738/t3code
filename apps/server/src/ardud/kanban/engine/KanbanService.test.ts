@@ -2618,25 +2618,27 @@ it.effect("a passed review hands the card back to its worker when the next step 
   }),
 );
 
-it.effect("an evaluator's second card with the same source link is refused while the first is open", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
-      const links = [{ url: "file:///tmp/packet-00.md" }];
-      const first = yield* kanban.createCard(
-        board.id,
-        { prompt: "Fix one", title: "Fix one", links },
-        evaluator,
-      );
-      const refused = yield* kanban
-        .createCard(board.id, { prompt: "Fix two", title: "Fix two", links }, evaluator)
-        .pipe(Effect.flip);
-      assert.strictEqual(refused.code, "conflict");
-      assert.include(refused.detail, `card #${first.number}`);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "an evaluator's second card with the same source link is refused while the first is open",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const links = [{ url: "file:///tmp/packet-00.md" }];
+        const first = yield* kanban.createCard(
+          board.id,
+          { prompt: "Fix one", title: "Fix one", links },
+          evaluator,
+        );
+        const refused = yield* kanban
+          .createCard(board.id, { prompt: "Fix two", title: "Fix two", links }, evaluator)
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "conflict");
+        assert.include(refused.detail, `card #${first.number}`);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("a same title, different case and spacing, is refused for an evaluator", () =>
