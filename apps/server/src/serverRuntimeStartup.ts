@@ -145,7 +145,9 @@ export const makeCommandGate = Effect.gen(function* () {
   } satisfies CommandGate;
 });
 
-const recordStartupHeartbeat = Effect.gen(function* () {
+export const recordStartupHeartbeat = Effect.gen(function* () {
+  if (!(yield* AnalyticsService.telemetryEnabled)) return;
+
   const analytics = yield* AnalyticsService.AnalyticsService;
   const projects = yield* ProjectService.ProjectService;
   const threads = yield* ThreadManagement.ThreadManagementService;
