@@ -1537,7 +1537,9 @@ it.effect(
               Layer.mock(RunExecutionService.RunExecutionServiceV2)({
                 startRootRun: (input) => Queue.offer(started, input).pipe(Effect.asVoid),
               }),
-              Layer.mock(ServerConfig.ServerConfig)({ worktreesDir: process.cwd() }),
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "provider-session-manager-start-",
+              }).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, Path.layer))),
               ServerSettings.layerTest(),
               NodeServices.layer,
               Path.layer,
