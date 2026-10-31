@@ -632,7 +632,10 @@ const make = Effect.gen(function* () {
   );
   // Cards waiting on evaluator subtasks: the step's subtask ids, when the wait began, and whether woken.
   const stepWaits = yield* Ref.make<
-    ReadonlyMap<KanbanCard["id"], { readonly key: string; readonly since: number; readonly woken: boolean }>
+    ReadonlyMap<
+      KanbanCard["id"],
+      { readonly key: string; readonly since: number; readonly woken: boolean }
+    >
   >(new Map());
   // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
   const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
@@ -3018,7 +3021,9 @@ const make = Effect.gen(function* () {
           ),
         );
         if (woke) {
-          yield* Ref.update(stepWaits, (all) => new Map(all).set(card.id, { ...wait, woken: true }));
+          yield* Ref.update(stepWaits, (all) =>
+            new Map(all).set(card.id, { ...wait, woken: true }),
+          );
         }
       }
       // An owner message a running evaluator hasn't answered gets one reminder. An idle
@@ -3070,7 +3075,10 @@ const make = Effect.gen(function* () {
           }
         }).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("kanban owner wait check failed", { discussionId: discussion.id, cause }),
+            Effect.logWarning("kanban owner wait check failed", {
+              discussionId: discussion.id,
+              cause,
+            }),
           ),
         );
       }
