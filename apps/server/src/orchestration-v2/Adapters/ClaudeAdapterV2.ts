@@ -75,6 +75,7 @@ import {
   type OrchestrationV2ProviderRetry,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2AssistantPhase,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2UserInputQuestion,
@@ -3144,6 +3145,7 @@ function buildAssistantArtifacts(input: {
   readonly ordinal: number;
   readonly startedAt: DateTime.Utc;
   readonly completedAt: DateTime.Utc;
+  readonly phase?: OrchestrationV2AssistantPhase;
 }): {
   readonly node: OrchestrationV2ExecutionNode;
   readonly message: OrchestrationV2ConversationMessage;
@@ -3194,6 +3196,7 @@ function buildAssistantArtifacts(input: {
       nodeId,
       role: "assistant",
       text: input.text,
+      phase: input.phase ?? "unknown",
       attachments: [],
       streaming: false,
       createdAt: input.completedAt,
@@ -3217,9 +3220,22 @@ function buildAssistantArtifacts(input: {
       type: "assistant_message",
       messageId,
       text: input.text,
+      phase: input.phase ?? "unknown",
       streaming: false,
     },
   };
+}
+
+/**
+ * Claude writes text before a tool call as its own assistant line, so the stop
+ * reason of that line tells narration from the reply. Only `end_turn` proves the
+ * reply; anything else (missing, `max_tokens`, unknown) stays unknown.
+ */
+function claudeAssistantPhase(message: SDKMessage): OrchestrationV2AssistantPhase {
+  if (message.type !== "assistant") return "unknown";
+  const content = message.message.content;
+  if (content.some((block) => block.type === "tool_use")) return "narration";
+  return message.message.stop_reason === "end_turn" ? "answer" : "unknown";
 }
 
 const CLAUDE_USAGE_LIMIT_WINDOWS = {
@@ -6666,6 +6682,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly nativeItemId: string;
           readonly text: string;
+          readonly phase?: OrchestrationV2AssistantPhase;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
@@ -6682,6 +6699,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ordinal,
             startedAt: now,
             completedAt: now,
+            ...(input.phase === undefined ? {} : { phase: input.phase }),
           });
           yield* Effect.all(
             [
@@ -8238,6 +8256,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
+              phase: claudeAssistantPhase(message),
             });
             return;
           }
