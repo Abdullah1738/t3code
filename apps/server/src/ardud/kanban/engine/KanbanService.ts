@@ -4638,10 +4638,11 @@ const make = Effect.gen(function* () {
     }
     const key = Rules.poolKey(model);
     const count = slots === undefined ? from.slots : Math.max(0, Math.round(slots));
-    // Same checks as a plain setPool: a level the provider doesn't offer or a hidden model
-    // can't be started. A pause (0 slots) is allowed, as on the plain path.
-    const pausing = count === 0;
-    if (!pausing) {
+    // A pause (0 slots) of the same pool may keep an unoffered level, as on the plain path.
+    // A level change always stores `model`, and a running card is switched to it, so it
+    // always passes the same checks as a plain setPool.
+    const pausingSame = count === 0 && key === from.key;
+    if (!pausingSame) {
       yield* checkModel(model);
       const listed = isListed(yield* models.listed, model);
       if (listed === false) {

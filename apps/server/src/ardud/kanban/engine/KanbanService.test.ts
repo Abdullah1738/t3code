@@ -5533,6 +5533,32 @@ it.effect("a level change keeps the composer's model check, as a plain setPool d
   }),
 );
 
+it.effect("a zero-slot level change never switches a running card to an unoffered level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const invalid = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "ultra" });
+      const running = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(running.id)).card.activeThreadId!;
+      const oldKey = Rules.poolKey(board.defaultCardModel);
+      // A pause of the same pool keeps its stored level (the plain path's exemption).
+      const paused = yield* kanban.setPool(board.id, invalid, 0);
+      assert.strictEqual(paused.find((pool) => pool.key === oldKey)?.slots, 0);
+      assert.strictEqual(Rules.modelLevel((yield* kanban.card(running.id)).card.model), "xhigh");
+      // A level change at 0 slots still stores and switches to `invalid`: refused.
+      const refused = yield* kanban
+        .setPool(board.id, invalid, 0, { replaces: oldKey })
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "invalid");
+      assert.strictEqual(Rules.modelLevel((yield* kanban.card(running.id)).card.model), "xhigh");
+      assert.isFalse(fake.modelSwitches.some((entry) => entry.threadId === thread));
+      assert.isTrue((yield* kanban.snapshot(board.id)).pools.some((pool) => pool.key === oldKey));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a level change whose write fails leaves the pool and its cards on the old level", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
