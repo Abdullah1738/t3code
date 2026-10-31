@@ -478,7 +478,8 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
                 case['next'] = after
                 case['updated'] = stamp(at)
                 case['history'].append({'at': stamp(at), 'text': f'card swap {old}->{new}: next updated'})
-            if dry_run:
+            if dry_run or not picks:
+                # Raising here keeps Locked from writing: a no-pick call must not replace cases.json at all.
                 raise _DryRun
     except _DryRun:
         pass

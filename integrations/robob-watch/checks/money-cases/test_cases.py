@@ -765,10 +765,14 @@ class CardSwap(Base):
     def test_without_case_nothing_is_written(self):
         self.case('a', merchant='Shop A', next_action='retry on 5542')
         self.case('b', merchant='Shop B', next_action='retry on 5542')
-        before = (self.data / 'cases.json').read_bytes()
-        code, out, _ = self.run_card_swap()
+        path = self.data / 'cases.json'
+        before, st = path.read_bytes(), path.stat()
+        with patch.object(mc, 'write_json', wraps=mc.write_json) as write:
+            code, out, _ = self.run_card_swap()
         self.assertEqual(code, 0)
-        self.assertEqual((self.data / 'cases.json').read_bytes(), before)
+        write.assert_not_called()
+        after = path.stat()
+        self.assertEqual((path.read_bytes(), after.st_ino, after.st_mtime_ns), (before, st.st_ino, st.st_mtime_ns))
         self.assertIn("a: next 'retry on 5542' -> 'retry on 2342'", out)
         self.assertIn("b: next 'retry on 5542' -> 'retry on 2342'", out)
         self.assertIn('2 case(s) would change; nothing written', out)
@@ -801,8 +805,10 @@ class CardSwap(Base):
     def test_dry_run_with_case_writes_nothing(self):
         self.case('a', merchant='Shop A', next_action='retry on 5542')
         before = (self.data / 'cases.json').read_bytes()
-        code, out, _ = self.run_card_swap('--case', 'a', '--dry-run')
+        with patch.object(mc, 'write_json', wraps=mc.write_json) as write:
+            code, out, _ = self.run_card_swap('--case', 'a', '--dry-run')
         self.assertEqual(code, 0)
+        write.assert_not_called()
         self.assertEqual((self.data / 'cases.json').read_bytes(), before)
         self.assertIn('1 case(s) would update', out)
 
