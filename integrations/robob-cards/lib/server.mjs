@@ -173,7 +173,7 @@ async function main(dir) {
   const kick = provisionQueue(async () => {
     try {
       const state = await provision({ dir, name, config });
-      const text = `Robob Cards for ${name} is ready. The page at ${link()} now shows an Install button. Tell ${name} to go back to it in Safari (it refreshes by itself), tap Install, then Install in the pop-up. Version ${state.build.version}.`;
+      const text = `Robob Cards for ${name} is ready. The page at ${link()} now shows an Install button. Tell ${name} to go back to it in Safari (it refreshes by itself), tap Install, then Install in the pop-up, then open Robob Cards once from the Home Screen. If it says Developer Mode Required, ${name} turns Developer Mode on (the page lists the steps) and opens it again. Version ${state.build.version}.`;
       notifyOwner({ name, key: `ready:${state.build.profileId}`, severity: "info", text });
       wakeThread(thread, text);
     } catch (error) {
