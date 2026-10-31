@@ -187,3 +187,26 @@ describe("control events", () => {
     ).toBeNull();
   });
 });
+
+describe("effort compatibility", () => {
+  const claude = {
+    instanceId: "claudeAgent",
+    model: "claude-opus-5-5",
+    options: [{ id: "effort", value: "max" }],
+  } as unknown as ModelSelection;
+
+  it("a variant patch replaces an existing effort with one effort option", () => {
+    expect(modelSelectionFrom({ variant: "xhigh", base: claude })).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+  });
+
+  it("a null variant clears the effort", () => {
+    expect(modelSelectionFrom({ variant: null, base: claude })).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+    });
+  });
+});

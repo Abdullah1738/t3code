@@ -13,6 +13,8 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import { mergeSelection, selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+
 /**
  * The coarse state external callers act on:
  * - `running`: a turn is in progress (or starting/preparing);
@@ -100,17 +102,18 @@ export function runSummary(run: OrchestrationV2Run) {
 /** `provider/model` with `variant` split out, matching how OpenChamber callers name models. */
 export function formatModel(selection: ModelSelection) {
   const variant = selection.options?.find((option) => option.id === "variant")?.value;
+  const effort = selectionEffort(selection);
   return {
     instanceId: selection.instanceId,
     model: selection.model,
     ...(typeof variant === "string" ? { variant } : {}),
+    ...(effort !== null ? { effort } : {}),
   };
 }
 
 /**
- * Builds a model selection from the OpenChamber-style `provider/model` string
- * plus an optional reasoning variant. Other options on `base` are kept when the
- * model stays the same, so a plain variant change does not drop them.
+ * Builds a model selection from the OpenChamber-style `provider/model` string plus
+ * an optional reasoning variant (see mergeSelection for the inherit and clear rules).
  */
 export function modelSelectionFrom(input: {
   readonly model?: string | undefined;
@@ -118,27 +121,11 @@ export function modelSelectionFrom(input: {
   readonly instanceId?: string | undefined;
   readonly base: ModelSelection;
 }): ModelSelection {
-  const instanceId = (input.instanceId ?? input.base.instanceId) as ModelSelection["instanceId"];
-  const model = input.model ?? input.base.model;
-  const keepOptions = model === input.base.model && instanceId === input.base.instanceId;
-  const kept: Array<ProviderOptionSelection> = keepOptions
-    ? (input.base.options ?? []).filter((option) => option.id !== "variant")
-    : [];
-  const inheritedVariant = keepOptions
-    ? input.base.options?.find((option) => option.id === "variant")
-    : undefined;
-  const variant =
-    input.variant === null
-      ? undefined
-      : input.variant !== undefined
-        ? { id: "variant", value: input.variant }
-        : inheritedVariant;
-  const options = variant === undefined ? kept : [...kept, variant];
-  return {
-    instanceId,
-    model: model as ModelSelection["model"],
-    ...(options.length > 0 ? { options: options as ModelSelection["options"] } : {}),
-  } as ModelSelection;
+  return mergeSelection(input.base, {
+    ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    variant: input.variant,
+  });
 }
 
 export function pendingRequestSummary(
