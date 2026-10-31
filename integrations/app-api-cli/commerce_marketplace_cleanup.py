@@ -56,6 +56,26 @@ def owned_adds(proof, response):
 
 def verify_source(proof, response, snapshot, vertical):
     adds = owned_adds(proof, response)
+    if proof.get('closed_uncharged'):
+        # noon rebuilds the cart after a failed order, so the bytes differ. Ownership
+        # rests on owned_adds (every row one of our adds, nothing else) plus the scope.
+        require(proof['readback_hash'] is None, 'MARKETPLACE_CLEAR_CART_READBACK_MISMATCH')
+        raw = response.data.get('items')
+        if 'groups' in response.data:
+            from noon_marketplace_native_shape import _flatten
+            raw = [row for _, _, row in _flatten(response.data, 'groups', 'SCHEMA_CART_ROWS')]
+        require(type(raw) is list, 'MARKETPLACE_CLEAR_CART_SCHEMA_CHANGED')
+        by_offer = {row.get('offerCode'): row for row in raw}
+        items = [{'sku_config': by_offer[adds[op['name']][1]].get('skuConfig'),
+                  'quantity': by_offer[adds[op['name']][1]].get('quantity')} for op in proof['adds']]
+        require(len(raw) == len(items), 'MARKETPLACE_CLEAR_CART_NOT_OWNED')
+        require(all(isinstance(row['sku_config'], str) and m.ID.fullmatch(row['sku_config'])
+                    for row in items), 'MARKETPLACE_CLEAR_CART_NOT_OWNED')
+        from commerce_main_order import _scope_hash as main_scope
+        from commerce_supermall_order import _scope_hash as rocket_scope
+        scope = (main_scope if vertical == 'main' else rocket_scope)(items, snapshot.address_ref)
+        require(proof['scope_hash'] == scope, 'MARKETPLACE_CLEAR_ACCOUNT_HOME_CHANGED')
+        return
     if proof['readback_hash']:
         require(m.cleanup_readback_hash(response, snapshot.account_ref, snapshot.address_ref)
                 == proof['readback_hash'], 'MARKETPLACE_CLEAR_CART_READBACK_MISMATCH')

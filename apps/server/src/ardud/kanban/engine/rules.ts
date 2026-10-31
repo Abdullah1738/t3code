@@ -286,6 +286,9 @@ export function isContextFull(failure: { readonly message: string }): boolean {
 /** How long after a fresh start a second context-full run is flagged instead of restarted. */
 export const CONTEXT_FULL_RETRY_MS = 60 * 60 * 1000;
 
+/** How long a failed evaluator waits before its one retry on the same thread. */
+export const EVALUATOR_RETRY_MS = 2 * 60 * 1000;
+
 export const PROBE_FIRST_MS = 5 * 60 * 1000;
 export const PROBE_MAX_MS = 30 * 60 * 1000;
 export const nextProbeDelay = (delayMs: number): number => Math.min(delayMs * 2, PROBE_MAX_MS);

@@ -92,9 +92,10 @@ export interface KanbanThreadsShape {
   /** The model the thread runs now, or null when the thread is gone. */
   readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
+  // runId names the executed run, so a repeated notification of the same run is recognised.
   readonly lastFailure: (
     threadId: ThreadId,
-  ) => Effect.Effect<OrchestrationV2ProviderFailure | null>;
+  ) => Effect.Effect<(OrchestrationV2ProviderFailure & { readonly runId?: string | null }) | null>;
   /** The thread, and the run its initial message started (null when it started no run). */
   readonly launch: (
     input: KanbanLaunchInput,
@@ -213,9 +214,10 @@ const make = Effect.gen(function* () {
             message: "The run failed without an error message.",
             code: null,
             retryable: null,
-          } as OrchestrationV2ProviderFailure;
+            runId: run.id,
+          } as OrchestrationV2ProviderFailure & { readonly runId?: string | null };
         }
-        return failure;
+        return failure === null ? null : { ...failure, runId: run?.id ?? null };
       }),
       Effect.catchCause(() => Effect.succeed(null)),
     );

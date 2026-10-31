@@ -361,6 +361,30 @@ export const providerBackText = (message: string) =>
     "Pick up exactly where you stopped. Check what you already did (git log, the card, your last messages) before redoing anything.",
   );
 
+export const evaluatorRetryText = (message: string) =>
+  lines(
+    `Your last run failed: "${message}". This is the one automatic retry. Pick up exactly where you stopped: check what you already did (the board, the cards, your last messages) before redoing anything.`,
+  );
+
+export const evaluatorTakeoverText = (threadId: string, message: string) =>
+  lines(
+    `The evaluator before you ([its thread](t3-thread://v1/${threadId})) stopped on an error: "${message}". Take over its work: read this discussion, the card if there is one, and its thread (t3_thread_read) to see what it was doing, then carry on from there without redoing what it finished.`,
+  );
+
+export const evaluatorGoneText = (message: string, fresh: boolean) =>
+  fresh
+    ? lines(
+        `This discussion's evaluator stopped on an error: "${message}". A new evaluator takes over here.`,
+      )
+    : lines(
+        `This discussion's evaluator stopped on an error again: "${message}". No new one starts automatically; write here to start one.`,
+      );
+
+export const evaluatorLostText = (title: string, threadId: string, message: string) =>
+  lines(
+    `Evaluator [${title}](t3-thread://v1/${threadId}) stopped on an error and one retry didn't help: "${message}". Its work is unfinished. Write here to have an evaluator pick it up.`,
+  );
+
 export const modelRefusedText = (card: KanbanCard, problem: string) =>
   `Card #${card.number} was not started: ${problem} It is flagged stalled. card_edit its model to the closest one orchestrator_capabilities offers (for a review step, ask the owner to change the board's review chain), clear the flag with card_flag stalled false, and say in the card's discussion what you changed.`;
 
