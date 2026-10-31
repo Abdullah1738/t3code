@@ -98,7 +98,10 @@ export interface KanbanThreadsShape {
   /** The thread, and the run its initial message started (null when it started no run). */
   readonly launch: (
     input: KanbanLaunchInput,
-  ) => Effect.Effect<{ readonly threadId: ThreadId; readonly runId: string | null }, KanbanThreadError>;
+  ) => Effect.Effect<
+    { readonly threadId: ThreadId; readonly runId: string | null },
+    KanbanThreadError
+  >;
   /**
    * Sends a message. The result names the run it started, when it started one (a steer into a running
    * run names none), so the board can key that run's admission to its id from the start.

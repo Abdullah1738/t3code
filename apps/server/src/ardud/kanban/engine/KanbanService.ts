@@ -647,7 +647,10 @@ const make = Effect.gen(function* () {
   // count. `turn` is unique per admission, so a stale turn end can't release a newer admission.
   // Keyed by the run id the send started; a turn not yet reported by its run stays `pending:`.
   const admitted = yield* Ref.make<
-    ReadonlyMap<ThreadId, { readonly boardId: KanbanBoard["id"]; readonly at: number; readonly turn: string }>
+    ReadonlyMap<
+      ThreadId,
+      { readonly boardId: KanbanBoard["id"]; readonly at: number; readonly turn: string }
+    >
   >(new Map());
   // Evaluator threads asked for a status: the run it was asked in and when. A new run starts over.
   const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
@@ -1715,7 +1718,9 @@ const make = Effect.gen(function* () {
    * send is accepted, so an interruption leaves them queued. A failed send
    * keeps its rows and ends this pass, so a dead thread can't spin the drain.
    */
-  const drainEvaluators = Effect.fn("KanbanService.drainEvaluators")(function* (boardId: KanbanBoard["id"]) {
+  const drainEvaluators = Effect.fn("KanbanService.drainEvaluators")(function* (
+    boardId: KanbanBoard["id"],
+  ) {
     const board = yield* boardOf(boardId);
     for (;;) {
       const queue = yield* store.evaluatorQueue(boardId);
@@ -1730,9 +1735,11 @@ const make = Effect.gen(function* () {
       // healthy requests queued behind it. The rows stay until the send has been attempted.
       const sent = yield* threads.send({ threadId, text, ...(model ? { model } : {}) }).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("kanban evaluator queue send failed", { boardId, threadId, cause }).pipe(
-            Effect.as(null),
-          ),
+          Effect.logWarning("kanban evaluator queue send failed", {
+            boardId,
+            threadId,
+            cause,
+          }).pipe(Effect.as(null)),
         ),
       );
       if (sent) yield* admit(threadId, boardId, sent.runId);
@@ -1783,8 +1790,7 @@ const make = Effect.gen(function* () {
     const title = Briefs.evaluatorTitle(purpose);
     const fullText = extra.text ? `${brief}\n\n${extra.text}` : brief;
     // A full pool launches the thread idle and queues its brief; drain sends it when a slot frees.
-    const queued =
-      (yield* poolFull(board)) || (yield* store.evaluatorQueue(board.id)).length > 0;
+    const queued = (yield* poolFull(board)) || (yield* store.evaluatorQueue(board.id)).length > 0;
     const launched = yield* threads.launch({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${at}`,
       projectId: board.defaultProjectId,
@@ -2505,15 +2511,13 @@ const make = Effect.gen(function* () {
         dispatch.role === "work"
           ? `#${card.number} ${card.title}`
           : `#${card.number} review: ${card.title}`;
-      threadId = (
-        yield* threads.launch({
-          key: `${card.id}:${dispatch.role}:${at}`,
-          projectId,
-          title,
-          model: dispatch.model,
-          text,
-        })
-      ).threadId;
+      threadId = (yield* threads.launch({
+        key: `${card.id}:${dispatch.role}:${at}`,
+        projectId,
+        title,
+        model: dispatch.model,
+        text,
+      })).threadId;
       yield* linkThread(
         {
           threadId,
@@ -2763,12 +2767,13 @@ const make = Effect.gen(function* () {
         continue;
       }
       const wake = Briefs.providerBackText(link.paused.message);
-      const sent = yield* (link.role === "evaluator"
-        ? boardOf(link.boardId).pipe(
-            Effect.flatMap((board) => sendEvaluator(board, link.threadId, wake)),
-            Effect.as(true),
-          )
-        : threads.send({ threadId: link.threadId, text: wake }).pipe(Effect.as(true))
+      const sent = yield* (
+        link.role === "evaluator"
+          ? boardOf(link.boardId).pipe(
+              Effect.flatMap((board) => sendEvaluator(board, link.threadId, wake)),
+              Effect.as(true),
+            )
+          : threads.send({ threadId: link.threadId, text: wake }).pipe(Effect.as(true))
       ).pipe(Effect.catchCause(() => Effect.succeed(false)));
       if (!sent) {
         failed = true;
@@ -3696,7 +3701,11 @@ const make = Effect.gen(function* () {
             if (!unchanged) yield* checkModel(step);
           }
         }
-        if (patch.evaluatorSlots !== undefined && patch.evaluatorSlots !== null && !Number.isInteger(patch.evaluatorSlots)) {
+        if (
+          patch.evaluatorSlots !== undefined &&
+          patch.evaluatorSlots !== null &&
+          !Number.isInteger(patch.evaluatorSlots)
+        ) {
           return yield* failWith("invalid", "the evaluator pool takes a whole number of slots");
         }
         if (patch.evaluatorSlots === 0) {
@@ -3705,7 +3714,11 @@ const make = Effect.gen(function* () {
             "the evaluator pool needs at least 1 slot; use no limit instead",
           );
         }
-        if (patch.evaluatorSlots !== undefined && patch.evaluatorSlots !== null && patch.evaluatorSlots > 50) {
+        if (
+          patch.evaluatorSlots !== undefined &&
+          patch.evaluatorSlots !== null &&
+          patch.evaluatorSlots > 50
+        ) {
           return yield* failWith("invalid", "the evaluator pool takes at most 50 slots");
         }
         const pools = missingPools(yield* store.pools(board.id), boardModels(next));

@@ -777,9 +777,7 @@ export const KanbanBoardSnapshot = Schema.Struct({
     slots: Schema.NullOr(PositiveInt),
     busy: NonNegativeInt,
     queued: NonNegativeInt,
-  }).pipe(
-    Schema.withDecodingDefault(Effect.succeed({ slots: null, busy: 0, queued: 0 })),
-  ),
+  }).pipe(Schema.withDecodingDefault(Effect.succeed({ slots: null, busy: 0, queued: 0 }))),
 });
 export type KanbanBoardSnapshot = typeof KanbanBoardSnapshot.Type;
 

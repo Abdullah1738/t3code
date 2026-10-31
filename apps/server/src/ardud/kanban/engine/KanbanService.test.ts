@@ -1954,7 +1954,11 @@ it.effect("a stale turn end cannot release a newer admission on the same thread"
       // run-1 ends. Its owed reply is nudged: the nudge starts run-2, a new admission.
       yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
       yield* kanban.turnEnded(a, "run-1");
-      assert.strictEqual((yield* Ref.get(fake.threads)).get(a)?.messages.length, 2, "the nudge reached A");
+      assert.strictEqual(
+        (yield* Ref.get(fake.threads)).get(a)?.messages.length,
+        2,
+        "the nudge reached A",
+      );
       yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
       yield* kanban.notifyThreadChanged(a, "run-2");
       const busy = (yield* kanban.snapshot(board.id)).evaluators.busy;
@@ -1997,7 +2001,11 @@ it.effect("a restarted service still counts the running evaluators it started", 
       const snapshot = yield* kanban.snapshot(board!.id);
       assert.strictEqual(snapshot.evaluators.busy, 1, "the restart counts A's live turn");
       const b = yield* kanban.startEvaluator(board!.id, { kind: "request", text: "B" });
-      assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(b)?.messages, [], "B waits for a slot");
+      assert.deepStrictEqual(
+        (yield* Ref.get(fake.threads)).get(b)?.messages,
+        [],
+        "B waits for a slot",
+      );
       assert.strictEqual((yield* kanban.snapshot(board!.id)).evaluators.queued, 1);
     }).pipe(Effect.provide(second));
   }),
@@ -2076,36 +2084,42 @@ it.effect("a plain turn end for the running run delivers the queued request with
   }),
 );
 
-it.effect("a stale run-1 end before run-2 reports its id does not release run-2's pending slot", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      yield* kanban.updateBoard(board.id, { evaluatorSlots: 2 });
-      const channel = yield* kanban.createDiscussion(board.id, "Pending", owner);
-      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
-      const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
-      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
-      yield* kanban.notifyThreadChanged(a, "run-1");
-      // run-1 ends; its owed reply nudges A into run-2. run-2 is admitted but has not reported its id.
-      yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
-      yield* kanban.turnEnded(a, "run-1");
-      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 1, "run-2 is pending");
-      // A repeated run-1 terminal event arrives before run-2's running event. It must not release run-2.
-      yield* kanban.turnEnded(a, "run-1");
-      assert.strictEqual(
-        (yield* kanban.snapshot(board.id)).evaluators.busy,
-        1,
-        "the stale end left run-2's pending slot alone",
-      );
-      // run-2 reports its id and really ends: its own slot is released.
-      yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
-      yield* kanban.notifyThreadChanged(a, "run-2");
-      yield* setRunStart(fake, a, false, "2026-10-25T13:01:00.000Z");
-      yield* kanban.turnEnded(a, "run-2");
-      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 0);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "a stale run-1 end before run-2 reports its id does not release run-2's pending slot",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { evaluatorSlots: 2 });
+        const channel = yield* kanban.createDiscussion(board.id, "Pending", owner);
+        yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
+        const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+        yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+        yield* kanban.notifyThreadChanged(a, "run-1");
+        // run-1 ends; its owed reply nudges A into run-2. run-2 is admitted but has not reported its id.
+        yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
+        yield* kanban.turnEnded(a, "run-1");
+        assert.strictEqual(
+          (yield* kanban.snapshot(board.id)).evaluators.busy,
+          1,
+          "run-2 is pending",
+        );
+        // A repeated run-1 terminal event arrives before run-2's running event. It must not release run-2.
+        yield* kanban.turnEnded(a, "run-1");
+        assert.strictEqual(
+          (yield* kanban.snapshot(board.id)).evaluators.busy,
+          1,
+          "the stale end left run-2's pending slot alone",
+        );
+        // run-2 reports its id and really ends: its own slot is released.
+        yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
+        yield* kanban.notifyThreadChanged(a, "run-2");
+        yield* setRunStart(fake, a, false, "2026-10-25T13:01:00.000Z");
+        yield* kanban.turnEnded(a, "run-2");
+        assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 0);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("a refused queued head does not hold back the healthy requests behind it", () =>
@@ -2125,7 +2139,11 @@ it.effect("a refused queued head does not hold back the healthy requests behind 
       yield* kanban.turnEnded(a);
       const all = yield* Ref.get(fake.threads);
       assert.strictEqual(all.get(b)?.messages.length, 0, "the refused head got nothing");
-      assert.strictEqual(all.get(c)?.messages.length, 1, "the healthy follower drained in the same pass");
+      assert.strictEqual(
+        all.get(c)?.messages.length,
+        1,
+        "the healthy follower drained in the same pass",
+      );
       // B's rows were dropped on the caught failure, so the queue is empty and no later tick repeats it.
       assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
       // Later requests keep draining: a tick with the pool full changes nothing and never blocks.

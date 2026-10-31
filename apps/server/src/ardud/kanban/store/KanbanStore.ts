@@ -252,7 +252,10 @@ export interface KanbanStoreShape {
   ) => Effect.Effect<void, KanbanStoreError>;
   readonly evaluatorQueue: (
     boardId: KanbanBoardId,
-  ) => Effect.Effect<ReadonlyArray<{ readonly threadId: string; readonly entry: EvaluatorQueueEntry }>, KanbanStoreError>;
+  ) => Effect.Effect<
+    ReadonlyArray<{ readonly threadId: string; readonly entry: EvaluatorQueueEntry }>,
+    KanbanStoreError
+  >;
   readonly dropEvaluatorQueue: (threadId: string) => Effect.Effect<void, KanbanStoreError>;
 
   /** Evaluator turns the board admitted and not yet released, whatever their link state. */
