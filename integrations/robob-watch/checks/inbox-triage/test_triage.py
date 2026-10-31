@@ -239,7 +239,7 @@ class TriageTests(unittest.TestCase):
             calls.append(seconds)
             real(which, seconds, interval)
             if len(calls) == 1:
-                time.sleep(1.05)  # descheduled between arming and the call
+                time.sleep(1.5)  # descheduled between arming and the call; macOS fires a 1 s timer at ~1.15 s
         with patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
              patch.object(t, 'classify', side_effect=AssertionError('the deadline came first')):
             hits, meta = t.classify_batch([self.item()], {}, 1)
