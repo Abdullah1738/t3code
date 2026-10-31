@@ -52,10 +52,11 @@ export const updateAsk = (
 export const openBlockingAsk = (card: KanbanCard) =>
   kanbanOpenAsks(card).findLast((ask) => ask.blocking);
 
-/** A plain question, or a pick (its block id is the ask id) when it has options. */
+/** A plain question, or a pick (its block id is the ask id) when it has options; multi lets the owner tick several. */
 export const askBlocks = (
   ask: KanbanOwnerAsk,
   options: ReadonlyArray<string>,
+  multi = false,
 ): ReadonlyArray<KanbanBlock> => {
   const labels = options.map((option) => option.trim()).filter((option) => option.length > 0);
   return labels.length > 0
@@ -66,7 +67,7 @@ export const askBlocks = (
           style: "pick",
           question: ask.text,
           options: labels.map((label, index) => ({ id: `o${index + 1}`, label })),
-          multi: false,
+          multi,
         },
       ]
     : [{ _tag: "md", text: ask.text }];

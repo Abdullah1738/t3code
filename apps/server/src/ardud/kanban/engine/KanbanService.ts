@@ -277,6 +277,7 @@ export interface KanbanServiceShape {
       readonly question: string;
       readonly blocking: boolean;
       readonly options?: ReadonlyArray<string> | undefined;
+      readonly multi?: boolean | undefined;
     },
     actor: KanbanActor,
     role: Rules.MoveRole,
@@ -318,7 +319,7 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly cardThread: (
     cardId: KanbanCard["id"],
-    action: "steer" | "stop" | "wake",
+    action: "steer" | "stop" | "wake" | "reset",
     text: string,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
@@ -737,15 +738,25 @@ const make = Effect.gen(function* () {
     model: ModelSelection,
   ) {
     const pools = yield* store.pools(boardId);
-    const key = Rules.poolKey(model);
     const joined = `${model.instanceId}/${model.model}`;
-    const match =
-      pools.find((pool) => pool.key === key) ??
-      pools.find((pool) => pool.model.model === joined || pool.model.model === model.model) ??
-      (() => {
-        const suffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-        return suffix.length === 1 ? suffix[0] : undefined;
-      })();
+    // An alias names the model without its instance; resolve it to the pool model it means,
+    // then pick the level among that model's pools (never the first row when a level is named).
+    const aliased = (): KanbanPool | undefined => {
+      const byName = pools.filter(
+        (pool) => pool.model.model === joined || pool.model.model === model.model,
+      );
+      const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
+      // A short name is unambiguous when its pools all belong to one model (one key per
+      // level is still one model); two different models or instances stay refused.
+      const suffixModels = new Set(bySuffix.map((pool) => Rules.modelKey(pool.model)));
+      const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
+      if (same.length === 0) return undefined;
+      const level = Rules.modelLevel(model);
+      if (level === null) return same[0];
+      // The requested level's pool when the model has one; else the first, as Rules.poolFor does.
+      return same.find((pool) => Rules.modelLevel(pool.model) === level) ?? same[0];
+    };
+    const match = Rules.poolFor(pools, model) ?? aliased();
     if (!match) {
       // A model the provider refuses is named as such, even when no pool exists for it.
       yield* checkModel(model);
@@ -773,14 +784,15 @@ const make = Effect.gen(function* () {
     models: ReadonlyArray<KanbanCardModel>,
   ) {
     if (models.length === 0) return yield* failWith("invalid", "models needs at least one model");
+    const pools = yield* store.pools(boardId);
     const mapped: Array<KanbanCardModel> = [];
     for (const entry of models) {
       if (!Number.isInteger(entry.weight) || entry.weight < 1) {
         return yield* failWith("invalid", "each model's weight is a whole number above 0");
       }
       const model = yield* poolModel(boardId, entry.model);
-      if (mapped.some((other) => Rules.poolKey(other.model) === Rules.poolKey(model))) {
-        return yield* failWith("invalid", `${Rules.poolKey(model)} is listed twice`);
+      if (mapped.some((other) => Rules.poolOf(pools, other.model) === Rules.poolOf(pools, model))) {
+        return yield* failWith("invalid", `${Rules.poolOf(pools, model)} is listed twice`);
       }
       mapped.push({ model, weight: entry.weight });
     }
@@ -923,6 +935,21 @@ const make = Effect.gen(function* () {
 
   const release = (card: KanbanCard) =>
     ({ ...card, activeThreadId: null, activeRole: null, activePool: null }) satisfies KanbanCard;
+
+  // Logged when a card leaves a thread that got too long; a repeat inside an hour is flagged.
+  const FRESH_START = "Thread too long; the next run starts on a fresh thread";
+  const freshStartedRecently = (card: KanbanCard, at: string) =>
+    store.cardEvents(card.id).pipe(
+      Effect.map((events) =>
+        events.some(
+          (event) =>
+            event.body?.startsWith(FRESH_START) === true &&
+            Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
+        ),
+      ),
+    );
+  const withFreshNote = (note: string | null | undefined) =>
+    [note?.trim(), Briefs.FRESH_THREAD_NOTE].filter((part): part is string => !!part).join("\n\n");
 
   /**
    * A card leaves its live thread. The thread's own move happens mid-turn, so
@@ -2203,7 +2230,14 @@ const make = Effect.gen(function* () {
             event.body !== "clear",
         )
         .map((event) => event.body ?? "");
-      text = Briefs.reviewBrief(board, synced, goal, Rules.chainFor(board, synced), findings);
+      text = Briefs.reviewBrief(
+        board,
+        synced,
+        goal,
+        Rules.chainFor(board, synced),
+        findings,
+        threadId === null,
+      );
     }
     if (threadId) {
       yield* threads.send({ threadId, text, model: dispatch.model });
@@ -2285,9 +2319,9 @@ const make = Effect.gen(function* () {
     }
   });
 
-  /** The pool key a board thread runs on. */
+  /** The outage key of the model a board thread runs on: per model, whatever its level. */
   const linkKey = (link: KanbanThreadLink, board: KanbanBoard) =>
-    Rules.poolKey(link.model ?? board.evaluatorModel);
+    Rules.modelKey(link.model ?? board.evaluatorModel);
 
   /**
    * Every paused thread link on every live board, ended or not: a reused evaluator is
@@ -2349,7 +2383,7 @@ const make = Effect.gen(function* () {
       endedAt: link.role === "evaluator" ? null : link.endedAt,
       paused: { at: link.paused?.at ?? at, message },
     });
-    const key = Rules.poolKey(model);
+    const key = Rules.modelKey(model);
     yield* Ref.update(down, (map) =>
       map.has(key)
         ? map
@@ -2500,6 +2534,37 @@ const make = Effect.gen(function* () {
     for (const card of nudge) yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
   });
 
+  /** A reviewer whose turn ended with no verdict: nudged once, then flagged and its slot freed. */
+  const reviewerStopped = Effect.fn("KanbanService.reviewerStopped")(function* (
+    card: KanbanCard,
+    threadId: ThreadId,
+  ) {
+    const at = yield* nowIso;
+    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    if (card.nudgedAt === null) {
+      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
+      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+      return;
+    }
+    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
+    const reason = "Reviewer stopped without a verdict";
+    const next: KanbanCard = {
+      ...release(card),
+      stage: "needs_review",
+      stalled: { reason, by: system, at },
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    yield* logEvent(next, system, "flagged", {
+      fromStage: card.stage,
+      toStage: next.stage,
+      body: reason,
+    });
+    yield* saveCard(next);
+    yield* kick;
+  });
+
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
   ) {
@@ -2614,6 +2679,27 @@ const make = Effect.gen(function* () {
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
         for (const entry of carried) {
+          // A thread too long to send again can't run the card: the next
+          // dispatch starts it on a fresh thread.
+          if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(entry, at))) {
+            const fresh: KanbanCard = {
+              ...release(entry),
+              stage: "todo",
+              workThreadId: null,
+              stalled: null,
+              nudgedAt: null,
+              wakeNote: withFreshNote(entry.wakeNote),
+              movedAt: at,
+              updatedAt: at,
+            };
+            yield* logEvent(fresh, system, "moved", {
+              fromStage: entry.stage,
+              toStage: "todo",
+              body: `${FRESH_START}: ${failure.message}`,
+            });
+            yield* saveCard(fresh);
+            continue;
+          }
           const next: KanbanCard = {
             ...release(entry),
             stage: "todo",
@@ -2641,6 +2727,8 @@ const make = Effect.gen(function* () {
       const view = yield* threads.view(threadId);
       // A repeated run event can arrive while the thread runs again.
       if (view === null || view.state !== "idle") return;
+      // A worker waiting on its own subagents hasn't stopped.
+      if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       yield* nudgeWorker(threadId, carried);
       return;
     }
@@ -2651,6 +2739,25 @@ const make = Effect.gen(function* () {
     }
     if (outage !== null) return;
     if (failure !== null) {
+      if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(card, at))) {
+        const fresh: KanbanCard = {
+          ...release(card),
+          stage: "needs_review",
+          reviewThreadId: null,
+          stalled: null,
+          nudgedAt: null,
+          movedAt: at,
+          updatedAt: at,
+        };
+        yield* logEvent(fresh, system, "moved", {
+          fromStage: card.stage,
+          toStage: "needs_review",
+          body: `${FRESH_START}: ${failure.message}`,
+        });
+        yield* saveCard(fresh);
+        yield* kick;
+        return;
+      }
       const reason = `Run failed: ${failure.message}`;
       const next: KanbanCard = {
         ...release(card),
@@ -2678,28 +2785,9 @@ const make = Effect.gen(function* () {
     // chain step before the one now running in this thread.
     const latest = yield* threads.view(threadId);
     if (latest !== null && latest.state !== "idle") return;
-    if (card.nudgedAt === null) {
-      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
-      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
-      return;
-    }
-    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
-    const reason = "Reviewer stopped without a verdict";
-    const next: KanbanCard = {
-      ...release(card),
-      stage: "needs_review",
-      stalled: { reason, by: system, at },
-      nudgedAt: null,
-      movedAt: at,
-      updatedAt: at,
-    };
-    yield* logEvent(next, system, "flagged", {
-      fromStage: card.stage,
-      toStage: next.stage,
-      body: reason,
-    });
-    yield* saveCard(next);
-    yield* kick;
+    // Its own subagents still run: their results wake it, so it hasn't stopped.
+    if (latest !== null && Rules.waitingOnBackground(latest, yield* nowMillis)) return;
+    yield* reviewerStopped(card, threadId);
   });
 
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
@@ -2794,7 +2882,12 @@ const make = Effect.gen(function* () {
         // A paused worker waits for probeOutages, not a nudge.
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
-        if (view === null || !Rules.workerQuietDue(card, view, now)) continue;
+        if (
+          view === null ||
+          Rules.waitingOnBackground(view, now) ||
+          !Rules.workerQuietDue(card, view, now)
+        )
+          continue;
         if (view.state === "needs-input") {
           // Its turn end after the interrupt brings the nudge.
           yield* threads.interrupt(threadId, "Stuck on its own question; the board nudges it");
@@ -2806,6 +2899,21 @@ const make = Effect.gen(function* () {
           continue;
         }
         yield* nudgeWorker(threadId, [card]);
+      }
+      // Backstop for a reviewer left idle with no verdict: a turn end skipped while
+      // its own background work ran, or one that never arrived.
+      for (const card of yield* store.cards(board.id)) {
+        const threadId = card.activeThreadId;
+        if (threadId === null || card.activeRole !== "review") continue;
+        if ((yield* store.threadLink(threadId))?.paused) continue;
+        const view = yield* threads.view(threadId);
+        if (
+          view === null ||
+          Rules.waitingOnBackground(view, now) ||
+          !Rules.reviewerQuietDue(card, view, now)
+        )
+          continue;
+        yield* reviewerStopped(card, threadId);
       }
       // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
       for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
@@ -3002,7 +3110,7 @@ const make = Effect.gen(function* () {
         const found = new Map<string, ModelSelection>();
         for (const { link, board } of yield* pausedLinks) {
           const model = link.model ?? board.evaluatorModel;
-          found.set(Rules.poolKey(model), model);
+          found.set(Rules.modelKey(model), model);
         }
         // A key whose threads all came back on their own is up again. A key with paused
         // links but no state is marked down now, so dispatch holds it while the probe
@@ -3103,18 +3211,18 @@ const make = Effect.gen(function* () {
     return [...seen.values()];
   };
 
-  /** The 0-slot pools a board still needs for its models; existing pools are never touched. */
+  /**
+   * The 0-slot pools a board still needs for its models; existing pools are never touched.
+   * A model with a pool at any level needs none, so a new board default level adds no pool.
+   */
   const missingPools = (
     existing: ReadonlyArray<KanbanPool>,
     models: ReadonlyArray<ModelSelection>,
   ): Array<KanbanPool> => {
-    const have = new Set(existing.map((pool) => pool.key));
     const added: Array<KanbanPool> = [];
     for (const model of models) {
-      const key = Rules.poolKey(model);
-      if (have.has(key)) continue;
-      have.add(key);
-      added.push({ key, model, slots: 0 });
+      if (Rules.poolFor([...existing, ...added], model)) continue;
+      added.push({ key: Rules.poolKey(model), model, slots: 0 });
     }
     return added;
   };
@@ -3335,7 +3443,8 @@ const make = Effect.gen(function* () {
     const pool =
       carried[0]?.activePool ??
       held?.pool ??
-      Rules.poolKey(
+      Rules.poolOf(
+        yield* store.pools(board.id),
         (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
       );
     const origin = carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null);
@@ -3391,8 +3500,8 @@ const make = Effect.gen(function* () {
       return yield* failWith("denied", `card #${card.number} is on another board`);
     }
     const cards = yield* store.cards(card.boardId);
-    const slots =
-      (yield* store.pools(card.boardId)).find((pool) => pool.key === thread.pool)?.slots ?? 0;
+    const pools = yield* store.pools(card.boardId);
+    const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
     const check = Rules.checkClaim(thread.board, card, {
       threadId,
       pool: thread.pool,
@@ -3400,6 +3509,7 @@ const make = Effect.gen(function* () {
       byId: new Map(cards.map((entry) => [entry.id as string, entry])),
       carrying: thread.carried.length,
       slots,
+      pools,
     });
     if (!check.ok) return yield* failWith("denied", check.reason);
     if (!thread.holdsSlot) {
@@ -3422,7 +3532,7 @@ const make = Effect.gen(function* () {
     const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
       ...card,
-      model: Rules.modelOnPool(card, pool) ?? card.model,
+      model: Rules.modelOnPool(card, pool, yield* store.pools(card.boardId)) ?? card.model,
       stage: "working",
       activeThreadId: threadId,
       activeRole: "work",
@@ -3470,18 +3580,19 @@ const make = Effect.gen(function* () {
         // The thread's live model comes first: a switch moves the thread even after every
         // card that carried the switch is released, and the held slot follows it.
         const live = yield* threads.model(threadId);
+        const pools = yield* store.pools(thread.board.id);
         const model = input.model
           ? yield* poolModel(thread.board.id, input.model)
           : (live ??
             thread.carried[0]?.model ??
             thread.link.model ??
-            (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.model ??
+            pools.find((pool) => pool.key === thread.pool)?.model ??
             thread.board.defaultCardModel);
         // A weighted list is checked by the take: one of its models must run here.
-        if (!input.models && Rules.poolKey(model) !== thread.pool) {
+        if (!input.models && Rules.poolOf(pools, model) !== thread.pool) {
           return yield* failWith(
             "denied",
-            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolKey(model)}`,
+            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolOf(pools, model)}`,
           );
         }
         const fields: NewCard = {
@@ -3509,9 +3620,8 @@ const make = Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
         const cards = yield* store.cards(thread.board.id);
         const mine = yield* ownCards(threadId, cards);
-        const slots =
-          (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.slots ??
-          0;
+        const pools = yield* store.pools(thread.board.id);
+        const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
         // Without a slot of its own the thread can only claim while the pool has room.
         const full =
           !thread.holdsSlot &&
@@ -3531,6 +3641,7 @@ const make = Effect.gen(function* () {
                 projectId: thread.projectId,
                 carrying: thread.carried.length,
                 slots,
+                pools,
               }),
           holdsSlot: thread.holdsSlot,
         } satisfies NextCards;
@@ -3573,13 +3684,15 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
+        const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
         const model = models
           ? // A card with a work thread stays on its pool while the list still has it; the list's
             // entry carries the pool's variant, so a variant change sticks.
             (card.workThreadId !== null
-              ? models.find((entry) => Rules.poolKey(entry.model) === Rules.poolKey(card.model))
-                  ?.model
+              ? models.find(
+                  (entry) => Rules.poolOf(pools, entry.model) === Rules.poolOf(pools, card.model),
+                )?.model
               : undefined) ?? (models[0]?.model ?? card.model)
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
@@ -3628,8 +3741,8 @@ const make = Effect.gen(function* () {
         const saved =
           paused.activeThreadId !== null &&
           paused.activeRole === "work" &&
-          paused.activePool !== Rules.poolKey(paused.model)
-            ? { ...paused, activePool: Rules.poolKey(paused.model) }
+          paused.activePool !== Rules.poolOf(pools, paused.model)
+            ? { ...paused, activePool: Rules.poolOf(pools, paused.model) }
             : paused;
         yield* saveCard(saved);
         yield* evaluatorTurn(card, saved, actor);
@@ -3650,7 +3763,7 @@ const make = Effect.gen(function* () {
           // The thread now runs the new model's pool; its slot follows, so the pool
           // counts and the one-slot limit stay right. Cards sharing the thread take the
           // same model, so a steer or wake to any of them keeps the thread on it.
-          const newPool = Rules.poolKey(saved.model);
+          const newPool = Rules.poolOf(pools, saved.model);
           for (const other of yield* store.cardsByThread(saved.activeThreadId)) {
             if (other.id === saved.id) continue;
             yield* saveCard({ ...other, model: saved.model, activePool: newPool });
@@ -3731,9 +3844,15 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     ask: KanbanOwnerAsk,
     options: ReadonlyArray<string>,
+    multi = false,
   ) {
     const discussion = yield* cardDiscussionUnlocked(card.id);
-    const message = yield* postUnlocked(discussion.id, ask.by, Asks.askBlocks(ask, options), false);
+    const message = yield* postUnlocked(
+      discussion.id,
+      ask.by,
+      Asks.askBlocks(ask, options, multi),
+      false,
+    );
     const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, { seq: message.seq });
     yield* saveCard(next);
     return next;
@@ -3769,7 +3888,7 @@ const make = Effect.gen(function* () {
           yield* evaluatorTurn(card, next, actor);
         }
         const ask = next.asks.at(-1);
-        return ask ? yield* postAsk(next, ask, input.options ?? []) : next;
+        return ask ? yield* postAsk(next, ask, input.options ?? [], input.multi ?? false) : next;
       }),
     );
 
@@ -4196,6 +4315,33 @@ const make = Effect.gen(function* () {
           yield* saveCard(next);
           return next;
         }
+        if (action === "reset") {
+          yield* letGo(card, false, "moved to a fresh thread");
+          const stage: KanbanCard["stage"] =
+            card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage;
+          const next: KanbanCard = {
+            ...release(card),
+            workThreadId: null,
+            reviewThreadId: null,
+            stage,
+            stalled: null,
+            nudgedAt: null,
+            wakeNote:
+              stage === "todo"
+                ? withFreshNote(text.trim() || card.wakeNote)
+                : text.trim() || card.wakeNote,
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(next, actor, "moved", {
+            fromStage: card.stage,
+            toStage: stage,
+            body: text.trim() ? `${FRESH_START}: ${text.trim()}` : FRESH_START,
+          });
+          yield* saveCard(next);
+          yield* kick;
+          return next;
+        }
         if (card.activeThreadId !== null) {
           const model =
             card.activeRole === "review"
@@ -4234,33 +4380,66 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * The pool a pool request names: its exact level's pool; else, for a request with no
+   * level, the model's only pool. A model with pools at several levels needs the level.
+   * Undefined: no pool yet.
+   */
+  const namedPool = Effect.fn("KanbanService.namedPool")(function* (
+    pools: ReadonlyArray<KanbanPool>,
+    model: ModelSelection,
+  ) {
+    const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
+    const exact = same.find((pool) => Rules.poolKey(pool.model) === Rules.poolKey(model));
+    // A named level is exact: its pool, or none (a new pool at that level).
+    if (Rules.modelLevel(model) !== null) return exact;
+    // A request with no level must name one only when the model has several pools.
+    if (same.length > 1) {
+      const levels = same.map((pool) => Rules.modelLevel(pool.model) ?? "no level").join(", ");
+      return yield* failWith("invalid", `${model.model} has pools at ${levels}; name the level`);
+    }
+    return same[0];
+  });
+
   const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots) =>
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
-        const key = Rules.poolKey(model);
         const count = Math.max(0, Math.round(slots));
-        const existing = (yield* store.pools(board.id)).find((pool) => pool.key === key);
+        const pools = yield* store.pools(board.id);
+        const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
+        const offered = Result.isSuccess(yield* Effect.result(checkModel(model)));
+        // A pause at a level the provider doesn't offer pauses the model's only pool.
+        const existing =
+          (yield* namedPool(pools, model)) ??
+          (count === 0 && !offered && same.length === 1 ? same[0] : undefined);
         // Pausing an existing pool must always work, even when its model has left the
         // provider's catalog: the pool is being stopped, not started.
         const pausing = count === 0 && existing !== undefined;
-        // A pause that names a variant the provider doesn't offer keeps the pool's stored
-        // model, so the board's model for this pool is never replaced by an unoffered one.
+        // A resize that names no level, or a pause at an unoffered level, keeps the pool's
+        // stored model, so a pool's level is never dropped or replaced by an unoffered one.
         const stored =
-          pausing && existing !== undefined && Result.isFailure(yield* Effect.result(checkModel(model)))
+          existing !== undefined && (Rules.modelLevel(model) === null || (pausing && !offered))
             ? existing.model
             : model;
-        if (!pausing) yield* checkModel(model);
+        if (!pausing) yield* checkModel(stored);
         // Unknown (null) never blocks; only a model the composer is known not to offer does.
-        const listed = isListed(yield* models.listed, model);
+        const listed = isListed(yield* models.listed, stored);
         if (listed === false && !pausing) {
-          return yield* failWith("invalid", `${key} isn't in the model list; pick a model the composer offers`);
+          return yield* failWith(
+            "invalid",
+            `${Rules.poolKey(stored)} isn't in the model list; pick a model the composer offers`,
+          );
         }
-        yield* store.putPool(boardId, { key, model: stored, slots: count });
-        const pools = yield* store.pools(boardId);
-        yield* publish(boardId, { _tag: "pools", pools });
+        yield* store.putPool(boardId, {
+          key: existing?.key ?? Rules.poolKey(stored),
+          model: stored,
+          slots: count,
+        });
+        const saved = yield* store.pools(boardId);
+        yield* publish(boardId, { _tag: "pools", pools: saved });
         yield* kick;
-        return pools;
+        return saved;
       }),
     );
 
@@ -4268,9 +4447,12 @@ const make = Effect.gen(function* () {
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
-        const key = Rules.poolKey(model);
-        const pool = (yield* store.pools(board.id)).find((candidate) => candidate.key === key);
-        if (!pool) return yield* failWith("not-found", `pool ${key}`);
+        const pools = yield* store.pools(board.id);
+        const pool = yield* namedPool(pools, model);
+        if (!pool) return yield* failWith("not-found", `pool ${Rules.poolKey(model)}`);
+        const key = pool.key;
+        // A model with no pool at its own level runs on its model's first pool (Rules.poolFor).
+        const runsHere = (used: ModelSelection) => Rules.poolFor(pools, used)?.key === key;
         if (pool.slots > 0) {
           return yield* failWith("invalid", `${key} has ${pool.slots} slots; set it to 0 before removing`);
         }
@@ -4280,12 +4462,12 @@ const make = Effect.gen(function* () {
           ["the default card model", board.defaultCardModel],
         ];
         for (const [label, used] of boardUses) {
-          if (used && Rules.poolKey(used) === key) {
+          if (used && runsHere(used)) {
             return yield* failWith("invalid", `${label} uses ${key}`);
           }
         }
         for (const chain of board.reviewChains) {
-          if (chain.steps.some((step) => Rules.poolKey(step) === key)) {
+          if (chain.steps.some(runsHere)) {
             return yield* failWith("invalid", `a review chain uses ${key}`);
           }
         }
@@ -4295,15 +4477,15 @@ const make = Effect.gen(function* () {
           }
           if (card.settledAt !== null) continue;
           // card.model is the pinned work model, kept even when weighted candidates exist.
-          if (Rules.modelOnPool(card, key) !== null) {
+          if (Rules.modelOnPool(card, key, pools) !== null) {
             return yield* failWith("invalid", `card #${card.number} uses ${key}`);
           }
         }
         yield* store.removePool(board.id, key);
-        const pools = yield* store.pools(board.id);
-        yield* publish(boardId, { _tag: "pools", pools });
+        const left = yield* store.pools(board.id);
+        yield* publish(boardId, { _tag: "pools", pools: left });
         yield* kick;
-        return pools;
+        return left;
       }),
     );
 
@@ -4534,6 +4716,11 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // The apps never show a card's prompt (they read one card in full through card), and on big boards prompts are most of the feed.
+  const feedCard = (card: KanbanCard): KanbanCard => ({ ...card, prompt: "" });
+  const feedChange = (change: KanbanChange): KanbanChange =>
+    change._tag === "card" ? { ...change, card: feedCard(change.card) } : change;
+
   const watch: KanbanServiceShape["watch"] = (boardId) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -4541,10 +4728,16 @@ const make = Effect.gen(function* () {
         const snapshot = yield* read(snapshotOf(boardId));
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
-          Stream.map((entry): KanbanWatchEvent => ({ _tag: "change", change: entry.change })),
+          Stream.map((entry): KanbanWatchEvent => ({
+            _tag: "change",
+            change: feedChange(entry.change),
+          })),
         );
         return Stream.concat(
-          Stream.succeed<KanbanWatchEvent>({ _tag: "snapshot", snapshot }),
+          Stream.succeed<KanbanWatchEvent>({
+            _tag: "snapshot",
+            snapshot: { ...snapshot, cards: snapshot.cards.map(feedCard) },
+          }),
           live,
         );
       }),
@@ -4559,7 +4752,7 @@ const make = Effect.gen(function* () {
           Effect.forEach(all, (board) =>
             Effect.all({
               board: Effect.succeed(board),
-              cards: store.cards(board.id),
+              cards: store.summaryCards(board.id),
               discussions: store.discussions(board.id),
               threadIds: Effect.map(
                 store.threadLinks({ boardId: board.id, open: false }),

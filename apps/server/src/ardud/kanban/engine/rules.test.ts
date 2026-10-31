@@ -19,17 +19,24 @@ import {
   checkMove,
   discussionSettleDue,
   isBlocked,
+  isContextFull,
   isOutage,
   MAX_BATCH,
   maskDownPools,
+  modelKey,
+  modelLevel,
   modelOnPool,
   nextProbeDelay,
   planDispatch,
+  poolFor,
   poolKey,
   prsLanded,
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  reviewerQuietDue,
+  waitingOnBackground,
+  BACKGROUND_GRACE_MS,
 } from "./rules.ts";
 
 const model = (name: string): ModelSelection => ({
@@ -865,6 +872,78 @@ describe("workerQuietDue", () => {
   });
 });
 
+describe("waitingOnBackground and reviewerQuietDue", () => {
+  const START = Date.parse("2026-10-25T00:00:00Z");
+  const START_ISO = "2026-10-25T00:00:00.000Z";
+  const at = (minutes: number) => START + minutes * 60 * 1000;
+  const bg = (state: string, background: number) => ({
+    state,
+    quietSince: START_ISO,
+    backgroundWork: background,
+  });
+
+  it("holds an idle thread with background work for the grace only", () => {
+    expect(BACKGROUND_GRACE_MS).toBe(60 * 60 * 1000);
+    expect(waitingOnBackground(bg("idle", 1), at(59))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1), at(61))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0), at(59))).toBe(false);
+    expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
+  });
+
+  const reviewing = card({
+    stage: "in_review",
+    activeRole: "review",
+    activeThreadId: ThreadId.make("t1"),
+    movedAt: START_ISO,
+  });
+  const idle = { state: "idle", quietSince: START_ISO };
+
+  it("is due for an idle reviewer with no verdict after 30 minutes", () => {
+    expect(reviewerQuietDue(reviewing, idle, at(31))).toBe(true);
+    expect(reviewerQuietDue(reviewing, idle, at(29))).toBe(false);
+  });
+
+  it("counts from the last nudge", () => {
+    const nudged = { ...reviewing, nudgedAt: "2026-10-25T00:20:00.000Z" };
+    expect(reviewerQuietDue(nudged, idle, at(31))).toBe(false);
+    expect(reviewerQuietDue(nudged, idle, at(51))).toBe(true);
+  });
+
+  it("skips stalled, worker and running reviewers", () => {
+    expect(
+      reviewerQuietDue(
+        { ...reviewing, stalled: { reason: "x", by: { _tag: "owner" }, at: START_ISO } },
+        idle,
+        at(31),
+      ),
+    ).toBe(false);
+    expect(reviewerQuietDue({ ...reviewing, activeRole: "work" }, idle, at(31))).toBe(false);
+    expect(reviewerQuietDue(reviewing, { ...idle, state: "running" }, at(31))).toBe(false);
+  });
+});
+
+describe("isContextFull", () => {
+  it("treats a thread too long for the model as context-full", () => {
+    expect(
+      isContextFull({
+        message:
+          '[400]: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000528 tokens > 1000000 maximum"}}',
+      }),
+    ).toBe(true);
+    expect(isContextFull({ message: "context_length_exceeded" })).toBe(true);
+    expect(
+      isContextFull({ message: "This model's maximum context length is 200000 tokens" }),
+    ).toBe(true);
+  });
+
+  it("leaves model, variant and empty failures alone", () => {
+    expect(isContextFull({ message: "Variant unavailable for opus/gpt-6-astra: high" })).toBe(
+      false,
+    );
+    expect(isContextFull({ message: "The run failed without an error message." })).toBe(false);
+  });
+});
+
 describe("isOutage", () => {
   it("treats out-of-usage, rate-limit and expired-token failures as outages", () => {
     expect(
@@ -941,5 +1020,81 @@ describe("probe backoff and pool masking", () => {
     ] as unknown as ReadonlyArray<KanbanPool>;
     const masked = maskDownPools(pools, new Set(["opencode/opus/claude-opus-5-5"]));
     expect(masked.map((pool) => pool.slots)).toEqual([0, 1]);
+  });
+
+  it("zeroes every level of a down model", () => {
+    const high = { ...opus, options: [{ id: "variant", value: "high" }] } as ModelSelection;
+    const max = { ...opus, options: [{ id: "variant", value: "max" }] } as ModelSelection;
+    const masked = maskDownPools(
+      pools([
+        [high, 2],
+        [max, 3],
+        [sol, 1],
+      ]),
+      new Set([modelKey(opus)]),
+    );
+    expect(masked.map((pool) => pool.slots)).toEqual([0, 0, 1]);
+  });
+});
+
+describe("pool levels", () => {
+  const at = (m: ModelSelection, level: string): ModelSelection => ({
+    ...m,
+    options: [{ id: "variant", value: level }],
+  });
+
+  it("keys a pool by model and level, and leaves a model with no level as it was", () => {
+    expect(poolKey(haiku)).toBe("opencode/opus/cc/claude-haiku-5-5");
+    expect(poolKey(at(haiku, "max"))).toBe("opencode/opus/cc/claude-haiku-5-5#max");
+    expect(modelKey(at(haiku, "max"))).toBe("opencode/opus/cc/claude-haiku-5-5");
+    expect(modelLevel(at(haiku, "max"))).toBe("max");
+    expect(modelLevel(haiku)).toBeNull();
+  });
+
+  it("finds the exact level's pool, else the model's first pool", () => {
+    const all = pools([
+      [at(haiku, "max"), 3],
+      [at(haiku, "xhigh"), 1],
+      [opus, 1],
+    ]);
+    expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
+    expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
+    expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
+    expect(poolFor(all, at(opus, "high"))?.key).toBe(poolKey(opus));
+    expect(poolFor(all, sol)).toBeUndefined();
+  });
+
+  it("runs each level's cards on its own pool, and a card at an unpooled level on the model's first", () => {
+    const max = at(haiku, "max");
+    const xhigh = at(haiku, "xhigh");
+    const all = pools([
+      [max, 1],
+      [xhigh, 1],
+    ]);
+    const plan = planDispatch(
+      board,
+      [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
+      all,
+    );
+    // The low card would run on max (the first Haiku pool), but max's one slot is taken.
+    expect(plan.map((d) => d.pool)).toEqual([poolKey(xhigh), poolKey(max)]);
+    const alone = planDispatch(board, [card({ model: at(haiku, "low") })], all);
+    expect(alone.map((d) => d.pool)).toEqual([poolKey(max)]);
+  });
+
+  it("lets a thread claim a card whose level runs on the thread's pool", () => {
+    const max = at(haiku, "max");
+    const c = card({ model: at(haiku, "low") });
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(max),
+      projectId: null,
+      byId: new Map([[c.id as string, c]]),
+      carrying: 0,
+      slots: 1,
+    };
+    expect(checkClaim(board, c, ctx).ok).toBe(false);
+    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(true);
+    expect(modelOnPool(c, poolKey(max), pools([[max, 1]]))).toEqual(c.model);
   });
 });

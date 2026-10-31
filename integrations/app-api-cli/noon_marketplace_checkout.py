@@ -5,6 +5,7 @@ Headers are supplied by the auth lifecycle owner. ``before_send`` must durably
 reserve the exact operation before allowing it onto the wire. Place and payment
 are separate operations; an order number alone is not payment confirmation.
 """
+import order_card
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -228,7 +229,7 @@ def operation(service, name, **args):
     elif name == 'payment_method':
         path = CHECKOUT + 'set-payment-method'
         mask = args.pop('card_mask')
-        if not isinstance(mask, str) or len(mask) > 64 or not mask.endswith('5542') or '\n' in mask or '\r' in mask:
+        if not isinstance(mask, str) or len(mask) > 64 or not mask.endswith(order_card.LAST4) or '\n' in mask or '\r' in mask:
             raise MarketplaceError('SAVED_CARD_MISMATCH')
         payload = {'paymentMethodCode': 'cc_noonpay', 'cardToken': _id(args.pop('card_token')), 'cardMask': mask}
         section = args.pop('card_section_code', None)

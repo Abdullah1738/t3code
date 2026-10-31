@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import order_card
 import talabat_auth as auth
 import talabat_http_orders as http
 
@@ -90,7 +91,7 @@ def select_card(data, now=None):
     if not all(isinstance(card, dict) for card in cards):
         _fail('SAVED_CARDS_SCHEMA_CHANGED')
     matches = [c for c in cards if isinstance(c.get('cardNumber'), str)
-               and re.fullmatch(r'[0-9 *xX•●-]*5542', c['cardNumber'])]
+               and re.fullmatch(r'[0-9 *xX•●-]*' + order_card.LAST4, c['cardNumber'])]
     if len(matches) != 1:
         _fail('EXACT_SAVED_CARD_NOT_UNIQUE')
     card = matches[0]
@@ -382,7 +383,7 @@ def readiness(apk_pool, timeout=30):
     http.remaining_time(deadline)
     return {'ok': True, 'app': 'talabat', 'mode': 'read_only_checkout_readiness',
             'profile_verified': True, 'saved_home_verified': True,
-            'payment': {'saved_card_last4': '5542', 'unique_match': True,
+            'payment': {'saved_card_last4': order_card.LAST4, 'unique_match': True,
                         'not_expired': True, 'cvv_required_by_cards_endpoint': False,
                         'selected_for_checkout': False},
             'cart': cart, 'benefits_verified': False, 'quiet_instructions_verified': False,

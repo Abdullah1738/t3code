@@ -17,7 +17,7 @@ from test.test_talabat_http_orders import saved
 
 
 def card(**changes):
-    return {'cardNumber': '**** **** **** 5542', 'CountryId': 4, 'isExpired': False,
+    return {'cardNumber': '**** **** **** 2342', 'CountryId': 4, 'isExpired': False,
             'isValidCard': True, 'isForceCvv': False, 'expireYear': '40', 'expireMonth': '12',
             'token': 'synthetic-private-token', 'tokenId': 'synthetic-private-token-id',
             'holderName': 'synthetic-private-name', **changes}
@@ -293,7 +293,7 @@ class CheckoutTest(unittest.TestCase):
     def test_card_flags_and_material_fail_closed(self):
         changes = [{'isExpired': True}, {'isExpired': None}, {'isValidCard': False}, {'isForceCvv': True},
                    {'isForceCvv': None}, {'isForceCvv': 0}, {'CountryId': '4'}, {'CountryId': 1},
-                   {'token': None}, {'tokenId': ''}, {'cardNumber': '5555'}, {'cardNumber': 'junk5542'},
+                   {'token': None}, {'tokenId': ''}, {'cardNumber': '5555'}, {'cardNumber': 'junk2342'},
                    {'expireYear': '3'}, {'expireMonth': '13'}, {'expireMonth': '0'}, {'expireYear': '2000'}]
         for change in changes:
             with self.subTest(change=change), self.assertRaises(checkout.http.TalabatError):

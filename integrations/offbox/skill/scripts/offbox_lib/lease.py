@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
@@ -475,6 +475,33 @@ def _too_big(con, box_id: str, e: api.ApiError):
     con.commit()
     event(con, box_id, "lease_too_big", f"needs {need} GiB, {size} holds {holds} GiB")
     return DiskTooBig(box_id, need, size, holds)
+
+
+class DeadMount(OffboxError):
+    """A box's home filesystem died (ENOTCONN): nothing ran there. The run moves to another box; the dead one is
+    set aside by set_aside_dead_mount (stopped, marked, out of the pool, never deleted)."""
+
+    def __init__(self, box_id: str, reason: str):
+        super().__init__(f"{box_id} has a dead filesystem ({reason})")
+        self.box_id, self.reason = box_id, reason
+
+
+def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
+    con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{DEAD_MOUNT_NOTE} {reason}"[:200], box_id))
+    con.commit()
+    event(con, box_id, "lease_dead_mount", reason)
+    try:
+        ssh_sync.close_master(box_id)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        api.stop(box_id)
+    except OffboxError as e:
+        # The reaper's idle stop catches it later; a dead box must not block the run from moving on.
+        event(con, box_id, "lease_dead_mount_stop_failed", str(e)[:300])
+        return
+    con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
+    con.commit()
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):

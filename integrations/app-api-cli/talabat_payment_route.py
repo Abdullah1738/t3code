@@ -25,7 +25,7 @@ def _text(value):
 
 
 def selected_payment_event(*, home, vendor, config, saved_card):
-    """Serialize only the explicit talabat+sync, saved5542, no-precheck candidate.
+    """Serialize only the explicit talabat+sync, saved order-card, no-precheck candidate.
 
     This is the seven-field KEg serializer, not the enclosing FDg payment body.
     Native defaults and alternate-wallet/card fallback are intentionally absent.

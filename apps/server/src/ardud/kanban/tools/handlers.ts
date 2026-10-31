@@ -172,6 +172,24 @@ const workOrigin = Effect.fn("KanbanTools.workOrigin")(function* (
   return caller.link?.cardId ? (yield* service.card(caller.link.cardId)).card : null;
 });
 
+/** Names the board, card and thread a card thread's request came from, so the new evaluator knows. */
+const stampHandOn = Effect.fn("KanbanTools.stampHandOn")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+  text: string,
+) {
+  const link = caller.link;
+  if (!link) return text;
+  const boards = yield* service.boards;
+  const sourceBoard = boards.find((board) => board.id === link.boardId);
+  const card = yield* workOrigin(service, caller);
+  const boardName = sourceBoard ? `"${sourceBoard.name}" board` : `board ${link.boardId}`;
+  const cardPart = card
+    ? `, card [#${card.number} ${card.title}](t3-context://v1/kanban-card/${card.id})`
+    : "";
+  return `Handed on by a ${link.role} thread on the ${boardName}${cardPart}, thread [${caller.threadId}](t3-thread://v1/${caller.threadId}).\n\n${text}`;
+});
+
 const modelOf = (input: ModelInput): ModelSelection => modelSelectionOf(input);
 
 const modelsOf = (
@@ -361,7 +379,12 @@ const handlers = {
         }
         const asked = yield* service.askOwner(
           card.id,
-          { question: input.question, blocking: input.blocking ?? false, options: input.options },
+          {
+            question: input.question,
+            blocking: input.blocking ?? false,
+            options: input.options,
+            multi: input.multi,
+          },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
@@ -732,8 +755,14 @@ const handlers = {
   ),
 
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
-    asEvaluator((service, caller) =>
+    withCaller((service, caller) =>
       Effect.gen(function* () {
+        const cardThread = isCardThread(caller);
+        if (cardThread && input.kind !== "request") {
+          return yield* refuse(
+            'Card threads can start only a request evaluator (kind "request"), for example to hand a broken tool to the Robob board.',
+          );
+        }
         const board = yield* boardFor(service, caller, input.boardId);
         const text = input.text?.trim() ?? "";
         let purpose: EvaluatorPurpose;
@@ -741,7 +770,7 @@ const handlers = {
           if (!text) return yield* invalid(`A ${input.kind} evaluator needs text.`);
           purpose = {
             kind: input.kind,
-            text,
+            text: cardThread && caller.link ? yield* stampHandOn(service, caller, text) : text,
             ...(input.kind === "setup" ? { discussionId: input.discussionId ?? null } : {}),
           };
         } else {

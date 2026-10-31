@@ -49,7 +49,7 @@ class FreebieTests(unittest.TestCase):
     def review(self,data):
         return c.m.review_snapshot(snapshot(data),expected_skus=[c.m.sku_line('SYNTHETIC_SHAKE',1)],
             expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
-            card=c.m.SavedCard('synthetic-payment-token','xxxx5542','mastercard'))
+            card=c.m.SavedCard('synthetic-payment-token','xxxx2342','mastercard'))
 
     def test_recorded_freebie_with_qtymax_zero_passes_and_is_digest_bound(self):
         data=fixture();data['items'].insert(0,gift())

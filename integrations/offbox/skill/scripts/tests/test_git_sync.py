@@ -1,6 +1,7 @@
 """Exercise Git metadata sync with real Git/rsync and an offline SSH transport."""
 import contextlib
 import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -199,27 +200,54 @@ class GitSyncTests(unittest.TestCase):
         self.assertFalse((self.remote / ".git/objects/info/alternates").exists())
         self.git(self.remote, "fsck", "--full")
 
-    def test_partial_clone_missing_history_reports_pack_failure_without_fetching(self):
+    def partial_clone(self, *extra):
         self.git(self.worktree, "branch", "tip")
         self.git(self.source, "config", "uploadpack.allowFilter", "true")
         partial = self.base / "partial clone"
         self.git(self.source, "clone", "-q", "--filter=blob:none", "--single-branch",
-                 "--branch=tip", self.source.as_uri(), str(partial))
+                 "--branch=tip", *extra, self.source.as_uri(), str(partial))
+        return partial
+
+    def test_partial_clone_missing_history_sends_head_only_without_fetching(self):
+        partial = self.partial_clone()
         self.git(partial, "switch", "-q", "--detach", self.head)
         missing = self.git(partial, "rev-list", "--objects", "--missing=print", "HEAD")
         self.assertTrue(any(row.startswith("?") for row in missing.splitlines()))
+        self.source.rename(self.base / "source unavailable")
         before = self.contents(partial / ".git")
-        with self.assertRaisesRegex(OffboxError, "git pack-objects failed.*partial clone"):
+        with patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.push(root=partial, with_git=True)
+        self.assertEqual(before, self.contents(partial / ".git"))
+        self.assertIn("partial clone missing 1 older objects; sending HEAD only", err.getvalue())
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        partial.rename(self.base / "partial unavailable")
+        self.assertEqual(self.git(self.remote, "rev-parse", "HEAD"), self.head)
+        self.assertEqual(self.git(self.remote, "rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git(self.remote, "rev-list", "HEAD"), self.head)
+        self.assertEqual(self.git(self.remote, "show", "HEAD:tracked.txt"), "selected")
+        self.assertEqual(self.git(self.remote, "status", "--porcelain"), "")
+        self.git(self.remote, "fsck", "--full")
+
+    def test_partial_clone_missing_head_files_fails_fast_without_fetching(self):
+        partial = self.partial_clone("--no-checkout")
+        self.source.rename(self.base / "source unavailable")
+        before = self.contents(partial / ".git")
+        with self.assertRaisesRegex(OffboxError, "partial clone and some of HEAD's own files are not local"):
             self.push(root=partial, with_git=True)
         self.assertEqual(before, self.contents(partial / ".git"))
         self.assertFalse(self.remote.exists())
 
+    def test_missing_objects_outside_a_partial_clone_still_fail_the_pack(self):
+        blob = self.git(self.worktree, "rev-parse", f"{self.base_head}:tracked.txt")
+        loose = self.source / ".git/objects" / blob[:2] / blob[2:]
+        loose.chmod(0o600)
+        loose.unlink()
+        with self.assertRaisesRegex(OffboxError, "git pack-objects failed"):
+            self.push(with_git=True)
+        self.assertFalse(self.remote.exists())
+
     def test_partial_clone_with_all_reachable_objects_exports_offline(self):
-        self.git(self.worktree, "branch", "tip")
-        self.git(self.source, "config", "uploadpack.allowFilter", "true")
-        partial = self.base / "partial clone"
-        self.git(self.source, "clone", "-q", "--filter=blob:none", "--single-branch",
-                 "--branch=tip", self.source.as_uri(), str(partial))
+        partial = self.partial_clone()
         self.assertEqual(self.git(partial, "show", "HEAD^:tracked.txt"), "base")
         missing = self.git(partial, "rev-list", "--objects", "--missing=print", "HEAD")
         self.assertFalse(any(row.startswith("?") for row in missing.splitlines()))

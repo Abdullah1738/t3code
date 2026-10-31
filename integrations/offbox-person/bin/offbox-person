@@ -28,6 +28,7 @@ usage:
   offbox-person secret list <person>
   offbox-person save <person>                        save a default base and pin it (stops the box)
   offbox-person backup <person> [--force]            back up the box's latest snapshot to Dropbox now
+  offbox-person wa <person> setup|<wa args...>       her own WhatsApp on her box (offbox-person skill)
   offbox-person list
 EOF
   exit 2
@@ -301,6 +302,26 @@ cmd_backup() {
   exec "$BACKUP" "$p" "$@"
 }
 
+# Her own WhatsApp (wacli linked device) on her box. No `up`: the desktop, browser and tunnels would keep the box
+# warm; a plain ssh resumes a stopped box and the systemd --user sync service starts with it.
+cmd_wa() {
+  local p=$1; shift
+  check_person "$p"
+  (( $# )) || set -- status
+  if [[ $1 == setup ]]; then
+    local f
+    for f in wa:"$OFFBOX_PERSON_HOME/box/wa" wa-db:"$OFFBOX_PERSON_HOME/../robob-watch/helpers/wa-db"; do
+      [[ -f ${f#*:} ]] || die "missing ${f#*:}"
+      box_ssh "$p" "mkdir -p ~/person/run && cat > ~/person/run/push-${f%%:*}" < "${f#*:}" >&2
+    done
+    box_ssh "$p" 'bash -s' < "$OFFBOX_PERSON_HOME/box/wa-setup.sh"
+    return
+  fi
+  local a q=()
+  for a in "$@"; do q+=("${(qq)a}"); done
+  box_ssh "$p" "~/person/bin/wa ${q[*]}"
+}
+
 cmd_list() {
   local f p state
   for f in "$ROOT"/state/*.env(N); do
@@ -324,6 +345,7 @@ case $cmd in
   secret)  [[ $# -ge 2 ]] || usage; cmd_secret "$@" ;;
   save)    [[ $# -eq 1 ]] || usage; cmd_save "$1" ;;
   backup)  [[ $# -ge 1 && $# -le 2 ]] || usage; [[ $# -eq 1 || $2 == --force ]] || usage; cmd_backup "$@" ;;
+  wa)      [[ $# -ge 1 ]] || usage; cmd_wa "$@" ;;
   list)    cmd_list ;;
   *)       usage ;;
 esac

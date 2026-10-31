@@ -20,10 +20,11 @@ Lifecycle (mutations journalled at-most-once):
   guard empty cart + no unpaid active orders -> catalog rocket skuConfig ->
   offer resolution (buyable, rocket, min quantity) -> quick add -> checkout
   session {shouldUpdateSession:true} (verify silent delivery + default card
-  5542 + address + totals + rocket manifest + absolute promise) -> place-order
+  order card + address + totals + rocket manifest + absolute promise) -> place-order
   {total} -> order-status poll until success+shipments (paid signal;
   paymentError is failure) -> exact tracking -> watcher.
 """
+import order_card
 import datetime as dt
 import json
 import os
@@ -188,10 +189,10 @@ def _scope_hash(items, address_hash):
     """Single-item keeps the exact legacy digest; multi binds the full manifest."""
     if len(items) == 1:
         return journal.digest({'sku': items[0]['sku_config'], 'qty': items[0]['quantity'],
-                               'home': address_hash, 'card': '5542', 'quiet': True,
+                               'home': address_hash, 'card': order_card.LAST4, 'quiet': True,
                                'service': 'supermall'})
     return journal.digest({'items': [[i['sku_config'], i['quantity']] for i in items],
-                           'home': address_hash, 'card': '5542', 'quiet': True,
+                           'home': address_hash, 'card': order_card.LAST4, 'quiet': True,
                            'service': 'supermall'})
 
 
@@ -492,7 +493,7 @@ class SupermallOrderFlow(MarketplacePayment):
         if cards is None:
             _fail('SUPERMALL_DEFAULT_CARD_MISSING')
         defaults = [card for card in cards if isinstance(card, dict)
-                    and isinstance(card.get('mask'), str) and card['mask'].endswith('5542')
+                    and isinstance(card.get('mask'), str) and card['mask'].endswith(order_card.LAST4)
                     and card.get('isDefault') is True and card.get('isSelected') is True]
         if len(defaults) != 1:
             _fail('SUPERMALL_DEFAULT_CARD_NOT_SELECTED')
@@ -550,7 +551,7 @@ class SupermallOrderFlow(MarketplacePayment):
                           'quantity': self.quantity, 'total_minor': total_minor,
                           'subtotal_minor': subtotal_minor,
                           'fees_minor': total_minor - subtotal_minor,
-                          'address_key': data.get('addressKey'), 'card_last4': '5542',
+                          'address_key': data.get('addressKey'), 'card_last4': order_card.LAST4,
                           'silent_delivery': True, 'credits': False, 'isRocket': True,
                           'promise_delivery_date': latest_date}
         else:
@@ -559,7 +560,7 @@ class SupermallOrderFlow(MarketplacePayment):
                           'subtotal_minor': subtotal_minor,
                           'fees_minor': total_minor - subtotal_minor,
                           'total_minor': total_minor, 'shipments': len(shipments),
-                          'address_key': data.get('addressKey'), 'card_last4': '5542',
+                          'address_key': data.get('addressKey'), 'card_last4': order_card.LAST4,
                           'silent_delivery': True, 'credits': False, 'isRocket': True,
                           'promise_delivery_date': latest_date}
         self.review = {'digest': journal.digest(projection), 'payable_minor': total_minor,

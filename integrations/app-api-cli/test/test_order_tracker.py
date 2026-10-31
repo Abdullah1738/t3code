@@ -701,5 +701,88 @@ class AmazonGlueTest(unittest.TestCase):
         reconcile.assert_not_called()
 
 
+class RetireTest(unittest.TestCase):
+    """Terminal trackers stop themselves a quiet 30 minutes after the delivered wake."""
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        self.cfg = {'app': 'talabat', 'order': '12345', 'for': 'owner', 'chat': 'owner',
+                    'watcher': 'order-talabat-12345', 'registered_at': t.stamp(self.now - 7200)}
+        self.wid = self.cfg['watcher']
+        self.live = Path.home() / '.local/share/robob-watch/watchers' / self.wid
+
+    def check(self, state, result, folder=None, run=None):
+        output = io.StringIO()
+        run = run or mock.Mock(return_value='')
+        with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder or self.live)), \
+             mock.patch.object(Path, 'open', mock.mock_open()), \
+             mock.patch.object(Path, 'exists', return_value=True), \
+             mock.patch.object(t.fcntl, 'flock'), \
+             mock.patch.object(t, 'read', return_value=state), \
+             mock.patch.object(t, 'write') as write, \
+             mock.patch.object(t.time, 'time', return_value=self.now), \
+             mock.patch.object(t, 'fetch', return_value=result), \
+             mock.patch.object(t.store, 'reconcile'), \
+             mock.patch.object(t, 'run', run), \
+             redirect_stdout(output):
+            t.check(self.cfg)
+        return run, write, output.getvalue()
+
+    def test_delivered_tracker_retires_itself_after_a_quiet_half_hour(self):
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801}
+        run, write, out = self.check(state, {'status': 'delivered', 'errors': []})
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertIs(self.cfg.get('active'), False)
+        self.assertIs(write.call_args.args[1], self.cfg)
+        self.assertEqual(out, '')
+
+    def test_delivered_tracker_waits_out_the_first_half_hour(self):
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 600}
+        run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
+        run.assert_not_called()
+        self.assertEqual(out, '')
+
+    def test_terminal_wake_run_never_retires(self):
+        state = {'primed': True, 'status': 'placed'}
+        run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
+        run.assert_not_called()
+        self.assertEqual(state['terminal_at'], self.now)
+        self.assertEqual([e['kind'] for e in json.loads(out)['events']], ['stage_change'])
+
+    def test_amazon_tracker_never_retires_itself(self):
+        self.cfg.update(app='amazon', watcher='order-amazon-12345')
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 7200}
+        run, _, _ = self.check(state, {'status': 'delivered', 'errors': [], 'whole_order_complete': True})
+        run.assert_not_called()
+
+    def test_scratch_watch_dir_never_retires(self):
+        import tempfile
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 7200}
+        with tempfile.TemporaryDirectory() as scratch:
+            run, _, _ = self.check(state, {'status': 'delivered', 'errors': []}, folder=Path(scratch))
+        run.assert_not_called()
+
+    def test_failed_retire_is_kept_for_the_next_tick(self):
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 7200}
+        run = mock.Mock(side_effect=RuntimeError('robob-watch failed'))
+        _, write, _ = self.check(state, {'status': 'delivered', 'errors': []}, run=run)
+        self.assertEqual(state['retire_error'], 'robob-watch failed')
+        write.assert_called()
+
+    def test_remove_command_still_retires(self):
+        cfg = dict(self.cfg, active=True)
+        output = io.StringIO()
+        with mock.patch.object(Path, 'exists', return_value=True), \
+             mock.patch.object(t, 'read', return_value=cfg), \
+             mock.patch.object(t, 'write') as write, \
+             mock.patch.object(t, 'run', return_value='') as run, \
+             redirect_stdout(output):
+            t.main(['remove', '--app', 'talabat', '--order', '12345'])
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertIs(cfg['active'], False)
+        self.assertIs(write.call_args.args[1], cfg)
+        self.assertEqual(output.getvalue().strip(), f'Removed {self.wid}')
+
+
 if __name__ == '__main__':
     unittest.main()

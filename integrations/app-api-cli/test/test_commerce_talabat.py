@@ -116,7 +116,7 @@ class SettleInterruptedCartTest(unittest.TestCase):
         flow = str(uuid.uuid4())
         scope = journal.digest({'branch': self.store.branch_id, 'vertical': 'mart',
             'items': [(x.item_id, x.quantity) for x in self.items],
-            'home': 'Banyantree2104', 'card': '5542', 'quiet': True, 'extras': False})
+            'home': 'Banyantree2104', 'card': '2342', 'quiet': True, 'extras': False})
         binding = dict(flow_id=flow, app='talabat', vertical='mart',
                        account_hash=self.account_hash, scope_hash=scope)
         receipts.create(**binding)

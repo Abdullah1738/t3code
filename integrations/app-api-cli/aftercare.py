@@ -393,7 +393,7 @@ def main(argv=None, session=None):
     parser.add_argument('--for', dest='recipient', choices=list(WHO), default='owner')
     parser.add_argument('--item', action='append', default=[], help='item covered by the case (repeat for more)')
     parser.add_argument('--amount', help='e.g. "AED 79"')
-    parser.add_argument('--refund-to', help='e.g. "card 5542"')
+    parser.add_argument('--refund-to', help='e.g. "card 2342"')
     parser.add_argument('--request', help='what was asked and by whom, e.g. a short quote')
     parser.add_argument('--requested-at', help='ISO time the request was accepted')
     parser.add_argument('--blocker', help='why it cannot be done yet')

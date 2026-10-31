@@ -21,6 +21,7 @@ import type {
   OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -50,6 +51,8 @@ export interface KanbanThreadView {
   readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
+  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches don't count: they never end. */
+  readonly backgroundWork: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
   readonly archived: boolean;
 }
@@ -121,6 +124,15 @@ export const viewStateOf = (
   return { state, quietSince };
 };
 
+/** Background work that still runs for the thread once its turn ended. */
+export const backgroundWorkOf = (
+  shell: Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">,
+): number =>
+  (shell.pendingBackgroundTasks ?? []).filter(
+    (task) =>
+      !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
+  ).length;
+
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
@@ -140,6 +152,7 @@ const make = Effect.gen(function* () {
               runStartedAt: shell.activityRunStartedAt
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
+              backgroundWork: backgroundWorkOf(shell),
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,

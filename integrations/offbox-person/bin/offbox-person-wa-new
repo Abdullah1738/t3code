@@ -1,0 +1,20 @@
+#!/usr/bin/env zsh
+# offbox-person-wa-new <person> <jid|number>: robob-watch check for a person's own WhatsApp on her offbox.
+# Prints new incoming messages in that chat since the last run ("(dd-mm-yy HH:MM:SS) Name: text"), nothing if
+# none. The cursor lives on her box (~/person/wa/watch/<WATCH_ID>, wa-db new), so no message text is stored on
+# the Mac beyond the runner's own pending event. WATCH_RUN / the watcher's .run-ok go along, so lines from a run
+# the runner never recorded are printed again (wa-db's outbox). Exit 1 if her sync service is down.
+# Each run touches her lease, so a watcher keeps her box running: see the offbox-person skill for the cost.
+set -eu
+person=${1:?usage: offbox-person-wa-new <person> <jid>}
+jid=${2:?usage: offbox-person-wa-new <person> <jid>}
+id=${WATCH_ID:?run this as a robob-watch check (WATCH_ID unset)}
+dir=${WATCH_DIR:-.}
+[[ $id =~ '^[a-z0-9][a-z0-9-]{0,47}$' ]] || { print -u2 "bad WATCH_ID"; exit 2; }
+[[ $jid =~ '^[0-9A-Za-z.@+-]{5,80}$' ]] || { print -u2 "bad jid"; exit 2; }
+ok=""
+[[ -f $dir/.run-ok ]] && ok=$(<"$dir/.run-ok")
+[[ $ok =~ '^[A-Za-z0-9._:-]{0,100}$' ]] || ok=""
+run=${WATCH_RUN:-}
+[[ $run =~ '^[A-Za-z0-9._:-]{0,100}$' ]] || run=""
+exec "${0:A:h}/offbox-person" wa "$person" new "$jid" "$id" "$run" "$ok"

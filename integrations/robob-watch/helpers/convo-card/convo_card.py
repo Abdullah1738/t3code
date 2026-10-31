@@ -26,10 +26,12 @@ Use the defaults. Every option has one; don't stop to ask which to pick.
         It never sends WhatsApp and never sends a picture of the chat.
     convo-card show --slug SLUG       config, pending items (with photo paths), send journal
     convo-card watch --slug SLUG      watcher check (state in $WATCH_DIR): prints CONVO_CARD_UPDATE once
-        new, edited or deleted messages have been quiet for 2 min, CONVO_CARD_SHARE_DOWN when a shared
-        link fails twice in a row. Changing a card's window (--since/--days) is not reported. Exits 1 while
-        the wacli sync daemon is down. Under robob-watch ($WATCH_RUN) an event the runner never recorded is
-        printed again (.convo-outbox.json in the state dir).
+        new, edited or deleted messages have been quiet for 2 min. A shared link that fails twice in a row is
+        re-shared quietly (new link kept in $WATCH_DIR/share.json; .sent.json is left alone, nothing is sent).
+        CONVO_CARD_SHARE_DOWN prints only when the re-share fails too: tell the owner, never send a card for it.
+        Changing a card's window (--since/--days) is not reported. Exits 1 while the wacli sync daemon is down.
+        Under robob-watch ($WATCH_RUN) an event the runner never recorded is printed again (.convo-outbox.json
+        in the state dir).
 
 Card folder ~/.local/share/imessage-apps/<slug>/ (served): index.html, data.json, preview.png, media/.
 The page re-reads data.json every 25s, so a rebuild shows up on the open card by itself.
@@ -55,6 +57,8 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9:_@.-]{6,200}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 QUIET_S = 120
 PROBE_S = 600
+WATCH_BUDGET_S = float(os.environ.get("CONVO_CARD_WATCH_BUDGET") or 48)   # robob-watch SIGKILLs a check at 60 s
+T_START = time.monotonic()
 OUTBOX_TTL = 3600         # an event the runner never recorded is printed again for up to an hour,
 OUTBOX_MAX_REPLAYS = 3    # at most this many times (same rule as wa-db's whatsapp-new-message outbox)
 LABELS = {"audio": "Voice message", "ptt": "Voice message", "video": "Video", "gif": "GIF",
@@ -800,12 +804,32 @@ def cmd_show(a):
 
 # ---------- watcher check ----------
 
-def probe(url):
+# Cloudflare in front of cards.abdullah.fund answers Python's default agent (Python-urllib/x) with 403, error 1010.
+PROBE_UA = "Mozilla/5.0 (compatible; convo-card-probe)"
+
+
+def probe(url, timeout=15):
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=15) as r:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": PROBE_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
+
+
+def left():
+    """Seconds left in this watch run's budget, so the probes, the re-share and the alert all finish in time."""
+    return WATCH_BUDGET_S - (time.monotonic() - T_START)
+
+
+def reshare(slug, timeout):
+    """The page's new share link, or None. Same bridge call send makes; no card is sent."""
+    try:
+        pub = bridge("share", "--app", slug, "--days", "30", timeout=timeout)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        return None
+    url = pub.get("publicURL") or pub.get("url") or ""
+    return url if url.startswith("http") else None
 
 
 def watch_rows(w, con, cfg):
@@ -933,17 +957,52 @@ def cmd_watch(a):
             quiet = {"rowid": top, "seq": cur.get("seq", 0), "fps": fps, "since": cfg["since"]}
             writes.append(lambda: write_json(state / "cursor.json", quiet))
     share = read_json(state / "share.json") or {}
-    urls = sorted({v["url"] for k, v in (read_json(d / ".sent.json", {}) or {}).items() if k != "owner" and v.get("url")})
+    sent = read_json(d / ".sent.json", {}) or {}
+    moved = share.get("moved") or {}
+    # .sent.json keeps the link each send made. A quiet re-share is kept here instead, so the journal stays honest.
+    targets = {}
+    for k, v in sent.items():
+        if k == "owner" or not v.get("url"):
+            continue
+        m = moved.get(k)
+        targets[k] = m["url"] if m and m.get("old") == v["url"] else v["url"]
+    urls = sorted(set(targets.values()))
     if urls and now - share.get("last_probe", 0) >= PROBE_S:
-        bad = [u for u in urls if not probe(u)]
+        bad = [u for u in urls if not probe(u, timeout=max(1, min(15, left() - 5)))]
         share["last_probe"] = now
         share["fails"] = share.get("fails", 0) + 1 if bad else 0
-        if share["fails"] >= 2 and share.get("alerted_url") != bad[0]:
+        why = "it still doesn't answer after a re-share"
+        if bad:
+            # The link is dead (the bridge restarted and made a new one). Re-share the page as send does and probe
+            # the link it returns from now on. Nothing is sent; a card goes out only on a real chat change. This
+            # runs at the first failed probe, so links already dead before this change get it too.
+            fresh = None
+            budget = left() - 10          # leave room to probe, alert and save before robob-watch's 60 s kill
+            if a.dry_run:
+                why = "a dry run does not re-share"
+            elif budget >= 5:
+                fresh = reshare(a.slug, timeout=min(30, budget))
+            else:
+                why = "the watch check ran out of time"
+            if fresh is None:
+                if budget >= 5 and not a.dry_run:
+                    why = "the bridge could not re-share it"
+            else:
+                for k, u in targets.items():
+                    if u in bad:
+                        moved[k] = {"old": sent[k]["url"], "url": fresh}
+                share["moved"] = moved
+                if probe(fresh, timeout=max(1, min(15, left() - 5))):
+                    bad, share["fails"] = [], 0
+                else:
+                    bad = [fresh]
+                    why = f"the new link {fresh} doesn't answer either"
+        if bad and share.get("alerted_url") != bad[0]:
             head = f"CONVO_CARD_SHARE_DOWN {a.slug}: {bad[0]} "
             # A run that died after its outbox write but before share.json is being replayed with this alert.
             if not any(x.startswith(head) for b in carry for x in b["lines"]):
-                out.append(f"{head}failed {share['fails']} probes in a row; run `convo-card send --slug {a.slug} "
-                           f"--to <chat> --session <yours>` to re-share and resend.")
+                out.append(f"{head}is down ({why}). Tell Abdullah the {cfg['title']} chat card's link is down. "
+                           "Do not send a card or message anyone; he decides.")
             share["alerted_url"] = bad[0]
         if not bad:
             share.pop("alerted_url", None)

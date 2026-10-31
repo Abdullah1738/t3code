@@ -687,9 +687,15 @@ export function blockText(block: KanbanBlock): string {
   }
 }
 
+const messagePreviews = new WeakMap<KanbanMessage, string>();
+
 export function messagePreview(message: KanbanMessage): string {
+  const known = messagePreviews.get(message);
+  if (known !== undefined) return known;
   const text = message.blocks.map(blockText).join(" ").replace(/\s+/g, " ").trim();
-  return message.author._tag === "owner" ? text : `${message.authorName}: ${text}`;
+  const preview = message.author._tag === "owner" ? text : `${message.authorName}: ${text}`;
+  messagePreviews.set(message, preview);
+  return preview;
 }
 
 export interface DiscussionRow {

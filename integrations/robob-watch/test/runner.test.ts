@@ -63,6 +63,36 @@ test("a wake watcher fires once with its context, falling back to send when wake
   expect(state("demo").pending).toBeUndefined();
 }, 20_000);
 
+test("a chat watcher wakes only that chat (wake --chat with the owner's live route), never the owner's chat", async () => {
+  writeFileSync(calls, "");
+  for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
+  const flag = join(sandbox, "chat-event");
+  const add = cli("add", "--id", "her-wa", "--title", "Moni WhatsApp", "--chat", "moni", "--check", `[[ -f ${flag} ]] && cat ${flag}; true`,
+    "--interval", "10", "--context", "Moni asked to hear when Ana replies on her WhatsApp. Tell Moni.", "--expires", "1d");
+  expect(add.exitCode).toBe(0);
+  expect(JSON.parse(readFileSync(join(sandbox, "root/watchers/her-wa/watcher.json"), "utf8")).chat).toBe("moni");
+  writeFileSync(join(sandbox, "fail-wake"), "");
+  writeFileSync(flag, "(31-10-26 09:00:00) Ana: see you at 6");
+  await runnerFor(2_500);
+  // The wake failed: the event stays pending and nothing reaches the owner (no send, no telegram).
+  expect(readCalls().filter(call => call.args[0] !== "wake")).toHaveLength(0);
+  const pending = state("her-wa").pending;
+  expect(pending.event).toContain("Ana: see you at 6");
+  rmSync(join(sandbox, "fail-wake"));
+  writeFileSync(join(sandbox, "root/watchers/her-wa/state.json"), JSON.stringify({ ...state("her-wa"), next_at: 0 }));
+  await runnerFor(2_500);
+  const wakes = readCalls().filter(call => call.args[0] === "wake");
+  const last = wakes.at(-1)!.args;
+  expect(last[last.indexOf("--chat") + 1]).toBe("moni");
+  expect(last[last.indexOf("--session") + 1]).toBe("ses_live123");
+  expect(last[last.indexOf("--key") + 1]).toBe(pending.key);
+  expect(last[last.indexOf("--text") + 1]).toContain("Ana: see you at 6");
+  expect(readCalls().some(call => call.args[0] === "send" || call.cli === "telegram")).toBe(false);
+  expect(state("her-wa")).toMatchObject({ status: "done", fires: 1, last_delivery: "wake:moni" });
+  expect(cli("add", "--id", "bad-chat", "--title", "x", "--chat", "Moni!", "--check", "true", "--context", "x").exitCode).not.toBe(0);
+  expect(cli("add", "--id", "bad-mode", "--title", "x", "--chat", "moni", "--mode", "notify", "--check", "true", "--context", "x").exitCode).not.toBe(0);
+}, 20_000);
+
 test("an undelivered event is kept and retried under the same key before the check runs again", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) writeFileSync(join(sandbox, `fail-${name}`), "");

@@ -28,7 +28,7 @@ def sample(service='minutes'):
                   2, 1295, 2590)
     quiet = n.Quiet('selected', 'selected', 'selected', True, n.QUIET_NOTE, True,
                     n.fingerprint('quiet-schema-and-readback'))
-    payment = n.Payment('saved_card', '5542', 'mastercard', n.fingerprint('card-A'), 0, 3390, 'none')
+    payment = n.Payment('saved_card', '2342', 'mastercard', n.fingerprint('card-A'), 0, 3390, 'none')
     quote = n.Quote(service, home.account_ref, home.address_ref, n.fingerprint('cart-A'),
                     n.fingerprint('revision-A'), 1000, 1060, 'AED', (line,), True,
                     (('delivery', 800),), True, 3390, payment, quiet,
@@ -257,8 +257,8 @@ class QuoteSafetyTests(unittest.TestCase):
     def test_discounts_not_mistaken_for_zero_fee(self):
         self.check(adjustments=(('delivery', 900), ('discount', -100)))
 
-    def test_saved_card_5542_exact_network_and_allocation(self):
-        for update in ({'last4': '1111'}, {'last4': '****5542'}, {'network': 'visa'},
+    def test_saved_order_card_exact_network_and_allocation(self):
+        for update in ({'last4': '1111'}, {'last4': '****2342'}, {'network': 'visa'},
                        {'method': 'cash'}, {'selected_card_ref': ''}):
             self.fails('CARD_MISMATCH', payment=replace(self.quote.payment, **update))
         for update in ({'credits_minor': 1}, {'credits_minor': False}, {'card_charge_minor': 1}):

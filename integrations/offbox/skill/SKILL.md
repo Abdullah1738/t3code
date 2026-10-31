@@ -74,6 +74,8 @@ offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
 offbox local --list ; offbox local --clear
 ```
 
+The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
+
 ## Your box (lease)
 
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
@@ -112,6 +114,7 @@ offbox local --list ; offbox local --clear
   A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
   stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
   lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
+  A box whose filesystem has died (`Transport endpoint is not connected`) is caught by a write check before the sync, or by the sync itself: it is stopped, marked `dead-mount:` and taken out of the pool, and the run moves to another box (once). `offbox list --all` shows it; `offbox release <id> --delete` removes it.
 
 ## Options
 
@@ -124,7 +127,7 @@ offbox local --list ; offbox local --clear
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
@@ -143,6 +146,9 @@ sync filters, so staged changes appear as unstaged remotely. A committed HEAD an
 are required (no automatic fetch). Committed content in the exported history remains available to Git,
 including paths excluded from the working-file sync. The local Git state is read-only. Submodule git-dirs
 are not materialized. Each `--git` sync rebuilds and replaces the remote metadata; `--no-sync` retains it.
+A partial clone (`--filter=blob:none`, e.g. the board's mobile review worktrees) usually lacks old blobs: `--git`
+then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If even HEAD's files aren't local
+(a `--no-checkout` partial clone) it stops before syncing and tells you to run without `--git`.
 
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
@@ -169,6 +175,9 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
 
 - `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
   `offbox whoami`, `offbox status`.
+- `offbox kill <run>` stops a hung starting/running box run and marks it `killed` once boat confirms the process
+  stopped. Release refuses while a run is active and names the run ids. Use kill, not pkill on the box.
+  Local runs and runs with no box process are refused.
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.
 
@@ -223,11 +232,14 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Go `package unsafe is not in std` or `build constraints exclude all Go files in /usr/local/go/src/...` while other go commands in the same run pass: a box read glitch seen on the first run after a resume, not your code and not a repair race (one run per box). offbox prints a hint and logs a `go_std_glitch` event; rerun the same command. A nested `/usr/local/go/go` is a half-swapped GOROOT; the next run repairs it under a box-local lock and verifies the replacement.
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
+- A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
   `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
-- Hung or weird box: `offbox release --delete`, then rerun (fresh lease from base/template).
+- Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
+  is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
+- Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
 - Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.

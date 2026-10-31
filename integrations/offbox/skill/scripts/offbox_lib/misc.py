@@ -11,9 +11,9 @@ import sys
 import time
 
 from . import api, capacity, lease, pool, ssh_sync
-from .common import (CAP_PATH, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago,
-                     atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, offsets_path, read_json,
-                     say)
+from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError,
+                     ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, offsets_path,
+                     read_json, say)
 
 WAIT_POLL_S = 5
 
@@ -74,7 +74,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if (d.get("note") or "").startswith(TOO_BIG_NOTE) else ""
+        note = f"  [{d['note']}]" if (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
@@ -94,13 +94,33 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         say("nothing to release")
         return
     for r in rows:
-        with file_lock('box-'+r['box_id'], timeout=1):
-            _release_one(con, r, delete)
+        # A foreground run holds box-<id> while it streams, so a hung run shows up as a lock timeout. Name the active
+        # runs on that path too; the recheck under the lock still decides before any mutation.
+        try:
+            with file_lock('box-'+r['box_id'], timeout=1):
+                _release_one(con, r, delete)
+        except OffboxError as e:
+            if "timed out waiting for lock" not in str(e):
+                raise
+            if not _report_active_runs(con, r["box_id"], lock_held=True):
+                say(f"{r['box_id']}: box is busy (another offbox process holds it); not released. Try again shortly.")
+
+
+def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
+    """Name the starting/running runs on a box and suggest kill. Returns False when there are none."""
+    ids = [x[0] for x in con.execute("SELECT run_id FROM runs WHERE box_id=? AND status IN ('starting','running') "
+                                     "ORDER BY start_at", (box_id,))]
+    if not ids:
+        return False
+    where = " (the box lock is held by a live client)" if lock_held else ""
+    say(f"{box_id}: run in progress, not released{where}: {', '.join(ids)}. If it is hung, stop it with "
+        "`offbox kill <run>` and release again.")
+    return True
 
 
 def _release_one(con, r, delete):
         if lease.active_runs(con, r["box_id"]):
-            say(f"{r['box_id']}: run in progress, not released")
+            _report_active_runs(con, r["box_id"])
             return
         if delete:
             lease.delete_box(con, r["box_id"], "release --delete")
@@ -109,6 +129,44 @@ def _release_one(con, r, delete):
             if r["state"] == "running":
                 lease.stop_box(con, r["box_id"], "release")
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
+
+
+def kill_run(run_id: str) -> int:
+    """Stop a hung starting/running box run. The row is marked killed only after boat confirms the process is gone.
+    No box lock: the hung run's client may be holding it."""
+    from .runs import finish
+    r = _run_row(run_id)
+    rid = r["run_id"]
+    if r["status"] not in ("starting", "running"):
+        raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
+    if r["mode"] == "local":
+        raise OffboxError(f"run {rid} is a local run (no box); kill its process on this Mac instead", code=2)
+    if not r["box_id"] or not r["process_id"]:
+        raise OffboxError(f"run {rid} never got a box process (no box_id/process_id). Nothing remote to stop; "
+                          "if the client is gone the reaper marks it lost (`offbox reap`).", code=2)
+    box, pid = r["box_id"], r["process_id"]
+    # DELETE may fail (timeout) while the process is already gone, so the GET is the authority. Only a 404 (None)
+    # or an explicit running:false counts as stopped; a DELETE error alone, an error on the GET, or an empty/unknown
+    # status keeps the row (and the lease's active-run reservation) as it is.
+    kill_err = None
+    try:
+        api.cmd_kill(box, pid)
+    except OffboxError as e:
+        kill_err = str(e)
+    try:
+        st = api.cmd_status(box, pid)
+    except OffboxError as e:
+        say(f"run {rid}: could not read process {pid} on {box} after kill ({e}); row left as {r['status']}")
+        return 1
+    if st is not None and st.get("running") is not False:
+        why = "still reports it running" if st.get("running") else "returned no clear running state"
+        say(f"run {rid}: boat {why} for process {pid} on {box}; row left as {r['status']}"
+            + (f" (kill error: {kill_err})" if kill_err else ""))
+        return 1
+    finish(rid, 143, "killed")
+    print(f"killed run {rid} (process {pid} on box {box}). `offbox release [--delete]` works now."
+          + (f" (kill request failed but boat reports the process gone: {kill_err})" if kill_err else ""))
+    return 0
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:

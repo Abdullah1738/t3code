@@ -74,7 +74,7 @@ class IntegrationTests(unittest.TestCase):
         flow.last_cart=c.market.Response(c.market.operation('main','cart'),200,fixture.cart,now)
         flow.session_response=c.market.Response(c.market.operation('main','session'),200,fixture.session,now)
         flow.owned_offers=(('offer-1','vanilla',2),)
-        flow.card=SavedCard('saved-token','****5542','mastercard')
+        flow.card=SavedCard('saved-token','****2342','mastercard')
         reviewed=flow.review_selected(manifest=fixture.manifest,expected_fees=(('shipping',250),),
             quiet_options=fixture.quiet,shape=fixture.shape)
         self.assertEqual(reviewed.payable_minor,2250)

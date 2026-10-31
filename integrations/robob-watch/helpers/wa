@@ -11,10 +11,14 @@
 #                             --more N shows N*40 more and asks the phone for older history when the store runs out
 #   wa draft <jid> <text...>  store a single-line text draft (sends nothing); prints the preview lines to show Abdullah
 #   wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]   same for a file (bound to its bytes)
-#   wa send --approved <id> [--inbound <id> | --app]   send a text draft once, right away. --inbound/--app are optional
+#   wa send --approved <id> [--quiet] [--inbound <id> | --app]   send a text draft once, right away. --inbound/--app are optional
 #                             and not checked. Where his OK makes sense, show him the draft preview first and send after his reply.
 #   wa sendfile --approved <id> [--inbound <id> | --app]   same for a file draft
-#   wa send <jid> <text...>   send now, to anyone (the owner's own number needs no extra flag)
+#   wa send [--quiet] <jid> <text...>   send now, to anyone (the owner's own number needs no extra flag).
+#                             Prints "(sent) Me: <text>"; --quiet prints "(sent) id <msgid>" instead.
+#   wa send [--quiet] <jid> -           text from stdin, through the sync daemon's socket (helpers/wa-sendtext). Always quiet.
+#   wa send [--quiet] <jid> --file <path>   same, text from a file. Always quiet.
+#                             Passwords and other secrets: use - or --file, so the text is on no argv and in no output.
 #   wa sendfile <jid> <path> [image|video|audio|doc]   same, for a file
 #   wa download <jid> [N]     download the Nth-newest media message (default 1) -> prints the file path
 #   wa ids <jid> [N]          last N messages with message ids (for download/reply-to)
@@ -94,6 +98,63 @@ show_preview() {
   print -r -- "Preview (to get Abdullah's OK first, show him these lines as is; for Moni's own request: Moni, in her chat; in a Robob thread: alone in a plain \`\`\` code block):"
   print -r -- "$3"
   print -r -- "Send: wa $2 --approved $1"
+}
+# Reads a send's result: sets SR_OK (1 sent, 0 not), SR_ID (message id, may be empty) and SR_MSG (error, already redacted).
+# Args: exit code, message text, output. The text and output reach python on stdin (text on the first line, which
+# callers keep single-line, then the output), never on argv or in env. Each output line is parsed on its own, so a
+# warning before the JSON envelope doesn't hide the id. Every form the text takes in an error (plain, JSON-escaped,
+# or Go-escaped <>&) is replaced with [message hidden].
+RESULT_PY='
+import json, sys
+data = sys.stdin.buffer.read().decode("utf-8", "replace")
+text, _, out = data.partition(chr(10))
+rc = int(sys.argv[1])
+body = json.dumps(text)[1:-1]
+body_u = json.dumps(text, ensure_ascii=False)[1:-1]
+def go(s):
+    return s.replace("<", chr(92) + "u003c").replace(">", chr(92) + "u003e").replace("&", chr(92) + "u0026")
+variants = {text, body, body_u, go(body), go(body_u)} - {""}
+def red(s):
+    for v in sorted(variants, key=len, reverse=True):
+        s = s.replace(v, "[message hidden]")
+    return s
+ok, ids, errs, rest = False, [], [], []
+for line in out.splitlines():
+    s = line.strip()
+    d = None
+    if s.startswith("{"):
+        try:
+            d = json.loads(s)
+        except ValueError:
+            d = None
+    if not isinstance(d, dict):
+        if s:
+            rest.append(line)
+        continue
+    if d.get("success") is True or d.get("sent") is True:
+        ok = True
+        dd = d["data"] if isinstance(d.get("data"), dict) else d
+        if dd.get("id"):
+            ids.append(str(dd["id"]))
+    elif d.get("error") or d.get("success") is False:
+        errs.append(str(d.get("error") or "unknown error"))
+    elif s:
+        rest.append(line)
+if rc == 0 and ok and not errs:
+    print("OK " + (ids[0] if ids else ""))
+else:
+    parts = [red(e) for e in errs] + [red(r) for r in rest]
+    msg = "\n".join(parts) if parts else red(out.strip())
+    print("ERR " + (msg or "wacli reported no result"))
+'
+wacli_result() {
+  local v
+  v=$({ print -r -- "$2"; print -r -- "$3"; } | /usr/bin/python3 -c "$RESULT_PY" "$1" 2>/dev/null) || v=""
+  case $v in
+    OK*) SR_OK=1; SR_ID=${v#OK}; SR_ID=${SR_ID# }; SR_MSG= ;;
+    ERR*) SR_OK=0; SR_ID=; SR_MSG=${v#ERR } ;;
+    *) SR_OK=0; SR_ID=; SR_MSG="wa: no result from the send; it may still have gone through. Check with wa ids <chat> 3 before sending again." ;;
+  esac
 }
 # Printed after a send to someone other than the owner. Stderr, so stdout stays the sent line.
 tip() { [[ ${1%%@*} == $OWNER ]] || print -r -- "Tip: when a message speaks for Abdullah with new wording, money, dates or a commitment, show him a wa draft preview first." >&2; }
@@ -342,25 +403,66 @@ if not ok:
     show_preview $id sendfile "$pv"
     print -r -- "In iMessage, send-file him $abs in the same chat right before the preview (the file has to reach him too)." ;;
   send)
+    quiet=0
+    if [[ ${1:-} == --quiet ]]; then quiet=1; shift; fi
     if [[ ${1:-} == --approved ]]; then
-      claim_draft "${2:?usage: wa send --approved <id> [--inbound <id> | --app]}" text
+      claim_draft "${2:?usage: wa send --approved <id> [--quiet] [--inbound <id> | --app]}" text
+      [[ ${3:-} == --quiet ]] && quiet=1
       jid=$(jget "$CLAIMED" jid); text=$(jget "$CLAIMED" text)
       self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
       out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
-      if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then
-        settle sent; print -r -- "(sent) Me: $text"; tip "$jid"
+      wacli_result $rc "$text" "$out"
+      if (( SR_OK )); then
+        settle sent
+        if (( quiet )); then print -r -- "(sent) id $SR_ID"
+        else print -r -- "(sent) Me: $text"; fi
+        tip "$jid"
       else
-        settle failed; print -r -- "$out" >&2; exit 1
+        settle failed; print -r -- "$SR_MSG" >&2; exit 1
       fi
       exit 0
     fi
-    jid=$(norm ${1:?usage: wa send <jid> <text>}); shift
+    jid=$(norm ${1:?usage: wa send [--quiet] <jid> <text>|-|--file <path>}); shift
+    if [[ ${1:-} == --quiet ]]; then quiet=1; shift; fi
+    # Text from stdin or a file goes only through wa-sendtext (print is a builtin, so the text never reaches argv).
+    # Trailing newlines are stripped by command substitution, as for positional text.
+    secret_mode=""
+    if [[ ${1:-} == - && $# -eq 1 ]]; then secret_mode=stdin; shift
+    elif [[ ${1:-} == --file && $# -eq 2 ]]; then secret_mode=file; fp=$2; shift 2
+    fi
+    if [[ -n $secret_mode ]]; then
+      if [[ -n ${ROBOB_TEST:-} || ${NODE_ENV:-} == test || -n ${PYTEST_CURRENT_TEST:-} ]] && [[ -z ${WA_SEND_SOCK:-} ]]; then
+        print -r -- "refused: test run; wa send would reach WhatsApp (set WA_SEND_SOCK to a stub)" >&2; exit 2
+      fi
+      if [[ $secret_mode == file ]]; then
+        [[ -r $fp && -f $fp ]] || { print -r -- "error: can't read $fp" >&2; exit 2; }
+        text=$(<"$fp")
+      else
+        text=$(cat)
+      fi
+      [[ -n $text ]] || { print -r -- "error: empty text" >&2; exit 2; }
+      [[ $text == *$'\n'* ]] && { print -r -- "error: single-line text only" >&2; exit 2; }
+      self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
+      WS=${WA_SENDTEXT:-${0:A:h}/wa-sendtext}
+      out=$(print -rn -- "$text" | "$WS" --to "$jid" $self); rc=$?
+      if (( rc == 0 )); then
+        wacli_result 0 "" "$out"
+        print -r -- "(sent) id $SR_ID"; tip "$jid"; exit 0
+      fi
+      exit $rc
+    fi
     text="${*}"
     [[ $text == *$'\n'* ]] && die "error: single-line text only"
     [[ -n $text ]] || die "error: empty text"
     self=(); [[ ${jid%%@*} == $OWNER ]] && self=(--allow-self)
     out=$("$W" --json send text --to "$jid" --message "$text" $self 2>&1); rc=$?
-    if (( rc == 0 )) && [[ $out == *'"success":true'* ]]; then print -r -- "(sent) Me: $text"; tip "$jid"; else print -r -- "$out" >&2; exit 1; fi ;;
+    wacli_result $rc "$text" "$out"
+    if (( SR_OK )); then
+      if (( quiet )); then print -r -- "(sent) id $SR_ID"; else print -r -- "(sent) Me: $text"; fi
+      tip "$jid"
+    else
+      print -r -- "$SR_MSG" >&2; exit 1
+    fi ;;
   sendfile)
     if [[ ${1:-} == --approved ]]; then
       claim_draft "${2:?usage: wa sendfile --approved <id> [--inbound <id> | --app]}" file
@@ -398,5 +500,5 @@ print(x.get("path") or x.get("Path") or x.get("local_path") or x.get("LocalPath"
     [[ -n $p && -f $p ]] || { print -r -- "$out" >&2; exit 1; }
     print -r -- "$p" ;;
   screen|tui) die "wa tui is retired (the old whatscli wrapper is gone). Use wa send." ;;
-  *) sed -n '2,26p' "$0" ;;
+  *) sed -n '2,29p' "$0" ;;
 esac

@@ -113,7 +113,9 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     if [ ! -f "$_offbox_goroot/.offbox-manifest" ]; then _offbox_old=missing
     elif _offbox_manifest_matches "$_offbox_goroot"; then _offbox_old=ok
     else _offbox_old=mismatch; fi
-    echo "offbox: Go repair: old tree manifest=$_offbox_old installed=$(stat -c %y "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16)" >&2
+    _offbox_marks=no
+    { [ -f "$_offbox_goroot/src/strconv/ctoa.go" ] || [ -f "$_offbox_goroot/src/syscall/syscall_linux_accept4.go" ]; } && _offbox_marks=yes
+    echo "offbox: Go repair: old tree manifest=$_offbox_old old-release-files=$_offbox_marks version_written=$(stat -c %z "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16) manifest_written=$(stat -c %z "$_offbox_goroot/.offbox-manifest" 2>/dev/null | cut -c1-16)" >&2
     # Stage beside GOROOT: /tmp may be on another filesystem, making mv a partial copy.
     _offbox_stage=$(sudo -n mktemp -d /usr/local/.offbox-go.XXXXXX) || _offbox_fail 'cannot create staging directory'
     _offbox_saved=0
@@ -230,6 +232,9 @@ LDCACHE_REPAIR = r'''(
 ) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
+# boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
+# A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
+SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
 # Go failing to read its own std tree (a box read glitch, not the user's code). User module paths never match.
 GO_STD_GLITCH = re.compile(r"package (unsafe|internal/\S+|runtime(/\S+)?) is not in std \(/usr/local/go/src/|"
                            r"build constraints exclude all Go files in /usr/local/go/src/(internal|runtime|unsafe)\b")
@@ -378,6 +383,14 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+def scope_failed(log_path: Path | None) -> bool:
+    """True when the run's only output is boat's scope error: nothing of ours ran."""
+    if not log_path or not Path(log_path).exists():
+        return False
+    lines = [ln for ln in Path(log_path).read_text(errors="replace").splitlines() if ln.strip()]
+    return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
+
+
 def exit_recording_command(script: str, run_id: str) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
@@ -521,32 +534,30 @@ class Runner:
         size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
         if size != a.size:
             say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
-        row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
-        self.lease_row = row
-        self.box = row["box_id"]
-        rdir = row["remote_dir"]
-        self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
-                    docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
-        prune.run(con, self.box, rdir)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
-        err: list = []
-        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
-        tw.start()
-        if not a.no_sync:
-            st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
-            self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
-            say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
-                f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
-            skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
-            if skipped:
-                say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
-                    f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
-        tw.join()
-        if err:
-            raise err[0]
+        for attempt in (1, 2):
+            row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+            self.lease_row = row
+            self.box = row["box_id"]
+            rdir = row["remote_dir"]
+            self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
+                        docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            try:
+                self._prepare_box(con, a, rdir, env_file, body)
+                break
+            except lease.DeadMount as e:
+                dead = self.box
+                self.record(box_id=None)  # our run row must not point at the box we stop
+                lease.set_aside_dead_mount(con, dead, e.reason)
+                pool.release_guard(row)
+                self.lease_row = self.box = None
+                if attempt == 2:
+                    raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
+                                      "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+                say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
+                    "Trying another box")
         try:
             w = node_version.want(self.root, self.cwd)
             node_block = node_version.block(w) if w else ""
@@ -563,6 +574,15 @@ class Runner:
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             if (e.status or 0) in REFUSED_STATUSES:
                 self.started = False
+                if e.api_code in ("sandbox_not_ready", "machine_not_running"):
+                    # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
+                    # hand-run `boat resume`.
+                    con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (self.box,))
+                    con.commit()
+                    ssh_sync.close_master(self.box)
+                    event(con, self.box, "lease_not_ready", str(e)[:200])
+                    raise OffboxError(f"{e}. Nothing ran; offbox resumes {self.box} on the next run. "
+                                      "Retry; don't run `boat resume` by hand.", code=EXIT_INFRA) from e
                 if "E2BIG" in str(e):
                     # Usage error, not infra: no infra alert, no retry, no fallback.
                     raise OffboxError(f"{e}: the command is too long for one exec; put it in a script file "
@@ -575,6 +595,42 @@ class Runner:
         event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
                                           f"cmd={cmd_text[:200]}")
         return row
+
+    def _prepare_box(self, con, a, rdir, env_file, body) -> None:
+        """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
+        # The probe goes before prune: prune's ssh hangs on a dead filesystem.
+        reason = ssh_sync.probe_home(self.box)
+        if reason:
+            raise lease.DeadMount(self.box, reason)
+        prune.run(con, self.box, rdir)
+        # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
+        err: list = []
+        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
+        tw.start()
+        push_exc = None
+        try:
+            if not a.no_sync:
+                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
+                say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
+                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
+                if skipped:
+                    say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
+                        f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
+        except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
+            push_exc = e
+        finally:
+            tw.join()
+        # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
+        for e in (push_exc, err[0] if err else None):
+            reason = ssh_sync.dead_mount(str(e)) if e is not None else None
+            if reason:
+                raise lease.DeadMount(self.box, reason) from e
+        if push_exc is not None:
+            raise push_exc
+        if err:
+            raise err[0]
 
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
@@ -880,6 +936,20 @@ def _run_remote(a, rn) -> int:
         code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
+    if code not in (0, None) and scope_failed(rn.log_path):
+        rn.started = False
+        rn.record(error="box could not start the command (systemd scope)")
+        finish(rn.run_id, None, "infra")
+        con = db()
+        event(con, rn.box, "box_broken", f"{rn.run_id} transient scope failed")
+        try:
+            # images=False: docker-images.sh needs a working systemd and may hang on this box.
+            lease.stop_box(con, rn.box, "broken: transient scope failed", images=False, locked=True)
+            after = "offbox stopped it, so the next run resumes it clean"
+        except OffboxError as e:
+            after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
+        raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
+                          f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

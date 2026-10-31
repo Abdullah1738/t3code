@@ -289,7 +289,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       ),
   );
 
-  it.effect("an event for one thread reads that thread's shell, not every thread's", () =>
+  it.effect("bulk PR sweeps request candidates but thread events still read one shell", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const thread = threadShell("updated-thread");
@@ -338,7 +338,11 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const service = yield* ThreadPullRequestService.make;
           yield* service.start();
           yield* Deferred.succeed(activation, undefined);
-          expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: false });
+          expect(yield* Queue.take(reads)).toEqual({
+            location: "active",
+            unsettledOnly: false,
+            pullRequestCandidatesOnly: true,
+          });
           yield* service.drain;
           yield* PubSub.publish(events, {
             type: "thread.metadata-updated",
@@ -390,6 +394,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const reads = yield* Queue.unbounded<{
           readonly location?: string;
           readonly unsettledOnly?: boolean;
+          readonly pullRequestCandidatesOnly?: boolean;
         }>();
         const layerDependencies = Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({
@@ -425,10 +430,18 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const service = yield* ThreadPullRequestService.make;
           yield* service.start();
           yield* Deferred.succeed(activation, undefined);
-          expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: false });
+          expect(yield* Queue.take(reads)).toEqual({
+            location: "active",
+            unsettledOnly: false,
+            pullRequestCandidatesOnly: true,
+          });
           yield* service.drain;
           yield* TestClock.adjust("1 minute");
-          expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: true });
+          expect(yield* Queue.take(reads)).toEqual({
+            location: "active",
+            unsettledOnly: true,
+            pullRequestCandidatesOnly: true,
+          });
           yield* service.drain;
         }).pipe(Effect.provide(layerDependencies));
       }),

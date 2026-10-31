@@ -8,6 +8,7 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 mkdir -p "$HOME/.local/bin" "$HOME/.config/opencode/skills" "$HOME/.local/share/offbox-person/state" "${plist:h}"
 ln -sfn "$here/bin/offbox-person" "$HOME/.local/bin/offbox-person"
 ln -sfn "$here/bin/offbox-person-backup" "$HOME/.local/bin/offbox-person-backup"
+ln -sfn "$here/bin/offbox-person-wa-new" "$HOME/.local/bin/offbox-person-wa-new"
 ln -sfn "$here/skill" "$HOME/.config/opencode/skills/offbox-person"
 # launchd's /bin/bash may not read the external drive (macOS privacy: "Operation not permitted"),
 # so the LaunchAgent runs an installed copy from the home folder.

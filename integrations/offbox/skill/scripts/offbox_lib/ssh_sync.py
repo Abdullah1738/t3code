@@ -124,6 +124,30 @@ def close_master(box_id: str) -> None:
         subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=10)
 
 
+DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)
+
+
+def dead_mount(text: str) -> str | None:
+    m = DEAD_MOUNT.search(text or "")
+    return m.group(0) if m else None
+
+
+def probe_home(box_id: str, timeout: float = 45) -> str | None:
+    """The matched dead-mount error when $HOME on the box can't be written, else None (also None when the probe
+    can't tell: the sync still catches it). Creates nothing outside .offbox, so a --no-sync run still sees a
+    missing remote dir."""
+    try:
+        p = ssh(box_id, 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && : > "$p" && rm -f -- "$p" '
+                        '&& echo OFFBOX_PROBE_OK', timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"probe {box_id} inconclusive ({type(e).__name__})")
+        return None
+    text = (p.stdout + p.stderr).decode(errors="replace")
+    if p.returncode == 0 and "OFFBOX_PROBE_OK" in text:
+        return None
+    return dead_mount(text)
+
+
 def _gitinfo_exclude(root: Path) -> list[str]:
     """info/exclude lives in the COMMON git dir. In a linked worktree root/.git is a file, so ask git."""
     cands = [root / ".git" / "info" / "exclude"]
@@ -244,7 +268,8 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
                f"{gitdir}/", f"{box_id}:{staging}/"]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
-            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode})")
+            # Keep rsync's stderr: a dead mount reported here must still classify as dead-mount.
+            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
         ssh(box_id, f"rm -rf -- {qdest} && mv -- {qstage} {qdest}", check=True)
         return _stats(p.stdout)
     finally:
