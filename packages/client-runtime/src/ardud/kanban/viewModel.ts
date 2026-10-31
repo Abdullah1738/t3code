@@ -121,7 +121,9 @@ export function poolAddLevel(
   const levels = descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
   const preferred =
     descriptor?.type === "select"
-      ? (descriptor.currentValue ?? descriptor.options.find((option) => option.isDefault)?.id ?? null)
+      ? (descriptor.currentValue ??
+        descriptor.options.find((option) => option.isDefault)?.id ??
+        null)
       : null;
   if (pooled.length === 0) return { variant: preferred };
   const free = [preferred, ...levels].find(
