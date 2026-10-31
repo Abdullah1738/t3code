@@ -319,6 +319,45 @@ def _offbox_skips(path: str) -> bool:
     return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _disk_path(root: Path, rel: str, names: dict[str, list[str]]) -> str | None:
+    """The on-disk spelling of a git index path, or None when the file is gone or a parent is a symlink.
+
+    The index can spell a path differently from disk after a case-only rename on APFS (`.AWS/canary` vs
+    `.aws/canary`), so each component is matched against the real listing; the excludes then apply to the real
+    name. Parents are never followed: rsync would traverse a symlinked dir, and pass 1 already sends the link."""
+    cur, real = root, []
+    for i, part in enumerate(rel.split("/")):
+        if i and os.path.islink(cur):
+            return None
+        d = str(cur)
+        if d not in names:
+            try:
+                names[d] = os.listdir(cur)
+            except OSError:
+                names[d] = []
+        ents = names[d]
+        if part in ents:
+            name = part
+        else:
+            # Accept a casefold/NFC match only when it is the same file on disk, so an unrelated `foo` next to a
+            # deleted `Foo` on a case-sensitive box is never taken for it.
+            hits = [e for e in ents if _key(e) == _key(part) and _same_file(cur / part, cur / e)]
+            if len(hits) != 1:
+                return None
+            name = hits[0]
+        real.append(name)
+        cur = cur / name
+    return "/".join(real)
+
+
 def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
     """Git-tracked files pass 1 left out, other than secret/heavy ones. Those are .gitignore matches (a tracked
     package-lock.json, 31 Oct) or rsync reading .gitignore more broadly than git (`test/*`, `!` lines)."""
@@ -328,18 +367,21 @@ def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
         return []
     if p.returncode != 0:
         return []
-    out = []
+    out, names = [], {}
     for raw in p.stdout.split(b"\0"):
         if not raw:
             continue
         f = os.fsdecode(raw)
-        if _key(f) in seen or _offbox_skips(f):
+        # A tracked file deleted in the checkout (or outside a sparse checkout) resolves to None and is skipped.
+        real = _disk_path(root, f, names)
+        if real is None:
             continue
-        q = root / f
-        # A tracked file deleted in the checkout (or outside a sparse checkout) is skipped. A dir here is a
-        # submodule: pass 2 recurses into what it lists, so sending one would bypass its .gitignore.
-        if os.path.lexists(q) and (os.path.islink(q) or not os.path.isdir(q)):
-            out.append(f)
+        if any(_key(x) in seen for x in (f, real)) or _offbox_skips(f) or _offbox_skips(real):
+            continue
+        q = root / real
+        # A dir here is a submodule: pass 2 recurses into what it lists, so sending one would bypass its .gitignore.
+        if os.path.islink(q) or not os.path.isdir(q):
+            out.append(real)
     return out
 
 

@@ -133,6 +133,51 @@ class TrackedIgnoredTests(unittest.TestCase):
         self.push()
         self.assertFalse(self.on_box("ext/scratch.log"))
 
+    def test_tracked_dir_replaced_by_symlink_is_not_an_error(self):
+        # Pass 1 sends the link itself; pass 2 must not walk the index entries that now sit under it.
+        target = Path(self.tmp.name) / "elsewhere"
+        target.mkdir()
+        (target / "data.txt").write_text("d\n")
+        self.write("linked/data.txt", "tracked\n")
+        self.write(".gitignore", (self.src / ".gitignore").read_text() + "/linked/\n")
+        self.git("add", "-f", "linked/data.txt")
+        self.git("commit", "-qm", "linked")
+        import shutil
+        shutil.rmtree(self.src / "linked")
+        os.symlink(target, self.src / "linked")
+        sent = []
+        real_run = ssh_sync.subprocess.run
+
+        def record(cmd, **kw):
+            if cmd[0] == ssh_sync.RSYNC and "--files-from=-" in cmd:
+                sent.append(kw.get("input") or "")
+            return self.run_local(cmd, **kw)
+        with patch.object(ssh_sync.subprocess, "run", side_effect=record):
+            st = self.push()
+        self.assertTrue(sent, "the fixture still has other tracked-ignored files for pass 2")
+        self.assertNotIn("linked/data.txt", "\0".join(sent))
+        self.assertNotIn("linked/data.txt", st.get("tracked_ignored_first", []))
+        self.assertTrue((self.remote / "linked").is_symlink())
+
+    def test_case_alias_of_a_secret_dir_is_not_sent(self):
+        # APFS is case-insensitive: the index can keep `.AWS/canary` after the dir was renamed to `.aws`.
+        # The excludes must apply to the on-disk name. The identity check is patched so the alias path runs
+        # on case-sensitive filesystems too.
+        self.write(".aws/canary", "secret\n")
+        index_names = b".AWS/canary\0"
+        real_run = ssh_sync.subprocess.run
+
+        def fake_ls_files(cmd, **kw):
+            if cmd[:3] == ["git", "-C", str(self.src)] and "ls-files" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, index_names, b"")
+            return real_run(cmd, **kw)
+        with patch.object(ssh_sync.subprocess, "run", side_effect=fake_ls_files), \
+                patch.object(ssh_sync, "_same_file", return_value=True):
+            out = ssh_sync._tracked_skipped(self.src, set())
+        self.assertNotIn(".aws/canary", out)
+        self.assertNotIn(".AWS/canary", out)
+        self.assertEqual(ssh_sync._disk_path(self.src, ".AWS/canary", {}), ".aws/canary")
+
     def test_not_a_git_repo_is_one_pass(self):
         plain = Path(self.tmp.name) / "plain"
         plain.mkdir()
