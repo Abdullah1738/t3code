@@ -2789,8 +2789,10 @@ const make = Effect.gen(function* () {
       if (failure === null) {
         // lastFailure is also null while the latest run is still going or waiting on
         // input/approval, and a delayed terminal event for an older run must not clear
-        // a live retry's streak. Only a thread that is idle has finished its run.
-        if ((yield* threads.view(threadId))?.state !== "idle") return;
+        // a live retry's streak. Only a thread that is idle has finished its run. A gone
+        // thread (null view) counts as finished, so its one-shot link still ends.
+        const state = (yield* threads.view(threadId))?.state;
+        if (state !== undefined && state !== "idle") return;
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
           next.delete(threadId);
