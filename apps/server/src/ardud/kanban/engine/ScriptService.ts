@@ -40,6 +40,7 @@ import * as Stream from "effect/Stream";
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService } from "./KanbanService.ts";
+import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
 
 /** A run past this is killed with its whole process group. */
@@ -231,12 +232,22 @@ const make = Effect.gen(function* () {
     command: Scripts.PoolCommand,
   ) {
     const pools = yield* io(store.pools(script.boardId));
-    const pool = pools.find(
+    const same = pools.filter(
       (entry) =>
         entry.model.model === command.model &&
         (command.instanceId === undefined || entry.model.instanceId === command.instanceId),
     );
-    if (!pool) return `There's no ${command.model} pool on this board.`;
+    if (command.variant === undefined && same.length > 1) {
+      const levels = same.map((entry) => Rules.modelLevel(entry.model) ?? "no level").join(", ");
+      return `The ${command.model} pools run at ${levels}; name the variant.`;
+    }
+    const pool =
+      command.variant === undefined
+        ? same[0]
+        : same.find((entry) => Rules.modelLevel(entry.model) === command.variant);
+    if (!pool) {
+      return `There's no ${command.model}${command.variant ? ` ${command.variant}` : ""} pool on this board.`;
+    }
     const resized = yield* Effect.result(
       service.setPool(script.boardId, pool.model, command.slots),
     );
