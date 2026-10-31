@@ -2,8 +2,10 @@
 // Mirrors android-phone/scripts/ph.py redact(): keep the two rule sets in step.
 
 const CARD_RUN = /(?<!\d)\d(?:[ -]*\d){12,18}(?!\d)/g;
-// Up to three non-digit words (or ':', '=', '-') between a label and its value. Newlines count as separators.
-const GAP = String.raw`((?:[\s:=\-]*[A-Za-z]{1,20}){0,3}[\s:=\-]*)`;
+// Between a label and its value: up to three words, each side padded by up to six punctuation or
+// whitespace characters (':', '=', '-', quotes, brackets, commas, newlines). Covers 'CVC for card is 123',
+// JSON '"cvc":"123"' and 'CVV (123)'. Bounded, so unrelated text after the label is not reached.
+const GAP = String.raw`((?:[\s:=\-"'(\[{,]{0,6}(?:[A-Za-z]{1,20}[\s:=\-"'(\[{,]{0,6}){0,3}))`;
 const CVC_LABEL = new RegExp(String.raw`(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)` + GAP + String.raw`(\d{3,4})(?!\d)`, "gi");
 const EXP_LABEL = new RegExp(String.raw`(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*\/\s*yy(?:yy)?)\b)` + GAP + String.raw`(\d{1,2}\s*[\/-]\s*(?:\d{4}|\d{2}))(?!\d)`, "gi");
 const SECRET_KEY = /cvc|cvv|csc|securitycode|card.?number|cardnumber|cc-?number|cc-?csc|cc-?exp|expiry|expiration/i;

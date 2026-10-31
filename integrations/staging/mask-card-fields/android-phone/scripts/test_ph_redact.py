@@ -131,3 +131,14 @@ class ThreeFixesTests(unittest.TestCase):
     def test_three_word_gap_masks_cvc_value(self):
         self.assertEqual(ph.redact("CVC for card is 123"), "CVC for card is •••")
         self.assertEqual(ph.redact("CVC for card is one two three 123"), "CVC for card is one two three 123")
+
+
+class PunctuationGapTests(unittest.TestCase):
+    def test_json_stringified_fields_masked(self):
+        import json
+        out = ph.redact(json.dumps({"cvc": "123", "expiry": "12/29"}))
+        self.assertEqual(out, '{"cvc": "•••", "expiry": "••/••"}')
+
+    def test_parenthesised_values_masked(self):
+        self.assertEqual(ph.redact("CVV (123)"), "CVV (•••)")
+        self.assertEqual(ph.redact("Expiry (12/29)"), "Expiry (••/••)")

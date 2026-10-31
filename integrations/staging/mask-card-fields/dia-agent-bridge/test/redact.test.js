@@ -100,3 +100,15 @@ test("CVC label up to three words before the value is masked", () => {
   assert.equal(redactText("CVC for card is 123"), "CVC for card is •••");
   assert.equal(redactText("CVC for card is one two three 123"), "CVC for card is one two three 123");
 });
+
+test("JSON-stringified CVC and expiry fields are masked", () => {
+  assert.equal(
+    redactText(JSON.stringify({ cvc: "123", expiry: "12/29" })),
+    '{"cvc":"•••","expiry":"••/••"}',
+  );
+});
+
+test("parenthesised CVC and expiry values are masked", () => {
+  assert.equal(redactText("CVV (123)"), "CVV (•••)");
+  assert.equal(redactText("Expiry (12/29)"), "Expiry (••/••)");
+});

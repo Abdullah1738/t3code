@@ -72,8 +72,10 @@ def nodes():
 # Masks card numbers, CVC/CVV and expiry before screen text reaches an agent.
 # Mirrors dia-agent-bridge/src/redact.js: keep the two rule sets in step.
 _CARD_RUN = re.compile(r"(?<![0-9])[0-9](?:[ -]*[0-9]){12,18}(?![0-9])")
-# Up to three non-digit words (or ':', '=', '-') between a label and its value. Newlines count as separators.
-_GAP = r"((?:[\s:=\-]*[A-Za-z]{1,20}){0,3}[\s:=\-]*)"
+# Between a label and its value: up to three words, each side padded by up to six punctuation or
+# whitespace characters (':', '=', '-', quotes, brackets, commas, newlines). Covers 'CVC for card is 123',
+# JSON '"cvc":"123"' and 'CVV (123)'. Bounded, so unrelated text after the label is not reached.
+_GAP = r"((?:[\s:=\-\"'(\[{,]{0,6}(?:[A-Za-z]{1,20}[\s:=\-\"'(\[{,]{0,6}){0,3}))"
 _CVC_LABEL = re.compile(r"(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)" + _GAP + r"([0-9]{3,4})(?![0-9])", re.I | re.A)
 _EXP_LABEL = re.compile(r"(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*/\s*yy(?:yy)?)\b)" + _GAP + r"([0-9]{1,2}\s*[/-]\s*(?:[0-9]{4}|[0-9]{2}))(?![0-9])", re.I | re.A)
 # A field whose name/id/label says it is a CVC or expiry; its node value is the secret.
