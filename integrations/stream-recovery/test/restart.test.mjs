@@ -363,6 +363,28 @@ test('OpenCode-only restarts recover own turns and track sightings separately fr
   assert.equal(state.servers[1].prevSeenMs, null);
 });
 
+test('an OpenCode crash that leaves turns interrupted with no Stop request is a restart; a requested Stop is not', async () => {
+  const { io, calls } = fakeIo({
+    runs: [
+      run('lane', { status: 'interrupted', stop_requested: 0 }),
+      run('evaluator', { status: 'interrupted', stop_requested: 0 }),
+      run('stopped', { status: 'interrupted', stop_requested: 1 }),
+    ],
+    threads: { lane: { title: 'Work lane' }, evaluator: { title: 'Evaluator: #16 discussion' }, stopped: { title: 'Stopped by hand' } },
+  });
+  io.serverRuntime = () => ({ pid: 8, procStartMs: T0 - 86_400_000, readyMs: T0 - 86_400_000 });
+  io.openCodeRuntime = () => ({ service: 'opencode', pid: 9, procStartMs: T0, readyMs: T0 });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['lane', 'evaluator']);
+  assert.match(calls.send[0].text, /^\[stream-recovery\] OpenCode restarted/);
+  assert.match(calls.send[0].text, /Your own turn was cut off/);
+  assert.equal(calls.telegram.length, 1);
+  assert.match(calls.telegram[0].text, /^OpenCode restart at .* hit 2 thread\(s\): 2 with their own turn cut off/);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 2);
+});
+
 test('handed-off parents still get child session IDs even if every child looks handled', async () => {
   const { io, calls } = fakeIo({ subs: [sub('sol', 'old', 0)], threads: { old: { title: 'Old lane' } },
     later: { old: [{ subagent_id: 'redo', provider_thread_id: pt('ses_sol'), started_at: iso(T0 + 1_000), title: 'Sol resumed' }] },
@@ -544,12 +566,15 @@ test('read-only projection queries use real payload shapes and exclude Stops and
   add('child', 'cancelled', iso(T0 - 4_000), 'parent');
   add('queued', 'queued', null);
   add('starting', 'cancelled', null);
+  add('crash-cut', 'interrupted', iso(T0 - 4_000));
   db.prepare('insert into orchestration_v2_projection_turn_items values (?,?)').run(run('starting').run_id, 'user_message');
+  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?)').run(run('user-stop').run_id, 'run_interrupt_request');
   const candidates = restartRunsSince(db, iso(T0));
-  assert.deepEqual(candidates.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  assert.deepEqual(candidates.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'user-stop', 'starting', 'crash-cut']);
   const [incident] = findRestartIncidents([], { runs: candidates, serverStarts: [{ readyMs: T0 + 10_000 }] });
-  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting', 'crash-cut']);
   assert.equal(stoppedSince(db, 'user-stop', iso(T0)), true);
+  assert.equal(stoppedSince(db, 'crash-cut', iso(T0)), false);
   assert.equal(stoppedSince(db, 'mcp:03976a70', iso(T0)), false);
   assert.equal(queuedRuns(db, 'queued')[0].held, true);
   const id = 'rs-20261016T191520Z';

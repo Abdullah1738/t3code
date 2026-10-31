@@ -346,8 +346,10 @@ export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs
     } else merged.push(incident);
   }
   for (const run of runs) {
-    if (!['cancelled', 'failed'].includes(run.status) || isNestedThreadId(run.thread_id)) continue;
+    if (!['cancelled', 'failed', 'interrupted'].includes(run.status) || isNestedThreadId(run.thread_id)) continue;
     if (run.status === 'cancelled' && !run.started_at && !run.dispatched) continue;
+    // Interrupted counts only when the DB says nobody asked for it (no Stop).
+    if (run.status === 'interrupted' && run.stop_requested !== 0) continue;
     const ms = toMs(run.completed_at);
     let incident = merged.find((i) => ms >= i.windowFrom && ms <= i.windowTo);
     if (!incident) {
@@ -527,7 +529,7 @@ export function buildRestartSummary({ incident, results }) {
   for (const r of results) threads.add(r.plan.threadId);
   const turnThreads = new Set(runs.map((r) => r.thread_id));
   const lines = [
-    `Robob restart at ${hhmm(incident.failAllMs ?? incident.startMs)} hit ${threads.size} thread(s): ${turnThreads.size} with their own turn cut off, ${incident.subagents.length} background subagent(s) cancelled.`,
+    `${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restart at ${hhmm(incident.failAllMs ?? incident.startMs)} hit ${threads.size} thread(s): ${turnThreads.size} with their own turn cut off, ${incident.subagents.length} background subagent(s) cancelled.`,
   ];
   const name = (r) => truncate(r.plan.title || r.plan.threadId, 40);
   const what = (r) => {
