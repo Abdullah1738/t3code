@@ -338,6 +338,12 @@ SELLER_FROM = re.compile(
 
 
 OWNS = re.compile(r"\b(?:(?:is|are|was|it'?s|that'?s) mine|mine)\b", re.I)
+# A payment method is how he paid, never who was paid: "with Apple Pay", "via Apple Pay", "on my card".
+# It is cut from the clause before any payee or seller is read, so "Apple Pay" can't stand in for Apple.
+PAYMENT_METHOD = re.compile(r"\b(?:(?:with|via|using|through|on|by)\s+)?(?:my\s+|the\s+|his\s+|our\s+)?"
+                            r"(?:(?:[A-Za-z]+\s+)?(?:card|account|wallet|cheque)|apple\s+pay|google\s+pay|"
+                            r"samsung\s+pay|paypal|bank\s+transfer|transfer|cash|check)\b"
+                            r"(?:\s+(?:ending|no\.?|number)?\s*\d{4})?", re.I)
 
 
 def buys_from(clause, pattern):
@@ -345,6 +351,8 @@ def buys_from(clause, pattern):
     buys from Amazon: the purchase verb is followed by a seller word, and the merchant has to be the
     seller, not the product brand. "I paid Apple" with no seller word names the merchant itself. Owning
     it ("the Apple charge is mine") is separate and needs no seller."""
+    # How he paid is not who he paid: it is cut out before the payee or seller is read.
+    clause = PAYMENT_METHOD.sub(' ', clause)
     if OWNS.search(clause) and pattern.search(clause):
         return True
     m = OWNER_BUYS.search(clause)

@@ -292,6 +292,15 @@ class Explain(unittest.TestCase):
                 r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
                 self.assertEqual(r['verdict'], 'ask')
 
+    def test_a_payment_method_is_never_the_payee_or_the_seller(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+        for text in ('I paid with Apple Pay', 'I paid Amazon via Apple Pay'):
+            with self.subTest(text=text):
+                def said(since, until, deadline=None, text=text):
+                    return [('2026-10-24T00:20:00.000Z', text, 'iMessage')]
+                r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+                self.assertEqual(r['verdict'], 'ask')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 
