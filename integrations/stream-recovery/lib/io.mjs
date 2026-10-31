@@ -70,9 +70,9 @@ export function cancelledSubagentsSince(db, sinceIso) {
               json_extract(payload_json,'$.prompt') prompt, json_extract(payload_json,'$.model') model
          from orchestration_v2_projection_subagents s
         where origin='provider_native' and completed_at >= ?
-          and (status='cancelled' or (status='interrupted' and not exists(
-            select 1 from orchestration_v2_projection_turn_items i
-             where i.run_id=s.run_id and i.type='run_interrupt_request')))
+          and status in ('cancelled','interrupted')
+          and not exists(select 1 from orchestration_v2_projection_turn_items i
+            where i.run_id=s.run_id and i.type='run_interrupt_request')
         order by completed_at`,
     )
     .all(sinceIso);
@@ -104,12 +104,12 @@ export function restartRunsSince(db, sinceIso) {
 
 export function stoppedSince(db, threadId, sinceIso) {
   // A later explicit Stop is a barrier even if other turns ran in between.
-  // Only a requested interrupt is a Stop: a crash-interrupted turn has none.
+  // Any requested interrupt is a Stop, whatever the run's status: an idle
+  // thread's Stop marks its last run without changing that run's status.
+  // A crash-interrupted turn has no request item, so it is not a barrier.
   return Boolean(db.prepare(
-    `select 1 from orchestration_v2_projection_runs r
-      where r.thread_id=? and r.status='interrupted' and r.completed_at >= ?
-        and exists(select 1 from orchestration_v2_projection_turn_items i
-          where i.run_id=r.run_id and i.type='run_interrupt_request') limit 1`,
+    `select 1 from orchestration_v2_projection_turn_items
+      where thread_id=? and type='run_interrupt_request' and updated_at >= ? limit 1`,
   ).get(threadId, sinceIso));
 }
 

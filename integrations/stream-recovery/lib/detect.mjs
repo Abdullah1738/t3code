@@ -348,9 +348,14 @@ export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs
   for (const run of runs) {
     if (!['cancelled', 'failed', 'interrupted'].includes(run.status) || isNestedThreadId(run.thread_id)) continue;
     if (run.status === 'cancelled' && !run.started_at && !run.dispatched) continue;
+    // A Stop on an idle thread marks its last run without changing that run's
+    // status, so a requested Stop excludes a run whatever its status.
+    if (run.stop_requested === 1) continue;
     // Interrupted counts only when the DB says nobody asked for it (no Stop).
     if (run.status === 'interrupted' && run.stop_requested !== 0) continue;
     const ms = toMs(run.completed_at);
+    // A burst of cancelled subagents alone doesn't prove the turn was cut by a restart.
+    if (run.status === 'interrupted' && !windows.some((w) => ms >= w.from && ms <= w.to)) continue;
     let incident = merged.find((i) => ms >= i.windowFrom && ms <= i.windowTo);
     if (!incident) {
       const win = windows.find((w) => ms >= w.from && ms <= w.to);
