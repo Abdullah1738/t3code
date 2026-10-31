@@ -4700,7 +4700,7 @@ const make = Effect.gen(function* () {
           Effect.forEach(all, (board) =>
             Effect.all({
               board: Effect.succeed(board),
-              cards: store.cards(board.id),
+              cards: store.summaryCards(board.id),
               discussions: store.discussions(board.id),
               threadIds: Effect.map(
                 store.threadLinks({ boardId: board.id, open: false }),

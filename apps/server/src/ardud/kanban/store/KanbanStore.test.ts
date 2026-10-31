@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import {
   KanbanBoardId,
@@ -14,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
@@ -146,6 +148,90 @@ it.layer(TestLayer)("kanban store", (it) => {
       yield* store.putScriptRun({ ...runRecord, endedAt: at, exitCode: 0, output: "ok" });
       const runs = yield* store.scriptRuns(KanbanScriptId.make("script-1"), 5);
       assert.deepStrictEqual(runs, [{ ...runRecord, endedAt: at, exitCode: 0, output: "ok" }]);
+    }),
+  );
+});
+
+it.layer(TestLayer)("kanban store: summary cards", (it) => {
+  it.effect("summary cards match full-card counts without packet fields", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const summaryBoardId = KanbanBoardId.make("board-summary");
+      const openAsk = {
+        id: "q1",
+        text: "Ship it?",
+        blocking: false,
+        by: { _tag: "owner" as const },
+        at,
+        seq: null,
+        closedAt: null,
+      };
+      const closedAsk = { ...openAsk, id: "q2", closedAt: at };
+      const packet = (
+        number: number,
+        stage: KanbanCard["stage"],
+        patch: Partial<KanbanCard> = {},
+      ): KanbanCard => ({
+        ...card(number, stage),
+        id: KanbanCardId.make(`sum-card-${number}`),
+        boardId: summaryBoardId,
+        prompt: "p".repeat(100_000),
+        description: "a description",
+        subtasks: [
+          {
+            id: "s1",
+            step: 1,
+            text: "work",
+            owner: "work",
+            state: "done",
+            note: "a subtask note",
+            doneBy: null,
+            doneAt: null,
+          },
+        ],
+        ...patch,
+      });
+      const cards = [
+        packet(1, "todo"),
+        packet(2, "working"),
+        packet(3, "needs_owner", { activeThreadId: null, activeRole: null }),
+        packet(4, "working", { asks: [openAsk] }),
+        packet(5, "working", { asks: [closedAsk] }),
+        packet(6, "needs_owner", { settledAt: at }),
+      ];
+      for (const entry of cards) yield* store.putCard(entry);
+
+      const full = yield* store.cards(summaryBoardId);
+      const summary = yield* store.summaryCards(summaryBoardId);
+      assert.deepStrictEqual(
+        summary,
+        full.map(({ id, stage, settledAt, activeThreadId, asks }) => ({
+          id,
+          stage,
+          settledAt,
+          activeThreadId,
+          asks: asks.map(({ closedAt }) => ({ closedAt })),
+        })),
+      );
+      assert.isBelow(JSON.stringify(summary).length, 2_000);
+      assert.isAbove(JSON.stringify(full).length, 600_000);
+
+      const fromFull = summaries(
+        tallyBoards([{ board, cards: full, discussions: [], threadIds: [] }]),
+      );
+      const fromSummary = summaries(
+        tallyBoards([{ board, cards: summary, discussions: [], threadIds: [] }]),
+      );
+      assert.deepStrictEqual(fromSummary, fromFull);
+      assert.equal(fromSummary[0]?.needsOwner, 2);
+      assert.equal(fromSummary[0]?.running, 2);
+
+      yield* sql`UPDATE ardud_kanban_cards SET json = json_remove(json, '$.asks') WHERE id = ${"sum-card-1"}`;
+      const legacy = (yield* store.summaryCards(summaryBoardId)).find(
+        (entry) => entry.id === "sum-card-1",
+      );
+      assert.deepStrictEqual(legacy?.asks, []);
     }),
   );
 });

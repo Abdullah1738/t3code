@@ -6,16 +6,16 @@
  * the threads started since the last list.
  */
 import {
-  kanbanNeedsOwner,
   type KanbanBoard,
   type KanbanBoardListEntry,
   type KanbanBoardSummary,
-  type KanbanCard,
   type KanbanChange,
   type KanbanDiscussion,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Stream from "effect/Stream";
+
+import type { SummaryCard } from "../store/summaryCard.ts";
 
 type CardCount = "owner" | "running" | null;
 
@@ -34,10 +34,10 @@ interface BoardTally {
 export type BoardTallies = Map<string, BoardTally>;
 
 // A card waiting on the owner, or with an open ask, counts there even while a thread holds it.
-const cardCount = (card: KanbanCard): CardCount =>
+const cardCount = (card: SummaryCard): CardCount =>
   card.settledAt !== null
     ? null
-    : kanbanNeedsOwner(card)
+    : (card.stage === "needs_owner" || card.asks.some((ask) => ask.closedAt === null))
       ? "owner"
       : card.activeThreadId !== null
         ? "running"
@@ -52,7 +52,7 @@ const unreadOf = (discussion: KanbanDiscussion) => {
 export function tallyBoards(
   boards: ReadonlyArray<{
     readonly board: KanbanBoard;
-    readonly cards: ReadonlyArray<KanbanCard>;
+    readonly cards: ReadonlyArray<SummaryCard>;
     readonly discussions: ReadonlyArray<KanbanDiscussion>;
     readonly threadIds: ReadonlyArray<ThreadId>;
   }>,

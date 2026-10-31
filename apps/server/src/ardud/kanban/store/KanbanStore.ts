@@ -26,6 +26,8 @@ import {
   type KanbanStage,
 } from "@t3tools/contracts";
 
+import { SummaryCard } from "./summaryCard.ts";
+
 /**
  * Fork tables for the Missions board. Rows keep the whole record as JSON plus
  * the few columns we filter on; the records are small and always read whole.
@@ -142,6 +144,7 @@ const codec = <S extends Schema.Top>(schema: S) => {
 
 const Board = codec(KanbanBoard);
 const Card = codec(KanbanCard);
+const Summary = codec(SummaryCard);
 const CardEvent = codec(
   KanbanCardEvent.mapFields((fields) => ({ ...fields, id: Schema.optionalKey(fields.id) })),
 );
@@ -180,6 +183,10 @@ export interface KanbanStoreShape {
   readonly cards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  /** Only the fields the board list's badges read, for every card on the board, in number order. */
+  readonly summaryCards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<SummaryCard>, KanbanStoreError>;
   readonly card: (cardId: KanbanCardId) => Effect.Effect<KanbanCard | null, KanbanStoreError>;
   /** Cards a thread is running now; one work thread may carry several. */
   readonly cardsByThread: (
@@ -369,6 +376,28 @@ const make = Effect.gen(function* () {
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
         (rows) => decodeAll(rows, Card.decode),
+      ),
+    );
+  const summaryCards = (boardId: KanbanBoardId) =>
+    run(
+      "read summary cards",
+      Effect.flatMap(
+        sql<JsonRow>`
+          SELECT json_object(
+            'id', id,
+            'stage', stage,
+            'settledAt', json_extract(json, '$.settledAt'),
+            'activeThreadId', active_thread_id,
+            'asks', json(COALESCE((
+              SELECT json_group_array(json_object('closedAt', json_extract(ask.value, '$.closedAt')))
+              FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
+            ), '[]'))
+          ) AS json
+          FROM ardud_kanban_cards
+          WHERE board_id = ${boardId}
+          ORDER BY number
+        `,
+        (rows) => decodeAll(rows, Summary.decode),
       ),
     );
   const card = (cardId: KanbanCardId) =>
@@ -779,6 +808,7 @@ const make = Effect.gen(function* () {
     putBoard,
     putBoardWithPools,
     cards,
+    summaryCards,
     card,
     cardsByThread,
     cardsInStage,
