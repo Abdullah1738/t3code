@@ -8,7 +8,10 @@ const CARD_RUN = /(?<!\d)\d(?:[ -]*\d){12,18}(?!\d)/g;
 const GAP = String.raw`((?:[\s:=\-"'(\[{,]{0,6}(?:[A-Za-z]{1,20}[\s:=\-"'(\[{,]{0,6}){0,3}))`;
 const CVC_LABEL = new RegExp(String.raw`(\b(?:cvc|cvv|csc|cvn|security\s*code)\b)` + GAP + String.raw`(\d{3,4})(?!\d)`, "gi");
 const EXP_LABEL = new RegExp(String.raw`(\b(?:exp|expiry|expires?|expiration|valid\s*thru|valid\s*through|mm\s*\/\s*yy(?:yy)?)\b)` + GAP + String.raw`(\d{1,2}\s*[\/-]\s*(?:\d{4}|\d{2}))(?!\d)`, "gi");
-const SECRET_KEY = /cvc|cvv|csc|securitycode|card.?number|cardnumber|cc-?number|cc-?csc|cc-?exp|expiry|expiration/i;
+const SECRET_KEY = /cvc|cvv|ccv|cvn|csc|security.?code|card.?number|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|exp[-_]?(?:date|month|year)|expiry|expiration/i;
+// Keys like "exp" or "expires" also hold cookie and token timestamps, so mask them only when the value looks like a card expiry.
+const EXP_KEY = /^exp/i;
+const EXP_VALUE = /^\s*\d{1,2}\s*[\/-]\s*(?:\d{4}|\d{2})\s*$/;
 const SENSITIVE_FIELD = /(?<![a-z])(cvc|cvv|csc|cvn|security[\s_-]*code|card[\s_-]*number|cardnumber|cc[-_]?number|cc[-_]?csc|cc[-_]?exp|expir\w*|valid[\s_-]*thru|exp|mm\s*\/\s*yy(?:yy)?)(?![a-z])/i;
 // Attribute names whose values describe a field (CDP attribute lists and field descriptor objects).
 const FIELD_ATTRS = new Set(["name", "id", "autocomplete", "placeholder", "aria-label", "label", "title"]);
@@ -71,6 +74,7 @@ export function redactValue(value) {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
       if (SECRET_KEY.test(key)) out[key] = maskSecret(item);
+      else if (EXP_KEY.test(key) && typeof item === "string" && EXP_VALUE.test(item)) out[key] = "[redacted]";
       else if (sensitive && key === "value") out[key] = maskSecret(item);
       else out[key] = redactValue(item);
     }

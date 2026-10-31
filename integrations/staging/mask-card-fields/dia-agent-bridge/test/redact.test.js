@@ -112,3 +112,17 @@ test("parenthesised CVC and expiry values are masked", () => {
   assert.equal(redactText("CVV (123)"), "CVV (•••)");
   assert.equal(redactText("Expiry (12/29)"), "Expiry (••/••)");
 });
+
+test("underscore and synonym card keys are redacted", () => {
+  assert.deepEqual(
+    redactValue({ cc_exp: "12/29", exp_date: "12/29", exp_month: "12", exp_year: "2029", ccv: "123", cvn: "123", security_code: "123", card_number: "4111111111111111" }),
+    { cc_exp: "[redacted]", exp_date: "[redacted]", exp_month: "[redacted]", exp_year: "[redacted]", ccv: "[redacted]", cvn: "[redacted]", security_code: "[redacted]", card_number: "[redacted]" },
+  );
+});
+
+test("exp and expires keys are masked only when the value looks like a card expiry", () => {
+  assert.deepEqual(redactValue({ expires: "12/29", exp: "12 / 2029" }), { expires: "[redacted]", exp: "[redacted]" });
+  const cookie = { name: "sid", expires: 1793404800.5, session: false };
+  assert.deepEqual(redactValue(cookie), cookie);
+  assert.deepEqual(redactValue({ expiresAt: "2026-11-01T00:00:00Z", exp: 1793404800 }), { expiresAt: "2026-11-01T00:00:00Z", exp: 1793404800 });
+});
