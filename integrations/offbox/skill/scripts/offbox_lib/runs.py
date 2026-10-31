@@ -674,7 +674,21 @@ def _echo(stream, b: bytes) -> bool:
         stream.flush()
         return True
     except (BrokenPipeError, ValueError):
+        _silence(stream)
         return False
+
+
+def _silence(stream) -> None:
+    """Point the dead descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
+    again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(fd, stream.fileno())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def _close(frames) -> None:
@@ -760,6 +774,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 again = False
                 # A quiet stream must not hold the caller past its deadline: the socket read times out at the deadline.
                 read_s = 90 if until is None else max(1.0, min(90.0, left()))
+                if down_from is not None:
+                    # Inside an outage the attach may not outrun the outage window either.
+                    read_s = max(1.0, min(read_s, OUTAGE_FOLLOW_S - (now() - down_from)))
                 frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s, deadline=until)
                 for fr in frames:
                     if stop_evt.is_set():
@@ -813,31 +830,41 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 if until is not None and now() >= until:
                     raise timed_out()
                 failures += 1
+                failed_at = now()  # an outage window starts at the first failure that proves boat is down
                 st = None
                 boat_down = False
+                # The outage window runs on the wall clock: attach and status requests that hang count against it
+                # too, so the limit cannot slip by failure count alone.
+                if down_from is not None and now() - down_from >= OUTAGE_FOLLOW_S:
+                    raise OffboxError(f"lost the output stream of {box_id}:{pid}: boat's API was down for "
+                                      f"{int(OUTAGE_FOLLOW_S)}s: {e}", started=True)
                 try:
                     # Status and the retry pause share the deadline: a blocked status request must not outrun it.
+                    # During an outage it is also capped to the outage window left, so one call cannot outrun it.
+                    status_s = max(1.0, min(60.0, left() if until is not None else 60.0))
+                    if down_from is not None:
+                        status_s = max(1.0, min(status_s, OUTAGE_FOLLOW_S - (now() - down_from)))
                     try:
-                        st = api.cmd_status(box_id, pid, timeout=max(1.0, min(60.0, left())), retries=0,
-                                            deadline=until) if until is not None else api.cmd_status(box_id, pid)
+                        st = api.cmd_status(box_id, pid, timeout=status_s, retries=0, deadline=until) \
+                            if until is not None else api.cmd_status(box_id, pid, timeout=status_s, retries=0)
                     except OffboxError as se:
                         boat_down = getattr(se, "outage", False)
                 except OffboxError:
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
-                down_from = (down_from or now()) if boat_down else None
+                down_from = (down_from or failed_at) if boat_down else None
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return None
                     if failures > 3:
                         return st.get("exitCode")
-                if failures > 20 and down_from is not None and now() - down_from < OUTAGE_FOLLOW_S:
-                    # boat's API is down, not the run: keep reattaching.
-                    failures = 20
-                if failures > 20:
+                if failures > 20 and (down_from is None or now() - down_from >= OUTAGE_FOLLOW_S):
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
                 pause = min(10, 1 + failures)
+                if down_from is not None:
+                    # boat's API is down, not the run: keep reattaching, but never pause past the outage window.
+                    pause = min(pause, max(0.0, OUTAGE_FOLLOW_S - (now() - down_from)))
                 if until is not None:
                     pause = max(0.0, min(pause, left()))
                 if stop_evt.wait(pause):

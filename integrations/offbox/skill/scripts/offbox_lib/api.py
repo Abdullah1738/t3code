@@ -174,15 +174,17 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if e.code == 404 and ok404:
                 return None
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
-            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and _room(1.5 * attempt) \
-                    and _in_deadline(deadline, 1.5 * attempt):
+            # A start is never resent on a Cloudflare not-delivered answer, not even under the generic retry below:
+            # each send reserves a start slot (create/fork carry an Idempotency-Key, so safe_method is true there).
+            start_not_delivered = is_start and e.code in CF_NOT_DELIVERED
+            if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and not start_not_delivered \
+                    and _room(1.5 * attempt) and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
             # boat's proxy failed to *connect* to the sandbox host, so the request never
             # reached the box: safe to retry even for non-idempotent POSTs (e.g. 2026-10-14
             # "502 sandbox_direct_failed: connect EADDRNOTAVAIL", ~7% of calls for an hour).
-            # A start isn't resent here: each send reserves a start slot.
-            if _never_delivered(e.code, code, msg) and not (is_start and e.code in CF_NOT_DELIVERED) \
+            if _never_delivered(e.code, code, msg) and not start_not_delivered \
                     and attempt <= max(retries, max_connect) \
                     and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
                 log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")

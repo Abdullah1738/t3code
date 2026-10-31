@@ -75,6 +75,24 @@ class ApiOutageTests(OutageBase):
             api.resume("bx", 1200)
         self.assertEqual(self.urlopen.call_count, 1)
 
+    def test_create_and_fork_are_sent_once_on_not_delivered_cloudflare(self):
+        # create/fork carry an Idempotency-Key, which the generic 5xx retry would otherwise resend five times.
+        for code in api.CF_NOT_DELIVERED:
+            for start in (lambda: api.create("large", 1200, "n", "idem-1"),
+                          lambda: api.fork("bx", 1200, "idem-2")):
+                self.urlopen.reset_mock()
+                self.urlopen.side_effect = cf(code)
+                with self.assertRaises(api.ApiError):
+                    start()
+                self.assertEqual(self.urlopen.call_count, 1, f"HTTP {code} resent a start")
+
+    def test_create_500_still_retries_on_its_idempotency_key(self):
+        # Not a Cloudflare not-delivered answer: the existing idempotent retry stays.
+        self.urlopen.side_effect = cf(500)
+        with self.assertRaises(api.ApiError):
+            api.create("large", 1200, "n", "idem-3")
+        self.assertGreater(self.urlopen.call_count, 1)
+
     def test_probe_525_is_one_send(self):
         self.urlopen.side_effect = cf(525)
         self.assertEqual(api.probe(), "HTTP 525")
@@ -272,6 +290,41 @@ class BrokenPipeTests(Isolated):
             self.assertEqual(log.read_bytes(), b"a\nb\n")
 
 
+CLOSED_PIPE_CHILD = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from unittest.mock import patch
+from offbox_lib import runs
+frames = iter([{"type": "stdout", "data": "x" * 65536 + "\n", "nextOffset": 65537},
+               {"type": "stdout", "data": "tail\n", "nextOffset": 65542},
+               {"type": "exit", "exitCode": 3}])
+r, w = os.pipe()
+os.close(r)  # the reader is gone: the first echo write raises BrokenPipeError
+os.dup2(w, 1)
+os.close(w)
+with patch.object(runs, "_ttl_keeper", return_value=None), \
+        patch.object(runs.api, "cmd_attach", return_value=frames), \
+        patch.object(runs.lease, "ensure_ttl"), patch.object(runs.api, "get", return_value={}):
+    rc = runs.follow("bx", 1, Path(sys.argv[2]), echo=True, run_id="r")
+sys.stdout.write("")  # what the caller's own code does before exiting
+sys.exit(rc)
+'''
+
+
+class ClosedPipeSubprocessTests(Isolated):
+    def test_exit_code_survives_a_closed_stdout_pipe(self):
+        # A real closed pipe: the interpreter's shutdown flush must not raise and replace the remote exit code.
+        import subprocess
+        scripts = str(Path(__file__).resolve().parents[1])
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.run([sys.executable, "-W", "ignore", "-c", CLOSED_PIPE_CHILD, scripts,
+                                str(Path(d) / "run.log")], capture_output=True, timeout=60)
+            self.assertEqual(p.returncode, 3, p.stderr.decode(errors="replace")[-500:])
+            self.assertNotIn(b"BrokenPipeError", p.stderr)
+            self.assertEqual((Path(d) / "run.log").read_bytes()[:5], b"xxxxx")
+
+
 class FollowOutageTests(OutageBase):
     class Evt:
         def is_set(self):
@@ -305,6 +358,39 @@ class FollowOutageTests(OutageBase):
         self.assertGreater(att.call_count, 25)
         self.assertIn("lost the output stream", str(e))
         self.assertTrue(e.started)
+
+    def test_outage_window_holds_on_a_slow_request_clock(self):
+        # Each attach hangs 90 s and each status 60 s before failing (the reported slow-timeout pattern). The
+        # 30-minute outage window must end the follow near 30 min of wall clock, not after the 21-failure count.
+        clock = {"t": 1000.0, "first_fail": None}
+
+        # Each request hangs for its whole timeout, then fails: the fake clock advances by the timeout it was given.
+        # The outage window opens at the first failure, so the first attach's own 90 s is before it.
+        def slow_attach(*a, **k):
+            clock["t"] += min(90.0, k.get("timeout", 90))
+            if clock["first_fail"] is None:
+                clock["first_fail"] = clock["t"]
+            raise api.ApiError(525, "http_525", "")
+
+        def slow_status(*a, **k):
+            clock["t"] += min(60.0, k.get("timeout", 60))
+            raise api.ApiError(525, "http_525", "")
+
+        def fake_now():
+            return clock["t"]
+
+        with patch.object(runs, "_ttl_keeper", return_value=None), \
+                patch.object(runs.api, "cmd_attach", side_effect=slow_attach) as att, \
+                patch.object(runs.api, "cmd_status", side_effect=slow_status), \
+                patch.object(runs, "now", fake_now), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(OffboxError) as cm:
+                runs.follow("bx", 1, None, echo=False, stop_evt=self.Evt())
+        outage_s = clock["t"] - clock["first_fail"]
+        self.assertIn("lost the output stream", str(cm.exception))
+        self.assertLessEqual(outage_s, runs.OUTAGE_FOLLOW_S + 2)  # holds to within one second of the window
+        self.assertGreater(outage_s, runs.OUTAGE_FOLLOW_S - 120)  # and it does use the window, not gives up early
+        self.assertGreater(att.call_count, 5)
 
     def test_follow_gives_up_after_21_non_outage_failures(self):
         att, e = self.follow(OffboxError("x"), attach_error=OffboxError("x"))
