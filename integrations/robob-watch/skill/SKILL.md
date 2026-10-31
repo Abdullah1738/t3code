@@ -130,14 +130,14 @@ The `activity-digest` watcher (custom check, every 10 min) wakes the agent when 
 ```bash
 robob-watch list                  # status, fires, expiry, last run, failures, undelivered events
 robob-watch show ID               # definition, state, last 20 log lines
-robob-watch logs ID [-n 100]
+robob-watch logs ID [-n 100]      # the watcher log tail (there is no `robob-watch log`)
 robob-watch pause ID | resume ID [--expires 7d]   # resume also re-arms a done/expired watcher
 robob-watch remove ID             # archived under ~/.local/share/robob-watch/archive/
 ```
 
 Remove watchers once the thing is resolved, or when the owner says to stop. Done and expired watchers stay listed until removed. Remove them when you notice them.
 
-- Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the key `expires` (ISO or "14d"), not `expires_at`. Using `expires_at` silently resets it to the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.
+- Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the JSON key `expires_at` (an ISO time or a duration like "14d"). The `--expires` flag on the CLI is a separate option. If the JSON has no `expires_at`, the watcher gets the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.
 - Nightly 2026-10-15: an email watcher whose filter changes gets a new seen-file key (`sha256(acct|mbox|query)`). Copy `mail-<oldkey>.seen` and `.seen.init` to the new key before `--replace`, or the new query re-baselines and misses the mail that prompted the change.
 
 ## Troubleshooting
