@@ -540,18 +540,32 @@ it.effect("shell and settlement authored-message lookups use the authored index"
     );
     assert.isAtLeast(authoredQueries.length, 2);
     for (const [query, params] of authoredQueries) {
-      const plan = yield* sql.unsafe<{ readonly detail: string }>(
-        `EXPLAIN QUERY PLAN ${query}`,
-        params,
+      const plan = yield* sql.unsafe<{
+        readonly id: number;
+        readonly parent: number;
+        readonly detail: string;
+      }>(`EXPLAIN QUERY PLAN ${query}`, params);
+      // Walk the authored scalar subquery's subtree: the SEARCH on the authored index and
+      // every node below its scalar-subquery parent. The outer thread sort is not in it.
+      const authoredSearch = plan.find((row) =>
+        row.detail.includes("USING INDEX ardud_v2_messages_latest_user_authored_idx"),
       );
-      const authoredPlan = plan.filter((row) =>
-        row.detail.includes("ardud_v2_messages_latest_user_authored_idx"),
-      );
-      assert.isAtLeast(authoredPlan.length, 1);
-      // The outer shell query sorts its thread rows; only the authored subquery must avoid a sort.
-      assert.isTrue(
-        authoredPlan.every((row) => row.detail.startsWith("SEARCH message USING INDEX ardud_v2_messages_latest_user_authored_idx")),
-      );
+      assert.isDefined(authoredSearch);
+      const subqueryId = authoredSearch!.parent;
+      const subtree = new Set<number>([subqueryId]);
+      let grew = true;
+      while (grew) {
+        grew = false;
+        for (const row of plan) {
+          if (!subtree.has(row.id) && subtree.has(row.parent)) {
+            subtree.add(row.id);
+            grew = true;
+          }
+        }
+      }
+      const subtreeRows = plan.filter((row) => subtree.has(row.id));
+      assert.isTrue(subtreeRows.some((row) => row.id === authoredSearch!.id));
+      assert.isFalse(subtreeRows.some((row) => row.detail.includes("TEMP B-TREE")));
     }
     const neighbour = yield* sql<{ readonly updated_at: string }>`
       SELECT updated_at FROM orchestration_v2_projection_messages
