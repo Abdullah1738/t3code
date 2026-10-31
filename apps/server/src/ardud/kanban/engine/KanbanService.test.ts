@@ -1818,6 +1818,30 @@ it.effect("a message to a running evaluator never waits", () =>
   }),
 );
 
+it.effect("queued messages to one evaluator go as one turn", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      const channel = yield* kanban.createDiscussion(board.id, "Join", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "second" }]);
+      const c = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(c)?.messages.length, 0);
+      yield* kanban.turnEnded(a);
+      const messages = (yield* Ref.get(fake.threads)).get(c)?.messages ?? [];
+      assert.strictEqual(messages.length, 1, "queued texts go as one send");
+      const joined = messages[0]!;
+      assert.isTrue(joined.indexOf("first") < joined.indexOf("second"), "oldest text first");
+      assert.isTrue(joined.includes("\n\nsecond"), "joined with a blank line");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("no limit keeps today's behaviour", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
