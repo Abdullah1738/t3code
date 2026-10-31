@@ -67,6 +67,14 @@ def _id(value, *, blank=False):
     return value
 
 
+def card_token(value):
+    """A saved card's id as noon's payment API takes it: the decimal string.
+    Checkout sessions send it as a JSON integer, customer-v1 paymentcards as a string."""
+    if type(value) is int and value > 0:
+        value = str(value)
+    return _id(value)
+
+
 def _order(value):
     if not isinstance(value, str) or not ORDER_ID.fullmatch(value) or value.startswith('NN'):
         raise MarketplaceError('INVALID_MARKETPLACE_ORDER')

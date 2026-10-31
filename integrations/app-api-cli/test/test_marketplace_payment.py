@@ -108,6 +108,52 @@ class PaymentTests(unittest.TestCase):
                 for secret in (b'encrypted-fixture', b'synthetic-card-token', b'synthetic-intent'):
                     self.assertNotIn(secret, durable)
 
+    def set_selected_card_id(self, flow, value):
+        for method in flow.session_response.data['paymentMethods']:
+            for card in method.get('cards', []):
+                if card.get('isSelected'):
+                    card['id'] = value
+
+    def fresh_journal(self):
+        """Each subTest gets its own journal: an open flow locks the account for the next one."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve() / 'commerce'
+        for module in (j, receipts):
+            patcher = patch.object(module, 'ROOT', root)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return root
+
+    def test_int_card_id_is_sent_as_decimal_string_on_both_lanes(self):
+        for fixture in (main, rocket):
+            with self.subTest(lane=fixture.__name__):
+                self.fresh_journal()
+                pending = {'status': 'pending', 'clientSecret': 'synthetic-intent'}
+                flow, wire = self.placed(fixture, order_status=[pending, pending, fixture.FIXTURE['status_success']],
+                    payment_complete={'status': 'payment_pending'}, payment_status={'status': 'payment_ready_to_redirect'})
+                self.set_selected_card_id(flow, 1234567890)
+                wire.responses['payment_config'] = {'cvv_encryption': 'fixture'}
+                with patch('noon_cvv.encrypt', return_value={'encCvv': 'encrypted-fixture', 'publicKeyName': 'fixture'}):
+                    flow.prepare_payment(cvv=b'123')
+                flow.place()
+                flow.await_success(notify=Mock(return_value={'queued': True}), sleep=lambda _: None)
+                calls = [x for x in wire.calls if x[0] == 'payment_complete']
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][2]['idCustomerToken'], '1234567890')
+                self.assertIsInstance(calls[0][2]['idCustomerToken'], str)
+
+    def test_non_string_card_ids_that_are_not_positive_ints_are_refused_before_place(self):
+        for bad in (True, 0, -5, 12.0):
+            with self.subTest(id=bad):
+                self.fresh_journal()
+                flow, wire = self.placed(main)
+                self.set_selected_card_id(flow, bad)
+                with self.assertRaises(payment.market.MarketplaceError) as raised:
+                    flow.prepare_payment(cvv=b'123')
+                self.assertEqual(raised.exception.code, 'INVALID_REFERENCE')
+                self.assertNotIn('place', [x[0] for x in wire.calls])
+
     def test_redirect_challenge_fence_is_lifted_only_by_later_exact_success(self):
         flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}, main.FIXTURE['status_success']],
             payment_complete={'status': 'payment_ready_to_redirect', 'redirect_url': 'https://bank.invalid/challenge'})

@@ -83,6 +83,30 @@ class SelectedCardTests(unittest.TestCase):
         sections[3]['cards'][0]['isSelected'] = False
         self.fails(session, 'SELECTED_CARD_AMBIGUOUS_OR_MISSING')
 
+    def test_int_selected_card_id_becomes_decimal_token(self):
+        for sections in (True, False):
+            with self.subTest(sections=sections):
+                session = native_session(sections=sections)
+                for method in session['paymentMethodsV2']['methods']:
+                    for card in method.get('cards', []) or []:
+                        if card.get('isSelected'):
+                            card['id'] = 1234567890
+                    for section in method.get('cardSections', []) or []:
+                        for card in section.get('cards') or []:
+                            if card.get('isSelected'):
+                                card['id'] = 1234567890
+                self.assertEqual(c.extract_selected_card(session).token, '1234567890')
+                session_true = native_session(sections=sections)
+                for method in session_true['paymentMethodsV2']['methods']:
+                    for card in method.get('cards', []) or []:
+                        if card.get('isSelected'):
+                            card['id'] = True
+                    for section in method.get('cardSections', []) or []:
+                        for card in section.get('cards') or []:
+                            if card.get('isSelected'):
+                                card['id'] = True
+                self.fails(session_true, 'SCHEMA_CARD_ID')
+
     def test_wrong_selection_types_and_missing_identity(self):
         for flag in ('false', 1, None, [], {}):
             with self.subTest(flag=flag):
