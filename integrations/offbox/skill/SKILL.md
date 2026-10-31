@@ -215,7 +215,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **92** = every pool box stayed busy for the whole queue wait (or other runs held the pool's lock that long). Nothing
+  ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
