@@ -452,23 +452,34 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
-    from .runs import _status_code, recover_lost_exit
+    from .runs import _status_code
     code, how = _status_code(st), "boat's process status"
     if code is None:
-        # The box read is capped to what is left of the caller's deadline, so recovery never outlasts --timeout.
-        budget = 20.0 if deadline is None else deadline - now()
-        if budget <= 0:
-            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
-                              f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
-        if deadline is not None and now() >= deadline:
-            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
-                              f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        code, how = _recover_by(r, log_path, deadline)
     _tail(log_path, pos, echo)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
     out(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
+
+
+def _recover_by(r, log_path, deadline):
+    """recover_lost_exit for a wait: the box read gets only what is left of the caller's deadline (20 s without one),
+    and an answer that arrives at or past the deadline is not accepted, so nothing is published or settled from it
+    (--timeout is 124 and the run is left alone)."""
+    from .runs import recover_lost_exit
+    budget = 20.0 if deadline is None else deadline - now()
+    if budget <= 0:
+        raise _wait_timeout(r)
+    code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+    if deadline is not None and now() >= deadline:
+        raise _wait_timeout(r)
+    return code, how
+
+
+def _wait_timeout(r) -> OffboxError:
+    return OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
+                       f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
 
 
 def _has_data(log_path) -> bool:
@@ -522,12 +533,12 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
     `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
     only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
-    from .runs import follow, recover_lost_exit
+    from .runs import follow
     code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
                   start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
                   mirror_keep=mirror_keep)
     if code is None:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
+        code, how = _recover_by(r, log_path, until)
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
     return code

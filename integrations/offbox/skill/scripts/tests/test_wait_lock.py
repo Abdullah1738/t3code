@@ -172,6 +172,39 @@ class WaitLockTests(Isolated):
         self.assertEqual(rc, 124, err)
         self.assertIn('--timeout reached', err)
 
+    def test_lock_free_takeover_lost_status_recovery_keeps_to_the_deadline(self):
+        # The lock is free, so the wait takes over the follow. boat answers two reconnects (0.1 s each) and says the
+        # process is "lost", so follow() returns None and the exit is recovered from the box. With --timeout 1 that
+        # read gets only the 0.8 s left, its answer (7) comes at the deadline and is not accepted: 124 at t=1001, the
+        # row still running, no replacement log published.
+        clock = Clock()
+        seen = {}
+
+        def reconnects(box, pid, o, e, **kw):
+            clock.t += 0.1
+            return iter([{'type': 'attached', 'stdoutOffset': o, 'stderrOffset': e},
+                         {'type': 'reconnect', 'stdoutOffset': o, 'stderrOffset': e}])
+        self.ended.side_effect = lambda *a, **k: {'running': False, 'status': 'lost', 'exitCode': None}
+
+        def fake_recorded(box_id, run_id, timeout=20):
+            seen['timeout'] = timeout
+            clock.t += timeout  # the box read runs out its whole timeout, then finds the exit file
+            return 7
+        with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_attach', reconnects), \
+                patch.object(runs.api, 'cmd_status', side_effect=AssertionError('probe goes through _ended')), \
+                patch.object(runs, 'recorded_exit', side_effect=fake_recorded), \
+                patch.object(runs, 'finish', side_effect=AssertionError('a late recovery must not settle the row')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+        self.assertNotIn('exit=7', out)
+        self.assertIn('timeout', seen, 'the lost process must have gone to recovery')
+        self.assertLessEqual(seen['timeout'], 0.8 + 1e-6)
+        self.assertLessEqual(clock.t, 1001.0 + 1e-6)
+        self.assertEqual(self.con.execute("SELECT status, exit_code FROM runs WHERE run_id='run-x'").fetchone()[:],
+                         ('running', None))
+        self.assertFalse((common.LOGS_DIR / 'run-x.log.takeover').exists())
+
     def test_status_answer_after_the_deadline_is_not_accepted(self):
         # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
         self.hold_box()
