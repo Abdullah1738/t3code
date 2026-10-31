@@ -67,7 +67,7 @@ const makeFake = Effect.gen(function* () {
         Ref.update(threads, (all) => {
           all.get(input.threadId)?.messages.push(input.text);
           return all;
-        }),
+        }).pipe(Effect.as({ runId: null })),
       lastFailure: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,

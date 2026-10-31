@@ -40,7 +40,7 @@ const threads = Layer.succeed(
     find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
-    send: () => Effect.void,
+    send: () => Effect.succeed({ runId: null }),
     model: () => Effect.succeed(null),
     setModel: () => Effect.void,
     interrupt: () => Effect.void,
@@ -483,7 +483,7 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
       },
       send: (input) => {
         sent.push(input.text ?? "");
-        return Effect.void;
+        return Effect.succeed({ runId: null });
       },
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,

@@ -67,6 +67,11 @@ export interface KanbanLaunchInput {
   readonly text?: string | undefined;
 }
 
+export interface KanbanSendResult {
+  /** The run this send started, or null when it steered a run already running. */
+  readonly runId: string | null;
+}
+
 export interface KanbanSendInput {
   readonly threadId: ThreadId;
   readonly text: string;
@@ -89,7 +94,11 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ProviderFailure | null>;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
-  readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
+  /**
+   * Sends a message. The result names the run it started, when it started one (a steer into a running
+   * run names none), so the board can key that run's admission to its id from the start.
+   */
+  readonly send: (input: KanbanSendInput) => Effect.Effect<KanbanSendResult, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
   readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
   readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
@@ -232,7 +241,7 @@ const make = Effect.gen(function* () {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
       const id = NodeCrypto.randomUUID();
-      yield* threads.sendToThread({
+      const result = yield* threads.sendToThread({
         projectId: shell.projectId,
         commandId: CommandId.make(`kanban:send:${id}`),
         messageId: MessageId.make(`kanban:${id}`),
@@ -244,6 +253,8 @@ const make = Effect.gen(function* () {
         createdBy: "system",
         creationSource: "server",
       });
+      // A send that starts a run names it; a steer into the running run starts none.
+      return { runId: result.delivery === "steered" ? null : result.run.id };
     },
     Effect.mapError((error) =>
       isKanbanThreadError(error)

@@ -142,7 +142,7 @@ const makeFake = Effect.gen(function* () {
             }
             if (thread) thread.messages.push(input.text);
             sends.push({ threadId: input.threadId, model: input.model });
-            return Effect.void;
+            return Effect.succeed({ runId: null });
           }),
         ),
       setModel: (threadId, model) =>
@@ -179,6 +179,27 @@ const testLayer = (
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer(providers)),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+/**
+ * The same service layers as testLayer, over one SQLite file, so a second service built on the
+ * same file sees the first one's store (a restart).
+ */
+/**
+ * The service over one SQLite file, so a second service built on the same file sees the first
+ * one's store (a restart). The file layer is the production one, so it needs a filesystem: the
+ * caller provides NodeServices.
+ */
+const serviceOverFile = (fake: Layer.Layer<KanbanThreads>, dbPath: string) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer))),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
 
@@ -1900,7 +1921,72 @@ it.effect("a stale turn end cannot release a newer admission on the same thread"
   }),
 );
 
-it.effect("a queued send survives a failed drain and goes out on the next one", () =>
+it.effect("a restarted service still counts the running evaluators it started", () =>
+  Effect.gen(function* () {
+    const dbPath = `${process.env.TMPDIR ?? "/tmp"}/kanban-restart-${yield* Clock.currentTimeMillis}.sqlite`;
+    const fake = yield* makeFake;
+    const first = serviceOverFile(fake.layer, dbPath);
+    // First service: A is started and running, with its admission counted.
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "restart",
+        name: "Restart",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-a");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 1);
+    }).pipe(Effect.provide(first));
+    // Second service over the same file: A's turn is still running, so the pool is full.
+    const second = serviceOverFile(fake.layer, dbPath);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const [board] = yield* kanban.boards;
+      const snapshot = yield* kanban.snapshot(board!.id);
+      assert.strictEqual(snapshot.evaluators.busy, 1, "the restart counts A's live turn");
+      const b = yield* kanban.startEvaluator(board!.id, { kind: "request", text: "B" });
+      assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(b)?.messages, [], "B waits for a slot");
+      assert.strictEqual((yield* kanban.snapshot(board!.id)).evaluators.queued, 1);
+    }).pipe(Effect.provide(second));
+  }),
+);
+
+it.effect("a stale run-1 end before run-2 reports its id does not release run-2's pending slot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 2 });
+      const channel = yield* kanban.createDiscussion(board.id, "Pending", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
+      const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-1");
+      // run-1 ends; its owed reply nudges A into run-2. run-2 is admitted but has not reported its id.
+      yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
+      yield* kanban.turnEnded(a, "run-1");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 1, "run-2 is pending");
+      // A repeated run-1 terminal event arrives before run-2's running event. It must not release run-2.
+      yield* kanban.turnEnded(a, "run-1");
+      assert.strictEqual(
+        (yield* kanban.snapshot(board.id)).evaluators.busy,
+        1,
+        "the stale end left run-2's pending slot alone",
+      );
+      // run-2 reports its id and really ends: its own slot is released.
+      yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-2");
+      yield* setRunStart(fake, a, false, "2026-10-25T13:01:00.000Z");
+      yield* kanban.turnEnded(a, "run-2");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a refused queued head does not hold back the healthy requests behind it", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -1908,18 +1994,21 @@ it.effect("a queued send survives a failed drain and goes out on the next one", 
       yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
       const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
       yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      // B is queued first and its send will be refused (archived, deleted or refusing). C is healthy.
       const b = yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
-      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
-      // B's send is refused on the drain: its rows must stay queued, not vanish.
+      const c = yield* kanban.startEvaluator(board.id, { kind: "request", text: "C" });
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 2);
       fake.rejectSends.add(b);
+      // A's turn ends: the drain tries B first, B is refused, and the pass goes on to C.
       yield* kanban.turnEnded(a);
-      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
-      assert.strictEqual((yield* Ref.get(fake.threads)).get(b)?.messages.length, 0);
-      // The refusal lifts: the next drain (a tick) delivers it.
-      fake.rejectSends.delete(b);
+      const all = yield* Ref.get(fake.threads);
+      assert.strictEqual(all.get(b)?.messages.length, 0, "the refused head got nothing");
+      assert.strictEqual(all.get(c)?.messages.length, 1, "the healthy follower drained in the same pass");
+      // B's rows were dropped on the caught failure, so the queue is empty and no later tick repeats it.
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
+      // Later requests keep draining: a tick with the pool full changes nothing and never blocks.
       yield* kanban.tick;
       assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
-      assert.strictEqual((yield* Ref.get(fake.threads)).get(b)?.messages.length, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

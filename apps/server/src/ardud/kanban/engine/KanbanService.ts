@@ -631,6 +631,7 @@ const make = Effect.gen(function* () {
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
   // Evaluator turns this board started or woke and that haven't ended, limit or not: the pool's busy
   // count. `turn` is unique per admission, so a stale turn end can't release a newer admission.
+  // Keyed by the run id the send started; a turn not yet reported by its run stays `pending:`.
   const admitted = yield* Ref.make<
     ReadonlyMap<ThreadId, { readonly boardId: string; readonly at: number; readonly turn: string }>
   >(new Map());
@@ -1542,14 +1543,42 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Records an evaluator turn the board started, keyed to the run it started in
-   * (the thread's current run, when it has one).
+   * Records an evaluator turn the board started. `runId` is the run the send started, so the
+   * admission is keyed to that run from the start and only its own end can release it. A send
+   * that steered a running run names no run; its admission stays pending until rekeyAdmission.
    */
-  const admit = Effect.fn("KanbanService.admit")(function* (threadId: ThreadId, boardId: string) {
+  const admit = Effect.fn("KanbanService.admit")(function* (
+    threadId: ThreadId,
+    boardId: string,
+    runId: string | null = null,
+  ) {
     const at = yield* nowMillis;
-    // The run's id isn't known yet; a placeholder no run id can equal until rekeyAdmission sets it.
-    const turn = `pending:${at}:${NodeCrypto.randomUUID()}`;
+    // A placeholder no run id can equal until rekeyAdmission sets it.
+    const turn = runId ?? `pending:${at}:${NodeCrypto.randomUUID()}`;
     yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn }));
+  });
+
+  /**
+   * Rebuilds admissions from the board's open evaluator links and their live threads, so a restart
+   * (a service over the same store, with no in-memory admissions) counts the turns still running.
+   * A running turn keeps its run id as the key; one the view can't name stays pending, like a fresh
+   * admission. Idempotent: a thread already admitted is left as it is.
+   */
+  const restoreAdmissions = Effect.fn("KanbanService.restoreAdmissions")(function* () {
+    for (const board of yield* store.boards) {
+      if (board.archivedAt !== null) continue;
+      for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
+        if (link.role !== "evaluator") continue;
+        if ((yield* Ref.get(admitted)).has(link.threadId)) continue;
+        const view = yield* threads.view(link.threadId);
+        if (!view || view.archived || view.state === "idle") continue;
+        const at = yield* nowMillis;
+        const turn = `pending:${at}:${NodeCrypto.randomUUID()}`;
+        yield* Ref.update(admitted, (all) =>
+          new Map(all).set(link.threadId, { boardId: board.id, at, turn }),
+        );
+      }
+    }
   });
 
   /** A running run reported its id: an admission still waiting for one takes that id. */
@@ -1625,8 +1654,8 @@ const make = Effect.gen(function* () {
       return "sent" as const;
     }
     if (!(yield* poolFull(board))) {
-      yield* threads.send({ threadId, ...(model ? { model } : {}), text });
-      yield* admit(threadId, board.id);
+      const sent = yield* threads.send({ threadId, ...(model ? { model } : {}), text });
+      yield* admit(threadId, board.id, sent.runId);
       return "sent" as const;
     }
     yield* store.enqueueEvaluator(board.id, threadId, {
@@ -1654,16 +1683,16 @@ const make = Effect.gen(function* () {
       const mine = queue.filter((item) => item.threadId === threadId);
       const text = mine.map((item) => item.entry.text).join("\n\n");
       const model = mine.at(-1)?.entry.model ?? undefined;
+      // A refused or archived thread is logged and its rows dropped, so it can't hold back the
+      // healthy requests queued behind it. The rows stay until the send has been attempted.
       const sent = yield* threads.send({ threadId, text, ...(model ? { model } : {}) }).pipe(
-        Effect.as(true),
         Effect.catchCause((cause) =>
           Effect.logWarning("kanban evaluator queue send failed", { boardId, threadId, cause }).pipe(
-            Effect.as(false),
+            Effect.as(null),
           ),
         ),
       );
-      if (!sent) return;
-      yield* admit(threadId, boardId);
+      if (sent) yield* admit(threadId, boardId, sent.runId);
       yield* store.dropEvaluatorQueue(threadId);
     }
   });
@@ -2688,12 +2717,10 @@ const make = Effect.gen(function* () {
       const sent = yield* (link.role === "evaluator"
         ? boardOf(link.boardId).pipe(
             Effect.flatMap((board) => sendEvaluator(board, link.threadId, wake)),
+            Effect.as(true),
           )
-        : threads.send({ threadId: link.threadId, text: wake })
-      ).pipe(
-          Effect.as(true),
-          Effect.catchCause(() => Effect.succeed(false)),
-        );
+        : threads.send({ threadId: link.threadId, text: wake }).pipe(Effect.as(true))
+      ).pipe(Effect.catchCause(() => Effect.succeed(false)));
       if (!sent) {
         failed = true;
         continue;
@@ -2758,16 +2785,14 @@ const make = Effect.gen(function* () {
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
-    // The run that just ended. Released before anything else can admit a turn here (the
-    // nudge below is a new turn, a new admission). A run with no admission releases nothing.
-    // The run that ended is released before anything else can admit a turn here (the nudge
-    // below is a new turn, a new admission). A stale end names an older run, so nothing matches.
+    // The run that just ended is released before anything else can admit a turn here (the nudge
+    // below is a new turn with its own admission). A stale end names an older run, so it matches
+    // nothing and can't free a newer run's slot. An end that names no run releases the pending
+    // admission the turn started with; a nudge admitted during this end is not released.
+    const startedPending = (yield* Ref.get(admitted)).get(threadId)?.turn;
     yield* releaseTurn(threadId, runId);
-    // An admission that never saw its run's running event (no re-key) can only be the turn that just
-    // ended; a re-keyed admission belongs to a run and is released by that run's id alone.
-    const waiting = (yield* Ref.get(admitted)).get(threadId);
-    if (waiting !== undefined && waiting.turn.startsWith("pending:")) {
-      yield* releaseTurn(threadId, waiting.turn);
+    if (runId === "" && startedPending !== undefined && startedPending.startsWith("pending:")) {
+      yield* releaseTurn(threadId, startedPending);
     }
     const at = yield* nowIso;
     // Every board-thread turn end is announced, so the Threads view rereads the run
@@ -4959,6 +4984,9 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  // Admissions are counted from the store before the service is handed out, so nothing can admit or
+  // drain against an empty pool after a restart.
+  yield* restoreAdmissions();
   return KanbanService.of({
     boards: read(store.boards),
     ensureBoard,

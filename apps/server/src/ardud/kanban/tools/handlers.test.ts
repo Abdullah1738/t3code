@@ -95,7 +95,7 @@ const fakeThreads = () => {
           launches.push(input.text ?? "");
           return ThreadId.make(`thread-${++launched}`);
         }),
-      send: () => Effect.void,
+      send: () => Effect.succeed({ runId: null }),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
       interrupt: () => Effect.void,
