@@ -71,6 +71,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     poolAddLevel(
+      instanceId,
       instanceEntries.find((entry) => entry.instanceId === instanceId)?.models ?? [],
       model,
       pools
