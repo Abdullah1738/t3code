@@ -3999,6 +3999,32 @@ it.effect("a work run that dies on an outage is paused, not flagged or nudged", 
   }),
 );
 
+it.effect("a work run that times out waiting for response headers is paused, not flagged", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(workThread)!.messages.length;
+      fake.failures.set(workThread, {
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Timed out waiting for response headers",
+      });
+      yield* kanban.turnEnded(workThread);
+      const messages = (yield* Ref.get(fake.threads)).get(workThread)!.messages;
+      assert.strictEqual(messages.length, before);
+      const held = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(held.stage, "working");
+      assert.strictEqual(held.activeThreadId, workThread);
+      assert.isNull(held.stalled);
+      assert.match((yield* kanban.caller(workThread))?.paused?.message ?? "", /response headers/);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("an outage after a card_edit model switch holds the thread's live model", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

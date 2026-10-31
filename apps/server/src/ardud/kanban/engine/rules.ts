@@ -258,8 +258,10 @@ export function reviewerQuietDue(
 }
 
 // Words a provider uses when it is out of usage or down, not when the request is wrong.
+// A response-header timeout is the provider not answering, so it waits for the
+// probe like an outage instead of flagging the card as a broken run.
 const OUTAGE_TEXT =
-  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired/i;
+  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers/i;
 
 /** A failed run the same request would pass once the provider is back. */
 export function isOutage(failure: {

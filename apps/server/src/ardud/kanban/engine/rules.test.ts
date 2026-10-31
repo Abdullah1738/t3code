@@ -972,6 +972,13 @@ describe("isOutage", () => {
         message: "OAuth access token has expired",
       }),
     ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Timed out waiting for response headers",
+      }),
+    ).toBe(true);
   });
 
   it("keeps request, model and content failures on the flag path", () => {
@@ -980,6 +987,13 @@ describe("isOutage", () => {
         class: "provider_error",
         code: "provider.invalid-request",
         message: "prompt is too long: 1200000 tokens > 1000000 maximum",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Request timed out while reading tool output",
       }),
     ).toBe(false);
     expect(
