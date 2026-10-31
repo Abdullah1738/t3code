@@ -524,11 +524,12 @@ class Runner:
             cmd_text = " ; ".join(steps)[:4000]
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
-                       log_path, pulls, rel_cwd, local_cwd) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?)""",
+                       log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
                     (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                      cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
-                     json.dumps(a.pull or []), self.rel, str(self.cwd)))
+                     json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.commit()
         t0 = now()
         size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
@@ -950,34 +951,35 @@ def _run_remote(a, rn) -> int:
         rn.kill()
         raise KeyboardInterrupt
 
+    # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
+    # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
+    # 'starting' with no box (31 Oct, run-1031-145121-2b9f).
+    old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
-        rn.start()
-    except OffboxError as e:
-        if not rn.started:
-            finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
-        rn.record(error=str(e)[:500])
-        raise
-    if a.bg:
-        # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
-        # IDLE_STOP_S after the process ends (it checks process status itself).
-        lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
-        print(rn.run_id)
-        say(f"started in background on {rn.box}. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}")
-        return 0
-    old_int = signal.signal(signal.SIGINT, on_sig)
-    old_term = signal.signal(signal.SIGTERM, on_sig)
-    old_hup = signal.signal(signal.SIGHUP, on_sig)
-    code = None
-    try:
-        code = rn.stream()
-    except KeyboardInterrupt:
-        # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
-        rn.record(error='interrupted; awaiting confirmed remote termination')
-        return 130
+        try:
+            rn.start()
+        except OffboxError as e:
+            if not rn.started:
+                finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
+            rn.record(error=str(e)[:500])
+            raise
+        if a.bg:
+            # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
+            # IDLE_STOP_S after the process ends (it checks process status itself).
+            lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
+            print(rn.run_id)
+            say(f"started in background on {rn.box}. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}")
+            return 0
+        code = None
+        try:
+            code = rn.stream()
+        except KeyboardInterrupt:
+            # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
+            rn.record(error='interrupted; awaiting confirmed remote termination')
+            return 130
     finally:
-        signal.signal(signal.SIGINT, old_int)
-        signal.signal(signal.SIGTERM, old_term)
-        signal.signal(signal.SIGHUP, old_hup)
+        for s, h in old.items():
+            signal.signal(s, h)
     if code is None:
         code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
         if code is not None:

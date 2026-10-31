@@ -136,6 +136,8 @@ Runs longer than 10 minutes are fine (every run is a boat background command, re
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
 its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
+If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other

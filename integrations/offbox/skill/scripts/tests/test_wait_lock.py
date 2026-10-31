@@ -3,6 +3,8 @@
 import contextlib
 import http.server
 import io
+import os
+import signal
 from pathlib import Path
 import sys
 import tempfile
@@ -294,6 +296,182 @@ class WaitLockTests(Isolated):
         self.assertEqual(rc, 0)
         self.assertEqual((out.count('o1'), out.count('o2')), (1, 1), out)
         self.assertIn('run-x: done exit=0', out)
+
+
+class NoBoxYetTests(WaitLockTests):
+    """wait / logs on a run that is still 'starting' with no box (queued for a pool box) or no started command yet.
+    31 Oct: `offbox wait run-1031-151812-9e25 --timeout 30` crashed with exit 90 on 'box-' + None while the run's
+    pool lock wait went on; it later settled as infra with no box."""
+
+    def setUp(self):
+        super().setUp()
+        self.con.execute("UPDATE runs SET status='starting', box_id=NULL, process_id=NULL WHERE run_id='run-x'")
+        self.con.commit()
+
+    # The inherited WaitLockTests cases set up a boxed run of their own; run only the ones below here.
+    def run(self, result=None):
+        if not self._testMethodName.startswith('test_nobox_'):
+            return result
+        return super().run(result)
+
+    def row(self):
+        return tuple(self.con.execute("SELECT status, box_id, process_id, exit_code FROM runs WHERE run_id='run-x'")
+                     .fetchone())
+
+    def settle_infra(self):
+        self.con.execute("UPDATE runs SET status='infra', end_at=1100 WHERE run_id='run-x'")
+        self.con.commit()
+
+    def assert_no_crash(self):
+        log = common.LOG_PATH.read_text() if common.LOG_PATH.exists() else ''
+        self.assertNotIn('crash:', log)
+
+    def test_nobox_wait_polls_until_the_run_settles_without_a_box(self):
+        clock = Clock(on_sleep=lambda t: t >= 1030 and self.settle_infra())
+        with patch.object(runs, 'follow', side_effect=AssertionError('no box to attach to')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertEqual(rc, 90)
+        self.assertIn('run-x: infra exit=None', out)
+        self.assertEqual(err.count('waiting for a box'), 1, err)
+        self.assertNotIn('internal error', err)
+        self.assert_no_crash()
+
+    def test_nobox_wait_timeout_is_124_and_leaves_the_row(self):
+        with patch.object(runs, 'follow', side_effect=AssertionError('no box to attach to')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
+        self.assertEqual(rc, 124)
+        self.assertIn('--timeout reached', err)
+        self.assertIn('no box yet', err)
+        self.assertIn('offbox wait run-x', err)
+        self.assertEqual(self.row(), ('starting', None, None, None))
+        self.assert_no_crash()
+
+    def test_nobox_wait_follows_once_the_run_gets_a_box(self):
+        def gets_box(t):
+            if t >= 1010:
+                self.con.execute("UPDATE runs SET status='running', box_id='bx_a', process_id=7 WHERE run_id='run-x'")
+                self.con.commit()
+        seen = {}
+
+        def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0), until=None, **kw):
+            seen.update(box=box, pid=pid, run_id=run_id)
+            return 3
+        with patch.object(runs, 'follow', fake_follow):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], Clock(on_sleep=gets_box))
+        self.assertEqual(rc, 3)
+        self.assertEqual(seen, dict(box='bx_a', pid=7, run_id='run-x'))
+        self.assertIn('waiting for a box', err)
+        self.assertEqual(self.row()[0], 'failed')
+
+    def test_nobox_wait_on_a_box_whose_command_has_not_started(self):
+        # The runner has its box (and holds its lock) but is still syncing: no process_id yet.
+        self.con.execute("UPDATE runs SET box_id='bx_a' WHERE run_id='run-x'")
+        self.con.commit()
+        self.hold_box()
+
+        def starts_then_ends(t):
+            if t >= 1010:
+                self.con.execute("UPDATE runs SET status='running', process_id=7 WHERE run_id='run-x'")
+                self.con.commit()
+            if t >= 1020:
+                self.end_run(0)
+        with patch.object(runs, 'follow', side_effect=AssertionError('the runner follows it')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], Clock(on_sleep=starts_then_ends))
+        self.assertEqual(rc, 0)
+        self.assertIn('waiting for it to start', err)
+        self.assertIn('run-x: done exit=0', out)
+
+    def test_nobox_logs_follow_waits_then_reports_the_settled_run(self):
+        clock = Clock(on_sleep=lambda t: t >= 1010 and self.settle_infra())
+        with patch.object(runs, 'follow', side_effect=AssertionError('no box to attach to')):
+            rc, out, err = self.cli_wait(['logs', 'run-x', '--follow'], clock)
+        self.assertEqual(rc, 90)
+        self.assertIn('waiting for a box', err)
+        self.assertIn('run-x: infra exit=None', out)
+        self.assert_no_crash()
+
+    def test_nobox_wait_settles_a_row_whose_client_died(self):
+        # 31 Oct, run-1031-145121-2b9f: a tool-call timeout killed the client in the pool wait; the row sat 'starting'.
+        self.con.execute("UPDATE runs SET client_pid=4242 WHERE run_id='run-x'")
+        self.con.commit()
+        with patch.object(misc.os, 'kill', side_effect=ProcessLookupError), \
+                patch.object(runs, 'follow', side_effect=AssertionError('no box to attach to')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
+        self.assertEqual(rc, 90)
+        self.assertIn('never started, nothing ran', err)
+        self.assertIn('run-x: lost exit=None', out)
+        status, box, pid, code = self.row()
+        self.assertEqual((status, box, code), ('lost', None, None))
+        self.assertEqual(self.con.execute("SELECT error FROM runs WHERE run_id='run-x'").fetchone()[0],
+                         'client ended before it got a box')
+
+    def test_nobox_wait_treats_a_reused_pid_as_a_dead_client(self):
+        # The pid is alive but started after the run (pid reuse): the run's own client is gone.
+        self.con.execute("UPDATE runs SET client_pid=4242 WHERE run_id='run-x'")
+        self.con.commit()
+        with patch.object(misc.os, 'kill'), patch.object(misc, '_pid_started_at', return_value=5000.0):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
+        self.assertEqual(rc, 90)
+        self.assertEqual(self.row()[0], 'lost')
+
+    def test_nobox_wait_keeps_waiting_while_the_client_lives(self):
+        self.con.execute("UPDATE runs SET client_pid=4242 WHERE run_id='run-x'")
+        self.con.commit()
+        with patch.object(misc.os, 'kill'), patch.object(misc, '_pid_started_at', return_value=899.0):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
+        self.assertEqual(rc, 124)
+        self.assertEqual(self.row(), ('starting', None, None, None))
+
+    def test_nobox_dead_client_with_a_box_is_left_to_the_reaper(self):
+        # It had a box, so the start may have reached boat: wait must not mark it, only say so.
+        self.con.execute("UPDATE runs SET client_pid=4242, box_id='bx_a' WHERE run_id='run-x'")
+        self.con.commit()
+        with patch.object(misc.os, 'kill', side_effect=ProcessLookupError):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], Clock())
+        self.assertEqual(rc, 90)
+        self.assertIn('offbox reap', err)
+        self.assertEqual(self.row(), ('starting', 'bx_a', None, None))
+        self.assert_no_crash()
+
+    def test_nobox_wait_on_a_local_first_run_waits_for_its_end(self):
+        # Local-first runs never have a box: wait polls the row and returns the recorded code.
+        self.con.execute("UPDATE runs SET mode='local', status='running', process_id=55 WHERE run_id='run-x'")
+        self.con.commit()
+        with patch.object(runs, 'follow', side_effect=AssertionError('local runs have no box')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], Clock(on_sleep=lambda t: t >= 1010 and self.end_run(2)))
+        self.assertEqual(rc, 2)
+        self.assertIn('runs on this Mac', err)
+        self.assertIn('run-x: failed exit=2', out)
+
+    def test_nobox_logs_without_follow_says_no_box_yet(self):
+        with patch.object(api, 'get', side_effect=AssertionError('no box to ask about')):
+            rc, out, err = self.cli_wait(['logs', 'run-x'], Clock())
+        self.assertEqual(rc, 0)
+        self.assertIn('no box yet', err)
+        self.assertEqual(self.row(), ('starting', None, None, None))
+        self.assert_no_crash()
+
+
+class EarlySignalTests(Isolated):
+    """A SIGTERM while the run waits for its pool box settles the row instead of leaving it 'starting'."""
+
+    def test_sigterm_in_the_pool_wait_marks_the_run_killed(self):
+        a = cli.build_parser().parse_args(['run', '--remote', '--', 'go', 'test', './...'])
+        a.steps, a.env, a.bg, a.pull, a.size = None, [], False, None, None
+        seen = {}
+
+        def acquire(me, **kw):
+            seen['row'] = tuple(db().execute("SELECT status, box_id, client_pid FROM runs").fetchone())
+            signal.raise_signal(signal.SIGTERM)  # a tool-call timeout's SIGTERM during the pool wait
+            raise AssertionError('the SIGTERM handler must interrupt the pool wait')
+        before = signal.getsignal(signal.SIGTERM)
+        with patch.object(runs.pool, 'acquire', side_effect=acquire), \
+                patch.object(runs.lease, 'typecheck_size', return_value=None):
+            with self.assertRaises(KeyboardInterrupt):
+                runs.run_remote(a, self.me)
+        self.assertEqual(seen['row'], ('starting', None, os.getpid()))
+        self.assertEqual(tuple(db().execute("SELECT status, exit_code FROM runs").fetchone()), ('killed', 130))
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
 
 
 class FollowUntilTests(unittest.TestCase):
