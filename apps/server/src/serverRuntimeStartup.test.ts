@@ -479,21 +479,23 @@ const runHeartbeat = (
     ),
   );
 
-it.effect("disabled startup telemetry skips snapshots while enabled telemetry keeps counts and fallback", () =>
-  Effect.gen(function* () {
-    for (const config of [{}, { T3CODE_TELEMETRY_ENABLED: "false" }]) {
-      const records: Array<{ event: string; properties: unknown }> = [];
-      const snapshotCalls = { count: 0 };
-      yield* runHeartbeat(config, {
-        records,
-        snapshotCalls,
-        active: 3,
-        archived: 4,
-      });
-      assert.equal(snapshotCalls.count, 0);
-      assert.deepEqual(records, []);
-    }
-  }),
+it.effect(
+  "disabled startup telemetry skips snapshots while enabled telemetry keeps counts and fallback",
+  () =>
+    Effect.gen(function* () {
+      for (const config of [{}, { T3CODE_TELEMETRY_ENABLED: "false" }]) {
+        const records: Array<{ event: string; properties: unknown }> = [];
+        const snapshotCalls = { count: 0 };
+        yield* runHeartbeat(config, {
+          records,
+          snapshotCalls,
+          active: 3,
+          archived: 4,
+        });
+        assert.equal(snapshotCalls.count, 0);
+        assert.deepEqual(records, []);
+      }
+    }),
 );
 
 it.effect("enabled startup telemetry records thread and project counts", () =>
