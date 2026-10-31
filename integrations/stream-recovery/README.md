@@ -42,7 +42,9 @@ result. Their wake-ups never come, so parents sit idle or start over. Each scan
 also looks for those:
 
 - Reads `cancelled` provider-native subagents and top-level `cancelled`/`failed`
-  runs (statev2, read-only). Cancelled queued messages and user Stops are excluded. A cluster
+  runs (statev2, read-only), plus `interrupted` runs and native subagents whose turn has no
+  `run_interrupt_request` item: an OpenCode crash leaves turns that way (31 Oct, SIGBUS),
+  while every Stop writes that item first. Cancelled queued messages and user Stops are excluded. A cluster
   (rows <= 10s apart) is a restart when it has 3+ rows across 2+ top-level
   thread trees, or when any row falls in a Robob/OpenCode server start window.
   Own turns in that window get recovered even when no children were running.
@@ -52,7 +54,7 @@ also looks for those:
   the window runs from the last scan that saw the previous server (so shutdown
   cancels count) or process start minus 60s, to ready plus 60s.
   OpenCode's LaunchAgent PID and process start supply its independent window.
-- Not a restart: a user Stop (Robob marks those subagents `interrupted`), a
+- Not a restart: a user Stop (its turn has a `run_interrupt_request` item), a
   burst inside one thread tree, delegated `task_cancel` (app-owned rows), and
   sessions the stall watch interrupted itself.
 - Waits 3 min after the last cancel, and while `install-robob-resume.zsh` still

@@ -363,6 +363,28 @@ test('OpenCode-only restarts recover own turns and track sightings separately fr
   assert.equal(state.servers[1].prevSeenMs, null);
 });
 
+test('an OpenCode crash that leaves turns interrupted with no Stop request is a restart; a requested Stop is not', async () => {
+  const { io, calls } = fakeIo({
+    runs: [
+      run('lane', { status: 'interrupted', stop_requested: 0 }),
+      run('evaluator', { status: 'interrupted', stop_requested: 0 }),
+      run('stopped', { status: 'interrupted', stop_requested: 1 }),
+    ],
+    threads: { lane: { title: 'Work lane' }, evaluator: { title: 'Evaluator: #16 discussion' }, stopped: { title: 'Stopped by hand' } },
+  });
+  io.serverRuntime = () => ({ pid: 8, procStartMs: T0 - 86_400_000, readyMs: T0 - 86_400_000 });
+  io.openCodeRuntime = () => ({ service: 'opencode', pid: 9, procStartMs: T0, readyMs: T0 });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['lane', 'evaluator']);
+  assert.match(calls.send[0].text, /^\[stream-recovery\] OpenCode restarted/);
+  assert.match(calls.send[0].text, /Your own turn was cut off/);
+  assert.equal(calls.telegram.length, 1);
+  assert.match(calls.telegram[0].text, /^OpenCode restart at .* hit 2 thread\(s\): 2 with their own turn cut off/);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 2);
+});
+
 test('handed-off parents still get child session IDs even if every child looks handled', async () => {
   const { io, calls } = fakeIo({ subs: [sub('sol', 'old', 0)], threads: { old: { title: 'Old lane' } },
     later: { old: [{ subagent_id: 'redo', provider_thread_id: pt('ses_sol'), started_at: iso(T0 + 1_000), title: 'Sol resumed' }] },
@@ -529,7 +551,7 @@ test('read-only projection queries use real payload shapes and exclude Stops and
   const db = new DatabaseSync(':memory:');
   db.exec(`create table orchestration_v2_projection_threads(thread_id text, payload_json text);
     create table orchestration_v2_projection_runs(run_id text,thread_id text,ordinal integer,status text,requested_at text,completed_at text,payload_json text);
-    create table orchestration_v2_projection_turn_items(run_id text,type text);
+    create table orchestration_v2_projection_turn_items(run_id text,type text,thread_id text,updated_at text);
     create table orchestration_v2_projection_messages(message_id text,thread_id text,run_id text,payload_json text);`);
   const add = (id, status, startedAt, parentThreadId = null) => {
     const r = run(id, { status });
@@ -544,12 +566,15 @@ test('read-only projection queries use real payload shapes and exclude Stops and
   add('child', 'cancelled', iso(T0 - 4_000), 'parent');
   add('queued', 'queued', null);
   add('starting', 'cancelled', null);
-  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?)').run(run('starting').run_id, 'user_message');
+  add('crash-cut', 'interrupted', iso(T0 - 4_000));
+  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?,?,?)').run(run('starting').run_id, 'user_message', 'starting', iso(T0));
+  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?,?,?)').run(run('user-stop').run_id, 'run_interrupt_request', 'user-stop', iso(T0 + 1_000));
   const candidates = restartRunsSince(db, iso(T0));
-  assert.deepEqual(candidates.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  assert.deepEqual(candidates.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'user-stop', 'starting', 'crash-cut']);
   const [incident] = findRestartIncidents([], { runs: candidates, serverStarts: [{ readyMs: T0 + 10_000 }] });
-  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting', 'crash-cut']);
   assert.equal(stoppedSince(db, 'user-stop', iso(T0)), true);
+  assert.equal(stoppedSince(db, 'crash-cut', iso(T0)), false);
   assert.equal(stoppedSince(db, 'mcp:03976a70', iso(T0)), false);
   assert.equal(queuedRuns(db, 'queued')[0].held, true);
   const id = 'rs-20261016T191520Z';
@@ -557,6 +582,29 @@ test('read-only projection queries use real payload shapes and exclude Stops and
   assert.equal(restartNoteRun(db, 'mcp:03976a70', id), 'note-run');
   assert.equal(restartNoteRun(db, 'other', id), null);
   db.close();
+});
+
+test('a Stop request excludes a failed or cancelled run inside a server window; a later Stop on an old failed run bars the thread', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`create table orchestration_v2_projection_turn_items(run_id text,type text,thread_id text,updated_at text);`);
+  const stopped = [
+    { run_id: 'stop-failed', thread_id: 'stop-failed', status: 'failed', completed_at: iso(T0 + 1_000), stop_requested: 1 },
+    { run_id: 'stop-cancelled', thread_id: 'stop-cancelled', status: 'cancelled', completed_at: iso(T0 + 1_000), started_at: iso(T0), dispatched: 1, stop_requested: 1 },
+  ];
+  const [incident] = findRestartIncidents([], { runs: stopped, serverStarts: [{ readyMs: T0 + 10_000 }] });
+  assert.equal(incident, undefined);
+  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?,?,?)').run('old-failed', 'run_interrupt_request', 'old-failed', iso(T0 + 2_000));
+  assert.equal(stoppedSince(db, 'old-failed', iso(T0)), true);
+  assert.equal(stoppedSince(db, 'old-failed', iso(T0 + 5_000)), false);
+  db.close();
+});
+
+test('a burst of cancelled subagents alone does not make an uncut interrupted turn a restart casualty', () => {
+  const cancelled = (i) => ({ subagent_id: `s${i}`, thread_id: `parent${i}`, provider_thread_id: `pt${i}`, status: 'cancelled', completed_at: iso(T0 + i * 1_000), origin: 'provider_native' });
+  const turn = run('lonely', { status: 'interrupted', stop_requested: 0, completed_at: iso(T0 + 7_000) });
+  const [incident] = findRestartIncidents([cancelled(0), cancelled(1), cancelled(2)], { runs: [turn], serverStarts: [] });
+  assert.ok(incident);
+  assert.deepEqual(incident.runs, []);
 });
 
 // ---------- hold-back window and summary naming ----------

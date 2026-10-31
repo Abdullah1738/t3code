@@ -616,6 +616,9 @@ class Runner:
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                note = ssh_sync.tracked_ignored_note(st)
+                if note:
+                    say(note)
                 skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
                 if skipped:
                     say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
