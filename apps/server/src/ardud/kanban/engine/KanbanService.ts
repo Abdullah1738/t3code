@@ -3442,6 +3442,51 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * The open card an evaluator's or a thread's new card would duplicate: the same
+   * title, or the same source link. PR, Linear and card links are left out, since
+   * follow-up cards share those legitimately.
+   */
+  const openTwin = (
+    cards: ReadonlyArray<KanbanCard>,
+    input: NewCard,
+  ): { readonly card: KanbanCard; readonly why: "title" | "source link" } | null => {
+    const squash = (text: string) => text.trim().replace(/\s+/g, " ").toLowerCase();
+    const title = input.title?.trim() ? squash(input.title) : "";
+    // Shared follow-up links don't count: study parents (t3-context) and PR or Linear links.
+    const sourceUrl = (url: string) => !url.startsWith("t3-context://") && linkKind(url) === "url";
+    const urls = new Set(
+      (input.links ?? [])
+        .filter((link) => (link.kind ?? linkKind(link.url.trim())) === "url")
+        .map((link) => link.url.trim())
+        .filter(sourceUrl),
+    );
+    for (const card of cards) {
+      if (card.settledAt !== null || KANBAN_DONE_STAGES.has(card.stage)) continue;
+      if (title && squash(card.title) === title) return { card, why: "title" };
+      if (card.links.some((link) => link.kind === "url" && urls.has(link.url))) {
+        return { card, why: "source link" };
+      }
+    }
+    return null;
+  };
+
+  /** Evaluators and threads don't file a second open card for the same request. */
+  const refuseTwin = Effect.fn("KanbanService.refuseTwin")(function* (
+    boardId: KanbanBoard["id"],
+    input: NewCard,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "evaluator" && actor._tag !== "thread") return;
+    const twin = openTwin(yield* store.cards(boardId), input);
+    if (twin) {
+      return yield* failWith(
+        "conflict",
+        `card #${twin.card.number} "${twin.card.title}" is already open with the same ${twin.why}; add to it (card_edit / comment) instead of a second card`,
+      );
+    }
+  });
+
   /** A new card as it would be saved; nothing is written yet. */
   const draftCard = Effect.fn("KanbanService.draftCard")(function* (
     boardId: KanbanBoard["id"],
@@ -3542,6 +3587,7 @@ const make = Effect.gen(function* () {
     const fields = packet
       ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
       : input;
+    yield* refuseTwin(boardId, fields, actor);
     const card = yield* insertCard(yield* draftCard(boardId, fields, actor), fields);
     if (packet) yield* evaluatorTurn(null, card, actor);
     const ask = Asks.openBlockingAsk(card);
@@ -3733,7 +3779,9 @@ const make = Effect.gen(function* () {
           reviewChain: thread.origin ? thread.origin.reviewChain : (input.reviewChain ?? null),
           goalId: input.goalId ?? thread.origin?.goalId ?? null,
         };
-        const draft = yield* draftCard(thread.board.id, fields, { _tag: "thread", threadId });
+        const actor: KanbanActor = { _tag: "thread", threadId };
+        yield* refuseTwin(thread.board.id, fields, actor);
+        const draft = yield* draftCard(thread.board.id, fields, actor);
         yield* checkTake(thread, threadId, draft);
         const card = yield* insertCard(draft, fields);
         return yield* takeCard(threadId, thread.pool, card, "Created and taken by its work thread");
