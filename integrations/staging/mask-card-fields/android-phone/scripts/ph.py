@@ -95,12 +95,16 @@ def redact_text(text):
     return _EXP_LABEL.sub(lambda m: m.group(1) + m.group(2) + "••/••", text)
 def is_sensitive_field(*names):
     return any(n and _SENSITIVE_FIELD.search(n) for n in names)
+def field_ctx(n):
+    """Everything that can name a field for one node: resource-id, text and content-desc."""
+    return " ".join(x for x in (n.get("rid", ""), n.get("t", ""), n.get("c", "")) if x)
 def redact(text, field=""):
-    """Redact screen text. If the node's label/resource-id names a CVC or expiry field and the
-    text is a bare value (e.g. '123' or '12/29'), mask it: the value has no label of its own."""
+    """Redact screen text. If the field context (node label, content-desc or resource-id) names a
+    CVC or expiry field and the text is a bare value ('123', '12/29'), mask it: a bare value has
+    no label of its own, so the node's context is the only way to know it is a secret."""
     if field and is_sensitive_field(field) and text:
-        if re.fullmatch(r"\s*[0-9]{3,4}\s*", text): return "•••"
-        if re.fullmatch(r"\s*[0-9]{1,2}\s*[/-]\s*[0-9]{2,4}\s*", text): return "••/••"
+        bare = re.fullmatch(r"\s*[0-9][0-9/ -]{0,6}\s*", text)
+        if bare: return "••/••" if re.search(r"[/-]", text) else "•••"
     return redact_text(text)
 NOISE = re.compile(r"notification:|signal|Battery|clock|key_pos|Location requests active", re.I)
 def show(allnodes=False):
@@ -109,9 +113,9 @@ def show(allnodes=False):
     pk = max(set(pks), key=pks.count) if pks else "?"   # app_current() RPC takes ~5 s; derive from the tree instead
     print(f"== app={pk} at={time.strftime('%Hh%Mm%Ss')}")
     for i, n in enumerate(ns):
-        lab = redact(n["t"] or n["c"], n["rid"]); extra = []
+        ctx = field_ctx(n); lab = redact(n["t"] or n["c"], ctx); extra = []
         if not allnodes and (n["pkg"] == "com.android.systemui" or NOISE.search(lab) or NOISE.search(n["rid"])): continue
-        if n["c"] and n["t"] and n["c"] != n["t"]: extra.append(f"desc={redact(n['c'], n['rid'])[:40]}")
+        if n["c"] and n["t"] and n["c"] != n["t"]: extra.append(f"desc={redact(n['c'], ctx)[:40]}")
         if n["rid"]: extra.append(f"id={n['rid']}")
         flags = ("E" if n["edit"] else "") + ("C" if n["clk"] else "") + ("✓" if n["chk"] or n["sel"] else "")
         print(f"[{i}] {lab[:70]!r} ({n['x']},{n['y']}) {flags} {' '.join(extra)}")
@@ -148,11 +152,12 @@ sh CMD...                  raw adb shell
         else:
             n = find(a[1], int(a[2]) if len(a) > 2 else 0)
             if not n: print("NOT FOUND:", redact(a[1])); sys.exit(1)
-            d().click(n["x"], n["y"]); print("tapped", repr(redact(n["t"] or n["c"], n["rid"])), n["x"], n["y"])
+            d().click(n["x"], n["y"]); print("tapped", repr(redact(n["t"] or n["c"], field_ctx(n))), n["x"], n["y"])
     elif c == "wait":
         end = time.time() + (float(a[2]) if len(a) > 2 else 15)
         while time.time() < end:
-            if find(a[1]): print("found", redact(a[1])); return
+            hit = find(a[1])
+            if hit: print("found", redact(a[1], field_ctx(hit))); return
             time.sleep(0.4)
         print("TIMEOUT", redact(a[1])); sys.exit(1)
     elif c == "type":

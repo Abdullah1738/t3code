@@ -58,3 +58,57 @@ class RedactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FieldContextTests(unittest.TestCase):
+    """Synthetic nodes with generic or absent IDs: the label/content-desc alone must carry the context."""
+
+    def _node(self, t, c, rid, x=1, y=2):
+        return dict(t=t, c=c, rid=rid, x=x, y=y, b=(0, 0, 1, 1), clk=False, edit=True, chk=False, sel=False, pkg="com.uber")
+
+    def _show(self, nodes):
+        import io, contextlib
+        orig = ph.nodes; ph.nodes = lambda: nodes
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf): ph.show(True)
+        finally:
+            ph.nodes = orig
+        return buf.getvalue()
+
+    def test_show_masks_generic_rid_cvc_from_content_desc(self):
+        out = self._show([self._node("123", "CVV", "text_input")])
+        self.assertNotIn("123", out); self.assertIn("•••", out)
+
+    def test_show_masks_expiry_from_content_desc_without_rid(self):
+        out = self._show([self._node("12/29", "Expiry MM/YY", "")])
+        self.assertNotIn("12/29", out); self.assertIn("••/••", out)
+
+    def test_tap_echo_masks_cvc_node(self):
+        import io, contextlib
+        class FakeDev:
+            def click(self, x, y): pass
+        orig_nodes, orig_d = ph.nodes, ph.d
+        ph.nodes = lambda: [self._node("123", "CVV", "text_input")]
+        ph.d = lambda: FakeDev()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf): ph.main(["tap", "CVV"])
+        finally:
+            ph.nodes, ph.d = orig_nodes, orig_d
+        self.assertNotIn("123", buf.getvalue()); self.assertIn("•••", buf.getvalue())
+
+    def test_wait_echo_masks_matched_cvc_node(self):
+        import io, contextlib
+        orig = ph.nodes
+        ph.nodes = lambda: [self._node("123", "CVV", "card_cvc")]
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf): ph.main(["wait", "123", "1"])
+        finally:
+            ph.nodes = orig
+        self.assertNotIn("123", buf.getvalue()); self.assertIn("found •••", buf.getvalue())
+
+    def test_plain_labels_unaffected_by_context(self):
+        out = self._show([self._node("Pay now", "Button", "submit_btn")])
+        self.assertIn("'Pay now'", out)

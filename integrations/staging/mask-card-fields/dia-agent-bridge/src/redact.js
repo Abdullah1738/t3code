@@ -36,11 +36,22 @@ function isSensitiveField(values) {
   return values.some(v => typeof v === "string" && SENSITIVE_FIELD.test(v));
 }
 
+// A sensitive field's value. CDP RemoteObjects nest it as {type, value, description, unserializableValue}.
+const REMOTE_VALUE_KEYS = ["value", "description", "unserializableValue"];
+function maskSecret(item) {
+  if (item && typeof item === "object" && !Array.isArray(item)) {
+    const out = { ...item };
+    for (const k of REMOTE_VALUE_KEYS) if (k in out && out[k] !== undefined && out[k] !== null) out[k] = "[redacted]";
+    return out;
+  }
+  return "[redacted]";
+}
+
 function redactArray(arr) {
   const isPairs = arr.length >= 2 && arr.length % 2 === 0 && arr.every(x => typeof x === "string");
   if (!isPairs) return arr.map(redactValue);
   const sensitive = isSensitiveField(arr.filter((_, i) => i % 2 === 1 && FIELD_ATTRS.has(arr[i - 1])));
-  return arr.map((item, i) => (sensitive && i % 2 === 1 && arr[i - 1] === "value" ? "[redacted]" : redactValue(item)));
+  return arr.map((item, i) => (sensitive && i % 2 === 1 && arr[i - 1] === "value" ? maskSecret(item) : redactValue(item)));
 }
 
 export function redactValue(value) {
@@ -51,7 +62,7 @@ export function redactValue(value) {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
       if (SECRET_KEY.test(key) && item !== null && typeof item !== "object") out[key] = "[redacted]";
-      else if (sensitive && key === "value" && typeof item === "string") out[key] = "[redacted]";
+      else if (sensitive && key === "value") out[key] = maskSecret(item);
       else out[key] = redactValue(item);
     }
     return out;

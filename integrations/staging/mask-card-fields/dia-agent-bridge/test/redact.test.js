@@ -61,3 +61,18 @@ test("error text from a failed tool call is redacted", () => {
     "Security code ••• Expires ••/••; card •••• 1111",
   );
 });
+
+test("CDP RemoteObject descriptors redact nested values for cvc and expiry", () => {
+  assert.deepEqual(
+    redactValue({ name: "cvc", value: { type: "string", value: "123" } }),
+    { name: "cvc", value: { type: "string", value: "[redacted]" } },
+  );
+  assert.deepEqual(
+    redactValue({ name: "expiry", value: { type: "string", value: "12/29" } }),
+    { name: "expiry", value: { type: "string", value: "[redacted]" } },
+  );
+  assert.deepEqual(
+    redactValue([{ name: "cvc", value: { type: "string", value: "123" } }, { name: "email", value: { type: "string", value: "a@b.co" } }]),
+    [{ name: "cvc", value: { type: "string", value: "[redacted]" } }, { name: "email", value: { type: "string", value: "a@b.co" } }],
+  );
+});
