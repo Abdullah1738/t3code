@@ -87,7 +87,7 @@ CORRECTION = re.compile(r"\b(?:wrong\s+(?:charge|one|transaction|payment)|nothin
                         # Only "someone else's charge" and "belongs to someone else" deny that it is his.
                         r"someone\s+else'?s\s+(?:charge|one|transaction|payment)|"
                         # Predicative: "That was someone else's", "that one is someone else's". Not "someone else reimbursed me".
-                        r"(?:that|this|it|one|charge)(?:\s+one)?\s+(?:was|is|'s)\s+someone\s+else'?s|"
+                        r"(?:that|this|it|one|charge)(?:\s+one)?(?:\s+(?:was|is)|'s)\s+someone\s+else'?s|"
                         r"belongs?\s+to\s+(?:someone|somebody|another|anyone)(?:\s+else)?)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
@@ -403,6 +403,8 @@ def owner_said(charge, at, now, said=None, deadline=None):
     pattern = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I)
     money = amount_pattern(charge)
     for created, text, title in said(at - OWNER_AROUND, min(now, at + OWNER_AROUND), deadline=deadline):
+        # Phone keyboards type curly apostrophes ("That’s"); the patterns only know the straight one.
+        text = text.replace('\u2019', "'").replace('\u2018', "'")
         # "It isn't mine", "what's the Acme charge?" or "Have I paid Acme" anywhere in the message explains
         # nothing. The whole message is checked, before it is split, so a "?" is never cut off its clause.
         parts = CLAUSES.split(text)
