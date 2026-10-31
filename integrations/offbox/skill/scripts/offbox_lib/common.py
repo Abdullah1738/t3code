@@ -120,11 +120,21 @@ def silence(stream) -> None:
 
 
 def _emit(text: str) -> None:
-    # The caller's pipe can close first (tool timeout, | head); progress lines are best effort.
+    # The caller's pipe can close first (tool timeout, | head), or its redirect target can vanish (EIO); progress lines
+    # are best effort and must never turn into an exception, least of all inside a signal handler or an error report.
     try:
         print(text, file=sys.stderr, flush=True)
-    except (BrokenPipeError, ValueError):
+    except (OSError, ValueError):
         silence(sys.stderr)
+
+
+def out(text: str) -> None:
+    """A result line on stdout (`<run>: exit=N`). Like _emit: a dead stdout must not turn into a crash that replaces the
+    exit code the caller is waiting for."""
+    try:
+        print(text, flush=True)
+    except (OSError, ValueError):
+        silence(sys.stdout)
 
 
 def say(msg: str) -> None:

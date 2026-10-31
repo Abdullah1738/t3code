@@ -135,7 +135,9 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
-its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
+minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
+`--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
