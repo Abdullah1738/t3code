@@ -1538,11 +1538,13 @@ it.effect("thread resume across compacted history keeps message order and final 
     );
   }).pipe(
     Effect.scoped,
-    Effect.provide(layerNoThreadSessionUpdates),
     Effect.provide(
-      ProjectionMaintenance.layer.pipe(
-        Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
-        Layer.provideMerge(ReplayTestLayer),
+      Layer.merge(
+        layerNoThreadSessionUpdates,
+        ProjectionMaintenance.layer.pipe(
+          Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+          Layer.provideMerge(ReplayTestLayer),
+        ),
       ),
     ),
   ),
