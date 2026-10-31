@@ -218,6 +218,12 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     key: string,
   ) => Effect.Effect<void, KanbanStoreError>;
+  /** Gives the pool at `from` a new key and record in place; its row, and so its order, stay. */
+  readonly rekeyPool: (
+    boardId: KanbanBoardId,
+    from: string,
+    pool: KanbanPool,
+  ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
     boardId: KanbanBoardId,
@@ -512,6 +518,17 @@ const make = Effect.gen(function* () {
         yield* sql`
           INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${boardId}, ${pool.key}, ${json})
           ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
+        `;
+      }),
+    );
+  const rekeyPool = (boardId: KanbanBoardId, from: string, pool: KanbanPool) =>
+    run(
+      "rekey pool",
+      Effect.gen(function* () {
+        const json = yield* Pool.encode(pool);
+        yield* sql`
+          UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${json}
+          WHERE board_id = ${boardId} AND key = ${from}
         `;
       }),
     );
@@ -821,6 +838,7 @@ const make = Effect.gen(function* () {
     pools,
     putPool,
     removePool,
+    rekeyPool,
     groups,
     putGroups,
     discussions,
