@@ -462,8 +462,11 @@ describe("createKanbanClient", () => {
 describe("discussion preview loader", () => {
   // The grace the feed keeps after its last reader leaves (the store keepalive).
   const KEEP_ALIVE = { keepAliveMs: 120_000 };
-  const previewDiscussion = (id: string, lastSeq: number, boardId = "board-toy"): KanbanDiscussion =>
-    ({ ...discussion(lastSeq, 0), id, boardId, lastSeq }) as never;
+  const previewDiscussion = (
+    id: string,
+    lastSeq: number,
+    boardId = "board-toy",
+  ): KanbanDiscussion => ({ ...discussion(lastSeq, 0), id, boardId, lastSeq }) as never;
   const previewMessage = (discussionId: string, seq: number): KanbanMessage =>
     ({ ...message(seq), discussionId }) as never;
   const previewChange = (id: string, lastSeq: number): KanbanWatchEvent =>
@@ -487,9 +490,9 @@ describe("discussion preview loader", () => {
     const stopBoard = board.subscribe(() => {});
     const stopPreviews = client.watchPreviews("board-toy");
     fake.push(snapshotEvent(0));
-    fake.take("kanban.discussions").resolve(
-      Array.from({ length: count }, (_, i) => previewDiscussion(`disc-${i}`, 1)),
-    );
+    fake
+      .take("kanban.discussions")
+      .resolve(Array.from({ length: count }, (_, i) => previewDiscussion(`disc-${i}`, 1)));
     await settle();
     return { fake, client, board, stopBoard, stopPreviews };
   }
