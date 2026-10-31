@@ -488,6 +488,79 @@ it.effect(
     }).pipe(Effect.provide(layerSql)),
 );
 
+it.effect("shell and settlement authored-message lookups use the authored index", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = yield* createThread("authored-index");
+    const noMatch = yield* createThread("authored-none");
+    const genuineAt = "2026-01-01T00:00:00.000Z";
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${"message:genuine"}, ${threadId}, NULL, NULL, 'user', 0, ${genuineAt}, ${genuineAt},
+        '{"createdBy":"user"}')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      SELECT 'message:system:' || value, ${threadId}, NULL, NULL, 'user', 0,
+        '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z', '{"createdBy":"system"}'
+      FROM json_each(${JSON.stringify(Array.from({ length: 3000 }, (_, i) => i + 1))})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${"message:noise-assistant"}, ${noMatch}, NULL, NULL, 'user', 0,
+        '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z', '{"createdBy":"system"}')`;
+    const queries: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+    const record: Statement.Transformer = (statement) =>
+      Effect.sync(() => {
+        queries.push(statement.compile());
+        return statement;
+      });
+    const candidates = yield* store
+      .getSettlementCandidates()
+      .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    const settlement = candidates.find((thread) => thread.id === threadId);
+    assert.isDefined(settlement);
+    assert.equal(
+      DateTime.toEpochMillis(settlement!.latestUserAuthoredMessageAt!),
+      DateTime.toEpochMillis(DateTime.makeUnsafe(genuineAt)),
+    );
+    assert.isNull(
+      candidates.find((thread) => thread.id === noMatch)?.latestUserAuthoredMessageAt ?? null,
+    );
+    const shell = yield* store
+      .getShellSnapshot({ location: "active" })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    const shellThread = shell.threads.find((thread) => thread.id === threadId);
+    assert.isDefined(shellThread);
+    assert.equal(
+      DateTime.toEpochMillis(shellThread!.latestUserAuthoredMessageAt!),
+      DateTime.toEpochMillis(DateTime.makeUnsafe(genuineAt)),
+    );
+    const authoredQueries = queries.filter(([query]) =>
+      query.includes("AS latest_user_authored_message_at"),
+    );
+    assert.isAtLeast(authoredQueries.length, 2);
+    for (const [query, params] of authoredQueries) {
+      const plan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${query}`,
+        params,
+      );
+      const authoredPlan = plan.filter((row) =>
+        row.detail.includes("ardud_v2_messages_latest_user_authored_idx"),
+      );
+      assert.isAtLeast(authoredPlan.length, 1);
+      // The outer shell query sorts its thread rows; only the authored subquery must avoid a sort.
+      assert.isTrue(
+        authoredPlan.every((row) => row.detail.startsWith("SEARCH message USING INDEX ardud_v2_messages_latest_user_authored_idx")),
+      );
+    }
+    const neighbour = yield* sql<{ readonly updated_at: string }>`
+      SELECT updated_at FROM orchestration_v2_projection_messages
+      WHERE thread_id = ${threadId} AND role = 'user'
+      ORDER BY updated_at DESC, message_id DESC LIMIT 1`;
+    assert.equal(neighbour[0]?.updated_at, "2026-02-01T00:00:00.000Z");
+  }).pipe(Effect.provide(layerSql)),
+);
+
 it.effect("shell failure lookups stay on the thread's own turn items", () =>
   Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;

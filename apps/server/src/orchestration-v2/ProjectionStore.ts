@@ -5696,7 +5696,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ) AS latest_user_message_at,
               (
                 SELECT message.updated_at
-                FROM orchestration_v2_projection_messages message
+                FROM orchestration_v2_projection_messages message INDEXED BY ardud_v2_messages_latest_user_authored_idx
                 WHERE message.thread_id = t.thread_id
                   AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
@@ -5939,7 +5939,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ) AS latest_user_message_at,
               (
                 SELECT message.updated_at
-                FROM orchestration_v2_projection_messages message
+                FROM orchestration_v2_projection_messages message INDEXED BY ardud_v2_messages_latest_user_authored_idx
                 WHERE message.thread_id = t.thread_id AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
                 ORDER BY message.updated_at DESC, message.message_id DESC

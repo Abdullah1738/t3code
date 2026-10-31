@@ -7282,3 +7282,52 @@ it.effect("SQL PR candidate shell selection preserves default snapshots and fork
     return yield* prCandidateShellSelectionBody("SQL", sql);
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("latest authored timestamp follows message replacement and removal", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = "thread:authored-replacement";
+    const oldSelect = (indexed: boolean) => `
+      SELECT message.updated_at
+      FROM orchestration_v2_projection_messages message${indexed ? " INDEXED BY ardud_v2_messages_latest_user_authored_idx" : ""}
+      WHERE message.thread_id = ?
+        AND message.role = 'user'
+        AND json_extract(message.payload_json, '$.createdBy') = 'user'
+      ORDER BY message.updated_at DESC, message.message_id DESC
+      LIMIT 1`;
+    const readBoth = Effect.gen(function* () {
+      const exact = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(false), [threadId]);
+      const indexed = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(true), [threadId]);
+      assert.deepEqual(indexed, exact);
+      return exact[0]?.updated_at ?? null;
+    });
+    const insert = (id: string, role: string, createdBy: string | null, at: string) =>
+      sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, NULL, NULL, ${role}, 0, ${at}, ${at},
+          ${createdBy === null ? "{}" : JSON.stringify({ createdBy })})`;
+
+    yield* insert("m:user-system", "user", "system", "2026-03-01T00:00:00.000Z");
+    yield* insert("m:assistant-user", "assistant", "user", "2026-03-02T00:00:00.000Z");
+    yield* insert("m:missing", "user", null, "2026-03-03T00:00:00.000Z");
+    yield* insert("m:genuine", "user", "user", "2026-03-04T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-04T00:00:00.000Z");
+
+    yield* sql`UPDATE orchestration_v2_projection_messages SET updated_at = ${"2026-03-09T00:00:00.000Z"}
+      WHERE message_id = ${"m:genuine"}`;
+    assert.equal(yield* readBoth, "2026-03-09T00:00:00.000Z");
+
+    yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${"m:genuine"}`;
+    assert.isNull(yield* readBoth);
+
+    yield* insert("m:genuine-a", "user", "user", "2026-03-05T00:00:00.000Z");
+    yield* insert("m:genuine-b", "user", "user", "2026-03-05T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-05T00:00:00.000Z");
+
+    yield* sql`BEGIN`;
+    yield* insert("m:speculative", "user", "user", "2026-03-20T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-20T00:00:00.000Z");
+    yield* sql`ROLLBACK`;
+    assert.equal(yield* readBoth, "2026-03-05T00:00:00.000Z");
+  }).pipe(Effect.provide(layerTest)),
+);
