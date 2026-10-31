@@ -746,7 +746,10 @@ const make = Effect.gen(function* () {
         (pool) => pool.model.model === joined || pool.model.model === model.model,
       );
       const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-      const same = byName.length > 0 ? byName : bySuffix.length === 1 ? bySuffix : [];
+      // A short name is unambiguous when its pools all belong to one model (one key per
+      // level is still one model); two different models or instances stay refused.
+      const suffixModels = new Set(bySuffix.map((pool) => Rules.modelKey(pool.model)));
+      const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
       if (same.length === 0) return undefined;
       const level = Rules.modelLevel(model);
       if (level === null) return same[0];

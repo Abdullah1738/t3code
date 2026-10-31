@@ -5029,6 +5029,24 @@ it.effect("an alias with an explicit level runs on that level's pool, not the fi
   }),
 );
 
+it.effect("a short model name with two level pools of one model still resolves to the level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      yield* kanban.setPool(board.id, opusXhigh, 1);
+      yield* kanban.setPool(board.id, opusHigh, 1);
+      // Short name, default instance: both pools are levels of the one model opus/claude-opus-5-5.
+      const short = modelSelectionOf({ model: "claude-opus-5-5", variant: "high" });
+      const created = yield* kanban.createCard(board.id, { prompt: "s", title: "s", model: short }, owner);
+      assert.strictEqual(Rules.modelLevel(created.model), "high");
+      assert.strictEqual(created.model.model, "opus/claude-opus-5-5");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a pause at a level the provider doesn't offer, with two pools, needs the level", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
