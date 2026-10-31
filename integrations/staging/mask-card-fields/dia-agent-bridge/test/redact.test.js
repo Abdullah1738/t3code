@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactText, redactValue } from "../src/redact.js";
+import { redactText, redactValue, safeErrorMessage } from "../src/redact.js";
 
 test("Luhn-valid card number is masked to its last four digits", () => {
   assert.equal(redactText("card 4111 1111 1111 1111 saved"), "card •••• 1111 saved");
@@ -33,4 +33,31 @@ test("nested arrays and objects are walked", () => {
   assert.deepEqual(redactValue(value), {
     items: [{ text: "cvv: •••" }, { inner: [{ cardNumber: "[redacted]" }] }],
   });
+});
+
+test("repeated spaces or dashes still form a card number", () => {
+  assert.equal(redactText("4111  1111  1111  1111"), "•••• 1111");
+  assert.equal(redactText("4111--1111 1111-1111"), "•••• 1111");
+});
+
+test("labels split from their value by a newline are masked", () => {
+  assert.equal(redactText("Security code\n123"), "Security code\n•••");
+  assert.equal(redactText("Expiry\n12/29"), "Expiry\n••/••");
+});
+
+test("CDP attribute pairs for a sensitive field redact its value", () => {
+  assert.deepEqual(redactValue({ attributes: ["name", "cvc", "value", "123"] }).attributes, ["name", "cvc", "value", "[redacted]"]);
+  assert.deepEqual(redactValue(["autocomplete", "cc-exp", "value", "12/29"]), ["autocomplete", "cc-exp", "value", "[redacted]"]);
+  assert.deepEqual(redactValue(["name", "email", "value", "a@b.co"]), ["name", "email", "value", "a@b.co"]);
+});
+
+test("field descriptor objects with a sensitive name redact their value", () => {
+  assert.deepEqual(redactValue({ name: "cvc", value: "123" }), { name: "cvc", value: "[redacted]" });
+});
+
+test("error text from a failed tool call is redacted", () => {
+  assert.equal(
+    safeErrorMessage(new Error("Security code 123 Expires 12/29; card 4111 1111 1111 1111")),
+    "Security code ••• Expires ••/••; card •••• 1111",
+  );
 });

@@ -30,7 +30,7 @@ import {
   getDiaInventory
 } from "./dia.js";
 import { createMappedTab, pruneTabBindings, tabBindings } from "./tabs.js";
-import { redactValue } from "./redact.js";
+import { redactValue, safeErrorMessage } from "./redact.js";
 
 const server = new McpServer({
   name: "dia-agent-bridge",
@@ -43,7 +43,7 @@ function textResult(value) {
 }
 
 function errorResult(error) {
-  return { isError: true, content: [{ type: "text", text: error?.message || String(error) }] };
+  return { isError: true, content: [{ type: "text", text: safeErrorMessage(error) }] };
 }
 
 const TOOL_TIMEOUT_MS = Number(process.env.DIA_TOOL_TIMEOUT_MS) || 90_000;
