@@ -73,6 +73,7 @@ const shells: ReadonlyArray<OrchestrationV2ThreadShell> = [
   shell("asks-waiting", { ...idle, ...waiting("request-waiting") }),
   shell("asks-archived", { ...idle, ...waiting("request-archived"), archivedAt: askedAt }),
   shell("quiet", idle),
+  shell("migrated"),
 ];
 
 const projectionFor = (threadId: ThreadId): OrchestrationV2ThreadProjection => {
@@ -137,6 +138,52 @@ const seedRows = Effect.gen(function* () {
   yield* request("asks-waiting", "request-waiting", "pending");
   yield* request("asks-archived", "request-archived", "pending");
   yield* request("quiet", "request-answered", "resolved");
+  // A thread migrated from OpenCode to Claude: the old ses_ row was written
+  // later than the Claude row, so only activeProviderThreadId picks the right id.
+  yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
+    thread_id: "migrated",
+    project_id: "project",
+    title: "migrated",
+    default_provider: "claudeAgent",
+    runtime_mode: "full-access",
+    interaction_mode: "default",
+    active_provider_thread_id: "pt-migrated-claude",
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z",
+    archived_at: null,
+    deleted_at: null,
+    provider_instance_id: "claudeAgent",
+    payload_json: JSON.stringify({
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "migrated" },
+      activeProviderThreadId: "pt-migrated-claude",
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+    }),
+  })}`;
+  for (const [providerThreadId, driver, nativeId, updatedAt] of [
+    ["pt-migrated-claude", "claudeAgent", "claude-session-uuid", "2026-01-01T00:00:00.000Z"],
+    ["pt-migrated-oc", "opencode", "ses_migrated_old", "2026-01-02T00:00:00.000Z"],
+  ] as const) {
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert({
+      provider_thread_id: providerThreadId,
+      thread_id: "migrated",
+      owner_node_id: null,
+      provider: driver,
+      provider_session_id: null,
+      status: "idle",
+      first_run_ordinal: 1,
+      last_run_ordinal: 1,
+      updated_at: updatedAt,
+      driver,
+      provider_instance_id: driver,
+      payload_json: JSON.stringify({
+        id: providerThreadId,
+        driver,
+        providerInstanceId: driver,
+        appThreadId: "migrated",
+        nativeThreadRef: { driver, nativeId, strength: "strong" },
+      }),
+    })}`;
+  }
 });
 
 // Shaped like the real snapshot: the location picks which threads are read,
@@ -270,6 +317,7 @@ describe("control listings", () => {
         assert.deepStrictEqual(yield* threadIds("/threads?state=idle,running"), [
           "live-running",
           "live-settling",
+          "migrated",
           "quiet",
         ]);
         assert.deepStrictEqual(yield* threadIds("/threads?archived=true&state=running"), [
@@ -297,6 +345,36 @@ describe("control listings", () => {
           [{ threadId: "asks-waiting", requestId: "request-waiting", kind: "question" }],
         );
         assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+      }),
+    ),
+  );
+
+  it.effect("lists a migrated thread under its current native id, not the old ses_", () =>
+    run(({ get }) =>
+      Effect.gen(function* () {
+        const response = yield* get("/threads/migrated");
+        assert.strictEqual(response.status, 200);
+        const thread = response.body.thread as Record<string, unknown>;
+        assert.strictEqual(thread.nativeSessionId, "claude-session-uuid");
+        assert.deepStrictEqual(thread.native, {
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          nativeId: "claude-session-uuid",
+        });
+      }),
+    ),
+  );
+
+  it.effect("resolves a native id through /identity/resolve", () =>
+    run(({ get }) =>
+      Effect.gen(function* () {
+        const response = yield* get("/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent");
+        assert.strictEqual(response.status, 200);
+        assert.strictEqual(response.body.ok, true);
+        assert.strictEqual(response.body.identity.resolution, "resolved");
+        assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+        assert.strictEqual(response.body.identity.executionKind, "top-level");
+        assert.strictEqual(response.body.identity.driver, "claudeAgent");
       }),
     ),
   );

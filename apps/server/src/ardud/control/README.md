@@ -79,7 +79,8 @@ All paths are under `/api/ardud/control`.
 | GET    | `/models`                                  | Default model and runtime mode, plus each provider's models and variants.                   |
 | GET    | `/threads`                                 | List threads (see filters below).                                                           |
 | POST   | `/threads`                                 | Create a thread, optionally with a first prompt.                                            |
-| GET    | `/threads/by-native/:sesId`                | Thread for an OpenCode session id (`ses_...`).                                              |
+| GET    | `/threads/by-native/:sesId?driver=`        | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.      |
+| GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`. |
 | GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                                  |
 | PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`. |
 | POST   | `/threads/:id/archive-if-idle`             | Archive only if the thread is still idle; otherwise refuse and leave it alone.              |

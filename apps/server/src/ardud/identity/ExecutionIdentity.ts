@@ -1,0 +1,436 @@
+/**
+ * Maps a native id a hook or tool sees (OpenCode `ses_`, Claude session id plus
+ * agent id, Codex thread id) to the exact Robob execution it belongs to.
+ *
+ * Claude in-process children share their parent's session id and are only
+ * told apart by agent id, so a session id alone never names a child. Codex
+ * children own a provider thread. Two app threads claiming the same native id
+ * is `ambiguous`, never resolved to the newest.
+ */
+import type { ModelSelection } from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+
+export class ExecutionIdentityError extends Schema.TaggedError<ExecutionIdentityError>()(
+  "ExecutionIdentityError",
+  { operation: Schema.String, cause: Schema.Defect() },
+) {}
+
+export type ExecutionKind = "top-level" | "app-managed-child" | "provider-native-child";
+export type IdentityResolution = "resolved" | "pending" | "ambiguous" | "unavailable";
+
+export interface NativeBinding {
+  readonly driver: string;
+  readonly providerInstanceId: string;
+  readonly nativeId: string;
+}
+
+export interface ResolveInput {
+  readonly nativeId: string;
+  readonly driver?: string;
+  readonly providerInstanceId?: string;
+  readonly agentId?: string;
+}
+
+export interface ExecutionIdentityResult {
+  readonly resolution: IdentityResolution;
+  /** Null unless resolved. */
+  readonly robobThreadId: string | null;
+  readonly parentThreadId: string | null;
+  readonly rootThreadId: string | null;
+  readonly executionKind: ExecutionKind | null;
+  readonly driver: string | null;
+  readonly providerInstanceId: string | null;
+  /** The native session that owns the execution (the parent's, for Claude children). */
+  readonly nativeSessionId: string | null;
+  readonly nativeAgentId: string | null;
+  readonly model: ModelSelection | null;
+  readonly acceptsMessages: boolean;
+  /** Thread ids that matched when resolution is ambiguous; empty otherwise. */
+  readonly candidates: ReadonlyArray<string>;
+}
+
+export interface ExecutionIdentityShape {
+  readonly resolve: (
+    input: ResolveInput,
+  ) => Effect.Effect<ExecutionIdentityResult, ExecutionIdentityError>;
+  /** Current native binding per thread, from its active provider thread. */
+  readonly currentNative: (
+    threadIds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyMap<string, NativeBinding>, ExecutionIdentityError>;
+  /** Every native binding a thread has had, current or historical. */
+  readonly aliases: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<NativeBinding>, ExecutionIdentityError>;
+}
+
+export class ExecutionIdentity extends Context.Service<ExecutionIdentity, ExecutionIdentityShape>()(
+  "t3/ardud/identity/ExecutionIdentity",
+) {}
+
+// A provider thread with no native id yet is "pending" for this long after its
+// last write; the projection keeps no other creation timestamp for it.
+const PENDING_WINDOW_DURATION = Duration.seconds(120);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CHUNK = 400;
+
+interface ProviderRow {
+  readonly provider_thread_id: string;
+  readonly thread_id: string | null;
+  readonly driver: string | null;
+  readonly provider_instance_id: string | null;
+  readonly native_id: string | null;
+  readonly updated_at: string;
+  readonly active: number;
+}
+
+interface ThreadRow {
+  readonly parent_thread_id: string | null;
+  readonly root_thread_id: string | null;
+  readonly model_json: string | null;
+}
+
+interface SubagentRow {
+  readonly thread_id: string;
+  readonly child_thread_id: string | null;
+  readonly model_json: string | null;
+}
+
+const parseModel = (json: string | null): ModelSelection | null => {
+  if (json === null) return null;
+  try {
+    return JSON.parse(json) as ModelSelection;
+  } catch {
+    return null;
+  }
+};
+
+const chunks = <A>(values: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> => {
+  const out: Array<ReadonlyArray<A>> = [];
+  for (let index = 0; index < values.length; index += CHUNK) {
+    out.push(values.slice(index, index + CHUNK));
+  }
+  return out;
+};
+
+const unresolved = (
+  resolution: Exclude<IdentityResolution, "resolved">,
+  candidates: ReadonlyArray<string> = [],
+): ExecutionIdentityResult => ({
+  resolution,
+  robobThreadId: null,
+  parentThreadId: null,
+  rootThreadId: null,
+  executionKind: null,
+  driver: null,
+  providerInstanceId: null,
+  nativeSessionId: null,
+  nativeAgentId: null,
+  model: null,
+  acceptsMessages: false,
+  candidates,
+});
+
+const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const fail = (operation: string) => (cause: unknown) =>
+    new ExecutionIdentityError({ operation, cause });
+
+  // Same DDL as ControlStore (the shared fork contract), created idempotently.
+  yield* sql`
+    CREATE TABLE IF NOT EXISTS ardud_opencode_import (
+      native_session_id TEXT PRIMARY KEY,
+      thread_id         TEXT NOT NULL UNIQUE,
+      imported_at       TEXT NOT NULL
+    )
+  `.pipe(Effect.mapError(fail("ensure-opencode-import")));
+
+  // Driver and instance columns are newer than some rows; fall back to payload.
+  const providerRowsFor = (nativeId: string) =>
+    sql<ProviderRow>`
+      SELECT pt.provider_thread_id, pt.thread_id,
+        COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+        COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+        json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+        pt.updated_at,
+        CASE WHEN t.active_provider_thread_id = pt.provider_thread_id THEN 1 ELSE 0 END AS active
+      FROM orchestration_v2_projection_provider_threads pt
+      LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = pt.thread_id
+      WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
+    `.pipe(Effect.mapError(fail("read-provider-rows")));
+
+  const providerRowsForThread = (threadId: string) =>
+    sql<ProviderRow>`
+      SELECT pt.provider_thread_id, pt.thread_id,
+        COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+        COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+        json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+        pt.updated_at,
+        CASE WHEN t.active_provider_thread_id = pt.provider_thread_id THEN 1 ELSE 0 END AS active
+      FROM orchestration_v2_projection_provider_threads pt
+      LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = pt.thread_id
+      WHERE pt.thread_id = ${threadId}
+      ORDER BY pt.updated_at ASC
+    `.pipe(Effect.mapError(fail("read-thread-provider-rows")));
+
+  const importedThreadsFor = (nativeId: string) =>
+    sql<{ readonly thread_id: string }>`
+      SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.thread_id)),
+      Effect.mapError(fail("read-import")),
+    );
+
+  const importedNativesFor = (threadId: string) =>
+    sql<{ readonly native_session_id: string }>`
+      SELECT native_session_id FROM ardud_opencode_import WHERE thread_id = ${threadId}
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.native_session_id)),
+      Effect.mapError(fail("read-import-natives")),
+    );
+
+  const threadRow = (threadId: string) =>
+    sql<ThreadRow>`
+      SELECT json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
+        json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
+        json_extract(payload_json, '$.modelSelection') AS model_json
+      FROM orchestration_v2_projection_threads
+      WHERE thread_id = ${threadId}
+    `.pipe(
+      Effect.map((rows) => rows[0] ?? null),
+      Effect.mapError(fail("read-thread")),
+    );
+
+  // Claude children have no provider thread: the subagent row is the only link,
+  // and the agent id is the child's discriminator inside the shared session.
+  const subagentByAgent = (threadId: string, agentId: string) =>
+    sql<SubagentRow>`
+      SELECT thread_id, child_thread_id, json_extract(payload_json, '$.modelSelection') AS model_json
+      FROM orchestration_v2_projection_subagents
+      WHERE thread_id = ${threadId}
+        AND json_extract(payload_json, '$.nativeTaskRef.nativeId') = ${agentId}
+      ORDER BY updated_at DESC
+    `.pipe(
+      Effect.map((rows) => rows[0] ?? null),
+      Effect.mapError(fail("read-subagent-by-agent")),
+    );
+
+  // Codex children: the subagent row points at the child's own provider thread.
+  const subagentByProviderThread = (providerThreadId: string) =>
+    sql<SubagentRow>`
+      SELECT thread_id, child_thread_id, json_extract(payload_json, '$.modelSelection') AS model_json
+      FROM orchestration_v2_projection_subagents
+      WHERE provider_thread_id = ${providerThreadId} AND child_thread_id IS NOT NULL
+      ORDER BY updated_at DESC
+    `.pipe(
+      Effect.map((rows) => rows[0] ?? null),
+      Effect.mapError(fail("read-subagent-by-provider-thread")),
+    );
+
+  // Walks parentThreadId up to the root. The visited set stops cycles; there is
+  // no depth cap, so a long chain still ends at its real root.
+  const rootOf = (threadId: string) =>
+    Effect.gen(function* () {
+      const start = yield* threadRow(threadId);
+      if (start?.root_thread_id) return start.root_thread_id;
+      const visited = new Set<string>([threadId]);
+      let top = threadId;
+      let parent = start?.parent_thread_id ?? null;
+      while (parent !== null && !visited.has(parent)) {
+        visited.add(parent);
+        top = parent;
+        parent = (yield* threadRow(parent))?.parent_thread_id ?? null;
+      }
+      return top;
+    });
+
+  // Is there a fresh provider thread still waiting for its native id? That
+  // means "not yet", not "unknown".
+  const hasPendingProvider = (driver: string | undefined, instance: string | undefined) =>
+    Effect.gen(function* () {
+      const cutoff = DateTime.formatIso(
+        DateTime.subtractDuration(yield* DateTime.now, PENDING_WINDOW_DURATION),
+      );
+      const rows = yield* sql<{
+        readonly driver: string | null;
+        readonly provider_instance_id: string | null;
+        readonly native_id: string | null;
+      }>`
+        SELECT COALESCE(driver, json_extract(payload_json, '$.driver')) AS driver,
+          COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS provider_instance_id,
+          json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
+        FROM orchestration_v2_projection_provider_threads
+        WHERE updated_at >= ${cutoff}
+      `;
+      return rows.some(
+        (row) =>
+          (row.native_id === null || row.native_id.startsWith("pending")) &&
+          (driver === undefined || row.driver === driver) &&
+          (instance === undefined || row.provider_instance_id === instance),
+      );
+    }).pipe(Effect.mapError(fail("read-pending-providers")));
+
+  const resolve: ExecutionIdentityShape["resolve"] = Effect.fn("ExecutionIdentity.resolve")(
+    function* (input) {
+      const providers = (yield* providerRowsFor(input.nativeId)).filter(
+        (row) =>
+          row.thread_id !== null &&
+          (input.driver === undefined || row.driver === input.driver) &&
+          (input.providerInstanceId === undefined ||
+            row.provider_instance_id === input.providerInstanceId),
+      );
+
+      // Sessions the importer adopted are aliases of their thread (OpenCode only).
+      const importAllowed =
+        (input.driver === undefined || input.driver === "opencode") &&
+        (input.providerInstanceId === undefined || input.providerInstanceId === "opencode");
+      const imported = importAllowed ? yield* importedThreadsFor(input.nativeId) : [];
+
+      const threadIds = [...new Set([...providers.map((row) => row.thread_id!), ...imported])];
+      if (threadIds.length === 0) {
+        if (!UUID.test(input.nativeId)) return unresolved("unavailable");
+        return (yield* hasPendingProvider(input.driver, input.providerInstanceId))
+          ? unresolved("pending")
+          : unresolved("unavailable");
+      }
+      if (threadIds.length > 1) return unresolved("ambiguous", threadIds);
+
+      const threadId = threadIds[0]!;
+      const row = providers
+        .filter((candidate) => candidate.thread_id === threadId)
+        .toSorted((a, b) => b.active - a.active || b.updated_at.localeCompare(a.updated_at))[0];
+      const driver = row?.driver ?? "opencode";
+      const providerInstanceId = row?.provider_instance_id ?? "opencode";
+
+      if (input.agentId !== undefined) {
+        const subagent = yield* subagentByAgent(threadId, input.agentId);
+        if (subagent === null || subagent.child_thread_id === null) {
+          return (yield* hasPendingProvider(driver, providerInstanceId))
+            ? unresolved("pending")
+            : unresolved("unavailable");
+        }
+        return {
+          resolution: "resolved",
+          robobThreadId: subagent.child_thread_id,
+          parentThreadId: subagent.thread_id,
+          rootThreadId: yield* rootOf(subagent.thread_id),
+          executionKind: "provider-native-child",
+          driver,
+          providerInstanceId,
+          nativeSessionId: input.nativeId,
+          nativeAgentId: input.agentId,
+          model: parseModel(subagent.model_json),
+          acceptsMessages: false,
+          candidates: [],
+        };
+      }
+
+      if (row !== undefined) {
+        const child = yield* subagentByProviderThread(row.provider_thread_id);
+        if (child !== null) {
+          return {
+            resolution: "resolved",
+            robobThreadId: child.child_thread_id,
+            parentThreadId: child.thread_id,
+            rootThreadId: yield* rootOf(child.thread_id),
+            executionKind: "provider-native-child",
+            driver,
+            providerInstanceId,
+            nativeSessionId: input.nativeId,
+            nativeAgentId: null,
+            model: parseModel(child.model_json),
+            acceptsMessages: true,
+            candidates: [],
+          };
+        }
+      }
+
+      const thread = yield* threadRow(threadId);
+      const parentThreadId = thread?.parent_thread_id ?? null;
+      return {
+        resolution: "resolved",
+        robobThreadId: threadId,
+        parentThreadId,
+        rootThreadId: yield* rootOf(threadId),
+        executionKind: parentThreadId === null ? "top-level" : "app-managed-child",
+        driver,
+        providerInstanceId,
+        nativeSessionId: input.nativeId,
+        nativeAgentId: null,
+        model: parseModel(thread?.model_json ?? null),
+        acceptsMessages: true,
+        candidates: [],
+      };
+    },
+  );
+
+  const currentNative: ExecutionIdentityShape["currentNative"] = (threadIds) =>
+    Effect.forEach(
+      chunks([...new Set(threadIds)]),
+      (ids) =>
+        sql<{
+          readonly thread_id: string;
+          readonly driver: string | null;
+          readonly provider_instance_id: string | null;
+          readonly native_id: string | null;
+        }>`
+          SELECT t.thread_id,
+            COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+            COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id
+          FROM orchestration_v2_projection_threads t
+          JOIN orchestration_v2_projection_provider_threads pt
+            ON pt.provider_thread_id = t.active_provider_thread_id
+          WHERE t.thread_id IN ${sql.in(ids)}
+        `,
+      { concurrency: 1 },
+    ).pipe(
+      Effect.map((pages) => {
+        const out = new Map<string, NativeBinding>();
+        for (const row of pages.flat()) {
+          if (row.driver !== null && row.provider_instance_id !== null && row.native_id !== null) {
+            out.set(row.thread_id, {
+              driver: row.driver,
+              providerInstanceId: row.provider_instance_id,
+              nativeId: row.native_id,
+            });
+          }
+        }
+        return out;
+      }),
+      Effect.mapError(fail("current-native")),
+    );
+
+  const aliases: ExecutionIdentityShape["aliases"] = (threadId) =>
+    Effect.gen(function* () {
+      const providers = yield* providerRowsForThread(threadId);
+      const imported = yield* importedNativesFor(threadId);
+      const seen = new Map<string, NativeBinding>();
+      for (const row of providers) {
+        if (row.driver !== null && row.provider_instance_id !== null && row.native_id !== null) {
+          seen.set(`${row.driver}|${row.provider_instance_id}|${row.native_id}`, {
+            driver: row.driver,
+            providerInstanceId: row.provider_instance_id,
+            nativeId: row.native_id,
+          });
+        }
+      }
+      for (const nativeId of imported) {
+        seen.set(`opencode|opencode|${nativeId}`, {
+          driver: "opencode",
+          providerInstanceId: "opencode",
+          nativeId,
+        });
+      }
+      return [...seen.values()];
+    });
+
+  return ExecutionIdentity.of({ resolve, currentNative, aliases });
+});
+
+export const layer = Layer.effect(ExecutionIdentity, make);

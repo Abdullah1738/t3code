@@ -20,7 +20,9 @@ const HELP = `t3ctl <command> [options]
          [--variant V] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
-  native SES_ID                        thread for an OpenCode session id
+  native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
+  identity NATIVE_ID [--driver D] [--instance I] [--agent A]
+                                       resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
   send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
@@ -40,6 +42,9 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
   options: {
     url: { type: "string" },
     token: { type: "string" },
+    driver: { type: "string" },
+    instance: { type: "string" },
+    agent: { type: "string" },
     prompt: { type: "string" },
     title: { type: "string" },
     dir: { type: "string" },
@@ -153,7 +158,17 @@ async function main() {
     case "status":
       return print(await client.thread(need(args[0], "THREAD")));
     case "native":
-      return print(await client.threadByNativeSession(need(args[0], "SES_ID")));
+      return print(
+        await client.threadByNativeSession(need(args[0], "SES_ID"), { driver: flags.driver }),
+      );
+    case "identity":
+      return print(
+        await client.identity(need(args[0], "NATIVE_ID"), {
+          driver: flags.driver,
+          instance: flags.instance,
+          agentId: flags.agent,
+        }),
+      );
     case "messages": {
       const threadId = need(args[0], "THREAD");
       const result = await client.messages(threadId, {
