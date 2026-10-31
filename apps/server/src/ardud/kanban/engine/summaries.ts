@@ -37,7 +37,7 @@ export type BoardTallies = Map<string, BoardTally>;
 const cardCount = (card: SummaryCard): CardCount =>
   card.settledAt !== null
     ? null
-    : (card.stage === "needs_owner" || card.asks.some((ask) => ask.closedAt === null))
+    : card.stage === "needs_owner" || card.asks.some((ask) => ask.closedAt === null)
       ? "owner"
       : card.activeThreadId !== null
         ? "running"
