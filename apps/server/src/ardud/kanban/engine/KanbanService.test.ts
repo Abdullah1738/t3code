@@ -5421,6 +5421,107 @@ it.effect("a short model name with two level pools of one model still resolves t
   }),
 );
 
+it.effect("changing a pool's level moves its open cards and running thread, not finished cards", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const oldKey = Rules.poolKey(board.defaultCardModel);
+      // toyBoard's card pool is the default card model (Opus xhigh) with 1 slot.
+      const running = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(running.id)).card.activeThreadId!;
+      const waiting = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      const done = yield* kanban.createCard(board.id, { prompt: "C", title: "C" }, owner);
+      yield* kanban.moveCard(done.id, "completed", "owner", owner);
+      assert.strictEqual(Rules.modelLevel(waiting.model), "xhigh");
+
+      const pools = yield* kanban.setPool(board.id, opusHigh, undefined, { replaces: oldKey });
+
+      assert.isFalse(pools.some((pool) => pool.key === oldKey));
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(opusHigh))?.slots, 1);
+      const after = (yield* kanban.card(running.id)).card;
+      assert.strictEqual(Rules.modelLevel(after.model), "high");
+      assert.strictEqual(after.activePool, Rules.poolKey(opusHigh));
+      assert.strictEqual(Rules.modelLevel((yield* kanban.card(waiting.id)).card.model), "high");
+      assert.strictEqual(Rules.modelLevel((yield* kanban.card(done.id)).card.model), "xhigh");
+      const switches = fake.modelSwitches.filter((entry) => entry.threadId === thread);
+      assert.strictEqual(switches.length, 1);
+      assert.strictEqual(Rules.modelLevel(switches[0]!.model), "high");
+      const events = (yield* kanban.card(waiting.id)).events;
+      assert.isTrue(events.some((event) => event.kind === "edited" && event.body === "model level: high"));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a level change refuses a level another pool of the model already has", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haikuMax = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      // toyBoard already has the manager's Haiku xhigh pool.
+      yield* kanban.setPool(board.id, haikuMax, 2);
+      const refused = yield* kanban
+        .setPool(board.id, haikuMax, undefined, { replaces: Rules.poolKey(board.managerModel) })
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, "already has a pool at max");
+      const other = yield* kanban
+        .setPool(board.id, board.defaultCardModel, undefined, { replaces: Rules.poolKey(haikuMax) })
+        .pipe(Effect.flip);
+      assert.include(other.detail, "a level change keeps the model");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a work thread holding its slot between cards follows its pool's new level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      // The thread's own move mid-turn: it keeps the slot as a hold until its turn ends.
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: thread });
+      yield* kanban.setPool(board.id, opusHigh, undefined, {
+        replaces: Rules.poolKey(board.defaultCardModel),
+      });
+      // Its hold is on the new pool, so a follow-up card on its (high) pool is its own to take.
+      const follow = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      assert.strictEqual(follow.card.activePool, Rules.poolKey(opusHigh));
+      assert.strictEqual(Rules.modelLevel(follow.card.model), "high");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a level change whose write fails leaves the pool and its cards on the old level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const oldKey = Rules.poolKey(board.defaultCardModel);
+      const waiting = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      rekeyFailures.remaining = 1;
+      const failed = yield* kanban
+        .setPool(board.id, opusHigh, undefined, { replaces: oldKey })
+        .pipe(Effect.flip);
+      assert.strictEqual(rekeyFailures.remaining, 0);
+      assert.strictEqual(failed.code, "failed");
+      const pools = (yield* kanban.snapshot(board.id)).pools;
+      assert.isTrue(pools.some((pool) => pool.key === oldKey));
+      assert.isFalse(pools.some((pool) => pool.key === Rules.poolKey(opusHigh)));
+      const after = yield* kanban.card(waiting.id);
+      assert.strictEqual(Rules.modelLevel(after.card.model), "xhigh");
+      assert.isFalse(after.events.some((event) => event.body === "model level: high"));
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
 it.effect("a pause at a level the provider doesn't offer, with two pools, needs the level", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

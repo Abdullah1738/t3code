@@ -324,10 +324,15 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
 
+  /**
+   * Sets one pool's slots. With `replaces` (a pool key), that pool moves to `model`'s level
+   * and its open cards follow; `slots` undefined keeps its slot count.
+   */
   readonly setPool: (
     boardId: KanbanBoard["id"],
     model: ModelSelection,
-    slots: number,
+    slots: number | undefined,
+    options?: { readonly replaces?: string | undefined },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly removePool: (
     boardId: KanbanBoard["id"],
@@ -4522,10 +4527,130 @@ const make = Effect.gen(function* () {
     return same[0];
   });
 
-  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots) =>
+  /**
+   * Moves pool `from` to `to` (same row, new key and level) with the cards still to run on it,
+   * in one transaction (store.rekeyBoard). An open card's work model and weighted entries that
+   * resolve to `from` take the new level; a slot a card or a thread between cards holds on
+   * `from` moves to `to`. Done and settled cards keep the level they ran at. A running work
+   * thread switches for its next turn; review threads aren't switched, their next step reads
+   * the chain.
+   */
+  const movePoolLevel = Effect.fn("KanbanService.movePoolLevel")(function* (
+    board: KanbanBoard,
+    pools: ReadonlyArray<KanbanPool>,
+    from: KanbanPool,
+    to: KanbanPool,
+  ) {
+    const at = yield* nowIso;
+    // `pools` is read before the move: a card is on `from` when its model resolves to it now.
+    const onPool = (entry: ModelSelection) => Rules.poolOf(pools, entry) === from.key;
+    const moved: Array<{ readonly card: KanbanCard; readonly leveled: boolean; readonly work: boolean }> =
+      [];
+    for (const card of yield* store.cards(board.id)) {
+      const moveSlot = card.activePool === from.key;
+      const open = card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage);
+      const work = open && onPool(card.model);
+      const weighted = open && card.models.some((entry) => onPool(entry.model));
+      if (!moveSlot && !work && !weighted) continue;
+      moved.push({
+        card: {
+          ...card,
+          model: work ? to.model : card.model,
+          models: weighted
+            ? card.models.map((entry) => (onPool(entry.model) ? { ...entry, model: to.model } : entry))
+            : card.models,
+          activePool: moveSlot ? to.key : card.activePool,
+          updatedAt: work || weighted ? at : card.updatedAt,
+        },
+        leveled: work || weighted,
+        work,
+      });
+    }
+    yield* store.rekeyBoard(
+      board.id,
+      [{ from: from.key, pool: to }],
+      moved.map((entry) => entry.card),
+    );
+    const actor: KanbanActor = { _tag: "system", component: "pools" };
+    const level = Rules.modelLevel(to.model) ?? "default";
+    const switched = new Set<string>();
+    for (const { card, leveled, work } of moved) {
+      // Logged before the publish: clients re-read the card's history when it's published.
+      if (leveled) yield* logEvent(card, actor, "edited", { body: `model level: ${level}` });
+      yield* publish(board.id, { _tag: "card", card });
+      if (
+        work &&
+        card.activeRole === "work" &&
+        card.activeThreadId !== null &&
+        !switched.has(card.activeThreadId)
+      ) {
+        switched.add(card.activeThreadId);
+        yield* threads.setModel(card.activeThreadId, to.model).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
+          ),
+        );
+      }
+    }
+    // A held slot (a work thread between cards) moves with its pool and keeps its start time.
+    yield* Ref.update(
+      holds,
+      (all) =>
+        new Map(
+          [...all].map(([threadId, held]) =>
+            held.boardId === board.id && held.pool === from.key
+              ? [threadId, { ...held, pool: to.key }]
+              : [threadId, held],
+          ),
+        ),
+    );
+  });
+
+  /** Moves the pool at `replaces` to `model`'s level, keeping its row and, unless given, its slots. */
+  const changePoolLevel = Effect.fn("KanbanService.changePoolLevel")(function* (
+    board: KanbanBoard,
+    model: ModelSelection,
+    slots: number | undefined,
+    replaces: string,
+  ) {
+    const pools = yield* store.pools(board.id);
+    const from = pools.find((pool) => pool.key === replaces);
+    if (!from) return yield* failWith("not-found", `pool ${replaces}`);
+    if (Rules.modelKey(from.model) !== Rules.modelKey(model)) {
+      return yield* failWith(
+        "invalid",
+        `${replaces} runs ${from.model.model}; a level change keeps the model`,
+      );
+    }
+    const key = Rules.poolKey(model);
+    const count = slots === undefined ? from.slots : Math.max(0, Math.round(slots));
+    if (key === from.key) {
+      if (count === from.slots) return pools;
+      yield* store.putPool(board.id, { ...from, slots: count });
+      return yield* store.pools(board.id);
+    }
+    if (pools.some((pool) => pool.key === key)) {
+      return yield* failWith(
+        "conflict",
+        `${model.model} already has a pool at ${Rules.modelLevel(model) ?? "no level"}`,
+      );
+    }
+    yield* checkModel(model);
+    yield* movePoolLevel(board, pools, from, { key, model, slots: count });
+    return yield* store.pools(board.id);
+  });
+
+  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots, options) =>
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
+        if (options?.replaces !== undefined) {
+          const changed = yield* changePoolLevel(board, model, slots, options.replaces);
+          yield* publish(boardId, { _tag: "pools", pools: changed });
+          yield* kick;
+          return changed;
+        }
+        if (slots === undefined) return yield* failWith("invalid", "slots is required");
         const count = Math.max(0, Math.round(slots));
         const pools = yield* store.pools(board.id);
         const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));

@@ -649,7 +649,11 @@ const handlers = {
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
-        return { pools: yield* service.setPool(board.id, modelOf(input.model), input.slots) };
+        return {
+          pools: yield* service.setPool(board.id, modelOf(input.model), input.slots, {
+            replaces: input.replaces,
+          }),
+        };
       }),
     ),
   ),

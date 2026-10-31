@@ -420,7 +420,16 @@ const PoolSet = tool(
   "pool_set",
   "Set a model pool",
   "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
-  { model: ModelInput, slots: NonNegativeInt },
+  {
+    model: ModelInput,
+    slots: Schema.optional(NonNegativeInt),
+    replaces: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Key of the pool to move to this model's level (board_get pools); its open cards follow. Leave out slots to keep its count.",
+      ),
+    ),
+  },
   { pools: Records },
   { readonly: false },
 );
