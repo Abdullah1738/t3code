@@ -177,3 +177,29 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
     }),
   );
 });
+
+it.layer(TestLayer)("kanban store: evaluator queue", (it) => {
+  it.effect("reads queued evaluator sends oldest first and drops one thread", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putBoard(board);
+      const entry = (text: string) => ({ text, model: null, queuedAt: at });
+      yield* store.enqueueEvaluator(boardId, "thread-a", entry("one"));
+      yield* store.enqueueEvaluator(boardId, "thread-b", entry("two"));
+      yield* store.enqueueEvaluator(boardId, "thread-a", entry("three"));
+      assert.deepStrictEqual(
+        (yield* store.evaluatorQueue(boardId)).map((item) => [item.threadId, item.entry.text]),
+        [
+          ["thread-a", "one"],
+          ["thread-b", "two"],
+          ["thread-a", "three"],
+        ],
+      );
+      yield* store.dropEvaluatorQueue("thread-a");
+      assert.deepStrictEqual(
+        (yield* store.evaluatorQueue(boardId)).map((item) => [item.threadId, item.entry.text]),
+        [["thread-b", "two"]],
+      );
+    }),
+  );
+});
