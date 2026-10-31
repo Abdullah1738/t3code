@@ -15,6 +15,7 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -24,11 +25,8 @@ export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "sy
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
-/** A model's reasoning level (its string "variant" option), or null. */
-export const modelLevel = (model: ModelSelection): string | null => {
-  const value = model.options?.find((option) => option.id === "variant")?.value;
-  return typeof value === "string" ? value : null;
-};
+/** A model's reasoning level (its effort option for its driver), or null. */
+export const modelLevel = (model: ModelSelection): string | null => selectionEffort(model);
 
 /** One key per model, whatever its level: outages and the composer's list are per model. */
 export const modelKey = (model: ModelSelection): string => `${model.instanceId}/${model.model}`;
@@ -40,21 +38,21 @@ export const poolKey = (model: ModelSelection): string => {
 };
 
 /**
- * The pool a model runs on: the pool at its exact level, else the first pool (in pool
- * order) of the same model at any level. A board with one pool per model behaves as
- * before levels were part of the key.
+ * The pool a model runs on: the pool at its exact level. A model with a level never
+ * falls back to another level's pool (max and xhigh are different pools). A model with
+ * no level takes the first pool (in pool order) of the same model, so a board with one
+ * pool per model behaves as before levels were part of the key.
  */
 export function poolFor(
   pools: ReadonlyArray<KanbanPool>,
   model: ModelSelection,
 ): KanbanPool | undefined {
   const key = poolKey(model);
-  const base = modelKey(model);
   // Compared by each pool's model, not its stored key, so a pool not yet rekeyed still matches.
-  return (
-    pools.find((pool) => poolKey(pool.model) === key) ??
-    pools.find((pool) => modelKey(pool.model) === base)
-  );
+  const exact = pools.find((pool) => poolKey(pool.model) === key);
+  if (exact !== undefined || modelLevel(model) !== null) return exact;
+  const base = modelKey(model);
+  return pools.find((pool) => modelKey(pool.model) === base);
 }
 
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);

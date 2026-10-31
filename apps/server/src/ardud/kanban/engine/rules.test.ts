@@ -1084,9 +1084,12 @@ describe("pool levels", () => {
       [opus, 1],
     ]);
     expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
-    expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
+    // A named level never borrows another level's pool (max and low are different pools).
+    expect(poolFor(all, at(haiku, "low"))).toBeUndefined();
     expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
-    expect(poolFor(all, at(opus, "high"))?.key).toBe(poolKey(opus));
+    // A named level on a model whose only pool has no level gets no pool: levels never mix.
+    expect(poolFor(all, at(opus, "high"))).toBeUndefined();
+    expect(poolFor(all, opus)?.key).toBe(poolKey(opus));
     expect(poolFor(all, sol)).toBeUndefined();
   });
 
@@ -1102,15 +1105,15 @@ describe("pool levels", () => {
       [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
       all,
     );
-    // The low card would run on max (the first Haiku pool), but max's one slot is taken.
+    // A low card has no pool of its own here, so it waits rather than running on max or xhigh.
     expect(plan.map((d) => d.pool)).toEqual([poolKey(xhigh), poolKey(max)]);
     const alone = planDispatch(board, [card({ model: at(haiku, "low") })], all);
-    expect(alone.map((d) => d.pool)).toEqual([poolKey(max)]);
+    expect(alone).toEqual([]);
   });
 
   it("lets a thread claim a card whose level runs on the thread's pool", () => {
     const max = at(haiku, "max");
-    const c = card({ model: at(haiku, "low") });
+    const c = card({ model: max });
     const ctx = {
       threadId: "t1",
       pool: poolKey(max),
@@ -1119,8 +1122,33 @@ describe("pool levels", () => {
       carrying: 0,
       slots: 1,
     };
-    expect(checkClaim(board, c, ctx).ok).toBe(false);
+    // Its own level's pool is the thread's pool, so the claim goes through.
     expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(true);
     expect(modelOnPool(c, poolKey(max), pools([[max, 1]]))).toEqual(c.model);
+    // A card at another level does not run on this thread's max pool, so it can't be claimed.
+    const low = card({ model: at(haiku, "low") });
+    const lowCtx = { ...ctx, byId: new Map([[low.id as string, low]]), pools: pools([[max, 1]]) };
+    expect(checkClaim(board, low, lowCtx).ok).toBe(false);
+  });
+});
+
+describe("claude effort pools", () => {
+  const claude = (level: string | null): ModelSelection => ({
+    instanceId: ProviderInstanceId.make("claudeAgent"),
+    model: "claude-haiku-5-5",
+    ...(level === null ? {} : { options: [{ id: "effort", value: level }] }),
+  });
+  const maxPool = claude("max");
+  const xhighPool = claude("xhigh");
+
+  it("keeps max and xhigh on their own pools and falls back only for a card with no level", () => {
+    const all = pools([
+      [maxPool, 1],
+      [xhighPool, 1],
+    ]);
+    expect(poolFor(all, claude("max"))?.key).toBe(poolKey(maxPool));
+    expect(poolFor(all, claude("xhigh"))?.key).toBe(poolKey(xhighPool));
+    expect(poolFor(all, claude("low"))).toBeUndefined();
+    expect(poolFor(all, claude(null))?.key).toBe(poolKey(maxPool));
   });
 });
