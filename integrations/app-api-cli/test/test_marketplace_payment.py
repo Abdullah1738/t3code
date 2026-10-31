@@ -552,6 +552,17 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(result['reservation_released_minor'], 1980)
         self.assertFalse(result['financial_send'])
 
+    def test_reconcile_payment_timeout_with_null_payment_error_releases(self):
+        failed = failed_responses(main.ORDER, 1980)
+        failed['order_status'] = {'status': 'failed', 'statusMessage': 'Payment timed out',
+                                  'paymentError': None, 'paymentErrorMsg': None}
+        flow, wire = self.placed(**failed)
+        flow.place()
+        result = disposition.reconcile(flow.flow_id, client=flow.client)
+        self.assertEqual(result['state'], 'RELEASED')
+        self.assertEqual(result['reservation_released_minor'], 1980)
+        self.assertFalse(result['financial_send'])
+
     def test_reconcile_rejects_concurrent_success(self):
         flow, wire = self.placed(**failed_responses(main.ORDER, 1980))
         flow.place()
@@ -571,6 +582,10 @@ class PaymentTests(unittest.TestCase):
 class ProjectionTests(unittest.TestCase):
     def test_incomplete_wrong_order_wrong_card_or_partial_refunds_reject(self):
         changes = [lambda s,d,r: s.update(status='pending'),
+                   lambda s,d,r: s.update(paymentError=None, statusMessage='Payment pending'),
+                   lambda s,d,r: s.update(paymentError=None),
+                   lambda s,d,r: (s.update(paymentError=None, statusMessage='Payment timed out'),
+                                  r['sections']['completedRefunds']['refundMediums'][0].update(description='Refunded')),
                    lambda s,d,r: d.update(orderNr='NOTTHISORDER'),
                    lambda s,d,r: d['itemGroups'][0]['subStatus'].update(highStatusCode='delivered'),
                    lambda s,d,r: r['sections']['paymentDetails'].update(amount='1'),
