@@ -452,28 +452,26 @@ const sessionRefresh = (
   };
 };
 
-const sessionHistoryItems = [1, 2, 3, 4].map(
-  (ordinal): OrchestrationV2TurnItem => ({
-    id: TurnItemId.make(`item:session-history:${ordinal}`),
-    threadId: THREAD_ID,
-    runId: null,
-    nodeId: null,
-    providerThreadId: null,
-    providerTurnId: null,
-    nativeItemRef: null,
-    parentItemId: null,
-    ordinal,
-    status: "completed",
-    title: null,
-    startedAt: v2Projection.updatedAt,
-    completedAt: v2Projection.updatedAt,
-    updatedAt: v2Projection.updatedAt,
-    type: "assistant_message",
-    messageId: MessageId.make(`message:session-history:${ordinal}`),
-    text: `History page ${ordinal}`,
-    streaming: false,
-  }),
-);
+const sessionHistoryItems = [1, 2, 3, 4].map((ordinal): OrchestrationV2TurnItem => ({
+  id: TurnItemId.make(`item:session-history:${ordinal}`),
+  threadId: THREAD_ID,
+  runId: null,
+  nodeId: null,
+  providerThreadId: null,
+  providerTurnId: null,
+  nativeItemRef: null,
+  parentItemId: null,
+  ordinal,
+  status: "completed",
+  title: null,
+  startedAt: v2Projection.updatedAt,
+  completedAt: v2Projection.updatedAt,
+  updatedAt: v2Projection.updatedAt,
+  type: "assistant_message",
+  messageId: MessageId.make(`message:session-history:${ordinal}`),
+  text: `History page ${ordinal}`,
+  streaming: false,
+}));
 
 const sessionHistoryRows = sessionHistoryItems.map((item, position) => ({
   position,
@@ -510,7 +508,9 @@ describe("EnvironmentThreads", () => {
         const heldPageStarted = yield* Deferred.make<void>();
         const releaseHeldPage = yield* Deferred.make<void>();
         const requestedCursors: string[] = [];
-        const encodePage = Schema.encodeEffect(Schema.toCodecJson(OrchestrationV2ThreadHistoryPage));
+        const encodePage = Schema.encodeEffect(
+          Schema.toCodecJson(OrchestrationV2ThreadHistoryPage),
+        );
         const historyHttpClient = HttpClient.make((request, url) =>
           Effect.gen(function* () {
             const cursor = url.searchParams.get("cursor");
@@ -582,7 +582,9 @@ describe("EnvironmentThreads", () => {
           expect(yield* Fiber.join(heldPage)).toEqual({ _tag: "loaded" });
         }
         const before = yield* SubscriptionRef.get(h.threadState);
-        const resubscribe = Effect.fn("TestSessionRefresh.resubscribe")(function* (sequence: number) {
+        const resubscribe = Effect.fn("TestSessionRefresh.resubscribe")(function* (
+          sequence: number,
+        ) {
           expect(yield* Ref.get(h.loaderCalls)).toBe(0);
           if (resume === "warm navigation") {
             yield* Scope.close(scope, Exit.void);
@@ -607,8 +609,9 @@ describe("EnvironmentThreads", () => {
 
         const refresh = sessionRefresh("running", 9);
         yield* Queue.offer(h.inputs, refresh);
-        const refreshing = yield* awaitThreadState(h.observed, (state) =>
-          Option.getOrNull(state.data)?.providerSessions[0]?.status === "running",
+        const refreshing = yield* awaitThreadState(
+          h.observed,
+          (state) => Option.getOrNull(state.data)?.providerSessions[0]?.status === "running",
         );
         expect(refreshing.status).toBe("synchronizing");
         expectSessionRefreshOnly(before, refreshing, refresh);

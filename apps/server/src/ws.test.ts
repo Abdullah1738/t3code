@@ -565,11 +565,11 @@ const makeSessionResumeFixture = Effect.fn("makeSessionResumeFixture")(function*
           yield* Queue.offer(refreshStarted, undefined);
           yield* Deferred.await(refreshGate);
           if (options.failAt === "refresh-read") return yield* Effect.fail(readError);
-          const records = yield* projections
-            .getThreadRecords(threadId, ["providerSessions"])
-            .pipe(
-              Effect.catchTag("ProjectionStoreThreadNotFoundError", () => Effect.succeed(null)),
-            );
+          const records = yield* projections.getThreadRecords(threadId, ["providerSessions"]).pipe(
+            Effect.catchTags({
+              ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
+            }),
+          );
           if (
             records === null ||
             records.thread.deletedAt !== null ||
