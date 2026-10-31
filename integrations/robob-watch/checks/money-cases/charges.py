@@ -83,7 +83,10 @@ VETO = re.compile(r"\b(?:not\s+me|not\s+mine|wasn'?t\s+(?:me|mine)|isn'?t\s+(?:m
                   r"|\bno\s+(?:\w+\s+)?(?:orders?|purchases?|payments?|charges?|subscriptions?|mine|from\s+me)\b", re.I)
 CORRECTION = re.compile(r"\b(?:wrong\s+(?:charge|one|transaction|payment)|nothing\s+to\s+do\s+with\s+(?:me|us|this)|"
                         r"not\s+(?:my|for)\s+(?:charge|one|transaction|payment|me)|not\s+mine|isn'?t\s+mine|"
-                        r"someone\s+else'?s?|belongs?\s+to\s+(?:someone|somebody|another|anyone))\b", re.I)
+                        # Naming another person is not a denial: "someone else reimbursed me" stays a payment he made.
+                        # Only "someone else's charge" and "belongs to someone else" deny that it is his.
+                        r"someone\s+else'?s\s+(?:charge|one|transaction|payment)|"
+                        r"belongs?\s+to\s+(?:someone|somebody|another|anyone)(?:\s+else)?)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
                   re.I)
