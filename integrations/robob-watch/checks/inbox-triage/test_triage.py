@@ -858,6 +858,34 @@ class SourceHealthTests(unittest.TestCase):
             self.assertEqual([log.get('health_alerts_skipped') for log in logs], [None, None, ['outlook']])
             self.assertEqual(t.read_json(wd / 'cursor.json')['source_health']['outlook']['streak'], 3)
 
+    def prefs_context(self, prefs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / 'data').mkdir()
+        (home / 'data/prefs.md').write_text(prefs)
+        with patch.object(t, 'HOME', home), patch.object(t, 'DATA', home / 'data'):
+            return t.build_context([], [], time.time())
+
+    def test_context_keeps_middle_rules(self):
+        rules = [f'- rule {i:03d} ' + 'x' * 180 for i in range(50)]
+        rules[29] = '- MIDDLE RULE marker'
+        prefs = '\n'.join(rules)
+        self.assertGreater(len(prefs), 8000)
+        context = self.prefs_context(prefs)['preferences']
+        self.assertIn('MIDDLE RULE marker', context)
+        self.assertIn('- MIDDLE RULE marker\n', context)
+
+    def test_context_trims_only_past_limit(self):
+        prefs = 'FIRST LINE\n' + 'y' * 20000 + '\nLAST LINE'
+        context = self.prefs_context(prefs)['preferences']
+        self.assertIn('FIRST LINE', context)
+        self.assertIn('LAST LINE', context)
+        self.assertLessEqual(len(context), t.PREFS_LIMIT + 100)
+
+    def test_system_mentions_security_rotation(self):
+        self.assertIn('Security:', t.SYSTEM)
+
 
 if __name__ == '__main__':
     unittest.main()
