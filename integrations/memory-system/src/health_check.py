@@ -170,6 +170,118 @@ def check_muse_lag():
     return True, f"{len(behind)} Muse sessions behind"
 
 
+NATIVE_LAG_MAX = 15 * 60         # oldest complete line not yet captured
+NATIVE_ERROR_MAX = 30 * 60       # a quarantined file must recover within this
+NATIVE_ALIAS_MAX = 15 * 60       # thread_aliases refresh (card D1)
+NATIVE_LEDGER = os.path.join(DATA, "memory.db")
+CLAUDE_SETTINGS = os.path.join(HOME, ".robob/harness-homes/claude/settings.json")
+CLEANUP_MIN_DAYS = 3650
+
+
+def _native_enabled(instance):
+    """Robob settings.json says the instance is enabled. Missing settings -> None (unknown)."""
+    try:
+        with open(os.path.join(HOME, ".robob/settings.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for inst in st.get("providerInstances") or st.get("instances") or []:
+        if isinstance(inst, dict) and inst.get("id") == instance:
+            return inst.get("enabled", True) is not False
+    return None
+
+
+def native_roots_report(now=None):
+    """Per root: files, backlog bytes, oldest lag seconds, problems. Read only."""
+    import transcript_roots
+    now = now or time.time()
+    report, problems = [], []
+    ledger = {}
+    if os.path.isfile(NATIVE_LEDGER):
+        try:
+            c = ro(NATIVE_LEDGER)
+            cols = [d[1] for d in c.execute("PRAGMA table_info(native_capture_files)")]
+            if cols:
+                ledger = {r[cols.index("path")]: dict(zip(cols, r))
+                          for r in c.execute("SELECT * FROM native_capture_files")}
+            c.close()
+        except sqlite3.Error:
+            ledger = {}
+    for r in transcript_roots.roots():
+        inst = r["instance"]
+        enabled = _native_enabled(inst)
+        entry = {"instance": inst, "root": r["root"], "exists": r["exists"], "files": 0,
+                 "backlog_bytes": 0, "oldest_lag_s": 0}
+        report.append(entry)
+        if not r["exists"]:
+            if enabled is False:
+                continue  # disabled and never existed: fine
+            problems.append(f"{inst}: enabled root missing ({r['root']})")
+            continue
+        for d in transcript_roots.transcript_dirs(inst):
+            for dirpath, _, names in os.walk(d):
+                for name in names:
+                    if not name.endswith(".jsonl"):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    try:
+                        size = os.stat(full).st_size
+                    except OSError:
+                        continue
+                    entry["files"] += 1
+                    row = ledger.get(full) or {}
+                    offset = row.get("offset") or 0
+                    extra = size - offset
+                    if extra > 0:
+                        # complete-but-unconsumed bytes only: a fresh incomplete tail gets grace
+                        with open(full, "rb") as fh:
+                            fh.seek(offset)
+                            tail = fh.read(extra)
+                        nl = tail.rfind(b"\n")
+                        if nl >= 0:
+                            entry["backlog_bytes"] += nl + 1
+                            # age of the oldest unconsumed complete line: the file's mtime is
+                            # the newest write, so it would hide a backlog that keeps growing
+                            lag = now - row.get("consumed_at", os.stat(full).st_mtime)
+                            entry["oldest_lag_s"] = max(entry["oldest_lag_s"], int(lag))
+                            if lag > NATIVE_LAG_MAX:
+                                problems.append(f"{inst}: {os.path.basename(full)} has "
+                                                f"{nl + 1} captured-pending bytes, oldest {int(lag)} s")
+                    if row.get("error_count", 0) > 0:
+                        since = row.get("error_since") or 0
+                        if since and now - since > NATIVE_ERROR_MAX:
+                            problems.append(f"{inst}: {os.path.basename(full)} quarantined "
+                                            f"{int((now - since) / 60)} min ({row.get('last_error', '')[:80]})")
+        refreshed = max((row.get("alias_refreshed_at") or 0) for row in ledger.values()) if ledger else None
+        if refreshed is not None and now - refreshed > NATIVE_ALIAS_MAX:
+            problems.append(f"{inst}: thread_aliases not refreshed for {int((now - refreshed) / 60)} min")
+    return report, problems
+
+
+def check_native_capture():
+    try:
+        report, problems = native_roots_report()
+    except Exception as e:
+        return False, f"native capture check crashed: {type(e).__name__}: {e}"
+    summary = "; ".join(f"{r['instance']} {r['files']} files, {r['backlog_bytes']} B backlog, "
+                        f"oldest {r['oldest_lag_s']} s" if r["exists"] else f"{r['instance']} absent"
+                        for r in report)
+    if problems:
+        return False, "; ".join(problems[:3]) + f" [{summary}]"
+    return True, summary
+
+
+def check_claude_retention():
+    try:
+        with open(CLAUDE_SETTINGS) as f:
+            days = json.load(f).get("cleanupPeriodDays")
+    except (OSError, ValueError):
+        return False, f"cannot read {CLAUDE_SETTINGS}"
+    if not isinstance(days, int) or days < CLEANUP_MIN_DAYS:
+        return False, f"cleanupPeriodDays is {days}, need >= {CLEANUP_MIN_DAYS}"
+    return True, f"cleanupPeriodDays {days}"
+
+
 def check_recall():
     import urllib.request
     try:
@@ -526,7 +638,8 @@ def check_msgs():
     return False, msg
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("recall", check_recall),
+CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
+          ("claude_retention", check_claude_retention), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
           ("health_backup", check_health_backup), ("person_backup", check_person_backups),
