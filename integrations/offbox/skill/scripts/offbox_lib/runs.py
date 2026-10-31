@@ -532,9 +532,9 @@ class Runner:
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.commit()
         t0 = now()
-        size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
-        if size != a.size:
-            say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
+        size, why = lease.auto_size(con, cmd_text, me, a.size)
+        if why:
+            say(why)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
