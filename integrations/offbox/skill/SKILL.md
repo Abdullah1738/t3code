@@ -218,6 +218,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
   semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.
+- **90 + "boat.dev is down (HTTP 525 since HH:MM, waited Ns); nothing ran"** = boat's own API was unreachable
+  (Cloudflare 520-526 or no answer), not your box. Before a run starts, offbox waits up to 600 s for it to come back
+  (`OFFBOX_OUTAGE_WAIT_SECONDS`, max 1800), prints a line every minute and retries by itself. Small commands that may
+  fall back locally don't wait. A run that already started keeps reattaching for up to 30 min of outage and keeps its
+  box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
+  shows `boat.dev: DOWN since ...` during one.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the

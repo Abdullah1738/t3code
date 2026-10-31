@@ -37,7 +37,9 @@ EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps 
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
 RUN_TTL_S = 30 * 60            # ttl while a run is in progress, refreshed every TTL_REFRESH_S
-TTL_REFRESH_S = 10 * 60
+# With RUN_TTL_S an attached box survives a ~25 min boat API outage (refresh well inside the 30 min deadline).
+TTL_REFRESH_S = 5 * 60
+TTL_RETRY_S = 30                # retry soon after a failed refresh
 ARCHIVED_DELETE_S = 7 * 86400  # delete a lease 7 days after its thread is archived
 UNUSED_DELETE_S = 30 * 86400   # delete an unpinned lease unused for 30 days
 BASES_SOFT_LIMIT = 50
@@ -104,23 +106,32 @@ def log(msg: str) -> None:
         f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
+def _emit(text: str) -> None:
+    # The caller's pipe can close first (tool timeout, | head); progress lines are best effort.
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except (BrokenPipeError, ValueError):
+        pass
+
+
 def say(msg: str) -> None:
     """Progress line for the human/agent, always on stderr so stdout stays the command's."""
-    print(f"offbox: {msg}", file=sys.stderr, flush=True)
+    _emit(f"offbox: {msg}")
 
 
 def warn_loud(msg: str) -> None:
     bar = "!" * 78
-    print(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n", file=sys.stderr, flush=True)
+    _emit(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n")
 
 
 class OffboxError(Exception):
     """Raised for failures; code 90 = infra (fallback allowed), 91 = cap, 92 = pool busy, 2 = usage."""
 
-    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False):
+    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False, outage: bool = False):
         super().__init__(msg)
         self.code = code
         self.started = started   # True once the remote command may have started (no local fallback then)
+        self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
 def die(msg: str, code: int = 2):

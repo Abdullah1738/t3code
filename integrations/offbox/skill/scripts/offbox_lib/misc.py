@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import api, capacity, lease, pool, ssh_sync
+from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError,
                      ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, offsets_path,
                      read_json, say)
@@ -238,28 +238,37 @@ def ports(me: dict, remote: int, local: int | None, box_id: str | None, reverse:
     return 0
 
 
+STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (each call gets its own budget)
+
+
 def status(me: dict) -> None:
     con = db()
     cap = read_json(CAP_PATH, {})
+    d = outage.current()
+    if d:
+        print(f"boat.dev: DOWN since {iso(d['since'])} ({d.get('reason')}), last failure {ago(d.get('seen'))} ago")
     try:
-        L = api.limits()
+        with api.budget(STATUS_CALL_S):
+            L = api.limits()
         sps = L.get("creditSecondsPerDollar") or 100000
         print(f"account: plan {L.get('sandboxPlanKey')} {L.get('subscriptionStatus')}, can start: {L.get('canStart')}, "
               f"active boxes {L.get('activeSandboxes')}/{L.get('maxActiveSandboxes')}, "
               f"plan left ${(L.get('subscriptionRemainingSeconds') or 0) / sps:.2f}, packs ${L.get('packBalanceDollars')}")
     except OffboxError as e:
-        print(f"account: unreachable ({e})")
+        print(f"account: boat API unreachable ({e})")
     capped = cap.get("capped")
     print(f"cap: {'CAPPED' if capped else 'ok'} (last spend ${cap.get('spend', 0):.2f})")
     s = capacity.snapshot(con)
     print('starts: ' + ', '.join(f"{w['used']}/{w['cap']} in {w['window']}s" for w in s['counts']) +
           (f"; next local allowance {iso(s['retry_at'])}" if s['blocked'] else '; allowance available'))
     try:
-        for b in api.list_boxes():
+        with api.budget(STATUS_CALL_S):
+            boxes = api.list_boxes()
+        for b in boxes:
             r = con.execute("SELECT repo_key, owner FROM leases WHERE box_id=?", (b["id"],)).fetchone()
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}")
     except OffboxError as e:
-        print(f"boxes: {e}")
+        print(f"boxes: boat API unreachable ({e})")
     print(f"you: {me['owner']} repo {me['repo_root']}")
 
 

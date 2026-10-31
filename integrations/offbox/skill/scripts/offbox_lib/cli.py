@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 from .common import EXIT_BUSY, EXIT_CAP, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now, say
 
@@ -107,6 +108,29 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _remote_once(a, me) -> int:
+    from . import runs
+    try:
+        return runs.run_remote(a, me)
+    except (OffboxError, KeyboardInterrupt):
+        raise
+    except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
+        import traceback
+        log("run crashed: " + traceback.format_exc()[-2000:])
+        raise OffboxError(f"offbox internal error: {type(e).__name__}: {e}")
+
+
+def _outage_wait_applies(a, e: OffboxError) -> bool:
+    """Wait out a boat API outage only when nothing started and the run can't fall back to the Mac anyway.
+    Small commands that may fall back keep today's immediate fallback."""
+    from . import fallback
+    if not (e.outage and not e.started and e.code == EXIT_INFRA):
+        return False
+    if a.no_fallback or a.remote or a.bg:
+        return True
+    return not fallback.allowed(a.cmd, e, os.getcwd())
+
+
 def cmd_run(a, me) -> int:
     from . import capacity, fallback, runs
     if a.cmd and a.cmd[0] == "--":
@@ -142,15 +166,21 @@ def cmd_run(a, me) -> int:
         if not a.remote:
             why = "could not start locally"
     log(f"remote: {why}")
+    from . import outage
+    waited_from = None
     try:
-        try:
-            return runs.run_remote(a, me)
-        except (OffboxError, KeyboardInterrupt):
-            raise
-        except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
-            import traceback
-            log("run crashed: " + traceback.format_exc()[-2000:])
-            raise OffboxError(f"offbox internal error: {type(e).__name__}: {e}")
+        while True:
+            try:
+                return _remote_once(a, me)
+            except OffboxError as e:
+                if not _outage_wait_applies(a, e):
+                    raise
+                if waited_from is None:
+                    waited_from = time.monotonic()
+                left = outage.window_seconds() - (time.monotonic() - waited_from)
+                if left > 0 and outage.wait_until_up(outage.reason_of(e), left):
+                    continue
+                raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))

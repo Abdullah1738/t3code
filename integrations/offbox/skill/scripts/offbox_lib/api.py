@@ -45,9 +45,19 @@ def redact(obj):
     return obj
 
 
+# Cloudflare answers these when it gets no response from boat's origin. The NOT_DELIVERED ones fail before the
+# request reaches boat, while 520/524 may have reached it.
+CF_OUTAGE = {520: "origin returned an unknown error", 521: "origin refused the connection",
+             522: "origin connection timed out", 523: "origin unreachable", 524: "origin timed out",
+             525: "origin SSL handshake failed", 526: "origin SSL certificate invalid"}
+CF_NOT_DELIVERED = (521, 522, 523, 525, 526)
+
+
 class ApiError(OffboxError):
     def __init__(self, status: int, code: str, message: str, retryable: bool = False):
-        super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA)
+        if status in CF_OUTAGE and not message:
+            message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
+        super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
         self.status, self.api_code, self.retryable = status, code, retryable
 
 
@@ -56,6 +66,8 @@ _PRE_DELIVERY = re.compile(r"^connect (EADDRNOTAVAIL|ECONNREFUSED|ETIMEDOUT|EHOS
 
 
 def _never_delivered(status: int, code: str, msg: str) -> bool:
+    if status in CF_NOT_DELIVERED:
+        return True
     return status in (502, 503) and code == "sandbox_direct_failed" and bool(_PRE_DELIVERY.match(msg or ""))
 
 
@@ -169,7 +181,9 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             # boat's proxy failed to *connect* to the sandbox host, so the request never
             # reached the box: safe to retry even for non-idempotent POSTs (e.g. 2026-10-14
             # "502 sandbox_direct_failed: connect EADDRNOTAVAIL", ~7% of calls for an hour).
-            if _never_delivered(e.code, code, msg) and attempt <= max(retries, max_connect) \
+            # A start isn't resent here: each send reserves a start slot.
+            if _never_delivered(e.code, code, msg) and not (is_start and e.code in CF_NOT_DELIVERED) \
+                    and attempt <= max(retries, max_connect) \
                     and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
                 log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
                 time.sleep(min(2.0 * attempt, 8))
@@ -186,7 +200,19 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             if deadline is not None and time.time() >= deadline:
                 raise OffboxError(f"deadline passed during {method} {path}: {e}")
             log(f"api {method} {path} -> network {e}")
-            raise OffboxError(f"boat API unreachable ({method} {path}): {e}")
+            raise OffboxError(f"boat API unreachable ({method} {path}): {e}", outage=True)
+
+
+def probe(timeout: float = 15) -> str | None:
+    """One cheap GET to see whether boat answers. None = it answers; else why not. No connect retries: each
+    would add sends and sleeps, so a probe would outrun its interval."""
+    try:
+        call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0)
+        return None
+    except ApiError as e:
+        return None if not e.outage else f"HTTP {e.status}"
+    except OffboxError:
+        return "no answer"
 
 
 class StreamDeadline(OffboxError):

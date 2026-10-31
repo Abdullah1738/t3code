@@ -149,17 +149,20 @@ def box_name(me: dict, repo_key: str) -> str:
     return f"offbox {repo_key} | {who}"
 
 
-def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> None:
-    """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl)."""
+def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
+    """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl).
+    True when the deadline is far enough already or the PATCH succeeded; False when the PATCH failed (warned)."""
     try:
         if s and s.get("archiveAfter"):
             from .common import iso_ts
             left = (iso_ts(s["archiveAfter"]) or 0) - now()
             if left >= ttl - 60:
-                return
+                return True
         api.set_ttl(box_id, ttl)
+        return True
     except OffboxError as e:
         say(f"warning: could not set auto-stop on {box_id}: {e}")
+        return False
 
 
 def idle_ttl(box_id: str) -> None:

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import api, lease, node_version, pool, ssh_sync
 from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, OffboxError,
+from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say)
 
 BG_TTL_S = 6 * 3600
@@ -572,7 +572,8 @@ class Runner:
         except api.ApiError as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
-            if (e.status or 0) in REFUSED_STATUSES:
+            # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
+            if (e.status or 0) in REFUSED_STATUSES or (e.status or 0) in api.CF_NOT_DELIVERED:
                 self.started = False
                 if e.api_code in ("sandbox_not_ready", "machine_not_running"):
                     # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
@@ -657,12 +658,23 @@ def _safe(err: list, fn, *args):
 def _ttl_keeper(box_id: str, stop_evt: threading.Event):
     """Keep the boat auto-stop deadline >= RUN_TTL_S away while attached. Never shortens a longer deadline."""
     while True:
+        ok = False
         try:
-            lease.ensure_ttl(box_id, RUN_TTL_S, api.get(box_id))
+            ok = lease.ensure_ttl(box_id, RUN_TTL_S, api.get(box_id))
         except OffboxError:
-            pass
-        if stop_evt.wait(TTL_REFRESH_S):
+            ok = False
+        if stop_evt.wait(TTL_REFRESH_S if ok else TTL_RETRY_S):
             return
+
+
+def _echo(stream, b: bytes) -> bool:
+    """Echo a chunk to the caller. A closed pipe stops the echo only; the log keeps the output."""
+    try:
+        stream.buffer.write(b)
+        stream.flush()
+        return True
+    except (BrokenPipeError, ValueError):
+        return False
 
 
 def _close(frames) -> None:
@@ -683,6 +695,10 @@ def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
                           {"stdoutOffset": out_off, "stderrOffset": err_off, "logBytes": log_bytes})
     except OSError:
         pass
+
+
+# Matches outage.WAIT_MAX_S: the auto-stop now holds ~25 min, so a run can ride out an outage that long.
+OUTAGE_FOLLOW_S = 1800
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
@@ -723,6 +739,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
     frames = None
+    down_from = None  # since when boat's API has been unreachable during this follow
 
     def timed_out() -> OffboxError:
         return OffboxError(f"--timeout reached; {run_id or f'{box_id}:{pid}'} keeps running on {box_id} "
@@ -755,8 +772,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         data = fr.get("data") or ""
                         b = data.encode()
                         if echo:
-                            (sys.stdout if t == "stdout" else sys.stderr).buffer.write(b)
-                            (sys.stdout if t == "stdout" else sys.stderr).flush()
+                            echo = _echo(sys.stdout if t == "stdout" else sys.stderr, b)
                         nxt = fr.get("nextOffset")
                         if t == "stdout":
                             out_off = nxt if nxt is not None else out_off + len(b)
@@ -798,19 +814,27 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                     raise timed_out()
                 failures += 1
                 st = None
+                boat_down = False
                 try:
                     # Status and the retry pause share the deadline: a blocked status request must not outrun it.
-                    st = api.cmd_status(box_id, pid, timeout=max(1.0, min(60.0, left())), retries=0,
-                                        deadline=until) if until is not None else api.cmd_status(box_id, pid)
+                    try:
+                        st = api.cmd_status(box_id, pid, timeout=max(1.0, min(60.0, left())), retries=0,
+                                            deadline=until) if until is not None else api.cmd_status(box_id, pid)
+                    except OffboxError as se:
+                        boat_down = getattr(se, "outage", False)
                 except OffboxError:
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
+                down_from = (down_from or now()) if boat_down else None
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return None
                     if failures > 3:
                         return st.get("exitCode")
+                if failures > 20 and down_from is not None and now() - down_from < OUTAGE_FOLLOW_S:
+                    # boat's API is down, not the run: keep reattaching.
+                    failures = 20
                 if failures > 20:
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
                 pause = min(10, 1 + failures)
