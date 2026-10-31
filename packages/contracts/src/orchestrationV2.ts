@@ -1006,6 +1006,10 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
+  /** The provider's native finish reason (e.g. Claude stop_reason); null when not reported. */
+  finish: Schema.optional(Schema.NullOr(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
 
@@ -1106,6 +1110,18 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+/**
+ * Whether an assistant message is the turn's answer or narration that came before a tool call.
+ * Rows written before this field existed have none, so they decode as "unknown" and never count
+ * as an answer.
+ */
+export const OrchestrationV2AssistantPhase = Schema.Literals(["answer", "narration", "unknown"]);
+export type OrchestrationV2AssistantPhase = typeof OrchestrationV2AssistantPhase.Type;
+
+const assistantPhaseField = Schema.optional(OrchestrationV2AssistantPhase).pipe(
+  Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
+);
+
 export const OrchestrationV2ConversationMessage = Schema.Struct({
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
@@ -1122,6 +1138,7 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   nodeId: Schema.NullOr(NodeId),
   role: Schema.Literals(["user", "assistant", "system"]),
   text: Schema.String,
+  phase: assistantPhaseField,
   context: Schema.optional(OrchestrationMessageContext),
   attachments: Schema.Array(ChatAttachment),
   streaming: Schema.Boolean,
@@ -1423,6 +1440,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
@@ -2190,6 +2208,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
