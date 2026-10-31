@@ -1,7 +1,7 @@
 /**
  * Board scripts: what runs them, when they are due, and how they talk to the
  * board. A script prints one JSON object per line with a `kanban` key to add
- * a card, post in a discussion, resize a pool, tick its subtask (`subtask`),
+ * a card, post in a discussion, resize a pool or the evaluator pool (`evaluators`), tick its subtask (`subtask`),
  * hand one back to the evaluator (`handback`) or move a card to completed,
  * deployed or verified (`move`); every other line is plain output.
  */
@@ -101,6 +101,12 @@ const PoolCommand = Schema.Struct({
   slots: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 50 })),
 });
 
+/** Sets the board's evaluator pool to N slots, or null for no limit. */
+const EvaluatorsCommand = Schema.Struct({
+  kanban: Schema.Literal("evaluators"),
+  slots: Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 }))),
+});
+
 /** Marks a subtask this script owns done, or skipped with a note. */
 const SubtaskCommand = Schema.Struct({
   kanban: Schema.Literal("subtask"),
@@ -131,6 +137,7 @@ export const ScriptCommand = Schema.Union([
   CardCommand,
   PostCommand,
   PoolCommand,
+  EvaluatorsCommand,
   SubtaskCommand,
   HandBackCommand,
   MoveCommand,
@@ -139,6 +146,7 @@ export type ScriptCommand = typeof ScriptCommand.Type;
 export type CardCommand = typeof CardCommand.Type;
 export type PostCommand = typeof PostCommand.Type;
 export type PoolCommand = typeof PoolCommand.Type;
+export type EvaluatorsCommand = typeof EvaluatorsCommand.Type;
 export type SubtaskCommand = typeof SubtaskCommand.Type;
 export type HandBackCommand = typeof HandBackCommand.Type;
 export type MoveCommand = typeof MoveCommand.Type;

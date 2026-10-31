@@ -92,7 +92,7 @@ const fakeThreads = () => {
       lastFailure: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {
-          launches.push(input.text);
+          launches.push(input.text ?? "");
           return ThreadId.make(`thread-${++launched}`);
         }),
       send: () => Effect.void,

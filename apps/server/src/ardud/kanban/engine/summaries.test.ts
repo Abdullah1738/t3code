@@ -27,6 +27,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   managerModel: opus,
   evaluatorModel: opus,
   defaultCardModel: opus,
+  evaluatorSlots: null,
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },

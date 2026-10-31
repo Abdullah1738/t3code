@@ -55,6 +55,7 @@ const board: KanbanBoard = {
   managerModel: haiku,
   evaluatorModel: opus,
   defaultCardModel: opus,
+  evaluatorSlots: null,
   reviewChains: [
     { name: "Critical", steps: [sol, astra] },
     { name: "Default", steps: [opus] },

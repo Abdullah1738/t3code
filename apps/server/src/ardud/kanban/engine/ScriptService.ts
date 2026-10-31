@@ -286,6 +286,19 @@ const make = Effect.gen(function* () {
         notes.push(yield* resizePool(script, command));
         continue;
       }
+      if (command.kanban === "evaluators") {
+        const set = yield* Effect.result(
+          service.updateBoard(script.boardId, { evaluatorSlots: command.slots }),
+        );
+        notes.push(
+          Result.isSuccess(set)
+            ? command.slots === null
+              ? "Set the evaluator pool to no limit."
+              : `Set the evaluator pool to ${command.slots} ${command.slots === 1 ? "slot" : "slots"}.`
+            : `Couldn't set the evaluator pool: ${set.failure.detail}`,
+        );
+        continue;
+      }
       if (command.kanban === "subtask" || command.kanban === "handback" || command.kanban === "move") {
         const card = cards.find((entry) => entry.number === command.card);
         if (!card) {

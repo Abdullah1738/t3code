@@ -137,6 +137,7 @@ const BoardBody = Schema.Struct({
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
   ),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  evaluatorSlots: Schema.optional(Schema.NullOr(Schema.Number)),
 });
 
 const PoolBody = Schema.Struct({ model: ModelBody, slots: Schema.Number });
@@ -281,6 +282,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(input.iconImage !== undefined ? { iconImage: input.iconImage } : {}),
           ...(input.projectId !== undefined
             ? { defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null }
+            : {}),
+          ...(input.evaluatorSlots !== undefined
+            ? {
+                evaluatorSlots: input.evaluatorSlots,
+              }
             : {}),
           ...(input.managerModel ? { managerModel: modelSelectionOf(input.managerModel) } : {}),
           ...(input.evaluatorModel

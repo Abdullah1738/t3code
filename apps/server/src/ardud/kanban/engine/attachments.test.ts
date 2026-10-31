@@ -60,7 +60,7 @@ const makeFake = Effect.gen(function* () {
         Ref.modify(threads, (all) => {
           const threadId = ThreadId.make(`thread-${all.size + 1}`);
           const copy = new Map(all);
-          copy.set(threadId, { title: input.title, messages: [input.text] });
+          copy.set(threadId, { title: input.title, messages: [input.text ?? ""] });
           return [threadId, copy] as const;
         }),
       send: (input) =>

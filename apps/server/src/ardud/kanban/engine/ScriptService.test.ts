@@ -449,11 +449,11 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
       find: () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       launch: (input) => {
-        sent.push(input.text);
+        sent.push(input.text ?? "");
         return Effect.succeed(ThreadId.make("thread-1"));
       },
       send: (input) => {
-        sent.push(input.text);
+        sent.push(input.text ?? "");
         return Effect.void;
       },
       model: () => Effect.succeed(null),

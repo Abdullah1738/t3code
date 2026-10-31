@@ -32,6 +32,7 @@ const board: KanbanBoard = {
   managerModel: model,
   evaluatorModel: model,
   defaultCardModel: model,
+  evaluatorSlots: null,
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
