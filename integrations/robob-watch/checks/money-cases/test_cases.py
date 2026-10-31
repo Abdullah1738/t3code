@@ -617,6 +617,61 @@ class Brief(Base):
         self.assertIn('Acme AED 120.50 (overdue since Sun 25 Oct)', late)
 
 
+class CardSwap(Base):
+    def test_card_swap_rewrites_next_on_open_cases_naming_the_old_card(self):
+        self.case('stale', merchant='Shop 1', next_action='switch to 7572 once it clears')
+        self.case('acme', merchant='Shop 2', next_action='dispute on card 5542')
+        self.case('done', merchant='Shop 3', next_action='card 5542 charge')
+        mc.close(self.data, 'done', outcome='refunded')
+        changes = mc.card_swap(self.data, '5542', '2342', also=('7572',), at=at('2026-10-30T18:00'))
+        self.assertEqual(sorted(c['id'] for c in changes), ['acme', 'stale'])
+        book = mc.load(self.data)
+        by_id = {c['id']: c for c in book['cases']}
+        self.assertEqual(by_id['stale']['next'], 'switch to 2342 once it clears')
+        self.assertEqual(by_id['acme']['next'], 'dispute on card 2342')
+        self.assertIn('card swap 5542->2342: next updated', by_id['acme']['history'][-1]['text'])
+        self.assertEqual(by_id['done']['next'], 'card 5542 charge')
+        self.assertEqual(by_id['done']['status'], 'closed')
+        self.assertEqual(by_id['done']['history'][-1]['text'], 'closed: refunded')
+
+    def test_dry_run_writes_nothing(self):
+        self.case('acme', merchant='Shop 4', next_action='dispute on card 5542')
+        before = mc.load(self.data)
+        changes = mc.card_swap(self.data, '5542', '2342', dry_run=True)
+        self.assertEqual(changes[0]['after'], 'dispute on card 2342')
+        self.assertEqual(mc.load(self.data), before)
+
+    def test_case_naming_old_card_only_in_state_is_listed_with_after_none(self):
+        self.case('acme', merchant='Shop 5', state='card 5542 declined', next_action='dispute on the card')
+        changes = mc.card_swap(self.data, '5542', '2342')
+        self.assertEqual(changes, [{'id': 'acme', 'before': 'dispute on the card', 'after': None}])
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on the card')
+
+    def test_four_digit_token_inside_a_longer_number_is_not_replaced(self):
+        self.case('acme', merchant='Shop 6', reference='ORD-155420', next_action='dispute on card 5542')
+        self.case('other', merchant='Shop 7', reference='ORD-155420', next_action='wait for refund')
+        changes = mc.card_swap(self.data, '5542', '2342')
+        self.assertEqual([c['id'] for c in changes], ['acme'])
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 2342')
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['reference'], 'ORD-155420')
+
+    def test_bad_last4_is_refused(self):
+        self.case('acme', merchant='Shop 8', next_action='dispute on card 5542')
+        with self.assertRaisesRegex(mc.CaseError, 'exactly the last 4 digits'):
+            mc.card_swap(self.data, '5542', '23421')
+        with self.assertRaisesRegex(mc.CaseError, 'exactly the last 4 digits'):
+            mc.card_swap(self.data, '5542', '2342', also=('75',))
+
+    def test_cli_card_swap_prints_moves_and_dry_run_says_would_update(self):
+        self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(mc.main(['card-swap', '--old', '5542', '--new', '2342', '--dry-run']), 0)
+        self.assertIn("acme: next 'dispute on card 5542' -> 'dispute on card 2342'", out.getvalue())
+        self.assertIn('1 case(s) would update', out.getvalue())
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 5542')
+
+
 class Cli(Base):
     def run_cli(self, *args):
         out, err = io.StringIO(), io.StringIO()

@@ -11,6 +11,8 @@
                   [--because TEXT | --reply ID]   required with --deadline
   money-cases add ... --unmatched     no merchant match: recorded as "unmatched", never guessed
                   [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
+  money-cases card-swap --old OLD --new NEW [--also STALE ...] [--dry-run]
+                  point open cases' next line at a replacement card (last 4 only); never closes a case
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
   money-cases brief    one line for the morning brief, nothing when no case is open
@@ -415,6 +417,50 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
     return case
 
 
+def last4_arg(name, value):
+    if type(value) is not str or not re.fullmatch(r'[0-9]{4}', value):
+        raise CaseError(f'{name} {value!r} must be exactly the last 4 digits of the card')
+    return value
+
+
+class _DryRun(Exception):
+    """Raised inside Locked so nothing is written."""
+
+
+def card_swap(data, old, new, also=(), dry_run=False, at=None):
+    """Point open cases at a replacement card: rewrite the old (and stale planned) last-4 in `next` only.
+
+    Closed cases are never touched and nothing is closed here: a human confirms each move. A case that
+    names a card elsewhere (state, why, reference) comes back with after=None so someone checks it by hand."""
+    old, new = last4_arg('old', old), last4_arg('new', new)
+    if old == new:
+        raise CaseError('old and new card are the same last 4')
+    stale = sorted({old, *(last4_arg('also', a) for a in also)})
+    token = re.compile(r'(?<!\d)(?:' + '|'.join(stale) + r')(?!\d)')
+    changes = []
+    try:
+        with Locked(data) as book:
+            for case in book['cases']:
+                if case.get('status') != 'open':
+                    continue
+                if not any(token.search(str(case.get(f) or '')) for f in ('id', 'reference', 'state', 'next', 'why')):
+                    continue
+                before = case.get('next') or ''
+                after, count = token.subn(new, before)
+                if not count:
+                    changes.append({'id': case['id'], 'before': before, 'after': None})
+                    continue
+                changes.append({'id': case['id'], 'before': before, 'after': after})
+                case['next'] = after
+                case['updated'] = stamp(at)
+                case['history'].append({'at': stamp(at), 'text': f'card swap {old}->{new}: next updated'})
+            if dry_run:
+                raise _DryRun
+    except _DryRun:
+        pass
+    return changes
+
+
 def close(data, case_id, outcome, at=None):
     with Locked(data) as book:
         case = find(book, case_id)
@@ -775,6 +821,11 @@ def main(argv=None):
     p.add_argument('--charged', required=True, help='charge date YYYY-MM-DD')
     p.add_argument('--kind', default='charge', choices=KINDS)
     p.add_argument('--observation', required=True, help='where it was seen, e.g. "SMS 10:45"')
+    p = sub.add_parser('card-swap', help='a card was replaced: move open cases to the new last 4')
+    p.add_argument('--old', required=True)
+    p.add_argument('--new', required=True)
+    p.add_argument('--also', action='append', default=[], metavar='LAST4', help='another stale planned card')
+    p.add_argument('--dry-run', action='store_true')
     sub.add_parser('brief')
     sub.add_parser('check')
     args = parser.parse_args(argv)
@@ -816,6 +867,16 @@ def main(argv=None):
             corroborate(DATA, args.id, args.merchant, args.amount, args.currency, args.charged, args.kind,
                         args.observation)
             print(table([find(load(), args.id)]))
+        elif args.command == 'card-swap':
+            changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run)
+            for c in changes:
+                if c['after'] is None:
+                    print(f"{c['id']}: names {args.old}, check by hand")
+                else:
+                    print(f"{c['id']}: next {c['before']!r} -> {c['after']!r}")
+            updated = sum(1 for c in changes if c['after'] is not None)
+            verb = 'would update' if args.dry_run else 'updated'
+            print(f'{updated} case(s) {verb}')
         elif args.command == 'close':
             close(DATA, args.id, args.outcome)
             print(f'closed {args.id}')
