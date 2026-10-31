@@ -4012,7 +4012,7 @@ it.effect("a work run that times out waiting for response headers is paused, not
         class: "provider_error",
         code: "provider.internal",
         message: "Timed out waiting for response headers",
-      });
+      } as never);
       yield* kanban.turnEnded(workThread);
       const messages = (yield* Ref.get(fake.threads)).get(workThread)!.messages;
       assert.strictEqual(messages.length, before);
