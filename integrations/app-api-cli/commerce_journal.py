@@ -1166,15 +1166,28 @@ def marketplace_cleanup_source(flow_id, vertical, *, cleanup_flow_id=None):
         ops = list(db.execute('SELECT rowid AS seq,* FROM operations WHERE flow_id=? ORDER BY rowid', (flow_id,)))
         adds = [op for op in ops if op['kind'] == 'cart'
                 and re.fullmatch(r'add(?:_rocket)?(?:_[0-9a-f]{16})?', op['name'])]
-        if (vertical not in ('main', 'supermall') or flow['app'] != 'noon'
-                or flow['vertical'] != vertical or flow['state'] != 'RELEASED'
-                or flow['reserved_minor'] != 0 or any(flow[k] is not None for k in
-                    ('order_id', 'review_hash', 'place_cart_hash')) or not adds
-                or any(op['state'] != 'OBSERVED' or not (op in adds or
-                    op['kind'] == 'quote' and re.fullmatch(r'session(?:_[0-9a-f]{8})?', op['name'])) for op in ops)):
-            fail('MARKETPLACE_CLEAR_CLOSED_CART_ONLY_FLOW_REQUIRED')
         observations = list(db.execute('SELECT * FROM observations WHERE flow_id=? ORDER BY sequence', (flow_id,)))
-        for op in ops:
+        session_ops = [op for op in ops if op['kind'] == 'quote'
+                       and re.fullmatch(r'session(?:_[0-9a-f]{8})?', op['name'])]
+        base = (vertical in ('main', 'supermall') and flow['app'] == 'noon'
+                and flow['vertical'] == vertical and flow['state'] == 'RELEASED'
+                and flow['reserved_minor'] == 0 and bool(adds))
+        cart_only = (base and all(flow[k] is None for k in ('order_id', 'review_hash', 'place_cart_hash'))
+                     and all(op['state'] == 'OBSERVED' and (op in adds or op in session_ops) for op in ops))
+        # Closed uncharged: noon failed the order and reconcile-order closed it. The
+        # only financial history allowed is the one place (and at most one payment).
+        closures = [row for row in observations if row['outcome'] == 'MARKETPLACE_CLOSED_UNCHARGED']
+        places = [op for op in ops if op['kind'] == 'place']
+        payments = [op for op in ops if op['kind'] == 'payment']
+        closed = (base and not cart_only and len(closures) == 1
+                  and time.time() - closures[0]['observed_at'] <= 24 * 60 * 60
+                  and len(places) == 1 and len(payments) <= 1
+                  and all(op['state'] == 'OBSERVED' and (op in adds or op in session_ops
+                          or op in places or op in payments) for op in ops))
+        if not (cart_only or closed):
+            fail('MARKETPLACE_CLEAR_CLOSED_CART_ONLY_FLOW_REQUIRED')
+        checked = adds + session_ops if closed else ops
+        for op in checked:
             evidence = [row for row in observations if row['operation'] == op['name']]
             if (not any(row['outcome'] == 'RESPONSE_RECEIVED' for row in evidence)
                     or any(row['outcome'] not in ('RESPONSE_RECEIVED', 'CART_READBACK')
@@ -1187,7 +1200,8 @@ def marketplace_cleanup_source(flow_id, vertical, *, cleanup_flow_id=None):
         proof = {'account_hash': flow['account_hash'], 'scope_hash': flow['scope_hash'],
                  'adds': [{'name': op['name'], 'request_hash': op['request_hash']} for op in adds],
                  'add_evidence_hash': add_evidence,
-                 'readback_hash': readbacks[-1]['evidence_hash'] if readbacks else None}
+                 'readback_hash': None if closed else (readbacks[-1]['evidence_hash'] if readbacks else None),
+                 'closed_uncharged': closed}
         if cleanup_flow_id is not None:
             claim = _get(db, cleanup_flow_id)
             if (claim['app'] != 'noon' or claim['vertical'] != vertical
