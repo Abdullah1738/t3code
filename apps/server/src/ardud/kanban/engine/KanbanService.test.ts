@@ -4417,6 +4417,8 @@ it.effect("an evaluator that fails twice is replaced in its discussion", () =>
       yield* kanban.turnEnded(e);
       yield* TestClock.adjust("2 minutes");
       yield* kanban.tick;
+      // The retry is a new executed run, so its failure is a new object with its own run id.
+      fake.failures.set(e, { ...stopping });
       yield* kanban.turnEnded(e);
       const n = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
       assert.notStrictEqual(n, e);
@@ -4470,6 +4472,8 @@ it.effect("a one-shot evaluator that keeps failing is reported in Evaluator erro
       yield* kanban.turnEnded(t);
       yield* TestClock.adjust("2 minutes");
       yield* kanban.tick;
+      // The retry is a new executed run, so its failure is a new object with its own run id.
+      fake.failures.set(t, { ...stopping });
       yield* kanban.turnEnded(t);
       const channel = (yield* kanban.discussions(board.id)).find(
         (d) => d.title === "Evaluator errors",
