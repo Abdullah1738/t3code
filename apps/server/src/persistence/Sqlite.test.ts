@@ -128,7 +128,10 @@ it.effect("installs the authored-message shell index on fresh and reopened datab
       return yield* authoredIndexSql(sql);
     }).pipe(Effect.provide(persistence()));
     assert.lengthOf(first, 1);
-    assert.include(first[0]!.sql, "WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'");
+    assert.include(
+      first[0]!.sql,
+      "WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'",
+    );
 
     const reopened = yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

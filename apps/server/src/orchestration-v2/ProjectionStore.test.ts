@@ -7296,8 +7296,12 @@ it.effect("latest authored timestamp follows message replacement and removal", (
       ORDER BY message.updated_at DESC, message.message_id DESC
       LIMIT 1`;
     const readBoth = Effect.gen(function* () {
-      const exact = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(false), [threadId]);
-      const indexed = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(true), [threadId]);
+      const exact = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(false), [
+        threadId,
+      ]);
+      const indexed = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(true), [
+        threadId,
+      ]);
       assert.deepEqual(indexed, exact);
       return exact[0]?.updated_at ?? null;
     });
