@@ -5487,6 +5487,29 @@ it.effect("a no-level set or remove with a no-level pool and a leveled pool name
   }),
 );
 
+it.effect("a no-level pool named by its key stays addressable once a second level is added", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      // Add model on a provider with no default: the first add is level-less, the next leveled.
+      const astraPlain = modelSelectionOf({ model: "opus/gpt-6-astra" });
+      const first = yield* kanban.setPool(board.id, astraPlain, 0);
+      const plainKey = first.find((pool) => Rules.modelLevel(pool.model) === null)?.key;
+      assert.isDefined(plainKey);
+      yield* kanban.setPool(board.id, astraXhigh, 0);
+      // The original row's controls send its own key: they reach that pool, not the leveled one.
+      const resized = yield* kanban.setPool(board.id, astraPlain, 2, { replaces: plainKey });
+      assert.strictEqual(resized.find((pool) => pool.key === plainKey)?.slots, 2);
+      const paused = yield* kanban.setPool(board.id, astraPlain, 0, { replaces: plainKey });
+      assert.strictEqual(paused.find((pool) => pool.key === plainKey)?.slots, 0);
+      const removed = yield* kanban.removePool(board.id, astraPlain, { replaces: plainKey });
+      assert.isUndefined(removed.find((pool) => pool.key === plainKey));
+      assert.strictEqual(removed.filter((pool) => pool.model.model === astraXhigh.model).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("an alias with an explicit level runs on that level's pool, not the first", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

@@ -175,7 +175,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 disabledReason={blockedReason}
                 onChange={(slots) =>
                   void runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, slots),
+                    kanban.setPool(board.id, pool.model, slots, { replaces: pool.key }),
                   )
                 }
               />
@@ -188,7 +188,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 aria-label={`${pool.name} pool on`}
                 onCheckedChange={(on) =>
                   void runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, on ? Math.max(1, pool.busy) : 0),
+                    kanban.setPool(board.id, pool.model, on ? Math.max(1, pool.busy) : 0, {
+                      replaces: pool.key,
+                    }),
                   )
                 }
               />
@@ -199,7 +201,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                   title="Remove pool"
                   onClick={() =>
                     void runAction("Couldn't remove the pool", () =>
-                      kanban.removePool(board.id, pool.model),
+                      kanban.removePool(board.id, pool.model, { replaces: pool.key }),
                     )
                   }
                   className="grid size-7 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"

@@ -93,7 +93,11 @@ export interface KanbanClient {
     slots: number | undefined,
     options?: { readonly replaces?: string },
   ): Promise<void>;
-  removePool(boardId: string, model: ModelSelection): Promise<void>;
+  removePool(
+    boardId: string,
+    model: ModelSelection,
+    options?: { readonly replaces?: string },
+  ): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
   /** Owner's New board: creates the board with its project and evaluator model. */
   createBoard(input: {
@@ -814,8 +818,12 @@ export function createKanbanClient(
         ...(options?.replaces === undefined ? {} : { replaces: options.replaces }),
       });
     },
-    async removePool(boardId, model) {
-      await transport.request(M.poolRemove, { boardId: boardId as never, model });
+    async removePool(boardId, model, options) {
+      await transport.request(M.poolRemove, {
+        boardId: boardId as never,
+        model,
+        ...(options?.replaces === undefined ? {} : { replaces: options.replaces }),
+      });
     },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);

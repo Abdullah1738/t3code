@@ -97,7 +97,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.poolRemove]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
       readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
-    }) => service.removePool(input.boardId, input.model),
+      readonly replaces?: string | undefined;
+    }) => service.removePool(input.boardId, input.model, { replaces: input.replaces }),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;

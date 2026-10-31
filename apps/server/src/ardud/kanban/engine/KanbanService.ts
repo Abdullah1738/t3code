@@ -337,6 +337,7 @@ export interface KanbanServiceShape {
   readonly removePool: (
     boardId: KanbanBoard["id"],
     model: ModelSelection,
+    options?: { readonly replaces?: string | undefined },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly setGoal: (
     boardId: KanbanBoard["id"],
@@ -4776,12 +4777,16 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const removePool: KanbanServiceShape["removePool"] = (boardId, model) =>
+  const removePool: KanbanServiceShape["removePool"] = (boardId, model, options) =>
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
         const pools = yield* store.pools(board.id);
-        const pool = yield* namedPool(pools, model);
+        // A named key is the exact pool, even for a level-less request on a model with several pools.
+        const pool =
+          options?.replaces !== undefined
+            ? pools.find((candidate) => candidate.key === options.replaces)
+            : yield* namedPool(pools, model);
         if (!pool) return yield* failWith("not-found", `pool ${Rules.poolKey(model)}`);
         const key = pool.key;
         // A model with no pool at its own level runs on its model's first pool (Rules.poolFor).

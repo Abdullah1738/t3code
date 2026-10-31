@@ -229,7 +229,12 @@ export const KanbanRpcs = RpcGroup.make(
   ),
   call(
     M.poolRemove,
-    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection }),
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      model: ModelSelection,
+      /** Key of the pool to remove; it names the pool even when `model` has no level. */
+      replaces: Schema.optional(TrimmedNonEmptyString),
+    }),
     Schema.Array(KanbanPool),
   ),
   call(
