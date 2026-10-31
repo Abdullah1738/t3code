@@ -631,7 +631,7 @@ def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
-           replay_path: Path | None = None) -> int | None:
+           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
@@ -645,10 +645,19 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     # append (never truncated) so that prefix survives, and its checkpoint starts at the length it already holds.
     target = replay_path or log_path
     lf = open(target, "ab") if target else None
+    # A takeover also mirrors every committed chunk into the original log (`mirror_path`), so a lock-blocked
+    # `logs --follow` sees the new output while the owner runs. The mirror is opened for append, never truncated.
+    # Never truncated: the original keeps its committed prefix, and readers only trust bytes up to its checkpoint.
+    mf = open(mirror_path, "r+b") if mirror_path else None
+    if mf:
+        # The original already holds the committed prefix; new output continues at that point.
+        mf.seek(mirror_keep)
     if lf:
         # Checkpoint before the first byte: a holder that dies inside its first chunk still leaves one, so a waiter
         # never prints bytes that its takeover will replay (no checkpoint at all = a holder from before checkpoints).
         _commit(target, out_off, err_off, lf.tell())
+        if mf:
+            _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
     frames = None
 
@@ -695,6 +704,10 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
                             _commit(target, out_off, err_off, lf.tell())
+                            if mf:
+                                mf.write(b)
+                                mf.flush()
+                                _commit(mirror_path, out_off, err_off, mf.tell())
                     elif t == "reconnect":
                         out_off, err_off = fr.get("stdoutOffset", out_off), fr.get("stderrOffset", err_off)
                         again = True
@@ -751,6 +764,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         keeper.join(_KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
         if lf:
             lf.close()
+        if mf:
+            mf.close()
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:

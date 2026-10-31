@@ -352,7 +352,10 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep):
         with open(tmp, "wb") as dst:
             dst.write(prefix)
         # The replay's follow commits checkpoints into tmp: it starts at the committed prefix, then tracks the stream.
-        code = _resolve_exit(cur, log_path, deadline, start, tmp)
+        # Only a checkpointed log can be mirrored: its committed length says where new output goes. A legacy log has
+        # no committed length, so it stays as it is until the replay is confirmed and published.
+        mirror = log_path if keep else None
+        code = _resolve_exit(cur, log_path, deadline, start, tmp, echo=echo, mirror_path=mirror, mirror_keep=keep)
         if code is None:
             raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
         # Publish the replacement log and checkpoint before the run is recorded as settled.
@@ -369,12 +372,15 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep):
         raise
 
 
-def _resolve_exit(r, log_path, until, start_offsets, replay_path):
+def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mirror_path=None, mirror_keep=0):
     """Attach and follow the run to its end. Returns the real exit code, or None when the outcome is unknown (the
-    stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish."""
+    stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
+    `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
+    only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
     from .runs import follow, recover_lost_exit
-    code = follow(r["box_id"], r["process_id"], log_path, echo=True, run_id=r["run_id"], until=until,
-                  start_offsets=start_offsets, replay_path=replay_path)
+    code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
+                  start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
+                  mirror_keep=mirror_keep)
     if code is None:
         code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
         if code is not None:
@@ -405,5 +411,5 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
     if r['status'] not in ('starting','running'):
         return r['exit_code'] if r['exit_code'] is not None else 90
     log_path = LOGS_DIR / f"{r['run_id']}.log"
-    code = _resolve_exit(r, log_path, until, start_offsets, replay_path)
+    code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
     return _finalize(r, code, log_path)

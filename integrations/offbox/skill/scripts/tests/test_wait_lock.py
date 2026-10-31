@@ -504,6 +504,83 @@ class TakeoverPublishTests(unittest.TestCase):
         self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
 
 
+class LiveAndEchoTests(unittest.TestCase):
+    """Round 6: a quiet wait does not echo remote output; a concurrent logs --follow sees the owner's new chunks before
+    the owner's exit frame. Real frames through follow(); temp dir, not the live offbox logs."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
+        self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
+        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
+        self.row = {'run_id': 'run-l', 'box_id': 'bx_a', 'process_id': 7, 'pulls': '[]', 'status': 'running',
+                    'exit_code': None}
+
+    def test_quiet_takeover_prints_no_remote_output(self):
+        # echo=False (a plain offbox wait): the remote stdout must not reach stdout, even through a takeover replay.
+        log = self.logs / 'run-l.log'
+        committed = b'o1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 0, len(committed))
+        frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
+        out = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(out.close)
+        with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
+                contextlib.redirect_stdout(out):
+            rc = misc._replay_takeover(self.row, False, None, (3, 0), log, len(committed))
+        self.assertEqual(rc, 0)
+        out.flush()
+        # Remote output must not be echoed. The exit line ("run-l: exit=0") is the wait's own status, not remote output.
+        self.assertNotIn(b'o2', out.buffer.getvalue())
+        self.assertEqual(log.read_bytes(), b'o1\no2\n')
+
+    def test_echoing_follow_still_prints_remote_output(self):
+        # The same takeover with echo=True (logs --follow) prints the new remote chunk.
+        log = self.logs / 'run-l.log'
+        committed = b'o1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 0, len(committed))
+        frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
+        out = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(out.close)
+        with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
+                contextlib.redirect_stdout(out):
+            rc = misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed))
+        self.assertEqual(rc, 0)
+        out.flush()
+        self.assertIn(b'o2\n', out.buffer.getvalue())
+
+    def test_follower_sees_owner_chunks_before_its_exit_frame(self):
+        # Owner A replays the run: chunk 'o2' arrives, then the stream is held before its exit frame. Follower B
+        # reads the original log at that moment and must already see 'o2'.
+        log = self.logs / 'run-l.log'
+        committed = b'o1\n'
+        log.write_bytes(committed)
+        runs._commit(log, 3, 0, len(committed))
+        seen_by_follower = {}
+
+        def held_stream(box, pid, o, e, **kw):
+            yield {'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}
+            # Pause before the exit frame: this is the moment follower B reads.
+            seen_by_follower['bytes'] = log.read_bytes()
+            seen_by_follower['ck'] = common.checkpoint(log)
+            yield {'type': 'exit', 'exitCode': 0}
+        out = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(out.close)
+        with patch.object(runs.api, 'cmd_attach', held_stream), contextlib.redirect_stdout(out):
+            misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed))
+        self.assertEqual(seen_by_follower['bytes'], b'o1\no2\n')
+        self.assertEqual(seen_by_follower['ck']['logBytes'], len(b'o1\no2\n'))
+
+
 class _Boat(http.server.BaseHTTPRequestHandler):
     """A local ndjson stream that misbehaves on purpose: /quiet sends one frame late, then goes silent; /trickle sends
     a line one byte at a time and never finishes it. ?plain=1 answers HTTP/1.0 without chunking."""
