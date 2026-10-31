@@ -1877,24 +1877,24 @@ it.effect("a stale turn end cannot release a newer admission on the same thread"
       const channel = yield* kanban.createDiscussion(board.id, "Stale", owner);
       yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
       const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
-      // A's first turn is running; it still owes the discussion a reply.
+      // A's first run (run-1) is running and reports its id: the admission is keyed to it.
       yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-1");
       assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 1);
-      // The turn ends. Its owed reply is nudged: the nudge is a new turn, a new admission.
+      // run-1 ends. Its owed reply is nudged: the nudge starts run-2, a new admission.
       yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
-      yield* kanban.turnEnded(a);
-      const nudged = (yield* Ref.get(fake.threads)).get(a)?.messages ?? [];
-      assert.strictEqual(nudged.length, 2, "the nudge reached A");
-      // The nudge starts a new run, with its own start time, as a real provider reports it.
+      yield* kanban.turnEnded(a, "run-1");
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(a)?.messages.length, 2, "the nudge reached A");
       yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-2");
       const busy = (yield* kanban.snapshot(board.id)).evaluators.busy;
-      assert.strictEqual(busy, 1, "the nudged turn holds one admission");
-      // A stale end for the first run arrives while the nudged run is still going: it must keep that admission.
-      yield* kanban.turnEnded(a);
+      assert.strictEqual(busy, 1, "run-2 holds one admission");
+      // A stale end for run-1 arrives again while run-2 runs: it must keep run-2's admission.
+      yield* kanban.turnEnded(a, "run-1");
       assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, busy);
-      // The nudged run really ends: now its own slot is released.
+      // run-2 really ends: its own slot is released.
       yield* setRunStart(fake, a, false, "2026-10-25T13:01:00.000Z");
-      yield* kanban.turnEnded(a);
+      yield* kanban.turnEnded(a, "run-2");
       assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 0);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -2179,7 +2179,7 @@ it.effect("announces a mid-turn question so the board stops showing the thread a
         all.get(thread)!.stuck = true;
         return all;
       });
-      yield* kanban.notifyThreadChanged(thread);
+      yield* kanban.notifyThreadChanged(thread, null);
       const announced = yield* stuckAnnounced;
       assert.isTrue(Option.isSome(announced));
       if (Option.isSome(announced) && announced.value.change._tag === "thread") {
@@ -2202,7 +2202,7 @@ it.effect("announces a mid-turn question so the board stops showing the thread a
         return all;
       });
       yield* setRunning(fake, thread, true);
-      yield* kanban.notifyThreadChanged(thread);
+      yield* kanban.notifyThreadChanged(thread, null);
       assert.isTrue(Option.isSome(yield* resumed));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

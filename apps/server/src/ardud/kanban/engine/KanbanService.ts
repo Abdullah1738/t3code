@@ -446,15 +446,20 @@ export interface KanbanServiceShape {
   /** Runs dispatch for every board now. */
   readonly dispatchNow: Effect.Effect<void, KanbanError>;
   /** Handles a finished turn of a board thread now. */
-  readonly turnEnded: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
+  /** A turn end; `runId` is the run that ended (tests may omit it). */
+  readonly turnEnded: (threadId: ThreadId, runId?: string) => Effect.Effect<void, KanbanError>;
   /** Periodic upkeep: typing heartbeat, PR states, dispatch. */
   readonly tick: Effect.Effect<void, KanbanError>;
   /** Probes the models paused threads wait on and wakes them when one answers. */
   readonly probeOutages: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
-  readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
+  readonly notifyTurnEnded: (threadId: ThreadId, runId: string) => Effect.Effect<void>;
   /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
-  readonly notifyThreadChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
+  /** A run update also names its run, so an admission waiting for one can take it. */
+  readonly notifyThreadChanged: (
+    threadId: ThreadId,
+    runId: string | null,
+  ) => Effect.Effect<void, KanbanError>;
   /** Background worker: runs queued dispatch kicks and turn ends; never returns. */
   readonly worker: Effect.Effect<never>;
 }
@@ -463,7 +468,9 @@ export class KanbanService extends Context.Service<KanbanService, KanbanServiceS
   "t3/ardud/kanban/engine/KanbanService",
 ) {}
 
-type Job = { readonly _tag: "kick" } | { readonly _tag: "turnEnd"; readonly threadId: ThreadId };
+type Job =
+  | { readonly _tag: "kick" }
+  | { readonly _tag: "turnEnd"; readonly threadId: ThreadId; readonly runId: string };
 
 /** A slot a work thread keeps between cards (see `holds`). */
 interface Hold {
@@ -1540,9 +1547,21 @@ const make = Effect.gen(function* () {
    */
   const admit = Effect.fn("KanbanService.admit")(function* (threadId: ThreadId, boardId: string) {
     const at = yield* nowMillis;
-    const view = yield* threads.view(threadId);
-    const run = view?.runStartedAt ?? `admitted:${at}:${NodeCrypto.randomUUID()}`;
-    yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn: run }));
+    // The run's id isn't known yet; a placeholder no run id can equal until rekeyAdmission sets it.
+    const turn = `pending:${at}:${NodeCrypto.randomUUID()}`;
+    yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn }));
+  });
+
+  /** A running run reported its id: an admission still waiting for one takes that id. */
+  const rekeyAdmission = Effect.fn("KanbanService.rekeyAdmission")(function* (
+    threadId: ThreadId,
+    runId: string,
+  ) {
+    yield* Ref.update(admitted, (all) => {
+      const entry = all.get(threadId);
+      if (!entry || !entry.turn.startsWith("pending:")) return all;
+      return new Map(all).set(threadId, { ...entry, turn: runId });
+    });
   });
 
   /**
@@ -2735,15 +2754,21 @@ const make = Effect.gen(function* () {
 
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
+    runId: string,
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
     // The run that just ended. Released before anything else can admit a turn here (the
     // nudge below is a new turn, a new admission). A run with no admission releases nothing.
-    // The admission that turn held is released before anything else can admit a turn here (the
-    // nudge below is a new turn, a new admission).
-    const endedRun = (yield* Ref.get(admitted)).get(threadId)?.turn;
-    if (endedRun !== undefined) yield* releaseTurn(threadId, endedRun);
+    // The run that ended is released before anything else can admit a turn here (the nudge
+    // below is a new turn, a new admission). A stale end names an older run, so nothing matches.
+    yield* releaseTurn(threadId, runId);
+    // An admission that never saw its run's running event (no re-key) can only be the turn that just
+    // ended; a re-keyed admission belongs to a run and is released by that run's id alone.
+    const waiting = (yield* Ref.get(admitted)).get(threadId);
+    if (waiting !== undefined && waiting.turn.startsWith("pending:")) {
+      yield* releaseTurn(threadId, waiting.turn);
+    }
     const at = yield* nowIso;
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
@@ -4925,7 +4950,9 @@ const make = Effect.gen(function* () {
 
   const runJob = (job: Job) =>
     lock
-      .withPermits(1)(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId))
+      .withPermits(1)(
+        job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId, job.runId),
+      )
       .pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("kanban job failed", { job: job._tag, cause }),
@@ -5039,18 +5066,20 @@ const make = Effect.gen(function* () {
     createForThread,
     nextCards,
     dispatchNow: guard(dispatchUnlocked()),
-    turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
+    turnEnded: (threadId, runId) => guard(turnEndedUnlocked(threadId, runId ?? "")),
     tick: guard(tickUnlocked()),
     probeOutages: read(probeOutagesNow()),
-    notifyTurnEnded: (threadId) =>
-      Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
-    notifyThreadChanged: (threadId) =>
+    notifyTurnEnded: (threadId, runId) =>
+      Queue.offer(jobs, { _tag: "turnEnd", threadId, runId }).pipe(Effect.asVoid),
+    notifyThreadChanged: (threadId, runId) =>
       read(
         Effect.gen(function* () {
           const link = yield* store.threadLink(threadId);
           if (!link) return;
           const view = yield* threads.view(threadId);
           if (!view) return;
+          // A running run names itself: an admission made before its id was known takes it.
+          if (runId !== null && view.state !== "idle") yield* rekeyAdmission(threadId, runId);
           yield* publish(link.boardId, {
             _tag: "thread",
             thread: {
