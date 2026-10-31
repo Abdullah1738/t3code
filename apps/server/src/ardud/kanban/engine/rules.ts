@@ -24,7 +24,38 @@ export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "sy
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
-export const poolKey = (model: ModelSelection): string => `${model.instanceId}/${model.model}`;
+/** A model's reasoning level (its string "variant" option), or null. */
+export const modelLevel = (model: ModelSelection): string | null => {
+  const value = model.options?.find((option) => option.id === "variant")?.value;
+  return typeof value === "string" ? value : null;
+};
+
+/** One key per model, whatever its level: outages and the composer's list are per model. */
+export const modelKey = (model: ModelSelection): string => `${model.instanceId}/${model.model}`;
+
+/** A pool runs one model at one level: `instance/model#level`, or `instance/model` with no level. */
+export const poolKey = (model: ModelSelection): string => {
+  const level = modelLevel(model);
+  return level === null ? modelKey(model) : `${modelKey(model)}#${level}`;
+};
+
+/**
+ * The pool a model runs on: the pool at its exact level, else the first pool (in pool
+ * order) of the same model at any level. A board with one pool per model behaves as
+ * before levels were part of the key.
+ */
+export function poolFor(
+  pools: ReadonlyArray<KanbanPool>,
+  model: ModelSelection,
+): KanbanPool | undefined {
+  const key = poolKey(model);
+  const base = modelKey(model);
+  // Compared by each pool's model, not its stored key, so a pool not yet rekeyed still matches.
+  return (
+    pools.find((pool) => poolKey(pool.model) === key) ??
+    pools.find((pool) => modelKey(pool.model) === base)
+  );
+}
 
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);
 
@@ -262,7 +293,7 @@ export function maskDownPools(
   pools: ReadonlyArray<KanbanPool>,
   down: ReadonlySet<string>,
 ): ReadonlyArray<KanbanPool> {
-  return pools.map((pool) => (down.has(pool.key) ? { ...pool, slots: 0 } : pool));
+  return pools.map((pool) => (down.has(modelKey(pool.model)) ? { ...pool, slots: 0 } : pool));
 }
 
 /** Whether an open card holds `card` up; see kanbanHeldUpBy for the same-thread case. */
@@ -288,10 +319,18 @@ export function nextModel(board: KanbanBoard, card: KanbanCard): ModelSelection 
   return card.model;
 }
 
+/** The key of the pool `model` runs on; with no pool for it, its own pool key. */
+export const poolOf = (pools: ReadonlyArray<KanbanPool>, model: ModelSelection): string =>
+  poolFor(pools, model)?.key ?? poolKey(model);
+
 /** The model of a card's that runs on `pool`, if any. */
-export function modelOnPool(card: KanbanCard, pool: string): ModelSelection | null {
-  if (poolKey(card.model) === pool) return card.model;
-  return kanbanCardModels(card).find((entry) => poolKey(entry.model) === pool)?.model ?? null;
+export function modelOnPool(
+  card: KanbanCard,
+  pool: string,
+  pools: ReadonlyArray<KanbanPool> = [],
+): ModelSelection | null {
+  if (poolOf(pools, card.model) === pool) return card.model;
+  return kanbanCardModels(card).find((entry) => poolOf(pools, entry.model) === pool)?.model ?? null;
 }
 
 /**
@@ -300,10 +339,13 @@ export function modelOnPool(card: KanbanCard, pool: string): ModelSelection | nu
  */
 function weightedModel(
   card: KanbanCard,
+  pools: ReadonlyArray<KanbanPool>,
   free: ReadonlyMap<string, number>,
   pick: (count: number) => number,
 ): ModelSelection | null {
-  const open = kanbanCardModels(card).filter((entry) => (free.get(poolKey(entry.model)) ?? 0) > 0);
+  const open = kanbanCardModels(card).filter(
+    (entry) => (free.get(poolOf(pools, entry.model)) ?? 0) > 0,
+  );
   if (open.length === 0) return null;
   const top = Math.max(...open.map((entry) => entry.weight));
   const tied = open.filter((entry) => entry.weight === top);
@@ -407,11 +449,11 @@ export function planDispatch(
       // Once a card has a work thread it stays on that thread's model.
       const model =
         role === "work" && card.workThreadId === null
-          ? weightedModel(card, free, pick)
+          ? weightedModel(card, pools, free, pick)
           : nextModel(board, card);
       if (model === null) continue;
-      const key = poolKey(model);
-      if ((slots.get(key) ?? 0) <= 0) continue;
+      const key = poolFor(pools, model)?.key;
+      if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
       let thread = role === "work" ? card.workThreadId : null;
       const fresh = thread !== null && busyElsewhere(thread, key);
       // A new thread can't take a card its old thread's own work still holds up.
@@ -446,6 +488,8 @@ export interface ClaimContext {
   readonly carrying: number;
   /** Slots in the thread's pool; a pool at 0 is paused. */
   readonly slots: number;
+  /** The board's pools, to find the pool each of the card's models runs on. */
+  readonly pools?: ReadonlyArray<KanbanPool>;
 }
 
 /**
@@ -471,10 +515,11 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
     );
   }
+  const pools = ctx.pools ?? [];
   const runsOn =
     card.workThreadId === null
-      ? kanbanCardModels(card).map((entry) => poolKey(entry.model))
-      : [poolKey(card.model)];
+      ? kanbanCardModels(card).map((entry) => poolOf(pools, entry.model))
+      : [poolOf(pools, card.model)];
   if (!runsOn.includes(ctx.pool)) {
     return no(`card #${card.number} runs on ${runsOn.join(" or ")}; this thread runs ${ctx.pool}`);
   }
@@ -511,6 +556,7 @@ export function relatedCandidates(input: {
   readonly projectId: string | null;
   readonly carrying: number;
   readonly slots: number;
+  readonly pools?: ReadonlyArray<KanbanPool>;
   readonly limit?: number;
 }): ReadonlyArray<Candidate> {
   const byId = new Map(input.cards.map((card) => [card.id as string, card]));
@@ -543,6 +589,7 @@ export function relatedCandidates(input: {
     byId,
     carrying: input.carrying,
     slots: input.slots,
+    ...(input.pools ? { pools: input.pools } : {}),
   };
   const order = kanbanPickOrder(input.cards);
   return [...reasons]

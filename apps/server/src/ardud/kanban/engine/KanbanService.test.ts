@@ -4957,7 +4957,7 @@ it.effect("pausing a pool at a variant the provider doesn't offer keeps the pool
   }),
 );
 
-it.effect("pausing a pool at a different offered variant stores the requested variant", () =>
+it.effect("a second offered level of a pooled model is its own pool, and each level's cards run on it", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -4965,10 +4965,83 @@ it.effect("pausing a pool at a different offered variant stores the requested va
       const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
       const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
       yield* kanban.setPool(board.id, opusXhigh, 2);
-      const paused = yield* kanban.setPool(board.id, opusHigh, 0);
-      const pool = paused.find((candidate) => candidate.key === Rules.poolKey(opusXhigh));
-      assert.strictEqual(pool?.slots, 0);
-      assert.strictEqual(pool?.model.options?.find((o) => o.id === "variant")?.value, "high");
+      const pools = yield* kanban.setPool(board.id, opusHigh, 1);
+      assert.notStrictEqual(Rules.poolKey(opusHigh), Rules.poolKey(opusXhigh));
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(opusXhigh))?.slots, 2);
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(opusHigh))?.slots, 1);
+
+      const high = yield* kanban.createCard(board.id, { prompt: "h", title: "h", model: opusHigh }, owner);
+      const xhigh = yield* kanban.createCard(board.id, { prompt: "x", title: "x", model: opusXhigh }, owner);
+      const waits = yield* kanban.createCard(board.id, { prompt: "w", title: "w", model: opusHigh }, owner);
+      assert.strictEqual(Rules.modelLevel(high.model), "high");
+      assert.strictEqual(Rules.modelLevel(xhigh.model), "xhigh");
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(high.id)).card.activePool, Rules.poolKey(opusHigh));
+      assert.strictEqual((yield* kanban.card(xhigh.id)).card.activePool, Rules.poolKey(opusXhigh));
+      // The high pool's one slot is taken; the xhigh pool's free slot doesn't run a high card.
+      assert.strictEqual((yield* kanban.card(waits.id)).card.stage, "todo");
+
+      // With two Opus pools, a request with no level names no pool.
+      const opus = modelSelectionOf({ model: "opus/claude-opus-5-5" });
+      const ambiguous = yield* kanban.setPool(board.id, opus, 3).pipe(Effect.flip);
+      assert.strictEqual(ambiguous.code, "invalid");
+      assert.include(ambiguous.detail, "opus/claude-opus-5-5 has pools at xhigh, high; name the level");
+      const removeAmbiguous = yield* kanban.removePool(board.id, opus).pipe(Effect.flip);
+      assert.include(removeAmbiguous.detail, "name the level");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a pause at a level the provider doesn't offer, with two pools, needs the level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haikuMax = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      const haikuXhigh = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      const haikuUltra = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "ultra" });
+      yield* kanban.setPool(board.id, haikuMax, 3);
+      yield* kanban.setPool(board.id, haikuXhigh, 1);
+      const refused = yield* kanban.setPool(board.id, haikuUltra, 0).pipe(Effect.flip);
+      assert.include(refused.detail, 'has no "ultra" variant');
+      const pools = (yield* kanban.snapshot(board.id)).pools;
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(haikuMax))?.slots, 3);
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(haikuXhigh))?.slots, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a resize with no level keeps the model's one pool and its level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const pools = yield* kanban.setPool(board.id, modelSelectionOf({ model: "opus/claude-opus-5-5" }), 3);
+      const opus = pools.filter((pool) => pool.model.model === "opus/claude-opus-5-5");
+      assert.strictEqual(opus.length, 1);
+      assert.strictEqual(opus[0]?.slots, 3);
+      assert.strictEqual(opus[0]?.key, Rules.poolKey(board.defaultCardModel));
+      assert.strictEqual(Rules.modelLevel(opus[0]!.model), "xhigh");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an outage on one level of a model holds every pool of that model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.setPool(board.id, opusHigh, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      fake.failures.set(workThread, outage);
+      yield* kanban.turnEnded(workThread);
+      const high = yield* kanban.createCard(board.id, { prompt: "h", title: "h", model: opusHigh }, owner);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(high.id)).card.stage, "todo");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -5376,16 +5449,18 @@ it.effect("a pool whose model leaves the composer's list drops to 0 slots on the
       ]);
       yield* Ref.set(listed, stillListed);
 
-      const slotsOf = (key: string) =>
+      // `gone` names no level, so it resized the board's one Haiku pool (the manager's, xhigh).
+      const slotsOf = (model: ModelSelection) =>
         Effect.map(
           kanban.snapshot(board.id),
-          (snapshot) => snapshot.pools.find((pool) => pool.key === key)!.slots,
+          (snapshot) =>
+            snapshot.pools.find((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model))!.slots,
         );
       yield* kanban.tick;
-      assert.strictEqual(yield* slotsOf(Rules.poolKey(gone)), 2);
+      assert.strictEqual(yield* slotsOf(gone), 2);
       yield* kanban.tick;
-      assert.strictEqual(yield* slotsOf(Rules.poolKey(gone)), 0);
-      assert.strictEqual(yield* slotsOf(Rules.poolKey(board.defaultCardModel)), 2);
+      assert.strictEqual(yield* slotsOf(gone), 0);
+      assert.strictEqual(yield* slotsOf(board.defaultCardModel), 2);
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );
@@ -5405,7 +5480,7 @@ it.effect("with an unknown composer list no pool is zeroed", () =>
       yield* kanban.tick;
       yield* kanban.tick;
       const pool = (yield* kanban.snapshot(board.id)).pools.find(
-        (entry) => entry.key === Rules.poolKey(haiku),
+        (entry) => Rules.modelKey(entry.model) === Rules.modelKey(haiku),
       );
       assert.strictEqual(pool!.slots, 2);
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -5438,7 +5513,7 @@ it.effect("setPool refuses an unlisted model with slots and adds a listed one at
       assert.strictEqual(refused.code, "invalid");
       assert.include(refused.detail, "isn't in the model list");
       const added = yield* kanban.setPool(board.id, haiku, 0);
-      assert.isTrue(added.some((pool) => pool.key === Rules.poolKey(haiku) && pool.slots === 0));
+      assert.isTrue(added.some((pool) => Rules.modelKey(pool.model) === Rules.modelKey(haiku) && pool.slots === 0));
     }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );
