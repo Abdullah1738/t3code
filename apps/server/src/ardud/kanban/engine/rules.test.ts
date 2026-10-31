@@ -1025,7 +1025,14 @@ describe("probe backoff and pool masking", () => {
   it("zeroes every level of a down model", () => {
     const high = { ...opus, options: [{ id: "variant", value: "high" }] } as ModelSelection;
     const max = { ...opus, options: [{ id: "variant", value: "max" }] } as ModelSelection;
-    const masked = maskDownPools(pools([[high, 2], [max, 3], [sol, 1]]), new Set([modelKey(opus)]));
+    const masked = maskDownPools(
+      pools([
+        [high, 2],
+        [max, 3],
+        [sol, 1],
+      ]),
+      new Set([modelKey(opus)]),
+    );
     expect(masked.map((pool) => pool.slots)).toEqual([0, 0, 1]);
   });
 });
@@ -1045,7 +1052,11 @@ describe("pool levels", () => {
   });
 
   it("finds the exact level's pool, else the model's first pool", () => {
-    const all = pools([[at(haiku, "max"), 3], [at(haiku, "xhigh"), 1], [opus, 1]]);
+    const all = pools([
+      [at(haiku, "max"), 3],
+      [at(haiku, "xhigh"), 1],
+      [opus, 1],
+    ]);
     expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
     expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
     expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
@@ -1056,7 +1067,10 @@ describe("pool levels", () => {
   it("runs each level's cards on its own pool, and a card at an unpooled level on the model's first", () => {
     const max = at(haiku, "max");
     const xhigh = at(haiku, "xhigh");
-    const all = pools([[max, 1], [xhigh, 1]]);
+    const all = pools([
+      [max, 1],
+      [xhigh, 1],
+    ]);
     const plan = planDispatch(
       board,
       [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
