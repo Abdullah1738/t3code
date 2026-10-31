@@ -692,7 +692,6 @@ class CardSwap(Base):
             else:
                 case['id'] = f'ref-{full.replace(" ", "")}'
                 case['state'] = 'card 5542 flagged'
-                case['next'] = f'dispute {full} on card 5542'
         path.write_text(json.dumps(book))
         for dry in (True, False):
             out = io.StringIO()
@@ -720,7 +719,32 @@ class CardSwap(Base):
             text = out.getvalue()
             for leaked in ('4242554242420004', '4242 5542 4242 0004', '4242 2342 4242 0004', '4242 2342'):
                 self.assertNotIn(leaked, text, f'dry={dry}')
-            self.assertIn('[card number removed] then 2342', text, f'dry={dry}')
+            self.assertIn("'pay [card number removed] then 5542' holds a card number or code", text, f'dry={dry}')
+
+    def test_a_next_line_holding_a_full_number_is_left_as_stored_and_later_reads_stay_masked(self):
+        # Rewriting a group of 4242 5542 4242 0004 would store a number that fails the Luhn check, so show,
+        # list --json and the watcher would print it. The row is left as is; the other open case still moves.
+        full = '4242 5542 4242 0004'
+        self.case('acme', next_action='dispute on card 5542')
+        self.case('other', merchant='Shop 2', next_action='retry on 5542')
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        book['cases'][0]['next'] = f'pay {full} then 5542'
+        path.write_text(json.dumps(book))
+        out = io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+            mc.main(['card-swap', '--old', '5542', '--new', '2342'])
+        self.assertIn('1 case(s) updated', out.getvalue())
+        stored = mc.load(self.data)
+        self.assertEqual(mc.find(stored, 'acme')['next'], f'pay {full} then 5542')
+        self.assertEqual([h['text'] for h in mc.find(stored, 'acme')['history'] if 'card swap' in h['text']], [])
+        self.assertEqual(mc.find(stored, 'other')['next'], 'retry on 2342')
+        for args in (['show', 'acme'], ['list', '--json']):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(args)
+            for leaked in ('4242 5542 4242 0004', '4242 2342 4242 0004', '4242554242420004', '4242234242420004'):
+                self.assertNotIn(leaked, out.getvalue(), args)
 
     def test_cli_card_swap_prints_moves_and_dry_run_says_would_update(self):
         self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')

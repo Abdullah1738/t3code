@@ -13,6 +13,7 @@
                   [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
   money-cases card-swap --old OLD --new NEW [--also STALE ...] [--dry-run]
                   point open cases' next line at a replacement card (last 4 only); never closes a case
+                  and leaves a next line that holds a card number or code as is
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
   money-cases brief    one line for the morning brief, nothing when no case is open
@@ -452,6 +453,11 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None):
                 # last-4 is masked before the swap can make it fail the Luhn check and slip through.
                 shown_before = redact(before)
                 shown_after = token.subn(new, shown_before)[0]
+                if count and (card_numbers(before) or LABELLED.search(before)):
+                    # Rewriting a group of a stored full number breaks its Luhn check, so show, list --json and the
+                    # watcher would stop masking it. Leave the row exactly as stored for a human to clean.
+                    changes.append({'id': case['id'], 'before': shown_before, 'after': None, 'held': True})
+                    continue
                 if not count:
                     changes.append({'id': case['id'], 'before': shown_before, 'after': None})
                     continue
@@ -877,7 +883,9 @@ def main(argv=None):
             for c in changes:
                 # Same redaction as show/list: a hand-edited case may hold a card number or code in next.
                 cid = redact(c['id'])
-                if c['after'] is None:
+                if c.get('held'):
+                    print(f"{cid}: next {redact(c['before'])!r} holds a card number or code, left as is; clean it by hand")
+                elif c['after'] is None:
                     print(f"{cid}: names {args.old}, check by hand")
                 else:
                     print(f"{cid}: next {redact(c['before'])!r} -> {redact(c['after'])!r}")
