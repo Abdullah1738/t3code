@@ -408,6 +408,12 @@ export class RobobBackend implements ChatBackend {
     return BUSY.has((await this.detail(id)).state);
   }
 
+  /** Busy, or waiting on background work a reset would cut off (see `resetBlocked` in openchamber.ts). */
+  async resetBlocked(id: string): Promise<boolean> {
+    const state = (await this.detail(id)).state;
+    return BUSY.has(state) || state === "waiting";
+  }
+
   async permissions(sessionId: string, _directory?: string): Promise<PermissionRequest[]> {
     const thread = await this.detail(sessionId);
     return thread.pendingRequests.filter(request => request.kind === "approval").map(request => permissionFrom(request, sessionId));

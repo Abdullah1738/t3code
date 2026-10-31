@@ -1289,6 +1289,10 @@ export class Router {
 
   /** Whether the route or any session in its family is still running. Call only with statuses that match the route. */
   private async familyBusy(route: Route): Promise<boolean> {
+    // A waiting root can still owe background work (commands, monitors) with no child session,
+    // which statuses() and sessionBusy() both call idle, so the reset check asks resetBlocked.
+    const blocked = await bounded(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => undefined);
+    if (blocked === undefined || blocked) return true;
     const statuses = await this.statusesFor(route).catch(() => undefined);
     if (!statuses) return true;
     if (statuses[route.id] !== undefined) return true;
@@ -2796,8 +2800,9 @@ export class Router {
         if (text && turn!.inboundId && turn!.inboundId === this.store.get<string | null>("newNudge")) {
           this.store.set("newDeferred", { generation: turn!.generation, since: this.rowidOf(turn!.inboundId), outbox: this.outboxMark() } satisfies NewDeferred);
         } else if (deferred && deferred.generation === turn!.generation && this.sentSince(turn!.generation, deferred.outbox)) {
-          this.store.set("newDeferred", null);
-          this.options.log?.("context-reset-dropped", "moved-on");
+          // The conversation moved on: a queued reset row for it must not be POSTed either.
+          this.dropQueuedNewIfMovedOn();
+          this.clearDeferredNew();
         }
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
         this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
@@ -2821,8 +2826,11 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     if (!route || (turn && turn.phase !== "failed" && this.current(turn))) return;
     // Until a reset nudge is handled, whatever the old context still says (an
-    // answer /new cut off, say) is not for the owner.
-    if (this.store.pendingInbound().some(row => resetRow(row.id))) return;
+    // answer /new cut off, say) is not for the owner. A deferred /new is the
+    // exception: its nudge waits for the work to finish, so background follow-ups
+    // still deliver, and whichever lands first decides (see cancelQueuedNew).
+    const queued = this.store.get<{ id: string } | null>("newQueued");
+    if (this.store.pendingInbound().some(row => resetRow(row.id) && row.id !== queued?.id)) return;
     const now = Date.now();
     if (now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
     this.watchedAt = now;
