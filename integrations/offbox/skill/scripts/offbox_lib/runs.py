@@ -406,10 +406,10 @@ def exit_recording_command(script: str, run_id: str) -> str:
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
 
 
-def recorded_exit(box_id: str, run_id: str) -> int | None:
+def recorded_exit(box_id: str, run_id: str, timeout: float = 20) -> int | None:
     """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
     try:
-        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=20)
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, OffboxError):
         return None
     if p.returncode != 0:
@@ -430,9 +430,11 @@ def steps_exit(log_path: Path | None, planned: int) -> int | None:
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
 
 
-def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int) -> tuple[int | None, str]:
-    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines."""
-    code = recorded_exit(box_id, run_id)
+def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
+                      timeout: float = 20) -> tuple[int | None, str]:
+    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines.
+    `timeout` bounds the box read (a caller with a deadline passes what is left of it)."""
+    code = recorded_exit(box_id, run_id, timeout=timeout)
     if code is not None:
         return code, "the box's exit file"
     code = steps_exit(log_path, planned)

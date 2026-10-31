@@ -424,8 +424,13 @@ def _wait_locked(r, echo, timeout=None):
             if deadline is not None and now() >= deadline:
                 raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
                                   f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
-            ended_at = (ended_at or now()) if st else None
-            if st and now() - ended_at >= _grace(cur):
+            # Output that arrived during the status request is progress too: re-read the log before deciding.
+            grown = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            if grown != last_size:
+                last_size, ended_at = grown, None
+            else:
+                ended_at = (ended_at or now()) if st else None
+            if st and ended_at is not None and now() - ended_at >= _grace(cur):
                 return _holder_stuck(cur, st, log_path, pos, echo, deadline)
         if not said:
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
@@ -450,10 +455,12 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     from .runs import _status_code, recover_lost_exit
     code, how = _status_code(st), "boat's process status"
     if code is None:
-        if deadline is not None and now() >= deadline:
+        # The box read is capped to what is left of the caller's deadline, so recovery never outlasts --timeout.
+        budget = 20.0 if deadline is None else deadline - now()
+        if budget <= 0:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
                               f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
                               f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)

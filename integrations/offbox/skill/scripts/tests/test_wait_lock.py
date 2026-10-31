@@ -111,6 +111,67 @@ class WaitLockTests(Isolated):
         # The holder kept writing across more than two grace windows (2 x 60 s), so the grace really was restarted.
         self.assertGreater(state['n'], 2 * 60 // 5)
 
+    def test_output_during_the_status_call_restarts_the_grace(self):
+        # Boat says "ended" from the first poll on, so the grace clock starts at the first answer (t=1000). Each poll
+        # every 30 s sees the log unchanged, except the third one: its answer is in flight while the holder writes, at
+        # t=1060+5. That byte is progress, so the grace restarts there and must not be judged stuck at t=1060.
+        self.hold_box()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        calls = {'n': 0}
+        clock = None
+
+        def ended_with_late_output(*a, **k):
+            calls['n'] += 1
+            if calls['n'] == 3:
+                # The third answer is in flight while the holder writes at t=1065 (nothing was written before).
+                clock.t = 1065.0
+                with open(log, 'ab') as f:
+                    f.write(b'late\n')
+            return {'running': False, 'status': 'exited', 'exitCode': 0}
+
+        def holder(t):
+            # From t=1065 the holder keeps writing every poll and records its end at t=1200, so the grace never elapses.
+            if t >= 1200:
+                self.end_run(0)
+            elif t >= 1065:
+                with open(log, 'ab') as f:
+                    f.write(b'more\n')
+        self.ended.side_effect = ended_with_late_output
+        clock = Clock(on_sleep=holder)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('looks stuck', err)
+        self.assertGreaterEqual(calls['n'], 3)
+
+    def test_near_deadline_lost_status_recovery_is_capped_to_the_budget(self):
+        # The holder's grace has already elapsed when boat says "lost" at t=1060 with one second of --timeout 61 left.
+        # The recovery read must get that second, not 20 s, and the wait must end at the deadline with 124.
+        self.hold_box()
+        clock = Clock()  # the wait starts at t=1000, so --timeout 61 ends at t=1061
+        seen = {}
+
+        def lost(*a, **k):
+            return {'running': False, 'status': 'lost', 'exitCode': None}
+        self.ended.side_effect = lost
+
+        def fake_recorded(box_id, run_id, timeout=20):
+            seen['timeout'] = timeout
+            clock.t += timeout
+            return None
+        # Polls at t=1000, 1030, 1060: the grace (60 s since the first "lost" answer) elapses at t=1060, one second
+        # before the deadline. Recovery must read the box for that one second only, not for its usual 20 s.
+        with patch.object(runs, 'recorded_exit', side_effect=fake_recorded), \
+                patch.object(runs, 'steps_exit', return_value=None), \
+                patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '61'], clock)
+        self.assertIn('timeout', seen, 'recovery must have been attempted near the deadline')
+        self.assertLessEqual(seen['timeout'], 1.0 + 1e-6)
+        self.assertLessEqual(clock.t, 1061.0 + 1e-6)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+
     def test_status_answer_after_the_deadline_is_not_accepted(self):
         # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
         self.hold_box()
