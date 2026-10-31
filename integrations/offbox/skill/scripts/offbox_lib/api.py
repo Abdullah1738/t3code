@@ -200,7 +200,8 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
                 time.sleep(1.5 * attempt)
                 continue
             if deadline is not None and time.time() >= deadline:
-                raise OffboxError(f"deadline passed during {method} {path}: {e}")
+                # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
+                raise OffboxError(f"deadline passed during {method} {path}: {e}", outage=True)
             log(f"api {method} {path} -> network {e}")
             raise OffboxError(f"boat API unreachable ({method} {path}): {e}", outage=True)
 

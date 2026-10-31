@@ -365,6 +365,49 @@ class StatusConnectRetryTests(OutageBase):
         self.assertGreater(self.urlopen.call_count, 1)
 
 
+class FollowTimeoutClockTests(OutageBase):
+    """follow -> real api.cmd_attach/cmd_status -> real api.call, with only the socket faked: every socket attempt
+    hangs for the timeout urllib was given, then fails the way a silent boat does. The 30-minute outage bound must
+    hold on that clock, not only on mocked cmd_status results."""
+
+    def run_follow(self, attach_timeout_s, status_timeout_s):
+        clock = {"t": 1000.0, "first_fail": None}
+
+        def fake_urlopen(req, timeout=None):
+            # urllib gives the socket its timeout; a silent boat burns all of it before failing.
+            clock["t"] += min(float(timeout), attach_timeout_s if "/stream" in req.full_url else status_timeout_s)
+            if clock["first_fail"] is None:
+                clock["first_fail"] = clock["t"]
+            raise OSError("timed out")
+
+        self.urlopen.side_effect = fake_urlopen
+        import time as real_time
+        with patch.object(runs, "_ttl_keeper", return_value=None), \
+                patch.object(runs.api, "time", types.SimpleNamespace(
+                    time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s))), \
+                patch.object(runs, "now", lambda: clock["t"]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(OffboxError) as cm:
+                runs.follow("bx", 1, None, echo=False, stop_evt=FollowOutageTests.Evt(),
+                            until=None)
+        del real_time
+        return clock, cm.exception
+
+    def test_slow_timeouts_hold_the_30_minute_bound(self):
+        clock, e = self.run_follow(attach_timeout_s=90, status_timeout_s=60)
+        outage_s = clock["t"] - clock["first_fail"]
+        self.assertIn("lost the output stream", str(e))
+        self.assertLessEqual(outage_s, runs.OUTAGE_FOLLOW_S + 150)  # one slow attach past the window at most
+        self.assertGreater(outage_s, runs.OUTAGE_FOLLOW_S - 150)    # and the window is actually used
+
+    def test_fast_failures_hold_the_30_minute_bound(self):
+        clock, e = self.run_follow(attach_timeout_s=1, status_timeout_s=1)
+        outage_s = clock["t"] - clock["first_fail"]
+        self.assertIn("lost the output stream", str(e))
+        self.assertLessEqual(outage_s, runs.OUTAGE_FOLLOW_S + 150)
+        self.assertGreater(outage_s, runs.OUTAGE_FOLLOW_S - 150)
+
+
 class ClosedStderrSubprocessTests(Isolated):
     def test_say_then_exit_code_survives_a_closed_stderr_pipe(self):
         code = (
