@@ -585,10 +585,10 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
     assert.notInclude(sent.join("\n"), "waiting on your subtasks");
 
     const againOut = yield* runScript("again", [
-      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"again"}`,
+      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"second-handback-note"}`,
     ]);
     assert.include(againOut, `Couldn't hand s2 on card #${card.number} back: subtask s2 isn't a script's`);
-    assert.strictEqual(sent.filter((text) => text.includes("again")).length, 0);
+    assert.strictEqual(sent.filter((text) => text.includes("second-handback-note")).length, 0);
   }).pipe(Effect.provide(makeTestLayer(recording)));
 });
 
