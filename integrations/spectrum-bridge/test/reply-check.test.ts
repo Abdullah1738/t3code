@@ -34,6 +34,17 @@ describe("card-limit", () => {
   test("does not apply to other chats", () => {
     expect(checkReply(moni, limitText, {})).toBeUndefined();
   });
+
+  test("blocks the limit excuse for card 2342", () => {
+    const hit = checkReply(owner, "Card 2342's available limit is only AED 4,085, pay part of the balance first", {});
+    expect(hit?.rule).toBe("card-limit");
+    expect(hit?.reason).toContain("2342");
+    expect(hit?.reason).not.toContain("5542");
+  });
+
+  test("ignores 2342 inside a longer number", () => {
+    expect(checkReply(owner, "Your limit on the AED 12342 plan is fine", {})).toBeUndefined();
+  });
 });
 
 describe("banned words", () => {
