@@ -1350,6 +1350,41 @@ it.effect("a work thread that gets too long starts the card on a fresh thread", 
   }),
 );
 
+const handoffFull = {
+  class: "provider_error",
+  code: null,
+  message:
+    "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.",
+} as never;
+
+it.effect("a work thread refused for handoff context starts the card on a fresh thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const oldThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(oldThread)!.messages.length;
+      fake.failures.set(oldThread, handoffFull);
+      yield* kanban.turnEnded(oldThread);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(oldThread)!.messages.length, before);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "todo");
+      assert.isNull(moved.stalled);
+      assert.isNull(moved.workThreadId);
+      assert.isNull(moved.activeThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "working");
+      assert.notStrictEqual(fresh.activeThreadId, oldThread);
+      const first = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(first, "Fresh thread:");
+      assert.include(first, "x");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a second overflow within the hour is flagged", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

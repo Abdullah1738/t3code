@@ -274,9 +274,9 @@ export function isOutage(failure: {
   return OUTAGE_TEXT.test(failure.message);
 }
 
-// Words a provider uses when a thread's history no longer fits the model.
+// Words a provider (or T3's own handoff budget) uses when a thread's history no longer fits the model.
 const CONTEXT_FULL_TEXT =
-  /prompt is too long|input is too long|context[ _]length|maximum context|context window|too many tokens|request_too_large/i;
+  /prompt is too long|input is too long|context[ _]length|maximum context|context window|too many tokens|request_too_large|insufficient context allowance|too little context for a provider handoff/i;
 
 /** A failed run only a fresh thread gets past: the thread is too long to send again. */
 export function isContextFull(failure: { readonly message: string }): boolean {
