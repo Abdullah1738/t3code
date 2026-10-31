@@ -118,7 +118,7 @@ const makeFake = Effect.gen(function* () {
           copy.set(threadId, {
             title: input.title,
             model: input.model,
-            messages: [input.text],
+            messages: input.text === undefined ? [] : [input.text],
             running: false,
             archived: false,
           });

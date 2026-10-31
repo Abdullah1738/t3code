@@ -63,7 +63,8 @@ export interface KanbanLaunchInput {
   readonly projectId: ProjectId;
   readonly title: string;
   readonly model: ModelSelection;
-  readonly text: string;
+  /** Omitted: the thread is created idle, with no first message. */
+  readonly text?: string | undefined;
 }
 
 export interface KanbanSendInput {
@@ -211,7 +212,9 @@ const make = Effect.gen(function* () {
         runtimeMode: DEFAULT_RUNTIME_MODE,
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         workspaceStrategy: { type: "root" },
-        initialMessage: { text: input.text, attachments: [] },
+        ...(input.text === undefined
+          ? {}
+          : { initialMessage: { text: input.text, attachments: [] } }),
         createdBy: "system",
         creationSource: "server",
       })
