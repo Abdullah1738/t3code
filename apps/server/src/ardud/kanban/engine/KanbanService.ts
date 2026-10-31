@@ -4766,6 +4766,50 @@ const make = Effect.gen(function* () {
     }),
   );
 
+  /**
+   * Pool keys carry the level (`instance/model#level`) since one model can run as several
+   * pools. Pools stored before that are rekeyed in place (UPDATE keeps the row, so pool
+   * order stays), and cards whose activePool names an old key follow. Each board's pools
+   * and cards move in one transaction, so a failed write leaves that board on its old keys
+   * and consistent; the next start tries again. Runs before the worker or any request; a
+   * board with no stale pool costs one pools read.
+   */
+  const rekeyBoard = Effect.fn("KanbanService.rekeyBoard")(
+    function* (board: KanbanBoard) {
+      const pools = yield* store.pools(board.id);
+      const moves = new Map<string, string>();
+      for (const pool of pools) {
+        const key = Rules.poolKey(pool.model);
+        if (pool.key === key) continue;
+        if (pools.some((other) => other.key === key)) {
+          yield* Effect.logWarning(
+            `board ${board.slug}: pool ${pool.key} can't become ${key}, taken`,
+          );
+          continue;
+        }
+        moves.set(pool.key, key);
+      }
+      if (moves.size === 0) return;
+      const cards = (yield* store.cards(board.id))
+        .filter((card) => card.activePool !== null && moves.has(card.activePool))
+        .map((card) => ({ ...card, activePool: moves.get(card.activePool!)! }));
+      const rekeyed = pools
+        .filter((pool) => moves.has(pool.key))
+        .map((pool) => ({ from: pool.key, pool: { ...pool, key: moves.get(pool.key)! } }));
+      yield* store.rekeyBoard(board.id, rekeyed, cards);
+      for (const { from, pool } of rekeyed) {
+        yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
+      }
+    },
+    (effect, board) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`kanban pool rekey failed for board ${board.slug}`, { cause }),
+        ),
+      ),
+  );
+  yield* Effect.forEach(yield* store.boards, rekeyBoard, { discard: true });
+
   const runJob = (job: Job) =>
     lock
       .withPermits(1)(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId))

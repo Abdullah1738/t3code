@@ -218,6 +218,15 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     key: string,
   ) => Effect.Effect<void, KanbanStoreError>;
+  /**
+   * Gives each pool in `pools` (keyed by its old key) a new key and record in place, and
+   * writes the cards, in one transaction: a failure leaves the board as it was.
+   */
+  readonly rekeyBoard: (
+    boardId: KanbanBoardId,
+    pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
+    cards: ReadonlyArray<KanbanCard>,
+  ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
     boardId: KanbanBoardId,
@@ -514,6 +523,29 @@ const make = Effect.gen(function* () {
           ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
         `;
       }),
+    );
+  const rekeyBoard = (
+    boardId: KanbanBoardId,
+    pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
+    cards: ReadonlyArray<KanbanCard>,
+  ) =>
+    run(
+      "rekey board",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          for (const { from, pool } of pools) {
+            const json = yield* Pool.encode(pool);
+            yield* sql`
+              UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${json}
+              WHERE board_id = ${boardId} AND key = ${from}
+            `;
+          }
+          for (const card of cards) {
+            const json = yield* Card.encode(card);
+            yield* sql`UPDATE ardud_kanban_cards SET json = ${json} WHERE id = ${card.id}`;
+          }
+        }),
+      ),
     );
   const removePool = (boardId: KanbanBoardId, key: string) =>
     run(
@@ -821,6 +853,7 @@ const make = Effect.gen(function* () {
     pools,
     putPool,
     removePool,
+    rekeyBoard,
     groups,
     putGroups,
     discussions,

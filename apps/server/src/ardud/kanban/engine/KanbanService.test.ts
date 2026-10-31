@@ -3502,7 +3502,11 @@ const probe = { ok: false, calls: 0 };
 const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
   fake.pipe(
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(failPosts ? failingPostStore.pipe(Layer.provide(KanbanStore.layer)) : KanbanStore.layer),
+    Layer.provideMerge(
+      failPosts
+        ? failingPostStore.pipe(Layer.provide(KanbanStore.layer))
+        : failingRekeyStore.pipe(Layer.provide(KanbanStore.layer)),
+    ),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(
       Layer.mock(TextGeneration.TextGeneration)({
@@ -5137,6 +5141,126 @@ it.effect("an outage on one level of a model holds every pool of that model", ()
   }),
 );
 
+it.effect(
+  "pools stored under the old instance/model key are rekeyed at start, with their cards",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      // The manager's pool (toyBoard: Haiku xhigh); like the live boards, one pool per model.
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      const legacy = modelSelectionOf({ model: "gpt-6-astra" });
+      yield* Effect.gen(function* () {
+        const { board, cardId, order } = yield* Effect.gen(function* () {
+          const { kanban, board } = yield* toyBoard;
+          const store = yield* KanbanStore.KanbanStore;
+          yield* kanban.setPool(board.id, haiku, 3);
+          const card = yield* kanban.createCard(
+            board.id,
+            { prompt: "x", title: "x", model: haiku },
+            owner,
+          );
+          yield* kanban.dispatchNow;
+          // Write the rows as the old code stored them: key instance/model, level only in the model.
+          for (const pool of yield* store.pools(board.id)) {
+            yield* store.rekeyBoard(
+              board.id,
+              [{ from: pool.key, pool: { ...pool, key: Rules.modelKey(pool.model) } }],
+              [],
+            );
+          }
+          yield* store.putPool(board.id, { key: Rules.poolKey(legacy), model: legacy, slots: 0 });
+          const running = (yield* store.card(card.id))!;
+          assert.strictEqual(running.activePool, Rules.poolKey(haiku));
+          yield* store.putCard({ ...running, activePool: Rules.modelKey(haiku) });
+          const order = (yield* store.pools(board.id)).map((pool) => pool.model);
+          return { board, cardId: card.id, order };
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+        // A new service on the same store rekeys before anything reads.
+        yield* Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          const pools = (yield* kanban.snapshot(board.id)).pools;
+          assert.deepStrictEqual(
+            pools.map((pool) => pool.key),
+            order.map((model) => Rules.poolKey(model)),
+          );
+          assert.include(
+            pools.map((pool) => pool.key),
+            "opencode/opus/cc/claude-haiku-5-5#xhigh",
+          );
+          assert.include(
+            pools.map((pool) => pool.key),
+            "opencode/gpt-6-astra",
+          );
+          assert.strictEqual((yield* kanban.card(cardId)).card.activePool, Rules.poolKey(haiku));
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+        // A third start changes nothing.
+        yield* Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          const pools = (yield* kanban.snapshot(board.id)).pools;
+          assert.deepStrictEqual(
+            pools.map((pool) => pool.key),
+            order.map((model) => Rules.poolKey(model)),
+          );
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+      }).pipe(Effect.provide(probeDeps(fake.layer)));
+    }),
+);
+
+it.effect(
+  "a failed rekey leaves cards and pools on old keys, and dispatch still honours the slot",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      yield* Effect.gen(function* () {
+        const { board, runningId, waitingId } = yield* Effect.gen(function* () {
+          const { kanban, board } = yield* toyBoard;
+          const store = yield* KanbanStore.KanbanStore;
+          yield* kanban.setPool(board.id, haiku, 1);
+          const running = yield* kanban.createCard(
+            board.id,
+            { prompt: "a", title: "a", model: haiku },
+            owner,
+          );
+          yield* kanban.dispatchNow;
+          // Old rows: pool and card keyed instance/model, level only in the model.
+          const running0 = (yield* store.card(running.id))!;
+          const moves = (yield* store.pools(board.id)).map((pool) => ({
+            from: pool.key,
+            pool: { ...pool, key: Rules.modelKey(pool.model) },
+          }));
+          yield* store.rekeyBoard(board.id, moves, [
+            { ...running0, activePool: Rules.modelKey(haiku) },
+          ]);
+          const waiting = yield* kanban.createCard(
+            board.id,
+            { prompt: "b", title: "b", model: haiku },
+            owner,
+          );
+          return { board, runningId: running.id, waitingId: waiting.id };
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+
+        // The first start's rekey write fails: startup must survive, nothing half-moved.
+        rekeyFailures.remaining = 1;
+        yield* Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          const store = yield* KanbanStore.KanbanStore;
+          const pools = (yield* kanban.snapshot(board.id)).pools;
+          assert.deepStrictEqual(
+            pools.map((pool) => pool.key),
+            pools.map((pool) => Rules.modelKey(pool.model)),
+          );
+          assert.strictEqual((yield* store.card(runningId))!.activePool, Rules.modelKey(haiku));
+          // Dispatch still counts the running card against the one slot.
+          yield* kanban.dispatchNow;
+          assert.strictEqual((yield* kanban.card(runningId)).card.stage, "working");
+          assert.strictEqual((yield* kanban.card(waitingId)).card.stage, "todo");
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+        assert.strictEqual(rekeyFailures.remaining, 0);
+      }).pipe(Effect.provide(probeDeps(fake.layer)));
+    }),
+);
+
 it.effect("the pool's variant wins on create and edit", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -6073,6 +6197,25 @@ const failingLinkStore = Layer.effect(
             Effect.fail(new KanbanStore.KanbanStoreError({ operation: "read thread links", cause: "injected" })))
           : real.threadLinks(filter);
       },
+    };
+  }),
+);
+
+// Fails the next `rekeyFailures.remaining` board rekeys, as a write error mid-migration would.
+const rekeyFailures = { remaining: 0 };
+const failingRekeyStore = Layer.effect(
+  KanbanStore.KanbanStore,
+  Effect.gen(function* () {
+    const real = yield* KanbanStore.KanbanStore;
+    return {
+      ...real,
+      rekeyBoard: (boardId, pools, cards) =>
+        rekeyFailures.remaining > 0
+          ? ((rekeyFailures.remaining -= 1),
+            Effect.fail(
+              new KanbanStore.KanbanStoreError({ operation: "rekey board", cause: "injected" }),
+            ))
+          : real.rekeyBoard(boardId, pools, cards),
     };
   }),
 );
