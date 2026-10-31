@@ -109,7 +109,11 @@ def clean_lines(text, limit):
     text = re.sub(r'[\u200b-\u200f\u2060\ufeff\u034f\u00ad]', '', str(text or ''))
     text = re.sub(r'https?://[^\s\]<>]+', '[link]', text)
     lines = [re.sub(r'[ \t\r\f\v]+', ' ', line).strip() for line in text.splitlines()]
-    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()[:limit]
+    text = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
+    # Same OTP redaction as clean(), so keeping line breaks does not change what gets redacted.
+    if OTP.search(text):
+        text = re.sub(r'\b\d{4,8}\b', '[code]', text)
+    return text[:limit]
 
 
 def redact_item(item, context=''):
