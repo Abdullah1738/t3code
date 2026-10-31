@@ -386,11 +386,20 @@ def acquire(me: dict, size: str | None = None, template: str | None = None, base
 
 def acquire_private(me: dict, size: str | None = None, template: str | None = None, base: str | None = None,
             fresh: bool = False) -> dict:
-    """Return a dict lease row with the box running, ssh ready and ttl >= RUN_TTL_S."""
+    """Return a dict lease row with the box running, ssh ready and ttl >= RUN_TTL_S.
+
+    A pool caller's row carries the new box's lock in "_guard". It is taken before the row exists and stays held
+    through bring-up, so no other caller can adopt the box while it is being made; the pool releases it."""
     cap_check()
     con = db()
-    with file_lock(f"lease-{me['owner']}-{me['repo_root']}", timeout=1200):
-        row = None if me['owner'].startswith('pool:') else find_lease(con, me["owner"], me["repo_root"])
+    pooled = me["owner"].startswith("pool:")
+    # A pool creator's bring-up is not serialized on the owner lock: the pool's own slot limit bounds concurrent
+    # creators, and each new box is guarded by its own lock instead (taken below, before the row exists).
+    owner_lock = None if pooled else file_lock(f"lease-{me['owner']}-{me['repo_root']}", timeout=1200)
+    if owner_lock is not None:
+        owner_lock.__enter__()
+    try:
+        row = None if pooled else find_lease(con, me["owner"], me["repo_root"])
         if row and (base or fresh) and row["state"] in ("running", "stopped"):
             say(f"note: --base/--fresh only apply to a NEW lease; reusing {row['box_id']} "
                 f"(`offbox release` first to start over)")
@@ -401,41 +410,60 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         t = now()
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)
         box_id = s["id"]
-        rdir = remote_dir_for(me["repo_root"])
-        is_recipe = source.startswith("recipe:")
-        # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
-        # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
-        # one can hand out as ready. The reaper deletes such rows (see reap._reap).
-        state = "bringing_up" if is_recipe else "running"
-        con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
-                       repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
-                     me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
-        con.commit()
-        event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
+        hold = None
+        if pooled:
+            hold = file_lock(f"box-{box_id}", timeout=0)
+            hold.__enter__()
         try:
-            _bring_up(box_id, fresh=(source == "fresh"),
-                      recipe=source.split(":", 1)[1] if is_recipe else None)
-            try:
-                api.rename(box_id, box_name(me, me["repo_key"]))
-            except OffboxError:
-                pass
-            if base_dir and base_dir != rdir:
-                ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
-                                     f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
-        except OffboxError as e:
-            # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
-            # half built. It must not stay a pool candidate, or a later acquisition would hand it out as ready.
-            if is_recipe:
-                _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
+            got = _create_row(con, me, box_id, source, base_dir, sz, t)
+        except BaseException:
+            if hold is not None:
+                hold.__exit__(None, None, None)
             raise
-        event(con, box_id, "lease_ready", f"{round(now() - t, 1)}s")
-        # Only now is a recipe box reusable: the recipe finished (exit 0) and the bring-up completed.
-        con.execute("UPDATE leases SET ssh_ready_at=?, state=CASE WHEN state='bringing_up' THEN 'running' ELSE state END "
-                    "WHERE box_id=?", (now(), box_id))
-        con.commit()
-        return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
+        if hold is not None:
+            got["_guard"] = hold
+        return got
+    finally:
+        if owner_lock is not None:
+            owner_lock.__exit__(None, None, None)
+
+
+def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t) -> dict:
+    rdir = remote_dir_for(me["repo_root"])
+    is_recipe = source.startswith("recipe:")
+    # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
+    # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
+    # one can hand out as ready. The reaper deletes such rows (see reap._reap).
+    state = "bringing_up" if is_recipe else "running"
+    con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
+                   repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
+                 me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
+    con.commit()
+    event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
+    try:
+        _bring_up(box_id, fresh=(source == "fresh"),
+                  recipe=source.split(":", 1)[1] if is_recipe else None)
+        try:
+            api.rename(box_id, box_name(me, me["repo_key"]))
+        except OffboxError:
+            pass
+        if base_dir and base_dir != rdir:
+            ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
+                                 f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
+    except OffboxError as e:
+        # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
+        # half built. It must not stay a pool candidate, or a later acquisition would hand it out as ready.
+        if is_recipe:
+            _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
+        raise
+    event(con, box_id, "lease_ready", f"{round(now() - t, 1)}s")
+    # Only now is a recipe box reusable: the recipe finished (exit 0) and the bring-up completed.
+    con.execute("UPDATE leases SET ssh_ready_at=?, state=CASE WHEN state='bringing_up' THEN 'running' ELSE state END "
+                "WHERE box_id=?", (now(), box_id))
+    con.commit()
+    return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
 
 
 def _bigger(a: str | None, b: str | None) -> bool:

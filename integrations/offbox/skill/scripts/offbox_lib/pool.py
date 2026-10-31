@@ -300,18 +300,29 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     except capacity.CapacityError as e:
                         last_error = e
                         break
-                    guard = file_lock("box-"+got["box_id"], timeout=0)
-                    guard.__enter__()
+                    # acquire_private hands over the box lock it took before the row existed.
+                    guard = got.pop("_guard", None)
+                    if guard is None:
+                        guard = file_lock("box-"+got["box_id"], timeout=0)
+                        guard.__enter__()
                     try:
-                        _claim(con, me, got, run_id)
+                        # The member row and the slot's removal happen in one step under the pool lock, so a
+                        # selection never sees the box as neither a member nor a pending slot.
+                        with _pool_lock(key, deadline, wait):
+                            _claim(con, me, got, run_id)
+                            con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
+                            con.commit()
+                            token = None
                     except BaseException:
                         guard.__exit__(None, None, None)
                         raise
                     got["_guard"] = guard
                     return got
                 finally:
-                    con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
-                    con.commit()
+                    if token is not None:
+                        # Failed create: removing the slot only lowers the count, so no lock is needed.
+                        con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
+                        con.commit()
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break

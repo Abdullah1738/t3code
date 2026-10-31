@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import threading
 import sys
 import unittest
 from unittest.mock import patch
@@ -170,6 +171,69 @@ class PoolLockTests(Isolated):
             pool.release_guard(row)
         self.assertEqual(tried, ['bad', 'good'])
         new.assert_not_called()
+
+    def test_new_box_cannot_be_claimed_while_creator_is_bringing_it_up(self):
+        """Another caller can see the creator's row as running during bring-up; it must not adopt that box."""
+        ids = iter(['bx_new', 'bx_second'])
+        second = {}
+
+        def new_box(con, me, size, template, base, fresh):
+            return {'id': next(ids)}, 'fresh', None, 'large'
+
+        def bring_up(bid, **kw):
+            if bid == 'bx_new' and not second:
+                second['row'] = pool.acquire(dict(self.me, owner='second'))
+            return {'state': 'running', 'type': 'large'}
+
+        with patch.object(lease, '_new_box', side_effect=new_box), \
+                patch.object(lease, '_bring_up', side_effect=bring_up), \
+                patch.object(lease, 'ensure_ttl'), patch.object(lease.api, 'rename'), \
+                patch.object(lease.api, 'get', return_value={'state': 'running', 'type': 'large'}), \
+                patch.object(lease.api, 'call', side_effect=AssertionError('network forbidden')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            creator = pool.acquire(self.me)
+            try:
+                self.assertEqual(creator['box_id'], 'bx_new')
+                self.assertEqual(second['row']['box_id'], 'bx_second')
+            finally:
+                pool.release_guard(second.get('row'))
+                pool.release_guard(creator)
+
+    def test_pending_handoff_is_under_the_pool_lock(self):
+        """Creator-to-member handoff runs under the pool lock: a concurrent selection can't read between its steps."""
+        second = {}
+
+        def creator(me, size, template, base, fresh):
+            return self.new_box('bx_a')(me, size, template, base, fresh)
+
+        real_claim = pool._claim
+        seen_lock_free = []
+
+        def claim(con, me, row, run_id):
+            seen_lock_free.append(pool_lock_free())
+
+            def other():
+                try:
+                    second['row'] = pool.acquire(dict(self.me, owner='other'))
+                except pool.PoolBusyError as e:
+                    second['error'] = e
+            th = threading.Thread(target=other)
+            th.start()
+            th.join(10)
+            return real_claim(con, me, row, run_id)
+
+        with patch.object(lease, 'acquire_private', side_effect=creator), \
+                patch.object(pool, '_claim', side_effect=claim), \
+                patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            row = pool.acquire(self.me)
+        try:
+            self.assertEqual(seen_lock_free, [False])
+            self.assertIsInstance(second.get('error'), pool.PoolBusyError)
+            self.assertNotIn('row', second)
+            self.assertEqual([r['box_id'] for r in pool.members(self.con, 'repo')], ['bx_a'])
+        finally:
+            pool.release_guard(row)
 
 
 if __name__ == '__main__':
