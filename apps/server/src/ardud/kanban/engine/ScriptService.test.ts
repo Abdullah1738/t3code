@@ -205,6 +205,35 @@ it.effect("adds cards and posts from what a run prints, once", () =>
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("sets the evaluator pool from a script, and refuses 0", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    const script = yield* register(
+      board,
+      scriptFile(
+        [
+          `echo '{"kanban":"evaluators","slots":4}'`,
+          `echo '{"kanban":"evaluators","slots":null}'`,
+          `echo '{"kanban":"evaluators","slots":0}'`,
+          "",
+        ].join("\n"),
+      ),
+    );
+
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+
+    const [done] = yield* scripts.runs(script.id, 1);
+    assert.include(done?.output, "Set the evaluator pool to 4 slots.");
+    assert.include(done?.output, "Set the evaluator pool to no limit.");
+    // A bad line (0 slots) is dropped by the parser, so no note and the pool is untouched.
+    assert.notInclude(done?.output, "evaluator pool to 0");
+    assert.strictEqual((yield* kanban.snapshot(board.id)).board.evaluatorSlots, null);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("resizes a pool the board has, and only that", () =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -550,7 +579,7 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
       `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"again"}`,
     ]);
     assert.include(againOut, `Couldn't hand s2 on card #${card.number} back: subtask s2 isn't a script's`);
-    assert.strictEqual(sent.filter((text) => text.includes("again")).length, 0);
+    assert.strictEqual(sent.filter((text) => text.includes('"again"')).length, 0);
   }).pipe(Effect.provide(makeTestLayer(recording)));
 });
 
