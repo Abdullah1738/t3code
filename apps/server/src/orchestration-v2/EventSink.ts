@@ -403,7 +403,7 @@ const layerBase: Layer.Layer<
                 event,
               ): event is Extract<
                 OrchestrationV2DomainEvent,
-                { type: "provider-session.updated" }
+                { type: "provider-session.attached" | "provider-session.updated" }
               > => event.type === "provider-session.updated",
             );
             if (
