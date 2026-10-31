@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -201,6 +202,91 @@ class CleanupTests(unittest.TestCase):
         j.release_orderless(active, evidence_hash='e'*64)
         with self.assertRaisesRegex(j.JournalError, 'CLOSED_CART_ONLY'):
             cleanup.clear_cart(active, 'supermall', auth=flow.auth)
+
+    def closed_uncharged(self, vertical):
+        """Place, time out at noon, reconcile as uncharged. Returns (flow, cart data, fixture)."""
+        from test import test_marketplace_payment as pay
+        from commerce_marketplace_disposition import reconcile
+        fixture = mt if vertical == 'main' else rt
+        quantity = 2 if vertical == 'main' else 1
+        amount = 1980 if vertical == 'main' else 2549
+        failed = pay.failed_responses(fixture.ORDER, amount)
+        flow, wire = pay.PaymentTests.placed(self, fixture, **failed)
+        pay.PaymentTests.setup_cvv(self, flow, wire)
+        flow.place()
+        timed_out = copy.deepcopy(failed)
+        timed_out['order_status'] = {'status': 'failed', 'statusMessage': 'Payment timed out',
+                                     'paymentError': None, 'paymentErrorMsg': None}
+        reconcile(flow.flow_id, client=self.canned_client(flow, timed_out))
+        self.assertEqual(j.inspect(flow.flow_id)['state'], 'RELEASED')
+        return flow, fixture.cart_state(quantity=quantity), fixture
+
+    def canned_client(self, flow, responses):
+        client = flow.client
+        original = client.call
+        def call(name, **kwargs):
+            if name in ('order_status', 'order_detail', 'order_refund'):
+                return type('R', (), {'data': responses[name]})()
+            return original(name, **kwargs)
+        client.call = call
+        return client
+
+    def test_closed_uncharged_source_clears_owned_row_for_both_lanes(self):
+        for vertical in ('main', 'supermall'):
+            with self.subTest(vertical=vertical):
+                flow, data, fixture = self.closed_uncharged(vertical)
+                result, _ = self.invoke(flow, data, fixture)
+                self.assertTrue(result['cart_empty'])
+                self.assertFalse(result['financial_send'])
+                self.assertEqual(j.inspect(result['cleanup_flow_id'])['state'], 'RELEASED')
+
+    def test_closed_uncharged_refusals_send_no_remove(self):
+        for case in ('foreign_row', 'quantity_changed', 'older_than_24h', 'fenced_not_closed',
+                     'later_noon_writer', 'second_payment_op'):
+            with self.subTest(case=case), self.fresh_journal():
+                flow, data, fixture = self.closed_uncharged('main')
+                reads = [data, data]
+                clock = None
+                if case == 'foreign_row':
+                    reads = [fixture.cart_state(offer='FOREIGN', quantity=2)] * 2
+                elif case == 'quantity_changed':
+                    reads = [fixture.cart_state(quantity=1)] * 2
+                elif case == 'older_than_24h':
+                    clock = time.time() + 25 * 60 * 60
+                elif case == 'fenced_not_closed':
+                    with j._db() as db:
+                        db.execute("UPDATE flows SET state='FENCED' WHERE id=?", (flow.flow_id,))
+                elif case == 'later_noon_writer':
+                    self.add_later_noon_writer(flow)
+                elif case == 'second_payment_op':
+                    # The closure already has one payment-kind op at most; a second is refused.
+                    with j._db() as db:
+                        for n in ('payment_one', 'payment_two'):
+                            db.execute("INSERT INTO operations(flow_id,name,kind,state,created_at,request_hash) "
+                                       "VALUES (?,?,?,?,?,?)", (flow.flow_id, n, 'payment', 'OBSERVED',
+                                       time.time(), 'e' * 64))
+                harness = fixture.Harness({'cart': reads, 'remove': fixture.cart_state(empty=True)})
+                clock_patch = patch.object(time, 'time', return_value=clock) if clock else contextlib.nullcontext()
+                with clock_patch, patch.object(cleanup, 'active_marketplace_orders', return_value=[]), \
+                        self.assertRaises(j.JournalError):
+                    cleanup.clear_cart(flow.flow_id, 'main', auth=flow.auth, request=harness.request)
+                self.assertNotIn('remove', [name for name, _, _ in harness.calls])
+
+    @contextlib.contextmanager
+    def fresh_journal(self):
+        """Each subTest gets its own journal: an open flow locks the account for the next one."""
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                    patch.object(main.receipts, 'ROOT', Path(temp).resolve() / 'commerce'):
+                yield
+
+    def add_later_noon_writer(self, flow):
+        other = str(uuid.uuid4())
+        j.open_flow(flow_id=other, app='noon', vertical='minutes',
+                    account_hash=flow.account_hash, scope_hash='a' * 64)
+        j.consume(other, 'sync', kind='cart', request_hash='b' * 64)
+        j.observe(other, 'sync', outcome='RESPONSE_RECEIVED', evidence_hash='c' * 64)
+        j.abandon(other)
 
     def test_cli_routes_both_marketplace_lanes(self):
         for vertical in ('main', 'supermall'):

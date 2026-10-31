@@ -249,6 +249,54 @@ class TypecheckSizeTests(unittest.TestCase):
             self.assertIsNone(lease.typecheck_size('npx tsc --noEmit', r, None))
 
 
+class AutoSizeTests(Isolated):
+
+    def ident(self, d, key="repo"):
+        return {'repo_root': d, 'repo_key': key}
+
+    def size(self, cmd, d, key='repo', explicit=None):
+        return lease.auto_size(self.con, cmd, self.ident(d, key), explicit)[0]
+
+    def test_ordinary_runs_take_the_template_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'package.json').write_text('{}')
+            for cmd in ('npm ci', 'npx jest', 'go test ./...', 'uv run pytest -q tests', 'make test',
+                        'docker run --rm alpine true'):
+                self.assertIsNone(self.size(cmd, d), cmd)
+
+    def test_explicit_size_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.size('docker compose up -d', d, explicit='large'), 'large')
+            self.assertEqual(self.size('go test ./...', d, explicit='xlarge'), 'xlarge')
+
+    def test_container_stacks_get_xlarge(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.size('docker compose up -d && ./health.sh', d), 'xlarge')
+            self.assertEqual(self.size('localstack start -d', d), 'xlarge')
+            self.assertEqual(self.size('bash tmp/hc-005/check.sh', d, key='crpko-integration-harness'), 'xlarge')
+
+    def test_whole_suite_in_testcontainers_repo_gets_xlarge(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'go.mod').write_text('module x\nrequire github.com/testcontainers/testcontainers-go v0.1\n')
+            self.assertEqual(self.size('go test ./...', d), 'xlarge')
+            self.assertIsNone(self.size('go test -run TestX ./internal/pkg', d))
+            self.assertIsNone(self.size('go vet ./internal/a ./internal/b', d))
+
+    def test_typecheck_still_xlarge(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'package.json').write_text('{}')
+            self.assertEqual(self.size('npx tsc --noEmit -p apps/server', d), 'xlarge')
+
+    def test_recent_oom_in_repo_gets_xlarge(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir) VALUES ('bx_o','o',?,'repo','r')", (d,))
+            self.con.execute("INSERT INTO runs(run_id,box_id,size,exit_code,start_at) VALUES ('r1','bx_o','large',137,?)",
+                             (time.time() - 3600,))
+            self.con.commit()
+            self.assertEqual(self.size('npx vitest run', d), 'xlarge')
+            self.assertIsNone(self.size('npx vitest run', d, key='other'))
+
+
 class ExitHintTests(unittest.TestCase):
 
     def test_137_prints_memory_hint_before_exit_line(self):

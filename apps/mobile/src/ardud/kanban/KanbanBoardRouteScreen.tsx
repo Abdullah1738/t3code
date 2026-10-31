@@ -61,7 +61,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
         <FeedError what="the board" feed={feed} nowMs={nowMs} />
         <BoardView
           state={state}
-          layout={layout}
+          width={width}
           nowMs={nowMs}
           selectedCardId={paneCard}
           bottomInset={bottomInset}

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import os
 import time
 
 from . import capacity
-from .common import DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, now, say
+from .common import (DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
+                     now, say)
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
 WAIT_MAX_S = 1200
 PROGRESS_EVERY_S = 60
+# A create slot is claimed under the pool lock and the box is made after it. A slot whose process died is dropped at
+# once; the age bound only covers a reused pid (a recipe bring-up can take ~30 min).
+PENDING_MAX_S = 3600
 
 
 class PoolBusyError(capacity.CapacityError):
@@ -43,6 +49,44 @@ def lock_name(key: str) -> str:
     return "pool-" + hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
+@contextlib.contextmanager
+def _pool_lock(key: str, deadline: float, wait: int):
+    """The pool lock covers only choosing a box or a create slot, so a wait for it is a busy pool, never infra."""
+    lk = file_lock(lock_name(key), timeout=max(1, deadline - time.monotonic()))
+    try:
+        lk.__enter__()
+    except OffboxError as e:
+        raise PoolBusyError(f"repository pool busy for {key}: other offbox runs kept its pool lock for the whole "
+                            f"{wait}s queue wait. Nothing ran (exit {EXIT_BUSY}, not an infra failure): retry, or "
+                            f"raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})") from e
+    try:
+        yield
+    finally:
+        lk.__exit__(None, None, None)
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, TypeError, ValueError, OverflowError):
+        pass
+    return True
+
+
+def _pending(con, key) -> int:
+    """Pool boxes being created right now (their slots count toward the cap). Dead or too old slots are dropped."""
+    n = 0
+    for r in con.execute("SELECT token, pid, created_at FROM pool_pending WHERE pool_key=?", (key,)).fetchall():
+        if now() - r["created_at"] < PENDING_MAX_S and _alive(r["pid"]):
+            n += 1
+        else:
+            con.execute("DELETE FROM pool_pending WHERE token=?", (r["token"],))
+            con.commit()
+    return n
+
+
 TOO_BIG_LIKE = f"{TOO_BIG_NOTE}%"  # a box marked too big frees its pool slot and is never offered again
 DEAD_LIKE = f"{DEAD_MOUNT_NOTE}%"  # same for a box whose filesystem died
 
@@ -55,11 +99,15 @@ def members(con, key):
 
 
 def _source_member(con, key, source) -> bool:
-    return any((r["source"] or "").replace("recipe:", "template:", 1) == source for r in members(con, key))
+    if any((r["source"] or "").replace("recipe:", "template:", 1) == source for r in members(con, key)):
+        return True
+    # A box from this source still being created by another caller: waiting for it can help.
+    return _pending(con, key) > 0 and con.execute("SELECT 1 FROM pool_pending WHERE pool_key=? AND source=?",
+                                                  (key, source)).fetchone() is not None
 
 
 def _room(con, key) -> bool:
-    return len(members(con, key)) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
+    return len(members(con, key)) + _pending(con, key) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
 
 
 def candidates(con, key, size, source, me=None):
@@ -135,42 +183,66 @@ def _acquire(con, me, size, template, base, fresh, run_id):
         lease.cap_check()
         # Only the latest pass decides whether a timeout was a start limit (90) or plain busy (92).
         last_error = None
-        # Every candidate is also protected by its box lock. The DB run reservation bridges
-        # detached commands and prevents a reaper or another client from syncing over them.
-        with file_lock(lock_name(key), timeout=max(1, deadline-time.monotonic())):
-            if time.monotonic() >= next_refresh:
-                _refresh_background(con, key)
-                next_refresh = time.monotonic() + 10
-            rows, can_create = candidates(con, key, size, source, me)
-            if source and not rows and not can_create and not _source_member(con, key, source):
-                busy, cap, _ = queue_state(con, key, run_id)
-                raise OffboxError(
-                    f"this run needs a new {key} pool box ({source}), but the pool is full "
-                    f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
-                    "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
-                    "offbox list --all, then offbox release <id> --delete.", code=2)
-            stopped_tries = 0
-            stopped_error = None
-            stopped_failed = False  # the last stopped box tried could not be used (error or gone)
-            for row in rows:
-                if row['state'] != 'running':
-                    # One resume per pass, a second only after the first stopped box failed to come up;
-                    # later running rows may still be free either way.
-                    if stopped_tries >= 2 or (stopped_tries == 1 and not stopped_failed):
+        if time.monotonic() >= next_refresh:
+            # Outside the pool lock: it asks boat about every detached run.
+            _refresh_background(con, key)
+            next_refresh = time.monotonic() + 10
+        tried = set()
+        stopped_tries = 0
+        stopped_error = None
+        stopped_failed = False  # the last stopped box tried could not be used (error or gone)
+        while True:
+            # The pool lock covers only the choice: a box (its box lock taken without waiting) or a create slot.
+            # The resume or create runs after it is released, so one slow boat call never holds up other callers
+            # (31 Oct: a 900 s resume under this lock failed every other edge-api run with exit 90).
+            row = guard = token = None
+            with _pool_lock(key, deadline, wait):
+                rows, can_create = candidates(con, key, size, source, me)
+                if source and not rows and not can_create and not _source_member(con, key, source):
+                    busy, cap, _ = queue_state(con, key, run_id)
+                    raise OffboxError(
+                        f"this run needs a new {key} pool box ({source}), but the pool is full "
+                        f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
+                        "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
+                        "offbox list --all, then offbox release <id> --delete.", code=2)
+                for r in rows:
+                    if r["box_id"] in tried:
                         continue
+                    if r['state'] != 'running':
+                        # One resume per pass, a second only after the first stopped box failed to come up;
+                        # later running rows may still be free either way.
+                        if stopped_tries >= 2 or (stopped_tries == 1 and not stopped_failed):
+                            continue
+                        try:
+                            capacity.check(con)
+                        except capacity.CapacityError as e:
+                            last_error = e
+                            continue
+                    g = file_lock("box-"+r["box_id"], timeout=0)
+                    try:
+                        g.__enter__()
+                    except OffboxError:
+                        continue
+                    if lease.active_runs(con, r["box_id"]):
+                        g.__exit__(None, None, None)
+                        continue
+                    row, guard = r, g
+                    # Counted as a member from now on, so a creator can't overfill the pool while this resumes.
+                    con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (r["box_id"], key))
+                    con.commit()
+                    break
+                if row is None and can_create:
                     try:
                         capacity.check(con)
+                        token = new_id("create")
+                        con.execute("INSERT INTO pool_pending VALUES (?,?,?,?,?)",
+                                    (token, key, os.getpid(), now(), source))
+                        con.commit()
                     except capacity.CapacityError as e:
                         last_error = e
-                        continue
-                guard = file_lock("box-"+row["box_id"], timeout=0)
+            if row is not None:
+                tried.add(row["box_id"])
                 try:
-                    guard.__enter__()
-                except OffboxError:
-                    continue
-                try:
-                    if lease.active_runs(con, row["box_id"]):
-                        continue
                     try:
                         # A live box grows for an explicit bigger --size but never shrinks (that costs a start);
                         # a stopped one resumes at max(--size, its natural size) inside lease._reuse.
@@ -186,7 +258,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         continue
                     except lease.ArchivingSkip as e:
                         # Busy-like: the box is still archiving, so try the next member. It does not
-                        # make the pool look full, so a create below still runs when under cap.
+                        # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':
                             stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
                         say(f"skipping pool box {row['box_id']}: {e}")
@@ -195,7 +267,6 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         # Marked and left stopped: it no longer counts toward the pool. Not stopped_error, so a
                         # still-full pool queues (exit 92) instead of failing with the resume error (exit 90).
                         stopped_failed = True
-                        can_create = _room(con, key)
                         say(f"skipping {row['box_id']}: its disk needs {e.need} GiB but '{e.size}' holds {e.holds} GiB. "
                             f"It stays stopped with its disk and no longer counts toward the pool (remove it with: "
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
@@ -216,28 +287,45 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         return got
                     if row['state'] != 'running':
                         stopped_failed = True  # the box is gone; another stopped box may still be fine
+                    continue
                 finally:
                     if guard is not None:
                         guard.__exit__(None, None, None)
-            if stopped_error is not None and not can_create:
-                raise stopped_error
-            if can_create:
+            if token is not None:
                 try:
-                    capacity.check(con)
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
-                    got = creator(shared, size, template, base, fresh)
-                    guard = file_lock("box-"+got["box_id"], timeout=0)
-                    guard.__enter__()
                     try:
-                        _claim(con, me, got, run_id)
+                        got = creator(shared, size, template, base, fresh)
+                    except capacity.CapacityError as e:
+                        last_error = e
+                        break
+                    # acquire_private hands over the box lock it took before the row existed.
+                    guard = got.pop("_guard", None)
+                    if guard is None:
+                        guard = file_lock("box-"+got["box_id"], timeout=0)
+                        guard.__enter__()
+                    try:
+                        # The member row and the slot's removal happen in one step under the pool lock, so a
+                        # selection never sees the box as neither a member nor a pending slot.
+                        with _pool_lock(key, deadline, wait):
+                            _claim(con, me, got, run_id)
+                            con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
+                            con.commit()
+                            token = None
                     except BaseException:
                         guard.__exit__(None, None, None)
                         raise
                     got["_guard"] = guard
                     return got
-                except capacity.CapacityError as e:
-                    last_error = e
+                finally:
+                    if token is not None:
+                        # Failed create: removing the slot only lowers the count, so no lock is needed.
+                        con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
+                        con.commit()
+            if stopped_error is not None and not can_create:
+                raise stopped_error
+            break
         t = time.monotonic()
         if t >= deadline:
             if last_error:

@@ -37,7 +37,10 @@ def _still_bringing_up(con, box_id: str) -> bool:
 
 
 def _bringup_lock(row) -> str:
-    """The lock a live acquisition holds for its whole bring-up (lease.acquire_private)."""
+    """The lock a live acquisition holds for its whole bring-up (lease.acquire_private). A pool creator holds its
+    box lock instead, so its bring-up never waits on other pool callers."""
+    if row["owner"].startswith("pool:"):
+        return f"box-{row['box_id']}"
     return f"lease-{row['owner']}-{row['repo_root']}"
 
 
@@ -56,13 +59,14 @@ def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> No
         actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
         return
     try:
+        # Probe only: act() takes box-<id> itself, so a pool row's box lock can't be held across it.
         with file_lock(_bringup_lock(row), timeout=0):
             if row["state"] == "bringing_up" and not _still_bringing_up(con, bid):
                 return
-            act(bid, "delete", "recipe cancelled, box quarantined or bring-up abandoned",
-                lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
     except OffboxError:
         return  # a live acquisition holds the bring-up lock: skip it this pass
+    act(bid, "delete", "recipe cancelled, box quarantined or bring-up abandoned",
+        lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
 
 
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
@@ -202,7 +206,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
     # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
     # recipe cannot be trusted, so the box is retired like a quarantined one.
-    # A live acquisition holds lease-<owner>-<repo> for its whole bring-up (acquire_private), so cleanup takes that same
+    # A live acquisition holds its bring-up lock (_bringup_lock) for the whole bring-up, so cleanup takes that same
     # lock without waiting and re-reads the row under it. A selection made before the lock is stale: a row that became
     # running (or was reused) is skipped, never deleted.
     for r in con.execute("SELECT box_id, owner, repo_root, state FROM leases "
@@ -218,9 +222,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                     with file_lock(_bringup_lock(r), timeout=0):
                         if not _still_bringing_up(con, bid):
                             continue
-                        _forget(con, bid, actions)
                 except OffboxError:
                     continue  # a live acquisition holds the lock: leave it to that process
+                _forget(con, bid, actions)
             else:
                 _forget(con, bid, actions, dry=dry)
     # Templates/bases: make sure they are stopped (they are free when stopped).

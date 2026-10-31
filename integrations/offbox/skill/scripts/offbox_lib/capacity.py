@@ -37,6 +37,10 @@ def schema(con):
           owner TEXT, repo_root TEXT, box_id TEXT, remote_dir TEXT,
           PRIMARY KEY(owner, repo_root)
         );
+        -- A pool box being created: its slot is claimed under the pool lock, the box is made after it (pool._pending).
+        CREATE TABLE IF NOT EXISTS pool_pending (
+          token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL, source TEXT
+        );
         -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
         -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
         CREATE TABLE IF NOT EXISTS prune_holds (

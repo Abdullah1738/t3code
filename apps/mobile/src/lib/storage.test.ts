@@ -311,6 +311,29 @@ describe("mobile connection storage", () => {
     await expect(loadPreferences()).resolves.toEqual({});
   });
 
+  it("keeps kanban board columns per board and drops malformed entries", async () => {
+    const kanbanBoardColumns = {
+      "board-robob": { widths: { working: 240 }, hidden: ["shipped"], groupWidth: null },
+    };
+    mocks.setPreferencesJson(JSON.stringify({ kanbanBoardColumns }), 12);
+    await expect(loadPreferences()).resolves.toEqual({ kanbanBoardColumns });
+
+    mocks.setPreferencesJson(
+      JSON.stringify({
+        kanbanBoardColumns: {
+          "board-robob": { widths: { working: 9999 }, hidden: ["nope", "todo"] },
+        },
+      }),
+      13,
+    );
+    // Width out of range is dropped, the unknown column key too; the rest of the entry stays.
+    await expect(loadPreferences()).resolves.toEqual({
+      kanbanBoardColumns: {
+        "board-robob": { widths: {}, hidden: ["todo"], groupWidth: null },
+      },
+    });
+  });
+
   it("keeps kanban board filters per board and drops malformed entries", async () => {
     const kanbanBoardFilters = {
       "board-robob": {

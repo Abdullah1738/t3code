@@ -934,6 +934,18 @@ describe("isContextFull", () => {
     expect(
       isContextFull({ message: "This model's maximum context length is 200000 tokens" }),
     ).toBe(true);
+    expect(
+      isContextFull({
+        message:
+          "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.",
+      }),
+    ).toBe(true);
+    expect(
+      isContextFull({
+        message:
+          "The request leaves too little context for a provider handoff. Shorten the request or use a larger-context model; the current request has not been truncated.",
+      }),
+    ).toBe(true);
   });
 
   it("leaves model, variant and empty failures alone", () => {

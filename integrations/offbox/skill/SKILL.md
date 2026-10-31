@@ -23,7 +23,8 @@ offbox run --size xlarge -- make test-integration
 ```
 
 offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
-gitignored files, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent), `cd`s into the same relative
+gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
+file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
 **Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
@@ -101,10 +102,14 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
-  large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
+  large), `crpko-harness` (large, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
+- Other automatic xlarge (no `--size` given; offbox says why): compose/LocalStack/testcontainers in the command,
+  any run in a `*harness*` repo, a whole suite (`./...`, `make test`, bare `pytest`) in a repo whose manifests use
+  testcontainers, and any run in a repo that had an exit 137 on a smaller box in the last 14 days. Everything else
+  runs at the template/base size (large; generic default). Real per-job peak is ~12 GB, which large (16 GB) holds.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
   the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
@@ -138,6 +143,8 @@ For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeo
 its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
 `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
+If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -214,7 +221,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **92** = every pool box stayed busy for the whole queue wait (or other runs held the pool's lock that long). Nothing
+  ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
@@ -243,8 +251,11 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
 - Sync fails with rsync 23 `delete_file: unlink(...) failed: Permission denied (13)`: a container wrote root-owned files into the checkout on the box (LocalStack's `tmp/localstack`). offbox gives them back to the box user (`sudo chown -R`) and syncs once more by itself. If that fails too it exits 90 before your command and names the `offbox ssh <box> -- sudo chown ...` to run.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
-- Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
-  `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+- Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
+  ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+  Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
+  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
+  lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.

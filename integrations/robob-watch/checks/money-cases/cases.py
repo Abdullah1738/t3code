@@ -19,20 +19,34 @@
   money-cases brief    one line for the morning brief, nothing when no case is open
   money-cases check    the robob-watch check for the money-cases watcher
 
+Charge questions (owner rule, nightly 2026-10-24: never ask about a charge a receipt or his own
+words already explain, wait for the receipt from a merchant he already pays, never ask a third time):
+  money-cases charge ALERT [--sender S] [--at T] [--now T]   is a card alert explained? (reads only)
+  money-cases ask (ALERT --at T [--sender S] | --id QID) --said QUESTION
+                       run before asking him about a charge: exit 0 = ask now (counted), 3 = don't
+  money-cases answered QID --note TEXT
+  money-cases questions [--all] [--json]
+
 A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has one.
 """
 import argparse
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import sys
 import tempfile
+import time
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import charges  # noqa: E402
 
 TZ = ZoneInfo('Asia/Dubai')
 DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
@@ -44,6 +58,22 @@ BRIEF_DUE = dt.timedelta(hours=48)
 BRIEF_CHANGED = dt.timedelta(hours=24)
 QUIET = (23, 8)  # Dubai hours: no pings from 23:00 until 08:00
 KEEP_SENT = dt.timedelta(days=60)
+# Charge questions: alerts this close with the same card, amount and merchant are one charge. One
+# ask and one re-ask (not within REASK_GAP of the first); CASE_AFTER the re-ask without an answer,
+# or FOLLOW_FOR after the charge, the question becomes a money case.
+SAME_CHARGE = dt.timedelta(minutes=15)
+# The same alert seen twice (a re-run, or an ask whose --at is the minute shown) lands this close;
+# a second alert on the same channel further apart is a second charge.
+ALERT_SAME = dt.timedelta(minutes=2)
+MAX_ASKS = 2
+REASK_GAP = dt.timedelta(hours=6)
+CASE_AFTER = dt.timedelta(hours=12)
+FOLLOW_FOR = dt.timedelta(days=7)
+# A charge that became a money case is still looked up this long, so a late receipt settles it.
+FOLLOW_CASE = dt.timedelta(days=30)
+FOLLOW_BUDGET = 25  # seconds of archive lookups per check
+FOLLOW_EACH = 8  # at most this many of them per question, least recently checked first
+DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
 EVENT_LIMIT = 4000
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
@@ -287,18 +317,26 @@ def load(data=None):
     return book
 
 
-class Locked:
-    """Serialise read-modify-write of cases.json between CLI calls."""
+def load_questions(data=None):
+    data = data or DATA
+    book = read_json(data / 'questions.json', {'version': 1, 'questions': []})
+    if not isinstance(book, dict) or not isinstance(book.get('questions'), list):
+        raise CaseError(f'{data / "questions.json"} is not a questions file')
+    return book
 
-    def __init__(self, data):
-        self.data = data
+
+class Locked:
+    """Serialise read-modify-write of cases.json (or questions.json) between CLI calls and checks."""
+
+    def __init__(self, data, name='cases'):
+        self.data, self.name = data, name
 
     def __enter__(self):
         self.data.mkdir(parents=True, exist_ok=True)
-        self.lock = (self.data / 'cases.lock').open('a')
+        self.lock = (self.data / f'{self.name}.lock').open('a')
 
         def timed_out(*_):
-            raise CaseError('cases.lock still held after 10s')
+            raise CaseError(f'{self.name}.lock still held after 10s')
         previous = signal.signal(signal.SIGALRM, timed_out)
         signal.alarm(10)
         try:
@@ -306,13 +344,19 @@ class Locked:
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous)
-        self.book = load(self.data)
+        try:
+            self.book = load(self.data) if self.name == 'cases' else load_questions(self.data)
+        except BaseException:
+            self.lock.close()
+            raise
         return self.book
 
     def __exit__(self, kind, *_):
         try:
             if kind is None:
-                write_json(self.data / 'cases.json', self.book)
+                # Question rows quote alerts, receipts and his own words; nothing secret is stored.
+                book = self.book if self.name == 'cases' else redact_all(self.book)
+                write_json(self.data / f'{self.name}.json', book)
         finally:
             self.lock.close()
 
@@ -680,7 +724,375 @@ def live_keys(cases):
     return tuple(keys)
 
 
-def run_check(wd, run, data=None, root=None, now=None):
+def merchant_key(merchant):
+    return ' '.join(charges.words(merchant)) or ' '.join(merchant.lower().split())
+
+
+def charge_of(q):
+    # Questions opened before 'pending' was stored rebuild it from the merchant name.
+    pending = q.get('pending', bool(re.search(r'\b(?:pending|auth)\b', q.get('merchant') or '', re.I)))
+    return {k: q[k] for k in ('kind', 'currency', 'amount', 'card', 'merchant')} | {'pending': pending}
+
+
+def channel(sender):
+    """A bank's SMS and its email copy are two channels for one charge."""
+    return 'email' if '@' in str(sender or '') else 'sms'
+
+
+def alerts_of(q):
+    return q.get('alerts') or [{'channel': 'sms', 'at': q.get('at'), 'item': q.get('item')}]
+
+
+def question_matches(q, charge):
+    return (q.get('kind'), q.get('card'), q.get('currency'), q.get('amount'), q.get('mkey')) == \
+        (charge['kind'], charge['card'], charge['currency'], charge['amount'], merchant_key(charge['merchant']))
+
+
+def seen_alert(q, chan, at, item=None):
+    """Whether this alert is already on the question: the same triage item, or (for an alert quoted
+    without an item, as `money-cases ask` gets it) the same channel within ALERT_SAME."""
+    for a in alerts_of(q):
+        if item and a.get('item'):
+            if a['item'] == item:
+                return True
+            continue
+        try:
+            if a.get('channel') == chan and abs(parse_time(a['at']) - at) <= ALERT_SAME:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
+def question_for(book, charge, at, chan='sms', item=None):
+    """The question an alert belongs to: the one that already has this alert (the same triage item,
+    or the same channel within ALERT_SAME), else one with no alert on this channel yet within
+    SAME_CHARGE (the bank's copy on its other channel). A second alert on the same channel is a
+    second charge, and a decline is never the same question as a charge."""
+    copy = None
+    for q in reversed(book['questions']):
+        if not question_matches(q, charge):
+            continue
+        if seen_alert(q, chan, at, item):
+            return q
+        try:
+            near = abs(parse_time(q['at']) - at) <= SAME_CHARGE
+        except (KeyError, TypeError, ValueError):
+            continue
+        if copy is None and near and all(a.get('channel') != chan for a in alerts_of(q)):
+            copy = q
+    return copy
+
+
+def attach(q, chan, at, item=None):
+    if not seen_alert(q, chan, at, item):
+        q['alerts'] = alerts_of(q) + [{'channel': chan, 'at': stamp(at), 'item': item}]
+
+
+def find_question(book, qid):
+    for q in book['questions']:
+        if q.get('id') == qid:
+            return q
+    raise CaseError(f'no charge question {qid!r}')
+
+
+def new_question(book, charge, text, at, now, chan='sms', item=None):
+    key = merchant_key(charge['merchant'])
+    base = '|'.join([charge['kind'], charge['card'], charge['currency'], charge['amount'], key, chan, stamp(at)])
+    q = {'id': 'q-' + hashlib.sha256(base.encode()).hexdigest()[:8], 'kind': charge['kind'],
+         'card': charge['card'], 'currency': charge['currency'], 'amount': charge['amount'],
+         'merchant': clip(redact(charge['merchant']), 80), 'pending': bool(charge.get('pending')),
+         'mkey': key, 'at': stamp(at),
+         'alert': clip(redact(text or ''), 240), 'alerts': [{'channel': chan, 'at': stamp(at), 'item': item}],
+         'status': 'open', 'wait_until': None, 'asks': [], 'passed': False, 'item': None, 'why': '',
+         'case': None, 'by': None, 'outcome': None, 'checked': None,
+         'opened': stamp(now), 'updated': stamp(now), 'closed': None}
+    book['questions'].append(q)
+    return q
+
+
+def note_why(q, why, now):
+    q.update({'why': clip(redact(why), 200), 'updated': stamp(now)})
+
+
+def settle(q, outcome, by, now, status='closed'):
+    q.update({'status': status, 'outcome': clip(redact(outcome), 200), 'by': by, 'closed': stamp(now),
+              'updated': stamp(now)})
+
+
+def prune_questions(book, now):
+    cutoff = stamp(now - KEEP_SENT)
+    book['questions'] = [q for q in book['questions'] if q.get('status') == 'open' or (q.get('closed') or '') >= cutoff]
+
+
+def case_from(data, q, now, by, root=None):
+    """Turn a charge question he never answered into a money case (never a third ask)."""
+    cid = 'charge-' + q['id'][2:]
+    n = len(q.get('asks', []))
+    try:
+        add(data, cid, q['merchant'] or 'unknown merchant', q['amount'], q['currency'],
+            f'charge on card ending {q["card"]} on {when(parse_time(q["at"]))}: asked him {n} time(s), '
+            'no answer and no receipt',
+            'tell him once it is an open money case, with options (his charge, dispute it, block the card); '
+            'never ask about the charge again',
+            (now + dt.timedelta(days=2)).date().isoformat(), 'Abdullah',
+            reference=f'card ending {q["card"]}', why=f'charge question {q["id"]}', at=now, root=root)
+    except CaseError as e:
+        if 'already exists' not in str(e):
+            raise
+    q['case'] = cid
+    settle(q, f'now money case {cid}', by, now, 'case')
+    return cid
+
+
+def close_untouched(data, cid, outcome, now):
+    """Close a money case a charge question opened, unless someone has worked on it since."""
+    with Locked(data) as book:
+        case = next((c for c in book['cases'] if c['id'] == cid), None)
+        if not case or case['status'] != 'open' or len(case.get('history', [])) > 1:
+            return False
+        outcome = clip(redact(outcome), 200)
+        case.update(status='closed', closed=stamp(now), outcome=outcome, updated=stamp(now))
+        case['history'].append({'at': stamp(now), 'text': 'closed: ' + outcome})
+        return True
+
+
+def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=None, said=None, record=True,
+           item=None):
+    """For inbox triage: None when the text isn't a card alert this reads, else {verdict, why, id,
+    kind, errors} with verdict explained | case | asked | wait | ask. Only ask should reach him.
+    item is triage's id for the message; triaged() records whether triage raised it."""
+    charge = charges.parse(text, sender)
+    if not charge:
+        return None
+    now = (now or now_dubai()).astimezone(TZ)
+    at = (at or now).astimezone(TZ)
+    chan = channel(sender)
+    q = question_for(load_questions(data), charge, at, chan, item)
+    base = {'kind': charge['kind'], 'errors': []}
+    if record and q:
+        # Record the alert before the early returns below, or the next copy of this charge (say the
+        # email after an SMS that was already asked) looks like a new charge and goes to him again.
+        with Locked(data or DATA, 'questions') as book:
+            live = question_for(book, charge, at, chan, item)
+            if live:
+                attach(live, chan, at, item)
+    if q and q['status'] == 'closed':
+        return {**base, 'verdict': 'explained', 'why': q.get('outcome') or '', 'id': q['id']}
+    if q and q['status'] == 'case':
+        return {**base, 'verdict': 'case', 'why': f"money case {q['case']}", 'id': q['id']}
+    if q and q.get('asks'):
+        return {**base, 'verdict': 'asked', 'why': f"asked {len(q['asks'])} time(s); the check follows it",
+                'id': q['id']}
+    if q and q.get('passed') and item and q.get('item') and q['item'] != item:
+        return {**base, 'verdict': 'asked', 'why': f"another alert for this charge ({q['item']}) went to him",
+                'id': q['id']}
+    r = charges.explain(charge, at, now, deadline, find, said)
+    verdict = 'explained' if r['verdict'] in ('receipt', 'owner') else r['verdict']
+    qid = q['id'] if q else None
+    if record:
+        with Locked(data or DATA, 'questions') as book:
+            q = question_for(book, charge, at, chan, item) or new_question(book, charge, text, at, now, chan, item)
+            attach(q, chan, at, item)
+            qid = q['id']
+            if q['status'] == 'open' and not q.get('asks') and not q.get('passed'):
+                note_why(q, r['why'], now)
+                if verdict == 'explained':
+                    settle(q, r['why'], 'triage', now)
+                elif verdict == 'wait':
+                    q['wait_until'] = r['until']
+            prune_questions(book, now)
+    return {'verdict': verdict, 'why': r['why'], 'id': qid, 'kind': charge['kind'], 'errors': r['errors']}
+
+
+def triaged(data, outcomes, now=None):
+    """After inbox triage has saved its event: outcomes are (question id, item id, raised). A raised
+    alert went to the woken agent (so a later receipt gets a closing line and the bank's copy isn't
+    sent again). Triage raises every unexplained charge; one it dropped was already answered in a
+    chat."""
+    now = (now or now_dubai()).astimezone(TZ)
+    with Locked(data or DATA, 'questions') as book:
+        for qid, item, raised in outcomes:
+            q = next((x for x in book['questions'] if x.get('id') == qid), None)
+            if not q or q['status'] != 'open' or q.get('asks') or q.get('passed'):
+                continue
+            if raised:
+                q.update({'passed': True, 'item': item, 'updated': stamp(now)})
+            else:
+                settle(q, 'already answered in a chat', 'triage', now)
+
+
+def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadline=None, root=None,
+        find=None, said=None):
+    """The gate before anyone asks him about a charge: (0, message) means ask now and the ask is
+    counted; (DONT_ASK, message) says why not. at is the alert's own time, so asking about the same
+    alert again finds the same question."""
+    data = data or DATA
+    question = check_text('question', clip(question or '', 300))
+    now = (now or now_dubai()).astimezone(TZ)
+    chan = None
+    if qid:
+        q = find_question(load_questions(data), qid)
+        charge, at = charge_of(q), parse_time(q['at'])
+    else:
+        charge = charges.parse(text or '', sender)
+        if not charge:
+            raise CaseError('not a card charge or decline alert this reads; check the receipt and his threads by hand')
+        if at is None:
+            raise CaseError("give --at, the alert's own time, so the same alert stays one question")
+        at, chan = at.astimezone(TZ), channel(sender)
+        q = question_for(load_questions(data), charge, at, chan)
+    # Lookups run before taking the lock; a settled question needs none.
+    r = None if q and q['status'] != 'open' else charges.explain(charge, at, now, deadline, find, said)
+    with Locked(data, 'questions') as book:
+        q = (find_question(book, q['id']) if q else None) or question_for(book, charge, at, chan) \
+            or new_question(book, charge, text, at, now, chan)
+        if chan:
+            attach(q, chan, at)
+        if q['status'] == 'closed':
+            return DONT_ASK, f"{q['id']} is settled ({q['outcome']}). Don't ask."
+        if q['status'] == 'case':
+            return DONT_ASK, f"{q['id']} is money case {q['case']}; follow the case, don't ask about the charge."
+        if r is None:
+            r = charges.explain(charge, at, now, deadline, find, said)
+        note_why(q, r['why'], now)
+        if r['verdict'] in ('receipt', 'owner'):
+            settle(q, r['why'], 'ask', now)
+            return DONT_ASK, (f"{q['id']} is explained: {r['why']}. Don't ask; if he was asked about it before, "
+                              'tell him in one line.')
+        if r['verdict'] == 'wait':
+            q['wait_until'] = r['until']
+            return DONT_ASK, (f"{q['id']}: {r['why']} (until {when(parse_time(r['until']))}). Don't ask; the "
+                              'money-cases check says when no receipt came.')
+        asks = q['asks']
+        if len(asks) >= MAX_ASKS:
+            cid = case_from(data, q, now, 'ask', root)
+            return DONT_ASK, (f"{q['id']} was asked {len(asks)} times, so it is now money case {cid}. Tell him once "
+                              'with options; never a third ask.')
+        if asks and now - parse_time(asks[-1]['at']) < REASK_GAP:
+            again = parse_time(asks[-1]['at']) + REASK_GAP
+            return DONT_ASK, f"{q['id']}: asked at {when(parse_time(asks[-1]['at']))}; the one re-ask waits until {when(again)}."
+        asks.append({'at': stamp(now), 'question': question})
+        note = f" (couldn't check everything: {'; '.join(r['errors'])})" if r['errors'] else ''
+        return 0, (f"{q['id']}: ask him now ({len(asks)} of {MAX_ASKS}); {r['why']}{note}. When he answers: "
+                   f"money-cases answered {q['id']} --note '<his answer>'.")
+
+
+def answered(data, qid, note, now=None):
+    """His answer settles the question. A money case it opened stays open with his answer noted: he may
+    have said it isn't his."""
+    data = data or DATA
+    note = check_text('note', note)
+    now = (now or now_dubai()).astimezone(TZ)
+    with Locked(data, 'questions') as book:
+        q = find_question(book, qid)
+        if q['status'] == 'case':
+            cid = q['case']
+            settle(q, note, 'answered', now)
+            q['was_case'] = cid
+            try:
+                update(data, cid, {}, note=f'he answered about charge question {qid}: {note}', at=now)
+            except CaseError:
+                pass
+        elif q['status'] == 'open':
+            settle(q, note, 'answered', now)
+        return q
+
+
+def follow(data, now, root=None, deadline=None, find=None, said=None):
+    """Close questions a receipt or his words now explain, including ones already turned into money
+    cases (FOLLOW_CASE); turn ones he didn't answer after the re-ask, or followed past FOLLOW_FOR,
+    into money cases. Least recently checked first, at most FOLLOW_EACH seconds each, so one slow
+    question doesn't starve the rest. Lookups run outside the lock; returns lookup errors."""
+    errors, hits, looked = [], {}, set()
+    todo = []
+    for q in load_questions(data)['questions']:
+        try:
+            at = parse_time(q['at'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if q.get('status') == 'open' or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
+            todo.append((q.get('checked') or '', at, q))
+    for _, at, q in sorted(todo, key=lambda x: x[0]):
+        if deadline is not None and deadline - time.time() < 2:
+            errors.append('out of time; the rest next check')
+            break
+        looked.add(q['id'])
+        if q.get('kind') == 'charge':
+            each = time.time() + FOLLOW_EACH
+            hit = charges.found(charge_of(q), at, now, each if deadline is None else min(deadline, each),
+                                find, said, errors)
+            if hit:
+                hits[q['id']] = hit
+    if not looked:
+        return errors
+    with Locked(data, 'questions') as book:
+        for q in book['questions']:
+            if q['id'] not in looked:
+                continue
+            q['checked'] = stamp(now)
+            if q.get('status') == 'case':
+                if q['id'] in hits:
+                    cid = q['case']
+                    settle(q, hits[q['id']]['why'], 'check', now)
+                    q['was_case'] = cid
+                    try:
+                        q['case_closed'] = close_untouched(data, cid, 'explained: ' + hits[q['id']]['why'], now)
+                    except CaseError as e:
+                        errors.append(f"{q['id']}: {e}")
+                continue
+            if q.get('status') != 'open':
+                continue
+            if q['id'] in hits:
+                settle(q, hits[q['id']]['why'], 'check', now)
+                continue
+            asks, at = q.get('asks', []), parse_time(q['at'])
+            try:
+                if len(asks) >= MAX_ASKS and now - parse_time(asks[-1]['at']) >= CASE_AFTER:
+                    case_from(data, q, now, 'check', root)
+                elif now - at >= FOLLOW_FOR:
+                    # Never closed unseen: a week without an explanation is a money case he hears about.
+                    case_from(data, q, now, 'check', root)
+            except CaseError as e:
+                errors.append(f"{q['id']}: {e}")
+        prune_questions(book, now)
+    return errors
+
+
+def question_entries(questions, now, sent):
+    """attention()-style (head, items, tail, day) entries for what the check did to charge questions, once each."""
+    entries = []
+    for q in questions:
+        try:
+            at = parse_time(q['at'])
+            done = parse_time(q['closed']) if q.get('closed') else None
+        except (KeyError, TypeError, ValueError):
+            continue
+        head = f"- {q['id']}: {clip(redact(q.get('merchant', '')), 80)} {money(q)} on card ending {q.get('card')} ({when(at)})"
+        recent = done is not None and now - done <= FOLLOW_FOR
+        if q.get('status') == 'closed' and q.get('by') == 'check' and recent and q.get('was_case'):
+            state = 'closed' if q.get('case_closed') else 'still open (someone worked on it): close it if this settles it'
+            item = (f"q|{q['id']}|closed", f"explained now: {clip(redact(q.get('outcome') or ''), 160)}; money case "
+                    f"{q['was_case']} {state}", 'Tell him in one line it is settled')
+        elif q.get('status') == 'closed' and q.get('by') == 'check' and recent and (q.get('asks') or q.get('passed')):
+            item = (f"q|{q['id']}|closed", f"explained now: {clip(redact(q.get('outcome') or ''), 160)}",
+                    "He was told about it, so tell him in one line it's settled")
+        elif q.get('status') == 'case' and q.get('by') == 'check' and recent:
+            item = (f"q|{q['id']}|case", f"he didn't answer, so it is now money case {q.get('case')}",
+                    "Tell him once with options; never ask about the charge again")
+        elif q.get('status') == 'open' and not q.get('asks') and q.get('wait_until') \
+                and now >= parse_time(q['wait_until']):
+            item = (f"q|{q['id']}|ask", 'no receipt came while we waited',
+                    f"Run money-cases ask --id {q['id']} --said '<question>' and ask him once if it says so")
+        else:
+            continue
+        if item[0] not in sent:
+            # No day: a question's pings are once-only keys, outside the one-reminder-a-day cap of cases.
+            entries.append((head, [(item[0], item[1])], item[2], None))
+    return entries
+
+
+def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     now = (now or now_dubai()).astimezone(TZ)
     pings = wd / 'pings.json'
     state = read_json(pings, {'sent': {}})
@@ -706,6 +1118,11 @@ def run_check(wd, run, data=None, root=None, now=None):
         # is kept; the second is dropped and rebuilt below, or it would block every alert for good.
         if runner_owns(wd, out):
             state['outbox'] = out
+    errors = follow(data or DATA, now, root, time.time() + FOLLOW_BUDGET, find, said)
+    if errors:
+        state['question_errors'] = {'at': stamp(now), 'errors': errors[:10]}
+    else:
+        state.pop('question_errors', None)
     # An event the runner never took is rebuilt from the book, so it skips quiet hours and closed or moved cases.
     cases = load(data)['cases']
     cutoff = stamp(now - KEEP_SENT)
@@ -715,7 +1132,8 @@ def run_check(wd, run, data=None, root=None, now=None):
     # An undelivered event is still out: the runner retries it. Never build a second one over it, so no
     # case key is recorded for an event that was never shown.
     if not quiet(now) and 'outbox' not in state:
-        entries = attention(cases, now, state['sent'], root, clock)
+        entries = attention(cases, now, state['sent'], root, clock) + \
+            question_entries(load_questions(data)['questions'], now, state['sent'])
         if entries:
             header = f'Money cases: {len(entries)} need attention.'
             footer = 'Details: money-cases show ID.'
@@ -740,7 +1158,8 @@ def run_check(wd, run, data=None, root=None, now=None):
                     line = fit(case_line(head, texts, tail), room - 1)
                     shown.append(line)
                     room -= units(line) + 1
-                    days.append(day)
+                    if day:
+                        days.append(day)
                 if len(texts) < len(items):
                     break
                 full += 1
@@ -854,11 +1273,67 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true')
     sub.add_parser('brief')
     sub.add_parser('check')
+    p = sub.add_parser('charge')
+    p.add_argument('alert')
+    p.add_argument('--sender', default='')
+    p.add_argument('--at')
+    p.add_argument('--now')
+    p = sub.add_parser('ask')
+    p.add_argument('alert', nargs='?')
+    p.add_argument('--id')
+    p.add_argument('--sender', default='')
+    p.add_argument('--at')
+    p.add_argument('--said', required=True)
+    p = sub.add_parser('answered')
+    p.add_argument('id')
+    p.add_argument('--note', required=True)
+    p = sub.add_parser('questions')
+    p.add_argument('--all', action='store_true')
+    p.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'check':
+        if args.command == 'charge':
+            charge = charges.parse(args.alert, args.sender)
+            if not charge:
+                raise CaseError('not a card charge or decline alert this reads')
+            now = parse_time(args.now) if args.now else now_dubai()
+            r = charges.explain(charge, parse_time(args.at) if args.at else now, now, time.time() + 30)
+            print(json.dumps(redact_all({'charge': charge, **r}), ensure_ascii=False, indent=1))
+        elif args.command == 'ask':
+            if bool(args.alert) == bool(args.id):
+                raise CaseError('give the alert text or --id QID')
+            rc, message = ask(DATA, args.said, args.alert, args.sender, parse_time(args.at) if args.at else None,
+                              args.id, deadline=time.time() + 30)
+            print(redact(message))
+            return rc
+        elif args.command == 'answered':
+            q = answered(DATA, args.id, args.note)
+            print(f"{q['id']}: {q['status']} ({redact(q.get('outcome') or '')})")
+            if q.get('was_case') and q.get('by') == 'answered':
+                print(f"money case {q['was_case']} stays open with his answer noted; close it if that settles it.")
+        elif args.command == 'questions':
+            qs = [q for q in load_questions()['questions'] if args.all or q.get('status') == 'open']
+            if args.json:
+                print(json.dumps(redact_all(qs), ensure_ascii=False, indent=1))
+            else:
+                for q in qs:
+                    print(redact(f"{q['id']} [{q['status']}] {q.get('merchant')} {money(q)} card {q.get('card')} "
+                                 f"at {when(parse_time(q['at']))}, asked {len(q.get('asks', []))}x: "
+                                 f"{q.get('outcome') or q.get('why') or ''}"))
+                if not qs:
+                    print('No charge questions.')
+        elif args.command == 'check':
             wd = Path(os.environ.get('WATCH_DIR', LIVE))
             wd.mkdir(parents=True, exist_ok=True)
+            data = DATA
+            if wd.resolve() != LIVE.resolve():
+                # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
+                data = wd / 'scratch-books'
+                if not data.exists():
+                    data.mkdir(mode=0o700)
+                    for name in ('cases.json', 'questions.json'):
+                        if (DATA / name).exists():
+                            shutil.copy2(DATA / name, data / name)
             with (wd / 'check.lock').open('a') as lock:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -866,7 +1341,7 @@ def main(argv=None):
                     # Nonzero so the runner keeps its last .run-ok acknowledgement.
                     print('money-cases check already running', file=sys.stderr)
                     return 75
-                event = run_check(wd, os.environ.get('WATCH_RUN', ''))
+                event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
             if event:
                 print(event)
         elif args.command == 'brief':

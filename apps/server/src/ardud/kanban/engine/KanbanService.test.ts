@@ -2,6 +2,8 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -11,6 +13,7 @@ import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -63,6 +66,15 @@ const makeFake = Effect.gen(function* () {
   const interrupted: Array<string> = [];
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   const failures = new Map<string, OrchestrationV2ProviderFailure>();
+  // One run id per stored failure object (the same run reports the same id).
+  const runIds = new WeakMap<object, string>();
+  let nextRun = 0;
+  const failureOf = (threadId: string) => {
+    const failure = failures.get(threadId);
+    if (!failure) return null;
+    if (!runIds.has(failure)) runIds.set(failure, `run-${(nextRun += 1)}`);
+    return { ...failure, runId: runIds.get(failure)! };
+  };
   const sends: Array<{ threadId: string; model: ModelSelection | undefined }> = [];
   const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
   // Threads whose sends are refused, to test a wake that doesn't land.
@@ -146,7 +158,8 @@ const makeFake = Effect.gen(function* () {
         ),
       setModel: (threadId, model) =>
         Effect.sync(() => void modelSwitches.push({ threadId, model })),
-      lastFailure: (threadId) => Effect.succeed(failures.get(threadId) ?? null),
+      // Each stored failure is one executed run; a repeat notification of it reports the same runId.
+      lastFailure: (threadId) => Effect.succeed(failureOf(threadId)),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
@@ -178,6 +191,19 @@ const testLayer = (
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer(providers)),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+/** testLayer on a real file database, which has a reader connection. */
+const fileTestLayer = (fake: Layer.Layer<KanbanThreads>, dbPath: string) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
 
@@ -1332,6 +1358,41 @@ it.effect("a work thread that gets too long starts the card on a fresh thread", 
       const oldThread = (yield* kanban.card(created.id)).card.activeThreadId!;
       const before = (yield* Ref.get(fake.threads)).get(oldThread)!.messages.length;
       fake.failures.set(oldThread, overflow);
+      yield* kanban.turnEnded(oldThread);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(oldThread)!.messages.length, before);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "todo");
+      assert.isNull(moved.stalled);
+      assert.isNull(moved.workThreadId);
+      assert.isNull(moved.activeThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(fresh.stage, "working");
+      assert.notStrictEqual(fresh.activeThreadId, oldThread);
+      const first = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
+      assert.include(first, "Fresh thread:");
+      assert.include(first, "x");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+const handoffFull = {
+  class: "provider_error",
+  code: null,
+  message:
+    "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.",
+} as never;
+
+it.effect("a work thread refused for handoff context starts the card on a fresh thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const oldThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const before = (yield* Ref.get(fake.threads)).get(oldThread)!.messages.length;
+      fake.failures.set(oldThread, handoffFull);
       yield* kanban.turnEnded(oldThread);
       assert.strictEqual((yield* Ref.get(fake.threads)).get(oldThread)!.messages.length, before);
       const moved = (yield* kanban.card(created.id)).card;
@@ -4149,6 +4210,390 @@ it.effect("a paused evaluator is kept open and woken", () =>
       const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
       assert.include(messages[messages.length - 1] ?? "", "answers again");
     }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+const stopping = {
+  class: "provider_error",
+  code: null,
+  message: "OpenCode is still stopping the previous turn. Send the message again in a moment.",
+} as never;
+
+it.effect("a stale turn end while the retry waits on input does not clear the failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      fake.failures.delete(e);
+      const retry = (yield* Ref.get(fake.threads)).get(e)!;
+      retry.running = true;
+      retry.stuck = true;
+      yield* kanban.turnEnded(e);
+      retry.stuck = false;
+      retry.running = false;
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(
+        retry.messages.filter((text) => text.includes("one automatic retry")).length,
+        1,
+      );
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135r2: a stale turn end while retry runs does not clear the failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      // Production lastFailure is null when the latest executed run is still running.
+      fake.failures.delete(e);
+      (yield* Ref.get(fake.threads)).get(e)!.running = true;
+      yield* kanban.turnEnded(e);
+      (yield* Ref.get(fake.threads)).get(e)!.running = false;
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 1);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135r2: an intervening outage preserves the non-outage failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Continue now" }]);
+      fake.failures.set(e, outage);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(e))!.paused);
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a replacement setup evaluator can finish setup", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const first = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const setup = (yield* kanban.boards).find((b) => b.id === board.id)!.setup!;
+      fake.failures.set(first, {
+        class: "provider_error",
+        code: null,
+        message: "prompt is too long",
+      } as never);
+      yield* kanban.turnEnded(first);
+      const fresh = (yield* kanban.discussion(setup.discussionId)).evaluatorThreadId!;
+      assert.notStrictEqual(fresh, first);
+      yield* kanban.endSetup(board.id, { _tag: "evaluator", threadId: fresh });
+      assert.strictEqual(
+        (yield* kanban.boards).find((b) => b.id === board.id)!.setup!.status,
+        "done",
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: an outage pauses a previously scheduled retry", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Continue now" }]);
+      fake.failures.set(e, outage);
+      yield* kanban.turnEnded(e);
+      assert.isNotNull((yield* kanban.caller(e))!.paused);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: duplicate failure notifications do not consume the retry", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.turnEnded(e);
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a rejected retry send hands off once without breaking the tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      fake.rejectSends.add(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const fresh = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      assert.notStrictEqual(fresh, e);
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, fresh);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a given-up ask routes to the card discussion evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Look at it",
+      });
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Ship?", blocking: false, options: ["A", "B"] },
+        { _tag: "evaluator", threadId: evaluator },
+        "evaluator",
+      );
+      fake.failures.set(evaluator, {
+        class: "provider_error",
+        code: null,
+        message: "prompt is too long",
+      } as never);
+      yield* kanban.turnEnded(evaluator);
+      const before = (yield* Ref.get(fake.threads)).get(evaluator)!.messages.length;
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.answer(talk.id, 1, "q1", ["o1"], owner);
+      const current = yield* kanban.discussion(talk.id);
+      assert.isNotNull(current.evaluatorThreadId);
+      assert.notStrictEqual(current.evaluatorThreadId, evaluator);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(evaluator)!.messages.length, before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a clean replacement run resets the discussion handoff budget", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      const full = { class: "provider_error", code: null, message: "prompt is too long" } as never;
+      fake.failures.set(e, full);
+      yield* kanban.turnEnded(e);
+      const n = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* kanban.turnEnded(n);
+      fake.failures.set(n, full);
+      yield* kanban.turnEnded(n);
+      const next = (yield* kanban.discussion(channel.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, n);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+const lastText = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unknown> }>) =>
+  messages
+    .at(-1)
+    ?.blocks.map((b) => ("text" in (b as object) ? (b as { text: string }).text : ""))
+    .join("") ?? "";
+
+it.effect("a failed evaluator run is retried once after two minutes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      const count = () =>
+        Effect.gen(function* () {
+          const msgs = (yield* Ref.get(fake.threads)).get(e)!.messages;
+          return msgs.filter((m) => String(m).includes("one automatic retry")).length;
+        });
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      assert.strictEqual(yield* count(), 0);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      assert.strictEqual(yield* count(), 1);
+      yield* kanban.tick;
+      assert.strictEqual(yield* count(), 1);
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an evaluator that recovers is not retried", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      fake.failures.delete(e);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("3 minutes");
+      yield* kanban.tick;
+      const msgs = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.isFalse(msgs.some((m) => String(m).includes("one automatic retry")));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an evaluator that fails twice is replaced in its discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      // The retry is a new executed run, so its failure is a new object with its own run id.
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      const n = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      assert.notStrictEqual(n, e);
+      const nMsgs = (yield* Ref.get(fake.threads)).get(n)!.messages.map(String).join("\n");
+      assert.include(nMsgs, "stopped on an error");
+      assert.include(nMsgs, e);
+      assert.include(lastText(yield* kanban.messages(channel.id)), "A new evaluator takes over");
+      fake.failures.set(n, stopping);
+      yield* kanban.turnEnded(n);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      // The retry of n is its own executed run, so it fails with a fresh failure object.
+      fake.failures.set(n, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(n);
+      assert.isNull((yield* kanban.discussion(channel.id)).evaluatorThreadId);
+      assert.include(
+        lastText(yield* kanban.messages(channel.id)),
+        "No new one starts automatically",
+      );
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Still there?" }]);
+      assert.isNotNull((yield* kanban.discussion(channel.id)).evaluatorThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a full context replaces the evaluator without a retry", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, {
+        class: "provider_error",
+        code: null,
+        message: "prompt is too long: 213000 tokens > 200000 maximum",
+      } as never);
+      yield* kanban.turnEnded(e);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+      const msgs = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.isFalse(msgs.some((m) => String(m).includes("one automatic retry")));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a one-shot evaluator that keeps failing is reported in Evaluator errors", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const t = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at it" });
+      fake.failures.set(t, stopping);
+      yield* kanban.turnEnded(t);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      // The retry is a new executed run, so its failure is a new object with its own run id.
+      fake.failures.set(t, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(t);
+      const channel = (yield* kanban.discussions(board.id)).find(
+        (d) => d.title === "Evaluator errors",
+      );
+      assert.isDefined(channel);
+      assert.include(lastText(yield* kanban.messages(channel!.id)), t);
+      assert.isNotNull((yield* kanban.caller(t))?.endedAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
@@ -7135,4 +7580,55 @@ it.effect("a worker waiting on its own subagents isn't nudged", () =>
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.live("answers board reads while the SQLite writer is held", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-reader-" });
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const sql = yield* SqlClient.SqlClient;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Read me", title: "Reader" },
+        owner,
+      );
+
+      const writerHeld = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          Deferred.succeed(writerHeld, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        ),
+      );
+      yield* Deferred.await(writerHeld);
+      const reads = yield* Effect.all({
+        boards: kanban.boards,
+        snapshot: kanban.snapshot(board.id),
+        card: kanban.card(created.id),
+        threads: kanban.threads(board.id),
+        discussions: kanban.discussions(board.id),
+        wiki: kanban.wiki(board.id),
+      }).pipe(Effect.timeout("5 seconds"));
+      yield* Deferred.succeed(releaseWriter, undefined);
+      yield* Fiber.join(writer);
+
+      assert.isTrue(reads.boards.some((entry) => entry.id === board.id));
+      assert.deepEqual(
+        reads.snapshot.cards.map((card) => card.id),
+        [created.id],
+      );
+      assert.strictEqual(reads.card.card.id, created.id);
+    }).pipe(Effect.provide(fileTestLayer(fake.layer, path.join(directory, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

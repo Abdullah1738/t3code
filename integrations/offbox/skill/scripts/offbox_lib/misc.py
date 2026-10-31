@@ -11,9 +11,9 @@ import sys
 import time
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE, OffboxError,
-                     ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now, offsets_path,
-                     out, read_json, say, silence)
+from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
+                     offsets_path, out, read_json, say, silence)
 
 WAIT_POLL_S = 5
 # A lock-blocked waiter asks boat about the process this often, and once boat has said it ended for HOLDER_GRACE_S
@@ -289,6 +289,11 @@ def _run_row(run_id: str):
 def logs(run_id: str, do_follow: bool) -> int:
     from .runs import finish, follow
     r = _run_row(run_id)
+    if r["status"] in ("starting", "running") and not (r["box_id"] and r["process_id"]):
+        if do_follow:
+            return _wait_locked(r, echo=True)
+        if r['mode'] != 'local':
+            say(f"{_not_started(r)}; no output yet. Follow it with: offbox logs {r['run_id']} --follow")
     if r["status"] in ("starting", "running") and r["box_id"] and r["process_id"]:
         s = api.get(r["box_id"])
         if s and s.get("state") in api.LIVE_STATES:
@@ -365,6 +370,10 @@ def _wait_locked(r, echo, timeout=None):
     from .runs import _ended
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
+    r = _wait_for_start(r, deadline)
+    if r['status'] not in ('starting', 'running'):
+        _tail(log_path, 0, echo)
+        return _settled(r)
     pos, said = 0, False
     polled, ended_at = None, None
     # The row we poll: refreshed each loop, so a PID the holder records later (it starts with NULL) is picked up.
@@ -480,6 +489,74 @@ def _recover_by(r, log_path, deadline):
 def _wait_timeout(r) -> OffboxError:
     return OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                        f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+
+
+def _not_started(r) -> str:
+    if r['mode'] == 'local':
+        return f"{r['run_id']} runs on this Mac (local-first), not on a box"
+    if not r['box_id']:
+        return f"{r['run_id']} has no box yet (queued for a pool box)"
+    return f"{r['run_id']} has {r['box_id']} but its command hasn't started yet"
+
+
+def _pid_started_at(pid: int) -> float | None:
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+                             env=dict(os.environ, LC_ALL="C")).stdout.strip()
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y")) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _client_alive(pid: int | None, start_at: float | None) -> bool:
+    """Is the `offbox run` that inserted this row still running? Unknown (no pid recorded) counts as alive.
+    A live pid that started after the run did is a reused pid, so the client is gone."""
+    if not pid:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    began = _pid_started_at(pid)
+    return began is None or start_at is None or began <= start_at + 2
+
+
+def _wait_for_start(r, deadline):
+    """Poll a run row until it has a box and a started command (box_id and process_id), or settles; return that row.
+    A run queued for a pool box has no box_id, and one still syncing has no process_id: there is no box lock to
+    take and no process to attach to yet (31 Oct: `wait` crashed on 'box-' + None while a run waited for its pool)."""
+    said = None
+    while True:
+        cur = _run_row(r['run_id'])
+        if cur['status'] not in ('starting', 'running') or (cur['box_id'] and cur['process_id']):
+            return cur
+        pid = cur['client_pid'] if 'client_pid' in cur.keys() else None
+        if not _client_alive(pid, cur['start_at']):
+            if not cur['box_id']:
+                con = db()
+                con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
+                            "AND status IN ('starting','running')",
+                            (now(), "client ended before it got a box", cur['run_id']))
+                con.commit()
+                say(f"{cur['run_id']}: its offbox client (pid {pid}) ended before it got a box; never started, "
+                    "nothing ran")
+                continue
+            # It had a box, so the start request may have reached boat: leave the row to the reaper.
+            raise OffboxError(f"{cur['run_id']}: its offbox client (pid {pid}) ended on {cur['box_id']} before the "
+                              "command was recorded as started, so there is nothing to follow. `offbox reap` settles "
+                              "the row; check `offbox list` before running it again", code=EXIT_INFRA)
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {_not_started(cur)} (nothing was stopped). "
+                              f"Wait again: offbox wait {cur['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        msg = f"{_not_started(cur)}; " + ("waiting for it to end" if cur['mode'] == 'local' else
+                                          "waiting for a box" if not cur['box_id'] else "waiting for it to start")
+        if msg != said:
+            say(msg)
+            said = msg
+        pause = WAIT_POLL_S if deadline is None else max(0.0, min(WAIT_POLL_S, deadline - now()))
+        time.sleep(pause)
 
 
 def _has_data(log_path) -> bool:

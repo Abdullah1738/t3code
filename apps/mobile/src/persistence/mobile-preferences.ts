@@ -1,5 +1,7 @@
 import {
+  sanitizeBoardColumnPrefs,
   sanitizeBoardFilterPrefs,
+  type BoardColumnPrefs,
   type BoardFilterPrefs,
 } from "@t3tools/client-runtime/ardud/kanban";
 import * as Context from "effect/Context";
@@ -61,6 +63,7 @@ const KanbanBoardFilterPrefs = Schema.Struct({
 const KanbanBoardFilters = Schema.Record(Schema.String, KanbanBoardFilterPrefs);
 export type KanbanBoardFilters = typeof KanbanBoardFilters.Type;
 type KanbanBoardFilterPrefs = BoardFilterPrefs;
+type KanbanBoardColumnPrefs = BoardColumnPrefs;
 
 const isThreadListFilters = Schema.is(ThreadListFilters);
 const isPullRequestListPreferences = Schema.is(PullRequestListPreferences);
@@ -120,6 +123,8 @@ export interface Preferences {
   >;
   /** Board filter choices per board id, kept on this device. */
   readonly kanbanBoardFilters?: KanbanBoardFilters;
+  /** Column widths, hidden columns and group width per board id, kept on this device. */
+  readonly kanbanBoardColumns?: Readonly<Record<string, BoardColumnPrefs>>;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -193,6 +198,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     pullRequestListFilters?: PullRequestListPreferences;
     kanbanDiscussionShelves?: Preferences["kanbanDiscussionShelves"];
     kanbanBoardFilters?: KanbanBoardFilters;
+    kanbanBoardColumns?: Record<string, KanbanBoardColumnPrefs>;
   } = {};
 
   if (typeof parsed.pullRequestHideTestFiles === "boolean") {
@@ -333,6 +339,14 @@ function sanitizePreferences(parsed: Preferences): Preferences {
       boards[boardId] = sanitizeBoardFilterPrefs(entry);
     }
     preferences.kanbanBoardFilters = boards;
+  }
+  if (typeof parsed.kanbanBoardColumns === "object" && parsed.kanbanBoardColumns !== null) {
+    // Same per-board rule as the filters: one malformed board doesn't drop the rest.
+    const boards: Record<string, KanbanBoardColumnPrefs> = {};
+    for (const [boardId, entry] of Object.entries(parsed.kanbanBoardColumns)) {
+      boards[boardId] = sanitizeBoardColumnPrefs(entry);
+    }
+    preferences.kanbanBoardColumns = boards;
   }
   return preferences;
 }

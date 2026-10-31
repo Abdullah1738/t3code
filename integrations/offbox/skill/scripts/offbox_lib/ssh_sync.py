@@ -9,6 +9,7 @@ import secrets
 import shlex
 import subprocess
 import time
+import unicodedata
 from pathlib import Path
 
 from . import api, git_snapshot
@@ -286,6 +287,115 @@ def tracked_secret_matches(root: Path, includes: list[str] | None) -> list[str]:
     return out
 
 
+# Pass 1 lists every file it considered (-ii) with this prefix, so the tracked files it skipped can be found.
+ITEM = "offbox-item "
+
+
+def _key(name: str) -> str:
+    # git's index and the disk can differ in Unicode form and (on APFS) in case. Matching on a folded key keeps
+    # pass 2 from sending a second copy under another spelling to the case-sensitive box.
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _seen(out: str) -> set[str]:
+    """Paths pass 1's itemized output says it sent or checked (deletions left out)."""
+    seen = set()
+    for ln in out.split("\n"):
+        if ln.startswith(ITEM) and not ln.startswith(ITEM + "*"):
+            seen.add(_key(ln[len(ITEM) + 12:].rstrip("/")))
+    return seen
+
+
+def _offbox_skips(path: str) -> bool:
+    """True when the secret or heavy excludes cover the path (a dir rule covers everything below it)."""
+    import fnmatch
+    parts = path.split("/")
+    if any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
+        parts = parts[:-1]
+    pats = [x.rstrip("/") for x in SECRET_EXCLUDES + HEAVY_EXCLUDES]
+    if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats if "/" not in pat):
+        return True
+    joined = "/" + "/".join(parts)
+    return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _disk_path(root: Path, rel: str, names: dict[str, list[str]]) -> str | None:
+    """The on-disk spelling of a git index path, or None when the file is gone or a parent is a symlink.
+
+    The index can spell a path differently from disk after a case-only rename on APFS (`.AWS/canary` vs
+    `.aws/canary`), so each component is matched against the real listing; the excludes then apply to the real
+    name. Parents are never followed: rsync would traverse a symlinked dir, and pass 1 already sends the link."""
+    cur, real = root, []
+    for i, part in enumerate(rel.split("/")):
+        if i and os.path.islink(cur):
+            return None
+        d = str(cur)
+        if d not in names:
+            try:
+                names[d] = os.listdir(cur)
+            except OSError:
+                names[d] = []
+        ents = names[d]
+        if part in ents:
+            name = part
+        else:
+            # Accept a casefold/NFC match only when it is the same file on disk, so an unrelated `foo` next to a
+            # deleted `Foo` on a case-sensitive box is never taken for it.
+            hits = [e for e in ents if _key(e) == _key(part) and _same_file(cur / part, cur / e)]
+            if len(hits) != 1:
+                return None
+            name = hits[0]
+        real.append(name)
+        cur = cur / name
+    return "/".join(real)
+
+
+def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
+    """Git-tracked files pass 1 left out, other than secret/heavy ones. Those are .gitignore matches (a tracked
+    package-lock.json, 31 Oct) or rsync reading .gitignore more broadly than git (`test/*`, `!` lines)."""
+    try:
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20)
+    except Exception:  # noqa: BLE001 - no git: pass 1 is the whole sync, as before
+        return []
+    if p.returncode != 0:
+        return []
+    out, names = [], {}
+    for raw in p.stdout.split(b"\0"):
+        if not raw:
+            continue
+        f = os.fsdecode(raw)
+        # A tracked file deleted in the checkout (or outside a sparse checkout) resolves to None and is skipped.
+        real = _disk_path(root, f, names)
+        if real is None:
+            continue
+        if any(_key(x) in seen for x in (f, real)) or _offbox_skips(f) or _offbox_skips(real):
+            continue
+        q = root / real
+        # A dir here is a submodule: pass 2 recurses into what it lists, so sending one would bypass its .gitignore.
+        if os.path.islink(q) or not os.path.isdir(q):
+            out.append(real)
+    return out
+
+
+def tracked_ignored_note(st: dict) -> str | None:
+    """The run's one line about tracked files .gitignore matches, which pass 2 sent anyway. Only when pass 2
+    changed something on the box: a repo with many of them (t3code-fork's .repos/) would print it every run."""
+    n = st.get("tracked_ignored") or 0
+    if not n or not st.get("tracked_ignored_sent"):
+        return None
+    first = st.get("tracked_ignored_first") or []
+    more = f" (+{n - len(first)} more)" if n > len(first) else ""
+    return f"also synced {n} git-tracked file(s) that .gitignore matches: {', '.join(first)}{more}"
+
+
 def _stats(out: str) -> dict:
     d = {}
     for key, name in (("Total bytes sent", "sent"), ("Total bytes received", "received"),
@@ -339,11 +449,41 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
 
 def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
                 includes: list[str] | None) -> dict:
+    ssh_cmd = " ".join(shlex.quote(x) for x in ssh_base(box_id))
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
-           "--timeout=120", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id))]
+           "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    out = _rsync(box_id, remote_dir, cmd, timeout)
+    st = _stats(out)
+    # A file git tracks is part of the checkout the command expects, whatever .gitignore says. Pass 2 sends the
+    # ones pass 1 skipped, by name and without --delete; pass 1 excludes them, which also keeps them from --delete.
+    extra = _tracked_skipped(root, _seen(out))
+    if extra:
+        cmd2 = [RSYNC, "-az", "--no-o", "--no-g", "--omit-dir-times", "--stats", "--timeout=120", "-e", ssh_cmd,
+                "-8", "--from0", "--files-from=-", "--ignore-missing-args", "--filter=- /.git"]
+        cmd2 += [f"--filter=+ {t}" for t in SAFE_ENV_TEMPLATES]
+        for x in SECRET_EXCLUDES + HEAVY_EXCLUDES:
+            # Files go by name here, so a dir rule needs its /** form too (`- .aws/` alone lets .aws/creds through).
+            cmd2 += [f"--filter=- {x.rstrip('/')}", f"--filter=- {x.rstrip('/')}/**"]
+        cmd2 += [f"{root}/", f"{box_id}:{remote_dir}/"]
+        st2 = _stats(_rsync(box_id, remote_dir, cmd2, timeout, files="\0".join(extra)))
+        for k in ("sent", "received", "files", "xfer"):
+            if k in st2:
+                st[k] = st.get(k, 0) + st2[k]
+        st["tracked_ignored"] = len(extra)
+        st["tracked_ignored_first"] = extra[:5]
+        st["tracked_ignored_sent"] = st2.get("files", 0)
+        log(f"push_tracked_ignored {box_id} n={len(extra)} sent={st2.get('files', 0)} first={extra[0]}")
+    return st
+
+
+def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: str | None = None) -> str:
+    """One push rsync: reclaim box-owned files once, skip unreadable local files, else raise. Returns stdout."""
+    def run():
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=files)
+    p = run()
     if p.returncode == 23 and (denied := _receiver_denied(p.stderr)):
         import sys
         shown = ", ".join(denied[:3]) + (f" (+{len(denied) - 3} more)" if len(denied) > 3 else "")
@@ -354,8 +494,7 @@ def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeou
         print(f"offbox: warning: {len(denied)} root-owned path(s) on the box blocked the sync ({shown}); "
               f"gave them back to the box user (sudo chown) and synced again", file=sys.stderr)
         log(f"push_reclaim {box_id} {remote_dir} paths={len(denied)} first={denied[0]}")
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    st = _stats(p.stdout)
+        p = run()
     if p.returncode == 23 and (skipped := _soft_partial(p.stderr)):
         # Unreadable/vanished local files (e.g. a chmod 000 scratch file in tmp/) must not fail the run.
         import sys
@@ -364,7 +503,7 @@ def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeou
         log(f"push_partial {box_id} skipped={len(skipped)} first={skipped[0]}")
     elif p.returncode not in (0, 24):     # 24 = files vanished during transfer (fine)
         raise OffboxError(f"rsync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
-    return st
+    return p.stdout or ""
 
 
 def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path) -> dict:

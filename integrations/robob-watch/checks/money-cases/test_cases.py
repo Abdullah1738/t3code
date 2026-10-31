@@ -617,6 +617,266 @@ class Brief(Base):
         self.assertIn('Acme AED 120.50 (overdue since Sun 25 Oct)', late)
 
 
+ALERT = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+BANK = 'EmiratesNBD'
+HISTORY = {'id': 1, 'ts': at('2026-09-01T12:00').timestamp(), 'sender': BANK, 'source': 'imessage', 'from_me': 0,
+           'body': 'Purchase of EUR 9.99 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit'}
+RECEIPT = {'id': 2, 'ts': at('2026-10-24T10:47').timestamp(), 'sender': 'Acme <noreply@acme.example>',
+           'subject': 'Your Acme order', 'body': 'Thanks for ordering. Total €12.34', 'source': 'email', 'from_me': 0}
+
+
+def read(row, deadline=None):
+    return f"{row.get('subject', '')}\n{row.get('body', '')}"
+
+
+def finder(*rows):
+    """A fake msgs search; charges.py itself keeps rows by time, sender and source."""
+    def find(query, since, until=None, source=None, n=20, deadline=None):
+        return [r for r in rows if source is None or r['source'] == source]
+    return find
+
+
+def nobody(since, until, deadline=None):
+    return []
+
+
+class Questions(Base):
+    def setUp(self):
+        super().setUp()
+        p = patch.object(mc.charges, 'show', read)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def ask(self, now, find, said=nobody, **kw):
+        return mc.ask(self.data, 'Is the Acme charge yours?', ALERT, BANK, at('2026-10-23T23:47'), now=at(now),
+                      find=find, said=said, root=self.root, **kw)
+
+    def questions(self):
+        return mc.load_questions(self.data)['questions']
+
+    def follow(self, now, find, run='r1'):
+        # A delivered event is what counts (the runner's fires and last_fire_at), as in Base.check.
+        event = mc.run_check(self.wd, run, self.data, self.root, at(now), find, nobody)
+        if event:
+            (self.wd / '.run-ok').write_text(run)
+            self.deliver(now)
+        return event
+
+    def test_a_merchant_he_pays_waits_then_two_asks_at_most_then_a_money_case(self):
+        known = finder(HISTORY)
+        code, msg = self.ask('2026-10-24T00:37', known)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('wait for the receipt', msg)
+        code, msg = self.ask('2026-10-25T12:00', known)
+        self.assertEqual(code, 0)
+        self.assertIn('ask him now (1 of 2)', msg)
+        code, msg = self.ask('2026-10-25T13:00', known)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('re-ask waits until', msg)
+        self.assertEqual(self.ask('2026-10-25T18:00', known)[0], 0)
+        code, msg = self.ask('2026-10-26T09:00', known)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('never a third ask', msg)
+        q = self.questions()[0]
+        self.assertEqual((q['status'], len(q['asks'])), ('case', 2))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['id'], case['amount'], case['currency'], case['reference']),
+                         (q['case'], '12.34', 'EUR', 'card ending 1111'))
+        self.assertEqual(self.ask('2026-10-27T09:00', known)[0], mc.DONT_ASK)
+
+    def test_a_receipt_or_his_own_words_mean_no_ask(self):
+        code, msg = self.ask('2026-10-24T11:00', finder(RECEIPT))
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('is explained', msg)
+        self.assertEqual(self.questions()[0]['by'], 'ask')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-23T19:50:00.000Z', 'ordering acme eats now', 'iMessage 2026-10-23 23:40')]
+        other = ALERT.replace('12.34', '9.99')
+        code, msg = mc.ask(self.data, 'q?', other, BANK, at('2026-10-23T23:47'), now=at('2026-10-24T00:00'),
+                           find=finder(), said=said)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('he wrote about it at 23:50', msg)
+
+    def test_the_check_closes_a_question_once_the_receipt_lands_and_says_so_once(self):
+        r = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T00:37'), data=self.data, find=finder(),
+                      said=nobody, item='imsg:1')
+        self.assertEqual(r['verdict'], 'ask')
+        mc.triaged(self.data, [(r['id'], 'imsg:1', True)], at('2026-10-24T00:37'))
+        self.assertIsNone(self.follow('2026-10-24T09:00', finder()) or None)
+        event = self.follow('2026-10-24T11:00', finder(RECEIPT))
+        self.assertIn('explained now: receipt Sat 24 Oct 10:47', event)
+        self.assertEqual(self.questions()[0]['status'], 'closed')
+        self.assertEqual(self.follow('2026-10-24T11:15', finder(RECEIPT), 'r2'), '')
+        again = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T11:20'), data=self.data,
+                          find=finder(), said=nobody, item='imsg:1')
+        self.assertEqual(again['verdict'], 'explained')
+
+    def test_the_check_turns_a_question_asked_twice_into_a_case_and_says_so_once(self):
+        self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
+        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
+        self.assertEqual(self.follow('2026-10-24T12:00', finder()), '')
+        event = self.follow('2026-10-24T20:30', finder())
+        self.assertIn("he didn't answer, so it is now money case charge-", event)
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+        later = self.follow('2026-10-24T21:00', finder(), 'r2')
+        self.assertNotIn("he didn't answer", later)
+
+    def test_a_wait_with_no_receipt_is_raised_once(self):
+        r = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T00:37'), data=self.data,
+                      find=finder(HISTORY), said=nobody, item='imsg:1')
+        self.assertEqual(r['verdict'], 'wait')
+        self.assertEqual(self.follow('2026-10-25T09:00', finder(HISTORY)), '')
+        event = self.follow('2026-10-25T12:00', finder(HISTORY))
+        self.assertIn('no receipt came while we waited', event)
+        self.assertIn(f"money-cases ask --id {self.questions()[0]['id']}", event)
+        self.assertEqual(self.follow('2026-10-25T12:15', finder(HISTORY), 'r2'), '')
+
+    def screen(self, text, sender, when, now, item):
+        return mc.screen(text, sender, at(when), at(now), data=self.data, find=finder(), said=nobody, item=item)
+
+    def test_the_banks_email_copy_of_an_alert_isnt_passed_on_twice(self):
+        first = self.screen(ALERT, BANK, '2026-10-23T23:47', '2026-10-24T00:37', 'imsg:1')
+        self.assertFalse(self.questions()[0]['passed'])
+        mc.triaged(self.data, [(first['id'], 'imsg:1', True)], at('2026-10-24T00:37'))
+        copy = self.screen(ALERT, 'alert@emiratesnbd.com', '2026-10-23T23:48', '2026-10-24T00:38', 'mail:icloud:1:9')
+        self.assertEqual((first['verdict'], copy['verdict'], copy['id']), ('ask', 'asked', first['id']))
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIsNone(mc.screen('Your OTP is [code]', BANK, data=self.data))
+
+    def test_two_alerts_on_one_channel_or_a_decline_then_a_charge_are_separate(self):
+        a = self.screen(ALERT, BANK, '2026-10-23T23:47', '2026-10-24T00:37', 'imsg:1')
+        mc.triaged(self.data, [(a['id'], 'imsg:1', True)], at('2026-10-24T00:37'))
+        b = self.screen(ALERT, BANK, '2026-10-23T23:52', '2026-10-24T00:38', 'imsg:2')
+        self.assertEqual(b['verdict'], 'ask')
+        self.assertNotEqual(a['id'], b['id'])
+        decline = 'Transaction of EUR 12.34 on your Card 1111 at ACME EATS was declined due to insufficient limit'
+        d = self.screen(decline, BANK, '2026-10-23T23:53', '2026-10-24T00:39', 'imsg:3')
+        c = self.screen(ALERT.replace('EATS PENDING', 'EATS'), BANK, '2026-10-23T23:54', '2026-10-24T00:39', 'imsg:4')
+        self.assertEqual(len({a['id'], b['id'], d['id'], c['id']}), 4)
+        self.assertEqual([q['kind'] for q in self.questions()], ['charge', 'charge', 'decline', 'charge'])
+        # The same alert seen again (a re-run, or an ask quoting it) is still one question.
+        self.assertEqual(self.screen(ALERT, BANK, '2026-10-23T23:52', '2026-10-24T00:45', 'imsg:2')['id'], b['id'])
+
+    def test_an_alert_triage_left_out_is_closed_as_answered_and_one_nobody_raised_becomes_a_case(self):
+        a = self.screen(ALERT, BANK, '2026-10-23T23:47', '2026-10-24T00:37', 'imsg:1')
+        mc.triaged(self.data, [(a['id'], 'imsg:1', False)], at('2026-10-24T00:37'))
+        self.assertEqual((self.questions()[0]['status'], self.questions()[0]['outcome']),
+                         ('closed', 'already answered in a chat'))
+        # Held for a receipt and never raised: after a week it is a money case he hears about.
+        held = self.screen(ALERT.replace('12.34', '5.55'), BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:2')
+        event = self.follow('2026-10-31T09:00', finder())
+        self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'case')
+        self.assertIn("he didn't answer, so it is now money case", event)
+
+    def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
+        pending = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+        at_ = at('2026-10-23T23:47')
+        self.assertEqual(mc.ask(self.data, 'Is the Acme charge yours?', pending, BANK, at_, now=at('2026-10-24T00:37'),
+                                find=finder(HISTORY), said=nobody, root=self.root)[0], mc.DONT_ASK)
+        q = self.questions()[0]
+        self.assertTrue(q['pending'])
+        code, msg = mc.ask(self.data, 'Is the Acme charge yours?', qid=q['id'], now=at('2026-10-24T00:45'),
+                           find=finder(HISTORY), said=nobody, root=self.root)
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('wait for the receipt', msg)
+
+    def test_a_second_decline_after_sms_and_its_email_copy_still_reaches_him(self):
+        decline = 'Transaction of AED 120.00 on your Card 1111 at ACME was declined'
+        sms = self.screen(decline, BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:1')
+        email = self.screen(decline, 'alerts@emiratesnbd.example', '2026-10-23T23:47', '2026-10-23T23:48', 'mail:1')
+        self.assertEqual(email['id'], sms['id'])
+        second = self.screen(decline, BANK, '2026-10-23T23:52', '2026-10-23T23:53', 'imsg:2')
+        self.assertNotEqual(second['id'], sms['id'])
+        self.assertEqual(second['verdict'], 'ask')
+
+    def test_a_receipt_behind_21_usage_notices_is_still_found(self):
+        # Real msgs show output: each copy of a notice has its own Date and File headers, so only the
+        # words after them are the same. The receipt is the oldest mail in the window.
+        aed = 'Purchase of AED 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
+        receipt = {'id': 2, 'ts': at('2026-10-23T23:50').timestamp(), 'sender': 'Acme <noreply@acme.example>',
+                   'subject': 'Your Acme order', 'source': 'email', 'from_me': 0}
+        shown = {2: 'Account: ardud@icloud\nDate: Fri 23 Oct 23:50\nFrom: Acme <noreply@acme.example>\n'
+                    'Subject: Your Acme order\nFile: /m/2.emlx\n\nThanks for ordering. Total AED 12.34'}
+        notices = []
+        for i in range(21):
+            nid = 100 + i
+            notices.append({'id': nid, 'ts': at('2026-10-23T23:55').timestamp() + i, 'sender': 'Acme <usage@acme.example>',
+                            'subject': 'Usage notice', 'source': 'email', 'from_me': 0})
+            shown[nid] = (f'Account: ardud@icloud\nDate: Fri 23 Oct 23:5{i % 10}\nFrom: Acme <usage@acme.example>\n'
+                          f'Subject: Usage notice\nFile: /m/{nid}.emlx\n\nYour card 1111 was used for AED 12.34 at Acme. Avl limit.')
+        reads = []
+
+        def find(query, since, until=None, source=None, n=20, deadline=None):
+            return sorted([receipt] + notices, key=lambda r: -r['ts'])[:n]
+
+        def read(row, deadline=None):
+            reads.append(row['id'])
+            return shown[row['id']]
+        r = mc.charges.receipt(mc.charges.parse(aed, BANK), at('2026-10-24T00:37'), at('2026-10-24T00:45'),
+                               find=find, read=read)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['id'], receipt['id'])
+
+    def test_what_it_stores_is_redacted(self):
+        def said(since, until, deadline=None):
+            return [('2026-10-23T19:50:00.000Z', 'acme order, card 4111 1111 1111 1111 and OTP is 482913',
+                     'iMessage 2026-10-23 23:40')]
+        r = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T00:00'), data=self.data, find=finder(),
+                      said=said, item='imsg:1')
+        self.assertEqual(r['verdict'], 'explained')
+        raw = (self.data / 'questions.json').read_text()
+        self.assertNotIn('4111 1111', raw)
+        self.assertNotIn('482913', raw)
+        self.assertIn('[card number removed]', raw)
+
+    def test_a_late_receipt_settles_a_question_that_became_a_case(self):
+        self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
+        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
+        self.assertEqual(self.ask('2026-10-24T20:00', finder())[0], mc.DONT_ASK)
+        q = self.questions()[0]
+        self.assertEqual(q['status'], 'case')
+        event = self.follow('2026-10-25T09:00', finder(dict(RECEIPT, ts=at('2026-10-25T08:00').timestamp())))
+        self.assertIn(f"money case {q['case']} closed", event)
+        self.assertEqual(mc.find(mc.load(self.data), q['case'])['status'], 'closed')
+        self.assertEqual(self.questions()[0]['status'], 'closed')
+
+    def test_his_answer_to_a_case_question_is_noted_on_the_case(self):
+        for now in ('2026-10-24T00:37', '2026-10-24T08:00', '2026-10-24T20:00'):
+            self.ask(now, finder())
+        q = self.questions()[0]
+        mc.answered(self.data, q['id'], 'not mine', now=at('2026-10-24T21:00'))
+        case = mc.find(mc.load(self.data), q['case'])
+        self.assertEqual(case['status'], 'open')
+        self.assertIn('not mine', case['history'][-1]['text'])
+
+    def test_follow_up_starts_with_the_least_recently_checked_and_stops_in_time(self):
+        for n, amount in enumerate(('1.11', '2.22', '3.33')):
+            self.screen(ALERT.replace('12.34', amount), BANK, f'2026-10-23T23:4{n}', '2026-10-24T00:00', f'imsg:{n}')
+        book = mc.load_questions(self.data)
+        book['questions'][0]['checked'] = '2026-10-24T01:00:00+04:00'
+        mc.write_json(self.data / 'questions.json', book)
+        order, clock = [], [1000.0]
+
+        def slow(query, since, until=None, source=None, n=20, deadline=None):
+            order.append(query.split('"')[1])
+            clock[0] += 5
+            return []
+        with patch.object(mc.time, 'time', lambda: clock[0]):
+            errors = mc.follow(self.data, at('2026-10-24T02:00'), self.root, 1012.5, slow, nobody)
+        self.assertEqual(order[0], '2.22')
+        self.assertNotIn('1.11', order)
+        self.assertIn('out of time; the rest next check', errors)
+
+    def test_answered_closes_it(self):
+        self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
+        qid = self.questions()[0]['id']
+        mc.answered(self.data, qid, 'his order', now=at('2026-10-24T00:40'))
+        code, msg = self.ask('2026-10-24T09:00', finder())
+        self.assertEqual(code, mc.DONT_ASK)
+        self.assertIn('settled (his order)', msg)
+
+
 class CardSwap(Base):
     def test_card_swap_rewrites_next_on_open_cases_naming_the_old_card(self):
         self.case('stale', merchant='Shop 1', next_action='switch to 7572 once it clears')
@@ -839,6 +1099,43 @@ class Cli(Base):
         self.assertTrue(self.run_cli('brief')[1].startswith('Money: 1 open.'))
         self.assertEqual(self.run_cli('close', 'globex', '--outcome', 'refunded')[0], 0)
         self.assertEqual(self.run_cli('brief')[1], '')
+
+    def test_charge_ask_answered_and_questions(self):
+        with patch.object(mc.charges, 'search', finder()), patch.object(mc.charges, 'owner_texts', nobody):
+            code, out, _ = self.run_cli('charge', ALERT, '--sender', BANK, '--at', '2026-10-23T23:47:00+04:00')
+            self.assertEqual((code, json.loads(out)['verdict']), (0, 'ask'))
+            self.assertEqual(mc.load_questions(self.data)['questions'], [])
+            code, out, _ = self.run_cli('ask', ALERT, '--sender', BANK, '--at', '2026-10-23T23:47:00+04:00',
+                                        '--said', 'Is the Acme charge yours?')
+            self.assertEqual(code, 0)
+            qid = out.split(':')[0]
+            code, _, err = self.run_cli('ask', ALERT, '--sender', BANK, '--said', 'q?')
+            self.assertEqual(code, 2)
+            self.assertIn('give --at', err)
+            code, _, err = self.run_cli('ask', 'hello there', '--said', 'q?')
+            self.assertEqual(code, 2)
+            self.assertIn('not a card charge', err)
+            self.assertEqual(self.run_cli('ask', '--said', 'q?')[0], 2)
+            code, out, _ = self.run_cli('questions')
+            self.assertIn(qid, out)
+            self.assertEqual(self.run_cli('answered', qid, '--note', 'his order')[0], 0)
+            self.assertEqual(self.run_cli('questions')[1].strip(), 'No charge questions.')
+            self.assertIn(qid, self.run_cli('questions', '--all')[1])
+            self.assertEqual(self.run_cli('ask', '--id', qid, '--said', 'q?')[0], mc.DONT_ASK)
+
+
+    def test_a_scratch_check_never_writes_the_real_books(self):
+        self.case('acme', deadline='2026-10-30')
+        before = (self.data / 'cases.json').read_text()
+        scratch = self.tmp / 'scratch-wd'
+        scratch.mkdir()
+        with patch.dict(os.environ, {'WATCH_DIR': str(scratch), 'WATCH_RUN': 'x'}), \
+                patch.object(mc, 'now_dubai', return_value=at('2026-10-30T07:30')):
+            code, out, _ = self.run_cli('check')
+        self.assertEqual(code, 0)
+        self.assertEqual((self.data / 'cases.json').read_text(), before)
+        self.assertFalse((self.data / 'questions.json').exists())
+        self.assertTrue((scratch / 'scratch-books' / 'cases.json').exists())
 
 
 if __name__ == '__main__':

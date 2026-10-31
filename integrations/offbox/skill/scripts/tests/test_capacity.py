@@ -13,7 +13,7 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, capacity, cli, common, fallback, lease, pool, reap, runs, spend
+from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
 
 
 class Isolated(unittest.TestCase):
@@ -25,6 +25,13 @@ class Isolated(unittest.TestCase):
         root = Path(self.tmp.name)
         for name in ('STATE','LOGS_DIR','LOCKS_DIR','SSH_DIR','CM_DIR'):
             self.stack.enter_context(patch.object(common, name, root/name))
+        # Modules that import these by name keep the real paths; point them at the fixture and the repo's templates.
+        for mod in (runs, misc):
+            self.stack.enter_context(patch.object(mod, 'LOGS_DIR', root/'LOGS_DIR'))
+        (root/'LOGS_DIR').mkdir(parents=True, exist_ok=True)
+        repo_templates = Path(__file__).resolve().parents[2] / 'templates'
+        for mod in (lease, bases):
+            self.stack.enter_context(patch.object(mod, 'TEMPLATES_DIR', repo_templates))
         self.stack.enter_context(patch.object(common, 'DB_PATH', root/'db.sqlite'))
         self.stack.enter_context(patch.object(common, 'LOG_PATH', root/'log'))
         self.stack.enter_context(patch.object(spend, 'CAP_PATH', root/'cap.json'))
@@ -461,7 +468,7 @@ class PoolTests(Isolated):
         self.con.execute("INSERT INTO bases(name,repo_key,box_id,size,is_default) VALUES ('repo:default','repo','bx_b','default',1)")
         self.con.commit()
         self.assertEqual(lease.natural_size(self.con,{'source':'base:repo:default'}),'large')  # floored at large
-        self.assertEqual(lease.natural_size(self.con,{'source':'template:crpko-harness'}),'xlarge')
+        self.assertEqual(lease.natural_size(self.con,{'source':'template:crpko-harness'}),'large')  # xlarge is per run (auto_size)
         self.assertEqual(lease.natural_size(self.con,{'source':'template:generic'}),'default')
         self.assertEqual(lease.natural_size(self.con,{'source':'fresh'}),'large')
 

@@ -355,6 +355,9 @@ class RunTests(Isolated):
         old = os.getcwd()
         os.chdir(self.cwd)
         self.addCleanup(os.chdir, old)
+        # The sandbox can't create Go's cache dirs; a used Mac already has them, a fresh HOME doesn't.
+        for d in localfirst._go_paths().values():
+            os.makedirs(d, exist_ok=True)
         for p in (patch.object(localfirst.os, "getloadavg", return_value=(1.0, 1.0, 1.0)),
                   patch.object(localfirst, "_cpu_busy", return_value=0.1),
                   patch.object(localfirst, "_nice", lambda: None)):

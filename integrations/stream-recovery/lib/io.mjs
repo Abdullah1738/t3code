@@ -59,30 +59,40 @@ export function failedSubagentsSince(db, sinceIso) {
     .all(sinceIso);
 }
 
-// Native subagents Robob closed as cancelled (restart recovery does this).
+// Native subagents Robob closed as cancelled (restart recovery does this), or
+// interrupted with their parent's turn when OpenCode crashed: no Stop was
+// requested on that turn.
 export function cancelledSubagentsSince(db, sinceIso) {
   return db
     .prepare(
       `select subagent_id, thread_id, run_id, provider_thread_id, child_thread_id, started_at, completed_at,
               json_extract(payload_json,'$.result') result, json_extract(payload_json,'$.title') title,
               json_extract(payload_json,'$.prompt') prompt, json_extract(payload_json,'$.model') model
-         from orchestration_v2_projection_subagents
-        where status='cancelled' and origin='provider_native' and completed_at >= ? order by completed_at`,
+         from orchestration_v2_projection_subagents s
+        where origin='provider_native' and completed_at >= ?
+          and status in ('cancelled','interrupted')
+          and not exists(select 1 from orchestration_v2_projection_turn_items i
+            where i.run_id=s.run_id and i.type='run_interrupt_request')
+        order by completed_at`,
     )
     .all(sinceIso);
 }
 
 // A user_message turn item materializes when a queued turn starts, before
 // startedAt is set. It distinguishes cancelled starts from cancelled queues.
+// An OpenCode crash leaves Robob's turns 'interrupted' with no
+// run_interrupt_request item (31 Oct, SIGBUS); a Stop always writes one.
 export function restartRunsSince(db, sinceIso) {
   return db.prepare(
     `select r.run_id, r.thread_id, r.ordinal, r.status, r.requested_at, r.completed_at,
             json_extract(r.payload_json,'$.startedAt') started_at,
             exists(select 1 from orchestration_v2_projection_turn_items i
-              where i.run_id=r.run_id and i.type='user_message') dispatched
+              where i.run_id=r.run_id and i.type='user_message') dispatched,
+            exists(select 1 from orchestration_v2_projection_turn_items i
+              where i.run_id=r.run_id and i.type='run_interrupt_request') stop_requested
        from orchestration_v2_projection_runs r
        join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
-      where r.completed_at >= ? and r.status in ('cancelled','failed')
+      where r.completed_at >= ? and r.status in ('cancelled','failed','interrupted')
         and (r.status='failed' or json_extract(r.payload_json,'$.startedAt') is not null
           or exists(select 1 from orchestration_v2_projection_turn_items i
             where i.run_id=r.run_id and i.type='user_message'))
@@ -94,9 +104,12 @@ export function restartRunsSince(db, sinceIso) {
 
 export function stoppedSince(db, threadId, sinceIso) {
   // A later explicit Stop is a barrier even if other turns ran in between.
+  // Any requested interrupt is a Stop, whatever the run's status: an idle
+  // thread's Stop marks its last run without changing that run's status.
+  // A crash-interrupted turn has no request item, so it is not a barrier.
   return Boolean(db.prepare(
-    `select 1 from orchestration_v2_projection_runs
-      where thread_id=? and status='interrupted' and completed_at >= ? limit 1`,
+    `select 1 from orchestration_v2_projection_turn_items
+      where thread_id=? and type='run_interrupt_request' and updated_at >= ? limit 1`,
   ).get(threadId, sinceIso));
 }
 

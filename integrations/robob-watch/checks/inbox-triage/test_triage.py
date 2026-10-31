@@ -292,6 +292,131 @@ class TriageTests(unittest.TestCase):
             self.assertNotIn('imsg:3', state['outbox']['event'])
 
 
+class ChargeTests(unittest.TestCase):
+    """Card alerts go through money-cases before the classifier (owner rule, nightly 2026-10-24)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.mc = t.load_module('test_money_cases', t.MONEY_CASES)
+        self.now = 1_800_000_000.0
+        self.rows = []
+
+        def search(query, since, until=None, source=None, n=20, deadline=None):
+            # Terms are AND'ed; "a OR b" is one term, as in msgs search.
+            groups, prev = [], 'OR'
+            for tok in query.split(' '):
+                if tok == 'OR':
+                    prev = 'OR'
+                    continue
+                if prev != 'OR' or not groups:
+                    groups.append([])
+                groups[-1].append(tok.strip('"').lower())
+                prev = tok
+            return [r for r in self.rows if (source is None or r['source'] == source)
+                    and all(any(w in r['text'].lower() for w in g) for g in groups)]
+        self.patches = [patch.object(self.mc, 'DATA', self.tmp / 'money'),
+                        patch.object(self.mc.charges, 'search', search),
+                        patch.object(self.mc.charges, 'show', lambda row, deadline=None: row['text']),
+                        patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None: []),
+                        patch.object(t, 'load_module', return_value=self.mc)]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def alert(self, n, amount, merchant, age):
+        return {'id': f'imsg:{n}', 'source': 'imessage', 'sender': 'EmiratesNBD', 'subject': '', 'ts': self.now - age,
+                'preview': f'Purchase of EUR {amount} with Credit Card ending 1111 at {merchant}, Amsterdam. Avl Cr. Limit'}
+
+    def run_triage(self, items, hits=()):
+        wd = self.tmp / 'wd'
+        wd.mkdir(exist_ok=True)
+        if not (wd / 'cursor.json').exists():
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': []})
+        result = {'imessage': {'cursor': 9, 'items': items, 'drops': {}, 'scanned': len(items)}}
+        args = types.SimpleNamespace(dry_run_hours=None, report=None)
+        with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
+             patch.object(t.time, 'time', return_value=self.now), \
+             patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+             patch.object(t, 'collect', return_value=(result, {})), patch.object(t, 'build_context', return_value={}), \
+             patch.object(t, 'handled', return_value=({}, {})), \
+             patch.object(t, 'classify', return_value=(list(hits), {'cost_usd': 0})) as model, patch('builtins.print'):
+            self.assertEqual(t.run(args), 0)
+        return model, t.read_json(wd / 'cursor.json'), [json.loads(l) for l in (wd / 'diagnostics' / 'runs.jsonl').read_text().splitlines()]
+
+    def questions(self):
+        # Test runs aren't the live watcher, so they keep a copy of the money books in their folder.
+        return {q['amount']: q for q in self.mc.load_questions(self.tmp / 'wd' / 'scratch-money')['questions']}
+
+    def test_explained_waiting_held_and_unexplained_alerts(self):
+        self.rows = [{'id': 1, 'source': 'email', 'from_me': 0, 'ts': self.now - 30, 'sender': 'Globex <r@globex.example>',
+                      'subject': 'Your Globex receipt', 'text': 'Your globex receipt. Total EUR 20.00'},
+                     {'id': 2, 'source': 'imessage', 'from_me': 0, 'ts': self.now - 90 * 86400, 'sender': 'EmiratesNBD',
+                      'subject': '', 'text': 'Purchase of EUR 9.00 with Credit Card ending 1111 at initech * PENDING, '
+                                             'Amsterdam. Avl Cr. Limit'}]
+        items = [self.alert(1, '20.00', 'GLOBEX', 600), self.alert(2, '30.00', 'INITECH * PENDING', 600),
+                 self.alert(3, '40.00', 'HOOLI', 60), self.alert(4, '50.00', 'UMBRELLA', 600)]
+        model, state, runs = self.run_triage(items, [{'id': 'imsg:4', 'reason': 'unknown charge', 'urgency': 'today'}])
+        sent = model.call_args[0][0]
+        self.assertEqual([i['id'] for i in sent], ['imsg:4'])
+        self.assertIn('money-cases q-', sent[0]['charge_check'])
+        self.assertEqual([i['id'] for i in state['queue']], ['imsg:3'])
+        self.assertEqual(runs[-1]['held_for_receipt'], 1)
+        self.assertEqual((runs[-1]['dropped']['charge_explained'], runs[-1]['dropped']['charge_wait']), (1, 1))
+        qs = self.questions()
+        self.assertEqual((qs['20.00']['status'], qs['30.00']['wait_until'] is not None, qs['50.00']['passed'],
+                          qs['40.00']['passed']), ('closed', True, True, False))
+        self.assertEqual(self.mc.load_questions()['questions'], [])
+
+    def test_an_unexplained_charge_goes_on_even_when_the_classifier_skips_it(self):
+        model, state, runs = self.run_triage([self.alert(4, '50.00', 'UMBRELLA', 600)])
+        self.assertEqual(runs[-1]['hits'], 1)
+        self.assertTrue(self.questions()['50.00']['passed'])
+
+    def test_a_held_alert_goes_on_once_it_settles_and_a_bank_copy_isnt_sent_twice(self):
+        first = self.alert(3, '40.00', 'HOOLI', 60)
+        model, state, _ = self.run_triage([first])
+        self.assertFalse(model.called)
+        self.now += t.CHARGE_SETTLE
+        copy = {**self.alert(5, '40.00', 'HOOLI', 60), 'id': 'mail:icloud:1:5', 'source': 'email',
+                'sender': 'alert@emiratesnbd.com'}
+        model, state, runs = self.run_triage([copy])
+        self.assertEqual([i['id'] for i in model.call_args[0][0]], ['imsg:3'])
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['charge_asked'], 1)
+
+    def test_money_cases_failing_leaves_alerts_to_the_classifier(self):
+        with patch.object(t, 'load_module', side_effect=SyntaxError('broken')):
+            model, state, runs = self.run_triage([self.alert(1, '20.00', 'GLOBEX', 60)])
+        self.assertEqual([i['id'] for i in model.call_args[0][0]], ['imsg:1'])
+        self.assertIn('SyntaxError', runs[-1]['charge_check_errors'])
+
+    def test_the_banks_sms_and_email_in_one_run_go_on_once(self):
+        sms = self.alert(1, '50.00', 'UMBRELLA', 600)
+        mail = {**self.alert(2, '50.00', 'UMBRELLA', 590), 'id': 'mail:icloud:1:2', 'source': 'email',
+                'sender': 'alert@emiratesnbd.com'}
+        model, state, runs = self.run_triage([sms, mail])
+        self.assertEqual([i['id'] for i in model.call_args[0][0]], ['imsg:1'])
+        self.assertEqual(runs[-1]['dropped']['charge_asked'], 1)
+
+    def test_a_decline_after_the_receipt_budget_is_spent_still_reaches_him(self):
+        decline = {'id': 'imsg:9', 'source': 'imessage', 'sender': 'EmiratesNBD', 'subject': '', 'ts': self.now - 60,
+                   'preview': 'Transaction of AED 120.00 on your Card 1111 at GLOBEX was declined'}
+        # A deadline already in the past means the receipt budget is spent.
+        reasons, held, error = t.charge_checks([decline], self.now, False, self.now - 1)
+        self.assertEqual((reasons, held), ({}, set()))
+        self.assertIsNotNone(decline.get('charge_question'))
+        self.assertNotIn(t.UNCHECKED, error or '')
+
+    def test_alerts_the_budget_never_reached_wait_unless_they_are_old(self):
+        items = [self.alert(1, '20.00', 'GLOBEX', 60), self.alert(2, '30.00', 'INITECH', 2 * t.CHARGE_STALL)]
+        with patch.object(t, 'late', return_value=True):
+            reasons, held, error = t.charge_checks(items, self.now, False, self.now)
+        self.assertEqual((reasons, held, error), ({}, {'imsg:1'}, t.UNCHECKED))
+        self.assertEqual(t.charge_checks(items, self.now, True, None)[1], set())
+
+
 ROBOB = '+19362300565'
 MONI = '+971500000001'
 BOB = '+971500000002'

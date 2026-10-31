@@ -7,7 +7,18 @@ import type {
   KanbanParticipant,
   KanbanStage,
 } from "@t3tools/contracts";
-import { ownerChoiceAnswer, type StageBoard } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  BOARD_COLUMNS,
+  clampColumnWidth,
+  EMPTY_BOARD_COLUMN_PREFS,
+  ownerChoiceAnswer,
+  resetColumnWidths,
+  showAllColumns,
+  toggleColumn,
+  type BoardColumnKey,
+  type BoardColumnPrefs,
+  type StageBoard,
+} from "@t3tools/client-runtime/ardud/kanban";
 
 /** Completed, Deployed and Verified share one Shipped tab. */
 export type BoardTab = "todo" | "working" | "needs_review" | "in_review" | "shipped";
@@ -45,35 +56,122 @@ export const COLUMNS_MIN_WIDTH = 900;
 export const BOARD_PAD = 16;
 export const COLUMN_GAP = 10;
 export const OWNER_WIDTH = 264;
+/** A hidden column or Needs Owner folds to a rail this wide. */
+export const COLUMN_RAIL_WIDTH = 36;
 const MIN_COLUMN = 196;
 const MAX_COLUMN = 280;
 /** Four active stages and the folded Shipped column. */
 const SCROLLED_COLUMNS = 5;
 
+/** The stage columns in display order, Shipped last. Needs Owner is handled apart. */
+export const STAGE_COLUMN_KEYS: ReadonlyArray<BoardColumnKey> = [
+  "todo",
+  "working",
+  "needs_review",
+  "in_review",
+  "shipped",
+];
+
 export type BoardLayout =
   | { readonly kind: "tabs" }
   | {
       readonly kind: "columns";
-      readonly column: number;
+      /** Width of each visible stage column (Shipped included). Hidden columns are absent. */
+      readonly columns: Partial<Record<BoardColumnKey, number>>;
+      /** Stage columns the owner has hidden, in display order. */
+      readonly hidden: ReadonlyArray<BoardColumnKey>;
+      /** Needs Owner pane width, or the rail width when it is hidden. */
       readonly owner: number;
-      /** The stage columns are wider than the room left of Needs Owner. */
+      readonly ownerHidden: boolean;
+      /** The visible stage row is wider than the room left of Needs Owner, so it scrolls sideways. */
       readonly scrolls: boolean;
     };
 
-export function boardLayout(width: number): BoardLayout {
+/** Short labels for a hidden column's rail, which is only 36px wide. */
+export const COLUMN_RAIL_LABELS: Record<BoardColumnKey, string> = {
+  todo: "To-Do",
+  working: "Work",
+  needs_review: "Review",
+  in_review: "In rev.",
+  shipped: "Shipped",
+  needs_owner: "Owner",
+};
+
+/**
+ * True when the stage items don't fit the room. Every item (column or rail)
+ * carries one trailing gap, which is also the gap before Needs Owner.
+ */
+export function columnsOverflow(
+  room: number,
+  widths: ReadonlyArray<number>,
+  railCount: number,
+): boolean {
+  const items = widths.length + railCount;
+  const used = widths.reduce((total, width) => total + width, 0) + railCount * COLUMN_RAIL_WIDTH;
+  return used + items * COLUMN_GAP > room;
+}
+
+export function boardLayout(
+  width: number,
+  prefs: BoardColumnPrefs = EMPTY_BOARD_COLUMN_PREFS,
+): BoardLayout {
   if (width < COLUMNS_MIN_WIDTH) return { kind: "tabs" };
-  const room = width - OWNER_WIDTH - BOARD_PAD - COLUMN_GAP;
-  const gaps = (SCROLLED_COLUMNS - 1) * COLUMN_GAP;
-  const column = Math.min(
+  const ownerHidden = prefs.hidden.includes("needs_owner");
+  const owner = ownerHidden
+    ? COLUMN_RAIL_WIDTH
+    : clampColumnWidth("needs_owner", prefs.widths.needs_owner ?? OWNER_WIDTH);
+  const room = width - owner - BOARD_PAD;
+  // Today's default: five columns, each with its trailing gap.
+  const defaultColumn = Math.min(
     MAX_COLUMN,
-    Math.max(MIN_COLUMN, Math.floor((room - gaps) / SCROLLED_COLUMNS)),
+    Math.max(MIN_COLUMN, Math.floor((room - SCROLLED_COLUMNS * COLUMN_GAP) / SCROLLED_COLUMNS)),
   );
+  const hidden = STAGE_COLUMN_KEYS.filter((key) => prefs.hidden.includes(key));
+  const shown = STAGE_COLUMN_KEYS.filter((key) => !prefs.hidden.includes(key));
+  const columns: Partial<Record<BoardColumnKey, number>> = {};
+  for (const key of shown) {
+    columns[key] = clampColumnWidth(key, prefs.widths[key] ?? defaultColumn);
+  }
   return {
     kind: "columns",
-    column,
-    owner: OWNER_WIDTH,
-    scrolls: column * SCROLLED_COLUMNS + gaps > room,
+    columns,
+    hidden,
+    owner,
+    ownerHidden,
+    scrolls: columnsOverflow(
+      room,
+      shown.map((key) => columns[key] ?? 0),
+      hidden.length,
+    ),
   };
+}
+
+/** A column-menu pick: show or hide one stage or Needs Owner, show all, or reset widths. */
+export type ColumnAction =
+  | { readonly kind: "toggle"; readonly key: BoardColumnKey }
+  | { readonly kind: "show-all" }
+  | { readonly kind: "reset" };
+
+export function columnActionId(action: ColumnAction): string {
+  if (action.kind === "show-all") return "columns:show-all";
+  if (action.kind === "reset") return "columns:reset";
+  return `column:${action.key}`;
+}
+
+export function parseColumnAction(id: string): ColumnAction | null {
+  if (id === "columns:show-all") return { kind: "show-all" };
+  if (id === "columns:reset") return { kind: "reset" };
+  if (!id.startsWith("column:")) return null;
+  const key = id.slice("column:".length);
+  return (BOARD_COLUMNS as ReadonlyArray<string>).includes(key)
+    ? { kind: "toggle", key: key as BoardColumnKey }
+    : null;
+}
+
+export function applyColumnAction(prefs: BoardColumnPrefs, action: ColumnAction): BoardColumnPrefs {
+  if (action.kind === "show-all") return showAllColumns(prefs);
+  if (action.kind === "reset") return resetColumnWidths(prefs);
+  return toggleColumn(prefs, action.key);
 }
 
 /** The card opens in a pane over the columns, never wider than this. */
