@@ -6838,10 +6838,9 @@ const pullRequestCandidateFixture = {
   },
 } as const;
 
-it.effect("PR candidate shell selection preserves default snapshots and fork counts", () =>
+const prCandidateShellSelectionBody = (label: string, sql: SqlClient.SqlClient | null) =>
   Effect.gen(function* () {
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-    const sql = yield* SqlClient.SqlClient;
     const now = yield* DateTime.now;
     const projectId = ProjectId.make("project:pr-candidates");
     const threadIds = {
@@ -6851,7 +6850,7 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
       archivedBranch: ThreadId.make("thread:pr-candidates:archived-branch"),
       settledBranch: ThreadId.make("thread:pr-candidates:settled-branch"),
       forkSource: ThreadId.make("thread:pr-candidates:fork-source"),
-      forkNeither: ThreadId.make("thread:pr-candidates:fork-neither"),
+      forkCandidate: ThreadId.make("thread:pr-candidates:fork-candidate"),
     } as const;
     const runId = RunId.make("run:pr-candidates:fork-source");
     const rootNodeId = NodeId.make("node:pr-candidates:fork-source");
@@ -6864,7 +6863,7 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
 
     const created = (threadId: ThreadId, overrides: Record<string, unknown> = {}) =>
       projectionStore.apply({
-        id: EventId.make(`event:pr-candidates:${threadId}`),
+        id: EventId.make(`event:pr-candidates:${label}:${threadId}`),
         type: "thread.created",
         threadId,
         occurredAt: now,
@@ -6904,7 +6903,7 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
       settledAt: now,
     });
     yield* created(threadIds.forkSource);
-    yield* created(threadIds.forkNeither, {
+    yield* created(threadIds.forkCandidate, {
       branch: "feature/fork",
       forkedFrom: { type: "run", threadId: threadIds.forkSource, runId },
       lineage: {
@@ -6914,7 +6913,7 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
       },
     });
     yield* projectionStore.apply({
-      id: EventId.make("event:pr-candidates:fork-source-run"),
+      id: EventId.make(`event:pr-candidates:${label}:fork-source-run`),
       type: "run.created",
       threadId: threadIds.forkSource,
       runId,
@@ -6928,7 +6927,7 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
         providerInstanceId,
         modelSelection,
         providerThreadId: null,
-        userMessageId: MessageId.make("message:pr-candidates:fork-source"),
+        userMessageId: MessageId.make(`message:pr-candidates:${label}:fork-source`),
         rootNodeId,
         activeAttemptId: null,
         status: "completed",
@@ -6939,13 +6938,46 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
         contextHandoffId: null,
       },
     } as never);
+    // Inherited fork items on the source: one runless imported item and one native-run item.
+    const applySourceItem = (suffix: string, itemRunId: RunId | null, ordinal: number) =>
+      projectionStore.apply({
+        id: EventId.make(`event:pr-candidates:${label}:item:${suffix}`),
+        type: "turn-item.updated",
+        threadId: threadIds.forkSource,
+        ...(itemRunId === null ? {} : { runId: itemRunId }),
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`turn-item:pr-candidates:${label}:${suffix}`),
+          threadId: threadIds.forkSource,
+          runId: itemRunId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "assistant_message",
+          messageId: MessageId.make(`message:pr-candidates:${label}:${suffix}`),
+          text: suffix,
+          streaming: false,
+        },
+      } as never);
+    yield* applySourceItem("imported", null, 1);
+    yield* applySourceItem("native", runId, 2);
 
     const ids = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
       threads.map((thread) => thread.id).toSorted();
 
     const defaultSnapshot = yield* projectionStore.getShellSnapshot();
-    const readDefault = yield* yield* sql.withTransaction(projectionStore.readShellSnapshot());
-    assert.deepEqual(ids(readDefault.threads), ids(defaultSnapshot.threads));
+    if (sql !== null) {
+      const readDefault = yield* yield* sql.withTransaction(projectionStore.readShellSnapshot());
+      assert.deepEqual(ids(readDefault.threads), ids(defaultSnapshot.threads));
+    }
     assert.isTrue(defaultSnapshot.threads.some((thread) => thread.id === threadIds.neither));
 
     for (const unsettledOnly of [false, true]) {
@@ -6967,48 +6999,82 @@ it.effect("PR candidate shell selection preserves default snapshots and fork cou
         const retained = filtered.threads.find((thread) => thread.id === expectedThread.id);
         assert.deepEqual(retained, expectedThread);
       }
-      const forkFiltered = filtered.threads.find((thread) => thread.id === threadIds.forkNeither);
+      const forkFiltered = filtered.threads.find((thread) => thread.id === threadIds.forkCandidate);
       const forkUnfiltered = unfiltered.threads.find(
-        (thread) => thread.id === threadIds.forkNeither,
+        (thread) => thread.id === threadIds.forkCandidate,
       );
       assert.isDefined(forkUnfiltered);
+      assert.strictEqual(forkFiltered?.itemCount, forkUnfiltered?.itemCount);
       assert.strictEqual(forkFiltered?.visibleItemCount, forkUnfiltered?.visibleItemCount);
+      assert.isAbove(forkFiltered!.visibleItemCount, 0);
     }
 
-    const { statements, tracer } = traceSqlStatements();
-    yield* projectionStore
-      .getShellSnapshot({ location: "active", pullRequestCandidatesOnly: true })
-      .pipe(Effect.withTracer(tracer));
-    assert.isAtLeast(
-      statements.filter((statement) => statement.includes("'$.branchPullRequest'")).length,
-      1,
-    );
+    if (sql !== null) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* projectionStore
+        .getShellSnapshot({ location: "active", pullRequestCandidatesOnly: true })
+        .pipe(Effect.withTracer(tracer));
+      const outerEligibility = statements.filter(
+        (statement) =>
+          statement.includes("FROM orchestration_v2_projection_threads") &&
+          statement.includes("'$.branchPullRequest'"),
+      );
+      assert.isAtLeast(outerEligibility.length, 1);
+      assert.lengthOf(
+        statements.filter((statement) => /WHERE t\.thread_id = \?/.test(statement)),
+        0,
+      );
 
-    const [stored] = yield* sql<{ readonly payload_json: string }>`
-      SELECT payload_json FROM orchestration_v2_projection_threads
-      WHERE thread_id = ${threadIds.neither}
-    `;
-    yield* sql`UPDATE orchestration_v2_projection_threads
-      SET payload_json = json_set(payload_json, '$.title', 123)
-      WHERE thread_id = ${threadIds.neither}`;
-    const filteredRead = yield* sql
-      .withTransaction(
-        projectionStore.readShellSnapshot({ location: "active", pullRequestCandidatesOnly: true }),
-      )
-      .pipe(
-        Effect.flatMap((decode) => decode),
-        Effect.exit,
+      const unflaggedTrace = traceSqlStatements();
+      yield* projectionStore
+        .getShellSnapshot({ location: "active" })
+        .pipe(Effect.withTracer(unflaggedTrace.tracer));
+      assert.lengthOf(
+        unflaggedTrace.statements.filter((statement) =>
+          statement.includes("'$.branchPullRequest'"),
+        ),
+        0,
       );
-    const unfilteredRead = yield* sql
-      .withTransaction(projectionStore.readShellSnapshot({ location: "active" }))
-      .pipe(
-        Effect.flatMap((decode) => decode),
-        Effect.exit,
-      );
-    yield* sql`UPDATE orchestration_v2_projection_threads
-      SET payload_json = ${stored!.payload_json}
-      WHERE thread_id = ${threadIds.neither}`;
-    assert.isTrue(filteredRead._tag === "Success");
-    assert.isTrue(unfilteredRead._tag === "Failure");
+
+      const [stored] = yield* sql<{ readonly payload_json: string }>`
+            SELECT payload_json FROM orchestration_v2_projection_threads
+            WHERE thread_id = ${threadIds.neither}
+          `;
+      yield* sql`UPDATE orchestration_v2_projection_threads
+            SET payload_json = json_set(payload_json, '$.title', 123)
+            WHERE thread_id = ${threadIds.neither}`;
+      const filteredRead = yield* sql
+        .withTransaction(
+          projectionStore.readShellSnapshot({
+            location: "active",
+            pullRequestCandidatesOnly: true,
+          }),
+        )
+        .pipe(
+          Effect.flatMap((decode) => decode),
+          Effect.exit,
+        );
+      const unfilteredRead = yield* sql
+        .withTransaction(projectionStore.readShellSnapshot({ location: "active" }))
+        .pipe(
+          Effect.flatMap((decode) => decode),
+          Effect.exit,
+        );
+      yield* sql`UPDATE orchestration_v2_projection_threads
+            SET payload_json = ${stored!.payload_json}
+            WHERE thread_id = ${threadIds.neither}`;
+      assert.isTrue(filteredRead._tag === "Success");
+      assert.isTrue(unfilteredRead._tag === "Failure");
+    }
+  });
+
+it.effect("memory PR candidate shell selection preserves default snapshots and fork counts", () =>
+  prCandidateShellSelectionBody("memory", null).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("SQL PR candidate shell selection preserves default snapshots and fork counts", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    return yield* prCandidateShellSelectionBody("SQL", sql);
   }).pipe(Effect.provide(layerTest)),
 );
