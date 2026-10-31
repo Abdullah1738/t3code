@@ -1287,6 +1287,21 @@ export class Router {
     if (nudged) this.options.log?.("context-reset-nudged", "new-deferred");
   }
 
+  /**
+   * Whether the route's session has nothing after the watermark, read fresh from the backend.
+   * An unknown answer counts as not quiet: a deferred reset is never sent on a guess.
+   */
+  private async contextQuiet(route: Route): Promise<boolean> {
+    const mark = this.store.get<Watermark | null>("watermark");
+    if (!mark || mark.sessionId !== route.id) return false;
+    try {
+      const messages = await bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
+      return messages.at(-1)?.id === mark.id;
+    } catch {
+      return false;
+    }
+  }
+
   /** Whether the route or any session in its family is still running. Call only with statuses that match the route. */
   private async familyBusy(route: Route): Promise<boolean> {
     // A waiting root can still owe background work (commands, monitors) with no child session,
@@ -2322,6 +2337,14 @@ export class Router {
       && members.length === 1 && members[0] === row.id && !synthetic(row.id)
       && input.source === "typed" && input.attachments.length === 0 && typed && body.endsWith(typed)
       ? { inboundId: row.id, text: typed } : undefined;
+    // A deferred reset goes out only if the old context wrote nothing since the bridge last
+    // looked. An answer that finished during preparation is left to watch/poll, whose reply
+    // then cancels the reset (see dropQueuedNewIfMovedOn).
+    const queuedNew = this.store.get<{ id: string } | null>("newQueued");
+    if (queuedNew && members.includes(queuedNew.id) && !(await this.contextQuiet(activeRoute))) {
+      this.unsealBatch(row.id);
+      return;
+    }
     // Commit the final arrival check and acceptance fence together, before POST.
     const submitting = this.store.db.transaction(() => {
       if (interrupted() || !this.current(turn)) return false;

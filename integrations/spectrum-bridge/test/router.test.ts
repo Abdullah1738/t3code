@@ -4463,6 +4463,40 @@ test("a root that resumes between the background check and the deferred reset's 
   expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
 });
 
+test("a background answer that completes during the deferred reset's own status read is delivered, and the reset is not sent", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  const resetRows = () => h.store.pendingInbound().filter(row => row.id.startsWith("reset:"));
+  expect(resetRows().map(row => row.state)).toEqual(["pending"]);
+  // The answer and its idle marker land while submit reads statuses for the queued reset,
+  // after watch already looked: the root is idle again by the time submit checks it.
+  let injected = false;
+  h.backend.onStatuses = () => {
+    if (injected || resetRows()[0]?.state !== "processing") return;
+    injected = true;
+    h.backend.step("Found three options. Want the details?");
+    h.backend.settle();
+  };
+  for (let i = 1; i <= 6; i++) { setSystemTime(start + 20 * 60_000 + i * 1_000); await h.router.tick(); }
+  h.backend.onStatuses = undefined;
+  expect(injected).toBe(true);
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  expect(resetRows()).toEqual([]);
+});
+
 test("a refused /new is dropped when the owner writes", async () => {
   const start = Date.parse("2026-10-30T12:00:00Z");
   setSystemTime(start);
