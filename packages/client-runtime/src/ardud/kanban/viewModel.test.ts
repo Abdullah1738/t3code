@@ -750,13 +750,9 @@ describe("discussions", () => {
     expect(discussionRows(swapped, NOW).active[0]?.preview).toBe("Shipped");
 
     // Answers don't change the preview text, but a new object with them must not throw or go stale.
-    const answered = countedMessage(
-      3,
-      false,
-      [{ _tag: "md", text: "Window?" }],
-      reads,
-      [{ blockId: "q1", by: { _tag: "owner" }, choice: ["yes"] }],
-    );
+    const answered = countedMessage(3, false, [{ _tag: "md", text: "Window?" }], reads, [
+      { blockId: "q1", by: { _tag: "owner" }, choice: ["yes"] },
+    ]);
     const answeredState = { ...state, lastMessages: new Map([["disc-1", answered]]) };
     expect(discussionRows(answeredState, NOW).active[0]?.preview).toBe("Evaluator: Window?");
   });
@@ -789,7 +785,14 @@ describe("discussions", () => {
       { _tag: "collapse", title: "Details", text: "hidden" },
       { _tag: "html", html: "<p>x</p>", title: "Report", height: null },
       { _tag: "html", html: "<p>y</p>", title: null, height: null },
-      { _tag: "choice", id: "q1" as never, style: "poll", question: "Ship?", options: [], multi: false },
+      {
+        _tag: "choice",
+        id: "q1" as never,
+        style: "poll",
+        question: "Ship?",
+        options: [],
+        multi: false,
+      },
       { _tag: "card", cardId: "card-1" as never },
       { _tag: "image", url: "https://example.com/a.png", alt: null },
       { _tag: "attachment", attachment: { type: "file", name: "spec.pdf" } as never },
