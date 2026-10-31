@@ -221,10 +221,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     from . import bases, misc, reap, spend
     from .identity import whoami
+    from .redact import redact_argv, warn_env_values
     try:
         me = whoami()
-        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} argv={argv[:12]}")
+        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} argv={redact_argv(argv)[:12]}")
         if a.sub == "run":
+            warn_env_values(a.env)
             return cmd_run(a, me)
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)

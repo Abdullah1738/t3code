@@ -121,7 +121,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 | Flag | Use |
 |---|---|
 | `--size S` / `--template T` | machine size / template for a new lease |
-| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. |
+| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. For a secret, export it and pass the name only (`export LOCALSTACK_AUTH_TOKEN=...; offbox run --env LOCALSTACK_AUTH_TOKEN ...`): a `NAME=value` value sits on offbox's command line, where ps and transcripts see it (offbox.log keeps only the name). |
 | `--pull PATH` | copy an artifact back after the run (coverage.out, junit.xml, `test-results/`), relative to your cwd |
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
