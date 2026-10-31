@@ -623,7 +623,8 @@ class CardSwap(Base):
         self.case('acme', merchant='Shop 2', next_action='dispute on card 5542')
         self.case('done', merchant='Shop 3', next_action='card 5542 charge')
         mc.close(self.data, 'done', outcome='refunded')
-        changes = mc.card_swap(self.data, '5542', '2342', also=('7572',), at=at('2026-10-30T18:00'))
+        changes = mc.card_swap(self.data, '5542', '2342', also=('7572',), at=at('2026-10-30T18:00'),
+                               cases=('stale', 'acme'))
         self.assertEqual(sorted(c['id'] for c in changes), ['acme', 'stale'])
         book = mc.load(self.data)
         by_id = {c['id']: c for c in book['cases']}
@@ -643,14 +644,14 @@ class CardSwap(Base):
 
     def test_case_naming_old_card_only_in_state_is_listed_with_after_none(self):
         self.case('acme', merchant='Shop 5', state='card 5542 declined', next_action='dispute on the card')
-        changes = mc.card_swap(self.data, '5542', '2342')
+        changes = mc.card_swap(self.data, '5542', '2342', cases=())
         self.assertEqual(changes, [{'id': 'acme', 'before': 'dispute on the card', 'after': None}])
         self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on the card')
 
     def test_four_digit_token_inside_a_longer_number_is_not_replaced(self):
         self.case('acme', merchant='Shop 6', reference='ORD-155420', next_action='dispute on card 5542')
         self.case('other', merchant='Shop 7', reference='ORD-155420', next_action='wait for refund')
-        changes = mc.card_swap(self.data, '5542', '2342')
+        changes = mc.card_swap(self.data, '5542', '2342', cases=('acme',))
         self.assertEqual([c['id'] for c in changes], ['acme'])
         self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 2342')
         self.assertEqual(mc.find(mc.load(self.data), 'acme')['reference'], 'ORD-155420')
@@ -733,7 +734,7 @@ class CardSwap(Base):
         path.write_text(json.dumps(book))
         out = io.StringIO()
         with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
-            mc.main(['card-swap', '--old', '5542', '--new', '2342'])
+            mc.main(['card-swap', '--old', '5542', '--new', '2342', '--case', 'other'])
         self.assertIn('1 case(s) updated', out.getvalue())
         stored = mc.load(self.data)
         self.assertEqual(mc.find(stored, 'acme')['next'], f'pay {full} then 5542')
@@ -750,10 +751,60 @@ class CardSwap(Base):
         self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')
         out, err = io.StringIO(), io.StringIO()
         with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
-            self.assertEqual(mc.main(['card-swap', '--old', '5542', '--new', '2342', '--dry-run']), 0)
+            self.assertEqual(mc.main(['card-swap', '--old', '5542', '--new', '2342', '--case', 'acme', '--dry-run']), 0)
         self.assertIn("acme: next 'dispute on card 5542' -> 'dispute on card 2342'", out.getvalue())
         self.assertIn('1 case(s) would update', out.getvalue())
         self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 5542')
+
+    def run_card_swap(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+            code = mc.main(['card-swap', '--old', '5542', '--new', '2342', *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_without_case_nothing_is_written(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('b', merchant='Shop B', next_action='retry on 5542')
+        before = (self.data / 'cases.json').read_bytes()
+        code, out, _ = self.run_card_swap()
+        self.assertEqual(code, 0)
+        self.assertEqual((self.data / 'cases.json').read_bytes(), before)
+        self.assertIn("a: next 'retry on 5542' -> 'retry on 2342'", out)
+        self.assertIn("b: next 'retry on 5542' -> 'retry on 2342'", out)
+        self.assertIn('2 case(s) would change; nothing written', out)
+
+    def test_case_writes_only_the_picked_cases(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('b', merchant='Shop B', next_action='retry on 5542')
+        code, out, _ = self.run_card_swap('--case', 'a')
+        self.assertEqual(code, 0)
+        book = mc.load(self.data)
+        self.assertEqual(mc.find(book, 'a')['next'], 'retry on 2342')
+        self.assertIn('card swap 5542->2342: next updated', mc.find(book, 'a')['history'][-1]['text'])
+        self.assertEqual(mc.find(book, 'b')['next'], 'retry on 5542')
+        self.assertEqual([h for h in mc.find(book, 'b')['history'] if 'card swap' in h['text']], [])
+        self.assertIn("b: next 'retry on 5542' -> 'retry on 2342' (not picked)", out)
+        self.assertIn('1 case(s) updated', out)
+
+    def test_a_case_with_nothing_to_swap_is_refused_and_nothing_is_written(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('c', merchant='Shop C', next_action='retry on 5542')
+        self.case('d', merchant='Shop D', state='card 5542 declined', next_action='retry later')
+        mc.close(self.data, 'c', outcome='refunded')
+        before = (self.data / 'cases.json').read_bytes()
+        for pick in ('c', 'd', 'nope'):
+            code, _, err = self.run_card_swap('--case', pick, '--case', 'a')
+            self.assertEqual(code, 2, pick)
+            self.assertIn('has nothing to swap', err, pick)
+            self.assertEqual((self.data / 'cases.json').read_bytes(), before, pick)
+
+    def test_dry_run_with_case_writes_nothing(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        before = (self.data / 'cases.json').read_bytes()
+        code, out, _ = self.run_card_swap('--case', 'a', '--dry-run')
+        self.assertEqual(code, 0)
+        self.assertEqual((self.data / 'cases.json').read_bytes(), before)
+        self.assertIn('1 case(s) would update', out)
 
 
 class Cli(Base):

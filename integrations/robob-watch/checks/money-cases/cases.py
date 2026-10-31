@@ -11,8 +11,8 @@
                   [--because TEXT | --reply ID]   required with --deadline
   money-cases add ... --unmatched     no merchant match: recorded as "unmatched", never guessed
                   [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
-  money-cases card-swap --old OLD --new NEW [--also STALE ...] [--dry-run]
-                  point open cases' next line at a replacement card (last 4 only); never closes a case
+  money-cases card-swap --old OLD --new NEW [--also STALE ...] [--case ID ...] [--dry-run]
+                  lists open cases naming the old card; writes only the cases picked with --case; never closes a case
                   and leaves a next line that holds a card number or code as is
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
@@ -429,17 +429,20 @@ class _DryRun(Exception):
     """Raised inside Locked so nothing is written."""
 
 
-def card_swap(data, old, new, also=(), dry_run=False, at=None):
+def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
     """Point open cases at a replacement card: rewrite the old (and stale planned) last-4 in `next` only.
 
-    Closed cases are never touched and nothing is closed here: a human confirms each move. A case that
-    names a card elsewhere (state, why, reference) comes back with after=None so someone checks it by hand."""
+    A human picks each case with --case: only the ids in `cases` are written, and a pick with nothing to swap
+    refuses the whole call before any write. Closed cases are never touched and nothing is closed here. A case
+    that names a card elsewhere (state, why, reference) comes back with after=None so someone checks it by hand."""
     old, new = last4_arg('old', old), last4_arg('new', new)
     if old == new:
         raise CaseError('old and new card are the same last 4')
     stale = sorted({old, *(last4_arg('also', a) for a in also)})
     token = re.compile(r'(?<!\d)(?:' + '|'.join(stale) + r')(?!\d)')
+    picks = set(cases)
     changes = []
+    rewrites = []
     try:
         with Locked(data) as book:
             for case in book['cases']:
@@ -462,6 +465,16 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None):
                     changes.append({'id': case['id'], 'before': shown_before, 'after': None})
                     continue
                 changes.append({'id': case['id'], 'before': shown_before, 'after': shown_after})
+                rewrites.append((case, after, changes[-1]))
+            rewritable = {case['id'] for case, _, _ in rewrites}
+            nothing = [cid for cid in dict.fromkeys(cases) if cid not in rewritable]
+            if nothing:
+                raise CaseError(f'case {redact(nothing[0])!r} has nothing to swap; pick from the list')
+            for _, _, change in rewrites:
+                change['picked'] = change['id'] in picks
+            for case, after, change in rewrites:
+                if dry_run or not change['picked']:
+                    continue
                 case['next'] = after
                 case['updated'] = stamp(at)
                 case['history'].append({'at': stamp(at), 'text': f'card swap {old}->{new}: next updated'})
@@ -836,6 +849,7 @@ def main(argv=None):
     p.add_argument('--old', required=True)
     p.add_argument('--new', required=True)
     p.add_argument('--also', action='append', default=[], metavar='LAST4', help='another stale planned card')
+    p.add_argument('--case', action='append', default=[], metavar='ID', help='an open case to move (repeatable)')
     p.add_argument('--dry-run', action='store_true')
     sub.add_parser('brief')
     sub.add_parser('check')
@@ -879,7 +893,7 @@ def main(argv=None):
                         args.observation)
             print(table([find(load(), args.id)]))
         elif args.command == 'card-swap':
-            changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run)
+            changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run, cases=args.case)
             for c in changes:
                 # Same redaction as show/list: a hand-edited case may hold a card number or code in next.
                 cid = redact(c['id'])
@@ -888,10 +902,15 @@ def main(argv=None):
                 elif c['after'] is None:
                     print(f"{cid}: names {args.old}, check by hand")
                 else:
-                    print(f"{cid}: next {redact(c['before'])!r} -> {redact(c['after'])!r}")
-            updated = sum(1 for c in changes if c['after'] is not None)
-            verb = 'would update' if args.dry_run else 'updated'
-            print(f'{updated} case(s) {verb}')
+                    unpicked = ' (not picked)' if args.case and not c['picked'] else ''
+                    print(f"{cid}: next {redact(c['before'])!r} -> {redact(c['after'])!r}{unpicked}")
+            rewritable = [c for c in changes if c['after'] is not None]
+            if not args.case:
+                print(f"{len(rewritable)} case(s) would change; nothing written. Pick with --case ID (repeatable)")
+            else:
+                picked = sum(1 for c in rewritable if c['picked'])
+                verb = 'would update' if args.dry_run else 'updated'
+                print(f'{picked} case(s) {verb}')
         elif args.command == 'close':
             close(DATA, args.id, args.outcome)
             print(f'closed {args.id}')
