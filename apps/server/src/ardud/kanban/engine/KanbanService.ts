@@ -4774,15 +4774,17 @@ const make = Effect.gen(function* () {
    * and consistent; the next start tries again. Runs before the worker or any request; a
    * board with no stale pool costs one pools read.
    */
-  const rekeyBoard = (board: KanbanBoard) =>
-    Effect.gen(function* () {
+  const rekeyBoard = Effect.fn("KanbanService.rekeyBoard")(
+    function* (board: KanbanBoard) {
       const pools = yield* store.pools(board.id);
       const moves = new Map<string, string>();
       for (const pool of pools) {
         const key = Rules.poolKey(pool.model);
         if (pool.key === key) continue;
         if (pools.some((other) => other.key === key)) {
-          yield* Effect.logWarning(`board ${board.slug}: pool ${pool.key} can't become ${key}, taken`);
+          yield* Effect.logWarning(
+            `board ${board.slug}: pool ${pool.key} can't become ${key}, taken`,
+          );
           continue;
         }
         moves.set(pool.key, key);
@@ -4798,11 +4800,14 @@ const make = Effect.gen(function* () {
       for (const { from, pool } of rekeyed) {
         yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
       }
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning(`kanban pool rekey failed for board ${board.slug}`, { cause }),
+    },
+    (effect, board) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`kanban pool rekey failed for board ${board.slug}`, { cause }),
+        ),
       ),
-    );
+  );
   yield* Effect.forEach(yield* store.boards, rekeyBoard, { discard: true });
 
   const runJob = (job: Job) =>
