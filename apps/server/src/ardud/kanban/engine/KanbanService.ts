@@ -4593,14 +4593,28 @@ const make = Effect.gen(function* () {
       }
     }
     // A held slot (a work thread between cards) moves with its pool and keeps its start time.
+    // Its thread also switches: its last card may already be in review, so `moved` may not
+    // name it.
+    const held = yield* Ref.get(holds);
+    for (const [threadId, hold] of held) {
+      if (hold.boardId !== board.id || hold.pool !== from.key) continue;
+      if (!switched.has(threadId)) {
+        switched.add(threadId);
+        yield* threads.setModel(threadId, to.model).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
+          ),
+        );
+      }
+    }
     yield* Ref.update(
       holds,
       (all) =>
         new Map(
-          [...all].map(([threadId, held]) =>
-            held.boardId === board.id && held.pool === from.key
-              ? [threadId, { ...held, pool: to.key }]
-              : [threadId, held],
+          [...all].map(([threadId, hold]) =>
+            hold.boardId === board.id && hold.pool === from.key
+              ? [threadId, { ...hold, pool: to.key }]
+              : [threadId, hold],
           ),
         ),
     );
@@ -4624,6 +4638,19 @@ const make = Effect.gen(function* () {
     }
     const key = Rules.poolKey(model);
     const count = slots === undefined ? from.slots : Math.max(0, Math.round(slots));
+    // Same checks as a plain setPool: a level the provider doesn't offer or a hidden model
+    // can't be started. A pause (0 slots) is allowed, as on the plain path.
+    const pausing = count === 0;
+    if (!pausing) {
+      yield* checkModel(model);
+      const listed = isListed(yield* models.listed, model);
+      if (listed === false) {
+        return yield* failWith(
+          "invalid",
+          `${key} isn't in the model list; pick a model the composer offers`,
+        );
+      }
+    }
     if (key === from.key) {
       if (count === from.slots) return pools;
       yield* store.putPool(board.id, { ...from, slots: count });
@@ -4635,7 +4662,6 @@ const make = Effect.gen(function* () {
         `${model.model} already has a pool at ${Rules.modelLevel(model) ?? "no level"}`,
       );
     }
-    yield* checkModel(model);
     yield* movePoolLevel(board, pools, from, { key, model, slots: count });
     return yield* store.pools(board.id);
   });

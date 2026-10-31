@@ -5494,7 +5494,42 @@ it.effect("a work thread holding its slot between cards follows its pool's new l
       const follow = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
       assert.strictEqual(follow.card.activePool, Rules.poolKey(opusHigh));
       assert.strictEqual(Rules.modelLevel(follow.card.model), "high");
+      // Its card is in review, so only the hold names the thread: it still switches live.
+      const switched = fake.modelSwitches.filter((entry) => entry.threadId === thread);
+      assert.strictEqual(switched.length, 1);
+      assert.strictEqual(Rules.modelLevel(switched[0]!.model), "high");
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a level change keeps the composer's model check, as a plain setPool does", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const haikuMax = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      // A pause (0 slots) is allowed while the model is listed; then the model leaves the list.
+      yield* kanban.setPool(board.id, board.managerModel, 0);
+      yield* Ref.set(
+        listed,
+        new Map([[board.managerModel.instanceId as string, new Set([board.defaultCardModel.model])]]),
+      );
+      // Same key: resizing the hidden model's pool is refused.
+      const sameKey = yield* kanban
+        .setPool(board.id, board.managerModel, 1, { replaces: Rules.poolKey(board.managerModel) })
+        .pipe(Effect.flip);
+      assert.strictEqual(sameKey.code, "invalid");
+      assert.include(sameKey.detail, "isn't in the model list");
+      // Rekey: a level change to the hidden model is refused too.
+      const rekey = yield* kanban
+        .setPool(board.id, haikuMax, 1, { replaces: Rules.poolKey(board.managerModel) })
+        .pipe(Effect.flip);
+      assert.strictEqual(rekey.code, "invalid");
+      assert.include(rekey.detail, "isn't in the model list");
+      const pools = (yield* kanban.snapshot(board.id)).pools;
+      assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(board.managerModel))?.slots, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer, listedLayer(listed))));
   }),
 );
 
