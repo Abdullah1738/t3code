@@ -739,13 +739,21 @@ const make = Effect.gen(function* () {
   ) {
     const pools = yield* store.pools(boardId);
     const joined = `${model.instanceId}/${model.model}`;
-    const match =
-      Rules.poolFor(pools, model) ??
-      pools.find((pool) => pool.model.model === joined || pool.model.model === model.model) ??
-      (() => {
-        const suffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-        return suffix.length === 1 ? suffix[0] : undefined;
-      })();
+    // An alias names the model without its instance; resolve it to the pool model it means,
+    // then pick the level among that model's pools (never the first row when a level is named).
+    const aliased = (): KanbanPool | undefined => {
+      const byName = pools.filter(
+        (pool) => pool.model.model === joined || pool.model.model === model.model,
+      );
+      const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
+      const same = byName.length > 0 ? byName : bySuffix.length === 1 ? bySuffix : [];
+      if (same.length === 0) return undefined;
+      const level = Rules.modelLevel(model);
+      if (level === null) return same[0];
+      // The requested level's pool when the model has one; else the first, as Rules.poolFor does.
+      return same.find((pool) => Rules.modelLevel(pool.model) === level) ?? same[0];
+    };
+    const match = Rules.poolFor(pools, model) ?? aliased();
     if (!match) {
       // A model the provider refuses is named as such, even when no pool exists for it.
       yield* checkModel(model);
@@ -4380,7 +4388,9 @@ const make = Effect.gen(function* () {
   ) {
     const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
     const exact = same.find((pool) => Rules.poolKey(pool.model) === Rules.poolKey(model));
-    if (exact !== undefined || Rules.modelLevel(model) !== null) return exact;
+    // A named level is exact: its pool, or none (a new pool at that level).
+    if (Rules.modelLevel(model) !== null) return exact;
+    // A request with no level must name one only when the model has several pools.
     if (same.length > 1) {
       const levels = same.map((pool) => Rules.modelLevel(pool.model) ?? "no level").join(", ");
       return yield* failWith("invalid", `${model.model} has pools at ${levels}; name the level`);

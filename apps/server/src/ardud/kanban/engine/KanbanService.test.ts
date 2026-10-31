@@ -4992,6 +4992,43 @@ it.effect("a second offered level of a pooled model is its own pool, and each le
   }),
 );
 
+it.effect("a no-level set or remove with a no-level pool and a leveled pool names the level", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const astraPlain = modelSelectionOf({ model: "opus/gpt-6-astra" });
+      yield* kanban.setPool(board.id, astraPlain, 1);
+      yield* kanban.setPool(board.id, astraXhigh, 2);
+      const set = yield* kanban.setPool(board.id, astraPlain, 3).pipe(Effect.flip);
+      assert.strictEqual(set.code, "invalid");
+      assert.include(set.detail, "name the level");
+      const removed = yield* kanban.removePool(board.id, astraPlain).pipe(Effect.flip);
+      assert.include(removed.detail, "name the level");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an alias with an explicit level runs on that level's pool, not the first", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      yield* kanban.setPool(board.id, opusXhigh, 1);
+      yield* kanban.setPool(board.id, opusHigh, 1);
+      const alias = modelSelectionOf({
+        instanceId: "opus",
+        model: "claude-opus-5-5",
+        variant: "high",
+      });
+      const created = yield* kanban.createCard(board.id, { prompt: "a", title: "a", model: alias }, owner);
+      assert.strictEqual(Rules.modelLevel(created.model), "high");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a pause at a level the provider doesn't offer, with two pools, needs the level", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
