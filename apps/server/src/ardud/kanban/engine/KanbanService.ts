@@ -642,7 +642,7 @@ const make = Effect.gen(function* () {
       {
         readonly dueAt: number;
         readonly message: string;
-        readonly state: "retry" | "sent" | "gone";
+        readonly state: "retry" | "sent" | "gone" | "paused";
         readonly runId: string | null;
       }
     >
@@ -2787,6 +2787,9 @@ const make = Effect.gen(function* () {
       const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
       // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
       if (failure === null) {
+        // lastFailure is also null while the latest run is still going, and a delayed
+        // terminal event for an older run must not clear a live retry's streak.
+        if ((yield* threads.view(threadId))?.state === "running") return;
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
           next.delete(threadId);
@@ -2815,12 +2818,12 @@ const make = Effect.gen(function* () {
       }
       if (outage !== null) {
         // An outage pauses the thread for probeOutages; a retry scheduled before it must not fire.
+        // Parked, not deleted: the streak survives until a clean run, and the next
+        // non-outage failure after the probe still hands off instead of retrying.
         if (entry !== undefined && entry.state === "retry") {
-          yield* Ref.update(evaluatorFailures, (all) => {
-            const next = new Map(all);
-            next.delete(threadId);
-            return next;
-          });
+          yield* Ref.update(evaluatorFailures, (all) =>
+            new Map(all).set(threadId, { ...entry, state: "paused" }),
+          );
         }
         return;
       }

@@ -4219,6 +4219,61 @@ const stopping = {
   message: "OpenCode is still stopping the previous turn. Send the message again in a moment.",
 } as never;
 
+it.effect("review135r2: a stale turn end while retry runs does not clear the failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      // Production lastFailure is null when the latest executed run is still running.
+      fake.failures.delete(e);
+      (yield* Ref.get(fake.threads)).get(e)!.running = true;
+      yield* kanban.turnEnded(e);
+      (yield* Ref.get(fake.threads)).get(e)!.running = false;
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 1);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135r2: an intervening outage preserves the non-outage failure streak", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Continue now" }]);
+      fake.failures.set(e, outage);
+      yield* kanban.turnEnded(e);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isNull((yield* kanban.caller(e))!.paused);
+      fake.failures.set(e, { ...(stopping as object) } as never);
+      yield* kanban.turnEnded(e);
+      assert.notStrictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
 it.effect("review135: a replacement setup evaluator can finish setup", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
