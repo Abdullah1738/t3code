@@ -2009,6 +2009,86 @@ it.effect("an idle evaluator gets no tick reminder", () =>
   }),
 );
 
+it.effect("a packet wake never goes to a settled or archived card discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 1,
+          subtasks: [
+            { step: 1, owner: "evaluator", text: "Packet" },
+            { step: 2, owner: "work", text: "Build" },
+          ],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval-settled") },
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.tick;
+      // The card is settled (so its discussion is) before the wait is over: nobody is woken.
+      yield* kanban.moveCard(card.id, "verified", "owner", owner);
+      yield* kanban.settleCard(card.id);
+      assert.isNotNull((yield* kanban.discussion(discussion.id)).settledAt);
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an owner reminder is keyed to the owner's message, not later system posts", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Sys", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Please answer" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("14 minutes");
+      // A system post lands at +14: it must not restart the owner's clock.
+      yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+        { _tag: "md", text: "Status" },
+      ]);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+      yield* TestClock.adjust("30 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a script-only post never triggers an owner reminder", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Script", owner);
+      yield* kanban.post(channel.id, { _tag: "system", component: "script" }, [
+        { _tag: "md", text: "Ran" },
+      ]);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      // No owner message at all: no thread was sent an owner reminder.
+      const sent = (yield* Ref.get(fake.threads))
+        .values()
+        .toArray()
+        .flatMap((thread) => thread.messages)
+        .filter((text) => text.includes("has no reply yet")).length;
+      assert.strictEqual(sent, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("an evaluator that is not running gets no status ask", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

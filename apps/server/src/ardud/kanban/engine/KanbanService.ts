@@ -3002,28 +3002,41 @@ const make = Effect.gen(function* () {
         const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
         if (wait.woken || now - wait.since < limit) continue;
         const minutes = Math.round((now - wait.since) / 60_000);
-        yield* cardDiscussionUnlocked(card.id).pipe(
+        // A settled or archived discussion is finished: its evaluator isn't woken for it.
+        const woke = yield* cardDiscussionUnlocked(card.id).pipe(
           Effect.flatMap((discussion) =>
-            toEvaluator(discussion, Briefs.evaluatorStepWaitingText(card, minutes), true),
-          ),
-          Effect.andThen(
-            Ref.update(stepWaits, (all) =>
-              new Map(all).set(card.id, { ...wait, woken: true }),
-            ),
+            discussion.settledAt !== null || discussion.archivedAt !== null
+              ? Effect.succeed(false)
+              : toEvaluator(discussion, Briefs.evaluatorStepWaitingText(card, minutes), true).pipe(
+                  Effect.as(true),
+                ),
           ),
           Effect.catchCause((cause) =>
-            Effect.logWarning("kanban evaluator step wake failed", { cardId: card.id, cause }),
+            Effect.logWarning("kanban evaluator step wake failed", { cardId: card.id, cause }).pipe(
+              Effect.as(false),
+            ),
           ),
         );
+        if (woke) {
+          yield* Ref.update(stepWaits, (all) => new Map(all).set(card.id, { ...wait, woken: true }));
+        }
       }
       // An owner message a running evaluator hasn't answered gets one reminder. An idle
       // evaluator is covered by its turn-end nudge, so it isn't pinged here.
       for (const discussion of yield* store.discussions(board.id)) {
         if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
-        if (discussion.lastMessageAt === null) continue;
-        const idleMs = now - Date.parse(discussion.lastMessageAt);
+        // The owner's latest message must still be unanswered: a script or system post
+        // never counts, and the clock is the owner's message, not the last post.
+        const messages = yield* store.messages(discussion.id, { limit: 50 });
+        const ask = messages.findLast((message) => message.author._tag === "owner");
+        if (ask === undefined) continue;
+        const answered = messages.some(
+          (message) => message.seq > ask.seq && message.author._tag === "evaluator",
+        );
+        if (answered) continue;
+        const idleMs = now - Date.parse(ask.createdAt);
         if (idleMs < OWNER_WAIT_MS) continue;
-        if ((yield* Ref.get(ownerWaits)).get(discussion.id) === discussion.lastSeq) continue;
+        if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) continue;
         for (const participant of discussion.participants) {
           const actor = participant.actor;
           if (actor._tag !== "evaluator" || participant.owes !== "asked") continue;
@@ -3046,9 +3059,7 @@ const make = Effect.gen(function* () {
               ),
             );
           if (sent) {
-            yield* Ref.update(ownerWaits, (all) =>
-              new Map(all).set(discussion.id, discussion.lastSeq),
-            );
+            yield* Ref.update(ownerWaits, (all) => new Map(all).set(discussion.id, ask.seq));
           }
         }
       }
