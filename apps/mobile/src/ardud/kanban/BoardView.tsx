@@ -38,6 +38,7 @@ import { ChoiceRow, LinkButton } from "../common/parts";
 import {
   applyColumnAction,
   BOARD_PAD,
+  clampColumnWidth,
   boardLayout,
   COLUMN_RAIL_WIDTH,
   STAGE_COLUMN_KEYS,
@@ -566,32 +567,44 @@ function ColumnsBoard(props: {
 }) {
   const { board, layout } = props;
   const prefs = props.columnPrefs;
-  // Live widths while a divider is dragged: the saved layout stays put until the drag ends.
-  const [drag, setDrag] = useState<{
+  // The drag lives in a ref as well as in state: WorkspacePaneDivider can start,
+  // move and end inside one tick (accessibility steps do), before React re-renders.
+  const dragRef = useRef<{
     readonly key: BoardColumnKey;
     readonly start: number;
-    readonly width: number;
+    width: number;
   } | null>(null);
+  const [, setDragTick] = useState(0);
+  const sizeOf = (key: BoardColumnKey) =>
+    key === "needs_owner" ? layout.owner : (layout.columns[key] ?? 0);
   const widthOf = (key: BoardColumnKey) =>
-    drag !== null && drag.key === key ? drag.width : (layout.columns[key] ?? 0);
+    dragRef.current !== null && dragRef.current.key === key
+      ? dragRef.current.width
+      : sizeOf(key);
 
   const saveWidth = (key: BoardColumnKey, width: number) =>
-    props.onColumnPrefs({ ...prefs, widths: { ...prefs.widths, [key]: Math.round(width) } });
-
-  // A divider's drag resizes its column from where the drag started.
-  const resizeBy = (key: BoardColumnKey, delta: number) => {
-    setDrag((current) => {
-      const start = current?.key === key ? current.start : widthOf(key);
-      return { key, start, width: start + delta };
+    props.onColumnPrefs({
+      ...prefs,
+      widths: { ...prefs.widths, [key]: Math.round(clampColumnWidth(key, width)) },
     });
-  };
-  // Saves the final width once, when the drag ends, not on every move.
-  const endResize = () => {
-    if (drag !== null) saveWidth(drag.key, drag.width);
-    setDrag(null);
-  };
+
   const beginResize = (key: BoardColumnKey) => {
-    setDrag({ key, start: layout.columns[key] ?? 0, width: layout.columns[key] ?? 0 });
+    dragRef.current = { key, start: sizeOf(key), width: sizeOf(key) };
+    setDragTick((tick) => tick + 1);
+  };
+  // A divider's drag resizes from where the drag started, clamped to the column's range.
+  const resizeBy = (key: BoardColumnKey, delta: number) => {
+    const current = dragRef.current;
+    const start = current !== null && current.key === key ? current.start : sizeOf(key);
+    dragRef.current = { key, start, width: clampColumnWidth(key, start + delta) };
+    setDragTick((tick) => tick + 1);
+  };
+  // Saves once when the drag ends. Reads the ref, so it sees moves made this tick.
+  const endResize = () => {
+    const current = dragRef.current;
+    dragRef.current = null;
+    setDragTick((tick) => tick + 1);
+    if (current !== null) saveWidth(current.key, current.width);
   };
 
   const columnMenu = columnMenuActions(prefs, layout);
@@ -605,7 +618,7 @@ function ColumnsBoard(props: {
   const showColumn = (key: BoardColumnKey) => onColumnAction(columnActionId({ kind: "toggle", key }));
 
   const stageColumn = (key: BoardColumnKey, label: string, count: number, body: React.ReactNode) => (
-    <View key={key} className="flex-row" style={{ gap: COLUMN_GAP }}>
+    <View key={key} className="flex-row">
       <View style={{ width: widthOf(key) }}>
         <StageHead label={label} count={count} />
         <ColumnScroll bottomInset={props.bottomInset}>{body}</ColumnScroll>
@@ -778,7 +791,7 @@ function ColumnsBoard(props: {
               />
               <View
                 className="rounded-tl-[16px] bg-warning px-2.5 pt-1.5"
-                style={{ width: drag?.key === "needs_owner" ? drag.width : layout.owner }}
+                style={{ width: widthOf("needs_owner") }}
               >
                 <StageHead label={board.owner.label} count={board.owner.cards.length} owner />
                 {ownerContent}
