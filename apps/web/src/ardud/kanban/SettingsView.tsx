@@ -6,6 +6,7 @@ import {
   boardModelSelection,
   modelName,
   modelVariant,
+  poolAddLevel,
   poolListed,
   poolViews,
   type KanbanBoardState,
@@ -67,6 +68,15 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
+  // The level "Add model" gives a new pool; null when every level of it is pooled.
+  const addLevel = (instanceId: ProviderInstanceId, model: string) =>
+    poolAddLevel(
+      instanceEntries.find((entry) => entry.instanceId === instanceId)?.models ?? [],
+      model,
+      pools
+        .filter((pool) => pool.model.instanceId === instanceId && pool.model.model === model)
+        .map((pool) => pool.variant),
+    );
   const editNote = canEdit ? undefined : "Your connection can't change the board";
   const poolNote = canPool ? undefined : "Your connection can't change pools";
 
@@ -87,20 +97,58 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           const unlisted = listed === false;
           const blocked = !canPool || unlisted;
           const blockedReason = unlisted ? "This model is no longer in the model list" : poolNote;
+          const entry = instanceEntries.find(
+            (candidate) => candidate.instanceId === pool.model.instanceId,
+          );
           return (
             <div
               key={pool.key}
-              className="grid min-h-12.5 grid-cols-[minmax(90px,130px)_1fr_auto_auto_auto] items-center gap-4.5 py-1.5 not-last:border-b not-last:border-(--m-rule)"
+              className="grid min-h-12.5 grid-cols-[minmax(90px,130px)_auto_1fr_auto_auto_auto] items-center gap-4.5 py-1.5 not-last:border-b not-last:border-(--m-rule)"
             >
               <span className="flex min-w-0 flex-col">
                 <span className="flex min-w-0 items-baseline gap-1.5">
                   <span className="truncate font-medium">{pool.name}</span>
-                  {pool.variant ? (
+                  {pool.variant && (!entry || unlisted) ? (
                     <span className="text-xs text-(--m-muted)">{pool.variant}</span>
                   ) : null}
                 </span>
                 {unlisted ? (
                   <span className="text-xs text-(--m-muted)">Not in model list</span>
+                ) : null}
+              </span>
+              <span className="flex min-w-0 items-center">
+                {entry && !unlisted ? (
+                  <TraitsPicker
+                    provider={entry.driverKind}
+                    instanceId={pool.model.instanceId}
+                    models={entry.models}
+                    model={pool.model.model}
+                    prompt=""
+                    onPromptChange={() => {}}
+                    modelOptions={pool.model.options ?? []}
+                    allowPromptInjectedEffort={false}
+                    planModeEnabled={settings.planModeEnabled}
+                    disabled={blocked}
+                    onModelOptionsChange={(options) => {
+                      // Only the level is the pool's; the picker's other options (agent) aren't stored.
+                      const variant = modelVariant(
+                        createModelSelection(pool.model.instanceId, pool.model.model, options),
+                      );
+                      if (variant === pool.variant) return;
+                      void runAction("Couldn't change the pool's level", () =>
+                        kanban.setPool(
+                          board.id,
+                          boardModelSelection({
+                            instanceId: pool.model.instanceId,
+                            model: pool.model.model,
+                            variant,
+                          }),
+                          undefined,
+                          { replaces: pool.key },
+                        ),
+                      );
+                    }}
+                  />
                 ) : null}
               </span>
               <span
@@ -181,17 +229,19 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
             )}
             disabled={!canPool}
             getModelDisabledReason={(instanceId, model) =>
-              pools.some(
-                (pool) => pool.model.instanceId === instanceId && pool.model.model === model,
-              )
-                ? "Already in pools"
-                : null
+              addLevel(instanceId, model) === null ? "Already in pools" : null
             }
-            onInstanceModelChange={(instanceId, model) =>
+            onInstanceModelChange={(instanceId, model) => {
+              const level = addLevel(instanceId, model);
+              if (level === null) return;
               void runAction("Couldn't add the model", () =>
-                kanban.setPool(board.id, boardModelSelection({ instanceId, model }), 0),
-              )
-            }
+                kanban.setPool(
+                  board.id,
+                  boardModelSelection({ instanceId, model, variant: level.variant }),
+                  0,
+                ),
+              );
+            }}
           />
         </div>
       </Section>

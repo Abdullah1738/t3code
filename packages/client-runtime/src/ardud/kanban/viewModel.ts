@@ -83,6 +83,54 @@ export function boardModelSelection(input: {
 }
 
 /**
+ * The level "Add model" gives a new pool, or null when there's nothing left to add.
+ * A model with no pool yet gets the provider's default level (none when it has no
+ * default). A pooled model gets a level none of its pools has: the default if free,
+ * else the first offered one. It never sends a pooled model with no level: the server
+ * reads that as "resize its only pool".
+ */
+export function poolAddLevel(
+  models: ReadonlyArray<{
+    readonly slug: string;
+    readonly capabilities?:
+      | {
+          readonly optionDescriptors?:
+            | ReadonlyArray<
+                | {
+                    readonly id: string;
+                    readonly type: "select";
+                    readonly currentValue?: string | undefined;
+                    readonly options: ReadonlyArray<{
+                      readonly id: string;
+                      readonly isDefault?: boolean | undefined;
+                    }>;
+                  }
+                | { readonly id: string; readonly type: "boolean" }
+              >
+            | undefined;
+        }
+      | null
+      | undefined;
+  }>,
+  model: string,
+  pooled: ReadonlyArray<string | null>,
+): { readonly variant: string | null } | null {
+  const descriptor = models
+    .find((entry) => entry.slug === model)
+    ?.capabilities?.optionDescriptors?.find((entry) => entry.id === "variant");
+  const levels = descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
+  const preferred =
+    descriptor?.type === "select"
+      ? (descriptor.currentValue ?? descriptor.options.find((option) => option.isDefault)?.id ?? null)
+      : null;
+  if (pooled.length === 0) return { variant: preferred };
+  const free = [preferred, ...levels].find(
+    (level): level is string => level !== null && !pooled.includes(level),
+  );
+  return free === undefined ? null : { variant: free };
+}
+
+/**
  * Whether a pool's model is still in the composer's model list. Mirrors the
  * server rule in card #48: an instance missing from a non-empty list, disabled,
  * or not offering the slug is missing; null means unknown and must not be read as missing.
