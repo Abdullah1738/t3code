@@ -448,10 +448,14 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None):
                     continue
                 before = case.get('next') or ''
                 after, count = token.subn(new, before)
+                # The returned text is for display: redact first, so a grouped full number that contains the old
+                # last-4 is masked before the swap can make it fail the Luhn check and slip through.
+                shown_before = redact(before)
+                shown_after = token.subn(new, shown_before)[0]
                 if not count:
-                    changes.append({'id': case['id'], 'before': before, 'after': None})
+                    changes.append({'id': case['id'], 'before': shown_before, 'after': None})
                     continue
-                changes.append({'id': case['id'], 'before': before, 'after': after})
+                changes.append({'id': case['id'], 'before': shown_before, 'after': shown_after})
                 case['next'] = after
                 case['updated'] = stamp(at)
                 case['history'].append({'at': stamp(at), 'text': f'card swap {old}->{new}: next updated'})

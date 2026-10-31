@@ -704,6 +704,24 @@ class CardSwap(Base):
             self.assertIn('[card number removed]', text, f'dry={dry}')
             self.assertIn('2342', text, f'dry={dry}')
 
+    def test_grouped_full_number_containing_the_old_last4_is_masked_after_the_swap(self):
+        # 4242 5542 4242 0004 is Luhn-valid and has a group equal to the old last-4: the swap alone would make
+        # it fail the Luhn check, so the display text must be redacted before the rewrite.
+        full = '4242 5542 4242 0004'
+        self.case('acme', next_action='dispute on card 5542')
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        book['cases'][0]['next'] = f'pay {full} then 5542'
+        path.write_text(json.dumps(book))
+        for dry in (True, False):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
+            text = out.getvalue()
+            for leaked in ('4242554242420004', '4242 5542 4242 0004', '4242 2342 4242 0004', '4242 2342'):
+                self.assertNotIn(leaked, text, f'dry={dry}')
+            self.assertIn('[card number removed] then 2342', text, f'dry={dry}')
+
     def test_cli_card_swap_prints_moves_and_dry_run_says_would_update(self):
         self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')
         out, err = io.StringIO(), io.StringIO()
