@@ -126,3 +126,10 @@ test("exp and expires keys are masked only when the value looks like a card expi
   assert.deepEqual(redactValue(cookie), cookie);
   assert.deepEqual(redactValue({ expiresAt: "2026-11-01T00:00:00Z", exp: 1793404800 }), { expiresAt: "2026-11-01T00:00:00Z", exp: 1793404800 });
 });
+
+test("closing brackets in the label gap are accepted", () => {
+  assert.equal(redactText("Security code (CVV): 123"), "Security code (CVV): •••");
+  assert.equal(redactText("(CVC) 123"), "(CVC) •••");
+  assert.equal(redactText("Expiry (MM/YY): 12/29"), "Expiry (MM/YY): ••/••");
+  assert.equal(redactText("Total (AED): 245.00"), "Total (AED): 245.00");
+});

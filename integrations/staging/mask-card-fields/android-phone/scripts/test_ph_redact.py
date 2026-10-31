@@ -56,6 +56,7 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(ph.redact(""), "")
 
 
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -142,3 +143,11 @@ class PunctuationGapTests(unittest.TestCase):
     def test_parenthesised_values_masked(self):
         self.assertEqual(ph.redact("CVV (123)"), "CVV (•••)")
         self.assertEqual(ph.redact("Expiry (12/29)"), "Expiry (••/••)")
+
+
+class ClosingBracketGapTests(unittest.TestCase):
+    def test_closing_brackets_in_gap_masked(self):
+        self.assertEqual(ph.redact("Security code (CVV): 123"), "Security code (CVV): •••")
+        self.assertEqual(ph.redact("(CVC) 123"), "(CVC) •••")
+        self.assertEqual(ph.redact("Expiry (MM/YY): 12/29"), "Expiry (MM/YY): ••/••")
+        self.assertEqual(ph.redact("Total (AED): 245.00"), "Total (AED): 245.00")
