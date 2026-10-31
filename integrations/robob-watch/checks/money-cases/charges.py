@@ -72,6 +72,10 @@ NOT_MINE = re.compile(r"\?|n't\b|\b(?:not|never|no idea|unknown|recogni[sz]e|fra
                       re.I)
 # A negative statement about buying or owning: "No Apple orders from me", "I ordered nothing from Apple".
 NEGATED = re.compile(r"\b(?:no|none|nothing|never|not|n't|didn't|haven't|hasn't|wasn't|isn't)\b", re.I)
+# A denial or correction in the whole message: "I paid Apple. No, I ordered nothing from Apple." The later
+# denial vetoes the earlier affirmation, so it is checked on the message before any clause is accepted.
+VETO = re.compile(r"\b(?:no|nope|nah|wrong|incorrect|actually|correction|not\s+me|that\s+wasn'?t|it\s+wasn'?t)\b"
+                  r"|\b(?:none|nothing|never|not|n't)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
                   re.I)
@@ -344,7 +348,7 @@ OWNS = re.compile(r"\b(?:(?:is|are|was|it'?s|that'?s) mine|mine)\b", re.I)
 # card with its issuer ("with my ENBD card"). A bare "account" or "wallet" is a destination, not a method:
 # "I topped up my Apple account" funds Apple, so it stays as the payee.
 PAYMENT_METHOD = re.compile(r"\b(?:with|via|using|through|on|by)\s+(?:my\s+|the\s+|his\s+|our\s+)?"
-                            r"(?:(?:[A-Za-z]+\s+)?(?:card|cheque)|(?:apple|google|samsung)\s+pay|paypal|"
+                            r"(?:(?:[A-Za-z]+\s+)?(?:card|cheque)|(?:apple|google|samsung)\s+(?:pay|wallet)|paypal|"
                             r"bank\s+transfer|cash)\b(?:\s+(?:ending|no\.?|number)?\s*\d{4})?", re.I)
 
 
@@ -389,7 +393,7 @@ def owner_said(charge, at, now, said=None, deadline=None):
         # "It isn't mine", "what's the Acme charge?" or "Have I paid Acme" anywhere in the message explains
         # nothing. The whole message is checked, before it is split, so a "?" is never cut off its clause.
         parts = CLAUSES.split(text)
-        if NOT_MINE.search(text) or any(ASKS.search(c) for c in parts):
+        if NOT_MINE.search(text) or VETO.search(text) or any(ASKS.search(c) for c in parts):
             continue
         # The purchase words have to be about this merchant, in the same statement: "I paid Amazon AED 50.
         # Send me the Apple keynote summary." pays Amazon, not Apple. An amount in that statement has to be

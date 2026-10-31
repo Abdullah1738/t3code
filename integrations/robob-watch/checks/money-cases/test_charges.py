@@ -309,6 +309,22 @@ class Explain(unittest.TestCase):
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
         self.assertEqual(r['verdict'], 'owner')
 
+    def test_a_later_denial_vetoes_an_earlier_affirmation_in_the_same_message(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I paid Apple. No, I ordered nothing from Apple.', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
+    def test_paying_another_merchant_with_an_apple_wallet_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I paid Amazon via Apple Wallet', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'ask')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 
