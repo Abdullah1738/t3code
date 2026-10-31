@@ -2066,6 +2066,82 @@ it.effect("an owner reminder is keyed to the owner's message, not later system p
   }),
 );
 
+// Fails the next `allReadFailures.remaining` full-history message reads.
+const allReadFailures = { remaining: 0 };
+const failingAllReadStore = Layer.effect(
+  KanbanStore.KanbanStore,
+  Effect.gen(function* () {
+    const real = yield* KanbanStore.KanbanStore;
+    return {
+      ...real,
+      allMessages: (id) =>
+        allReadFailures.remaining > 0
+          ? ((allReadFailures.remaining -= 1),
+            Effect.fail(new KanbanStore.KanbanStoreError({ operation: "read all messages", cause: "injected" })))
+          : real.allMessages(id),
+    };
+  }),
+);
+
+// testLayer with the store's full-history read failing on demand.
+const failingAllReadLayer = (fake: Layer.Layer<KanbanThreads>) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(failingAllReadStore.pipe(Layer.provide(KanbanStore.layer))),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+it.effect("a failed owner-wait history read skips only that discussion, not the tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Broken read", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Hello" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      // A dispatchable card on the same board must still start after the failing read.
+      const card = yield* kanban.createCard(board.id, { prompt: "Ship", title: "Ship" }, owner);
+      allReadFailures.remaining = 1;
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(allReadFailures.remaining, 0, "the injected read failure was consumed");
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 0);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
+    }).pipe(Effect.provide(failingAllReadLayer(fake.layer)));
+  }),
+);
+
+it.effect("an owner message stays reminded when the discussion has 50+ later system posts", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Window", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Old question" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      // More than a page of system posts after the owner's message, none answered.
+      for (let i = 0; i < 55; i++) {
+        yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+          { _tag: "md", text: `Status ${i}` },
+        ]);
+      }
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a script-only post never triggers an owner reminder", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

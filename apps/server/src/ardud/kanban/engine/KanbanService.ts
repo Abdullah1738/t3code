@@ -3025,43 +3025,54 @@ const make = Effect.gen(function* () {
       // evaluator is covered by its turn-end nudge, so it isn't pinged here.
       for (const discussion of yield* store.discussions(board.id)) {
         if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
-        // The owner's latest message must still be unanswered: a script or system post
-        // never counts, and the clock is the owner's message, not the last post.
-        const messages = yield* store.messages(discussion.id, { limit: 50 });
-        const ask = messages.findLast((message) => message.author._tag === "owner");
-        if (ask === undefined) continue;
-        const answered = messages.some(
-          (message) => message.seq > ask.seq && message.author._tag === "evaluator",
+        // Only a discussion whose evaluator owes a reply can have an owner reminder due.
+        const owing = discussion.participants.filter(
+          (participant) => participant.actor._tag === "evaluator" && participant.owes === "asked",
         );
-        if (answered) continue;
-        const idleMs = now - Date.parse(ask.createdAt);
-        if (idleMs < OWNER_WAIT_MS) continue;
-        if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) continue;
-        for (const participant of discussion.participants) {
-          const actor = participant.actor;
-          if (actor._tag !== "evaluator" || participant.owes !== "asked") continue;
-          const evaluatorId = actor.threadId;
-          const read = yield* Effect.result(threads.find(evaluatorId));
-          if (read._tag === "Failure" || read.success?.state !== "running") continue;
-          const minutes = Math.round(idleMs / 60_000);
-          const sent = yield* threads
-            .send({
-              threadId: evaluatorId,
-              text: Briefs.ownerWaitingText(discussion, minutes),
-            })
-            .pipe(
-              Effect.as(true),
-              Effect.catchCause((cause) =>
-                Effect.logWarning("kanban owner message reminder failed", {
-                  threadId: evaluatorId,
-                  cause,
-                }).pipe(Effect.as(false)),
-              ),
-            );
-          if (sent) {
-            yield* Ref.update(ownerWaits, (all) => new Map(all).set(discussion.id, ask.seq));
+        if (owing.length === 0) continue;
+        // A failed read skips only this discussion, never the tick.
+        yield* Effect.gen(function* () {
+          // The whole history, not a window: the owner's message may be older than any recent page.
+          const messages = yield* store.allMessages(discussion.id);
+          const ask = messages.findLast((message) => message.author._tag === "owner");
+          if (ask === undefined) return;
+          const answered = messages.some(
+            (message) => message.seq > ask.seq && message.author._tag === "evaluator",
+          );
+          if (answered) return;
+          const idleMs = now - Date.parse(ask.createdAt);
+          if (idleMs < OWNER_WAIT_MS) return;
+          if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) return;
+          for (const participant of owing) {
+            const actor = participant.actor;
+            if (actor._tag !== "evaluator") continue;
+            const evaluatorId = actor.threadId;
+            const read = yield* Effect.result(threads.find(evaluatorId));
+            if (read._tag === "Failure" || read.success?.state !== "running") continue;
+            const minutes = Math.round(idleMs / 60_000);
+            const sent = yield* threads
+              .send({
+                threadId: evaluatorId,
+                text: Briefs.ownerWaitingText(discussion, minutes),
+              })
+              .pipe(
+                Effect.as(true),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("kanban owner message reminder failed", {
+                    threadId: evaluatorId,
+                    cause,
+                  }).pipe(Effect.as(false)),
+                ),
+              );
+            if (sent) {
+              yield* Ref.update(ownerWaits, (all) => new Map(all).set(discussion.id, ask.seq));
+            }
           }
-        }
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban owner wait check failed", { discussionId: discussion.id, cause }),
+          ),
+        );
       }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {
