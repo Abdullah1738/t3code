@@ -597,29 +597,26 @@ class LiveAndEchoTests(unittest.TestCase):
         self.assertEqual(seen_by_follower['ck']['logBytes'], len(b'o1\no2\n'))
 
 
-class LockBlockedFollowerTests(unittest.TestCase):
+class LockBlockedFollowerTests(Isolated):
     """Round 7: a lock-blocked logs --follow (the real _wait_locked poll loop) receives an owner's chunk before the
     owner's exit frame, for a fresh run with no checkpoint, with a zero checkpoint, and with an empty original log.
-    The owner is a real takeover in a background thread, paused between its chunk and its exit frame."""
+    The owner is a real takeover in a background thread, paused between its chunk and its exit frame.
+    Round 8: built on Isolated, so the DB, the lock directory and the logs all live in a per-test temp dir."""
 
     def setUp(self):
-        import tempfile
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.logs = Path(self._tmp.name)
-        self.stack = contextlib.ExitStack()
-        self.addCleanup(self.stack.close)
+        super().setUp()
+        self.logs = common.LOGS_DIR
+        # misc and runs import LOGS_DIR by name, so the isolated directory must be patched there too.
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(misc, 'WAIT_POLL_S', 0))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
         self.stack.enter_context(patch.object(runs, 'finish'))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
-        self.stack.enter_context(patch.object(misc, 'WAIT_POLL_S', 0))
         # logs --follow only enters the lock-blocked path for a live box.
         self.stack.enter_context(patch.object(runs.api, 'get', return_value={'state': 'running'}))
         self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
-        self.con = db()
         self.con.execute("INSERT OR REPLACE INTO runs(run_id,box_id,status,process_id,pulls,start_at) "
                          "VALUES ('run-f','bx_a','running',7,'[]',900)")
         self.con.commit()
@@ -627,6 +624,7 @@ class LockBlockedFollowerTests(unittest.TestCase):
                     'exit_code': None}
 
     def _settle_run(self):
+        # The isolated connection, never the live one.
         self.con.execute("UPDATE runs SET status='done', exit_code=0 WHERE run_id='run-f'")
         self.con.commit()
 
