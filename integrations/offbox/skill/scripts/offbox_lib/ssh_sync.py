@@ -173,6 +173,9 @@ def _soft_partial(stderr: str) -> list[str] | None:
         ln = ln.strip()
         if not ln or ln.startswith("rsync error: some files/attrs were not transferred"):
             continue
+        # [generator]/[receiver] errors come from the box side (a root-owned dir there, say): never a local skip.
+        if ln.startswith(("rsync: [generator]", "rsync: [receiver]")):
+            return None
         m = re.search(r'(?:failed to open|file has vanished:) "([^"]+)"', ln)
         if m and ("Permission denied" in ln or "vanished" in ln):
             bad.append(m.group(1))

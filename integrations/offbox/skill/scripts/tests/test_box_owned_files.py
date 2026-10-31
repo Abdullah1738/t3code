@@ -111,6 +111,27 @@ class BoxOwnedFilesTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 90)
         self.assertIn("sudo chown -R user:user", str(cm.exception))
 
+    def test_box_side_opendir_denial_after_reclaim_is_not_a_soft_pass(self):
+        # The second 23 must not look like a local unreadable file (the soft path); it's an infra failure, exit 90.
+        opendir = ('rsync: [generator] opendir "tmp/localstack/var-lib/cache" failed: Permission denied (13)\n'
+                   "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [sender=3.5.0]\n")
+        self.assertIsNone(ssh_sync._soft_partial(opendir))
+        rsyncs = []
+
+        def fake(cmd, **kw):
+            if cmd[0] == ssh_sync.RSYNC:
+                rsyncs.append(cmd)
+                return subprocess.CompletedProcess(cmd, 23, "", DENIED if len(rsyncs) == 1 else opendir)
+            return self.real_run(cmd, **kw)
+
+        self.ssh.side_effect = lambda *a, **kw: subprocess.CompletedProcess([], 0, b"", b"")
+        with patch.object(ssh_sync.subprocess, "run", side_effect=fake):
+            with self.assertRaises(OffboxError) as cm:
+                self.push()
+        self.assertEqual(cm.exception.code, 90)
+        self.assertEqual(len(rsyncs), 2)
+        self.assertEqual(self.ssh.call_count, 1)
+
     def test_receiver_denied_parsing(self):
         self.assertEqual(ssh_sync._receiver_denied(DENIED), ["tmp/localstack/var-lib/cache/certs",
                                                             "tmp/localstack/var-lib/cache/server.test.pem.crt"])
