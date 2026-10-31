@@ -7,7 +7,7 @@ import json
 import os
 import re
 
-from .common import IDLE_STOP_S, OffboxError, db, iso, now
+from .common import IDLE_STOP_S, OffboxError, db, event, iso, now
 
 WINDOWS = ((60, "MINUTE", 25), (3600, "HOUR", 180), (86400, "DAY", 760))
 
@@ -208,3 +208,55 @@ def idle_seconds(size: str | None = None, snap: dict | None = None, docker: bool
     if docker or not starts_plentiful(s):
         return IDLE_STOP_S
     return IDLE_BY_SIZE.get(size or "", IDLE_BY_SIZE["large"])
+
+
+# Per-size boat supply outage ("supply for size X is over, try later"). Temporary: boat restored xlarge within the
+# hour on 31 Oct, so this is a cooldown, not a lease or box mark.
+SUPPLY_KV = "boat_supply_out"
+
+
+def supply_cooldown_s() -> int:
+    return setting("OFFBOX_SUPPLY_COOLDOWN_SECONDS", 600, minimum=60, maximum=3600)
+
+
+def _supply_map(con) -> dict:
+    row = con.execute("SELECT v FROM kv WHERE k=?", (SUPPLY_KV,)).fetchone()
+    try:
+        return json.loads(row[0]) if row else {}
+    except ValueError:
+        return {}
+
+
+def supply_out(size: str, box_id: str | None, msg: str) -> None:
+    con = db()
+    try:
+        t = now()
+        con.execute("BEGIN IMMEDIATE")
+        m = {k: v for k, v in _supply_map(con).items() if (v.get("until") or 0) > t}
+        old = m.get(size) or {}
+        # The first outage's "since" survives repeated refusals while the cooldown is still running.
+        m[size] = {"until": t + supply_cooldown_s(), "since": old.get("since") or t, "box": box_id, "msg": msg[:300]}
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (SUPPLY_KV, json.dumps(m), t))
+        con.commit()
+        event(con, box_id, "supply_out", f"{size}: {msg[:200]}")
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def supply_status() -> dict:
+    """Active per-size outages: {size: {"until", "since", "box", "msg"}}."""
+    con = db()
+    try:
+        t = now()
+        return {k: v for k, v in _supply_map(con).items() if (v.get("until") or 0) > t}
+    finally:
+        con.close()
+
+
+def supply_until(size: str | None) -> float | None:
+    if not size:
+        return None
+    return (supply_status().get(size) or {}).get("until")

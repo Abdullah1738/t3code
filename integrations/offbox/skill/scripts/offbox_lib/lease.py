@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, month_key, new_id, now, read_json, say)
+                     file_lock, iso, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -256,6 +256,35 @@ def _start_from(con, table: str, row, sz: str, name: str, idem: str) -> dict | N
         return None
 
 
+def supply_size(want: str | None, floor: str = "large") -> str | None:
+    """`want` when boat has machines of that size, else the biggest size below it that does (never below the floor,
+    and never below large). None when nothing fits."""
+    if not want or capacity.supply_until(want) is None:
+        return want
+    lo = max(floor or "large", "large", key=_rank)
+    for n in reversed(SIZES):
+        if _rank(lo) <= _rank(n) < _rank(want) and capacity.supply_until(n) is None:
+            return n
+    return None
+
+
+def resume_size(con, row, size: str | None) -> str:
+    """The size _reuse resumes a stopped row at: the requested size when it is bigger than the natural one."""
+    nat = natural_size(con, row)
+    return size if _bigger(size, nat) else nat
+
+
+def _fit_new(sz: str, size: str | None) -> str:
+    """A new box's size, one size smaller while boat has no machines of `sz`. Explicit --size waits instead."""
+    fit = supply_size(sz, size or "large")
+    if fit is None:
+        raise api.SupplyOut(sz, None, f"supply for size {sz} is over until {iso(capacity.supply_until(sz))}",
+                            tried=False)
+    if fit != sz:
+        say(f"boat has no {sz} machines right now; creating a {fit} box instead (pass --size {sz} to wait for {sz})")
+    return fit
+
+
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
     """-> (sandbox dict, source label, base_remote_dir or None, size).
 
@@ -276,7 +305,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
                                "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
         if brow:
-            sz = size or brow["size"] or "large"
+            sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
             if s:
                 return s, f"base:{brow['name']}", brow["remote_dir"], sz
@@ -293,7 +322,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             if trow:
                 say(f"template {tname} not built yet; using generic")
         if trow:
-            sz = size or DEFAULT_SIZE.get(tname, "default")
+            sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
             s = _start_from(con, "templates", trow, sz, name, idem)
             if s:
                 return s, f"template:{trow['name']}", None, sz
@@ -301,7 +330,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                 f"instead, which takes a few minutes. The reaper rebuilds the template.")
             s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
             return s, f"recipe:{trow['name']}", None, sz
-    sz = size or DEFAULT_SIZE.get(tname or "generic", "default")
+    sz = _fit_new(size or DEFAULT_SIZE.get(tname or "generic", "default"), size)
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
     return s, "fresh", None, sz
@@ -400,8 +429,9 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 _FOLLOW_STOP_S = 160
 
 
-def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False) -> dict:
-    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900)
+def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
+              since: float | None = None, stale_error: str | None = None) -> dict:
+    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error)
     ssh_sync.setup(box_id)
     ssh_sync.wait_ssh(box_id)
     if recipe:
@@ -457,7 +487,7 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             hold = file_lock(f"box-{box_id}", timeout=0)
             hold.__enter__()
         try:
-            got = _create_row(con, me, box_id, source, base_dir, sz, t, box_held=hold is not None)
+            got = _create_row(con, me, box_id, source, base_dir, sz, t, box_held=hold is not None, since=t)
         except BaseException:
             if hold is not None:
                 hold.__exit__(None, None, None)
@@ -470,7 +500,8 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
-def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False) -> dict:
+def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False,
+                since: float | None = None) -> dict:
     rdir = remote_dir_for(me["repo_root"])
     is_recipe = source.startswith("recipe:")
     # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
@@ -486,7 +517,7 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
         _bring_up(box_id, fresh=(source == "fresh"),
-                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held)
+                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
         try:
             api.rename(box_id, box_name(me, me["repo_key"]))
         except OffboxError:
@@ -494,6 +525,15 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
         if base_dir and base_dir != rdir:
             ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
                                  f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
+    except api.SupplyOut as e:
+        # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
+        if is_recipe:
+            _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
+        else:
+            con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+            con.commit()
+            event(con, box_id, "lease_gone", "supply out")
+        raise
     except OffboxError as e:
         # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
         # half built. It must not stay a pool candidate, or a later acquisition would hand it out as ready.
@@ -610,6 +650,10 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         if active_runs(con, box_id):
             raise OffboxError(f"lease {box_id} is {have} with a run in progress; can't resize to {want} now",
                               code=2)
+        if capacity.supply_until(want):
+            # Never stop a live box to grow it into a size boat cannot give right now.
+            raise api.SupplyOut(want, box_id, f"supply for size {want} is over until "
+                                              f"{iso(capacity.supply_until(want))}", tried=False)
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
         api.stop(box_id)
@@ -649,10 +693,18 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     if st in api.STOPPED_STATES and want == have:
         # A resume costs a start either way: come back at the requested size or the box's natural size,
         # not the size some earlier run grew it to.
-        nat = natural_size(con, row)
-        want = size if _bigger(size, nat) else nat
+        want = resume_size(con, row, size)
     t = now()
     if st in api.STOPPED_STATES:
+        # Boat has no machines of this size right now: come back one size smaller (an explicit --size waits instead).
+        fit = supply_size(want, size or "large")
+        if fit is None:
+            raise api.SupplyOut(want, box_id, f"supply for size {want} is over until "
+                                              f"{iso(capacity.supply_until(want))}", tried=False)
+        if fit != want:
+            say(f"boat has no {want} machines right now; resuming {box_id} as {fit} instead "
+                f"(pass --size {want} to wait for {want})")
+            want = fit
         say(f"resuming stopped lease {box_id} ({want})")
         try:
             api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
@@ -667,6 +719,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 if tb:
                     raise tb from e
                 raise
+            if capacity.supply_until(s.get("type")):
+                raise api.SupplyOut(s.get("type"), box_id, str(e), tried=True) from e
             say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
             want = s.get("type")
             try:
@@ -676,7 +730,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 if tb:
                     raise tb from e2
                 raise
-        up = _bring_up(box_id)
+        up = _bring_up(box_id, since=t, stale_error=s.get("error"))
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
         event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")

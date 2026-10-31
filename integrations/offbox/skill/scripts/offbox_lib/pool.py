@@ -167,7 +167,7 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None):
 
 
 def _acquire(con, me, size, template, base, fresh, run_id):
-    from . import lease
+    from . import api, lease
     lease.cap_check()
     capacity.schema(con)
     key = me["repo_key"]
@@ -213,6 +213,12 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         # later running rows may still be free either way.
                         if stopped_tries >= 2 or (stopped_tries == 1 and not stopped_failed):
                             continue
+                        # boat has no machines of the size this box would resume at: not a try, nothing to wait on.
+                        fit_size = lease.resume_size(con, r, size)
+                        if lease.supply_size(fit_size, size or "large") is None:
+                            last_error = api.SupplyOut(fit_size, r["box_id"],
+                                                       f"supply for size {fit_size} is over", tried=False)
+                            continue
                         try:
                             capacity.check(con)
                         except capacity.CapacityError as e:
@@ -253,6 +259,16 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         if row['state'] != 'running':
                             stopped_tries += 1
                         got = lease._reuse(con, row, size, skip_archiving=True)
+                    except api.SupplyOut as e:
+                        # This box's size is out: the next member gets its turn in this pass.
+                        if row['state'] != 'running':
+                            if e.tried:
+                                stopped_failed = True
+                            else:
+                                stopped_tries -= 1
+                        last_error = e
+                        say(f"skipping {row['box_id']}: {e}. Trying other pool boxes")
+                        continue
                     except capacity.CapacityError as e:
                         last_error = e
                         continue
