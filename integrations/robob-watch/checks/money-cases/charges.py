@@ -86,6 +86,8 @@ CORRECTION = re.compile(r"\b(?:wrong\s+(?:charge|one|transaction|payment)|nothin
                         # Naming another person is not a denial: "someone else reimbursed me" stays a payment he made.
                         # Only "someone else's charge" and "belongs to someone else" deny that it is his.
                         r"someone\s+else'?s\s+(?:charge|one|transaction|payment)|"
+                        # Predicative: "That was someone else's", "that one is someone else's". Not "someone else reimbursed me".
+                        r"(?:that|this|it|one|charge)(?:\s+one)?\s+(?:was|is|'s)\s+someone\s+else'?s|"
                         r"belongs?\s+to\s+(?:someone|somebody|another|anyone)(?:\s+else)?)\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",

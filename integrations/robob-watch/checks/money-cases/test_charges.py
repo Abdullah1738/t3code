@@ -346,6 +346,16 @@ class Explain(unittest.TestCase):
                 r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
                 self.assertEqual(r['verdict'], 'owner', text)
 
+    def test_a_predicative_someone_else_denial_outvotes_an_earlier_payment(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+        for text in ("I paid Apple. That was someone else's.",
+                     "I paid Apple. Actually that one is someone else's."):
+            with self.subTest(text=text):
+                def said(since, until, deadline=None, text=text):
+                    return [('2026-10-24T00:20:00.000Z', text, 'iMessage')]
+                r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+                self.assertEqual(r['verdict'], 'ask', text)
+
     def test_an_ownership_answer_with_discourse_words_still_explains_the_charge(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
         for text in ('Actually the Apple charge is mine', 'The Apple charge is mine, no need to ask'):
