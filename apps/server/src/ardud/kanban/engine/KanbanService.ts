@@ -477,6 +477,13 @@ const HOLD_MAX_MS = 30 * 60_000;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
+// A todo card whose step is only evaluator subtasks (its packet) nobody has done
+// gets its evaluator woken once: a card made by an evaluator wakes nobody else.
+const STEP_WAIT_P1_MS = 15 * 60_000;
+const STEP_WAIT_MS = 60 * 60_000;
+// An owner message a running evaluator hasn't answered gets one reminder; its turn
+// end covers an idle evaluator, so the tick doesn't double it.
+const OWNER_WAIT_MS = 15 * 60_000;
 // A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
@@ -623,6 +630,12 @@ const make = Effect.gen(function* () {
   const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
     new Map(),
   );
+  // Cards waiting on evaluator subtasks: the step's subtask ids, when the wait began, and whether woken.
+  const stepWaits = yield* Ref.make<
+    ReadonlyMap<KanbanCard["id"], { readonly key: string; readonly since: number; readonly woken: boolean }>
+  >(new Map());
+  // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
+  const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
@@ -2959,6 +2972,84 @@ const make = Effect.gen(function* () {
           yield* Ref.update(statusAsked, (all) =>
             new Map(all).set(link.threadId, { run, at: now }),
           );
+        }
+      }
+      // A todo card whose step is only evaluator subtasks (its packet) and nobody has
+      // done them: its discussion's evaluator is woken once, after a wait.
+      for (const card of yield* store.cards(board.id)) {
+        const waiting =
+          card.stage === "todo" &&
+          card.settledAt === null &&
+          card.activeThreadId === null &&
+          kanbanEvaluatorStep(card);
+        if (!waiting) {
+          yield* Ref.update(stepWaits, (all) => {
+            if (!all.has(card.id)) return all;
+            const next = new Map(all);
+            next.delete(card.id);
+            return next;
+          });
+          continue;
+        }
+        const key = Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"));
+        const wait = (yield* Ref.get(stepWaits)).get(card.id);
+        if (wait === undefined || wait.key !== key) {
+          yield* Ref.update(stepWaits, (all) =>
+            new Map(all).set(card.id, { key, since: now, woken: false }),
+          );
+          continue;
+        }
+        const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
+        if (wait.woken || now - wait.since < limit) continue;
+        const minutes = Math.round((now - wait.since) / 60_000);
+        yield* cardDiscussionUnlocked(card.id).pipe(
+          Effect.flatMap((discussion) =>
+            toEvaluator(discussion, Briefs.evaluatorStepWaitingText(card, minutes), true),
+          ),
+          Effect.andThen(
+            Ref.update(stepWaits, (all) =>
+              new Map(all).set(card.id, { ...wait, woken: true }),
+            ),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban evaluator step wake failed", { cardId: card.id, cause }),
+          ),
+        );
+      }
+      // An owner message a running evaluator hasn't answered gets one reminder. An idle
+      // evaluator is covered by its turn-end nudge, so it isn't pinged here.
+      for (const discussion of yield* store.discussions(board.id)) {
+        if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
+        if (discussion.lastMessageAt === null) continue;
+        const idleMs = now - Date.parse(discussion.lastMessageAt);
+        if (idleMs < OWNER_WAIT_MS) continue;
+        if ((yield* Ref.get(ownerWaits)).get(discussion.id) === discussion.lastSeq) continue;
+        for (const participant of discussion.participants) {
+          const actor = participant.actor;
+          if (actor._tag !== "evaluator" || participant.owes !== "asked") continue;
+          const evaluatorId = actor.threadId;
+          const read = yield* Effect.result(threads.find(evaluatorId));
+          if (read._tag === "Failure" || read.success?.state !== "running") continue;
+          const minutes = Math.round(idleMs / 60_000);
+          const sent = yield* threads
+            .send({
+              threadId: evaluatorId,
+              text: Briefs.ownerWaitingText(discussion, minutes),
+            })
+            .pipe(
+              Effect.as(true),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("kanban owner message reminder failed", {
+                  threadId: evaluatorId,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            );
+          if (sent) {
+            yield* Ref.update(ownerWaits, (all) =>
+              new Map(all).set(discussion.id, discussion.lastSeq),
+            );
+          }
         }
       }
       // Typing heartbeat.

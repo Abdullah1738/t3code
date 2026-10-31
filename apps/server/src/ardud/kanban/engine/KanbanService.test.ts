@@ -1830,6 +1830,185 @@ it.effect("a long evaluator turn is asked for a status at 45 minutes, then hourl
   }),
 );
 
+// The wake starts or steers the discussion's evaluator, a thread the fake assigns, so count across all threads.
+const stepWaitsTo = (fake: Effect.Success<typeof makeFake>) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map((all) =>
+      [...all.values()]
+        .flatMap((thread) => thread.messages)
+        .filter((text) => text.includes("has waited")).length,
+    ),
+  );
+
+const ownerWaitsTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map(
+      (all) =>
+        all
+          .get(threadId)!
+          .messages.filter((text) => text.includes("has no reply yet"))
+          .length,
+    ),
+  );
+
+it.effect("a todo card waiting on its evaluator's packet wakes the card's evaluator once, after 15 minutes at P1", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 1,
+          subtasks: [
+            { step: 1, owner: "evaluator", text: "Packet" },
+            { step: 2, owner: "work", text: "Build" },
+          ],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval") },
+      );
+      // The first tick starts the wait clock.
+      yield* kanban.tick;
+      yield* TestClock.adjust("14 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a P3 card waits an hour before the wake", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 3,
+          subtasks: [
+            { step: 1, owner: "evaluator", text: "Packet" },
+            { step: 2, owner: "work", text: "Build" },
+          ],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval-p3") },
+      );
+      yield* kanban.tick;
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("45 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card whose evaluator step changes starts its own clock", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 1,
+          subtasks: [
+            { step: 1, owner: "evaluator", text: "Packet" },
+            { step: 2, owner: "work", text: "Build" },
+          ],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval-change") },
+      );
+      yield* kanban.tick;
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.tick;
+      // A new evaluator subtask changes the key: the clock restarts at this tick.
+      yield* kanban.editCard(
+        card.id,
+        {
+          subtasks: [
+            { step: 1, owner: "evaluator", text: "Packet" },
+            { step: 1, owner: "evaluator", text: "Second packet" },
+            { step: 2, owner: "work", text: "Build" },
+          ],
+        },
+        owner,
+      );
+      yield* TestClock.adjust("10 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an owner message a running evaluator hasn't answered gets one reminder after 15 minutes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Talk", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Please answer" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      assert.isNotNull(evaluator);
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("14 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 0);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+      yield* kanban.tick;
+      yield* TestClock.adjust("30 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+      // The evaluator answers; the owner writes again: a fresh 15 minutes, one more reminder.
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "On it" },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Still waiting" }]);
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 2);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an idle evaluator gets no tick reminder", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Idle talk", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Hello?" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, false, "2026-10-25T13:00:00.000Z");
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("an evaluator that is not running gets no status ask", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
