@@ -8,6 +8,8 @@ the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at
   CARD_READY trip=<uuid> rider=<who>[(assumed)] missing=<recipients>   driver assigned ~60s, card not yet sent to everyone
   CANCELED trip=<uuid> rider=<who>[(assumed)]                          a shared ride was cancelled and not rebooked within 180s
   FAILED trip=<uuid> rider=<who>[(assumed)] result=<STATUS>            a shared ride ended UNFULFILLED/FAILED
+  CANCEL_FEE trip=<uuid> rider=<who> fee=<amount> refunded=<yes|no>   a shared ride cancelled with a fee on
+                                                                       its receipt (read once; printed even if rebooked)
 
 Completion is quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
 a trip that disappears without a terminal history status shows "Checking" and is retried for
@@ -27,7 +29,7 @@ Env overrides (all optional):
   UBER_BIN           uber binary
   RIDE_SHARE_NOW     epoch seconds to use as "now" (tests only)
 """
-import json, os, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -127,6 +129,21 @@ def card_shared(uuid, t=None):
 
 def q(v):
     return json.dumps(v if v is None else str(v), ensure_ascii=False)
+
+
+def cancel_fee(uuid):
+    """(fee text, refunded) from a cancelled trip's receipt, or None. Any failed read is skipped."""
+    try:
+        r = uber("trips", "receipt", uuid)
+        text = str((r.get("result") or {}).get("text") or "") if r.get("ok") else ""
+    except Exception as e:
+        print(f"ride-share: receipt {uuid} failed: {e!r}"[:300], file=sys.stderr)
+        return None
+    m = re.search(r"Cancellation Fee\s+([A-Z]{3}\s?[\d.,]+)", text)
+    if not m:
+        return None
+    refunded = bool(re.search(r"^Refund\b", text, re.M)) or "New Total\tAED 0.00" in text
+    return m.group(1), refunded
 
 
 def recently_requested(trips, rider, now, exclude):
@@ -275,6 +292,12 @@ def main():
                 continue  # nothing was shared: nothing to correct
             rider, _, label = who(uuid)
             if rc.TERMINAL[status] == "cancelled":
+                if not t.get("fee_checked"):  # before the rebook skip: a rebook must not hide the fee
+                    t["fee_checked"] = now
+                    fee = cancel_fee(uuid)
+                    if fee:
+                        out.append(f"CANCEL_FEE trip={uuid} rider={label} fee={fee[0]} "
+                                   f"refunded={'yes' if fee[1] else 'no'}")
                 if recently_requested(trips, rider, now, uuid):
                     continue  # already rebooked: the new card says it all
                 pending[uuid] = {"since": now, "rider": rider, "label": label}
