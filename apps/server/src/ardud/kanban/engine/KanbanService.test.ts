@@ -66,6 +66,15 @@ const makeFake = Effect.gen(function* () {
   const interrupted: Array<string> = [];
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   const failures = new Map<string, OrchestrationV2ProviderFailure>();
+  // One run id per stored failure object (the same run reports the same id).
+  const runIds = new WeakMap<object, string>();
+  let nextRun = 0;
+  const failureOf = (threadId: string) => {
+    const failure = failures.get(threadId);
+    if (!failure) return null;
+    if (!runIds.has(failure)) runIds.set(failure, `run-${(nextRun += 1)}`);
+    return { ...failure, runId: runIds.get(failure)! };
+  };
   const sends: Array<{ threadId: string; model: ModelSelection | undefined }> = [];
   const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
   // Threads whose sends are refused, to test a wake that doesn't land.
@@ -149,7 +158,8 @@ const makeFake = Effect.gen(function* () {
         ),
       setModel: (threadId, model) =>
         Effect.sync(() => void modelSwitches.push({ threadId, model })),
-      lastFailure: (threadId) => Effect.succeed(failures.get(threadId) ?? null),
+      // Each stored failure is one executed run; a repeat notification of it reports the same runId.
+      lastFailure: (threadId) => Effect.succeed(failureOf(threadId)),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
