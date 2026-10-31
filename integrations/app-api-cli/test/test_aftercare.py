@@ -17,7 +17,7 @@ import order_tracker as t
 
 SESSION = 'ardud-control:thread:test'
 ADD = ['add', '--app', 'noon', '--order', 'NAEIA0072787151', '--for', 'moni',
-       '--item', 'TONEOF 173cm phone stand', '--amount', 'AED 79', '--refund-to', 'card 5542',
+       '--item', 'TONEOF 173cm phone stand', '--amount', 'AED 79', '--refund-to', 'card 2342',
        '--blocker', 'pickup dates only ran to 25 Oct', '--next-at', '2026-10-24T09:00:00+04:00',
        '--constraint', 'pickup on or after 27 Oct', '--deadline', '2026-11-06']
 CID = 'aftercare-noon-naeia0072787151-return'
@@ -109,7 +109,7 @@ class AftercareTest(unittest.TestCase):
         self.assertIsNone(spec['expires_at'], 'an open case keeps its wake until close or drop')
         context = spec['context']
         for phrase in ('Never place, cancel or change an order', 'close the case with that reference',
-                       'Banyantree Flat 2104', 'pickup on or after 27 Oct', 'refund to card 5542',
+                       'Banyantree Flat 2104', 'pickup on or after 27 Oct', 'refund to card 2342',
                        f'--key {CID}-g1-closed', 'Never via imsg', 'Never say it is booked or refunded'):
             self.assertIn(phrase, context)
         self.assertEqual(oct_mode(self.tmp / 'aftercare' / f'{CID}.json'), 0o600)

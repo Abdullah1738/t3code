@@ -97,7 +97,7 @@ class MinutesMultiBasketTests(unittest.TestCase):
         return data
 
     def card_wire(self):
-        return {'data': [{'id': 'synthetic-payment-token', 'ccMasked': 'xxxx 5542',
+        return {'data': [{'id': 'synthetic-payment-token', 'ccMasked': 'xxxx 2342',
                           'ccType': 'mastercard', 'isDefault': True, 'isDeleted': False}]}
 
     def test_items_alias_matches_skus_scope(self):

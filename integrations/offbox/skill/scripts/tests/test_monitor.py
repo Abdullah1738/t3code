@@ -48,6 +48,35 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(groups["ses_real"]["rss"], 3072)
         self.assertEqual(groups["ses_real"]["cpu"], 41)
 
+    def test_app_launched_from_agent_shell_is_not_that_agents_work(self):
+        # Robob reopened by an installer run from an agent thread: the app, its server and a
+        # terminal it started all carry the thread's session id. A real agent shell
+        # (opencode-service child) with the same id stays attributed.
+        app = " XPC_SERVICE_NAME=application.com.ardud.robob.1.2 OPENCODE_SESSION_ID=ses_stale PWD=/repo"
+        plain = ("20001 1 5.0 4096 /Applications/Robob.app/Contents/MacOS/Robob\n"
+                 "20002 20001 95.0 2000000 /Applications/Robob.app/Contents/MacOS/Robob --require server.mjs\n"
+                 "20003 20001 95.0 2000000 go test ./...\n"
+                 "20004 1 0.0 100 /bin/zsh\n"
+                 "20005 20004 95.0 2000000 go test ./...\n")
+        raw = ("20001 1 5.0 4096 /Applications/Robob.app/Contents/MacOS/Robob" + app + "\n"
+               "20002 20001 95.0 2000000 /Applications/Robob.app/Contents/MacOS/Robob --require server.mjs" + app + "\n"
+               "20003 20001 95.0 2000000 go test ./..." + app + "\n"
+               "20004 1 0.0 100 /bin/zsh XPC_SERVICE_NAME=com.ardud.opencode-service OPENCODE_SESSION_ID=ses_stale PWD=/repo\n"
+               "20005 20004 95.0 2000000 go test ./...\n")
+        previous, groups = {}, {}
+        with patch.object(sample, "run", return_value="n/repo\n"):
+            for now in range(1000, 1100, 10):
+                groups, previous, _ = sample.sample_processes(previous, now, raw, plain)
+        self.assertEqual(set(groups), {"ses_stale"})
+        self.assertEqual(groups["ses_stale"]["pids"], [20005])
+        # Without the agent's own shell, nothing is attributed at all.
+        plain, raw = "".join(plain.splitlines(True)[:3]), "".join(raw.splitlines(True)[:3])
+        previous = {}
+        with patch.object(sample, "run", return_value="n/repo\n"):
+            for now in range(1000, 1100, 10):
+                groups, previous, _ = sample.sample_processes(previous, now, raw, plain)
+        self.assertEqual(groups, {})
+
     def test_high_cpu_requires_continuity(self):
         plain = "10001 1 51.0 2048 python crunch.py\n"
         raw = plain.rstrip() + " OPENCODE_SESSION_ID=ses_cpu PWD=/repo\n"
@@ -199,7 +228,11 @@ class MonitorTests(unittest.TestCase):
             fake.write_text("#!/bin/zsh\nprint -r -- fake-real-docker \"$@\"\n")
             fake.chmod(0o755)
             shim = Path(monitor.__file__).parent / "blockers/docker"
-            env = dict(os.environ, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
+            # The shim only enforces when offbox is installed (~/.local/bin/offbox); give it a home that has one.
+            (root / ".local/bin").mkdir(parents=True)
+            (root / ".local/bin/offbox").write_text("#!/bin/sh\n")
+            (root / ".local/bin/offbox").chmod(0o755)
+            env = dict(os.environ, HOME=directory, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
                        OPENCODE_SESSION_ID="ses_test", OFFBOX_STATE_DIR=directory, OFFBOX_GATE_MODE="enforce")
             for expiry, expected in (("2030-01-01T00:00:00Z", 0), ("2000-01-01T00:00:00Z", 3)):
                 (root / "exemptions.json").write_text(json.dumps([{"session_id": "ses_test", "expires_at": expiry}]))

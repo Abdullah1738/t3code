@@ -131,11 +131,14 @@ exit 0
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 8, self.calls_log())
+        self.assertEqual(len(loads), 10, self.calls_log())
         for rel in (".local/share/juno-proxy/juno_proxy.py", ".local/bin/power-unplug-telegram.sh",
-                    ".local/bin/battery-low-telegram.sh"):
+                    ".local/bin/battery-low-telegram.sh", ".local/share/lydia-ticks/server.ts",
+                    ".local/share/lydia-ticks/tunnel.sh"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/power-unplug-telegram.sh"), os.X_OK))
+        self.assertEqual(stat.S_IMODE(os.stat(self.live(".local/share/lydia-ticks/server.ts")).st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(os.stat(self.live(".local/share/lydia-ticks/tunnel.sh")).st_mode), 0o700)
         self.assertIn("no Uber CLI under ~/.nvm", err)
         self.assertIn("installed", out)
         rc, _, err = self.run_install("--check")
@@ -216,6 +219,42 @@ exit 0
         self.assertIn("restarted com.abdullah.juno-proxy", out)
         rc, _, err = self.run_install("--check")
         self.assertEqual(rc, 0, err)
+
+    def test_new_lydia_server_code_restarts_the_server_only(self):
+        self.ready()
+        self.run_install()
+        os.remove(self.calls)
+        with open(self.live(".local/share/lydia-ticks/server.ts"), "a") as fh:
+            fh.write("\n// drift\n")
+        rc, out, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        uid = os.getuid()
+        self.assertEqual([c for c in self.calls_log() if c.startswith(("kickstart", "bootstrap", "bootout"))],
+                         [f"kickstart -k gui/{uid}/com.ardud.lydia-ticks-server"])
+        self.assertIn("restarted com.ardud.lydia-ticks-server", out)
+        rc, _, err = self.run_install("--check")
+        self.assertEqual(rc, 0, err)
+
+    def test_lydia_live_state_is_never_touched(self):
+        self.ready()
+        state = {"ticks.db": b"SQLite format 3\x00 ticks", "history-token": b"secret-token\n",
+                 "tunnel.json": b'{"TunnelID": "abc"}\n'}
+        live_dir = self.live(".local/share/lydia-ticks")
+        os.makedirs(live_dir)
+        for name, data in state.items():
+            with open(os.path.join(live_dir, name), "wb") as fh:
+                fh.write(data)
+            os.chmod(os.path.join(live_dir, name), 0o600)
+        before = {n: (open(os.path.join(live_dir, n), "rb").read(),
+                      stat.S_IMODE(os.stat(os.path.join(live_dir, n)).st_mode)) for n in state}
+        for _ in range(2):
+            rc, _, err = self.run_install()
+            self.assertEqual(rc, 0, err)
+        for name, (data, mode) in before.items():
+            path = os.path.join(live_dir, name)
+            self.assertEqual(open(path, "rb").read(), data, name)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), mode, name)
+        self.assertFalse([f for f in os.listdir(live_dir) if ".bak-" in f])
 
     def test_failed_proxy_restart_is_reported_by_check_and_redone(self):
         self.run_install()
@@ -310,7 +349,8 @@ exit 0
             self.assertTrue(os.path.isdir(d), d)
         self.assertEqual(sorted(os.listdir(self.loaded)),
                          ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.cards-health",
-                          "com.ardud.cards-tunnel", "com.ardud.power-unplug-telegram",
+                          "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
+                          "com.ardud.lydia-ticks-tunnel", "com.ardud.power-unplug-telegram",
                           "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
     def test_modes_are_checked_and_repaired_on_their_own(self):

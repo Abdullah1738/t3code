@@ -11,7 +11,7 @@ def native_session(*, sections=True):
     # Fields: HBC 4895765-4895775, 4893890-4893894.
     cards = [
         {'id': 'fixture-unselected-id', 'mask': '****0000', 'type': 'visa', 'isSelected': False},
-        {'id': 'fixture-selected-id', 'mask': '****5542', 'type': 'mastercard', 'isSelected': True},
+        {'id': 'fixture-selected-id', 'mask': '****2342', 'type': 'mastercard', 'isSelected': True},
     ]
     method = {'code': 'cc_noonpay', 'status': 'active'}
     if sections:
@@ -33,7 +33,7 @@ class SelectedCardTests(unittest.TestCase):
             before = deepcopy(session)
             card = c.extract_selected_card(session)
             self.assertEqual((card.token, card.mask, card.network, card.payment_method, card.is_selected),
-                             ('fixture-selected-id', '****5542', 'mastercard', 'cc_noonpay', True))
+                             ('fixture-selected-id', '****2342', 'mastercard', 'cc_noonpay', True))
             self.assertEqual(session, before)
             self.assertNotIn(card.token, repr(card))
             self.assertNotIn(card.mask, repr(card))
@@ -49,7 +49,7 @@ class SelectedCardTests(unittest.TestCase):
         self.fails(session, 'SCHEMA_CARD_SECTIONS')
 
     def test_flat_echo_and_saved_card_aliases_are_not_native_evidence(self):
-        self.fails({'paymentMethod': 'cc', 'cardToken': 'fake', 'cardMask': '****5542'},
+        self.fails({'paymentMethod': 'cc', 'cardToken': 'fake', 'cardMask': '****2342'},
                    'SCHEMA_PAYMENT_METHODS_V2')
         session = native_session(sections=False)
         card = session['paymentMethodsV2']['methods'][1]['cards'][1]
@@ -82,6 +82,30 @@ class SelectedCardTests(unittest.TestCase):
         sections[2]['cards'][0]['isSelected'] = False
         sections[3]['cards'][0]['isSelected'] = False
         self.fails(session, 'SELECTED_CARD_AMBIGUOUS_OR_MISSING')
+
+    def test_int_selected_card_id_becomes_decimal_token(self):
+        for sections in (True, False):
+            with self.subTest(sections=sections):
+                session = native_session(sections=sections)
+                for method in session['paymentMethodsV2']['methods']:
+                    for card in method.get('cards', []) or []:
+                        if card.get('isSelected'):
+                            card['id'] = 1234567890
+                    for section in method.get('cardSections', []) or []:
+                        for card in section.get('cards') or []:
+                            if card.get('isSelected'):
+                                card['id'] = 1234567890
+                self.assertEqual(c.extract_selected_card(session).token, '1234567890')
+                session_true = native_session(sections=sections)
+                for method in session_true['paymentMethodsV2']['methods']:
+                    for card in method.get('cards', []) or []:
+                        if card.get('isSelected'):
+                            card['id'] = True
+                    for section in method.get('cardSections', []) or []:
+                        for card in section.get('cards') or []:
+                            if card.get('isSelected'):
+                                card['id'] = True
+                self.fails(session_true, 'SCHEMA_CARD_ID')
 
     def test_wrong_selection_types_and_missing_identity(self):
         for flag in ('false', 1, None, [], {}):

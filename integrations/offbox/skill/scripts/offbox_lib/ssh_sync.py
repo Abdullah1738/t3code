@@ -124,6 +124,30 @@ def close_master(box_id: str) -> None:
         subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=10)
 
 
+DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)
+
+
+def dead_mount(text: str) -> str | None:
+    m = DEAD_MOUNT.search(text or "")
+    return m.group(0) if m else None
+
+
+def probe_home(box_id: str, timeout: float = 45) -> str | None:
+    """The matched dead-mount error when $HOME on the box can't be written, else None (also None when the probe
+    can't tell: the sync still catches it). Creates nothing outside .offbox, so a --no-sync run still sees a
+    missing remote dir."""
+    try:
+        p = ssh(box_id, 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && : > "$p" && rm -f -- "$p" '
+                        '&& echo OFFBOX_PROBE_OK', timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"probe {box_id} inconclusive ({type(e).__name__})")
+        return None
+    text = (p.stdout + p.stderr).decode(errors="replace")
+    if p.returncode == 0 and "OFFBOX_PROBE_OK" in text:
+        return None
+    return dead_mount(text)
+
+
 def _gitinfo_exclude(root: Path) -> list[str]:
     """info/exclude lives in the COMMON git dir. In a linked worktree root/.git is a file, so ask git."""
     cands = [root / ".git" / "info" / "exclude"]
@@ -149,6 +173,9 @@ def _soft_partial(stderr: str) -> list[str] | None:
         ln = ln.strip()
         if not ln or ln.startswith("rsync error: some files/attrs were not transferred"):
             continue
+        # [generator]/[receiver] errors come from the box side (a root-owned dir there, say): never a local skip.
+        if ln.startswith(("rsync: [generator]", "rsync: [receiver]")):
+            return None
         m = re.search(r'(?:failed to open|file has vanished:) "([^"]+)"', ln)
         if m and ("Permission denied" in ln or "vanished" in ln):
             bad.append(m.group(1))
@@ -158,6 +185,56 @@ def _soft_partial(stderr: str) -> list[str] | None:
             continue
         return None
     return bad or None
+
+
+def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
+    """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
+    tops: list[str] = []
+    for inc in includes or []:
+        parts = inc.strip("/").split("/")
+        for i in range(1, len(parts)):
+            anc = "/".join(parts[:i])
+            try:
+                p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
+                                   capture_output=True, timeout=10)
+            except Exception:  # noqa: BLE001 - no git: keep today's rules
+                return tops
+            if p.returncode == 0:
+                if anc not in tops:
+                    tops.append(anc)
+                break
+    return tops
+
+
+# rsync couldn't remove or replace a file on the box (root-owned, e.g. a container's cache inside the checkout).
+RECEIVER_DENIED = re.compile(r"^rsync: \[(?:generator|receiver)\] .*Permission denied \(13\)$", re.I)
+QUOTED_PATH = re.compile(r'"([^"]+)"|\(([^)]+)\)')
+
+
+def _receiver_denied(stderr: str) -> list[str] | None:
+    """rsync 23 caused only by Permission denied on the box's side: those paths, else None."""
+    bad = []
+    for ln in stderr.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("rsync error: some files/attrs were not transferred"):
+            continue
+        if not RECEIVER_DENIED.match(ln):
+            return None
+        m = QUOTED_PATH.search(ln)
+        bad.append((m.group(1) or m.group(2)) if m else ln)
+    return bad or None
+
+
+def _reclaim(box_id: str, remote_dir: str) -> bool:
+    """Give the box user back every file in the remote checkout (sudo chown -R). True when it worked."""
+    if not remote_dir or remote_dir.strip("/") in ("", ".") or ".." in remote_dir.split("/"):
+        return False
+    q = shlex.quote(remote_dir)
+    try:
+        p = ssh(box_id, f'cd "$HOME" && test -d {q} && sudo -n chown -R "$(id -u):$(id -g)" -- {q}', timeout=300)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return p.returncode == 0
 
 
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
@@ -171,6 +248,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             f.append("--filter=+ /" + "/".join(parts[:i]) + "/")
         f.append(f"--filter=+ /{inc}")
         f.append(f"--filter=+ /{inc}/**")
+    # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
+    # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
+    # Protect the rest of that dir on the box; the included path itself still mirrors.
+    for top in _ignored_include_tops(root, includes):
+        f.append(f"--filter=P /{top}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
     for x in SECRET_EXCLUDES:
@@ -244,7 +326,8 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
                f"{gitdir}/", f"{box_id}:{staging}/"]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
-            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode})")
+            # Keep rsync's stderr: a dead mount reported here must still classify as dead-mount.
+            raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
         ssh(box_id, f"rm -rf -- {qdest} && mv -- {qstage} {qdest}", check=True)
         return _stats(p.stdout)
     finally:
@@ -261,6 +344,17 @@ def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeou
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode == 23 and (denied := _receiver_denied(p.stderr)):
+        import sys
+        shown = ", ".join(denied[:3]) + (f" (+{len(denied) - 3} more)" if len(denied) > 3 else "")
+        if not _reclaim(box_id, remote_dir):
+            raise OffboxError(f"rsync to {box_id} failed (23): files on the box aren't writable ({shown}) and "
+                              f"sudo chown failed. Nothing ran. Fix: offbox ssh {box_id} -- sudo chown -R user:user "
+                              f"{remote_dir}")
+        print(f"offbox: warning: {len(denied)} root-owned path(s) on the box blocked the sync ({shown}); "
+              f"gave them back to the box user (sudo chown) and synced again", file=sys.stderr)
+        log(f"push_reclaim {box_id} {remote_dir} paths={len(denied)} first={denied[0]}")
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     st = _stats(p.stdout)
     if p.returncode == 23 and (skipped := _soft_partial(p.stderr)):
         # Unreadable/vanished local files (e.g. a chmod 000 scratch file in tmp/) must not fail the run.

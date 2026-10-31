@@ -6,7 +6,7 @@ import hashlib
 import time
 
 from . import capacity
-from .common import EXIT_BUSY, EXIT_INFRA, SIZES, OffboxError, db, file_lock, now, say
+from .common import DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, now, say
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
@@ -43,28 +43,44 @@ def lock_name(key: str) -> str:
     return "pool-" + hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
+TOO_BIG_LIKE = f"{TOO_BIG_NOTE}%"  # a box marked too big frees its pool slot and is never offered again
+DEAD_LIKE = f"{DEAD_MOUNT_NOTE}%"  # same for a box whose filesystem died
+
+
 def members(con, key):
-    return con.execute("""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
-        WHERE p.pool_key=? AND l.state IN ('running','stopped')
-        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key,)).fetchall()
+    return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
+        WHERE p.pool_key=? AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE ?
+        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE)).fetchall()
+
+
+def _source_member(con, key, source) -> bool:
+    return any((r["source"] or "").replace("recipe:", "template:", 1) == source for r in members(con, key))
+
+
+def _room(con, key) -> bool:
+    return len(members(con, key)) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
 
 
 def candidates(con, key, size, source, me=None):
     # Existing boxes count toward the cap once adopted; surplus legacy boxes are left intact.
     rows = con.execute("""SELECT l.*, p.pool_key FROM leases l LEFT JOIN pool_members p USING(box_id)
         WHERE l.repo_key=? AND l.state IN ('running','stopped')
+        AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE ?
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running'))
         AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)
-        ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""", (key, size)).fetchall()
-    cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
-    full = len(members(con, key)) >= cap
+        ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""",
+        (key, TOO_BIG_LIKE, DEAD_LIKE, size)).fetchall()
+    full = not _room(con, key)
     out = []
     for r in rows:
         if r["pool_key"] not in (None, key) or (full and r["pool_key"] is None):
             continue
-        if source and r["source"] != source:
+        # A box built from a template's recipe (the template had expired) serves that template's runs too.
+        if source and (r["source"] or "").replace("recipe:", "template:", 1) != source:
             continue
         out.append(r)
     # Running boxes first: the caller's own box (its checkout is already synced there), then the smallest that
@@ -126,6 +142,13 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                 _refresh_background(con, key)
                 next_refresh = time.monotonic() + 10
             rows, can_create = candidates(con, key, size, source, me)
+            if source and not rows and not can_create and not _source_member(con, key, source):
+                busy, cap, _ = queue_state(con, key, run_id)
+                raise OffboxError(
+                    f"this run needs a new {key} pool box ({source}), but the pool is full "
+                    f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
+                    "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
+                    "offbox list --all, then offbox release <id> --delete.", code=2)
             stopped_tries = 0
             stopped_error = None
             stopped_failed = False  # the last stopped box tried could not be used (error or gone)
@@ -167,6 +190,15 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         if row['state'] != 'running':
                             stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
                         say(f"skipping pool box {row['box_id']}: {e}")
+                        continue
+                    except lease.DiskTooBig as e:
+                        # Marked and left stopped: it no longer counts toward the pool. Not stopped_error, so a
+                        # still-full pool queues (exit 92) instead of failing with the resume error (exit 90).
+                        stopped_failed = True
+                        can_create = _room(con, key)
+                        say(f"skipping {row['box_id']}: its disk needs {e.need} GiB but '{e.size}' holds {e.holds} GiB. "
+                            f"It stays stopped with its disk and no longer counts toward the pool (remove it with: "
+                            f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
                         if row['state'] == 'running' or e.code != EXIT_INFRA:

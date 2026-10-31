@@ -325,6 +325,41 @@ class GoSwapTests(unittest.TestCase):
         self.assertIn('replacing mixed', result.stderr)
         self.assertFalse((self.fx.root / 'src/unsafe/other.go').exists())
 
+    def test_repair_reports_old_tree_state(self):
+        (self.fx.root / '.offbox-manifest').unlink()
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('old tree manifest=missing', result.stderr)
+        self.assertIn('old-release-files=no', result.stderr)
+        self.assertIn('version_written=', result.stderr)
+        self.assertIn('manifest_written=', result.stderr)
+
+        extra = tempfile.TemporaryDirectory()
+        self.addCleanup(extra.cleanup)
+        self.fx = RepairFixture(extra.name)
+        (self.fx.root / 'src/unsafe/extra.go').write_text('old')
+        self.fx.write_manifest(self.fx.root)
+        (self.fx.root / 'src/unsafe/extra.go').rename(self.fx.root / 'src/unsafe/other.go')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('old tree manifest=mismatch', result.stderr)
+
+        marks = tempfile.TemporaryDirectory()
+        self.addCleanup(marks.cleanup)
+        self.fx = RepairFixture(marks.name)
+        (self.fx.root / 'src/strconv').mkdir(parents=True, exist_ok=True)
+        (self.fx.root / 'src/strconv/ctoa.go').write_text('package strconv\n')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('old-release-files=yes', result.stderr)
+        self.assertIn('replacing mixed', result.stderr)
+        self.assertFalse((self.fx.root / 'src/strconv/ctoa.go').exists())
+
+    def test_healthy_tree_prints_no_old_tree_line(self):
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('old tree', result.stderr)
+
     def test_manifest_detects_changed_size_and_stray_symlink(self):
         for change in ('size', 'symlink'):
             with self.subTest(change=change):

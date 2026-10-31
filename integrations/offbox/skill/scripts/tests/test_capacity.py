@@ -13,7 +13,7 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, capacity, cli, common, fallback, lease, pool, reap, runs, spend
+from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
 
 
 class Isolated(unittest.TestCase):
@@ -25,6 +25,13 @@ class Isolated(unittest.TestCase):
         root = Path(self.tmp.name)
         for name in ('STATE','LOGS_DIR','LOCKS_DIR','SSH_DIR','CM_DIR'):
             self.stack.enter_context(patch.object(common, name, root/name))
+        # Modules that import these by name keep the real paths; point them at the fixture and the repo's templates.
+        for mod in (runs, misc):
+            self.stack.enter_context(patch.object(mod, 'LOGS_DIR', root/'LOGS_DIR'))
+        (root/'LOGS_DIR').mkdir(parents=True, exist_ok=True)
+        repo_templates = Path(__file__).resolve().parents[2] / 'templates'
+        for mod in (lease, bases):
+            self.stack.enter_context(patch.object(mod, 'TEMPLATES_DIR', repo_templates))
         self.stack.enter_context(patch.object(common, 'DB_PATH', root/'db.sqlite'))
         self.stack.enter_context(patch.object(common, 'LOG_PATH', root/'log'))
         self.stack.enter_context(patch.object(spend, 'CAP_PATH', root/'cap.json'))
@@ -332,6 +339,84 @@ class PoolTests(Isolated):
             got = lease._reuse(self.con,row,'large')
         self.assertEqual(resume.call_count, 2)
         self.assertEqual(got['size'], 'xlarge')
+
+    TOO_BIG = api.ApiError(409, 'resume_failed', "This Sandbox needs 113.6 GiB of disk but the largest 'large' "
+                           "machine holds 111.8 GiB. Resume or fork it as a bigger type (--type).")
+
+    def test_disk_too_big_resume_marks_lease(self):
+        self.box('a', 'stopped', size='large', member=True)
+        row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='a'").fetchone())
+        with patch.object(api,'get',return_value={'state':'archived','type':'large'}), \
+                patch.object(api,'resume',side_effect=[self.TOO_BIG]) as resume, patch.object(lease,'_bring_up'):
+            with self.assertRaises(lease.DiskTooBig):
+                lease._reuse(self.con,row,'large')
+        self.assertEqual(resume.call_count, 1)
+        note = self.con.execute("SELECT note FROM leases WHERE box_id='a'").fetchone()[0]
+        self.assertTrue(note.startswith('too-big:') and '113.6' in note)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE box_id='a' AND kind='lease_too_big'")
+                         .fetchone()[0], 1)
+
+    def test_pool_skips_too_big_box_and_creates_fresh(self):
+        self.box('a', 'stopped', size='large', member=True, used=500)
+        self.box('b', member=True)
+        self.busy('b')
+        def fresh(me, size, template, base, fresh):
+            self.box('new', size='large', member=True)
+            return dict(self.con.execute("SELECT * FROM leases WHERE box_id='new'").fetchone())
+        with patch.object(api,'get',return_value={'state':'archived','type':'large'}), \
+                patch.object(api,'resume',side_effect=[self.TOO_BIG]) as resume, patch.object(lease,'_bring_up'), \
+                patch.object(lease,'acquire_private',side_effect=fresh) as new, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            row = pool.acquire(self.me)
+            pool.release_guard(row)
+        self.assertEqual(row['box_id'], 'new')
+        self.assertIn('skipping a', err.getvalue())
+        self.assertIn('fresh lease', err.getvalue())
+        new.assert_called_once()
+        # The marked box is never offered again: a second acquire never even tries to reuse it.
+        tried = []
+        def reuse(c, r, s, **kw):
+            tried.append(r['box_id'])
+            return dict(r)
+        with patch.object(lease,'_reuse',side_effect=reuse), contextlib.redirect_stderr(io.StringIO()):
+            row2 = pool.acquire(self.me)
+            pool.release_guard(row2)
+        self.assertNotIn('a', tried)
+
+    def test_too_big_skip_with_full_pool_queues_not_exit_90(self):
+        # Pool cap is 2 (Isolated). a is too big; b and c are busy members, so once a stops counting the pool is full.
+        self.box('a', 'stopped', size='large', member=True, used=500)
+        self.box('b', member=True); self.busy('b')
+        self.box('c', member=True); self.busy('c')
+        with patch.object(api,'get',return_value={'state':'archived','type':'large'}), \
+                patch.object(api,'resume',side_effect=[self.TOO_BIG]), patch.object(lease,'_bring_up'), \
+                patch.object(lease,'acquire_private') as new, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(pool.PoolBusyError) as cm:
+                pool.acquire(self.me)
+        self.assertEqual(cm.exception.code, 92)
+        new.assert_not_called()
+
+    def test_shrink_fallback_beats_too_big(self):
+        self.box('s','stopped',size='xlarge')
+        row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='s'").fetchone())
+        with patch.object(api,'get',return_value={'state':'archived','type':'xlarge'}), \
+                patch.object(api,'resume',side_effect=[self.TOO_BIG,{}]) as resume, \
+                patch.object(lease,'_bring_up',return_value={'type':'xlarge'}), contextlib.redirect_stderr(io.StringIO()):
+            got = lease._reuse(self.con,row,'large')
+        self.assertEqual(resume.call_count, 2)
+        self.assertEqual(got['size'], 'xlarge')
+        self.assertIsNone(self.con.execute("SELECT note FROM leases WHERE box_id='s'").fetchone()[0])
+
+    def test_other_resume_errors_not_marked(self):
+        self.box('e','stopped',size='large')
+        row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='e'").fetchone())
+        busy = api.ApiError(409,'sandbox_busy','Agent resume already in progress')
+        with patch.object(api,'get',return_value={'state':'archived','type':'large'}), \
+                patch.object(api,'resume',side_effect=[busy]), patch.object(lease,'_bring_up'):
+            with self.assertRaises(common.OffboxError) as cm:
+                lease._reuse(self.con,row,'large')
+        self.assertNotIsInstance(cm.exception, lease.DiskTooBig)
+        self.assertIsNone(self.con.execute("SELECT note FROM leases WHERE box_id='e'").fetchone()[0])
 
     def test_docker_use_detected_from_command_or_repo_manifest(self):
         with tempfile.TemporaryDirectory() as d:

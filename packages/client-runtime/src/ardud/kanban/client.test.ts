@@ -458,3 +458,274 @@ describe("createKanbanClient", () => {
     await plain;
   });
 });
+
+describe("discussion preview loader", () => {
+  // The grace the feed keeps after its last reader leaves (the store keepalive).
+  const KEEP_ALIVE = { keepAliveMs: 120_000 };
+  const previewDiscussion = (
+    id: string,
+    lastSeq: number,
+    boardId = "board-toy",
+  ): KanbanDiscussion => ({ ...discussion(lastSeq, 0), id, boardId, lastSeq }) as never;
+  const previewMessage = (discussionId: string, seq: number): KanbanMessage =>
+    ({ ...message(seq), discussionId }) as never;
+  const previewChange = (id: string, lastSeq: number): KanbanWatchEvent =>
+    ({
+      _tag: "change",
+      change: { _tag: "discussion", discussion: previewDiscussion(id, lastSeq) },
+    }) as never;
+  const messageReads = (fake: ReturnType<typeof fakeTransport>, discussionId?: string) =>
+    fake.pending.filter(
+      (entry) =>
+        entry.tag === "kanban.messages" &&
+        (discussionId === undefined ||
+          (entry.input as { discussionId: string }).discussionId === discussionId),
+    );
+
+  /** Opens a board with `count` seq=1 discussions and watches its previews. */
+  async function openWithDiscussions(count: number) {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport, KEEP_ALIVE);
+    const board = client.board("board-toy");
+    const stopBoard = board.subscribe(() => {});
+    const stopPreviews = client.watchPreviews("board-toy");
+    fake.push(snapshotEvent(0));
+    fake
+      .take("kanban.discussions")
+      .resolve(Array.from({ length: count }, (_, i) => previewDiscussion(`disc-${i}`, 1)));
+    await settle();
+    return { fake, client, board, stopBoard, stopPreviews };
+  }
+
+  it("preview loader bounds in-flight reads at 40 while eventually loading every preview", async () => {
+    const { fake, board, stopBoard, stopPreviews } = await openWithDiscussions(100);
+    expect(messageReads(fake)).toHaveLength(40);
+
+    let answered = 0;
+    while (messageReads(fake).length > 0) {
+      expect(messageReads(fake).length).toBeLessThanOrEqual(40);
+      const next = messageReads(fake)[0]!;
+      const input = next.input as { discussionId: string; afterSeq: number };
+      fake.pending.splice(fake.pending.indexOf(next), 1);
+      next.resolve([previewMessage(input.discussionId, input.afterSeq + 1)]);
+      answered += 1;
+      await settle();
+    }
+    expect(answered).toBe(100);
+    expect(board.get()?.lastMessages.size).toBe(100);
+    stopPreviews();
+    stopBoard();
+  });
+
+  it("stops watching previews and keeps the ones already received", async () => {
+    const { fake, board, stopBoard, stopPreviews } = await openWithDiscussions(100);
+    stopPreviews();
+    for (const entry of fake.pending.splice(0)) {
+      entry.resolve([previewMessage((entry.input as { discussionId: string }).discussionId, 1)]);
+    }
+    await settle();
+    expect(fake.pending).toHaveLength(0);
+    expect(board.get()?.lastMessages.size).toBe(40);
+    stopBoard();
+  });
+
+  it("releases the slot on an empty response and does not refetch the same seq", async () => {
+    const { fake, stopBoard, stopPreviews } = await openWithDiscussions(41);
+    fake.take("kanban.messages").resolve([]);
+    await settle();
+    expect(messageReads(fake)).toHaveLength(40);
+    expect(messageReads(fake, "disc-0")).toHaveLength(0);
+    stopPreviews();
+    stopBoard();
+  });
+
+  it("waits for the next state change before retrying a failed preview", async () => {
+    const { fake, stopBoard, stopPreviews } = await openWithDiscussions(1);
+    fake.take("kanban.messages").reject(new Error("offline"));
+    await settle();
+    expect(fake.pending).toHaveLength(0);
+    fake.push(previewChange("disc-0", 1));
+    await settle();
+    expect(messageReads(fake, "disc-0")).toHaveLength(1);
+    stopPreviews();
+    stopBoard();
+  });
+
+  it("does not double-book a pending preview when its seq advances", async () => {
+    const { fake, stopBoard, stopPreviews } = await openWithDiscussions(1);
+    const first = fake.take("kanban.messages");
+    fake.push(previewChange("disc-0", 2));
+    await settle();
+    expect(fake.pending).toHaveLength(0);
+    first.resolve([previewMessage("disc-0", 1)]);
+    await settle();
+    const reads = messageReads(fake, "disc-0");
+    expect(reads).toHaveLength(1);
+    expect((reads[0]!.input as { afterSeq: number }).afterSeq).toBe(1);
+    stopPreviews();
+    stopBoard();
+  });
+
+  it("ignores a late reply from an obsolete feed", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fake, client, board, stopBoard, stopPreviews } = await openWithDiscussions(1);
+      const stale = fake.take("kanban.messages");
+      stopPreviews();
+      stopBoard();
+      vi.advanceTimersByTime(120_000);
+
+      const stopBoardAgain = client.board("board-toy").subscribe(() => {});
+      const stopPreviewsAgain = client.watchPreviews("board-toy");
+      fake.push(snapshotEvent(0));
+      fake.take("kanban.discussions").resolve([previewDiscussion("disc-0", 1)]);
+      await settle();
+
+      stale.resolve([previewMessage("disc-0", 100)]);
+      await settle();
+      expect(board.get()?.lastMessages.size ?? 0).toBe(0);
+
+      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      await settle();
+      expect(board.get()?.lastMessages.get("disc-0")?.seq).toBe(1);
+      stopPreviewsAgain();
+      stopBoardAgain();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reloads previews after the keepalive expires and the board is reopened", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fake, client, board, stopBoard, stopPreviews } = await openWithDiscussions(1);
+      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      await settle();
+      stopPreviews();
+      stopBoard();
+      vi.advanceTimersByTime(120_000);
+
+      const stopBoardAgain = client.board("board-toy").subscribe(() => {});
+      const stopPreviewsAgain = client.watchPreviews("board-toy");
+      fake.push(snapshotEvent(0));
+      fake.take("kanban.discussions").resolve([previewDiscussion("disc-0", 1)]);
+      await settle();
+      expect(messageReads(fake, "disc-0")).toHaveLength(1);
+      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      await settle();
+      expect(board.get()?.lastMessages.size).toBe(1);
+      stopPreviewsAgain();
+      stopBoardAgain();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reopening before the keepalive expires shares the feed and keeps the preview", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fake, client, board, stopBoard, stopPreviews } = await openWithDiscussions(1);
+      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      await settle();
+      stopPreviews();
+      stopBoard();
+      vi.advanceTimersByTime(5_000);
+
+      const stopBoardAgain = client.board("board-toy").subscribe(() => {});
+      const stopPreviewsAgain = client.watchPreviews("board-toy");
+      await settle();
+      expect(fake.streams()).toBe(1);
+      expect(fake.pending).toHaveLength(0);
+      expect(board.get()?.lastMessages.size).toBe(1);
+      stopPreviewsAgain();
+      stopBoardAgain();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a reconnect on the same feed keeps a completed preview", async () => {
+    const { fake, board, stopBoard, stopPreviews } = await openWithDiscussions(1);
+    fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+    await settle();
+    fake.push(snapshotEvent(0));
+    fake.take("kanban.discussions").resolve([previewDiscussion("disc-0", 1)]);
+    await settle();
+    expect(fake.pending).toHaveLength(0);
+    expect(board.get()?.lastMessages.size).toBe(1);
+    stopPreviews();
+    stopBoard();
+  });
+
+  it("bounds each board's previews at 40 independently", async () => {
+    // One stream per board, so each feed gets its own snapshot.
+    const streams = new Map<string, (event: KanbanWatchEvent) => void>();
+    const pending: Pending[] = [];
+    const transport: KanbanTransport = {
+      permission: () => Atom.make(() => true),
+      stream(tag, input, onValue) {
+        if (tag === "kanban.boards") return () => {};
+        const boardId = (input as { boardId: string }).boardId;
+        streams.set(boardId, onValue as (event: KanbanWatchEvent) => void);
+        return () => {
+          streams.delete(boardId);
+        };
+      },
+      request(tag, input) {
+        return new Promise((resolve, reject) => {
+          pending.push({ tag, input, resolve, reject } as Pending);
+        }) as never;
+      },
+    };
+    const client = createKanbanClient(transport, KEEP_ALIVE);
+    const takeFor = (tag: string, boardId: string) => {
+      const index = pending.findIndex(
+        (entry) =>
+          entry.tag === tag &&
+          (entry.input as { discussionId?: string; boardId?: string }).boardId === boardId,
+      );
+      if (index < 0) throw new Error(`no pending ${tag} for ${boardId}`);
+      return pending.splice(index, 1)[0]!;
+    };
+    const readsFor = (boardId: string) =>
+      pending.filter(
+        (entry) =>
+          entry.tag === "kanban.messages" &&
+          (entry.input as { discussionId: string }).discussionId.startsWith(`${boardId}-`),
+      ).length;
+
+    const stopA = client.board("board-a").subscribe(() => {});
+    const previewsA = client.watchPreviews("board-a");
+    const stopB = client.board("board-b").subscribe(() => {});
+    const previewsB = client.watchPreviews("board-b");
+    for (const boardId of ["board-a", "board-b"]) {
+      streams.get(boardId)!({
+        _tag: "snapshot",
+        snapshot: {
+          board: { id: boardId },
+          cards: [],
+          goals: [],
+          pools: [],
+          groups: [],
+          threads: [],
+          unread: [],
+        },
+      } as never);
+    }
+    for (const boardId of ["board-a", "board-b"]) {
+      takeFor("kanban.discussions", boardId).resolve(
+        Array.from({ length: 100 }, (_, i) => previewDiscussion(`${boardId}-${i}`, 1, boardId)),
+      );
+    }
+    await settle();
+    expect(readsFor("board-a")).toBe(40);
+    expect(readsFor("board-b")).toBe(40);
+
+    // Closing board-a's preview watcher leaves board-b's count alone.
+    previewsA();
+    expect(readsFor("board-b")).toBe(40);
+    previewsB();
+    stopA();
+    stopB();
+  });
+});

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +14,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import cli, lease, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
+from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
+
+
+class GoStdGlitchMatcherTests(unittest.TestCase):
+
+    def test_go_std_glitch_matcher(self):
+        for line in ('internal/abi/abi.go:9:2: package unsafe is not in std (/usr/local/go/src/unsafe)',
+                     'package internal/fmtsort is not in std (/usr/local/go/src/internal/fmtsort)',
+                     'build constraints exclude all Go files in /usr/local/go/src/internal/syscall/execenv'):
+            with self.subTest(line=line):
+                self.assertIsNotNone(GO_STD_GLITCH.search(line))
+        for line in ('package risk-liquidation/internal/x is not in std '
+                     '(/usr/local/go/src/risk-liquidation/internal/x)', 'FAIL TestX'):
+            with self.subTest(line=line):
+                self.assertIsNone(GO_STD_GLITCH.search(line))
 
 
 def fake_start(self):
@@ -139,6 +155,40 @@ class CliStepTests(Isolated):
         self.assertEqual(rc, 1)
         self.assertEqual(lines[-2], 'offbox: offbox steps: 1 ok, 1 failed (step 2 rc=1)')
         self.assertEqual(lines[-1], 'offbox: remote exit 1')
+
+    def glitch_events(self):
+        return self.con.execute("SELECT box_id, detail FROM events WHERE kind='go_std_glitch'").fetchall()
+
+    def test_go_std_glitch_prints_hint_and_records_event(self):
+        log = 'internal/abi/abi.go:9:2: package unsafe is not in std (/usr/local/go/src/unsafe)\n'
+        rc, lines = self.run_cli(['go', 'test', './...'], 1, log)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any('not your code' in x for x in lines))
+        self.assertEqual(lines[-1], 'offbox: remote exit 1')
+        rows = self.glitch_events()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 'bx_fake')
+        self.assertIn('unknown', rows[0][1])
+
+    def test_go_std_glitch_reports_seconds_after_resume(self):
+        self.con.execute("INSERT INTO events VALUES (?,?,?,?)", (time.time() - 90, 'bx_fake', 'lease_resume', ''))
+        self.con.commit()
+        log = 'package internal/fmtsort is not in std (/usr/local/go/src/internal/fmtsort)\n'
+        rc, lines = self.run_cli(['go', 'test', './...'], 1, log)
+        self.assertEqual(rc, 1)
+        self.assertRegex(self.glitch_events()[0][1], r'\d+s after resume')
+
+    def test_no_glitch_hint_on_success_or_other_failures(self):
+        std_log = 'package unsafe is not in std (/usr/local/go/src/unsafe)\n'
+        rc, lines = self.run_cli(['go', 'vet', './...'], 0, std_log)
+        self.assertEqual(rc, 0)
+        self.assertFalse(any('not your code' in x for x in lines))
+        rc, lines = self.run_cli(['go', 'test', './...'], 1, '--- FAIL TestX\n')
+        self.assertFalse(any('not your code' in x for x in lines))
+        user_log = 'package risk-liquidation/internal/x is not in std (/usr/local/go/src/risk-liquidation/internal/x)\n'
+        rc, lines = self.run_cli(['go', 'test', './...'], 1, user_log)
+        self.assertFalse(any('not your code' in x for x in lines))
+        self.assertEqual(self.glitch_events(), [])
 
     def test_plain_cmd_still_has_no_step_summary(self):
         rc, lines = self.run_cli(['go', 'test', './...'], 0)

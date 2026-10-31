@@ -80,6 +80,11 @@ export type Watcher = {
   trip?: string;
   /** People other than the owner a fire may message. Nobody else hears from a fire (23 Oct: ETA flips reached a group 5-7 times). */
   relays?: Relay[];
+  /**
+   * Bridge chat slug (e.g. "moni") whose agent a fire wakes instead of the owner's. For watchers on someone else's
+   * data (her own WhatsApp on her offbox): the event never goes to the owner's chat; no plain-text fallback.
+   */
+  chat?: string;
   created_at: string;
   created_by_session: string | null;
 };
@@ -220,6 +225,11 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (relays !== undefined && !validRelays(relays)) {
     errors.push("relays must be up to 8 distinct {to, name, quote, at}: to a phone number or phone/group jid (not an @lid), quote the owner's own words allowing it, at the ISO time he said it (not in the future)");
   }
+  const chat = input.chat;
+  if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat) || chat === "owner")) {
+    errors.push("chat must be a bridge chat slug like moni");
+  }
+  if (chat !== undefined && mode !== "wake") errors.push("chat watchers must use mode wake");
   if (errors.length) throw new Error(errors.join("; "));
   return {
     id: input.id!, title: input.title!.trim(), check: input.check!, interval_s: interval, mode: mode as Mode,
@@ -232,6 +242,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
     ...(quiet !== undefined ? { quiet: { start: quiet.start, end: quiet.end, time_zone: quiet.time_zone } } : {}),
     ...(trip !== undefined ? { trip } : {}),
+    ...(chat !== undefined ? { chat: chat as string } : {}),
     ...(relays !== undefined ? {
       relays: (relays as Relay[]).map(relay => ({
         to: relay.to.trim(), name: relay.name.trim(), quote: relay.quote.trim(), at: iso(Date.parse(relay.at)),
@@ -299,7 +310,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
@@ -354,18 +365,55 @@ export function headsUpText(watcher: Watcher, event: string): string {
 /** Telegram accepts only a short plain source label. */
 const telegramSource = (text: string) => (text.replace(/[^A-Za-z0-9 ._-]/g, " ").replace(/\s+/g, " ").trim() || "Watcher").slice(0, 40);
 
+/** Card #14: under a test run a real iMessage/Telegram send is refused unless the test overrode its CLI path.
+ * The CLI path and the refusal are both read at call time, so an override set after import still counts. */
+export function underTest(): boolean {
+  return Boolean(process.env.ROBOB_TEST) || process.env.NODE_ENV === "test" || Boolean(process.env.PYTEST_CURRENT_TEST);
+}
+const refused = (what: string) => ({ ok: false, out: `refused: test run; ${what} would reach a real app` });
+const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
+const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
+
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
-  return run([BUN, SPECTRUM_CLI, "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
+  return run([BUN, spectrumCli(), "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+}
+
+/**
+ * Wakes another chat's agent (`wake --chat`). The bridge only takes this from the owner's chat, so the owner's live
+ * route id is the caller; the event itself lands only in the target chat.
+ */
+export async function wakeChat(chat: string, source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  const cli = spectrumCli();
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("wake --chat");
+  const session = await liveSession();
+  if (!session) return { ok: false, out: "no live route session" };
+  return run([BUN, cli, "wake", "--chat", chat, "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
+  const cli = spectrumCli();
+  if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, SPECTRUM_CLI, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
-  return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+  if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
+  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+}
+
+/** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
+ * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
+const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
+  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
+  "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB"];
+export function testEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
+  return out;
 }
 
 const WA_SENDS = /\bwa\s+(draft|send|sendfile)\b/;
@@ -545,6 +593,12 @@ export type Delivery = { ok: boolean; via: string; detail: string };
 export async function deliver(watcher: Watcher, event: string, key: string, state: State, test = false): Promise<Delivery> {
   const tried: string[] = [];
   const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
+  if (watcher.chat) {
+    // Someone else's data: only her chat may see it. A failed wake stays pending and is retried with the same key.
+    const text = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this chat.]\n${wakeText(watcher, event, state, test)}`;
+    const result = await wakeChat(watcher.chat, `robob-watch ${watcher.id}`, text, key);
+    return result.ok ? { ok: true, via: `wake:${watcher.chat}`, detail: result.out } : { ok: false, via: "none", detail: `wake --chat ${watcher.chat}: ${result.out}` };
+  }
   if (watcher.mode === "wake") {
     const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);
     if (result.ok) return { ok: true, via: "wake", detail: result.out };

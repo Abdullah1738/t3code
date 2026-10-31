@@ -68,6 +68,20 @@ test("the steps text carries the link and stays free of jargon", () => {
   assert.doesNotMatch(text, /UDID|provision|ad hoc|tunnel/i);
 });
 
+test("the install steps have the person open the app once and turn on Developer Mode if asked", () => {
+  const text = stepsText("https://h.trycloudflare.com/c/t/");
+  assert.match(text, /then open it once/);
+  assert.match(text, /Developer Mode Required/);
+  assert.match(text, /Privacy & Security/);
+  assert.match(text, /Robob Cards is installed/);
+  assert.doesNotMatch(text, /don't need to open/i);
+  const ready = enrollPage({ phase: "ready", manifestUrl: "https://h.trycloudflare.com/c/t/manifest.plist" });
+  assert.match(ready, /then open it once/);
+  assert.match(ready, /Developer Mode Required/);
+  assert.match(ready, /Privacy &amp; Security/);
+  assert.doesNotMatch(ready, /don't need to open|don&apos;t need to open/i);
+});
+
 test("parseConfig needs App Store Connect and signing paths", () => {
   const good = {
     asc: { keyId: "K", issuerId: "I", keyPath: "/k.p8" },

@@ -3,15 +3,16 @@
 Live proof: paid order NAEIA0042714780 (2x Maxi Nutrition MaxShake vanilla,
 AED 19.80, frictionless saved-card cc_noonpay — no CVV, no 3DS, no
 clientSecret consumption). Account-level defaults carry checkout: silent
-delivery active, default card 5542 preselected, home address bound.
+delivery active, default card (order_card.LAST4) preselected, home address bound.
 
 Lifecycle (mutations journalled at-most-once):
   guard empty cart + no active marketplace orders -> catalog skuConfig ->
   offer resolution (buyable, min quantity) -> cart add -> checkout session
-  {shouldUpdateSession:true} (verify silent delivery + default card 5542 +
+  {shouldUpdateSession:true} (verify silent delivery + default card (order_card.LAST4) +
   address + totals + manifest) -> place-order {total} -> order-status poll
   until success+shipments (paid signal; paymentError is failure) -> watcher.
 """
+import order_card
 import datetime as dt
 import json
 import os
@@ -152,9 +153,9 @@ def _scope_hash(items, address_hash):
     """Single-item keeps the exact legacy digest; multi binds the full manifest."""
     if len(items) == 1:
         return journal.digest({'sku': items[0]['sku_config'], 'qty': items[0]['quantity'],
-                               'home': address_hash, 'card': '5542', 'quiet': True})
+                               'home': address_hash, 'card': order_card.LAST4, 'quiet': True})
     return journal.digest({'items': [[i['sku_config'], i['quantity']] for i in items],
-                           'home': address_hash, 'card': '5542', 'quiet': True})
+                           'home': address_hash, 'card': order_card.LAST4, 'quiet': True})
 
 
 def _sorted_wire_manifest(rows):
@@ -438,7 +439,7 @@ class MainOrderFlow(MarketplacePayment):
         if cards is None:
             _fail('MAIN_DEFAULT_CARD_MISSING')
         defaults = [card for card in cards if isinstance(card, dict)
-                    and isinstance(card.get('mask'), str) and card['mask'].endswith('5542')
+                    and isinstance(card.get('mask'), str) and card['mask'].endswith(order_card.LAST4)
                     and card.get('isDefault') is True and card.get('isSelected') is True]
         if len(defaults) != 1:
             _fail('MAIN_DEFAULT_CARD_NOT_SELECTED')
@@ -478,7 +479,7 @@ class MainOrderFlow(MarketplacePayment):
         if self.single:
             projection = {'sku_config': self.sku_config, 'offer': self.offer,
                           'quantity': self.quantity, 'total_minor': total_minor,
-                          'address_key': data.get('addressKey'), 'card_last4': '5542',
+                          'address_key': data.get('addressKey'), 'card_last4': order_card.LAST4,
                           'silent_delivery': True, 'credits': False}
         else:
             projection = {'items': sorted([item['sku_config'], item['quantity']]
@@ -486,7 +487,7 @@ class MainOrderFlow(MarketplacePayment):
                           'subtotal_minor': subtotal_minor,
                           'fees_minor': total_minor - subtotal_minor,
                           'total_minor': total_minor, 'shipments': len(shipments),
-                          'address_key': data.get('addressKey'), 'card_last4': '5542',
+                          'address_key': data.get('addressKey'), 'card_last4': order_card.LAST4,
                           'silent_delivery': True, 'credits': False}
         self.review = {'digest': journal.digest(projection), 'payable_minor': total_minor,
                        'observed_at': time.time(), 'projection': projection}

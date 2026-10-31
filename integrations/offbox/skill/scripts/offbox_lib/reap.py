@@ -1,12 +1,16 @@
-"""Reaper: stop idle leases (free, keeps disk); delete only archived-7d / unused-30d unpinned leases.
-Bases and templates are never touched. Every action is logged to events + offbox.log."""
+"""Reaper: stop idle leases (free; boat keeps the disk 14 days after the stop); delete only archived-7d /
+unused-30d unpinned leases; forget leases whose data boat deleted; keep pinned leases, bases and templates past
+boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 
 from __future__ import annotations
 
-from . import api, capacity, lease
-from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock, iso_ts, now,
-                     say)
+from . import api, bases, capacity, lease
+from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+                     iso_ts, now, say)
 from .identity import thread_get
+
+# The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
+REAP_BUDGET_S = 100
 
 
 def _protected(con) -> set[str]:
@@ -19,12 +23,46 @@ def reap(dry: bool = False) -> list[str]:
     actions: list[str] = []
     con = db()
     try:
-        with file_lock("reap", timeout=5):
+        with file_lock("reap", timeout=5), api.budget(REAP_BUDGET_S):
             return _reap(con, dry, actions)
     except OffboxError as e:
         if "timed out waiting for lock" in str(e):
             return ["another reap is running"]
         raise
+
+
+def _still_bringing_up(con, box_id: str) -> bool:
+    row = con.execute("SELECT state FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    return bool(row) and row["state"] == "bringing_up"
+
+
+def _bringup_lock(row) -> str:
+    """The lock a live acquisition holds for its whole bring-up (lease.acquire_private)."""
+    return f"lease-{row['owner']}-{row['repo_root']}"
+
+
+def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
+    actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from boat")
+    if not dry:
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        con.commit()
+        event(con, box_id, "reap_forget", "recipe box no longer exists on boat")
+
+
+def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
+    """Delete a quarantined or abandoned bring-up box. The bring-up lock is taken first (no wait), then the row is
+    re-read: a live acquisition that finished meanwhile is left alone. act() takes the box lock itself."""
+    if dry:
+        actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
+        return
+    try:
+        with file_lock(_bringup_lock(row), timeout=0):
+            if row["state"] == "bringing_up" and not _still_bringing_up(con, bid):
+                return
+            act(bid, "delete", "recipe cancelled, box quarantined or bring-up abandoned",
+                lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
+    except OffboxError:
+        return  # a live acquisition holds the bring-up lock: skip it this pass
 
 
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
@@ -37,6 +75,17 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry:
             con.execute("UPDATE runs SET status='lost', end_at=? WHERE run_id=?", (now(), rid))
     if stale and not dry:
+        con.commit()
+    # Foreground/--bg runs that never got a box (client died while waiting in the pool): nothing remote to check.
+    # Two hours is past any pool wait, so live waiters are never touched.
+    nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
+                        "AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
+    for (rid,) in nobox:
+        actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
+        if not dry:
+            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=?",
+                        (now(), "client ended before it got a box", rid))
+    if nobox and not dry:
         con.commit()
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
@@ -60,6 +109,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 event(con, box_id, f"reap_{what}_failed", f"{why}: {e}")
                 actions[-1] += f" (FAILED: {e})"
 
+    refreshes = 0  # resume+stop of pinned leases near boat's 14-day limit; a few per pass (120 s budget)
     # A lease with an open prune hold stays on the list even if it is marked deleted: its hold is released only
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
     rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
@@ -82,6 +132,20 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                     actions.append(f"hold kept {bid}: gone from boat, not yet confirmed")
             else:
                 actions.append(f"forget {bid}: gone from boat")
+            continue
+        if b.get("dataExpiredAt"):
+            # Same release rule as a box gone from boat: nothing can run on a box whose data is deleted, but the
+            # hold goes only after a locked, fresh confirmation; a busy lock leaves it for a later pass.
+            if not dry:
+                if lease.release_if_confirmed(con, bid):
+                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
+                    con.commit()
+                    event(con, bid, "reap_expired", f"boat deleted its data at {b['dataExpiredAt']}")
+                    actions.append(f"forget {bid}: boat deleted its data")
+                else:
+                    actions.append(f"hold kept {bid}: boat deleted its data, not yet confirmed")
+            else:
+                actions.append(f"forget {bid}: boat deleted its data")
             continue
         state = b.get("state")
         running_runs = lease.active_runs(con, bid)
@@ -130,6 +194,35 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if state in api.LIVE_STATES and idle > idle_limit:
             act(bid, "stop", f"idle {int(idle // 60)}m",
                 lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True))  # act() holds box-<id>
+        stopped = iso_ts(b.get("stoppedAt"))
+        if pinned and state in api.STOPPED_STATES and stopped and now() - stopped > KEEPALIVE_S and refreshes < 2:
+            refreshes += 1
+            act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
+                lambda bid=bid: lease.refresh_box(con, bid))
+    # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
+    # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
+    # recipe cannot be trusted, so the box is retired like a quarantined one.
+    # A live acquisition holds lease-<owner>-<repo> for its whole bring-up (acquire_private), so cleanup takes that same
+    # lock without waiting and re-reads the row under it. A selection made before the lock is stale: a row that became
+    # running (or was reused) is skipped, never deleted.
+    for r in con.execute("SELECT box_id, owner, repo_root, state FROM leases "
+                         "WHERE state IN ('quarantined','bringing_up')").fetchall():
+        bid = r["box_id"]
+        if r["state"] == "bringing_up" and not dry and not _still_bringing_up(con, bid):
+            continue
+        if bid in live:
+            _retire_locked(con, bid, r, dry, act, actions)
+        else:
+            if r["state"] == "bringing_up" and not dry:
+                try:
+                    with file_lock(_bringup_lock(r), timeout=0):
+                        if not _still_bringing_up(con, bid):
+                            continue
+                        _forget(con, bid, actions)
+                except OffboxError:
+                    continue  # a live acquisition holds the lock: leave it to that process
+            else:
+                _forget(con, bid, actions, dry=dry)
     # Templates/bases: make sure they are stopped (they are free when stopped).
     for bid in protected:
         b = live.get(bid)
@@ -138,6 +231,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                                (bid, now() - 3 * 3600)).fetchone()[0]
             if not busy:
                 act(bid, "stop", "template/base left running", lambda bid=bid: api.stop(bid))
+    bases.upkeep(con, live, dry, actions, act)
     # Orphans: offbox-named live boxes we have no record of (e.g. a crashed create).
     known = {r[0] for r in con.execute("SELECT box_id FROM leases")} | protected
     for bid, b in live.items():

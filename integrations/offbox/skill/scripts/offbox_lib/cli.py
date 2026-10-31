@@ -6,13 +6,15 @@ import argparse
 import json
 import os
 import sys
+import time
 
 from .common import EXIT_BUSY, EXIT_CAP, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now, say
 
 HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM instead of the Mac.
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
-  offbox logs <run> [--follow] | wait <run>     for --bg runs
+  offbox logs <run> [--follow] | wait <run> [--timeout S]     for --bg runs; also a run another shell follows
+  offbox kill <run>                 stop a hung starting/running box run (confirmed on boat), then release works
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
@@ -51,7 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--follow", "-f", action="store_true")
     w = sp.add_parser("wait")
     w.add_argument("run_id")
-    w.add_argument("--timeout", type=float)
+    w.add_argument("--timeout", type=float, metavar="S",
+                   help="stop waiting after S seconds with exit 124; the run keeps going on its box")
 
     lo = sp.add_parser("local", help="log an exemption to run heavy work locally")
     lo.add_argument("--reason")
@@ -62,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     li = sp.add_parser("list")
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
+    kl = sp.add_parser("kill", help="stop a hung box run by run id")
+    kl.add_argument("run_id")
     rl = sp.add_parser("release")
     rl.add_argument("box_id", nargs="?")
     rl.add_argument("--mine", action="store_true")
@@ -103,6 +108,29 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _remote_once(a, me) -> int:
+    from . import runs
+    try:
+        return runs.run_remote(a, me)
+    except (OffboxError, KeyboardInterrupt):
+        raise
+    except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
+        import traceback
+        log("run crashed: " + traceback.format_exc()[-2000:])
+        raise OffboxError(f"offbox internal error: {type(e).__name__}: {e}")
+
+
+def _outage_wait_applies(a, e: OffboxError) -> bool:
+    """Wait out a boat API outage only when nothing started and the run can't fall back to the Mac anyway.
+    Small commands that may fall back keep today's immediate fallback."""
+    from . import fallback
+    if not (e.outage and not e.started and e.code == EXIT_INFRA):
+        return False
+    if a.no_fallback or a.remote or a.bg:
+        return True
+    return not fallback.allowed(a.cmd, e, os.getcwd())
+
+
 def cmd_run(a, me) -> int:
     from . import capacity, fallback, runs
     if a.cmd and a.cmd[0] == "--":
@@ -138,15 +166,21 @@ def cmd_run(a, me) -> int:
         if not a.remote:
             why = "could not start locally"
     log(f"remote: {why}")
+    from . import outage
+    waited_from = None
     try:
-        try:
-            return runs.run_remote(a, me)
-        except (OffboxError, KeyboardInterrupt):
-            raise
-        except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
-            import traceback
-            log("run crashed: " + traceback.format_exc()[-2000:])
-            raise OffboxError(f"offbox internal error: {type(e).__name__}: {e}")
+        while True:
+            try:
+                return _remote_once(a, me)
+            except OffboxError as e:
+                if not _outage_wait_applies(a, e):
+                    raise
+                if waited_from is None:
+                    waited_from = time.monotonic()
+                left = outage.window_seconds() - (time.monotonic() - waited_from)
+                if left > 0 and outage.wait_until_up(outage.reason_of(e), left):
+                    continue
+                raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
@@ -187,10 +221,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     from . import bases, misc, reap, spend
     from .identity import whoami
+    from .redact import redact_argv, warn_env_values
     try:
         me = whoami()
-        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} argv={argv[:12]}")
+        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} argv={redact_argv(argv)[:12]}")
         if a.sub == "run":
+            warn_env_values(a.env)
             return cmd_run(a, me)
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
@@ -200,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
         elif a.sub == "list":
             misc.list_leases(me, a.all, a.json)
+        elif a.sub == "kill":
+            return misc.kill_run(a.run_id)
         elif a.sub == "release":
             misc.release(me, a.box_id, a.mine, a.delete)
         elif a.sub == "ssh":

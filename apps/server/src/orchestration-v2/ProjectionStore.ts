@@ -383,6 +383,7 @@ export interface ShellSnapshotOptions {
   readonly location?: "active" | "archive";
   readonly projectId?: ProjectId;
   readonly unsettledOnly?: boolean;
+  readonly pullRequestCandidatesOnly?: boolean;
 }
 
 export interface ProjectionStoreV2Shape {
@@ -5583,7 +5584,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const selectShellThreadRows = (
       threadId?: ThreadId,
-      { location, projectId, unsettledOnly = false }: ShellSnapshotOptions = {},
+      {
+        location,
+        projectId,
+        unsettledOnly = false,
+        pullRequestCandidatesOnly = false,
+      }: ShellSnapshotOptions = {},
     ) =>
       sql<ShellThreadRow>`
             SELECT
@@ -5690,7 +5696,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ) AS latest_user_message_at,
               (
                 SELECT message.updated_at
-                FROM orchestration_v2_projection_messages message
+                FROM orchestration_v2_projection_messages message INDEXED BY ardud_v2_messages_latest_user_authored_idx
                 WHERE message.thread_id = t.thread_id
                   AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
@@ -5770,6 +5776,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }${
               unsettledOnly
                 ? sql` AND json_extract(t.payload_json, '$.settledAt') IS NULL AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'`
+                : sql``
+            }${
+              pullRequestCandidatesOnly
+                ? sql` AND (json_extract(t.payload_json, '$.branch') IS NOT NULL OR json_extract(t.payload_json, '$.branchPullRequest') IS NOT NULL)`
                 : sql``
             }
             ORDER BY t.updated_at ASC, t.thread_id ASC
@@ -5929,7 +5939,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ) AS latest_user_message_at,
               (
                 SELECT message.updated_at
-                FROM orchestration_v2_projection_messages message
+                FROM orchestration_v2_projection_messages message INDEXED BY ardud_v2_messages_latest_user_authored_idx
                 WHERE message.thread_id = t.thread_id AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
                 ORDER BY message.updated_at DESC, message.message_id DESC
@@ -6498,6 +6508,13 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
         const existing = (yield* Ref.get(replayState)).projections;
         const selectedThreadIds = [...existing.entries()]
           .filter(([, projection]) => {
+            if (
+              options?.pullRequestCandidatesOnly &&
+              projection.thread.branch === null &&
+              projection.thread.branchPullRequest == null
+            ) {
+              return false;
+            }
             if (
               options?.projectId !== undefined &&
               projection.thread.projectId !== options.projectId

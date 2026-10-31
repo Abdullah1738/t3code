@@ -588,7 +588,7 @@ class CardTests(unittest.TestCase):
 
     def test_public_directory_does_not_reuse_private_legacy_metadata(self):
         legacy=c.APPS/c.slug('talabat','123');legacy.mkdir(parents=True)
-        (legacy/'items.json').write_text(json.dumps({'address':'private address','card':'5542'}))
+        (legacy/'items.json').write_text(json.dumps({'address':'private address','card':'2342'}))
         result=c.sync(self.cfg,self.data,send=True)
         self.assertNotEqual(result['slug'],legacy.name)
         self.assertFalse((c.APPS/result['slug']/'items.json').exists())

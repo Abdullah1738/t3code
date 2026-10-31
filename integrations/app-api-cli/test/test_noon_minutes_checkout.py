@@ -25,7 +25,7 @@ def fixture():
                        'selectedModifiers': {}, 'isFreebie': False, 'itemCode': 'SYNTHETIC_SHAKE'}],
             'currencyCode': 'AED', 'orderSubtotal': 12.5, 'orderTotal': 20.5,
             'orderPaymentAmount': 20.5, 'walletAmount': 0, 'paymentMethodCode': 'cc_noonpay',
-            'paymentToken': 'synthetic-payment-token', 'creditCardMask': 'xxxx 5542',
+            'paymentToken': 'synthetic-payment-token', 'creditCardMask': 'xxxx 2342',
             'ccType': 'mastercard', 'isCvvRequired': False, 'verifyDevice': False,
             'idEmiPlan': None, 'isShutdown': False,
             'orderSummary': [{'entries': [{'title': 'Subtotal', 'value': 'AED 12.50'},
@@ -83,7 +83,7 @@ class WireTests(unittest.TestCase):
     def test_payment_preserves_observed_null_optional_fields(self):
         h=Harness([{'status':'payment_pending'}])
         h.client.complete_payment(order='IAEGA123',client_secret='synthetic-secret',
-            card=m.SavedCard('synthetic-token','xxxx5542','mastercard'),provider_code='NOON_PAY',
+            card=m.SavedCard('synthetic-token','xxxx2342','mastercard'),provider_code='NOON_PAY',
             cvv_encryption=None,optional_fields={'installments':None,'paymentType':None,'idEmiPlan':None},
             before_send=h.reserve)
         body=h.calls[0][1]
@@ -91,7 +91,7 @@ class WireTests(unittest.TestCase):
         self.assertNotIn('applePayToken',body)
         with self.assertRaises(m.MinutesError):
             h.client.complete_payment(order='IAEGA123',client_secret='synthetic-secret',
-                card=m.SavedCard('synthetic-token','xxxx5542','mastercard'),provider_code='NOON_PAY',
+                card=m.SavedCard('synthetic-token','xxxx2342','mastercard'),provider_code='NOON_PAY',
                 cvv_encryption=None,optional_fields={'installments':3},before_send=h.reserve)
 
     def test_session_get_empty_and_refresh_body(self):
@@ -139,7 +139,7 @@ class WireTests(unittest.TestCase):
 
     def test_exact_saved_card_and_no_wallet(self):
         h = Harness()
-        card = m.SavedCard('synthetic-payment-token', 'xxxx 5542', 'mastercard')
+        card = m.SavedCard('synthetic-payment-token', 'xxxx 2342', 'mastercard')
         snap = h.client.set_payment_method(card=card, before_send=h.reserve)
         self.assertEqual(h.calls[0][1], {'paymentMethodCode': 'cc_noonpay',
             'paymentToken': card.token, 'creditCardMask': card.mask, 'walletAmount': 0, 'idEmiPlan': None})
@@ -149,23 +149,23 @@ class WireTests(unittest.TestCase):
 
     def test_wrong_card_denied_before_reservation(self):
         h = Harness()
-        for mask, network in [('xxxx 1234','mastercard'), ('xxxx 5542','visa'), ('123456785542','mastercard')]:
+        for mask, network in [('xxxx 1234','mastercard'), ('xxxx 2342','visa'), ('123456782342','mastercard')]:
             with self.assertRaisesRegex(m.MinutesError, 'CARD_MISMATCH'):
                 h.client.set_payment_method(card=m.SavedCard('token',mask,network), before_send=h.reserve)
         self.assertEqual(h.calls, [])
         self.assertEqual(h.reservations, [])
 
-    def test_native_cards_shape_selects_unique_5542(self):
-        data={'data':[{'id':'synthetic-id','ccMasked':'54321098xxxx5542','ccType':'MASTERCARD',
+    def test_native_cards_shape_selects_unique_order_card(self):
+        data={'data':[{'id':'synthetic-id','ccMasked':'54321098xxxx2342','ccType':'MASTERCARD',
                        'isDefault':True,'isDeleted':False},
                       {'id':'other','ccMasked':'xxxx1111','ccType':'VISA','isDeleted':False}]}
-        card=m.saved_card_5542(data)
+        card=m.saved_order_card(data)
         self.assertEqual(card.token,'synthetic-id')
         self.assertNotIn('543210',repr(card))
         self.assertNotIn('synthetic-id',json.dumps(m.project_cards(data)))
         data['data'].append(data['data'][0])
         with self.assertRaisesRegex(m.MinutesError,'SAVED_CARD_NOT_UNIQUE'):
-            m.saved_card_5542(data)
+            m.saved_order_card(data)
 
     def test_payload_detached_before_journal_callback(self):
         h=Harness([{'status':'PENDING'}])
@@ -174,7 +174,7 @@ class WireTests(unittest.TestCase):
             encryption['encCvv']='changed-after-binding'
             return True
         h.client.complete_payment(order='ISYNTHETIC1',client_secret='intent',
-            card=m.SavedCard('token','xxxx5542','mastercard'),provider_code='NOON_PAY',
+            card=m.SavedCard('token','xxxx2342','mastercard'),provider_code='NOON_PAY',
             cvv_encryption=encryption,before_send=reserve)
         self.assertEqual(h.calls[0][1]['cvvEncryption']['encCvv'],'synthetic-ciphertext')
 
@@ -203,7 +203,7 @@ class WireTests(unittest.TestCase):
     def test_401_no_refresh_or_retry(self):
         h = Harness([m.MinutesError('AUTH_EXPIRED')])
         with self.assertRaises(m.MinutesError) as raised:
-            h.client.set_payment_method(card=m.SavedCard('token','****5542','mastercard'), before_send=h.reserve)
+            h.client.set_payment_method(card=m.SavedCard('token','****2342','mastercard'), before_send=h.reserve)
         self.assertEqual(str(raised.exception),'AUTH_EXPIRED')
         self.assertTrue(raised.exception.may_have_sent)
         self.assertEqual(len(h.calls),1)
@@ -257,7 +257,7 @@ class WireTests(unittest.TestCase):
         self.assertEqual(status.projection['state'],'payment_action_required')
         self.assertNotIn('private-intent',repr(status))
         payment = h.client.complete_payment(order='ISYNTHETIC1',client_secret=status.wire['paymentIntentToken'],
-            card=m.SavedCard('token','****5542','mastercard'),provider_code='NOON_PAY',
+            card=m.SavedCard('token','****2342','mastercard'),provider_code='NOON_PAY',
             cvv_encryption=None,before_send=h.reserve)
         self.assertEqual(payment.projection['state'],'human_payment_challenge')
         self.assertNotIn('https://',repr(payment))
@@ -269,7 +269,7 @@ class WireTests(unittest.TestCase):
         h = Harness()
         with self.assertRaisesRegex(m.MinutesError,'ENCRYPTED_CVV_REQUIRED'):
             h.client.complete_payment(order='ISYNTHETIC1',client_secret='intent',
-                card=m.SavedCard('token','****5542','mastercard'), provider_code='NOON_PAY',
+                card=m.SavedCard('token','****2342','mastercard'), provider_code='NOON_PAY',
                 cvv_encryption='123',before_send=h.reserve)
         self.assertEqual(h.calls, [])
 
@@ -286,7 +286,7 @@ class ProjectionTests(unittest.TestCase):
     def review(self,snapshot):
         return m.review_snapshot(snapshot,expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
             expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
-            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'))
+            card=m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard'))
 
     def test_complete_lines_summary_and_private_token_hash(self):
         p = self.snapshot().projection
@@ -308,7 +308,7 @@ class ProjectionTests(unittest.TestCase):
     def review_quiet(self, data, required, note=m.QUIET_NOTE):
         return m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
             expected_total_minor=2050,required_preferences=required,
-            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),driver_note=note)
+            card=m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard'),driver_note=note)
 
     def test_only_dont_ring_bell_offered_passes_with_note(self):
         data=fixture();data['deliveryPreferences']=[{'code':'dont_ring_the_bell','value':True,'title':'Do not ring bell'}]
@@ -353,7 +353,7 @@ class ProjectionTests(unittest.TestCase):
             self.review(self.snapshot(data))
         digest=m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
             expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
-            card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=True)
+            card=m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard'),allow_cvv=True)
         self.assertRegex(digest,r'^[a-f0-9]{64}$')
 
     def test_verify_device_and_unknown_cvv_flag_always_refuse(self):
@@ -363,7 +363,7 @@ class ProjectionTests(unittest.TestCase):
             with self.subTest(key=key,value=value,allow=allow), self.assertRaises(m.MinutesError):
                 m.review_snapshot(self.snapshot(data),expected_skus=[m.sku_line('SYNTHETIC_SHAKE',1)],
                     expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
-                    card=m.SavedCard('synthetic-payment-token','xxxx 5542','mastercard'),allow_cvv=allow)
+                    card=m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard'),allow_cvv=allow)
 
     def test_home_provider_refreshes_old_home_and_refuses_address_move(self):
         h=Harness([fixture()])
@@ -522,7 +522,7 @@ class TransportTests(unittest.TestCase):
         evidence = canonical.pop('evidence_hash')
         self.assertEqual(evidence, hashlib.sha256(m._json(canonical)).hexdigest())
         encoded = json.dumps(record)
-        for private in ('synthetic-payment-token', 'synthetic-secret', 'a=one', 'Vanilla', '5542', 'driverNotes'):
+        for private in ('synthetic-payment-token', 'synthetic-secret', 'a=one', 'Vanilla', '2342', 'driverNotes'):
             self.assertNotIn(private, encoded)
         self.assertEqual(h.cookies[0][1], values)
 
@@ -622,7 +622,7 @@ class TransportTests(unittest.TestCase):
         h = Harness([{'success': True, 'order_nr': 'ISYNTHETIC1'}, {'status': 'PENDING'}])
         h.client.place_order(total_minor=2050, before_send=h.reserve)
         h.client.complete_payment(order='ISYNTHETIC1', client_secret='private',
-            card=m.SavedCard('token', 'xxxx5542', 'mastercard'), provider_code='NOON_PAY',
+            card=m.SavedCard('token', 'xxxx2342', 'mastercard'), provider_code='NOON_PAY',
             cvv_encryption=None, before_send=h.reserve)
         self.assertEqual([r['order_id'] for r in h.receipts], ['ISYNTHETIC1']*2)
         self.assertEqual([r['outcome'] for r in h.receipts], ['ORDER_ID_RECEIVED', 'RESPONSE_RECEIVED'])
@@ -642,7 +642,7 @@ class TransportTests(unittest.TestCase):
     def test_payment_challenge_fences_with_bound_receipt(self):
         h = Harness([{'status': 'PENDING', 'redirect_url': 'https://private.invalid/secret'}])
         h.client.complete_payment(order='ISYNTHETIC1', client_secret='private',
-            card=m.SavedCard('token', 'xxxx5542', 'mastercard'), provider_code='NOON_PAY',
+            card=m.SavedCard('token', 'xxxx2342', 'mastercard'), provider_code='NOON_PAY',
             cvv_encryption=None, before_send=h.reserve)
         self.assertEqual(h.receipts[0]['outcome'], 'CHALLENGE_REQUIRED')
         self.assertNotIn('private', json.dumps(h.receipts))

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# wa: the person's own WhatsApp on her offbox (wacli linked device, store ~/person/wa/store, systemd --user
+# service wacli-sync). Called from the Mac as `offbox-person wa <person> <cmd ...>`. Reads are local SQLite
+# (wa-db, read-only); sends go through the running sync daemon's socket. Times print in Asia/Dubai.
+#
+#   wa status                       online/offline, linked or not, last connect
+#   wa link <phone>                 pair by phone number: stops sync, prints the 8-character code for
+#                                   WhatsApp > Linked devices > Link a device > Link with phone number instead.
+#                                   The code is good for ~2.5 min; the link job then starts sync by itself.
+#   wa link --qr                    same with a QR: prints the first QR payload (rotates every 20 s)
+#   wa link-status                  linked yes/no, link job state
+#   wa start | stop | restart       the sync service
+#   wa chats [N]                    recent chats: name (unread) | jid
+#   wa find <name|number>           contact search -> jid | name | push name
+#   wa read <jid|number> [N]        last N messages (default 40), phone JID + LID merged
+#   wa search <query> [wacli messages search flags]   full-text search (--chat JID --from JID --after D --limit N)
+#   wa ids <jid> [N]                last N messages with ids and media type
+#   wa download <jid> <msg-id>      media -> ~/person/files/whatsapp/, prints the path
+#   wa send <jid|number> <text...>  send now (her account)
+#   wa sendfile <jid|number> <path> [caption...]
+#   wa new <jid> <watch-key>        watcher backend: new incoming messages in that chat since the last call for
+#                                   that key (cursor + outbox in ~/person/wa/watch/<key>, see wa-db new)
+#   wa events [N]                   last N sync events (connected, logged_out, ...)
+set -uo pipefail
+export TZ=Asia/Dubai
+P="$HOME/person"
+export WACLI_STORE_DIR="$P/wa/store"
+W="$P/bin/wacli"
+DB="$P/bin/wa-db"
+SVC=wacli-sync.service
+die() { echo "wa: $*" >&2; exit 2; }
+norm() { local j=$1; [[ $j == *@* ]] || j="${j//[^0-9]/}@s.whatsapp.net"; printf '%s\n' "$j"; }
+uctl() { systemctl --user "$@"; }
+authed() { "$W" auth status --json 2>/dev/null | grep -q '"authenticated":[[:space:]]*true'; }
+need_link() { [ -f "$WACLI_STORE_DIR/session.db" ] && authed || die "not linked yet (wa link <her number>)"; catchup; }
+# Right after a box resume the service has only just reconnected: wait (max ~25 s) for WhatsApp's offline sync, so a
+# read or watcher run sees what arrived while the box was stopped.
+catchup() {
+  uctl is-active --quiet $SVC || return 0
+  local since now
+  since=$(uctl show -p ActiveEnterTimestampMonotonic --value $SVC 2>/dev/null) || return 0
+  now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+  (( now - since < 90000000 )) || return 0
+  local start_ms=$(( $(date +%s%3N) - (now - since) / 1000 ))
+  for _ in $(seq 1 25); do
+    python3 - "$P/wa/sync.events.log" "$start_ms" <<'PY' && return 0
+import json, sys
+try:
+    lines = open(sys.argv[1], errors="replace").read().splitlines()[-200:]
+except OSError:
+    sys.exit(1)
+for l in reversed(lines):
+    try:
+        e = json.loads(l)
+    except ValueError:
+        continue
+    if e.get("event") == "offline_sync_completed" and e.get("ts", 0) >= int(sys.argv[2]):
+        sys.exit(0)
+sys.exit(1)
+PY
+    sleep 1
+  done
+}
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  status)
+    if uctl is-active --quiet $SVC; then
+      pid=$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$WACLI_STORE_DIR/LOCK" 2>/dev/null)
+      echo "online pid ${pid:-?}"
+    elif uctl is-active --quiet wa-link.service; then
+      echo "linking (link job running)"; exit 1
+    else
+      echo "offline ($(authed && echo linked || echo 'not linked'))"; exit 1
+    fi
+    ;;
+  link)
+    [ $# -ge 1 ] || die "usage: wa link <phone> | wa link --qr"
+    uctl stop wa-link.service 2>/dev/null; uctl reset-failed wa-link.service 2>/dev/null
+    authed && die "already linked; to re-link, unlink this device on her phone first (then wa stop; rm -rf ~/person/wa/store)"
+    uctl stop $SVC
+    log="$P/wa/link.events.log"; : > "$log"
+    if [ "$1" = --qr ]; then mode=(--qr-format text); kind=qr_code; else mode=(--phone "$1"); kind=pair_code; fi
+    # Own transient unit: survives this ssh session. After pairing, auth bootstraps history and exits once idle;
+    # sync then takes over.
+    systemd-run --user --unit=wa-link --collect --quiet \
+      --setenv=WACLI_STORE_DIR="$WACLI_STORE_DIR" \
+      bash -c "'$W' auth ${mode[*]} --events --idle-exit 90s >/dev/null 2>>'$log' && systemctl --user enable --now $SVC" \
+      || die "could not start the link job"
+    for _ in $(seq 1 45); do
+      line=$(grep -m1 "\"event\":\"$kind\"" "$log" 2>/dev/null) && break
+      if ! uctl is-active --quiet wa-link.service; then tail -5 "$log" >&2; die "link job exited before a code came"; fi
+      sleep 1
+    done
+    [ -n "${line:-}" ] || { tail -5 "$log" >&2; die "no $kind within 45s"; }
+    python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"]["code"])' "$line"
+    ;;
+  link-status)
+    if authed; then echo "linked"; else echo "not linked"; fi
+    echo "link job: $(uctl is-active wa-link.service 2>/dev/null || true)"
+    echo "sync: $(uctl is-active $SVC 2>/dev/null || true)"
+    tail -3 "$P/wa/link.events.log" 2>/dev/null | cut -c1-300 | grep -v '"code"' || true
+    ;;
+  start|restart) need_link; uctl enable --quiet $SVC; uctl restart $SVC; sleep 3; exec "$0" status ;;
+  stop) uctl stop wa-link.service $SVC 2>/dev/null; echo stopped ;;
+  chats) need_link; exec "$DB" chats "${1:-40}" ;;
+  find) need_link; [ $# -ge 1 ] || die "usage: wa find <name|number>"; exec "$DB" find "$*" ;;
+  read) need_link; [ $# -ge 1 ] || die "usage: wa read <jid> [N]"; exec "$DB" read "$(norm "$1")" --limit "${2:-40}" ;;
+  search)
+    need_link; [ $# -ge 1 ] || die "usage: wa search <query> [--chat JID] [--from JID] [--after D] [--limit N]"
+    q=$1; shift
+    "$W" --read-only --json messages search "$q" "$@" | python3 -c '
+import json, sys, time, datetime
+d = json.load(sys.stdin).get("data") or {}
+for m in d.get("messages") or []:
+    ts = datetime.datetime.fromisoformat(m["Timestamp"].replace("Z", "+00:00")).astimezone()
+    who = "Me" if m.get("FromMe") else (m.get("SenderName") or m.get("SenderJID", "").split("@")[0])
+    text = (m.get("Text") or m.get("MediaCaption") or m.get("Filename") or ("[" + m["MediaType"] + "]" if m.get("MediaType") else "")).replace("\n", " / ")
+    print(f"({ts:%d-%m-%y %H:%M}) {m.get(\"ChatName\") or m[\"ChatJID\"]} | {who}: {text[:300]}  [{m[\"ChatJID\"]} {m[\"MsgID\"]}]")'
+    ;;
+  ids)
+    need_link; [ $# -ge 1 ] || die "usage: wa ids <jid> [N]"
+    jids=$("$DB" resolve "$(norm "$1")" | sed "s/.*/'&'/" | paste -sd,)
+    sqlite3 -readonly -separator ' | ' "file:$WACLI_STORE_DIR/wacli.db?mode=ro" \
+      "select datetime(ts,'unixepoch','+4 hours'), msg_id, chat_jid, case from_me when 1 then 'Me' else coalesce(nullif(sender_name,''),sender_jid) end, coalesce(media_type,''), substr(coalesce(text,''),1,80) from messages where chat_jid in ($jids) order by ts desc, rowid desc limit ${2:-20}"
+    ;;
+  download)
+    need_link; [ $# -ge 2 ] || die "usage: wa download <jid> <msg-id>"
+    out="$P/files/whatsapp/"; mkdir -p "$out"
+    "$W" --read-only --json media download --chat "$(norm "$1")" --id "$2" --output "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("data") or {}).get("path") or d)'
+    ;;
+  send)
+    need_link; [ $# -ge 2 ] || die "usage: wa send <jid> <text...>"
+    to=$(norm "$1"); shift
+    "$W" send text --to "$to" --message "$*" && echo "(sent) Me: $*"
+    ;;
+  sendfile)
+    need_link; [ $# -ge 2 ] || die "usage: wa sendfile <jid> <path> [caption...]"
+    to=$(norm "$1"); f=$2; shift 2
+    [ -s "$f" ] || die "no such file: $f"
+    "$W" send file --to "$to" --file "$f" ${1:+--caption "$*"} && echo "(sent) Me: [file ${f##*/}]"
+    ;;
+  new)
+    # Cursor per watcher key on the box; RUN_OK carries the Mac runner's last acked run id (outbox replay).
+    # wa new <jid> <watch-key> [run-id] [last-acked-run-id] (the Mac runner's WATCH_RUN and .run-ok)
+    [ $# -ge 2 ] || die "usage: wa new <jid> <watch-key> [run] [run-ok]"
+    [[ $2 =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || die "bad watch key"
+    uctl is-active --quiet $SVC || { echo "her wacli sync is not running ($(authed && echo linked || echo 'not linked'))" >&2; exit 1; }
+    catchup
+    wd="$P/wa/watch/$2"; mkdir -p "$wd"
+    [ -n "${4:-}" ] && printf '%s' "$4" > "$wd/.run-ok"
+    WATCH_DIR="$wd" WATCH_RUN="${3:-}" exec "$DB" new "$(norm "$1")"
+    ;;
+  events) tail -n "${1:-20}" "$P/wa/sync.events.log" | grep -v '"qr_code"\|"pair_code"' | cut -c1-400 ;;
+  *) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 2 ;;
+esac

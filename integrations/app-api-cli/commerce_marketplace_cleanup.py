@@ -1,4 +1,5 @@
 """Explicit, at-most-once removal of journal-owned Main/Supermall cart rows."""
+import order_card
 import uuid
 
 import commerce_journal as j
@@ -68,7 +69,7 @@ def verify_source(proof, response, snapshot, vertical):
     require(record['evidence_hash'] == proof['add_evidence_hash'],
             'MARKETPLACE_CLEAR_CART_READBACK_MISMATCH')
     scopes = [j.digest({'service': vertical, 'account': snapshot.account_ref,
-                       'home': snapshot.address_ref, 'card': '5542', 'quiet': True})]
+                       'home': snapshot.address_ref, 'card': order_card.LAST4, 'quiet': True})]
     raw = response.data.get('items')
     if isinstance(raw, list) and raw and 'groups' not in response.data:
         by_offer = {row.get('offerCode'): row for row in raw}

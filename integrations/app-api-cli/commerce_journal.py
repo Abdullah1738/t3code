@@ -4,6 +4,7 @@ No network, credentials, raw cart/payment payloads, retry, reset or cancellation
 An unknown send retains account ownership; a different flow ID cannot escape it.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
+import order_card
 from contextlib import contextmanager
 import hashlib
 import json
@@ -515,7 +516,7 @@ def close_marketplace_uncharged(flow_id, *, evidence, expected_local):
     """Terminal native no-capture closure; order/operation ownership stays consumed."""
     if (not isinstance(evidence, dict) or evidence.get('provider_no_charge_proven') is not True
             or evidence.get('payment_failed') is not True or evidence.get('all_items_cancelled') is not True
-            or evidence.get('currency') != 'AED' or evidence.get('card_last4') != '5542'):
+            or evidence.get('currency') != 'AED' or evidence.get('card_last4') != order_card.LAST4):
         fail('JOURNAL_MARKETPLACE_NO_CHARGE_EVIDENCE_REQUIRED')
     with _db() as db:
         flow = _get(db, flow_id)

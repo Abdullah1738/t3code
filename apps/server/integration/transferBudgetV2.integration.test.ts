@@ -42,6 +42,7 @@ import * as OrchestrationEventStore from "../src/persistence/OrchestrationEventS
 import * as EventStore from "../src/orchestration-v2/EventStore.ts";
 import * as EventSink from "../src/orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../src/orchestration-v2/ProjectionStore.ts";
+import * as ProviderSessionManager from "../src/orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadManagementService from "../src/orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "../src/orchestration-v2/ProjectStore.ts";
 import * as ProjectService from "../src/project/ProjectService.ts";
@@ -110,6 +111,12 @@ const layerEnrichment = Layer.unwrap(
   }),
 );
 const layerServices = layerManagement.pipe(
+  Layer.provideMerge(
+    Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+      observeThreadSessionUpdates: () => Effect.void,
+      refreshThreadSessionUpdates: () => Effect.void,
+    }),
+  ),
   Layer.provideMerge(
     Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
       getEnvironmentId: Effect.succeed(EnvironmentId.make("transfer-test")),

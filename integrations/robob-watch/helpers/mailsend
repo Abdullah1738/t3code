@@ -5,6 +5,7 @@
   mailsend reply -a ACCT -m MAILBOX ID (--body TEXT | --body-file PATH) [--cc ADDR]... [--attach PATH]...
   mailsend forward -a ACCT -m MAILBOX ID -t ADDR [-t ADDR]... [--cc ADDR]... [--body TEXT | --body-file PATH] [--attach PATH]...
   mailsend show ID
+  mailsend card ID     (renders the pending draft as designed PNG card(s); prints their paths; sends nothing)
   mailsend send --approved ID [--inbound ID | --app]   (--inbound/--app are optional and not checked)
 
 draft, reply and forward build the exact message with himalaya (nothing is sent), keep it and print its preview:
@@ -15,15 +16,22 @@ new id; so does the same email drafted again after the old draft expired (it is 
 No Bcc: himalaya 2.1 leaves the Bcc header in the sent mail, so every recipient would see it.
 icloud and outlook get a copy in Sent after sending; Google accounts save their own.
 """
-import argparse, email, email.policy, fcntl, hashlib, json, os, re, shlex, subprocess, sys, time
+import argparse, email, email.policy, fcntl, hashlib, html, json, os, re, shlex, subprocess, sys, tempfile, time, unicodedata
 
 HOME = os.path.expanduser("~")
 D = os.environ.get("MAILSEND_DRAFT_DIR") or os.path.join(HOME, ".local/state/mail-drafts")
 HERE = os.path.dirname(os.path.realpath(__file__))
 SA = os.environ.get("MAILSEND_SEND_APPROVAL") or os.path.join(HERE, "send-approval")
 # himalaya through the XOAUTH2 retry wrapper (absolute path inside, so agent PATH shims don't apply).
-HIMALAYA = shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
+def himalaya_cmd():
+    """Read at call time: the guard and the command come from the same environment."""
+    return shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
                        f"/usr/bin/python3 {HOME}/.local/libexec/mail/mail_oauth.py himalaya")
+def under_test():
+    """True under `ROBOB_TEST=1`, bun test (NODE_ENV=test) or pytest (PYTEST_CURRENT_TEST)."""
+    return bool(os.environ.get("ROBOB_TEST")) or os.environ.get("NODE_ENV") == "test" or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 SAVE_COPY = {"icloud", "outlook"}
 MAX_AGE = 86400
 SEND_TIMEOUT = int(os.environ.get("MAILSEND_SEND_TIMEOUT") or 180)
@@ -31,6 +39,21 @@ TIP = "Tip: when a message speaks for Abdullah with new wording, money, dates or
 ADDR = re.compile(r"^[^\s<>@,;\"']+@[^\s<>@,;\"']+\.[^\s<>@,;\"']+$")
 RE_ID = re.compile(r"^[0-9a-f]{10}$")
 USED = ("sent", "sending", "failed", "uncertain", "expired")
+# Card rendering: the shared Robob card helper (headless Chrome shell). MAILSEND_CARD_RENDERER overrides it with
+# a command taking: html_path png_path width height (tests use it; nothing else does).
+CARD_LIB = os.environ.get("MAILSEND_CARD_LIB") or os.path.join(HOME, ".local/libexec/card-preview")
+CARD_RENDERER = os.environ.get("MAILSEND_CARD_RENDERER")
+CARD_W = 720       # px; the chat shows it ~300pt wide, so 30px body text reads at ~12pt
+CARD_INNER = 648   # text width inside the page padding (36px each side)
+TEXT_W = 586       # text width inside the body panel (its 28px padding, less slack)
+VAL_W = 560        # address value width next to its 70px label and 18px gap
+CARD_FONT = '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif'
+MAX_CARD_H = 2000  # px; a longer email is split into card-2.png, card-3.png ...
+FIXED_H = 170      # px: page padding, body panel padding, footer; the header and items are added to it
+FOOT_PAD = 26      # px of page padding below the footer
+SUBJ_PX, SUBJ_CONT_PX, ROW_PX, CHIP_PX, BODY_PX = 46, 26, 28, 26, 30
+CHIP_GAP = 12
+LINE = 42          # body line height in px
 
 
 def die(msg, code=2):
@@ -40,7 +63,10 @@ def die(msg, code=2):
 
 def run(argv, timeout=120):
     try:
-        return subprocess.run(HIMALAYA + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # Under a test, never fall back to the live himalaya: an override must be set (checked in main() too).
+        if under_test() and not os.environ.get("MAILSEND_HIMALAYA"):
+            die("refused: test run; himalaya would reach email (set MAILSEND_HIMALAYA to a stub)")
+        return subprocess.run(himalaya_cmd() + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None
 
@@ -239,6 +265,254 @@ def cmd_build(a):
     held.close()
 
 
+WIDE = ("W", "F")  # east_asian_width classes that take a full em (CJK, emoji, full-width forms)
+
+
+def char_w(ch, size):
+    """Conservative advance width in px: a Latin glyph is counted at 0.6em, a wide glyph at 1em."""
+    return size * (1.0 if unicodedata.east_asian_width(ch) in WIDE else 0.6)
+
+
+def text_w(s, size):
+    return sum(char_w(c, size) for c in s)
+
+
+def wrap_px(s, size, budget):
+    """Greedy wrap to a pixel budget: break at the last space when it isn't too early, else inside the word."""
+    lines, cur, w = [], "", 0.0
+    for ch in s:
+        cw = char_w(ch, size)
+        while cur and w + cw > budget:
+            k = cur.rfind(" ")
+            if k > 0 and k >= len(cur) // 3:
+                lines.append(cur[:k])
+                cur = cur[k + 1:]
+            else:
+                lines.append(cur)
+                cur = ""
+            w = text_w(cur, size)
+        cur += ch
+        w += cw
+    lines.append(cur)
+    return lines
+
+
+def block_items(s, quotes):
+    """Display items for a block of text. quotes=True folds each run of '>' lines into one line."""
+    items, quote = [], 0
+
+    def flush():
+        nonlocal quote
+        if quote:
+            items.append(("fold", f"+ quoted original, {quote} line{'s' if quote != 1 else ''}"))
+            quote = 0
+
+    for line in s.strip("\n").expandtabs(4).split("\n"):
+        if quotes and line.lstrip().startswith(">"):
+            quote += 1
+            continue
+        flush()
+        if not line.strip():
+            if items and items[-1][0] != "gap":
+                items.append(("gap", ""))
+            continue
+        items += [("line", w) for w in wrap_px(line, BODY_PX, TEXT_W)]
+    flush()
+    while items and items[-1][0] == "gap":
+        items.pop()
+    return items
+
+
+def card_items(text, body):
+    """Items for what goes out. Only the quoted original the source mail brought (the text after the body the
+    agent wrote) is folded; any '>' line the sender typed stays visible."""
+    # A forward with no added body stores body "" and its text starts with the quote, so nothing is authored and the
+    # whole quote folds. A reply/compose stores what the writer typed, and that prefix stays unfolded.
+    authored, rest = text, ""
+    b = (body or "").replace("\r\n", "\n").strip()
+    if text.startswith(b):
+        authored, rest = b, text[len(b):]
+    items = block_items(authored, quotes=False)
+    tail = block_items(rest, quotes=True)
+    if items and tail:
+        items.append(("gap", ""))
+    items += tail
+    return items or [("line", "(no text)")]
+
+
+def item_h(it):
+    return LINE // 2 if it[0] == "gap" else LINE
+
+
+def header_h(d, cont):
+    """Height of the header: the subject and rows on page 1, a one-line continued heading after."""
+    if cont:
+        return len(wrap_px(f"{d['subject']} (continued)", SUBJ_CONT_PX, CARD_INNER)) * 34 + 18
+    h = len(wrap_px(d["subject"] or "(no subject)", SUBJ_PX, CARD_INNER)) * 53 + 22
+    rows = [", ".join(d["to"])] + ([", ".join(d["cc"])] if d["cc"] else []) + [d["from"]]
+    h += sum(len(wrap_px(v, ROW_PX, VAL_W)) * 38 + 6 for v in rows)
+    if d["attachments"]:
+        rows_n, used = 1, 0.0
+        for f in d["attachments"]:
+            cw = min(CARD_INNER, text_w(f["name"], CHIP_PX) + 40)
+            if used and used + CHIP_GAP + cw > CARD_INNER:
+                rows_n, used = rows_n + 1, cw
+            else:
+                used = used + CHIP_GAP + cw if used else cw
+        h += rows_n * 48 + (rows_n - 1) * 12 + 16
+    return h
+
+
+def paginate(d, items):
+    """Split the items into pages that each fit MAX_CARD_H by estimate. Later pages carry a shorter header."""
+    first = MAX_CARD_H - FIXED_H - header_h(d, cont=False)
+    later = MAX_CARD_H - FIXED_H - header_h(d, cont=True)
+    if first < 4 * LINE or later < 4 * LINE:
+        die("error: this email's header (recipients, subject or attachments) is too long for one card "
+            "(nothing was sent)", 1)
+    pages, cur, used, budget = [], [], 0, first
+    for it in items:
+        h = item_h(it)
+        if cur and used + h > budget:
+            pages.append(cur)
+            cur, used, budget = [], 0, later
+        cur.append(it)
+        used += h
+    pages.append(cur)
+    return pages
+
+
+def card_html(d, page, n, total, h):
+    e = html.escape
+    if n == 1:
+        rows = [("From", d["from"]), ("To", ", ".join(d["to"]))] + ([("Cc", ", ".join(d["cc"]))] if d["cc"] else [])
+        meta = "".join(f'<div class="row"><span class="k">{e(k)}</span><span class="v">{e(v)}</span></div>'
+                       for k, v in rows)
+        chips = "".join(f'<span class="chip">{e(f["name"])}</span>' for f in d["attachments"])
+        head = (f'<div class="subj">{e(d["subject"] or "(no subject)")}</div>{meta}'
+                + (f'<div class="chips">{chips}</div>' if chips else ""))
+    else:
+        head = f'<div class="cont">{e(d["subject"])} (continued)</div>'
+    body = "".join(f'<div class="{cls}">{e(txt)}</div>' if cls != "gap" else '<div class="gap"></div>'
+                   for cls, txt in page)
+    foot = f"draft {d['id']}" + (f" · {n}/{total}" if total > 1 else "")
+    # The probe script reports, after layout, the lowest pixel of any element and whether anything runs past the
+    # right edge. cmd_card uses it to grow or refuse the frame; a screenshot can't show that.
+    probe = ("<script>addEventListener('load',function(){var W=innerWidth,b=0,r=0,all=document.querySelectorAll('body *');"
+             "for(var k=0;k<all.length;k++){var q=all[k].getBoundingClientRect();if(q.bottom>b)b=q.bottom;"
+             "if(q.right>r)r=q.right;}document.body.setAttribute('data-need',String(Math.ceil(b)));"
+             "document.body.setAttribute('data-fit',r<=W+0.5?'ok':'bad');});</script>")
+    return f"""<!doctype html><html><head><meta charset="utf-8"><style>
+*{{box-sizing:border-box;margin:0}}
+html,body{{width:{CARD_W}px;height:{h}px;overflow:hidden;background:#fff}}
+body{{color:#111;font-family:{CARD_FONT};padding:34px 36px 26px;display:flex;flex-direction:column;
+-webkit-font-smoothing:antialiased}}
+.subj{{font-size:{SUBJ_PX}px;font-weight:700;line-height:1.14;letter-spacing:-.02em;margin-bottom:22px;
+overflow-wrap:anywhere}}
+.cont{{font-size:{SUBJ_CONT_PX}px;font-weight:600;color:#6b7078;margin-bottom:18px;overflow-wrap:anywhere}}
+.row{{display:flex;gap:18px;font-size:{ROW_PX}px;line-height:1.36;margin-bottom:6px}}
+.k{{width:70px;flex:none;color:#6b7078}}
+.v{{min-width:0;overflow-wrap:anywhere}}
+.chips{{display:flex;flex-wrap:wrap;gap:12px;margin-top:16px}}
+.chip{{font-size:{CHIP_PX}px;font-weight:600;background:#eef0f3;border-radius:22px;padding:8px 20px;max-width:100%;
+overflow-wrap:anywhere}}
+.body{{margin-top:26px;background:#f5f6f8;border-radius:24px;padding:26px 28px 22px;flex:1}}
+.line,.fold{{font-size:{BODY_PX}px;line-height:{LINE}px;white-space:pre-wrap;overflow-wrap:anywhere}}
+.fold{{color:#6b7078;font-style:italic}}
+.gap{{height:{LINE // 2}px}}
+.foot{{margin-top:18px;font-size:22px;color:#8a8f98}}
+</style></head><body>{head}
+<div class="body">{body}</div>
+<div class="foot">{e(foot)}</div>{probe}
+</body></html>"""
+
+
+def card_height(d, page, n):
+    return header_h(d, cont=n > 1) + sum(item_h(it) for it in page) + FIXED_H
+
+
+def chrome_probe(doc, h):
+    """Lay the card out in headless Chrome and read back (lowest pixel, fits horizontally)."""
+    import cardpreview as cp
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "card.html")
+        with open(src, "w") as fh:
+            fh.write(doc)
+        r = subprocess.run([cp.CHROME, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+                            f"--user-data-dir={os.path.join(tmp, 'profile')}", "--force-device-scale-factor=1",
+                            "--virtual-time-budget=1500", f"--window-size={CARD_W},{h}", "--dump-dom",
+                            "file://" + src], capture_output=True, timeout=60)
+    dom = r.stdout.decode(errors="replace")
+    m_need = re.search(r'data-need="(\d+)"', dom)
+    m_fit = re.search(r'data-fit="(ok|bad)"', dom)
+    if not m_need or not m_fit:
+        die("error: the card layout check didn't run (nothing was sent)", 1)
+    return int(m_need.group(1)), m_fit.group(1) == "ok"
+
+
+def render_card(d, page, n, total, h, out):
+    """Write one card PNG. Real renders check the layout first and grow the frame to fit what Chrome lays out."""
+    doc = card_html(d, page, n, total, h)
+    if CARD_RENDERER:
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as fh:
+            fh.write(doc)
+            tmp = fh.name
+        try:
+            r = subprocess.run(shlex.split(CARD_RENDERER) + [tmp, out, str(CARD_W), str(h)], capture_output=True,
+                               timeout=120)
+        finally:
+            os.unlink(tmp)
+        if r.returncode != 0:
+            die(f"error: card renderer failed: {(r.stderr or b'').decode(errors='replace').strip()[:300]}", 1)
+        return
+    if not os.path.isfile(os.path.join(CARD_LIB, "cardpreview.py")):
+        die(f"error: card helper missing at {CARD_LIB} (nothing was sent)", 1)
+    sys.path.insert(0, CARD_LIB)
+    import cardpreview as cp
+    if not os.path.isfile(cp.CHROME):
+        die("error: headless Chrome not found, so the card can't be drawn (nothing was sent)", 1)
+    need, fit = chrome_probe(doc, h)
+    if need > h - FOOT_PAD:
+        h = need + FOOT_PAD
+        doc = card_html(d, page, n, total, h)
+        need, fit = chrome_probe(doc, h)
+        if need > h - FOOT_PAD:
+            die("error: the card layout didn't fit even when grown (nothing was sent)", 1)
+    if not fit:
+        die("error: a line runs past the card's width (nothing was sent)", 1)
+    cp.render_html(doc, out, CARD_W, h)
+
+
+def cmd_card(a):
+    """Render a pending draft as PNG card(s) in the draft dir. Sends nothing, changes no draft."""
+    i = a.draft
+    if not RE_ID.match(i):
+        die(f"error: bad draft id: {i}")
+    held = lock(i)
+    if not os.path.isfile(draft_path(i)):
+        die(f"no pending draft {i}")
+    d = load(i)
+    try:
+        with open(d["eml"], "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        die(f"Refused: the stored message for draft {i} is gone. Write a new draft.")
+    if hashlib.sha256(raw).hexdigest() != d["eml_sha256"]:
+        die(f"Refused: the stored message for draft {i} changed. Write a new draft.")
+    # Same text as the preview: every text/plain part of the stored message, quoted original included.
+    text = text_of(email.message_from_bytes(raw, policy=email.policy.default))
+    pages = paginate(d, card_items(text, d.get("body")))
+    os.makedirs(os.path.join(D, "cards"), exist_ok=True)
+    paths = []
+    for n, page in enumerate(pages, 1):
+        out = os.path.join(D, "cards", f"{i}.png" if n == 1 else f"{i}-{n}.png")
+        render_card(d, page, n, len(pages), card_height(d, page, n), out)
+        paths.append(out)
+    held.close()
+    for p in paths:
+        print(p)
+
+
 def cmd_show(a):
     if not RE_ID.match(a.draft):
         die(f"error: bad draft id: {a.draft}")
@@ -321,6 +595,9 @@ def main():
     p = sub.add_parser("show")
     p.add_argument("draft")
     p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("card")
+    p.add_argument("draft")
+    p.set_defaults(fn=cmd_card)
     p = sub.add_parser("send")
     p.add_argument("--approved", required=True)
     # Accepted for old callers; nothing checks them any more.
@@ -331,6 +608,9 @@ def main():
     if not getattr(a, "fn", None):
         print(__doc__)
         sys.exit(2)
+    # Test runs never reach email: a draft or send under a test needs a stub himalaya injected via MAILSEND_HIMALAYA.
+    if under_test() and not os.environ.get("MAILSEND_HIMALAYA"):
+        sys.exit(f"refused: test run; mailsend {a.cmd} would reach email (set MAILSEND_HIMALAYA to a stub)")
     a.fn(a)
 
 

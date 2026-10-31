@@ -61,7 +61,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
         <FeedError what="the board" feed={feed} nowMs={nowMs} />
         <BoardView
           state={state}
-          layout={layout}
+          width={width}
           nowMs={nowMs}
           selectedCardId={paneCard}
           bottomInset={bottomInset}
@@ -124,7 +124,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
             : []
         }
       />
-      <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
+      <KeyboardAvoidingView automaticOffset behavior="padding" className="flex-1">
         <View className="flex-1" onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
           {width > 0 ? body : null}
         </View>

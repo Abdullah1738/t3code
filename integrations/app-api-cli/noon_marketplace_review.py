@@ -4,6 +4,7 @@ Paths in EvidenceShape are explicit caller-evidenced response paths, not a Noon
 schema invented by this module. Missing paths fail closed with the semantic field
 name. A shape is trusted adapter configuration, never supplied by the server.
 """
+import order_card
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -264,8 +265,8 @@ def review(cart_data, session_data, expected_manifest, home, card, *, context,
     require(type(card) is dict, 'INVALID_SAVED_CARD')
     _fresh(card.get('observed_at'), ctx, 'STALE_CARD')
     mask = text(card.get('mask'), 'INVALID_SAVED_CARD')
-    require(re.fullmatch(r'[0-9xX*• .\-]*5542', mask) is not None
-            and bool(re.search(r'[xX*•]',mask)) and len(re.sub(r'\D','',mask))<=12, 'SAVED_CARD_5542_MISMATCH')
+    require(re.fullmatch(r'[0-9xX*• .\-]*' + order_card.LAST4, mask) is not None
+            and bool(re.search(r'[xX*•]',mask)) and len(re.sub(r'\D','',mask))<=12, 'SAVED_CARD_LAST4_MISMATCH')
     token = text(card.get('token'), 'INVALID_SAVED_CARD')
     card_type = text(card.get('card_type'), 'INVALID_SAVED_CARD')
     require(card_type.lower()=='mastercard','SAVED_CARD_TYPE_MISMATCH')

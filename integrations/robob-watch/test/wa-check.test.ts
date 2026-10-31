@@ -59,7 +59,7 @@ const SVC = `gui/${uid}/com.ardud.wacli-sync`;
 const PLIST = join(box, "Library/LaunchAgents/com.ardud.wacli-sync.plist");
 const wa = (args: string[], extra: Record<string, string> = {}) => {
   const r = Bun.spawnSync(["/bin/zsh", waBin, ...args], {
-    env: { HOME: box, PATH: [bin, "/usr/bin", "/bin"].join(":"), WA_WACLI: fakeWacli, WA_LAUNCHCTL: fakeLaunchctl,
+    env: { HOME: box, PATH: [bin, "/usr/bin", "/bin"].join(":"), ROBOB_TEST: "1", WA_WACLI: fakeWacli, WA_LAUNCHCTL: fakeLaunchctl,
       FAKE_CALLS: calls, FAKE_DOWN: down, LANG: "en_US.UTF-8", ...extra },
   });
   return { code: r.exitCode, out: r.stdout.toString().trim(), err: r.stderr.toString().trim() };

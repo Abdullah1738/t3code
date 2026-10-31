@@ -139,7 +139,11 @@ const BoardBody = Schema.Struct({
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
-const PoolBody = Schema.Struct({ model: ModelBody, slots: Schema.Number });
+const PoolBody = Schema.Struct({
+  model: ModelBody,
+  slots: Schema.optional(Schema.Number),
+  replaces: Schema.optional(Schema.String),
+});
 
 const ScriptBody = Schema.Struct({
   name: Schema.String,
@@ -308,10 +312,17 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(PoolBody);
-        if (!Number.isInteger(input.slots) || input.slots < 0) {
+        // A level change (replaces) may leave slots out to keep the pool's count.
+        const slotsOk =
+          input.slots === undefined
+            ? input.replaces !== undefined
+            : Number.isInteger(input.slots) && input.slots >= 0;
+        if (!slotsOk) {
           return yield* fail("invalid", "slots must be a whole number, 0 or more.");
         }
-        return yield* service.setPool(board.id, modelSelectionOf(input.model), input.slots);
+        return yield* service.setPool(board.id, modelSelectionOf(input.model), input.slots, {
+          replaces: input.replaces,
+        });
       }),
     );
 

@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+# wa-sendtext: send one WhatsApp text through the running sync daemon's send socket, the same path wacli uses
+# when the store lock is held. The text comes on stdin (whole, used exactly as given) and never touches argv,
+# the environment, a file, or any output. Errors that echo the text have it replaced.
+#   wa-sendtext --to <jid> [--allow-self] < text
+# Exit: 0 sent (stdout: one JSON line), 1 daemon refused (stderr), 2 bad input, 3 daemon unreachable (nothing sent),
+#       4 no usable reply (the message may still have gone through).
+import json
+import os
+import socket
+import sys
+import time
+
+USAGE = "usage: wa-sendtext --to <jid> [--allow-self] < text"
+
+
+def fail(msg, code):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def main():
+    args = sys.argv[1:]
+    to, allow_self = None, False
+    i = 0
+    while i < len(args):
+        if args[i] == "--to" and i + 1 < len(args):
+            to = args[i + 1]
+            i += 2
+        elif args[i] == "--allow-self":
+            allow_self = True
+            i += 1
+        else:
+            fail(USAGE, 2)
+    if not to:
+        fail(USAGE, 2)
+
+    try:
+        text = sys.stdin.buffer.read().decode("utf-8")
+    except UnicodeDecodeError:
+        fail("wa: text is not valid UTF-8; nothing was sent", 2)
+    if text == "":
+        fail("wa: empty text", 2)
+
+    sock_path = os.environ.get("WA_SEND_SOCK") or os.path.expanduser("~/.wacli/.send.sock")
+    try:
+        timeout_ms = int(os.environ.get("WA_SEND_TIMEOUT_MS") or 90000)
+    except ValueError:
+        fail("wa: WA_SEND_TIMEOUT_MS must be a whole number of milliseconds", 2)
+
+    req = {
+        "version": 1,
+        "kind": "text",
+        "to": to,
+        "message": text,
+        "post_send_wait_ms": 2000,
+        "timeout_ms": timeout_ms,
+        "deadline_unix_ms": int(time.time() * 1000) + timeout_ms,
+    }
+    if allow_self:
+        req["allow_self"] = True
+    payload = (json.dumps(req) + "\n").encode("utf-8")
+    no_reply = (
+        "wa: no reply from the WhatsApp sync daemon in time; the message may still have gone through. "
+        "Check with wa ids %s 3 before sending again." % to
+    )
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout_ms / 1000.0 + 5)
+    try:
+        s.connect(sock_path)
+    except OSError:
+        s.close()
+        fail("wa: the WhatsApp sync daemon isn't reachable (wa status, then wa start). Nothing was sent.", 3)
+
+    buf = b""
+    try:
+        s.sendall(payload)
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError:
+        s.close()
+        fail(no_reply, 4)
+    s.close()
+
+    try:
+        reply = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        fail(no_reply, 4)
+    if not isinstance(reply, dict):
+        fail(no_reply, 4)
+
+    if reply.get("ok") is True:
+        out = {"sent": True, "to": reply.get("to", to), "id": reply.get("id")}
+        if "store_warning" in reply:
+            out["store_warning"] = reply["store_warning"]
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(0)
+
+    err = str(reply.get("error") or "unknown error")
+    err = err.replace(text, "[message hidden]")
+    fail("wa: not sent: " + err, 1)
+
+
+if __name__ == "__main__":
+    main()

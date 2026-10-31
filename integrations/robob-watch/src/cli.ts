@@ -12,8 +12,9 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch add --id ID --title TEXT --check CMD [--interval 30] [--mode wake|notify]
                   (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial]
                   [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime] [--owner-only]
+                  [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, serial, triggers, quiet, trip, relays, created_by_session)
+                                         expires_at, max_fires, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID                 full saved context (wakes carry only its start)
@@ -84,7 +85,7 @@ async function main(argv: string[]): Promise<void> {
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" },
-      to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
+      chat: { type: "string" }, to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
     },
   });
   ensureDirs();
@@ -104,6 +105,7 @@ async function main(argv: string[]): Promise<void> {
           ...(values.serial ? { serial: true } : {}),
           ...(values.trigger?.length ? { triggers: values.trigger } : {}),
           ...(values.session === undefined ? {} : { created_by_session: values.session }),
+          ...(values.chat === undefined ? {} : { chat: values.chat }),
           // Third parties can only be listed with --json; this says the fires tell nobody but the owner.
           ...(values["owner-only"] ? { relays: [] } : {}),
         };
@@ -116,6 +118,7 @@ async function main(argv: string[]): Promise<void> {
       // outside watcher.json, so no replace can lift one.
       if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;
+      if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
       let watcher: Watcher;
       try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { throw new CliError((error as Error).message); }
       const dir = watcherDir(watcher.id);

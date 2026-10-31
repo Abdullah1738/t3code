@@ -8,6 +8,8 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   recall    recall server answers on :18765 and its session catalog keeps up
   backup    last memory backup succeeded recently
   backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
+  health_backup  health backup had a successful run in the last 13 h
+  person_backup  every offbox-person (Moni) backup had a successful run in the last 13 h
   dropbox   Dropbox copy of the live backup repo is complete (name + size)
   disk      internal disk has room
   session_reaper   hourly deletion of 30-day-idle OpenCode sessions runs and is not stuck gated
@@ -20,6 +22,7 @@ failing) and an all-clear when it recovers. --dry-run prints and never
 notifies.
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -51,6 +54,9 @@ RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
 BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
+HEALTH_BACKUP_STATUS = os.path.join(HOME, ".local/share/health-backup/backup_last.json")
+PERSON_BACKUP_DIR = os.path.join(HOME, ".local/share/offbox-person/state")
+OTHER_BACKUP_MAX_AGE = 13 * 3600  # these run every 6 h: two missed runs plus slack
 DISK_MIN_GB = 30
 MSGS_VOLUME = "/Volumes/ExternalSSD"
 MSGS_DB = os.path.join(MSGS_VOLUME, "message-archive/index.db")
@@ -189,6 +195,40 @@ def check_backup():
     if time.time() - last_ok > BACKUP_MAX_AGE:
         return False, f"last successful backup {int((time.time()-last_ok)/3600)} h ago"
     return True, f"snapshot {st.get('last_snapshot')} {int((time.time()-last_ok)/60)} min ago"
+
+
+def _backup_age(path, label):
+    # Stall only: a run that failed is already alerted by its own script, so ok=false is not checked here.
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except Exception:
+        return False, f"no {label} backup status ({path})"
+    last_ok = st.get("last_success_ts") or 0
+    age = time.time() - last_ok
+    if not last_ok or age > OTHER_BACKUP_MAX_AGE:
+        return False, (f"no good {label} backup in {int(OTHER_BACKUP_MAX_AGE/3600)} h "
+                       f"(last: {st.get('stage')} {str(st.get('message', ''))[:120]})")
+    return True, f"{label} ok {int(age/60)} min ago"
+
+
+def check_health_backup():
+    return _backup_age(HEALTH_BACKUP_STATUS, "health")
+
+
+def check_person_backups():
+    if not os.path.isdir(PERSON_BACKUP_DIR):
+        return True, "no offbox-person backups"
+    paths = sorted(glob.glob(os.path.join(PERSON_BACKUP_DIR, "*-backup.json")))
+    if not paths:
+        return False, f"no offbox-person backup status in {PERSON_BACKUP_DIR}"
+    results = []
+    for p in paths:
+        label = os.path.basename(p)[:-len("-backup.json")]
+        results.append(_backup_age(p, label))
+    if any(not ok for ok, _ in results):
+        return False, "; ".join(msg for ok, msg in results if not ok)
+    return True, "; ".join(msg for _, msg in results)
 
 
 def pid_is_backup(pid):
@@ -489,6 +529,7 @@ def check_msgs():
 CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
+          ("health_backup", check_health_backup), ("person_backup", check_person_backups),
           ("dropbox", check_dropbox), ("disk", check_disk), ("cold_finalize", check_cold_finalize),
           ("session_reaper", check_session_reaper), ("location_reaper", check_location_reaper),
           ("worktree_reaper", check_worktree_reaper), ("msgs", check_msgs)]
@@ -542,7 +583,7 @@ def main():
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
         key = "memory-health:" + today + ":" + ",".join(f"{n}@{failing[n]['since']}" for n in sorted(new_fail))
-        if notify("error" if any(n in ("sync", "backup", "backup_lock", "recall") for n in new_fail) else "attention", text, key):
+        if notify("error" if any(n in ("sync", "backup", "backup_lock", "recall", "health_backup", "person_backup") for n in new_fail) else "attention", text, key):
             for n in new_fail:
                 failing[n]["notified_day"] = today
     if recovered:

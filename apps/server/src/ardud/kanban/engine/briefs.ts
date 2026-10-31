@@ -41,7 +41,8 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
     "",
     "How the board works:",
-    "- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read.",
+    '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, evaluator_start (kind "request" only).',
+    '- If a tool, CLI or Robob itself fails you, use a workaround and keep going, then hand the problem to the Robob board: evaluator_start with boardId "robob", kind "request", and what failed with the evidence (error text, run ids, log paths).',
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,
@@ -122,6 +123,20 @@ export const evaluatorStepText = (card: KanbanCard) =>
     "Do them, mark each with subtask_done, then move the card on. Anything outward (a message, a ticket update, a merge or deploy) follows the board's approval rules: ask the owner first where they say so.",
   );
 
+/** The tick's reminder when a card's evaluator step has sat unclaimed for a while. */
+export const evaluatorStepWaitingText = (card: KanbanCard, minutes: number) =>
+  lines(
+    `Card #${card.number} (${card.title || "untitled"}, P${card.priority}) has waited ${minutes} minutes on evaluator subtasks nobody has done: ${subtaskIds(kanbanStepSubtasks(card, "evaluator"))}.`,
+    "",
+    evaluatorStepText(card),
+    "",
+    "Do them now (read the card's events first: another evaluator may be partway through), or post one line in the card's discussion saying who is doing them and when.",
+  );
+
+/** The tick's reminder when an owner message in a discussion has no evaluator reply yet. */
+export const ownerWaitingText = (discussion: { readonly title: string }, minutes: number) =>
+  `Abdullah wrote in "${discussion.title}" ${minutes} minutes ago and has no reply yet. Post a reply there now with discussion_post (an answer, or one line on what you're doing about it and when he'll have it), then carry on.`;
+
 /** Sent to the card discussion's evaluator once when a board script hands a subtask back. */
 export const handBackText = (
   card: KanbanCard,
@@ -143,16 +158,24 @@ export const wakeText = (card: KanbanCard) =>
     ? lines(`Card #${card.number} is back with you.`, "", card.wakeNote.trim())
     : `Card #${card.number} is back with you. Continue the work, then card_move to needs_review when done.`;
 
+/** Given to the fresh thread that takes over a card whose thread got too long. */
+export const FRESH_THREAD_NOTE = lines(
+  "Fresh thread: your earlier thread on this card got too long for the model, so the board started this one. Nothing from that thread carries over.",
+  "First see where the card is: card_get (subtasks, comments, discussion), then git status and git log in the worktree and branch it names. Carry on from there; don't redo finished steps.",
+);
+
 export const reviewBrief = (
   board: KanbanBoard,
   card: KanbanCard,
   goal: KanbanGoal | null,
   chain: KanbanReviewChain | null,
   priorFindings: ReadonlyArray<string>,
+  /** A new thread has no earlier step in it, so it gets the whole brief even on a later step. */
+  freshThread = false,
 ) => {
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
-  const continuing = card.reviewStep > 0;
+  const continuing = card.reviewStep > 0 && !freshThread;
   return lines(
     continuing
       ? `The previous review step came back clear. This is step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, on a different model: check the same change again with fresh eyes, using the context above.`
@@ -162,6 +185,9 @@ export const reviewBrief = (
     continuing ? null : "",
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
+    freshThread && card.wakeNote?.trim()
+      ? `\nNote for this review:\n${card.wakeNote.trim()}`
+      : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
@@ -258,7 +284,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     "- Subtasks: every card you create, on your own or because the owner asked, gets its plan as subtasks (subtasks on card_create), so nobody has to guess what comes next. Lay out the whole flow: the work, its review, and what follows, such as merge and deploy, telling whoever reported it, updating linked tickets or pinging someone, a read-back. Leave out what isn't needed. Same step means any order. Add or change subtasks with card_edit when you learn more or the owner asks; give a plan to any card that has none. Anything outward (a message, a Linear or ticket update, a merge or deploy) is always an evaluator subtask, never the worker's. Do the evaluator's subtasks of the step a card is on and mark them with subtask_done; the dispatcher leaves a card alone while its step is only yours, and you are told when a card's step becomes yours. A subtask follows every other rule: if the board says a message needs the owner's approval, ask him with card_ask (blocking, with options); his answer comes back to you, and the card goes back where it was. The subtask stays open until it's sent. A card reaches verified only when every subtask is done or skipped.",
     "- Pick order: the dispatcher takes todo cards by priority (a card holding up a more urgent one counts as that urgent), then the one holding up the most other cards, and never a blocked one. Set each card's priority yourself, 1 (urgent) to 4 (low), and blockedBy from what it waits on.",
     "- Backlog: priority 5 is never picked up, and a card with a thread is paused there until it leaves. Move a card into the backlog, or out of it, only when the owner asks.",
-    "- Threads: card_thread steer|stop|wake. Every message to a thread is a steer. Threads only talk to each other through you.",
+    "- Threads: card_thread steer|stop|wake|reset. Every message to a thread is a steer. reset starts the card on a fresh thread; use it when a thread is too long to run again. Threads only talk to each other through you.",
     "- Capacity: pool_set changes how many threads run per model, and adds a pool for any model in the composer's list (orchestrator_capabilities), at 0 slots unless the owner gives a number; pool_remove drops an unused one. A model that leaves the list drops to 0 by itself. Lowering never kills work by itself; stop threads to fit if needed. A pool the routing below doesn't name runs work only when the owner asks for that model.",
     "- Models: give a card several models with weights (models on card_create or card_edit) when the routing below says so. It starts on the highest-weight model whose pool has room, equal weights at random, and its thread keeps that model. A model or variant the provider doesn't offer is refused when you set it, and the error lists what it does offer; pick the closest one yourself. If a card's run fails, it is flagged stalled and you get a note: fix it, clear the flag, and say what you changed.",
     "- Goals: goal_set keeps a goal's Now (current status) and its numbered Story for a non-technical reader.",

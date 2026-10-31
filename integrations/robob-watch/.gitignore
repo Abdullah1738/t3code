@@ -1,1 +1,4 @@
 __pycache__/
+# Test runs with a fake HOME must never leave caches or locks in the repo.
+Library/
+.local/

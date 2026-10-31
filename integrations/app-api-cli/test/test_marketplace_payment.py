@@ -26,8 +26,8 @@ def failed_responses(order, amount):
     """Sanitized shape of the native failed order/refund GETs, 23 Oct."""
     amount = f'{amount / 100:.2f}'
     item = order + '-1'
-    method = {'code': 'mastercard', 'title': 'MASTERCARD xxxx5542', 'amount': amount}
-    medium = {'code': 'mastercard', 'title': 'Processed to xxxx5542', 'amount': amount,
+    method = {'code': 'mastercard', 'title': 'MASTERCARD xxxx2342', 'amount': amount}
+    medium = {'code': 'mastercard', 'title': 'Processed to xxxx2342', 'amount': amount,
               'description': disposition.NO_CAPTURE + ' Any temporary hold will be released by your bank.'}
     block = {'refundMediums': [medium], 'refundBreakup': {
         'totalAmount': amount, 'items': [{'itemNr': item, 'amount': amount}], 'feeGroups': []}}
@@ -107,6 +107,52 @@ class PaymentTests(unittest.TestCase):
                 durable = b''.join(p.read_bytes() for p in self.root.rglob('*') if p.is_file())
                 for secret in (b'encrypted-fixture', b'synthetic-card-token', b'synthetic-intent'):
                     self.assertNotIn(secret, durable)
+
+    def set_selected_card_id(self, flow, value):
+        for method in flow.session_response.data['paymentMethods']:
+            for card in method.get('cards', []):
+                if card.get('isSelected'):
+                    card['id'] = value
+
+    def fresh_journal(self):
+        """Each subTest gets its own journal: an open flow locks the account for the next one."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve() / 'commerce'
+        for module in (j, receipts):
+            patcher = patch.object(module, 'ROOT', root)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return root
+
+    def test_int_card_id_is_sent_as_decimal_string_on_both_lanes(self):
+        for fixture in (main, rocket):
+            with self.subTest(lane=fixture.__name__):
+                self.fresh_journal()
+                pending = {'status': 'pending', 'clientSecret': 'synthetic-intent'}
+                flow, wire = self.placed(fixture, order_status=[pending, pending, fixture.FIXTURE['status_success']],
+                    payment_complete={'status': 'payment_pending'}, payment_status={'status': 'payment_ready_to_redirect'})
+                self.set_selected_card_id(flow, 1234567890)
+                wire.responses['payment_config'] = {'cvv_encryption': 'fixture'}
+                with patch('noon_cvv.encrypt', return_value={'encCvv': 'encrypted-fixture', 'publicKeyName': 'fixture'}):
+                    flow.prepare_payment(cvv=b'123')
+                flow.place()
+                flow.await_success(notify=Mock(return_value={'queued': True}), sleep=lambda _: None)
+                calls = [x for x in wire.calls if x[0] == 'payment_complete']
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][2]['idCustomerToken'], '1234567890')
+                self.assertIsInstance(calls[0][2]['idCustomerToken'], str)
+
+    def test_non_string_card_ids_that_are_not_positive_ints_are_refused_before_place(self):
+        for bad in (True, 0, -5, 12.0):
+            with self.subTest(id=bad):
+                self.fresh_journal()
+                flow, wire = self.placed(main)
+                self.set_selected_card_id(flow, bad)
+                with self.assertRaises(payment.market.MarketplaceError) as raised:
+                    flow.prepare_payment(cvv=b'123')
+                self.assertEqual(raised.exception.code, 'INVALID_REFERENCE')
+                self.assertNotIn('place', [x[0] for x in wire.calls])
 
     def test_redirect_challenge_fence_is_lifted_only_by_later_exact_success(self):
         flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}, main.FIXTURE['status_success']],
@@ -506,6 +552,17 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(result['reservation_released_minor'], 1980)
         self.assertFalse(result['financial_send'])
 
+    def test_reconcile_payment_timeout_with_null_payment_error_releases(self):
+        failed = failed_responses(main.ORDER, 1980)
+        failed['order_status'] = {'status': 'failed', 'statusMessage': 'Payment timed out',
+                                  'paymentError': None, 'paymentErrorMsg': None}
+        flow, wire = self.placed(**failed)
+        flow.place()
+        result = disposition.reconcile(flow.flow_id, client=flow.client)
+        self.assertEqual(result['state'], 'RELEASED')
+        self.assertEqual(result['reservation_released_minor'], 1980)
+        self.assertFalse(result['financial_send'])
+
     def test_reconcile_rejects_concurrent_success(self):
         flow, wire = self.placed(**failed_responses(main.ORDER, 1980))
         flow.place()
@@ -525,6 +582,10 @@ class PaymentTests(unittest.TestCase):
 class ProjectionTests(unittest.TestCase):
     def test_incomplete_wrong_order_wrong_card_or_partial_refunds_reject(self):
         changes = [lambda s,d,r: s.update(status='pending'),
+                   lambda s,d,r: s.update(paymentError=None, statusMessage='Payment pending'),
+                   lambda s,d,r: s.update(paymentError=None),
+                   lambda s,d,r: (s.update(paymentError=None, statusMessage='Payment timed out'),
+                                  r['sections']['completedRefunds']['refundMediums'][0].update(description='Refunded')),
                    lambda s,d,r: d.update(orderNr='NOTTHISORDER'),
                    lambda s,d,r: d['itemGroups'][0]['subStatus'].update(highStatusCode='delivered'),
                    lambda s,d,r: r['sections']['paymentDetails'].update(amount='1'),

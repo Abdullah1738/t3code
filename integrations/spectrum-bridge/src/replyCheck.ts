@@ -15,7 +15,7 @@ const SENT_TEXTS = 50;
 /** Letters and digits only, lowercased, so punctuation and spacing do not hide a banned word. */
 const normalizeWords = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 const comparable = (text: string) => text.normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "").toLowerCase();
-const CARD_TARGET = /\b5542\b|marriott/i;
+const CARD_TARGET = /\b(?:5542|2342)\b|marriott/i;
 const CARD_LIMIT = /\blimits?\b|available (credit|balance)|headroom|balance first/i;
 const CARD_DECLINE = /\bdeclined\b/i;
 const CARD_SMS = /\b(sms|text)\b/i;
@@ -68,7 +68,7 @@ export function checkReply(chat: { slug: string; kind: string }, text: string, r
     && !(CARD_DECLINE.test(plain) && CARD_SMS.test(plain))) {
     return {
       rule: "card-limit",
-      reason: "card 5542 can go to about AED -9,400; never blame its limit or say pay the balance first unless you quote a real bank decline SMS",
+      reason: "the Marriott card (2342) can go to about AED -9,400; never blame its limit or say pay the balance first unless you quote a real bank decline SMS",
     };
   }
   const padded = ` ${normalizeWords(plain)} `;

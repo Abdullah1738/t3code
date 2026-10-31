@@ -753,10 +753,12 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
   }) {
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
 
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.thread_id": input.threadId,
     });
+    yield* providerSessions.observeThreadSessionUpdates(input.threadId);
     yield* threadManagement.ensureLegacyTranscript(input.threadId).pipe(
       Effect.mapError(
         (cause) =>
@@ -866,6 +868,31 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
     // tail, so no event published during the replay window is lost; overlapping
     // events are deduped by sequence on the client.
     if (input.afterSequence !== undefined) {
+      // Refresh appends a new global sequence; it must not validate a cursor
+      // ahead of this thread's restored history.
+      const preRefreshHighWater = yield* applicationEvents.latestAgentSequence(input.threadId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestrationV2GetThreadProjectionError({
+              threadId: input.threadId,
+              message: `Failed to prepare orchestration V2 thread ${input.threadId} replay`,
+              cause,
+            }),
+        ),
+      );
+      if (input.afterSequence > preRefreshHighWater) {
+        return yield* snapshotThenLive();
+      }
+      yield* providerSessions.refreshThreadSessionUpdates(input.threadId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestrationV2GetThreadProjectionError({
+              threadId: input.threadId,
+              message: `Failed to refresh orchestration V2 thread ${input.threadId} sessions`,
+              cause,
+            }),
+        ),
+      );
       const highWater = yield* applicationEvents.latestAgentSequence(input.threadId).pipe(
         Effect.mapError(
           (cause) =>
@@ -876,9 +903,6 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
             }),
         ),
       );
-      if (input.afterSequence > highWater) {
-        return yield* snapshotThenLive();
-      }
       const stats = yield* applicationEvents
         .getAgentReplayStats({
           threadId: input.threadId,

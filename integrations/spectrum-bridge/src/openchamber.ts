@@ -306,6 +306,12 @@ export interface ChatBackend {
    * backends whose full list is slow (Robob) implement this cheap single lookup.
    */
   sessionBusy?(id: string, directory: string): Promise<boolean>;
+  /**
+   * Whether a session still has work that a context reset would cut off: busy, or
+   * waiting on background commands or monitors. Optional, and separate from
+   * `statuses()`, which deliberately treats a waiting session as idle for polling.
+   */
+  resetBlocked?(id: string, directory: string): Promise<boolean>;
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
   questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
   /** `inboundId` is the owner's typed reply the answer came from, when there is one. */

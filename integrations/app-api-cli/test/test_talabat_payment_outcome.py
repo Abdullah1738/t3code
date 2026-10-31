@@ -100,7 +100,7 @@ class PaymentOutcomeTests(unittest.TestCase):
     def test_telemetry_success_and_financial_fields_never_promoted(self):
         result=p.project_payment_status(200,{'status':'success','totalAmount':30.14,
             'transactionId':'private-transaction','orderId':'private-order','currency':'AED',
-            'card':'5542','settled':True,'captured':True,'merchantAccepted':True})
+            'card':'2342','settled':True,'captured':True,'merchantAccepted':True})
         self.assert_blocked(result)
         self.assertFalse(result['request_response_binding_verified'])
 

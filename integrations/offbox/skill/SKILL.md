@@ -74,6 +74,8 @@ offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
 offbox local --list ; offbox local --clear
 ```
 
+The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
+
 ## Your box (lease)
 
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
@@ -87,7 +89,7 @@ offbox local --list ; offbox local --clear
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if the box ran Docker in the last 2 h
   or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
-  cooldown (stopped = free, disk kept). A resume takes ~6-10 s. The next run resumes it with everything
+  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). A resume takes ~6-10 s. The next run resumes it with everything
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
@@ -95,7 +97,9 @@ offbox local --list ; offbox local --clear
 - Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
   times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
 - Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
-- Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`.
+- Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
+  deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
+  says so) and the reaper rebuilds the template. An expired default base falls back to the template.
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
   large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
@@ -107,25 +111,33 @@ offbox local --list ; offbox local --clear
   or base size, at least large; generic stays default) the next time it resumes. While starts are plentiful an
   oversized running box is skipped for a stopped one so it can stop on its short timer, except the box you used
   last. A live box is never stopped just to shrink it, and a shrink boat refuses resumes at the old size.
+  A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
+  stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
+  lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
+  A box whose filesystem has died (`Transport endpoint is not connected`) is caught by a write check before the sync, or by the sync itself: it is stopped, marked `dead-mount:` and taken out of the pool, and the run moves to another box (once). `offbox list --all` shows it; `offbox release <id> --delete` removes it.
 
 ## Options
 
 | Flag | Use |
 |---|---|
 | `--size S` / `--template T` | machine size / template for a new lease |
-| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. |
+| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. For a secret, export it and pass the name only (`export LOCALSTACK_AUTH_TOKEN=...; offbox run --env LOCALSTACK_AUTH_TOKEN ...`): a `NAME=value` value sits on offbox's command line, where ps and transcripts see it (offbox.log keeps only the name). |
 | `--pull PATH` | copy an artifact back after the run (coverage.out, junit.xml, `test-results/`), relative to your cwd |
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
-| `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
+| `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id>` (exits with its code, does `--pull`) |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates |
+| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+`offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
+its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
+If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -136,6 +148,9 @@ sync filters, so staged changes appear as unstaged remotely. A committed HEAD an
 are required (no automatic fetch). Committed content in the exported history remains available to Git,
 including paths excluded from the working-file sync. The local Git state is read-only. Submodule git-dirs
 are not materialized. Each `--git` sync rebuilds and replaces the remote metadata; `--no-sync` retains it.
+A partial clone (`--filter=blob:none`, e.g. the board's mobile review worktrees) usually lacks old blobs: `--git`
+then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If even HEAD's files aren't local
+(a `--no-checkout` partial clone) it stops before syncing and tells you to run without `--git`.
 
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
@@ -143,28 +158,35 @@ UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on 
 
 ## Save state for later (do this!)
 
-Stopped boxes are free forever, so save generously:
+Stopped boxes are free, but boat deletes a stopped box's data 14 days after its last stop. Bases and templates
+are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
+resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
 
 - After an expensive setup (`npm ci`, `go mod download`, harness images pulled, a seeded database), run
   `offbox save --default --note "npm ci done at <sha>"`. New threads on this repo then start from that state and
   only rsync the delta. `save` briefly stops your lease to capture it (the next run resumes it), costs one machine
   start (~15-25 s), then $0. Names: `offbox save --name pg-seeded`; use one
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
-- `offbox bases` lists saved bases; `offbox base rm <name>` removes one. Bases are never auto-deleted.
-- `offbox keep --days 30` pins your current lease so the reaper never deletes it (it still stops when idle).
+- `offbox bases` lists saved bases and whether each is kept (saved snapshot), box-only (with the date boat deletes
+  it) or EXPIRED; `offbox base rm <name>` removes one. Bases are never auto-deleted by offbox.
+- `offbox keep --days 30` pins your current lease so the reaper never deletes it and keeps its disk past boat's
+  14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
 ## Housekeeping
 
 - `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
   `offbox whoami`, `offbox status`.
+- `offbox kill <run>` stops a hung starting/running box run and marks it `killed` once boat confirms the process
+  stopped. Release refuses while a run is active and names the run ids. Use kill, not pkill on the box.
+  Local runs and runs with no box process are refused.
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.
 
 ## Costs and the cap
 
-$100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and saved bases
-are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
+$100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and the plan's 50
+included saved snapshots are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
 at every $100. At $500 the cap trips: new leases are refused and all boxes stop. Heavy work returns 91.
 
 Create, fork and resume each consume a start. Offbox reserves starts atomically against rolling **25/minute,
@@ -193,10 +215,17 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
 - **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
   semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.
+- **90 + "boat.dev is down (HTTP 525 since HH:MM, waited Ns); nothing ran"** = boat's own API was unreachable
+  (Cloudflare 520-526 or no answer), not your box. Before a run starts, offbox waits up to 600 s for it to come back
+  (`OFFBOX_OUTAGE_WAIT_SECONDS`, max 1800), prints a line every minute and retries by itself. Small commands that may
+  fall back locally don't wait. A run that already started keeps reattaching for up to 30 min of outage and keeps its
+  box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
+  shows `boat.dev: DOWN since ...` during one.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
@@ -207,19 +236,24 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 - Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
-- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it.
-- Go `package unsafe is not in std` or nested `/usr/local/go/go`: a half-swapped GOROOT; the next run repairs it under a box-local lock, verifies the replacement, and removes stale repair directories only after verification.
+- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it. Each repair first prints the old tree's state (`old tree manifest=missing|mismatch|ok`).
+- Go `package unsafe is not in std` or `build constraints exclude all Go files in /usr/local/go/src/...` while other go commands in the same run pass: a box read glitch seen on the first run after a resume, not your code and not a repair race (one run per box). offbox prints a hint and logs a `go_std_glitch` event; rerun the same command. A nested `/usr/local/go/go` is a half-swapped GOROOT; the next run repairs it under a box-local lock and verifies the replacement.
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
+- A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
+- Sync fails with rsync 23 `delete_file: unlink(...) failed: Permission denied (13)`: a container wrote root-owned files into the checkout on the box (LocalStack's `tmp/localstack`). offbox gives them back to the box user (`sudo chown -R`) and syncs once more by itself. If that fails too it exits 90 before your command and names the `offbox ssh <box> -- sudo chown ...` to run.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
   `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
-- Hung or weird box: `offbox release --delete`, then rerun (fresh lease from base/template).
+- Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
+  is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
+- Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
 - Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
-  Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready).
+  Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready). `offbox template
+  list` shows each template's state: kept (saved snapshot), box only (date boat deletes it) or EXPIRED.
 - **Changing offbox**: the source is the Robob fork, `/Volumes/ExternalSSD/t3code-fork/integrations/offbox/`
   (this skill is `skill/`, plus the gate plugin, `boat` wrapper and monitor plist). Never edit the live copy.
   Edit there, run its tests (README), commit, `git push origin HEAD:main`, then `integrations/offbox/install.zsh`.

@@ -239,6 +239,44 @@ it.effect("resizes a pool the board has, and only that", () =>
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("a pool command names the level when the model runs at several", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    const opus = board.defaultCardModel.model;
+    yield* kanban.setPool(
+      board.id,
+      { ...board.defaultCardModel, options: [{ id: "variant", value: "high" }] },
+      1,
+    );
+    const script = yield* register(
+      board,
+      scriptFile(
+        [
+          `echo '{"kanban":"pool","model":"${opus}","slots":2}'`,
+          `echo '{"kanban":"pool","model":"${opus}","variant":"high","slots":4}'`,
+          `echo '{"kanban":"pool","model":"${opus}","variant":"low","slots":4}'`,
+          "",
+        ].join("\n"),
+      ),
+    );
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+    const [done] = yield* scripts.runs(script.id, 1);
+    assert.include(done?.output, `The ${opus} pools run at xhigh, high; name the variant.`);
+    assert.include(done?.output, `Set the ${opus} pool to 4 slots.`);
+    assert.include(done?.output, `There's no ${opus} low pool on this board.`);
+    const levels = (yield* kanban.snapshot(board.id)).pools
+      .filter((pool) => pool.model.model === opus)
+      .map((pool) => [Rules.modelLevel(pool.model), pool.slots]);
+    assert.deepStrictEqual(levels, [
+      ["xhigh", 0],
+      ["high", 4],
+    ]);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("runs one at a time and says why a run went wrong", () =>
   Effect.gen(function* () {
     const scripts = yield* ScriptService.KanbanScripts;
@@ -547,10 +585,10 @@ it.effect("a script ticks its subtasks, hands one back and moves cards, waking t
     assert.notInclude(sent.join("\n"), "waiting on your subtasks");
 
     const againOut = yield* runScript("again", [
-      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"again"}`,
+      `{"kanban":"handback","card":${card.number},"subtask":"s2","note":"second-handback-note"}`,
     ]);
     assert.include(againOut, `Couldn't hand s2 on card #${card.number} back: subtask s2 isn't a script's`);
-    assert.strictEqual(sent.filter((text) => text.includes("again")).length, 0);
+    assert.strictEqual(sent.filter((text) => text.includes("second-handback-note")).length, 0);
   }).pipe(Effect.provide(makeTestLayer(recording)));
 });
 

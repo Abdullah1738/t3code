@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -238,7 +239,7 @@ class TriageTests(unittest.TestCase):
             calls.append(seconds)
             real(which, seconds, interval)
             if len(calls) == 1:
-                time.sleep(3)  # descheduled between arming and the call; the deadline (1 s) cuts this short
+                time.sleep(1.5)  # descheduled between arming and the call; macOS fires a 1 s timer at ~1.15 s
         with patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
              patch.object(t, 'classify', side_effect=AssertionError('the deadline came first')):
             hits, meta = t.classify_batch([self.item()], {}, 1)
@@ -835,6 +836,10 @@ class LiveWorkTests(unittest.TestCase):
 
 
 class SourceHealthTests(unittest.TestCase):
+    # Card #14: these tests mock subprocess.run, but a test run still needs the Telegram stub override to send.
+    def stub_telegram(self):
+        return patch.dict('os.environ', {'ROBOB_WATCH_TELEGRAM_CLI': '/nonexistent/telegram-stub.ts'})
+
     def runs(self, errors_per_run, start=10_000, step=300):
         state, due = {}, []
         for n, errors in enumerate(errors_per_run):
@@ -874,10 +879,22 @@ class SourceHealthTests(unittest.TestCase):
         t.track_health(state, {}, later + t.HEALTH_REALERT)
         self.assertNotIn('outlook', state['source_health'])
 
+    def test_a_test_run_never_calls_the_live_telegram_cli(self):
+        # Card #14: even in the live directory, a test-marked run refuses the Telegram notify and never spawns it.
+        state = {'health_pending': {'text': 'outlook down', 'key': 'k', 'sources': ['outlook']}}
+        env = {k: v for k, v in os.environ.items() if k not in ('ROBOB_WATCH_TELEGRAM_CLI', 'NODE_ENV', 'PYTEST_CURRENT_TEST')}
+        env['ROBOB_TEST'] = '1'
+        with patch.dict('os.environ', env, clear=True), patch.object(t.subprocess, 'run') as run:
+            out = t.send_health(state, ['outlook'], t.LIVE, 0)
+        run.assert_not_called()
+        self.assertIn('refused: test run', out.get('health_alert_error', ''))
+        self.assertIn('health_pending', state)
+
     def tick(self, state, wd, errors, now):
         due = t.track_health(state, errors, now)
         t.health_alert(state, due, now)
-        return t.send_health(state, due, wd, now)
+        with self.stub_telegram():
+            return t.send_health(state, due, wd, now)
 
     def test_a_live_run_sends_one_alert_and_retries_exactly_that_alert(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -887,7 +904,7 @@ class SourceHealthTests(unittest.TestCase):
             # The first send may have reached the bridge before it timed out.
             lost = t.subprocess.TimeoutExpired('bun', 4)
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
                 self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
                 self.assertNotIn('alerted_at', state['source_health']['gmail'])
                 # The next run counts another failure, but resends the same text under the same key.
@@ -912,7 +929,7 @@ class SourceHealthTests(unittest.TestCase):
             down = types.SimpleNamespace(returncode=1, stdout='', stderr='bridge down')
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
             both = {'outlook': 'x', 'gmail': 'y'}
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[down, down, sent, sent]) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[down, down, sent, sent]) as run:
                 self.assertIn('health_alert_error', self.tick(state, wd, both, 10_600))
                 self.assertIn('health_alert_error', self.tick(state, wd, both, 10_900))
                 # gmail is due now too, but the pending outlook alert goes out unchanged.
@@ -929,7 +946,7 @@ class SourceHealthTests(unittest.TestCase):
             wd = Path(tmp)
             state, _ = self.runs([{'outlook': 'x'}] * 2)
             down = types.SimpleNamespace(returncode=1, stdout='', stderr='409')
-            with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=down) as run:
+            with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=down) as run:
                 self.tick(state, wd, {'outlook': 'x'}, 10_600)
                 first = state['health_pending']['key']
                 self.tick(state, wd, {'outlook': 'x'}, 10_600 + t.HEALTH_REALERT)
@@ -965,6 +982,34 @@ class SourceHealthTests(unittest.TestCase):
             logs = [json.loads(line) for line in (wd / 'diagnostics/runs.jsonl').read_text().splitlines()]
             self.assertEqual([log.get('health_alerts_skipped') for log in logs], [None, None, ['outlook']])
             self.assertEqual(t.read_json(wd / 'cursor.json')['source_health']['outlook']['streak'], 3)
+
+    def prefs_context(self, prefs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / 'data').mkdir()
+        (home / 'data/prefs.md').write_text(prefs)
+        with patch.object(t, 'HOME', home), patch.object(t, 'DATA', home / 'data'):
+            return t.build_context([], [], time.time())
+
+    def test_context_keeps_middle_rules(self):
+        rules = [f'- rule {i:03d} ' + 'x' * 180 for i in range(50)]
+        rules[29] = '- MIDDLE RULE marker'
+        prefs = '\n'.join(rules)
+        self.assertGreater(len(prefs), 8000)
+        context = self.prefs_context(prefs)['preferences']
+        self.assertIn('MIDDLE RULE marker', context)
+        self.assertIn('- MIDDLE RULE marker\n', context)
+
+    def test_context_trims_only_past_limit(self):
+        prefs = 'FIRST LINE\n' + 'y' * 20000 + '\nLAST LINE'
+        context = self.prefs_context(prefs)['preferences']
+        self.assertIn('FIRST LINE', context)
+        self.assertIn('LAST LINE', context)
+        self.assertLessEqual(len(context), t.PREFS_LIMIT + 100)
+
+    def test_system_mentions_security_rotation(self):
+        self.assertIn('Security:', t.SYSTEM)
 
 
 if __name__ == '__main__':

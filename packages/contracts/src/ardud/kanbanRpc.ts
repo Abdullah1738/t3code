@@ -217,12 +217,24 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.cardDiscussion, CardRef, KanbanDiscussion),
   call(
     M.poolSet,
-    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection, slots: NonNegativeInt }),
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      model: ModelSelection,
+      /** Required unless `replaces` is set; then left out keeps the pool's slots. */
+      slots: Schema.optional(NonNegativeInt),
+      /** Key of the pool whose level changes to `model`'s; its open cards follow. */
+      replaces: Schema.optional(TrimmedNonEmptyString),
+    }),
     Schema.Array(KanbanPool),
   ),
   call(
     M.poolRemove,
-    Schema.Struct({ boardId: KanbanBoardId, model: ModelSelection }),
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      model: ModelSelection,
+      /** Key of the pool to remove; it names the pool even when `model` has no level. */
+      replaces: Schema.optional(TrimmedNonEmptyString),
+    }),
     Schema.Array(KanbanPool),
   ),
   call(

@@ -37,11 +37,24 @@ class Base(unittest.TestCase):
         fields.update(extra)
         return mc.add(self.data, case_id, at=when, root=self.root, **fields)
 
-    def check(self, now, run='r1', ack=True):
+    def check(self, now, run='r1', ack=True, delivered_at=None):
+        """One runner tick: build the event, ack the run, then deliver it.
+
+        The runner delivers at `delivered_at` (default: the same moment), so a test can delay delivery. A
+        delivered event raises `fires` and sets `last_fire_at` in state.json, which is what the check reads.
+        With ack=False nothing is delivered (the runner never took the event)."""
         event = mc.run_check(self.wd, run, self.data, self.root, at(now))
         if ack and event:
             (self.wd / '.run-ok').write_text(run)
+            self.deliver(delivered_at or now)
         return event
+
+    def deliver(self, when):
+        path = self.wd / 'state.json'
+        state = json.loads(path.read_text()) if path.exists() else {'fires': 0}
+        state['fires'] = int(state.get('fires', 0)) + 1
+        state['last_fire_at'] = at(when).isoformat(timespec='seconds')
+        path.write_text(json.dumps(state))
 
     def watcher(self, watcher_id, status, fires=1):
         folder = self.root / 'watchers' / watcher_id
@@ -69,7 +82,8 @@ class Book(Base):
         self.case()
         self.watcher('acme-reply', 'active')
         mc.update(self.data, 'acme', {'state': 'Acme replied', 'deadline': '2026-10-27'}, ['acme-reply'],
-                  note='support answered', at=at('2026-10-24T12:00'), root=self.root)
+                  note='support answered', because='Acme asked for a week', at=at('2026-10-24T12:00'),
+                  root=self.root)
         with self.assertRaises(mc.CaseError):
             mc.update(self.data, 'acme', {'state': 'Acme replied'})
         mc.close(self.data, 'acme', 'refund received', at=at('2026-10-26T10:00'))
@@ -97,16 +111,16 @@ class Pings(Base):
         event = self.check('2026-10-24T18:30')
         self.assertIn('Money cases: 1 need attention.', event)
         self.assertIn('acme: Acme AED 120.50: due Sun 25 Oct 18:00. Next: dispute on the card. Who: Abdullah', event)
-        self.assertEqual(self.check('2026-10-25T10:00', 'r2'), '')
-        late = self.check('2026-10-25T18:30', 'r3')
-        self.assertIn('OVERDUE since Sun 25 Oct 18:00', late)
+        self.assertEqual(self.check('2026-10-24T20:00', 'r2'), '')
+        # Overdue pings come once a day, on the day they are due.
+        self.assertIn('OVERDUE since Sun 25 Oct 18:00', self.check('2026-10-25T18:30', 'r3'))
         self.assertEqual(self.check('2026-10-25T21:00', 'r4'), '')
         self.assertIn('OVERDUE', self.check('2026-10-26T09:00', 'r5'))
 
     def test_new_deadline_rearms_and_closed_cases_stay_quiet(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, at=at('2026-10-24T11:00'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, because='owner said Wed', at=at('2026-10-24T11:00'))
         self.assertEqual(self.check('2026-10-24T12:00', 'r2'), '')
         self.assertIn('due Wed 28 Oct', self.check('2026-10-27T10:00', 'r3'))
         mc.close(self.data, 'acme', 'refunded')
@@ -136,7 +150,8 @@ class Pings(Base):
         self.assertNotIn('due', event)
         self.assertEqual(self.check('2026-10-24T11:00', 'r2'), '')
         self.watcher('live-reply', 'expired', fires=0)
-        self.assertIn('live-reply expired after 0 fire(s)', self.check('2026-10-24T12:00', 'r3'))
+        # One reminder a day, so the next ending goes out on the next day.
+        self.assertIn('live-reply expired after 0 fire(s)', self.check('2026-10-25T10:00', 'r3'))
         # Cleaning up a finished watcher with `robob-watch remove` is not a second ending.
         self.archive('host-reply')
         self.assertEqual(self.check('2026-10-24T13:00', 'r4'), '')
@@ -163,13 +178,28 @@ class Pings(Base):
     def sent(self):
         return json.loads((self.wd / 'pings.json').read_text())['sent']
 
+    def test_an_old_outbox_without_its_event_text_is_rebuilt(self):
+        # An outbox written before the event text was kept can't be matched to the runner's pending event.
+        self.case(deadline='2026-10-25')
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 3}))
+        (self.wd / 'pings.json').write_text(json.dumps({'sent': {}, 'outbox': {
+            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3, 'clock': {}}}))
+        self.assertIn('acme', self.check('2026-10-24T10:00', 'r1'))
+        self.assertEqual(self.check('2026-10-24T10:30', 'r2'), '')
+        self.assertIn('acme|r0|soon', self.sent())
+
     def test_unrecorded_output_is_rebuilt_before_new_work(self):
         self.case(deadline='2026-10-25')
         first = self.check('2026-10-24T10:00', 'r1', ack=False)
         self.assertTrue(first)
-        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), first)
+        # The runner never took it (no state.pending), so the r2 check rebuilds the event rather than holding it.
+        rebuilt = self.check('2026-10-24T10:15', 'r2', ack=False)
+        self.assertEqual(rebuilt, first)
         self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+        self.assertEqual(self.sent(), {})
+        # Once the runner takes it and delivers, the reminder is recorded as sent at its delivery time.
         (self.wd / '.run-ok').write_text('r2')
+        self.deliver('2026-10-24T10:20')
         self.assertEqual(self.check('2026-10-24T10:30', 'r3'), '')
         self.assertIn('acme|r0|soon', self.sent())
 
@@ -179,7 +209,7 @@ class Pings(Base):
         self.assertIn('bolt', self.check('2026-10-24T22:59', 'r1', ack=False))
         self.assertEqual(self.check('2026-10-24T23:15', 'r2', ack=False), '')
         mc.close(self.data, 'bolt', 'refunded')
-        mc.update(self.data, 'acme', {'deadline': '2026-10-30'}, at=at('2026-10-25T07:00'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-30'}, because='owner said Fri', at=at('2026-10-25T07:00'))
         self.assertEqual(self.check('2026-10-25T08:05', 'r3', ack=False), '')
         self.assertEqual(self.sent(), {})
 
@@ -188,16 +218,17 @@ class Pings(Base):
         (self.wd / 'state.json').write_text(json.dumps({'fires': 4}))
         self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
         # The runner saved its pending event, died before .run-ok, then delivered it after restart.
-        (self.wd / 'state.json').write_text(json.dumps({'fires': 5}))
+        self.deliver('2026-10-24T10:10')
         self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
         self.assertIn('acme|r0|soon', self.sent())
 
     def test_big_batches_stay_under_the_runner_limit_and_the_rest_follow(self):
         for n in range(80):
-            self.case(f'case-{n:02d}', merchant=f'Merchant {n:02d} ' + 'x' * 40, deadline='2026-10-25')
+            self.case(f'case-{n:02d}', merchant=f'Merchant {n:02d} ' + 'x' * 40, deadline='2026-10-25',
+                      reference=f'ref-{n:02d}')
         first = self.check('2026-10-24T10:00')
         self.assertLess(len(first), 6000)
-        self.assertIn('more need attention; they follow in the next check', first)
+        self.assertIn('more need attention; they follow in a later check', first)
         seen = first.count('\n- ')
         rest = ''
         for n in range(1, 10):
@@ -211,15 +242,16 @@ class Pings(Base):
         self.assertGreater(seen, 0)
 
     def test_one_case_with_many_endings_is_split_and_nothing_is_lost(self):
-        names = [f'reply-{n:02d}-' + 'w' * 30 for n in range(35)]
+        names = [f'reply-{n:02d}-' + 'w' * 32 for n in range(35)]
         for w in names:
             self.watcher(w, 'active')
         self.case(deadline='2026-11-01', watchers=names, merchant='Acme ' + 'é' * 70)
         for w in names:
             self.watcher(w, 'done', fires=2)
         mentioned, events = set(), []
+        # One reminder a case a day, so the overflow of each day follows on the next day.
         for n in range(10):
-            event = self.check(f'2026-10-24T1{n}:00', f'r{n}')
+            event = self.check(f'2026-10-{24 + n:02d}T10:00', f'r{n}')
             if not event:
                 break
             events.append(event)
@@ -231,7 +263,7 @@ class Pings(Base):
 
     def test_wide_characters_count_like_the_runner(self):
         for n in range(40):
-            self.case(f'case-{n:02d}', merchant='💸' * 40, deadline='2026-10-25')
+            self.case(f'case-{n:02d}', merchant='💸' * 40 + f'{n:02d}', deadline='2026-10-25')
         event = self.check('2026-10-24T10:00')
         self.assertLessEqual(mc.units(event), mc.EVENT_LIMIT)
         self.assertGreater(mc.units(event), len(event))
@@ -239,13 +271,16 @@ class Pings(Base):
     def test_going_back_to_an_earlier_deadline_or_reopening_pings_again(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00', 'r1'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, at=at('2026-10-24T10:30'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, because='owner: Mon', at=at('2026-10-24T10:30'))
         self.assertTrue(self.check('2026-10-25T10:00', 'r2'))
-        mc.update(self.data, 'acme', {'deadline': '2026-10-25'}, at=at('2026-10-24T10:30'))
-        self.assertIn('OVERDUE', self.check('2026-10-25T11:00', 'r3'))
+        mc.update(self.data, 'acme', {'deadline': '2026-10-25'}, because='owner: back to Sun', at=at('2026-10-24T10:30'))
+        # Moving the deadline re-arms the ping, but the day's one reminder already went out at 10:00.
+        self.assertEqual(self.check('2026-10-25T11:00', 'r3'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-26T09:00', 'r4'))
         mc.close(self.data, 'acme', 'refunded')
         mc.reopen(self.data, 'acme', '2026-10-25', 'refund bounced')
-        self.assertIn('OVERDUE', self.check('2026-10-25T12:00', 'r4'))
+        self.assertEqual(self.check('2026-10-26T12:00', 'r5'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-27T09:00', 'r6'))
 
     def test_card_numbers_and_codes_are_refused_and_never_printed(self):
         for bad in (dict(reference='card 4111 1111 1111 1111'), dict(state='OTP 482913 sent'),
@@ -323,11 +358,15 @@ class Pings(Base):
         self.case(deadline='2027-06-01', watchers=['host-reply'])
         self.watcher('host-reply', 'done', fires=3)
         self.assertIn('host-reply done', self.check('2026-10-24T10:00'))
-        self.case('later', deadline='2027-06-01')
+        self.case('later', merchant='Later Co', deadline='2027-06-01')
         book = json.loads((self.data / 'cases.json').read_text())
         book['cases'][1]['deadline'] = 'soon'
         (self.data / 'cases.json').write_text(json.dumps(book))
-        self.assertIn('later', self.check('2026-12-24T13:00', 'r2'))
+        # The 'later' case is first reminded when its deadline is near, not earlier. The acme watcher ending is
+        # still raised once, on this check, as the case is open.
+        event = self.check('2026-12-24T13:00', 'r2')
+        self.assertIn('acme', event)
+        self.assertIn('later', self.check('2027-06-01T10:00', 'r2b'))
         # Months later both keys are past the 60-day prune, but the case is still open on the same cycle.
         self.assertEqual(self.check('2027-03-01T10:00', 'r3'), '')
         self.assertEqual(self.check('2027-05-01T10:00', 'r4'), '')
@@ -344,6 +383,221 @@ class Pings(Base):
             r = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
                                env=env, capture_output=True, text=True, timeout=20)
         self.assertEqual((r.returncode, r.stdout), (75, ''))
+
+
+class Rules(Base):
+    """The 2026-10-25 fixes: deadline guard, one reminder a day, one yes/no, mail+SMS dedupe, released, unmatched."""
+
+    def test_deadline_change_without_a_reason_is_refused_and_changes_nothing(self):
+        self.case(deadline='2026-10-25')
+        before = mc.load(self.data)['cases'][0]
+        with self.assertRaises(mc.CaseError) as err:
+            mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, at=at('2026-10-24T10:00'))
+        self.assertIn('--because', str(err.exception))
+        after = mc.load(self.data)['cases'][0]
+        self.assertEqual((after['deadline'], after['rev'], after['history']),
+                         (before['deadline'], before['rev'], before['history']))
+
+    def test_deadline_change_with_because_is_recorded_in_history(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, because='Acme agreed to Wed',
+                      at=at('2026-10-24T10:00'))
+        self.assertEqual(c['deadline'], '2026-10-28')
+        self.assertIn('because: Acme agreed to Wed', c['history'][-1]['text'])
+        self.assertIn('deadline: 2026-10-28', c['history'][-1]['text'])
+
+    def test_deadline_change_with_his_reply_id_is_accepted_and_recorded(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'deadline': '2026-10-28'}, reply='msg-4471', at=at('2026-10-24T10:00'))
+        self.assertIn('owner reply msg-4471', c['history'][-1]['text'])
+
+    def test_other_field_edits_need_no_reason(self):
+        self.case(deadline='2026-10-25')
+        c = mc.update(self.data, 'acme', {'state': 'chasing'}, at=at('2026-10-24T10:00'))
+        self.assertEqual(c['state'], 'chasing')
+
+    def test_second_reminder_the_same_day_is_suppressed(self):
+        self.case(deadline='2026-10-25T18:00:00+04:00')
+        self.assertIn('due Sun 25 Oct 18:00', self.check('2026-10-24T18:00', 'r1'))
+        # A new ending from a reply watcher the same day is held until the next day.
+        self.assertEqual(self.check('2026-10-24T20:00', 'r2'), '')
+        self.assertIn('OVERDUE', self.check('2026-10-25T19:00', 'r3'))
+
+    def test_after_two_unanswered_days_exactly_one_yes_no_then_silence(self):
+        # Deadline inside the 24h window, so the first reminder is delivered 24 Oct and starts the clock.
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        seen = []
+        for day in range(24, 32):
+            event = self.check(f'2026-10-{day}T10:00', f'r{day}')
+            if 'Yes or no' in event:
+                seen.append(day)
+        self.assertEqual(seen, [26])
+        self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
+                              if '|ask|' in k]), 1)
+
+    def test_output_lost_before_the_runner_accepted_it_is_rebuilt_not_stuck(self):
+        # The check printed and wrote its outbox, then died before the runner saved state.pending: the
+        # runner never took it, state.json has no pending and fires never rose.
+        self.case(deadline='2026-10-25')
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        self.assertFalse((self.wd / 'state.json').exists())
+        # A later check must not stay silent forever: it drops the lost output and shows the reminder again.
+        event = self.check('2026-10-24T10:30', 'r2', ack=False)
+        self.assertIn('acme', event)
+        # Nothing is recorded as sent until a delivery is confirmed.
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text()).get('sent', {}), {})
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+
+    def test_a_pending_event_the_runner_owns_is_waited_for_not_rebuilt(self):
+        # The runner saved the event as its pending event, so it will deliver it: the check does not rebuild.
+        self.case(deadline='2026-10-25')
+        event = self.check('2026-10-24T10:00', 'r1', ack=False)
+        self.assertTrue(event)
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'pending': {'event': event, 'key': 'k'}}))
+        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+
+    def test_a_reminder_delivered_two_days_late_counts_from_delivery(self):
+        # Built 24 Oct 10:00, but the runner only delivers it on 26 Oct at 10:00 (a retry after an outage).
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        (self.wd / '.run-ok').write_text('r1')
+        self.deliver('2026-10-26T10:00')
+        # Delivery day 26 Oct: that is the one reminder for the day, so no second reminder today.
+        self.assertEqual(self.check('2026-10-26T11:00', 'r2'), '')
+        # The clock starts at delivery (26 Oct), so no yes/no on 27 Oct; it is due 28 Oct, two full days later.
+        self.assertNotIn('Yes or no', self.check('2026-10-27T10:00', 'r3'))
+        self.assertIn('Yes or no', self.check('2026-10-28T10:00', 'r4'))
+        pings = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(pings['clock']['acme']['at'], '2026-10-26T10:00:00+04:00')
+
+    def test_a_future_case_is_not_asked_before_its_first_reminder(self):
+        self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
+        for day in range(24, 28):
+            self.assertNotIn('Yes or no', self.check(f'2026-10-{day}T10:00', f'q{day}'))
+
+    def test_answering_restarts_the_yes_no_clock(self):
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.assertIn('due Sun 25 Oct', self.check('2026-10-24T10:00', 'r1'))
+        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r2'))
+        # His reply id is an owner answer: a fresh two-day clock starts from the next delivered reminder.
+        mc.update(self.data, 'acme', {'state': 'keep chasing'}, reply='msg-9001', at=at('2026-10-27T09:00'))
+        # The answer on 27 Oct restarts the clock from the first reminder after it (28 Oct), so the next
+        # yes/no is due 30 Oct, two days later. Nothing is asked in between.
+        self.assertNotIn('Yes or no', self.check('2026-10-28T10:00', 'r3'))
+        self.assertNotIn('Yes or no', self.check('2026-10-29T10:00', 'r4'))
+        self.assertIn('Yes or no', self.check('2026-10-30T10:00', 'r5'))
+        self.assertEqual(self.check('2026-10-31T10:00', 'r6'), '')
+
+    def test_reason_only_update_after_the_yes_no_leaves_the_case_quiet(self):
+        self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))
+        self.check('2026-10-24T10:00', 'r1')
+        self.assertIn('Yes or no', self.check('2026-10-26T10:00', 'r2'))
+        # The merchant asked for more time: a process, not him, so the case stays quiet.
+        mc.update(self.data, 'acme', {'deadline': '2026-12-15'}, because='merchant requested more time',
+                  at=at('2026-10-27T09:00'))
+        for day in range(28, 32):
+            self.assertNotIn('Yes or no', self.check(f'2026-10-{day}T10:00', f'q{day}'))
+        self.assertEqual(self.check('2026-11-20T10:00', 'q-later'), '')
+
+    def test_email_and_sms_of_the_same_charge_count_once(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        with self.assertRaises(mc.CaseError) as err:
+            self.case('boat-sms', merchant='Boat.dev ', amount='25', currency='usd', deadline='2026-11-10',
+                      charged='2026-10-25')
+        self.assertIn('boat-mail', str(err.exception))
+        mc.corroborate(self.data, 'boat-mail', 'boat.dev', '25', 'USD', '2026-10-25', 'charge',
+                       'SMS 10:45', at=at('2026-10-25T10:45'))
+        book = mc.load(self.data)['cases']
+        self.assertEqual([c['id'] for c in book], ['boat-mail'])
+        self.assertIn('seen again: SMS 10:45', book[0]['history'][-1]['text'])
+
+    def test_corroborate_refuses_a_different_charge(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        for args in (dict(amount='26'), dict(charged='2026-10-26'), dict(merchant='Other Co')):
+            with self.subTest(args=args), self.assertRaises(mc.CaseError):
+                base = dict(merchant='boat.dev', amount='25', currency='USD', charged='2026-10-25')
+                base.update(args)
+                mc.corroborate(self.data, 'boat-mail', base['merchant'], base['amount'], base['currency'],
+                               base['charged'], 'charge', 'SMS', at=at('2026-10-25T10:45'))
+
+    def test_two_real_same_day_charges_of_equal_value_both_stay(self):
+        self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='invoice 1001')
+        with self.assertRaises(mc.CaseError):
+            self.case('boat-b', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                      charged='2026-10-25', reference='invoice 1002')
+        mc.add(self.data, 'boat-b', 'boat.dev', '25.00', 'USD', 's', 'n', '2026-11-10', 'A',
+               charged='2026-10-25', reference='invoice 1002', distinct=True, at=at('2026-10-25T10:00'))
+        self.assertEqual(sorted(c['id'] for c in mc.load(self.data)['cases']), ['boat-a', 'boat-b'])
+
+    def test_cli_repeat_exits_zero_prints_the_existing_case_and_leaves_one(self):
+        self.case('boat-mail', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25', reference='email 09:13')
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), patch.object(mc, 'WATCH_ROOT', self.root), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = mc.main(['add', 'boat-sms', '--merchant', 'boat.dev', '--amount', '25', '--currency', 'USD',
+                            '--state', 's', '--next', 'n', '--deadline', '2026-11-10', '--who', 'A',
+                            '--charged', '2026-10-25', '--reference', 'sms 10:45', '--repeat', 'boat-mail'])
+        self.assertEqual((code, err.getvalue()), (0, ''))
+        self.assertIn('boat-mail: boat.dev USD 25', out.getvalue())
+        self.assertNotIn('boat-sms', out.getvalue())
+        self.assertEqual([c['id'] for c in mc.load(self.data)['cases']], ['boat-mail'])
+        self.assertIn('seen again', mc.load(self.data)['cases'][0]['history'][-1]['text'])
+
+    def test_a_hold_and_a_charge_of_the_same_amount_stay_apart(self):
+        self.case('shop-charge', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25')
+        self.case('shop-hold', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25', kind='hold')
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
+
+    def test_a_different_amount_or_day_is_a_different_charge(self):
+        self.case('boat-a', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        self.case('boat-b', merchant='boat.dev', amount='26.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-25')
+        self.case('boat-c', merchant='boat.dev', amount='25.00', currency='USD', deadline='2026-11-10',
+                  charged='2026-10-26')
+        self.assertEqual(len(mc.load(self.data)['cases']), 3)
+
+    def test_hold_that_drops_off_is_released_not_refunded(self):
+        self.case('hold-1', merchant='Talabat', amount='90.30', currency='AED', deadline='2026-11-05',
+                  charged='2026-10-25', kind='hold')
+        mc.close(self.data, 'hold-1', 'pre-auth dropped off', at=at('2026-10-27T10:00'))
+        c = mc.find(mc.load(self.data), 'hold-1')
+        self.assertEqual(c['history'][-1]['text'], 'released: pre-auth dropped off')
+        self.assertNotIn('refund', c['history'][-1]['text'])
+
+    def test_a_charge_is_closed_as_closed_not_released(self):
+        self.case('charge-1', merchant='Shop', amount='10', currency='AED', deadline='2026-11-05')
+        mc.close(self.data, 'charge-1', 'refund landed', at=at('2026-10-27T10:00'))
+        self.assertEqual(mc.find(mc.load(self.data), 'charge-1')['history'][-1]['text'], 'closed: refund landed')
+
+    def test_unmatched_charge_says_unmatched_and_is_never_named(self):
+        c = mc.add(self.data, 'talabat-2792', None, '90.30', 'AED', 'charge seen on 2792', 'ask owner', '2026-11-05',
+                   'Abdullah', unmatched=True, charged='2026-10-25', at=at('2026-10-25T10:00'))
+        self.assertEqual(c['merchant'], 'unmatched')
+        self.assertIn('unmatched', mc.table([c]))
+        self.assertNotIn('Talabat', mc.table([c]))
+
+    def test_unmatched_and_merchant_together_are_refused(self):
+        with self.assertRaises(mc.CaseError):
+            mc.add(self.data, 'x-1', 'Talabat', '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True)
+
+    def test_a_merchant_is_required_unless_unmatched(self):
+        with self.assertRaises(mc.CaseError):
+            mc.add(self.data, 'x-2', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A')
+
+    def test_unmatched_charges_are_never_treated_as_duplicates(self):
+        mc.add(self.data, 'u-1', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True,
+               charged='2026-10-25', at=at('2026-10-25T10:00'))
+        mc.add(self.data, 'u-2', None, '90.30', 'AED', 's', 'n', '2026-11-05', 'A', unmatched=True,
+               charged='2026-10-25', at=at('2026-10-25T11:00'))
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
 
 
 class Brief(Base):
@@ -401,9 +655,11 @@ class Questions(Base):
         return mc.load_questions(self.data)['questions']
 
     def follow(self, now, find, run='r1'):
+        # A delivered event is what counts (the runner's fires and last_fire_at), as in Base.check.
         event = mc.run_check(self.wd, run, self.data, self.root, at(now), find, nobody)
         if event:
             (self.wd / '.run-ok').write_text(run)
+            self.deliver(now)
         return event
 
     def test_a_merchant_he_pays_waits_then_two_asks_at_most_then_a_money_case(self):
@@ -619,6 +875,202 @@ class Questions(Base):
         code, msg = self.ask('2026-10-24T09:00', finder())
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('settled (his order)', msg)
+
+
+class CardSwap(Base):
+    def test_card_swap_rewrites_next_on_open_cases_naming_the_old_card(self):
+        self.case('stale', merchant='Shop 1', next_action='switch to 7572 once it clears')
+        self.case('acme', merchant='Shop 2', next_action='dispute on card 5542')
+        self.case('done', merchant='Shop 3', next_action='card 5542 charge')
+        mc.close(self.data, 'done', outcome='refunded')
+        changes = mc.card_swap(self.data, '5542', '2342', also=('7572',), at=at('2026-10-30T18:00'),
+                               cases=('stale', 'acme'))
+        self.assertEqual(sorted(c['id'] for c in changes), ['acme', 'stale'])
+        book = mc.load(self.data)
+        by_id = {c['id']: c for c in book['cases']}
+        self.assertEqual(by_id['stale']['next'], 'switch to 2342 once it clears')
+        self.assertEqual(by_id['acme']['next'], 'dispute on card 2342')
+        self.assertIn('card swap 5542->2342: next updated', by_id['acme']['history'][-1]['text'])
+        self.assertEqual(by_id['done']['next'], 'card 5542 charge')
+        self.assertEqual(by_id['done']['status'], 'closed')
+        self.assertEqual(by_id['done']['history'][-1]['text'], 'closed: refunded')
+
+    def test_dry_run_writes_nothing(self):
+        self.case('acme', merchant='Shop 4', next_action='dispute on card 5542')
+        before = mc.load(self.data)
+        changes = mc.card_swap(self.data, '5542', '2342', dry_run=True)
+        self.assertEqual(changes[0]['after'], 'dispute on card 2342')
+        self.assertEqual(mc.load(self.data), before)
+
+    def test_case_naming_old_card_only_in_state_is_listed_with_after_none(self):
+        self.case('acme', merchant='Shop 5', state='card 5542 declined', next_action='dispute on the card')
+        changes = mc.card_swap(self.data, '5542', '2342', cases=())
+        self.assertEqual(changes, [{'id': 'acme', 'before': 'dispute on the card', 'after': None}])
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on the card')
+
+    def test_four_digit_token_inside_a_longer_number_is_not_replaced(self):
+        self.case('acme', merchant='Shop 6', reference='ORD-155420', next_action='dispute on card 5542')
+        self.case('other', merchant='Shop 7', reference='ORD-155420', next_action='wait for refund')
+        changes = mc.card_swap(self.data, '5542', '2342', cases=('acme',))
+        self.assertEqual([c['id'] for c in changes], ['acme'])
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 2342')
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['reference'], 'ORD-155420')
+
+    def test_bad_last4_is_refused(self):
+        self.case('acme', merchant='Shop 8', next_action='dispute on card 5542')
+        with self.assertRaisesRegex(mc.CaseError, 'exactly the last 4 digits'):
+            mc.card_swap(self.data, '5542', '23421')
+        with self.assertRaisesRegex(mc.CaseError, 'exactly the last 4 digits'):
+            mc.card_swap(self.data, '5542', '2342', also=('75',))
+
+    def test_rejected_last4_never_echoes_the_value(self):
+        full = '4242424242424242'
+        cases_argv = {
+            '--old': ['card-swap', '--old', full, '--new', '2342'],
+            '--new': ['card-swap', '--old', '5542', '--new', full],
+            '--also': ['card-swap', '--old', '5542', '--new', '2342', '--also', full],
+        }
+        for flag, argv in cases_argv.items():
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+                self.assertEqual(mc.main(argv), 2)
+            self.assertNotIn(full, err.getvalue() + out.getvalue(), flag)
+            self.assertIn('exactly the last 4 digits', err.getvalue())
+        with self.assertRaises(mc.CaseError) as ctx:
+            mc.card_swap(self.data, full, '2342')
+        self.assertNotIn(full, str(ctx.exception))
+
+    def test_card_swap_output_redacts_full_card_numbers_in_dry_run_and_write(self):
+        full = '4242 4242 4242 4242'
+        self.case('acme', next_action='dispute on card 5542')
+        self.case('ref', merchant='Other Shop', next_action='dispute on card 5542')
+        # A hand-edited book can hold a card number in next, which add() would refuse.
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        for case in book['cases']:
+            if case['id'] == 'acme':
+                case['next'] = f'dispute {full} on card 5542'
+            else:
+                case['id'] = f'ref-{full.replace(" ", "")}'
+                case['state'] = 'card 5542 flagged'
+        path.write_text(json.dumps(book))
+        for dry in (True, False):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
+            text = out.getvalue()
+            self.assertNotIn('4242', text.replace('[card number removed]', ''), f'dry={dry}')
+            self.assertNotIn(full.replace(' ', ''), text, f'dry={dry}')
+            self.assertIn('[card number removed]', text, f'dry={dry}')
+            self.assertIn('2342', text, f'dry={dry}')
+
+    def test_grouped_full_number_containing_the_old_last4_is_masked_after_the_swap(self):
+        # 4242 5542 4242 0004 is Luhn-valid and has a group equal to the old last-4: the swap alone would make
+        # it fail the Luhn check, so the display text must be redacted before the rewrite.
+        full = '4242 5542 4242 0004'
+        self.case('acme', next_action='dispute on card 5542')
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        book['cases'][0]['next'] = f'pay {full} then 5542'
+        path.write_text(json.dumps(book))
+        for dry in (True, False):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
+            text = out.getvalue()
+            for leaked in ('4242554242420004', '4242 5542 4242 0004', '4242 2342 4242 0004', '4242 2342'):
+                self.assertNotIn(leaked, text, f'dry={dry}')
+            self.assertIn("'pay [card number removed] then 5542' holds a card number or code", text, f'dry={dry}')
+
+    def test_a_next_line_holding_a_full_number_is_left_as_stored_and_later_reads_stay_masked(self):
+        # Rewriting a group of 4242 5542 4242 0004 would store a number that fails the Luhn check, so show,
+        # list --json and the watcher would print it. The row is left as is; the other open case still moves.
+        full = '4242 5542 4242 0004'
+        self.case('acme', next_action='dispute on card 5542')
+        self.case('other', merchant='Shop 2', next_action='retry on 5542')
+        path = self.data / 'cases.json'
+        book = json.loads(path.read_text())
+        book['cases'][0]['next'] = f'pay {full} then 5542'
+        path.write_text(json.dumps(book))
+        out = io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+            mc.main(['card-swap', '--old', '5542', '--new', '2342', '--case', 'other'])
+        self.assertIn('1 case(s) updated', out.getvalue())
+        stored = mc.load(self.data)
+        self.assertEqual(mc.find(stored, 'acme')['next'], f'pay {full} then 5542')
+        self.assertEqual([h['text'] for h in mc.find(stored, 'acme')['history'] if 'card swap' in h['text']], [])
+        self.assertEqual(mc.find(stored, 'other')['next'], 'retry on 2342')
+        for args in (['show', 'acme'], ['list', '--json']):
+            out = io.StringIO()
+            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+                mc.main(args)
+            for leaked in ('4242 5542 4242 0004', '4242 2342 4242 0004', '4242554242420004', '4242234242420004'):
+                self.assertNotIn(leaked, out.getvalue(), args)
+
+    def test_cli_card_swap_prints_moves_and_dry_run_says_would_update(self):
+        self.case('acme', merchant='Shop 9', next_action='dispute on card 5542')
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(mc.main(['card-swap', '--old', '5542', '--new', '2342', '--case', 'acme', '--dry-run']), 0)
+        self.assertIn("acme: next 'dispute on card 5542' -> 'dispute on card 2342'", out.getvalue())
+        self.assertIn('1 case(s) would update', out.getvalue())
+        self.assertEqual(mc.find(mc.load(self.data), 'acme')['next'], 'dispute on card 5542')
+
+    def run_card_swap(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+            code = mc.main(['card-swap', '--old', '5542', '--new', '2342', *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_without_case_nothing_is_written(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('b', merchant='Shop B', next_action='retry on 5542')
+        path = self.data / 'cases.json'
+        before, st = path.read_bytes(), path.stat()
+        with patch.object(mc, 'write_json', wraps=mc.write_json) as write:
+            code, out, _ = self.run_card_swap()
+        self.assertEqual(code, 0)
+        write.assert_not_called()
+        after = path.stat()
+        self.assertEqual((path.read_bytes(), after.st_ino, after.st_mtime_ns), (before, st.st_ino, st.st_mtime_ns))
+        self.assertIn("a: next 'retry on 5542' -> 'retry on 2342'", out)
+        self.assertIn("b: next 'retry on 5542' -> 'retry on 2342'", out)
+        self.assertIn('2 case(s) would change; nothing written', out)
+
+    def test_case_writes_only_the_picked_cases(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('b', merchant='Shop B', next_action='retry on 5542')
+        code, out, _ = self.run_card_swap('--case', 'a')
+        self.assertEqual(code, 0)
+        book = mc.load(self.data)
+        self.assertEqual(mc.find(book, 'a')['next'], 'retry on 2342')
+        self.assertIn('card swap 5542->2342: next updated', mc.find(book, 'a')['history'][-1]['text'])
+        self.assertEqual(mc.find(book, 'b')['next'], 'retry on 5542')
+        self.assertEqual([h for h in mc.find(book, 'b')['history'] if 'card swap' in h['text']], [])
+        self.assertIn("b: next 'retry on 5542' -> 'retry on 2342' (not picked)", out)
+        self.assertIn('1 case(s) updated', out)
+
+    def test_a_case_with_nothing_to_swap_is_refused_and_nothing_is_written(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        self.case('c', merchant='Shop C', next_action='retry on 5542')
+        self.case('d', merchant='Shop D', state='card 5542 declined', next_action='retry later')
+        mc.close(self.data, 'c', outcome='refunded')
+        before = (self.data / 'cases.json').read_bytes()
+        for pick in ('c', 'd', 'nope'):
+            code, _, err = self.run_card_swap('--case', pick, '--case', 'a')
+            self.assertEqual(code, 2, pick)
+            self.assertIn('has nothing to swap', err, pick)
+            self.assertEqual((self.data / 'cases.json').read_bytes(), before, pick)
+
+    def test_dry_run_with_case_writes_nothing(self):
+        self.case('a', merchant='Shop A', next_action='retry on 5542')
+        before = (self.data / 'cases.json').read_bytes()
+        with patch.object(mc, 'write_json', wraps=mc.write_json) as write:
+            code, out, _ = self.run_card_swap('--case', 'a', '--dry-run')
+        self.assertEqual(code, 0)
+        write.assert_not_called()
+        self.assertEqual((self.data / 'cases.json').read_bytes(), before)
+        self.assertIn('1 case(s) would update', out)
 
 
 class Cli(Base):

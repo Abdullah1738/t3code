@@ -205,13 +205,19 @@ const CardMove = tool(
 const CardAsk = tool(
   "card_ask",
   "Ask the owner",
-  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick.",
+  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick; multi lets him tick several.",
   {
     card: Schema.optional(CardRef),
     question: Schema.String,
     blocking: Schema.optional(Schema.Boolean),
     options: Schema.optional(
       describe(Schema.Array(Schema.String), "Answers to pick from, when they are known."),
+    ),
+    multi: Schema.optional(
+      describe(
+        Schema.Boolean,
+        "With options: let the owner tick several (a checklist). Default: one pick.",
+      ),
     ),
   },
   { card: Record },
@@ -300,7 +306,7 @@ const WikiRead = tool(
 const CardCreate = tool(
   "card_create",
   "Create a card",
-  "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; from an evaluator it is the packet (scope, files, steps, tests, when it's done). A card a thread makes without assignToSelf waits for an evaluator to write its packet. Title and description are written for you when left out.",
+  "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; from an evaluator it is the packet (scope, files, steps, tests, when it's done). A card a thread makes without assignToSelf waits for an evaluator to write its packet. Title and description are written for you when left out. Refused when an open card on the board has the same title or the same source link (not card, PR or Linear links).",
   {
     prompt: Schema.String,
     assignToSelf: Schema.optional(
@@ -399,11 +405,11 @@ const SubtaskDone = tool(
 
 const CardThread = tool(
   "card_thread",
-  "Steer, stop or wake a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), or wake its last work thread with text.",
+  "Steer, stop, wake or reset a card thread",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
   {
     card: CardRef,
-    action: Schema.Literals(["steer", "stop", "wake"]),
+    action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
   },
   { card: Record },
@@ -414,7 +420,16 @@ const PoolSet = tool(
   "pool_set",
   "Set a model pool",
   "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
-  { model: ModelInput, slots: NonNegativeInt },
+  {
+    model: ModelInput,
+    slots: Schema.optional(NonNegativeInt),
+    replaces: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Key of the pool to move to this model's level (board_get pools); its open cards follow. Leave out slots to keep its count.",
+      ),
+    ),
+  },
   { pools: Records },
   { readonly: false },
 );
@@ -496,7 +511,7 @@ const BoardOpen = tool(
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
-  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text.",
+  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
   {
     boardId: TrimmedNonEmptyString,
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),

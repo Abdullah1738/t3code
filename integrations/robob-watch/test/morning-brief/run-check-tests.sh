@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Six check.sh cases against temp health.db / cards dir / WATCH_DIR. Never touches live state.
+# Twelve check.sh cases against temp health.db / cards dir / WATCH_DIR. Never touches live state.
 set -u
 HERE=${0:A:h}
 CHECK=${CHECK_SH:-$HERE/../../../../tmp/robob-board/morning-brief/watchers/whoop-recovery-card/check.sh}
@@ -35,6 +35,9 @@ add_sleep() {  # $1 db; $2 created_at; $3 start; $4 end; $5 nap (true|false)
 }
 add_recovery() {  # $1 db; $2 created_at (scored today)
   sqlite3 "$1" "insert into whoop_recovery values ('{\"score_state\":\"SCORED\",\"created_at\":\"$2\"}');"
+}
+add_cycle() {  # $1 db; $2 start_utc; $3 timezone_offset
+  sqlite3 "$1" "create table if not exists whoop_cycles(cycle_id integer primary key, start_utc text, timezone_offset text); insert into whoop_cycles(start_utc, timezone_offset) values ('$2','$3');"
 }
 EP_1230=$(/bin/date -j -u -f "%Y-%m-%dT%H:%M:%S" "2026-10-28T08:30:00" +%s)  # 12:30 Dubai
 
@@ -92,7 +95,21 @@ o4=$(run $c 2026-10-28T13:00 $((EP_1230+1800)))
 c=$T/c10; setup_bare $c
 add_sleep $c/health.db 2026-10-28T04:00:00.000Z 2026-10-27T20:00:00.000Z 2026-10-28T04:00:00.000Z false
 o=$(run $c 2026-10-28T12:30 $EP_1230)
-[[ $o == NO_RECOVERY_TODAY* && -f $c/watch/norec-2026-10-28 ]] && ok "10 non-nap sleep fires no-recovery" || bad "10" "[$o]"
+[[ $o == NO_RECOVERY_TODAY* && -f $c/watch/norec-2026-10-28 && $o != *travel* ]] && ok "10 non-nap sleep fires no-recovery, no travel without cycles" || bad "10" "[$o]"
+
+# 11. same as 10, plus a non-Dubai cycle from the last two days: the line says travel
+c=$T/c11; setup_bare $c
+add_sleep $c/health.db 2026-10-28T04:00:00.000Z 2026-10-27T20:00:00.000Z 2026-10-28T04:00:00.000Z false
+add_cycle $c/health.db 2026-10-27T22:00:00.000Z +01:00
+o=$(run $c 2026-10-28T12:30 $EP_1230)
+[[ $o == NO_RECOVERY_TODAY* && $o == *"Send Abdullah one line: No recovery score today (travel cycle)."* ]] && ok "11 non-Dubai cycle gives travel line" || bad "11" "[$o]"
+
+# 12. same as 10, cycle on Dubai's +04:00: plain line, no travel
+c=$T/c12; setup_bare $c
+add_sleep $c/health.db 2026-10-28T04:00:00.000Z 2026-10-27T20:00:00.000Z 2026-10-28T04:00:00.000Z false
+add_cycle $c/health.db 2026-10-27T22:00:00.000Z +04:00
+o=$(run $c 2026-10-28T12:30 $EP_1230)
+[[ $o == NO_RECOVERY_TODAY* && $o == *"Send Abdullah one line: No recovery score today."* && $o != *travel* ]] && ok "12 Dubai-only cycles give plain line" || bad "12" "[$o]"
 
 echo "check.sh: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

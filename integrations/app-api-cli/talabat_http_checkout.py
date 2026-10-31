@@ -20,6 +20,7 @@ import urllib.request
 import uuid
 import zlib
 
+import order_card
 import talabat_auth as auth
 import talabat_checkout as shared
 import talabat_http_orders as orders
@@ -387,7 +388,7 @@ class CardSelection:
 
 
 def select_payment(config, saved_card):
-    """Explicit saved5542 Talabat route; preserve async instrument and intervals."""
+    """Explicit saved order-card Talabat route; preserve async instrument and intervals."""
     shared.select_card({'data': [saved_card]})
     if type(config) is not dict or type(config.get('paymentMethods')) is not list:
         fail('PAYMENT_CONFIG_INVALID')
@@ -401,12 +402,12 @@ def select_payment(config, saved_card):
         if type(card) is dict and card.get('cardId') == saved_card['tokenId']:
             matches.append(row)
     if len(matches) != 1:
-        fail('EXACT_SAVED5542_ROUTE_NOT_UNIQUE')
+        fail('EXACT_SAVED_CARD_ROUTE_NOT_UNIQUE')
     row = matches[0]; events = row['events']; event = events['payment']
     if row.get('isEnabled') is not True or row.get('paymentMode') is not None:
         fail('PAYMENT_MODE_OR_ENABLED_UNSUPPORTED')
-    if not isinstance(row.get('title'), str) or not re.search(r'(?<![0-9])5542(?![0-9])', row['title']):
-        fail('SAVED5542_TITLE_MISMATCH')
+    if not isinstance(row.get('title'), str) or not re.search(rf'(?<![0-9]){order_card.LAST4}(?![0-9])', row['title']):
+        fail('SAVED_CARD_TITLE_MISMATCH')
     if set(events) - {'prePayment', 'selected', 'payment', 'postPayment'}:
         fail('PAYMENT_EVENTS_UNSUPPORTED')
     for key in ('prePayment', 'selected', 'postPayment'):
@@ -1377,7 +1378,7 @@ def project_quote(quote):
     review = {'app': 'talabat', 'vertical': quote.cart.store.vertical, 'branch_id': quote.cart.store.branch_id,
             'currency': quote.currency, 'payable_minor': quote.amount_minor,
             'item_rows': len(quote.cart.items), 'quantity': sum(x.quantity for x in quote.cart.items),
-            'home': 'Banyantree 2104', 'card_last4': '5542' if quote.selection else None,
+            'home': 'Banyantree 2104', 'card_last4': order_card.LAST4 if quote.selection else None,
             'quiet_selected': json.loads(quote.body).get('deliveryInstructions') == list(quote.instruction_ids),
             'tip': False, 'subscription': False, 'wallet': False, 'save_preferences': False,
             'payment_platform_type': None if quote.selection is None else json.loads(quote.selection.event)['platformType'],

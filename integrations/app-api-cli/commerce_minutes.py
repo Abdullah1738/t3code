@@ -1,4 +1,5 @@
 """Journalled Minutes native operations with response-cookie lifecycle binding."""
+import order_card
 import datetime as dt
 import hashlib
 import json
@@ -182,7 +183,7 @@ def _driver_note_extra(extra):
 
 def _scope_hash(skus, home, extra, use_current_cart=False):
     """Scope digest; optional keys are included only when set, so existing flows keep their digest."""
-    scope={'skus':skus,'home':home,'card':'5542','quiet':True,'extras':False}
+    scope={'skus':skus,'home':home,'card':order_card.LAST4,'quiet':True,'extras':False}
     if extra is not None:
         scope['note']=extra
     if use_current_cart:
@@ -433,7 +434,7 @@ class MinutesFlow:
 
     def approve(self):
         snapshot=self.current
-        card=m.saved_card_5542(self.client.payment_cards(timeout=25).wire)
+        card=m.saved_order_card(self.client.payment_cards(timeout=25).wire)
         p=snapshot.projection;wire=snapshot.wire
         fee_keys={'orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
                   'orderPaymentFee','orderCodFee','orderBulkyOrderFee','orderConvenienceFee','orderLateNightFee'}
@@ -453,7 +454,7 @@ class MinutesFlow:
         self.card=card
         _,gifts=m.review_manifest(p['lines'],self.skus)
         return {'payable_minor':p['total_minor'],'subtotal_minor':p['subtotal_minor'],'fees':fees,
-                'card_last4':'5542','home':'Banyantree2104','quiet':True,'review_hash':digest,
+                'card_last4':order_card.LAST4,'home':'Banyantree2104','quiet':True,'review_hash':digest,
                 'quiet_codes_set':list(required),'quiet_codes_not_offered':not_offered,
                 'driver_note':self.driver_note,
                 'cvv_required':self.review['cvv_required'],
@@ -538,7 +539,7 @@ class MinutesFlow:
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
             header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
             home_provider=self._fresh_home)
-        self.card=m.saved_card_5542(self.client.payment_cards(timeout=25).wire)
+        self.card=m.saved_order_card(self.client.payment_cards(timeout=25).wire)
         if (self.current.projection['payment']['token_ref']!=m.fingerprint(self.card.token)
                 or self.current.projection['total_minor']!=self.review['amount']):
             j.fail('MINUTES_PAYMENT_CONTEXT_CHANGED')

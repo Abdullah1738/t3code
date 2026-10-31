@@ -41,7 +41,7 @@ class FreshReviewTests(unittest.TestCase):
         self.assertEqual(r.journal.review_digest(review), frozen.digest)
         self.assertEqual(review['payable_minor'],3014)
         safe = r.project_review(frozen, now=1005, now_monotonic=2005)
-        self.assertEqual(safe['card_last4'],'5542')
+        self.assertEqual(safe['card_last4'],'2342')
         self.assertEqual(safe['quantity'],1)
         self.assertTrue(safe['local_consistency_verified'])
         for key in ('owner_authorization_verified','fresh_server_provenance_verified',

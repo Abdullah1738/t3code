@@ -346,7 +346,7 @@ class OrderUseCurrentCartTests(CartTestBase):
 
     def test_digest_without_flag_equals_old_dict_digest(self):
         skus = c.m._skus([{'sku': 'SKU_A', 'qty': 1, 'modifiers': []}])
-        old = j.digest({'skus': skus, 'home': 'HOME', 'card': '5542', 'quiet': True, 'extras': False})
+        old = j.digest({'skus': skus, 'home': 'HOME', 'card': '2342', 'quiet': True, 'extras': False})
         self.assertEqual(c._scope_hash(skus, 'HOME', None), old)
         self.assertEqual(c._scope_hash(skus, 'HOME', None, False), old)
         self.assertNotEqual(c._scope_hash(skus, 'HOME', None, True), old)

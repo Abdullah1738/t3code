@@ -35,7 +35,7 @@ class ReviewTests(unittest.TestCase):
         self.cart = {'basket': [deepcopy(self.item)]}
         self.session = {'deliveries': [{'products': [deepcopy(self.item)]}],
             'destination': {'code':'home-code', 'key':'home-key'},
-            'pay': {'method':'cc', 'token':'saved-token', 'mask':'****5542', 'kind':'mastercard'},
+            'pay': {'method':'cc', 'token':'saved-token', 'mask':'****2342', 'kind':'mastercard'},
             'money': {'ccy':'AED', 'subtotal':'20', 'due':'22.50',
                       'fees':[{'id':'shipping', 'amount':'2.50'}], 'discount':0, 'tip':0, 'wallet':0},
             'subscribe':False, 'addons':[],
@@ -45,7 +45,7 @@ class ReviewTests(unittest.TestCase):
         self.home = {'account_ref':'a'*64, 'address_ref':'b'*64, 'address_code':'home-code',
                      'address_key':'home-key', 'title':'Home 2104', 'street_address':'BanyanTree Hillside',
                      'lat':250778251, 'lng':551569039, 'observed_at':990}
-        self.card = dict(token='saved-token', mask='****5542', card_type='mastercard', observed_at=990)
+        self.card = dict(token='saved-token', mask='****2342', card_type='mastercard', observed_at=990)
         self.manifest = (r.Item('offer-1', 'vanilla', 2, 'seller-1', 'fulfillment-1', 2000),)
         self.quiet = tuple(r.QuietOption(s, c, active, 'synthetic semantics only') for s,c,active in
                            [('leave_at_door','door',True), ('no_bell','bell',False), ('no_call','call',False)])

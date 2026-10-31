@@ -4,6 +4,7 @@ The dataclasses below are an INTERNAL contract, not an inferred Noon wire schema
 No checkout/cart/payment/cancellation write can be dispatched by this module.
 Tracking modules remain independent and unchanged. See NOON-CHECKOUT.md.
 """
+import order_card
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
@@ -290,7 +291,7 @@ def validate_quote(quote, home, expected_items, *, now, max_age=60):
     _require(sum(l.total_minor for l in quote.items) + sum(v for _, v in quote.adjustments)
              == quote.total_minor, 'FINAL_TOTAL_MISMATCH')
     pay = quote.payment
-    _require(type(pay) is Payment and pay.method == 'saved_card' and pay.last4 == '5542'
+    _require(type(pay) is Payment and pay.method == 'saved_card' and pay.last4 == order_card.LAST4
              and pay.network == 'mastercard' and _hash(pay.selected_card_ref), 'CARD_MISMATCH')
     _require(type(pay.credits_minor) is int and pay.credits_minor == 0
              and _integer(pay.card_charge_minor) and pay.card_charge_minor == quote.total_minor,
@@ -386,7 +387,7 @@ def readiness(service):
     return {'service': service, 'ready_to_order': False, 'mutations_enabled': False,
             'account_read': 'verified_whoami_get', 'cart_read': 'not_enabled',
             'missing': ['cart_namespace_and_complete_manifest', 'checkout_wire_schema',
-                        'saved_home_on_cart', 'selected_card_5542_and_payment_challenge',
+                        'saved_home_on_cart', 'selected_order_card_and_payment_challenge',
                         'quiet_controls_and_text_readback', 'all_prices_fees_and_final_total',
                         'server_quote_binding_and_expiry', 'server_idempotency_and_reconcile',
                         'exact_order_cancellation_eligibility']}

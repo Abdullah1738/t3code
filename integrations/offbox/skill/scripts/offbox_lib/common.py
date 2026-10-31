@@ -33,15 +33,22 @@ TZ = ZoneInfo("Asia/Dubai")
 EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
+EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
 RUN_TTL_S = 30 * 60            # ttl while a run is in progress, refreshed every TTL_REFRESH_S
-TTL_REFRESH_S = 10 * 60
+# With RUN_TTL_S an attached box survives a ~25 min boat API outage (refresh well inside the 30 min deadline).
+TTL_REFRESH_S = 5 * 60
+TTL_RETRY_S = 30                # retry soon after a failed refresh
 ARCHIVED_DELETE_S = 7 * 86400  # delete a lease 7 days after its thread is archived
 UNUSED_DELETE_S = 30 * 86400   # delete an unpinned lease unused for 30 days
 BASES_SOFT_LIMIT = 50
+DATA_KEEP_S = 14 * 86400       # boat deletes a stopped box's data this long after its last stop
+KEEPALIVE_S = 12 * 86400       # resume + stop a box that must survive, once it has been stopped this long
 SIZES = ("small", "default", "large", "xlarge")
 TEMPLATES = ("crpko-go", "crpko-node", "crpko-harness", "generic")
+TOO_BIG_NOTE = "too-big:"        # leases.note prefix: a stopped box whose disk outgrew its machine size
+DEAD_MOUNT_NOTE = "dead-mount:"  # leases.note prefix: a box whose home filesystem died (ENOTCONN); stopped, out of the pool
 
 
 def now() -> float:
@@ -99,23 +106,45 @@ def log(msg: str) -> None:
         f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
+def silence(stream) -> None:
+    """Point a dead output descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
+    again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(fd, stream.fileno())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _emit(text: str) -> None:
+    # The caller's pipe can close first (tool timeout, | head); progress lines are best effort.
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except (BrokenPipeError, ValueError):
+        silence(sys.stderr)
+
+
 def say(msg: str) -> None:
     """Progress line for the human/agent, always on stderr so stdout stays the command's."""
-    print(f"offbox: {msg}", file=sys.stderr, flush=True)
+    _emit(f"offbox: {msg}")
 
 
 def warn_loud(msg: str) -> None:
     bar = "!" * 78
-    print(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n", file=sys.stderr, flush=True)
+    _emit(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n")
 
 
 class OffboxError(Exception):
     """Raised for failures; code 90 = infra (fallback allowed), 91 = cap, 92 = pool busy, 2 = usage."""
 
-    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False):
+    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False, outage: bool = False):
         super().__init__(msg)
         self.code = code
         self.started = started   # True once the remote command may have started (no local fallback then)
+        self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
 def die(msg: str, code: int = 2):
@@ -174,9 +203,16 @@ def db() -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
-    for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER"):
+    for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
+                "client_pid INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
+    for table in ("templates", "bases"):
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for col in ("saved TEXT", "expired_at REAL"):
+            if col.split()[0] not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     return con
 
 
@@ -224,6 +260,22 @@ def file_lock(name: str, timeout: float = 600):
     finally:
         fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
+
+
+def offsets_path(log_path: Path) -> Path:
+    return Path(str(log_path) + ".offsets")
+
+
+def checkpoint(log_path: Path | None) -> dict | None:
+    """The last committed checkpoint of a local log (remote stream offsets and the log length they match), or None
+    when there is no log or the run never committed one. Shared by `runs` (writer) and `misc` (takeover reader)."""
+    if not log_path:
+        return None
+    d = read_json(offsets_path(Path(log_path)), None)
+    if not isinstance(d, dict) or d.get("logBytes") is None:
+        return None
+    return {"stdoutOffset": int(d.get("stdoutOffset") or 0), "stderrOffset": int(d.get("stderrOffset") or 0),
+            "logBytes": int(d["logBytes"])}
 
 
 def atomic_write_json(path: Path, data) -> None:

@@ -200,6 +200,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     });
     const delivery = new Delivery(chat.store, transport, {
       projectScope, chatGuid: () => chat.info.key,
+      statuses: since => transport.outboundStatuses(since),
       beforeSend: async item => router.beforeSend(item),
       enabled: () => ready() && !chat.controlsPending && !stopping, log,
       // Outage alerts only for the owner's chat; other chats must not page the owner per message.

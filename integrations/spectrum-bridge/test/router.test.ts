@@ -75,7 +75,12 @@ class Backend extends OpenChamber {
     this.reads.push(["messages", id, directory]);
     return this.messagesBehavior ? this.messagesBehavior() : this.records;
   }
-  override async statuses() { this.reads.push(["statuses"]); return this.states; }
+  /** Sessions waiting on background work with no child session (Robob's `waiting`): idle to statuses(), blocked for a reset. */
+  waitingRoots = new Set<string>();
+  async resetBlocked(id: string) { return this.waitingRoots.has(id); }
+  /** Runs during an awaited status read, so a test can inject an arrival mid-preparation. */
+  onStatuses?: () => void;
+  override async statuses() { this.reads.push(["statuses"]); this.onStatuses?.(); return this.states; }
   titles: Record<string, string> = {};
   override async getSession(id: string, directory: string) {
     this.reads.push(["session", id, directory]);
@@ -4112,6 +4117,404 @@ test("if the agent can't reset yet, its one-line reason reaches the owner", asyn
   h.backend.final("Can't start fresh yet, the audit is still running.");
   await h.router.tick();
   expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual([["Can't start fresh yet, the audit is still running.", undefined]]);
+});
+
+test("a refused /new is asked again once the background work finishes, when nothing happened since", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // Still busy in the app: the bridge waits instead of asking.
+  setSystemTime(start + 20 * 60_000);
+  h.backend.states.ses_1 = { type: "busy" };
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  // The work finished and the chat has been quiet: the reset is asked for again, once.
+  delete h.backend.states.ses_1;
+  h.backend.settle();
+  // Quiet for the whole reset window after the refusal settled.
+  setSystemTime(start + 40 * 60_000);
+  await h.router.tick();
+  // The settle restarts the quiet clock; wait out a full window after it.
+  setSystemTime(start + 51 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  const asks = () => h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE);
+  expect(asks()).toHaveLength(2);
+  const before = h.conversations().length;
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(asks()).toHaveLength(2);
+  expect(h.conversations()).toHaveLength(before);
+});
+
+test("a refused /new is dropped once a reply went out after it", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const events: string[][] = [];
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000, log: (event, code) => events.push([event, code ?? ""]) });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The search result arrives in the chat and the agent answers it.
+  h.input("wake", "Search finished", { id: "wake:search" } as Partial<NormalizedInbound>);
+  await h.router.tick();
+  h.backend.final("Found three options. Want the details?");
+  await h.router.tick();
+  expect(events).toContainEqual(["context-reset-dropped", "moved-on"]);
+  setSystemTime(start + 20 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a refused /new is dropped when a watcher wake sends its result directly and ends with NO_REPLY", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // A real watcher wake whose result goes out through the bridge's direct send, then NO_REPLY.
+  h.input("wake:search", "[Watcher event from watch, not typed by the owner.]\nSearch finished");
+  await h.router.tick();
+  h.store.enqueue({ id: "send:search", kind: "conversation", text: "Found three options.", sessionId: "ses_1", generation: 2 });
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("owner text in the gap before a queued deferred /new is sent cancels that reset", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The work finishes and the nudge is queued, but the owner writes before the reset is POSTed.
+  h.backend.settle();
+  setSystemTime(start + 20 * 60_000);
+  h.input("owner", "Actually, keep this chat");
+  await h.router.tick();
+  expect(h.store.pendingInbound().some(row => row.id.startsWith("reset:"))).toBe(false);
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a refused /new waits while a busy child of the root is still running", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The root is idle, but its subagent is still busy: the refusal would just repeat.
+  setSystemTime(start + 20 * 60_000);
+  h.backend.states.ses_child = { type: "busy" };
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  // Once the child finishes, the reset is asked again, once.
+  delete h.backend.states.ses_child;
+  h.backend.settle();
+  setSystemTime(start + 40 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("owner text that arrives while a queued deferred /new is being prepared cancels that reset", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  // The owner writes during the awaited status read that prepares the queued reset, before its POST.
+  h.backend.onStatuses = () => {
+    h.backend.onStatuses = undefined;
+    h.input("owner", "Actually, keep this chat");
+  };
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  expect(h.store.pendingInbound().some(row => row.id.startsWith("reset:"))).toBe(false);
+});
+
+test("a deferred /new is consumed once its retry is submitted: a full idle window after a successful NO_REPLY asks nothing more", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The deferred retry is asked once and the agent resets silently.
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  // The initial /new nudge plus the one deferred retry.
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  // A whole new idle window later, nothing is re-asked: the deferral was consumed.
+  setSystemTime(start + 60 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("a failed deferred retry does not leave the old deferral eligible for another ask", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  // The initial /new nudge plus the one deferred retry.
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+  // The retry turn fails outright: it is not a fresh refusal, so nothing asks again.
+  h.backend.failed("PRIVATE_TEXT");
+  await h.router.tick();
+  setSystemTime(start + 60 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("a refused /new waits while the root is waiting on background work with no child session", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // No child session exists, but the root is waiting on a background command: statuses() sees it idle.
+  setSystemTime(start + 20 * 60_000);
+  h.backend.waitingRoots.add("ses_1");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  // The background work finishes; the reset is then asked again, once.
+  h.backend.waitingRoots.delete("ses_1");
+  h.backend.settle();
+  setSystemTime(start + 40 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
+test("a background follow-up that lands while the deferred /new is queued is delivered, and the stale reset never overtakes it", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000, watchMs: 0 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The work finishes; the window passes and the deferred reset is queued (still pending).
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  expect(h.store.pendingInbound().filter(row => row.id.startsWith("reset:")).map(row => row.state)).toEqual(["pending"]);
+  // Background work then resumes on its own and finishes with the answer the owner is waiting for.
+  h.backend.step("Found three options. Want the details?");
+  h.backend.settle();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  // Only the initial /new ask: the stale deferred reset never reached the agent.
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  expect(h.store.pendingInbound().some(row => row.id.startsWith("reset:"))).toBe(false);
+});
+
+test("a background answer one tick after the deferred /new is queued beats the reset, with the default watch interval", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  expect(h.store.pendingInbound().filter(row => row.id.startsWith("reset:")).map(row => row.state)).toEqual(["pending"]);
+  setSystemTime(start + 20 * 60_000 + 2_000);
+  h.backend.step("Found three options. Want the details?");
+  h.backend.settle();
+  for (let i = 0; i < 4; i++) { setSystemTime(start + 20 * 60_000 + 2_000 + i * 1_000); await h.router.tick(); }
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a root that resumes before the deferred reset is submitted delivers its answer first, with the default watch interval", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  expect(h.store.pendingInbound().filter(row => row.id.startsWith("reset:")).map(row => row.state)).toEqual(["pending"]);
+  // The root resumes on its own before the queued reset is submitted (submit sees it busy and waits).
+  setSystemTime(start + 20 * 60_000 + 1_000);
+  h.backend.states.ses_1 = { type: "busy" };
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000 + 2_000);
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000 + 3_000);
+  h.backend.step("Found three options. Want the details?");
+  h.backend.settle();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) { setSystemTime(start + 20 * 60_000 + 3_000 + i * 1_000); await h.router.tick(); }
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a root that resumes between the background check and the deferred reset's submit still delivers its answer first", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  expect(h.store.pendingInbound().filter(row => row.id.startsWith("reset:")).map(row => row.state)).toEqual(["pending"]);
+  // Next tick: the watch reads idle, then the root goes busy before submit's own status read, so submit waits.
+  let calls = 0;
+  h.backend.onStatuses = () => { if (++calls === 2) h.backend.states.ses_1 = { type: "busy" }; };
+  setSystemTime(start + 20 * 60_000 + 1_000);
+  await h.router.tick();
+  h.backend.onStatuses = undefined;
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  // The resumed work finishes with the answer a second later, well inside the 5 s watch interval.
+  setSystemTime(start + 20 * 60_000 + 2_000);
+  h.backend.step("Found three options. Want the details?");
+  h.backend.settle();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) { setSystemTime(start + 20 * 60_000 + 2_000 + i * 1_000); await h.router.tick(); }
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a background answer that completes during the deferred reset's own status read is delivered, and the reset is not sent", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.backend.settle();
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  const resetRows = () => h.store.pendingInbound().filter(row => row.id.startsWith("reset:"));
+  expect(resetRows().map(row => row.state)).toEqual(["pending"]);
+  // The answer and its idle marker land while submit reads statuses for the queued reset,
+  // after watch already looked: the root is idle again by the time submit checks it.
+  let injected = false;
+  h.backend.onStatuses = () => {
+    if (injected || resetRows()[0]?.state !== "processing") return;
+    injected = true;
+    h.backend.step("Found three options. Want the details?");
+    h.backend.settle();
+  };
+  for (let i = 1; i <= 6; i++) { setSystemTime(start + 20 * 60_000 + i * 1_000); await h.router.tick(); }
+  h.backend.onStatuses = undefined;
+  expect(injected).toBe(true);
+  expect(h.conversations().map(op => op.text)).toContain("Found three options. Want the details?");
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  expect(resetRows()).toEqual([]);
+});
+
+test("a refused /new is dropped when the owner writes", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  h.input("owner", "Actually, never mind the reset");
+  await h.router.tick();
+  h.backend.final("Sure, I'll keep this chat going.");
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
 });
 
 test("/new moves to a new chat when the running turn won't stop", async () => {

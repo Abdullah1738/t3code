@@ -351,7 +351,12 @@ interface ThreadState {
   execution: number;
   /** T3's MCP server as registered for this thread, and the instructions entry sent with it. */
   mcp:
-    | { readonly name: string; readonly directory: string; readonly credential: string }
+    | {
+        readonly name: string;
+        readonly directory: string;
+        readonly credential: string;
+        readonly url: string;
+      }
     | undefined;
   instructions: string | undefined;
 }
@@ -839,6 +844,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const announced = new Map<string, EventOf<"session.created">["data"]>();
     const strays = new Map<string, ThreadState>();
     const busy = new Set<string>();
+    const shells = new Map<string, string>(); // running shell id -> the session that started it
+    const runsShell = (sessionId: string) => [...shells.values()].includes(sessionId);
     const pending = new Map<RuntimeRequestId, PendingRequest>();
     const lock = yield* Semaphore.make(1);
     const clearing = new Map<string, Deferred.Deferred<void>>();
@@ -946,7 +953,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state.wakes.length > 0 ||
       state.reports.size > 0 ||
       (state.subagent !== undefined && busy.has(state.sessionId)) ||
-      [...state.calls.values()].some((call) => call.background);
+      [...state.calls.values()].some((call) => call.background) ||
+      runsShell(state.sessionId);
 
     const hasBackground = (thread: ThreadState) => sessionsOf(thread).some(owesWork);
 
@@ -2533,9 +2541,52 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           (event.type === "permission.replied" && event.data.reply !== "reject");
         return yield* settleRequest(entry, answered ? "resolved" : "cancelled");
       }
+      // A background shell wakes its session when it ends, so it is pending work like a background subagent.
+      if (event.type === "shell.created") {
+        const owner = stringField(event.data.info.metadata, "sessionID");
+        if (owner !== undefined && event.data.info.status === "running")
+          shells.set(event.data.info.id, owner);
+        return;
+      }
+      if (event.type === "shell.exited" || event.type === "shell.deleted") {
+        shells.delete(event.data.id);
+        return;
+      }
+      if (event.type === "location.shutdown") {
+        const directory = event.location?.directory;
+        if (directory === undefined) return;
+        for (const state of threads.values()) {
+          if (state.mcp?.directory !== directory) continue;
+          // Idle eviction also shuts a location down; an idle thread gets its server back from its next prepareTurn.
+          if (
+            state.active === undefined &&
+            !busy.has(state.sessionId) &&
+            !runsShell(state.sessionId)
+          )
+            continue;
+          // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
+          yield* Effect.forkIn(
+            sessionGates.withLock(state.sessionId, readdMcp(state, directory)),
+            sessionScope,
+          );
+        }
+        return;
+      }
       if (sessionId === undefined) return;
       const state = threads.get(sessionId);
       if (state === undefined) return;
+      if (event.type === "session.moved") {
+        state.directory = event.data.location.directory;
+        // Forked so the event lock isn't held over HTTP; the session gate keeps it apart from a turn's prepareTurn.
+        // Scheduled on every move while registered: an in-flight add reconciles against the latest directory.
+        if (state.mcp !== undefined) {
+          yield* Effect.forkIn(
+            sessionGates.withLock(state.sessionId, followMove(state)),
+            sessionScope,
+          );
+        }
+        return;
+      }
       if (event.type === "session.model.selected" || event.type === "session.step.started") {
         if (event.type === "session.model.selected") state.model = event.data.model;
         const providerThread = withReportedModel(state.providerThread, event.data.model);
@@ -3006,6 +3057,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         state.mcp = undefined;
         state.execution = ++state.executions;
       }
+      // Shell events sent while the stream was down are lost, so a stale entry must not pin a thread forever.
+      shells.clear();
       yield* lock.withPermit(reconcile).pipe(Effect.timeout(RECONCILE_TIMEOUT));
       return stream;
     }).pipe(Effect.retry(RECONNECT_SCHEDULE));
@@ -3383,6 +3436,64 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         client.mcp.remove({ server: mcp.name, location: { directory: mcp.directory } }),
       ).pipe(Effect.timeout("5 seconds"), Effect.ignore({ log: true }));
 
+    const addMcp = (mcp: {
+      readonly name: string;
+      readonly directory: string;
+      readonly credential: string;
+      readonly url: string;
+    }) =>
+      Effect.suspend(() =>
+        client.mcp.add({
+          server: mcp.name,
+          location: { directory: mcp.directory },
+          config: new Mcp.RemoteConfig({
+            type: "remote",
+            url: mcp.url,
+            headers: { Authorization: mcp.credential },
+            oauth: false,
+          }),
+        }),
+      ).pipe(
+        Effect.timeout(INVENTORY_TIMEOUT),
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not add T3 Code's MCP server to OpenCode.", cause).pipe(
+            Effect.as(false),
+          ),
+        ),
+      );
+
+    // A reload or eviction dropped the location's runtime MCP servers; a running thread needs its own back now.
+    const readdMcp = Effect.fnUntraced(function* (state: ThreadState, directory: string) {
+      const registered = state.mcp;
+      if (registered === undefined || registered.directory !== directory) return;
+      if (!(yield* addMcp(registered))) return;
+      // An unload while the add ran already removed the old copy; drop the one just added.
+      if (threads.get(state.sessionId) !== state) yield* removeMcp(registered);
+    });
+
+    // Runs when the agent moved its session: the server must follow it to the new directory.
+    // The session may move again while an add is in flight, so each add is checked
+    // against the directory the session is in when it lands, not the one it started for.
+    const followMove = Effect.fnUntraced(function* (state: ThreadState) {
+      for (;;) {
+        const registered = state.mcp;
+        if (registered === undefined || registered.directory === state.directory) return;
+        const target = state.directory;
+        const moved = { ...registered, directory: target };
+        // state.mcp stays on the old directory; the next prepareTurn removes it and re-adds at the new one.
+        if (!(yield* addMcp(moved))) return;
+        if (threads.get(state.sessionId) !== state || state.directory !== target) {
+          yield* removeMcp(moved);
+          if (threads.get(state.sessionId) !== state) return;
+          continue;
+        }
+        state.mcp = moved;
+        yield* removeMcp(registered);
+        return;
+      }
+    });
+
     yield* Effect.addFinalizer(() =>
       Effect.forEach(
         [...threads.values()].flatMap((state) => (state.mcp === undefined ? [] : [state.mcp])),
@@ -3397,19 +3508,26 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
     ) {
       const mcpSession = yield* mcpSessions.read(turnInput.threadId);
-      const directory = turnInput.runtimePolicy.cwd ?? host.paths.cwd;
+      // state.directory follows session.moved, so the server goes where the agent moved the session.
+      const directory = state.directory;
       const name = yield* mcpServerNameFor(turnInput.threadId);
       // An external server may not reach T3's MCP endpoint, as with 1.x. A
       // loopback one shares this host, so it can.
       const wanted =
         mcpSession === undefined || (connection.external && !isLoopbackUrl(connection.url))
           ? undefined
-          : { name, directory, credential: mcpSession.authorizationHeader };
+          : {
+              name,
+              directory,
+              credential: mcpSession.authorizationHeader,
+              url: mcpSession.endpoint,
+            };
       if (
         state.mcp !== undefined &&
         (wanted === undefined ||
           state.mcp.directory !== wanted.directory ||
-          state.mcp.credential !== wanted.credential)
+          state.mcp.credential !== wanted.credential ||
+          state.mcp.url !== wanted.url)
       ) {
         yield* removeMcp(state.mcp);
         state.mcp = undefined;
@@ -3418,26 +3536,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       // Re-adding an unchanged config keeps its existing connection.
       let mcpAvailable = false;
       if (wanted !== undefined) {
-        mcpAvailable = yield* client.mcp
-          .add({
-            server: name,
-            location: { directory },
-            config: new Mcp.RemoteConfig({
-              type: "remote",
-              url: mcpSession!.endpoint,
-              headers: { Authorization: wanted.credential },
-              oauth: false,
-            }),
-          })
-          .pipe(
-            Effect.timeout(INVENTORY_TIMEOUT),
-            Effect.as(true),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Could not add T3 Code's MCP server to OpenCode.", cause).pipe(
-                Effect.as(false),
-              ),
-            ),
-          );
+        mcpAvailable = yield* addMcp(wanted);
         if (mcpAvailable) state.mcp = wanted;
       }
       const instructions = [
@@ -3922,6 +4021,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      sessionUpdateFanout: "interested_threads",
       instanceId,
       driver,
       providerSessionId: input.providerSessionId,

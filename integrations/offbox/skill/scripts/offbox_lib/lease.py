@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, OffboxError, db, event,
+from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
@@ -17,6 +18,8 @@ from .identity import remote_dir_for
 ARCHIVING_WAIT_S = 120
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
+DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
+                          re.I)  # boat's 409 for a stopped box whose disk outgrew every machine of its size
 DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
 
 
@@ -30,14 +33,14 @@ def natural_size(con, row) -> str:
     Its template's size (generic stays default); bases and fresh boxes never go below large, which is what
     ordinary Go/Python runs got before boxes were shrunk."""
     src = row["source"] or ""
-    if src == "template:generic":
+    if src in ("template:generic", "recipe:generic"):
         return "default"
     size = "large"
     if src.startswith("base:"):
         b = con.execute("SELECT size FROM bases WHERE name=?", (src[5:],)).fetchone()
         size = (b and b["size"]) or "large"
-    elif src.startswith("template:"):
-        size = DEFAULT_SIZE.get(src[9:], "large")
+    elif src.startswith(("template:", "recipe:")):
+        size = DEFAULT_SIZE.get(src.split(":", 1)[1], "large")
     return size if _rank(size) >= _rank("large") else "large"
 
 
@@ -146,17 +149,20 @@ def box_name(me: dict, repo_key: str) -> str:
     return f"offbox {repo_key} | {who}"
 
 
-def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> None:
-    """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl)."""
+def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
+    """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl).
+    True when the deadline is far enough already or the PATCH succeeded; False when the PATCH failed (warned)."""
     try:
         if s and s.get("archiveAfter"):
             from .common import iso_ts
             left = (iso_ts(s["archiveAfter"]) or 0) - now()
             if left >= ttl - 60:
-                return
+                return True
         api.set_ttl(box_id, ttl)
+        return True
     except OffboxError as e:
         say(f"warning: could not set auto-stop on {box_id}: {e}")
+        return False
 
 
 def idle_ttl(box_id: str) -> None:
@@ -183,8 +189,41 @@ def bootstrap_fresh(box_id: str) -> None:
         say(f"warning: cache env bootstrap failed on {box_id}: {p.stderr.decode(errors='replace')[-200:]}")
 
 
+def _start_from(con, table: str, row, sz: str, name: str, idem: str) -> dict | None:
+    """Start a box from a template/base row: its saved snapshot, else a fork of its stopped box.
+
+    None when boat has deleted the stopped box's data (14 days after it stopped); the row is marked expired."""
+    kind = table[:-1]
+    if row["saved"]:
+        say(f"starting {kind} {row['name']} from its saved snapshot {row['saved']} as {sz}")
+        try:
+            return api.create(sz, RUN_TTL_S, name, f"{idem}-{kind}-saved", saved=row["saved"])
+        except api.ApiError as e:
+            if not api.data_gone(e):
+                raise
+            say(f"saved snapshot {row['saved']} of {kind} {row['name']} is gone ({e}); forking its box")
+            con.execute(f"UPDATE {table} SET saved=NULL WHERE name=?", (row["name"],))
+            con.commit()
+            event(con, row["box_id"], f"{kind}_saved_gone", f"{row['name']} {row['saved']}: {e}")
+    if row["expired_at"]:
+        return None
+    say(f"forking {kind} {row['name']} ({row['box_id']}) as {sz}")
+    try:
+        return api.fork(row["box_id"], RUN_TTL_S, f"{idem}-{kind}", sz)
+    except api.ApiError as e:
+        if not api.data_gone(e):
+            raise
+        con.execute(f"UPDATE {table} SET expired_at=? WHERE name=?", (now(), row["name"]))
+        con.commit()
+        event(con, row["box_id"], f"{kind}_expired", f"{row['name']}: {e}")
+        return None
+
+
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
-    """-> (sandbox dict, source label, base_remote_dir or None, size)."""
+    """-> (sandbox dict, source label, base_remote_dir or None, size).
+
+    Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
+    deleted the template's data."""
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
@@ -197,12 +236,18 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             if not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
-            brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1", (rk,)).fetchone()
+            brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
+                               "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
         if brow:
             sz = size or brow["size"] or "large"
-            say(f"forking saved base {brow['name']} ({brow['box_id']}) as {sz}")
-            s = api.fork(brow["box_id"], RUN_TTL_S, idem, sz)
-            return s, f"base:{brow['name']}", brow["remote_dir"], sz
+            s = _start_from(con, "bases", brow, sz, name, idem)
+            if s:
+                return s, f"base:{brow['name']}", brow["remote_dir"], sz
+            if base:
+                raise OffboxError(f"saved base '{brow['name']}' is gone: boat deletes a stopped box's data after 14 "
+                                  f"days. Run without --base and `offbox save` again; `offbox base rm "
+                                  f"{brow['short'] or brow['name']}` drops the entry.", code=2)
+            say(f"default base {brow['name']} is gone (boat deleted its data); using the repo template")
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
         trow = con.execute("SELECT * FROM templates WHERE name=?", (tname,)).fetchone()
@@ -212,22 +257,125 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                 say(f"template {tname} not built yet; using generic")
         if trow:
             sz = size or DEFAULT_SIZE.get(tname, "default")
-            say(f"forking template {trow['name']} ({trow['box_id']}) as {sz}")
-            s = api.fork(trow["box_id"], RUN_TTL_S, idem, sz)
-            return s, f"template:{trow['name']}", None, sz
+            s = _start_from(con, "templates", trow, sz, name, idem)
+            if s:
+                return s, f"template:{trow['name']}", None, sz
+            say(f"template {trow['name']} is gone (boat deleted its data); building this box from its recipe "
+                f"instead, which takes a few minutes. The reaper rebuilds the template.")
+            s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
+            return s, f"recipe:{trow['name']}", None, sz
     sz = size or DEFAULT_SIZE.get(tname or "generic", "default")
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
     return s, "fresh", None, sz
 
 
-def _bring_up(box_id: str, fresh: bool = False) -> dict:
+# A recipe fallback runs inside a lease bring-up (harness ~6 min). Past this it is cancelled and the box retired,
+# not waited for: the TTL keeper would otherwise keep the box alive and billing while the pool lock is held.
+RECIPE_TIMEOUT_S = 15 * 60
+
+
+def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
+    """A box whose recipe did not finish cleanly is never handed out or reused: it may be half built, or its recipe
+    may still be changing it. Quarantine it (pools and reuse only take running/stopped leases), stop the recipe, and
+    delete the box: deletion is the one proof the recipe can no longer touch it. A failed delete leaves the lease
+    quarantined and the reaper deletes it on a later pass. True once deleted."""
+    con = db()
+    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
+    con.commit()
+    event(con, box_id, "lease_quarantined", why[:300])
+    if pid is not None:
+        try:
+            api.cmd_kill(box_id, pid)
+        except OffboxError as e:
+            say(f"warning: could not stop the recipe process on {box_id}: {e}")
+    try:
+        return delete_box(con, box_id, f"recipe cancelled: {why}"[:300])
+    except OffboxError as e:
+        say(f"warning: could not delete {box_id} ({e}); it stays quarantined until the reaper deletes it")
+        return False
+
+
+def run_recipe(box_id: str, name: str) -> None:
+    """Build a template's environment on this box (the script `offbox template build` runs). Only a recipe that
+    exits 0 makes the box ready. Any other outcome (failure, error, lost stream, timeout) retires the box and
+    raises, so a half-built box is never marked ready or reused."""
+    from . import bases
+    from .common import LOGS_DIR
+    t = now()
+    log_path = LOGS_DIR / f"recipe-{name}-{box_id}.log"
+    pid = None
+    code = None
+    try:
+        # The box lock keeps the reaper from idle-stopping the box while the recipe runs.
+        with file_lock("box-" + box_id, timeout=60):
+            script, _sha = bases.recipe(name)
+            ssh_sync.put_file(box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700")
+            bases.template_uploads(name, box_id)
+            r = api.cmd_start(box_id, "bash -lc " + shlex.quote("bash ~/.offbox/recipe.sh"))
+            pid = r["processId"]
+            event(db(), box_id, "lease_recipe_pid", str(pid))
+            code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
+        code = f"error: {e}"
+    touch(box_id)
+    event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
+    if code == 0:
+        return
+    what = (f"did not finish within {RECIPE_TIMEOUT_S // 60} min" if code == "timeout"
+            else f"failed ({str(code)[:200]})")
+    gone = _retire_recipe_box(box_id, pid, f"{name} recipe {what}")
+    raise OffboxError(f"recipe {name} {what} on {box_id}; log {log_path}. "
+                      + ("The box was deleted." if gone else "The box is quarantined until the reaper deletes it."))
+
+
+def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
+    """follow() in a helper thread, joined up to timeout_s. On timeout the follower is told to stop and joined
+    (it notices within one frame, or when its stream read times out); its TTL keeper is joined inside follow()."""
+    import threading
+    from .runs import follow
+    result: dict = {}
+    stop_evt = threading.Event()
+
+    def run():
+        try:
+            result["code"] = follow(box_id, pid, log_path, echo=False, stop_evt=stop_evt)
+        except Exception as e:  # noqa: BLE001
+            result["code"] = f"error: {e}"
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout_s)
+    if th.is_alive():
+        stop_evt.set()
+        th.join(_FOLLOW_STOP_S)
+        return "timeout"
+    return result.get("code")
+
+
+# A follower sees the stop signal at its next frame, or when its stream read times out (api.cmd_attach: 90 s), then
+# joins its TTL keeper (runs._KEEPER_JOIN_S).
+_FOLLOW_STOP_S = 160
+
+
+def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:
     s = api.wait_state(box_id, api.LIVE_STATES, timeout=900)
     ssh_sync.setup(box_id)
     ssh_sync.wait_ssh(box_id)
-    if fresh:
+    if recipe:
+        run_recipe(box_id, recipe)
+    elif fresh:
         bootstrap_fresh(box_id)
     return s
+
+
+def refresh_box(con, box_id: str) -> None:
+    """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    capacity.check(con)
+    api.resume(box_id, 600)
+    api.wait_state(box_id, api.LIVE_STATES, timeout=60)
+    api.stop(box_id)
+    event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
 
 
 def acquire(me: dict, size: str | None = None, template: str | None = None, base: str | None = None,
@@ -254,15 +402,21 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)
         box_id = s["id"]
         rdir = remote_dir_for(me["repo_root"])
+        is_recipe = source.startswith("recipe:")
+        # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
+        # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
+        # one can hand out as ready. The reaper deletes such rows (see reap._reap).
+        state = "bringing_up" if is_recipe else "running"
         con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
                        repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,'running',?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
-                     me["repo_root"], me["repo_key"], rdir, sz, source, t, t))
+                     me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
         con.commit()
         event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
         try:
-            _bring_up(box_id, fresh=(source == "fresh"))
+            _bring_up(box_id, fresh=(source == "fresh"),
+                      recipe=source.split(":", 1)[1] if is_recipe else None)
             try:
                 api.rename(box_id, box_name(me, me["repo_key"]))
             except OffboxError:
@@ -270,10 +424,16 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             if base_dir and base_dir != rdir:
                 ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
                                      f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
-        except OffboxError:
+        except OffboxError as e:
+            # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
+            # half built. It must not stay a pool candidate, or a later acquisition would hand it out as ready.
+            if is_recipe:
+                _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
             raise
         event(con, box_id, "lease_ready", f"{round(now() - t, 1)}s")
-        con.execute("UPDATE leases SET ssh_ready_at=? WHERE box_id=?", (now(), box_id))
+        # Only now is a recipe box reusable: the recipe finished (exit 0) and the bring-up completed.
+        con.execute("UPDATE leases SET ssh_ready_at=?, state=CASE WHEN state='bringing_up' THEN 'running' ELSE state END "
+                    "WHERE box_id=?", (now(), box_id))
         con.commit()
         return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
 
@@ -290,6 +450,63 @@ class ArchivingSkip(OffboxError):
     """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
 
 
+def _forget_expired(con, box_id: str, why: str) -> None:
+    """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    say(f"lease {box_id} expired ({why}); starting a new box")
+    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+    con.commit()
+    event(con, box_id, "lease_expired", why)
+
+
+class DiskTooBig(OffboxError):
+    """A stopped box's disk outgrew every machine of its size, so boat refuses the resume. The box is marked
+    (leases.note) and left stopped and untouched; pool callers skip it and stop counting it toward the pool."""
+
+    def __init__(self, box_id: str, need: str, size: str, holds: str):
+        super().__init__(f"{box_id} needs {need} GiB of disk but '{size}' holds {holds} GiB")
+        self.need, self.size, self.holds = need, size, holds
+
+
+def _too_big(con, box_id: str, e: api.ApiError):
+    """DiskTooBig for boat's 'disk outgrew its machine size' refusal (marks the lease), else None."""
+    m = DISK_TOO_BIG.search(str(e)) if (e.status or 0) in SHRINK_REFUSED else None
+    if not m:
+        return None
+    need, size, holds = m.group(1), m.group(2), m.group(3)
+    con.execute("UPDATE leases SET note=? WHERE box_id=?",
+                (f"{TOO_BIG_NOTE} needs {need} GiB, {size} holds {holds} GiB", box_id))
+    con.commit()
+    event(con, box_id, "lease_too_big", f"needs {need} GiB, {size} holds {holds} GiB")
+    return DiskTooBig(box_id, need, size, holds)
+
+
+class DeadMount(OffboxError):
+    """A box's home filesystem died (ENOTCONN): nothing ran there. The run moves to another box; the dead one is
+    set aside by set_aside_dead_mount (stopped, marked, out of the pool, never deleted)."""
+
+    def __init__(self, box_id: str, reason: str):
+        super().__init__(f"{box_id} has a dead filesystem ({reason})")
+        self.box_id, self.reason = box_id, reason
+
+
+def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
+    con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{DEAD_MOUNT_NOTE} {reason}"[:200], box_id))
+    con.commit()
+    event(con, box_id, "lease_dead_mount", reason)
+    try:
+        ssh_sync.close_master(box_id)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        api.stop(box_id)
+    except OffboxError as e:
+        # The reaper's idle stop catches it later; a dead box must not block the run from moving on.
+        event(con, box_id, "lease_dead_mount_stop_failed", str(e)[:300])
+        return
+    con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
+    con.commit()
+
+
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
@@ -303,6 +520,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         con.commit()
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
+        return None
+    if s.get("dataExpiredAt"):
+        _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
     st = s.get("state")
     if st == "archiving":
@@ -367,13 +587,25 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         try:
             api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
         except api.ApiError as e:
+            if e.api_code in api.DATA_GONE:
+                _forget_expired(con, box_id, str(e))
+                return None
             # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
             if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
                     or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
+                tb = _too_big(con, box_id, e)
+                if tb:
+                    raise tb from e
                 raise
             say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
             want = s.get("type")
-            api.resume(box_id, RUN_TTL_S, None)
+            try:
+                api.resume(box_id, RUN_TTL_S, None)
+            except api.ApiError as e2:
+                tb = _too_big(con, box_id, e2)
+                if tb:
+                    raise tb from e2
+                raise
         up = _bring_up(box_id)
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]

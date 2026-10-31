@@ -27,7 +27,7 @@ class PreorderFlowTests(unittest.TestCase):
             auth.revalidate.side_effect=lambda *a,**k:AuthSnapshot('nownow',fingerprint('customer'),fingerprint('home','key'),
                 time.time(),{'cookie':'synthetic=x','x-addresscode':'home','x-addresskey':'key'},time.monotonic()+30)
             flow=c.NowNowFlow(store_code='shop',products=(('p',2),),auth=auth,request=Mock())
-            flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx5542','mastercard')
+            flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx2342','mastercard')
             flow.controller_card={'id':flow.card.token,'ccMasked':flow.card.mask,'ccType':'mastercard','isDeleted':False}
             flow.current=Snapshot({'data':fixture.row},{},time.time())
             flow.card_binding=CardSyncBinding(flow.account_hash,flow.address_hash,fingerprint('owned'),fingerprint(flow.card.token),'1'*64,'2'*64,time.time())
@@ -36,7 +36,7 @@ class PreorderFlowTests(unittest.TestCase):
             flow.receipt_store=c.receipts.create(flow_id=flow.flow_id,app='noon',vertical='nownow',account_hash=flow.account_hash,scope_hash=flow.scope_hash)
             flow.opened=True
             original_card=flow.card
-            flow.card=SavedCard('other-token','xxxx5542','mastercard')
+            flow.card=SavedCard('other-token','xxxx2342','mastercard')
             with self.assertRaises(Exception):flow.authorize_preorder(cvv=b'007',vault=p.IntentVault(Store()))
             self.assertEqual(c.journal.inspect(flow.flow_id)['reserved_minor'],0)
             flow.card=original_card

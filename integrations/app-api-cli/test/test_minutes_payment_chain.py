@@ -58,7 +58,7 @@ class CapturedContractTests(unittest.TestCase):
         self.assertEqual(pending['currencyCode'], 'AED')
         self.assertEqual(pending['paymentMethodCode'], 'cc_noonpay')
         self.assertEqual(pending['creditCardBin'], '522873')
-        self.assertTrue(pending['creditCardMask'].endswith('5542'))
+        self.assertTrue(pending['creditCardMask'].endswith('2342'))
         self.assertEqual(pending['creditCardType'], 'MASTERCARD')
         # Fee arithmetic from the captured paid order: subtotal + delivery + small order.
         self.assertEqual(m.amount_minor(pending['orderSubtotal'])
@@ -83,7 +83,7 @@ class CapturedContractTests(unittest.TestCase):
         from test.test_noon_minutes_checkout import Harness
         h = Harness([{'status': 'payment_pending'}])
         card = m.SavedCard(FIXTURE['complete']['req']['idCustomerToken'],
-                          '522873xxxxxx5542', 'mastercard')
+                          '522873xxxxxx2342', 'mastercard')
         h.client.complete_payment(order=ORDER, client_secret='<secret>', card=card,
             provider_code='NOON_PAY',
             cvv_encryption={'encCvv': '<secret>', 'publicKeyName': 'key_1'},
@@ -99,7 +99,7 @@ class CapturedContractTests(unittest.TestCase):
         self.assertEqual(resp['transaction_status'], 'CREATED')
         self.assertEqual(m.amount_minor(resp['authorized_amount']), 0)
         self.assertEqual(resp['reference'], ORDER)
-        self.assertEqual(resp['cc_masked'], '522873xxxxxx5542')
+        self.assertEqual(resp['cc_masked'], '522873xxxxxx2342')
         self.assertEqual(resp['cc_type'], 'MASTERCARD')
         self.assertFalse(resp['is_3ds_failure'])
 

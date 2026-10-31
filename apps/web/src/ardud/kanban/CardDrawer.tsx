@@ -487,7 +487,9 @@ function Details(props: {
           <Fact label="Models">
             <span className="flex flex-wrap items-center gap-1.5">
               {card.models.map((entry) => (
-                <Chip key={`${entry.model.instanceId}/${entry.model.model}`}>
+                <Chip
+                  key={`${entry.model.instanceId}/${entry.model.model}#${modelVariant(entry.model) ?? ""}`}
+                >
                   {modelName(entry.model)}
                   <span className="text-(--m-muted) tabular-nums">{entry.weight}</span>
                 </Chip>

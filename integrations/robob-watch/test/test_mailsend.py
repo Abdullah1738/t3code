@@ -91,7 +91,7 @@ class MailsendTest(unittest.TestCase):
         self.file = os.path.join(t, "menu.pdf")
         with open(self.file, "wb") as fh:
             fh.write(b"%PDF fake")
-        self.env = {"HOME": t, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "MAILSEND_DRAFT_DIR": self.drafts,
+        self.env = {"HOME": t, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "ROBOB_TEST": "1", "MAILSEND_DRAFT_DIR": self.drafts,
                     "MAILSEND_HIMALAYA": f"/usr/bin/python3 {fake}", "MAILSEND_SEND_APPROVAL": sa,
                     "FAKE_LOG": self.log, "FAKE_APPROVALS": self.approvals}
 
@@ -365,6 +365,180 @@ class MailsendTest(unittest.TestCase):
                                "--body", "Can we move it to Friday?")
         self.assertEqual(code, 2)
         self.assertIn("already sent or attempted", err)
+
+    def card_env(self, **extra):
+        # A stub renderer: writes the HTML it was given next to the PNG path, so the test can read what was drawn.
+        stub = os.path.join(self.tmp.name, "stub_render.py")
+        with open(stub, "w") as fh:
+            fh.write("import shutil, sys\nhtml, out, w, h = sys.argv[1:5]\n"
+                     "shutil.copy(html, out + '.html')\nopen(out + '.h', 'w').write(h)\n"
+                     "open(out, 'wb').write(b'\\x89PNG fake')\n")
+        return {"MAILSEND_CARD_RENDERER": f"/usr/bin/python3 {stub}", **extra}
+
+    def card_html_of(self, out):
+        with open(out + ".html") as fh:
+            return fh.read()
+
+    def card_h_of(self, out):
+        with open(out + ".h") as fh:
+            return int(fh.read())
+
+    def test_card_height_grows_with_every_attachment_chip_row(self):
+        # Review r1 P2: four or eight long attachment names wrap to several chip rows; the frame must grow with them.
+        files = [os.path.join(self.tmp.name, f"Final-dinner-menu-option-{k}.pdf") for k in range(1, 9)]
+        for p in files:
+            with open(p, "wb") as fh:
+                fh.write(b"%PDF fake")
+        h = {}
+        for n in (0, 1, 4, 8):
+            i, _ = self.draft(*sum((["--attach", p] for p in files[:n]), []), body="Short body.")
+            code, out, err = self.ms("card", i, **self.card_env())
+            self.assertEqual(code, 0, err)
+            h[n] = self.card_h_of(out.strip())
+            self.assertIn(f"draft {i}", self.card_html_of(out.strip()))
+        self.assertLess(h[0], h[1])
+        self.assertLess(h[1], h[4])
+        self.assertLess(h[4], h[8])
+
+    def test_card_keeps_every_authored_line_visible(self):
+        # Review r1 P2: a '>' line the writer typed is body text, not a quoted original; it must stay on the card.
+        i, _ = self.draft(body="Deal is set.\n> We will pay EUR 3,400 on Friday.\nSee you then.")
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        page = self.card_html_of(out.strip())
+        self.assertIn("&gt;", page)
+        self.assertIn("We will pay EUR 3,400", page)
+        self.assertIn("See you then.", page)
+        self.assertNotIn("quoted original", page)
+
+    def test_card_folds_only_the_source_quote_of_a_reply(self):
+        code, out, err = self.ms("reply", "-a", "gmail", "-m", "Inbox", "262282",
+                                 "--body", "We agree.\n> We will pay EUR 3,400 on Friday.")
+        self.assertEqual(code, 0, err)
+        i = out.split()[1]
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        page = self.card_html_of(out.strip())
+        self.assertIn("&gt;", page)
+        self.assertIn("We will pay EUR 3,400", page)
+        self.assertIn("+ quoted original, 1 line", page)
+        self.assertNotIn("the original secret line", page)
+
+    def test_forward_with_no_body_folds_the_source_quote(self):
+        # Review r2 P2: a forward with no added body has body "", and its whole text used to count as authored text,
+        # so the quote never folded and a long source made several cards.
+        code, out, err = self.ms("forward", "-a", "gmail", "-m", "Inbox", "262282", "-t", "host@example.com")
+        self.assertEqual(code, 0, err)
+        i = out.split()[1]
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        paths = out.split()
+        self.assertEqual(len(paths), 1)
+        page = self.card_html_of(paths[0])
+        self.assertIn("+ quoted original, 1 line", page)
+        self.assertNotIn("the original secret line", page)
+
+    def test_wrapping_keeps_every_line_inside_the_text_column(self):
+        # Review r1 P2: a 60-character Chinese line is ~970px at 30px; the wrap must split it to fit 586px.
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("mailsend_mod", HELPER)
+        spec = importlib.util.spec_from_loader("mailsend_mod", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        text = "这是一个很长的中文句子用于测试换行是否会超出卡片的宽度限制" * 3
+        lines = mod.wrap_px(text, mod.BODY_PX, mod.TEXT_W)
+        self.assertGreater(len(lines), 3)
+        self.assertEqual("".join(lines), text)
+        for line in lines:
+            self.assertLessEqual(mod.text_w(line, mod.BODY_PX), mod.TEXT_W)
+        subj = "x" * 200
+        self.assertLessEqual(max(mod.text_w(l, mod.SUBJ_PX) for l in mod.wrap_px(subj, mod.SUBJ_PX, mod.CARD_INNER)),
+                             mod.CARD_INNER)
+
+    def test_long_unbroken_subject_grows_the_card(self):
+        short_i, _ = self.draft()
+        code, out, _ = self.ms("card", short_i, **self.card_env())
+        short_h = self.card_h_of(out.strip())
+        j = self.ms("draft", "-a", "icloud", "-t", "host@example.com", "-s", "Z" * 220, "--body", "Hi")[1].split()[1]
+        code, out, err = self.ms("card", j, **self.card_env())
+        self.assertEqual(code, 0, err)
+        self.assertGreater(self.card_h_of(out.strip()), short_h)
+
+    def test_long_bodies_paginate_by_rendered_height_not_line_count(self):
+        # Review r1 P2: pages are sized by the estimate, so a long CJK body splits instead of running off the card.
+        body = "\n".join("这是第%d行的中文内容，用来测试分页是否根据实际高度计算。" % k for k in range(60))
+        i, _ = self.draft(body=body)
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        paths = out.split()
+        self.assertGreater(len(paths), 1)
+        for p in paths:
+            self.assertLessEqual(self.card_h_of(p), 2000)
+
+    def test_real_chrome_card_renders_when_chrome_is_present(self):
+        cp = os.path.expanduser("~/Library/Caches/ms-playwright/chromium_headless_shell-1223/"
+                                "chrome-headless-shell-mac-arm64/chrome-headless-shell")
+        if not os.path.isfile(cp):
+            self.skipTest("headless Chrome shell not installed")
+        i, _ = self.draft("--attach", self.file, body="Real render check: 这是中文和 English 混合的一行。")
+        # No renderer override here: the real Chrome path draws the PNG and checks the layout.
+        env = {k: v for k, v in self.env.items()}
+        env.pop("MAILSEND_CARD_RENDERER", None)
+        env["HOME"] = os.path.expanduser("~")
+        env["MAILSEND_DRAFT_DIR"] = self.drafts
+        env["MAILSEND_CARD_LIB"] = os.path.expanduser("~/.local/libexec/card-preview")
+        r = subprocess.run(["/usr/bin/python3", HELPER, "card", i], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        png = r.stdout.strip()
+        self.assertTrue(os.path.isfile(png))
+        self.assertGreater(os.path.getsize(png), 1000)
+
+    def test_card_writes_a_png_named_for_the_draft_and_sends_nothing(self):
+        i, _ = self.draft("--cc", "moni@example.com", "--attach", self.file)
+        before = self.state(i)
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        png = os.path.join(self.drafts, "cards", f"{i}.png")
+        self.assertEqual(out.strip(), png)
+        self.assertTrue(os.path.isfile(png))
+        with open(png + ".html") as fh:
+            page = fh.read()
+        for want in ("Booking", "icloud@example.com", "host@example.com", "moni@example.com", "menu.pdf", "Can we move it to Friday?",
+                     f"draft {i}"):
+            self.assertIn(want, page)
+        self.assertEqual(self.calls("send"), [])
+        self.assertEqual(self.state(i), before)
+
+    def test_card_folds_the_quoted_original_and_splits_long_mail(self):
+        code, out, err = self.ms("reply", "-a", "gmail", "-m", "Inbox", "262282", "--body", "Thanks!")
+        i = out.split()[1]
+        code, out, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 0, err)
+        with open(os.path.join(self.drafts, "cards", f"{i}.png") + ".html") as fh:
+            page = fh.read()
+        self.assertIn("+ quoted original, 1 line", page)
+        self.assertNotIn("the original secret line", page)
+        # A long body (over one card's worth of lines) comes out as card 1 and card 2, both printed.
+        long_body = "\n".join(f"line {k}" for k in range(120))
+        j, _ = self.draft(body=long_body)
+        code, out, err = self.ms("card", j, **self.card_env())
+        self.assertEqual(code, 0, err)
+        paths = out.split()
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(paths[1].endswith(f"{j}-2.png"))
+
+    def test_card_refuses_an_unknown_or_bad_id(self):
+        code, _, err = self.ms("card", "0123456789", **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("no pending draft", err)
+        code, _, err = self.ms("card", "../../etc", **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("bad draft id", err)
+        i, _ = self.draft()
+        self.ms("send", "--approved", i, "--inbound", "X1")
+        code, _, err = self.ms("card", i, **self.card_env())
+        self.assertEqual(code, 2)
+        self.assertIn("no pending draft", err)
 
     def test_failed_sent_copy_is_only_a_warning(self):
         i, _ = self.draft()

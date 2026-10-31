@@ -44,30 +44,30 @@ class TempState(unittest.TestCase):
 
 class CardStatusModuleTests(TempState):
     def test_no_record_is_not_blocked(self):
-        code, out, _ = self.run_card('check', '5542')
+        code, out, _ = self.run_card('check', '2342')
         self.assertEqual(code, 0)
         self.assertIn('no decline on record', out)
         self.assertFalse(self.path.exists())
 
     def test_recent_decline_blocks_with_exact_message(self):
-        cs.record_declined('5542', reason=DECLINE, source='commerce talabat 3965762974', now=AT)
-        result = cs.check('5542', now=AT + 60)
+        cs.record_declined('2342', reason=DECLINE, source='commerce talabat 3965762974', now=AT)
+        result = cs.check('2342', now=AT + 60)
         self.assertTrue(result['blocked'])
         self.assertEqual(result['error'], 'CARD_RECENTLY_DECLINED')
         self.assertEqual(result['message'],
-            f'card 5542 declined at 11:11 Dubai ({DECLINE}, commerce talabat 3965762974). '
-            'Ask Abdullah before trying it again; clear with: card-status ok 5542')
+            f'card 2342 declined at 11:11 Dubai ({DECLINE}, commerce talabat 3965762974). '
+            'Ask Abdullah before trying it again; clear with: card-status ok 2342')
         self.assertEqual(result['at_dubai'], '2026-10-18T11:11:00+04:00')
 
     def test_cli_check_exits_3_and_json_carries_record(self):
-        code, out, _ = self.run_card('declined', '5542', '--reason', DECLINE, '--source', 'uber')
+        code, out, _ = self.run_card('declined', '2342', '--reason', DECLINE, '--source', 'uber')
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(out)['recorded'])
-        code, out, _ = self.run_card('check', '5542')
+        code, out, _ = self.run_card('check', '2342')
         self.assertEqual(code, 3)
-        self.assertTrue(out.startswith('card 5542 declined at '))
-        self.assertIn(f'({DECLINE}, uber). Ask Abdullah before trying it again; clear with: card-status ok 5542', out)
-        code, out, _ = self.run_card('check', '5542', '--json')
+        self.assertTrue(out.startswith('card 2342 declined at '))
+        self.assertIn(f'({DECLINE}, uber). Ask Abdullah before trying it again; clear with: card-status ok 2342', out)
+        code, out, _ = self.run_card('check', '2342', '--json')
         self.assertEqual(code, 3)
         row = json.loads(out)
         self.assertEqual((row['state'], row['reason'], row['source'], row['blocked']),
@@ -76,25 +76,25 @@ class CardStatusModuleTests(TempState):
         self.assertEqual(self.run_card('check', '1234')[0], 0)
 
     def test_decline_older_than_12h_no_longer_blocks(self):
-        cs.record_declined('5542', reason=DECLINE, now=AT)
-        self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
-        late = cs.check('5542', now=AT + 12 * 3600)
+        cs.record_declined('2342', reason=DECLINE, now=AT)
+        self.assertTrue(cs.check('2342', now=AT + 12 * 3600 - 1)['blocked'])
+        late = cs.check('2342', now=AT + 12 * 3600)
         self.assertFalse(late['blocked'])
         self.assertIn('more than 12h ago', late['message'])
 
     def test_ok_clears_the_card(self):
-        self.run_card('declined', '5542', '--reason', DECLINE)
-        code, out, _ = self.run_card('ok', '5542', '--note', 'Abdullah topped up 18:12')
+        self.run_card('declined', '2342', '--reason', DECLINE)
+        code, out, _ = self.run_card('ok', '2342', '--note', 'Abdullah topped up 18:12')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)['state'], 'ok')
-        code, out, _ = self.run_card('check', '5542')
+        code, out, _ = self.run_card('check', '2342')
         self.assertEqual(code, 0)
         self.assertIn('ok since', out)
         self.assertIn('Abdullah topped up 18:12', out)
-        self.assertEqual(self.stored()['5542']['state'], 'ok')
+        self.assertEqual(self.stored()['2342']['state'], 'ok')
 
     def test_only_exact_last4_is_accepted(self):
-        for bad in ('554', '55420', 'abcd', '55 2', '5228730112345542', '٥٥٤٢'):
+        for bad in ('554', '23420', 'abcd', '55 2', '5228730112342342', '٥٥٤٢'):
             with self.subTest(bad=bad):
                 for argv in (('declined', bad, '--reason', 'x'), ('ok', bad), ('check', bad)):
                     code, _, err = self.run_card(*argv)
@@ -103,132 +103,132 @@ class CardStatusModuleTests(TempState):
         self.assertFalse(self.path.exists())
 
     def test_full_card_numbers_never_stored_in_text(self):
-        for text in ('card 5228730112345542 declined', '5228 7301 1234 5542', '5228-7301-1234-5542'):
+        for text in ('card 5228730112342342 declined', '5228 7301 1234 2342', '5228-7301-1234-2342'):
             for field in ('--reason', '--source'):
                 with self.subTest(text=text, field=field):
-                    argv = ['declined', '5542', '--reason', DECLINE, field, text]
+                    argv = ['declined', '2342', '--reason', DECLINE, field, text]
                     if field == '--reason':
-                        argv = ['declined', '5542', '--reason', text]
+                        argv = ['declined', '2342', '--reason', text]
                     code, _, err = self.run_card(*argv)
                     self.assertEqual(code, 2)
                     self.assertIn('full card number', err)
-        self.assertEqual(self.run_card('ok', '5542', '--note', 'paid 5228730112345542')[0], 2)
+        self.assertEqual(self.run_card('ok', '2342', '--note', 'paid 5228730112342342')[0], 2)
         self.assertFalse(self.path.exists())
         # Order ids and flow UUIDs are fine.
-        code, _, _ = self.run_card('declined', '5542', '--reason', DECLINE,
+        code, _, _ = self.run_card('declined', '2342', '--reason', DECLINE,
                                    '--source', f'commerce talabat 3965762974 {FLOW}')
         self.assertEqual(code, 0)
 
     def test_same_event_recorded_once_so_cleared_card_stays_clear(self):
-        first = cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT)
+        first = cs.record_declined('2342', reason=DECLINE, event=FLOW, now=AT)
         self.assertTrue(first['recorded'])
-        cs.record_ok('5542', note='topped up', now=AT + 100)
-        again = cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT + 200)
+        cs.record_ok('2342', note='topped up', now=AT + 100)
+        again = cs.record_declined('2342', reason=DECLINE, event=FLOW, now=AT + 200)
         self.assertFalse(again['recorded'])
         self.assertEqual(again['duplicate_event'], FLOW)
-        self.assertFalse(cs.check('5542', now=AT + 300)['blocked'])
+        self.assertFalse(cs.check('2342', now=AT + 300)['blocked'])
         # A new failed attempt blocks again.
-        self.assertTrue(cs.record_declined('5542', reason=DECLINE, event='other-flow', now=AT + 400)['recorded'])
-        self.assertTrue(cs.check('5542', now=AT + 500)['blocked'])
+        self.assertTrue(cs.record_declined('2342', reason=DECLINE, event='other-flow', now=AT + 400)['recorded'])
+        self.assertTrue(cs.check('2342', now=AT + 500)['blocked'])
 
     def test_attempt_started_before_a_clear_does_not_reblock(self):
-        cs.record_ok('5542', now=AT + 100)
-        late = cs.record_declined('5542', reason=DECLINE, event='late-read', not_before=AT, now=AT + 200)
+        cs.record_ok('2342', now=AT + 100)
+        late = cs.record_declined('2342', reason=DECLINE, event='late-read', not_before=AT, now=AT + 200)
         self.assertFalse(late['recorded'])
         self.assertTrue(late['superseded'])
-        self.assertFalse(cs.check('5542', now=AT + 300)['blocked'])
-        fresh = cs.record_declined('5542', reason=DECLINE, event='fresh', not_before=AT + 150, now=AT + 200)
+        self.assertFalse(cs.check('2342', now=AT + 300)['blocked'])
+        fresh = cs.record_declined('2342', reason=DECLINE, event='fresh', not_before=AT + 150, now=AT + 200)
         self.assertTrue(fresh['recorded'])
 
     def test_old_decline_re_read_is_recorded_but_does_not_block(self):
         now = AT + 24 * 3600
-        late = cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=AT - 60,
+        late = cs.record_declined('2342', reason=DECLINE, event=FLOW, not_before=AT - 60,
                                   occurred_at=AT, now=now)
         self.assertTrue(late['recorded'])
-        record = self.stored()['5542']
+        record = self.stored()['2342']
         self.assertEqual((record['state'], record['at'], record['recorded_at'], record['events']),
                          ('declined', AT, now, [FLOW]))
-        result = cs.check('5542', now=now)
+        result = cs.check('2342', now=now)
         self.assertFalse(result['blocked'])
         self.assertEqual(result['message'],
-                         'card 5542 last declined at 2026-10-18 11:11 Dubai, more than 12h ago, '
+                         'card 2342 last declined at 2026-10-18 11:11 Dubai, more than 12h ago, '
                          'recorded 2026-10-19 11:11')
 
     def test_recent_decline_re_read_blocks_until_12h_after_it_happened(self):
         occurred = AT - 2 * 3600
-        cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=occurred - 60,
+        cs.record_declined('2342', reason=DECLINE, event=FLOW, not_before=occurred - 60,
                            occurred_at=occurred, now=AT)
-        blocked = cs.check('5542', now=AT)
+        blocked = cs.check('2342', now=AT)
         self.assertTrue(blocked['blocked'])
         self.assertEqual(blocked['error'], 'CARD_RECENTLY_DECLINED')
         self.assertIn('declined at 09:11 Dubai, recorded 2026-10-18 11:11 (', blocked['message'])
-        self.assertTrue(cs.check('5542', now=occurred + 12 * 3600 - 1)['blocked'])
-        self.assertFalse(cs.check('5542', now=occurred + 12 * 3600)['blocked'])
+        self.assertTrue(cs.check('2342', now=occurred + 12 * 3600 - 1)['blocked'])
+        self.assertFalse(cs.check('2342', now=occurred + 12 * 3600)['blocked'])
 
     def test_decline_time_in_the_future_or_unusable_is_clamped_to_now(self):
         for bad in (AT + 3600, float('inf'), float('nan'), 0, -5, True, '1792307460'):
             with self.subTest(occurred_at=bad):
                 self.path.unlink(missing_ok=True)
-                cs.record_declined('5542', reason=DECLINE, occurred_at=bad, now=AT)
-                self.assertEqual(self.stored()['5542']['at'], AT)
-                self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
-                self.assertFalse(cs.check('5542', now=AT + 12 * 3600)['blocked'])
+                cs.record_declined('2342', reason=DECLINE, occurred_at=bad, now=AT)
+                self.assertEqual(self.stored()['2342']['at'], AT)
+                self.assertTrue(cs.check('2342', now=AT + 12 * 3600 - 1)['blocked'])
+                self.assertFalse(cs.check('2342', now=AT + 12 * 3600)['blocked'])
 
     def test_live_decline_without_occurred_at_blocks_12h_from_now(self):
-        cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT)
-        record = self.stored()['5542']
+        cs.record_declined('2342', reason=DECLINE, event=FLOW, now=AT)
+        record = self.stored()['2342']
         self.assertEqual((record['at'], record['recorded_at']), (AT, AT))
-        self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
-        self.assertFalse(cs.check('5542', now=AT + 12 * 3600)['blocked'])
+        self.assertTrue(cs.check('2342', now=AT + 12 * 3600 - 1)['blocked'])
+        self.assertFalse(cs.check('2342', now=AT + 12 * 3600)['blocked'])
 
     def test_ok_after_a_re_read_decline_clears_and_a_later_re_read_stays_clear(self):
         occurred = AT - 3600
-        cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=occurred - 60,
+        cs.record_declined('2342', reason=DECLINE, event=FLOW, not_before=occurred - 60,
                            occurred_at=occurred, now=AT)
-        self.assertTrue(cs.check('5542', now=AT)['blocked'])
-        cs.record_ok('5542', note='topped up', now=AT + 60)
-        self.assertFalse(cs.check('5542', now=AT + 120)['blocked'])
+        self.assertTrue(cs.check('2342', now=AT)['blocked'])
+        cs.record_ok('2342', note='topped up', now=AT + 60)
+        self.assertFalse(cs.check('2342', now=AT + 120)['blocked'])
         # Another old flow whose decline happened before the clear: still clear.
-        again = cs.record_declined('5542', reason=DECLINE, event='other-old-flow',
+        again = cs.record_declined('2342', reason=DECLINE, event='other-old-flow',
                                    occurred_at=occurred + 30, now=AT + 120)
         self.assertFalse(again['recorded'])
         self.assertTrue(again['superseded'])
-        self.assertFalse(cs.check('5542', now=AT + 180)['blocked'])
+        self.assertFalse(cs.check('2342', now=AT + 180)['blocked'])
 
     def test_re_read_of_an_older_decline_never_shortens_a_newer_block(self):
-        cs.record_declined('5542', reason=DECLINE, event='fresh-flow', now=AT)
-        older = cs.record_declined('5542', reason=DECLINE, event=FLOW,
+        cs.record_declined('2342', reason=DECLINE, event='fresh-flow', now=AT)
+        older = cs.record_declined('2342', reason=DECLINE, event=FLOW,
                                    occurred_at=AT - 20 * 3600, now=AT + 60)
         self.assertFalse(older['recorded'])
-        self.assertEqual(self.stored()['5542']['at'], AT)
-        self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
+        self.assertEqual(self.stored()['2342']['at'], AT)
+        self.assertTrue(cs.check('2342', now=AT + 12 * 3600 - 1)['blocked'])
 
     def test_records_written_before_recorded_at_existed_still_load(self):
         self.path.parent.mkdir(parents=True)
-        self.path.write_text(json.dumps({'5542': {'state': 'declined', 'reason': DECLINE, 'source': 'uber',
+        self.path.write_text(json.dumps({'2342': {'state': 'declined', 'reason': DECLINE, 'source': 'uber',
                                                   'at': AT, 'note': None}}))
-        result = cs.check('5542', now=AT + 60)
+        result = cs.check('2342', now=AT + 60)
         self.assertTrue(result['blocked'])
         self.assertIsNone(result['recorded_at'])
-        self.path.write_text(json.dumps({'5542': {'state': 'declined', 'at': AT, 'recorded_at': 'soon'}}))
-        self.assertEqual(cs.check('5542', now=AT + 60)['error'], 'CARD_STATUS_UNREADABLE')
+        self.path.write_text(json.dumps({'2342': {'state': 'declined', 'at': AT, 'recorded_at': 'soon'}}))
+        self.assertEqual(cs.check('2342', now=AT + 60)['error'], 'CARD_STATUS_UNREADABLE')
 
     def test_unreadable_state_fails_closed_and_decline_still_records(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text('{not json')
-        code, out, _ = self.run_card('check', '5542')
+        code, out, _ = self.run_card('check', '2342')
         self.assertEqual(code, 3)
         self.assertIn('not valid JSON', out)
-        self.assertEqual(self.run_card('ok', '5542')[0], 2)
-        code, _, _ = self.run_card('declined', '5542', '--reason', DECLINE)
+        self.assertEqual(self.run_card('ok', '2342')[0], 2)
+        code, _, _ = self.run_card('declined', '2342', '--reason', DECLINE)
         self.assertEqual(code, 0)
-        self.assertEqual(self.stored()['5542']['state'], 'declined')
+        self.assertEqual(self.stored()['2342']['state'], 'declined')
         self.assertTrue(list(self.path.parent.glob('card-status.json.corrupt-*')))
-        self.path.write_text(json.dumps({'5542': {'state': 'maybe', 'at': 1}}))
-        self.assertTrue(cs.check('5542')['blocked'])
+        self.path.write_text(json.dumps({'2342': {'state': 'maybe', 'at': 1}}))
+        self.assertTrue(cs.check('2342')['blocked'])
 
     def test_state_file_is_private_and_list_shows_cards(self):
-        cs.record_declined('5542', reason=DECLINE, source='uber')
+        cs.record_declined('2342', reason=DECLINE, source='uber')
         cs.record_ok('1234', note='fine')
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         code, out, _ = self.run_card('list')
@@ -236,9 +236,9 @@ class CardStatusModuleTests(TempState):
         lines = out.strip().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[0].startswith('card 1234 ok since'))
-        self.assertTrue(lines[1].startswith('card 5542 declined at'))
+        self.assertTrue(lines[1].startswith('card 2342 declined at'))
         code, out, _ = self.run_card('list', '--json')
-        self.assertEqual([row['card_last4'] for row in json.loads(out)], ['1234', '5542'])
+        self.assertEqual([row['card_last4'] for row in json.loads(out)], ['1234', '2342'])
         self.assertEqual(self.run_card('list')[0], 0)
 
 
@@ -260,7 +260,7 @@ class CommerceCardRefusalTests(TempState):
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
     def test_every_paying_lane_refuses_before_any_network_call(self):
-        cs.record_declined('5542', reason=DECLINE, source='commerce talabat 3965762974')
+        cs.record_declined('2342', reason=DECLINE, source='commerce talabat 3965762974')
         forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')
         for name, (argv, lane) in self.LANES.items():
             with self.subTest(lane=name), \
@@ -273,25 +273,37 @@ class CommerceCardRefusalTests(TempState):
                 self.assertEqual(code, 3)
                 run.assert_not_called()
             self.assertEqual(result['error'], 'CARD_RECENTLY_DECLINED')
-            self.assertEqual(result['card_last4'], '5542')
+            self.assertEqual(result['card_last4'], '2342')
             self.assertFalse(result['ok'])
             self.assertFalse(result['financial_send'])
             self.assertFalse(result['financial_retry'])
-            self.assertIn('Ask Abdullah before trying it again; clear with: card-status ok 5542', result['message'])
+            self.assertIn('Ask Abdullah before trying it again; clear with: card-status ok 2342', result['message'])
+
+    def test_lanes_check_the_order_card_not_the_cancelled_one(self):
+        # 5542 is cancelled; a cancelled record for it must not stop the lane. 2342 declined must.
+        cs.record_cancelled('5542', reason='cancelled')
+        with patch.object(cli, 'purchase_talabat', return_value={'ok': True}) as purchase:
+            code, _ = self.run_cli(self.LANES['talabat'][0])
+        self.assertEqual(code, 0)
+        purchase.assert_called_once()
+        cs.record_declined('2342', reason=DECLINE)
+        code, result = self.run_cli(self.LANES['talabat'][0])
+        self.assertEqual(code, 3)
+        self.assertEqual(result['card_last4'], '2342')
 
     def test_prepare_only_is_not_refused_and_clear_reopens_ordering(self):
-        cs.record_declined('5542', reason=DECLINE)
+        cs.record_declined('2342', reason=DECLINE)
         with patch.object(cli, 'purchase_talabat', return_value={'ok': True, 'state': 'PREPARED_NOT_ORDERED'}):
             code, result = self.run_cli([*self.LANES['talabat'][0], '--prepare-only'])
         self.assertEqual((code, result['state']), (0, 'PREPARED_NOT_ORDERED'))
-        cs.record_ok('5542', note='topped up')
+        cs.record_ok('2342', note='topped up')
         with patch.object(cli, 'purchase_talabat', return_value={'ok': True}) as purchase:
             code, _ = self.run_cli(self.LANES['talabat'][0])
         self.assertEqual(code, 0)
         purchase.assert_called_once()
 
     def test_supermall_paid_resume_only_finishes_tracking(self):
-        cs.record_declined('5542', reason=DECLINE)
+        cs.record_declined('2342', reason=DECLINE)
         argv = [*self.LANES['supermall'][0], '--resume-flow', FLOW]
         with patch.object(cli.journal, 'inspect', return_value={'order_id': 'NAEIA1'}), \
                 patch.object(cli, 'order_supermall', return_value={'ok': True}) as resume:
@@ -328,7 +340,7 @@ class CommerceCardRefusalTests(TempState):
         flow.purchase.assert_called_once()
         self.assertTrue(result['card_status']['recorded'])
         self.assertTrue(result['card_status']['blocked'])
-        record = self.stored()['5542']
+        record = self.stored()['2342']
         self.assertEqual((record['state'], record['reason'], record['source']),
                          ('declined', DECLINE, 'commerce talabat 3965762974'))
         self.assertEqual(record['events'], [FLOW])
@@ -351,7 +363,7 @@ class CommerceCardRefusalTests(TempState):
         with patch.object(cs, 'record_declined', side_effect=OSError('disk full')):
             noted = cli.note_card_decline({'reason': DECLINE, 'flow_id': FLOW}, app='talabat')
         self.assertFalse(noted['recorded'])
-        self.assertIn('card-status declined 5542', noted['message'])
+        self.assertIn('card-status declined 2342', noted['message'])
 
     def test_recover_payment_decline_records_once_and_respects_a_later_clear(self):
         declined = {'ok': False, 'state': 'PAYMENT_ERROR_REPORTED', 'reason': DECLINE, 'flow_id': FLOW,
@@ -363,56 +375,75 @@ class CommerceCardRefusalTests(TempState):
         self.assertEqual(code, 1)
         self.assertEqual((result['state'], result['reason']), ('PAYMENT_ERROR_REPORTED', DECLINE))
         self.assertTrue(result['card_status']['recorded'])
-        self.assertEqual(self.stored()['5542']['source'], 'commerce talabat 3965762974')
+        self.assertEqual(self.stored()['2342']['source'], 'commerce talabat 3965762974')
         # Abdullah tops up; a later re-read of the same old flow keeps the card clear.
-        cs.record_ok('5542', note='topped up')
+        cs.record_ok('2342', note='topped up')
         with patch.object(cli, 'recover_payment', return_value={**declined, 'flow_id': 'other-old-flow'}), \
                 patch.object(cli.journal, 'flow_created_at', return_value=0), \
                 patch.object(cli.journal, 'decline_observed_at', return_value=None):
             code, result = self.run_cli(['recover-payment', 'other-old-flow'])
         self.assertEqual(code, 1)
         self.assertFalse(result['card_status']['recorded'])
-        self.assertFalse(cs.check('5542')['blocked'])
+        self.assertFalse(cs.check('2342')['blocked'])
 
     def test_cancelled_card_stays_blocked_after_12h(self):
-        cs.record_cancelled('5542', reason='lost card', source='owner', now=AT)
-        self.assertTrue(cs.check('5542', now=AT + 13 * 3600)['blocked'])
+        cs.record_cancelled('2342', reason='lost card', source='owner', now=AT)
+        self.assertTrue(cs.check('2342', now=AT + 13 * 3600)['blocked'])
 
     def test_decline_keeps_a_cancelled_card_cancelled(self):
-        cs.record_cancelled('5542', reason='lost card', now=AT)
-        cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT + 60)
-        result = cs.check('5542', now=AT + 13 * 3600)
+        cs.record_cancelled('2342', reason='lost card', now=AT)
+        cs.record_declined('2342', reason=DECLINE, event=FLOW, now=AT + 60)
+        result = cs.check('2342', now=AT + 13 * 3600)
         self.assertEqual((result['blocked'], result['error'], result['state']), (True, 'CARD_CANCELLED', 'cancelled'))
-        self.assertEqual(self.stored()['5542']['events'], [FLOW])
+        self.assertEqual(self.stored()['2342']['events'], [FLOW])
 
     def test_ok_refuses_a_cancelled_card_and_replace_reopens_it(self):
-        cs.record_cancelled('5542', reason='lost card', now=AT)
-        with self.assertRaisesRegex(cs.CardStatusError, 'card 5542 is cancelled; use card-status replace 5542'):
-            cs.record_ok('5542', now=AT + 60)
-        self.assertTrue(cs.check('5542', now=AT + 60)['blocked'])
-        cs.record_replaced('5542', note='new card from bank', now=AT + 120)
-        result = cs.check('5542', now=AT + 120)
+        cs.record_cancelled('2342', reason='lost card', now=AT)
+        with self.assertRaisesRegex(cs.CardStatusError, 'card 2342 is cancelled; use card-status replace 2342'):
+            cs.record_ok('2342', now=AT + 60)
+        self.assertTrue(cs.check('2342', now=AT + 60)['blocked'])
+        cs.record_replaced('2342', note='new card from bank', now=AT + 120)
+        result = cs.check('2342', now=AT + 120)
         self.assertFalse(result['blocked'])
-        self.assertEqual(self.stored()['5542']['note'], 'replaced: new card from bank')
+        self.assertEqual(self.stored()['2342']['note'], 'replaced: new card from bank')
 
     def test_cli_cancel_and_replace(self):
-        code, out, _ = self.run_card('cancel', '5542', '--reason', 'lost card', '--source', 'owner')
+        code, out, _ = self.run_card('cancel', '2342', '--reason', 'lost card', '--source', 'owner')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)['state'], 'cancelled')
-        code, out, _ = self.run_card('check', '5542')
+        code, out, _ = self.run_card('check', '2342')
         self.assertEqual(code, cs.EXIT_BLOCKED)
-        self.assertIn('Card 5542 was cancelled (lost card).', out)
-        code, _, err = self.run_card('ok', '5542')
+        self.assertIn('Card 2342 was cancelled (lost card).', out)
+        code, _, err = self.run_card('ok', '2342')
         self.assertEqual(code, cs.EXIT_USAGE)
-        self.assertIn('use card-status replace 5542', err)
-        code, out, _ = self.run_card('replace', '5542', '--note', 'new card', '--source', 'owner')
+        self.assertIn('use card-status replace 2342', err)
+        code, out, _ = self.run_card('replace', '2342', '--note', 'new card', '--source', 'owner')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)['state'], 'ok')
-        code, _, _ = self.run_card('check', '5542')
+        code, _, _ = self.run_card('check', '2342')
         self.assertEqual(code, 0)
 
+    def test_replace_new_records_replaced_by_and_prints_the_money_cases_hint(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        code, out, err = self.run_card('replace', '5542', '--new', '2342', '--source', 'owner')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['replaced_by'], '2342')
+        self.assertEqual(self.stored()['5542']['replaced_by'], '2342')
+        self.assertFalse(cs.check('5542', now=AT + 60)['blocked'])
+        self.assertIn('next: money-cases card-swap --old 5542 --new 2342 --dry-run', err)
+        self.assertNotIn('2342', self.run_card('replace', '5542')[2])
+
+    def test_replace_new_refuses_a_non_4_digit_value(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        for bad in ('23421', '23', '4242 4242 4242 4242'):
+            with self.subTest(new=bad):
+                code, _, err = self.run_card('replace', '5542', '--new', bad)
+                self.assertEqual(code, cs.EXIT_USAGE)
+                self.assertIn('exactly the last 4 digits', err)
+                self.assertEqual(cs.check('5542', now=AT + 60)['blocked'], True)
+
     def test_cancelled_card_refuses_every_paying_lane(self):
-        cs.record_cancelled('5542', reason='lost card')
+        cs.record_cancelled('2342', reason='lost card')
         forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')
         for name, (argv, lane) in CommerceCardRefusalTests.LANES.items():
             with self.subTest(lane=name), \
@@ -425,7 +456,7 @@ class CommerceCardRefusalTests(TempState):
                     code = cli.main([*argv, '--for', 'moni', '--moni-go', 'yes order it'])
                 result = json.loads(out.getvalue().strip().splitlines()[-1])
                 self.assertEqual(code, 3)
-                self.assertEqual((result['error'], result['card_last4']), ('CARD_CANCELLED', '5542'))
+                self.assertEqual((result['error'], result['card_last4']), ('CARD_CANCELLED', '2342'))
                 self.assertFalse(result['financial_send'])
                 run.assert_not_called()
 

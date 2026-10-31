@@ -551,6 +551,8 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
   readonly providerSession: OrchestrationV2ProviderSession;
+  /** Only healthy status/updatedAt changes may narrow; errors, recovery, metadata and release stay full-audience. */
+  readonly sessionUpdateFanout?: "interested_threads";
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   /**
    * Manager-owned runtimes expose a synchronous subscription so concurrent
