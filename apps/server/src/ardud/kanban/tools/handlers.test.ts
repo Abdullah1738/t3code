@@ -84,6 +84,7 @@ const fakeThreads = () => {
           updatedAt: "2026-10-26T08:00:00.000Z",
           quietSince: "2026-10-26T08:00:00.000Z",
           runStartedAt: null,
+          activeRunId: null,
           backgroundWork: 0,
           prs: [],
           archived: false,
@@ -93,7 +94,7 @@ const fakeThreads = () => {
       launch: (input) =>
         Effect.sync(() => {
           launches.push(input.text ?? "");
-          return ThreadId.make(`thread-${++launched}`);
+          return { threadId: ThreadId.make(`thread-${++launched}`), runId: null };
         }),
       send: () => Effect.succeed({ runId: null }),
       model: () => Effect.succeed(null),

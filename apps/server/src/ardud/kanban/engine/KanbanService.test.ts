@@ -8,6 +8,7 @@ import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
+import * as Random from "effect/Random";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -86,6 +87,7 @@ const makeFake = Effect.gen(function* () {
             updatedAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
             quietSince: thread.quietSince ?? "2026-10-25T13:00:00.000Z",
             runStartedAt: thread.runStartedAt ?? null,
+            activeRunId: null,
             backgroundWork: thread.background ?? 0,
             prs: prs.get(threadId) ?? [],
             archived: thread.archived,
@@ -123,7 +125,7 @@ const makeFake = Effect.gen(function* () {
             running: false,
             archived: false,
           });
-          return [threadId, copy] as const;
+          return [{ threadId, runId: null }, copy] as const;
         }),
       // Like production, an archived thread takes no messages.
       send: (input) =>
@@ -1923,7 +1925,7 @@ it.effect("a stale turn end cannot release a newer admission on the same thread"
 
 it.effect("a restarted service still counts the running evaluators it started", () =>
   Effect.gen(function* () {
-    const dbPath = `${process.env.TMPDIR ?? "/tmp"}/kanban-restart-${yield* Clock.currentTimeMillis}.sqlite`;
+    const dbPath = `${process.env.TMPDIR ?? "/tmp"}/kanban-restart-${yield* Random.nextInt}.sqlite`;
     const fake = yield* makeFake;
     const first = serviceOverFile(fake.layer, dbPath);
     // First service: A is started and running, with its admission counted.
@@ -1951,6 +1953,79 @@ it.effect("a restarted service still counts the running evaluators it started", 
       assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(b)?.messages, [], "B waits for a slot");
       assert.strictEqual((yield* kanban.snapshot(board!.id)).evaluators.queued, 1);
     }).pipe(Effect.provide(second));
+  }),
+);
+
+it.effect("a restarted service restores a turn of an ended evaluator link and counts it", () =>
+  Effect.gen(function* () {
+    const dbPath = `${process.env.TMPDIR ?? "/tmp"}/kanban-restart-ended-${yield* Random.nextInt}.sqlite`;
+    const fake = yield* makeFake;
+    const first = serviceOverFile(fake.layer, dbPath);
+    let firstBusy = 0;
+    // A is a discussion evaluator. Its first turn ends, which ends its link; a later owner post wakes it.
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "ended",
+        name: "Ended",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const channel = yield* kanban.createDiscussion(board.id, "Ended", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
+      const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-a1");
+      yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
+      yield* kanban.turnEnded(a, "run-a1");
+      // Woken by a later owner post: a new live turn on the same (ended-link) evaluator.
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "second" }]);
+      yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-a2");
+      firstBusy = (yield* kanban.snapshot(board.id)).evaluators.busy;
+      assert.isTrue(firstBusy >= 1, "A's woken turn is counted");
+    }).pipe(Effect.provide(first));
+    const second = serviceOverFile(fake.layer, dbPath);
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const [board] = yield* kanban.boards;
+      assert.strictEqual(
+        (yield* kanban.snapshot(board!.id)).evaluators.busy,
+        firstBusy,
+        "the restart counts the live turn of an ended link as the first service did",
+      );
+    }).pipe(Effect.provide(second));
+  }),
+);
+
+it.effect("a plain turn end for the running run delivers the queued request without a tick", () =>
+  Effect.gen(function* () {
+    const dbPath = `${process.env.TMPDIR ?? "/tmp"}/kanban-plain-end-${yield* Random.nextInt}.sqlite`;
+    const fake = yield* makeFake;
+    const first = serviceOverFile(fake.layer, dbPath);
+    const b = yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "plain",
+        name: "Plain",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.notifyThreadChanged(a, "run-a");
+      const queued = yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
+      yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
+      yield* kanban.turnEnded(a, "run-a");
+      return queued;
+    }).pipe(Effect.provide(first));
+    yield* Effect.gen(function* () {
+      assert.strictEqual(
+        (yield* Ref.get(fake.threads)).get(b)?.messages.length,
+        1,
+        "B's brief is delivered at once by the plain end",
+      );
+    }).pipe(Effect.provide(first));
   }),
 );
 

@@ -178,6 +178,30 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
   );
 });
 
+it.layer(TestLayer)("kanban store: evaluator admissions", (it) => {
+  it.effect("drops an admission only when its turn matches", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putBoard(board);
+      yield* store.putAdmission({ threadId: "thread-a", boardId, turn: "run-a", at: 1 });
+      yield* store.putAdmission({ threadId: "thread-b", boardId, turn: "run-b", at: 2 });
+      yield* store.dropAdmission("thread-a", "run-b");
+      assert.deepStrictEqual(
+        (yield* store.admissions()).map((row) => [row.threadId, row.turn]),
+        [
+          ["thread-a", "run-a"],
+          ["thread-b", "run-b"],
+        ],
+      );
+      yield* store.dropAdmission("thread-a", "run-a");
+      assert.deepStrictEqual(
+        (yield* store.admissions()).map((row) => [row.threadId, row.turn]),
+        [["thread-b", "run-b"]],
+      );
+    }),
+  );
+});
+
 it.layer(TestLayer)("kanban store: evaluator queue", (it) => {
   it.effect("reads queued evaluator sends oldest first and drops one thread", () =>
     Effect.gen(function* () {

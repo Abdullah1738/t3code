@@ -49,6 +49,7 @@ const makeFake = Effect.gen(function* () {
               updatedAt: "2026-10-27T10:00:00.000Z",
               quietSince: "2026-10-27T10:00:00.000Z",
               runStartedAt: null,
+              activeRunId: null,
               backgroundWork: 0,
               prs: [],
               archived: false,
@@ -61,7 +62,7 @@ const makeFake = Effect.gen(function* () {
           const threadId = ThreadId.make(`thread-${all.size + 1}`);
           const copy = new Map(all);
           copy.set(threadId, { title: input.title, messages: [input.text ?? ""] });
-          return [threadId, copy] as const;
+          return [{ threadId, runId: null }, copy] as const;
         }),
       send: (input) =>
         Ref.update(threads, (all) => {
