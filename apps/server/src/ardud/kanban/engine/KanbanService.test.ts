@@ -4281,14 +4281,14 @@ it.effect("an evaluator that fails twice is replaced in its discussion", () =>
       const nMsgs = (yield* Ref.get(fake.threads)).get(n)!.messages.map(String).join("\n");
       assert.include(nMsgs, "stopped on an error");
       assert.include(nMsgs, e);
-      assert.include(lastText((yield* kanban.discussion(channel.id)).messages), "A new evaluator takes over");
+      assert.include(lastText(yield* kanban.messages(channel.id)), "A new evaluator takes over");
       fake.failures.set(n, stopping);
       yield* kanban.turnEnded(n);
       yield* TestClock.adjust("2 minutes");
       yield* kanban.tick;
       yield* kanban.turnEnded(n);
       assert.isNull((yield* kanban.discussion(channel.id)).evaluatorThreadId);
-      assert.include(lastText((yield* kanban.discussion(channel.id)).messages), "No new one starts automatically");
+      assert.include(lastText(yield* kanban.messages(channel.id)), "No new one starts automatically");
       yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Still there?" }]);
       assert.isNotNull((yield* kanban.discussion(channel.id)).evaluatorThreadId);
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -4333,7 +4333,7 @@ it.effect("a one-shot evaluator that keeps failing is reported in Evaluator erro
         (d) => d.title === "Evaluator errors",
       );
       assert.isDefined(channel);
-      assert.include(lastText((yield* kanban.discussion(channel!.id)).messages), t);
+      assert.include(lastText(yield* kanban.messages(channel!.id)), t);
       assert.isNotNull((yield* kanban.caller(t))?.endedAt);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
