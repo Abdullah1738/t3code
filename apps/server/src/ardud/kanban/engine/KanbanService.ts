@@ -639,7 +639,12 @@ const make = Effect.gen(function* () {
   const evaluatorFailures = yield* Ref.make<
     ReadonlyMap<
       ThreadId,
-      { readonly dueAt: number; readonly message: string; readonly state: "retry" | "sent" | "gone" }
+      {
+        readonly dueAt: number;
+        readonly message: string;
+        readonly state: "retry" | "sent" | "gone";
+        readonly runId: string | null;
+      }
     >
   >(new Map());
   // Discussions that already got a fresh evaluator after a give-up, until one finishes a run cleanly.
@@ -1781,6 +1786,20 @@ const make = Effect.gen(function* () {
       }
     }
     yield* saveDiscussion(next);
+    // A replaced setup evaluator hands the running setup to its successor, or setup_done is denied.
+    const setupBoard = yield* boardOf(discussion.boardId);
+    if (
+      setupBoard.setup?.status === "running" &&
+      setupBoard.setup.discussionId === discussion.id &&
+      setupBoard.setup.threadId !== threadId
+    ) {
+      const running: KanbanBoard = {
+        ...setupBoard,
+        setup: { ...setupBoard.setup, threadId },
+      };
+      yield* store.putBoard(running);
+      yield* publish(running.id, { _tag: "board", board: running });
+    }
     return next;
   });
 
@@ -2613,7 +2632,7 @@ const make = Effect.gen(function* () {
   ) {
     const threadId = link.threadId;
     yield* Ref.update(evaluatorFailures, (all) =>
-      new Map(all).set(threadId, { dueAt: 0, message, state: "gone" }),
+      new Map(all).set(threadId, { dueAt: 0, message, state: "gone", runId: null }),
     );
     if (link.discussionId === null) {
       const current = (yield* store.threadLink(threadId)) ?? link;
@@ -2794,18 +2813,35 @@ const make = Effect.gen(function* () {
         yield* endLink;
         return;
       }
-      if (outage !== null) return;
+      if (outage !== null) {
+        // An outage pauses the thread for probeOutages; a retry scheduled before it must not fire.
+        if (entry !== undefined && entry.state === "retry") {
+          yield* Ref.update(evaluatorFailures, (all) => {
+            const next = new Map(all);
+            next.delete(threadId);
+            return next;
+          });
+        }
+        return;
+      }
       if (entry?.state === "gone") {
         yield* endLink;
         return;
       }
+      // The same executed run can be reported twice (a repeated turn-end or a metadata update).
+      if (entry !== undefined && failure.runId != null && entry.runId === failure.runId) return;
       if (entry !== undefined || Rules.isContextFull(failure)) {
         yield* evaluatorGiveUp(link, failure.message);
         return;
       }
       const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
       yield* Ref.update(evaluatorFailures, (all) =>
-        new Map(all).set(threadId, { dueAt, message: failure.message, state: "retry" }),
+        new Map(all).set(threadId, {
+          dueAt,
+          message: failure.message,
+          state: "retry",
+          runId: failure.runId ?? null,
+        }),
       );
       return;
     }

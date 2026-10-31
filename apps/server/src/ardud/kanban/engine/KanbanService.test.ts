@@ -4209,6 +4209,138 @@ const stopping = {
   message: "OpenCode is still stopping the previous turn. Send the message again in a moment.",
 } as never;
 
+it.effect("review135: a replacement setup evaluator can finish setup", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const first = yield* kanban.startEvaluator(board.id, { kind: "setup", text: "Set it up" });
+      const setup = (yield* kanban.boards).find((b) => b.id === board.id)!.setup!;
+      fake.failures.set(first, {
+        class: "provider_error", code: null, message: "prompt is too long",
+      } as never);
+      yield* kanban.turnEnded(first);
+      const fresh = (yield* kanban.discussion(setup.discussionId)).evaluatorThreadId!;
+      assert.notStrictEqual(fresh, first);
+      yield* kanban.endSetup(board.id, { _tag: "evaluator", threadId: fresh });
+      assert.strictEqual((yield* kanban.boards).find((b) => b.id === board.id)!.setup!.status, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: an outage pauses a previously scheduled retry", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Continue now" }]);
+      fake.failures.set(e, outage);
+      yield* kanban.turnEnded(e);
+      assert.isNotNull((yield* kanban.caller(e))!.paused);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: duplicate failure notifications do not consume the retry", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      yield* kanban.turnEnded(e);
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const messages = (yield* Ref.get(fake.threads)).get(e)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("one automatic retry")).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a rejected retry send hands off once without breaking the tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      fake.failures.set(e, stopping);
+      yield* kanban.turnEnded(e);
+      fake.rejectSends.add(e);
+      yield* TestClock.adjust("2 minutes");
+      yield* kanban.tick;
+      const fresh = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      assert.notStrictEqual(fresh, e);
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.discussion(channel.id)).evaluatorThreadId, fresh);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a given-up ask routes to the card discussion evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at it" });
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.askOwner(card.id, { question: "Ship?", blocking: false, options: ["A", "B"] },
+        { _tag: "evaluator", threadId: evaluator }, "evaluator");
+      fake.failures.set(evaluator, { class: "provider_error", code: null, message: "prompt is too long" } as never);
+      yield* kanban.turnEnded(evaluator);
+      const before = (yield* Ref.get(fake.threads)).get(evaluator)!.messages.length;
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.answer(talk.id, 1, "q1", ["o1"], owner);
+      const current = yield* kanban.discussion(talk.id);
+      assert.isNotNull(current.evaluatorThreadId);
+      assert.notStrictEqual(current.evaluatorThreadId, evaluator);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(evaluator)!.messages.length, before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("review135: a clean replacement run resets the discussion handoff budget", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+      const e = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      const full = { class: "provider_error", code: null, message: "prompt is too long" } as never;
+      fake.failures.set(e, full);
+      yield* kanban.turnEnded(e);
+      const n = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* kanban.turnEnded(n);
+      fake.failures.set(n, full);
+      yield* kanban.turnEnded(n);
+      const next = (yield* kanban.discussion(channel.id)).evaluatorThreadId;
+      assert.isNotNull(next);
+      assert.notStrictEqual(next, n);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const lastText = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unknown> }>) =>
   messages.at(-1)?.blocks.map((b) => ("text" in (b as object) ? (b as { text: string }).text : "")).join("") ?? "";
 
