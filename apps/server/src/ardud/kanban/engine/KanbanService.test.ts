@@ -11,6 +11,7 @@ import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -1772,6 +1773,99 @@ it.effect("a failed read does not forget a status ask, so the next tick does not
       assert.strictEqual(fake.failReads.left, 0, "the injected read failure was consumed");
       yield* kanban.tick;
       assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a full evaluator pool queues a new evaluator and starts it when a slot frees", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      const b = yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
+      assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(b)?.messages, []);
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).evaluators, {
+        slots: 1,
+        busy: 1,
+        queued: 1,
+      });
+      yield* kanban.turnEnded(a);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(b)?.messages.length, 1);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a message to a running evaluator never waits", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const channel = yield* kanban.createDiscussion(board.id, "Steer", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Hello" }]);
+      const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
+      const before = (yield* Ref.get(fake.threads)).get(a)?.messages.length ?? 0;
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Steer please" }]);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(a)?.messages.length, before + 1);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("no limit keeps today's behaviour", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const threads = [];
+      for (const text of ["A", "B", "C"]) {
+        threads.push(yield* kanban.startEvaluator(board.id, { kind: "request", text }));
+      }
+      const all = yield* Ref.get(fake.threads);
+      for (const id of threads) assert.strictEqual(all.get(id)?.messages.length, 1);
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).evaluators, {
+        slots: null,
+        busy: 0,
+        queued: 0,
+      });
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("raising the evaluator pool drains the queue", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      const b = yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
+      const c = yield* kanban.startEvaluator(board.id, { kind: "request", text: "C" });
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 2);
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 3 });
+      const all = yield* Ref.get(fake.threads);
+      assert.strictEqual(all.get(b)?.messages.length, 1);
+      assert.strictEqual(all.get(c)?.messages.length, 1);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the evaluator pool refuses 0", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const refused = yield* Effect.result(kanban.updateBoard(board.id, { evaluatorSlots: 0 }));
+      assert.isTrue(Result.isFailure(refused));
+      assert.strictEqual((yield* kanban.snapshot(board.id)).board.evaluatorSlots, null);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
