@@ -138,6 +138,82 @@ guard read, inheritance, foreign/conflicting rejection).
 - `GET post-order/{nr}` and the cart reset read are NOT replayed (post-order
   marketing payload; unnecessary for paid proof).
 
+## Checkout-v2 payment audit (2026-11-01, #239)
+
+**Stop condition reached: the app opens a payment webview.** No payment code
+was changed by this audit. A body-only patch is not a verified 3DS fix, and the
+earlier frictionless proofs do not cover this branch. The CLI currently alerts
+and polls where the app opens `redirect_url`; a pending response alone does not
+prove that ENBD has sent an approval prompt.
+
+Input: the retained 8 October `noon.apk` (214931048 bytes), asset
+`assets/index.android.bundle` (34278052 bytes), Hermes v98, source hash
+`d0701a3dd9cf80ab003916e00307a0d42abd7c6a`, asset SHA-256
+`a213ec477e181c8e4b9ccb4fa85b13a064559c8c4ad93c3869f1200d12f487f3`.
+This is **not** the older 33908200-byte APK asset in NOON-CHECKOUT.md.
+Read the ZIP asset into RAM and pipe it to the documented `hermesc` with
+`-b -dump-bytecode -pretty=false -`; filter its stdout, never save a full dump.
+References below are zero-based function IDs and decimal byte offsets within
+each function (`[@ N]`), which avoid pretty-output line-number differences.
+
+- **Marketplace call chain:** `NoonCheckoutScreen` f42598 creates
+  `getCvvEncryptionData` f88586, `_placeOrder` f88588 and
+  `paymentStatusHandler` f88590. `_placeOrder` reaches generator f131025,
+  which calls `NoonCheckoutService.placeOrderV2` at @394–451 and attaches
+  its result callback f134890 at @462. This is checkout-v2, not the separate
+  Minutes/Food/NowNow payment code.
+- **Completion object:** f134890 @0 uses shape 40097, key-buffer offset
+  567752, 11 slots: `orderNumber`, `paymentMethodCode`, `idCustomerToken`,
+  `cvvEncryption`, `idEmiPlan`, `tenorMonth`, `applePayToken`, `googlePayToken`,
+  `paymentType`, `installments`, `paymentProviderCode`. It fills every slot
+  at @18–219, then fetches order status. f119063 @621–657 copies that object,
+  adds `clientSecret` from the pending order-status response, and calls
+  `PaymentService.completePaymentIntent`. There is **no `adcbTokenCode`**
+  in this marketplace object. With saved `cc_noonpay` and required CVV, the
+  populated core is the order, method, selected card ID, encrypted envelope,
+  provider and client secret.
+- **Null versus absent matters:** shape 40097's literal values start as null,
+  but the instructions overwrite all 11 slots. Missing EMI selection writes
+  `undefined` at @83–93; absent optional payment arguments and array entries
+  likewise write `undefined` at @97–159 (arguments originate in f131025
+  @727–758). Ordinary JSON omits these properties. Static evidence therefore
+  does **not** justify copying Minutes' explicit-null body into marketplace.
+  No marketplace CVV wire capture was made; the exact optional values still
+  depend on caller/session data. Maximum constructed key set is 12 including
+  `clientSecret`, not the previously suggested 13-key body.
+- **Provider source:** f134890 @195–219 reads the checkout session's top-level
+  `paymentProviderCode` and passes it through `ApplePayManager.getMerchantIDCode`
+  (f62407). That helper preserves `NOON_PAY`, `ADYEN`, `CHECKOUT` (enum f5959
+  @47–77), otherwise defaults to `NOON_PAY` at @41–72. f119063 @639–651
+  carries the result into completion. Any future CLI change should use the
+  packet's stricter fail-closed provider check, not copy the app's fallback.
+- **CVV config route is already correct in the CLI:** f88611 @171–204 calls
+  `PaymentService.getPaymentConfig` alongside the checkout session fetch.
+  f29187 @22–80 uses `getServiceBaseUrl('st', 'mp-payment-api-public')` plus
+  GET `/config`: production `https://api-app-st.noon.com/_svc/mp-payment-api-public/config`
+  (base builder f23801 @168–378). f88586 @95–241 reads
+  `cvv_encryption.public_key/public_key_name`, calls `encryptDataV2` and
+  builds `cvvEncryption{encCvv,publicKeyName}`. Do not switch this to the
+  Minutes-only `/_svc/mp-payment-public/config` route.
+- **After complete:** f29184 @22–94 posts the supplied object unchanged to
+  `/_svc/mp-payment-api-public/paymentintent/complete` on the same `st` host.
+  f88590 @514–535 polls status after 1000 ms for `payment_pending` (f29185
+  @65–104 posts only `{clientSecret}` to `/paymentintent/status`). On
+  `payment_ready_to_redirect`, f88590 @314–499 passes the returned URL as
+  `uri` to `noon.WebViewScreenWithCancel` (shape 19426/value offset 608769).
+  When `use_new_webview` is true it instead calls `NoonCheckoutPasskeyUtils.handle`;
+  f88658 @14–78 invokes `NativeAuthSessionModule.startMastercardAuth(uri)`.
+  The webview close callback f119073 @35–47 checks `WebViewScreen.closeMessage`,
+  then @390–402 reads payment status. Confirmed/failed payment statuses lead
+  back to exact order status (f88590 @243–270). Neither redirect mechanism is
+  implemented by the CLI, so #239 stops here as instructed.
+
+These are static app-contract findings, not proof of which defect caused the
+two 31 October timeouts. No live request, bank prompt, order or payment was
+generated. Missing provider is a proven request difference; the config-route
+hypothesis is disproved for this bundle, and the mandatory redirect branch
+requires a separately scoped decision before implementation or a live retry.
+
 ## Live proof
 
 Lane's own live run, 2026-10-11 00:16-00:23 +04 (flow
