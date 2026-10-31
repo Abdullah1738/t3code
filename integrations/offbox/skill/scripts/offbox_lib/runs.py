@@ -406,10 +406,10 @@ def exit_recording_command(script: str, run_id: str) -> str:
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
 
 
-def recorded_exit(box_id: str, run_id: str) -> int | None:
+def recorded_exit(box_id: str, run_id: str, timeout: float = 20) -> int | None:
     """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
     try:
-        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=20)
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, OffboxError):
         return None
     if p.returncode != 0:
@@ -430,9 +430,11 @@ def steps_exit(log_path: Path | None, planned: int) -> int | None:
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
 
 
-def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int) -> tuple[int | None, str]:
-    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines."""
-    code = recorded_exit(box_id, run_id)
+def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
+                      timeout: float = 20) -> tuple[int | None, str]:
+    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines.
+    `timeout` bounds the box read (a caller with a deadline passes what is left of it)."""
+    code = recorded_exit(box_id, run_id, timeout=timeout)
     if code is not None:
         return code, "the box's exit file"
     code = steps_exit(log_path, planned)
@@ -532,9 +534,9 @@ class Runner:
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.commit()
         t0 = now()
-        size = lease.typecheck_size(cmd_text, me["repo_root"], a.size)
-        if size != a.size:
-            say("typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override")
+        size, why = lease.auto_size(con, cmd_text, me, a.size)
+        if why:
+            say(why)
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
@@ -672,12 +674,14 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
 
 
 def _echo(stream, b: bytes) -> bool:
-    """Echo a chunk to the caller. A closed pipe stops the echo only; the log keeps the output."""
+    """Echo a chunk to the caller. Any failure to write there stops the echo only; the log keeps the output. Not just a
+    closed pipe: a redirect to a file on a volume that went away fails with EIO (31 Oct, run-1031-140118-88ca), and
+    letting that reach follow()'s stream retry replayed the same chunk forever."""
     try:
         stream.buffer.write(b)
         stream.flush()
         return True
-    except (BrokenPipeError, ValueError):
+    except (OSError, ValueError):
         silence(stream)
         return False
 
@@ -700,6 +704,34 @@ def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
                           {"stdoutOffset": out_off, "stderrOffset": err_off, "logBytes": log_bytes})
     except OSError:
         pass
+
+
+def _status_code(st: dict) -> int | None:
+    """The exit code in an ended process's status, read like an exit frame: a signal without a code counts as 143,
+    and None (boat lost the process, or gave no code) sends the caller to recover_lost_exit."""
+    if st.get("status") == "lost":
+        return None
+    if st.get("exitCode") is not None:
+        return st.get("exitCode")
+    return 128 + 15 if st.get("signal") else None
+
+
+def _ended(box_id: str, pid: int, until: float | None) -> dict | None:
+    """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
+    request, no retries, never past the caller's deadline; any error counts as not ended."""
+    try:
+        left = 60.0 if until is None else max(1.0, min(60.0, until - now()))
+        st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
+    except OffboxError:
+        return None
+    if st and not st.get("running") and st.get("status") in ("exited", "lost"):
+        return st
+    return None
+
+
+# follow() asks boat's status at most this often while a stream sends only heartbeats.
+QUIET_PROBE_S = 300
+_RUNNING = object()
 
 
 # Matches outage.WAIT_MAX_S: the auto-stop now holds ~25 min, so a run can ride out an outage that long.
@@ -743,8 +775,33 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             # original right away sees a valid committed length rather than none.
             _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
+    # How often boat's status has said the process ended with no output delivered in between. Unlike `failures`, a
+    # frame does not reset it, only progress does: a failure that recurs after the first frame of every attach (31 Oct,
+    # run-1031-140118-88ca: each reattach replayed one chunk, its echo raised EIO, `attached` cleared `failures`) still
+    # ends with boat's exit code, while a finished run whose output is still arriving is followed to its exit frame.
+    ended = {"n": 0, "at": None}
     frames = None
     down_from = None  # since when boat's API has been unreachable during this follow
+
+    probed = {"at": now()}
+
+    def ended_again() -> int:
+        if ended["at"] != (out_off, err_off):
+            ended["n"], ended["at"] = 0, (out_off, err_off)
+        ended["n"] += 1
+        return ended["n"]
+
+    def probe_end():
+        """On a reconnect or a long run of heartbeats: boat's exit code once its status has said the process ended
+        twice with no output in between (None when boat lost it), else _RUNNING."""
+        probed["at"] = now()
+        st = _ended(box_id, pid, until)
+        # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
+        if until is not None and now() >= until:
+            raise timed_out()
+        if st is None or ended_again() < 2:
+            return _RUNNING
+        return _status_code(st)
 
     def timed_out() -> OffboxError:
         return OffboxError(f"--timeout reached; {run_id or f'{box_id}:{pid}'} keeps running on {box_id} "
@@ -799,8 +856,18 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                                 _commit(mirror_path, out_off, err_off, mf.tell())
                     elif t == "reconnect":
                         out_off, err_off = fr.get("stdoutOffset", out_off), fr.get("stderrOffset", err_off)
+                        # boat ends a healthy stream every 10 min; an ended process gets its exit frame on the next
+                        # attach. If boat keeps answering with reconnects instead, take the code from its status.
+                        code = probe_end()
+                        if code is not _RUNNING:
+                            return code
                         again = True
                         break
+                    elif t == "heartbeat" and now() - probed["at"] >= QUIET_PROBE_S:
+                        # A stream that only sends heartbeats can't hide a finished process for long either.
+                        code = probe_end()
+                        if code is not _RUNNING:
+                            return code
                     elif t == "exit":
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
                             128 + 15 if fr.get("signal") else None)
@@ -856,8 +923,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return None
-                    if failures > 3:
-                        return st.get("exitCode")
+                    if ended_again() > 3:
+                        return _status_code(st)
                 if failures > 20 and (down_from is None or now() - down_from >= OUTAGE_FOLLOW_S):
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
                 pause = min(10, 1 + failures)

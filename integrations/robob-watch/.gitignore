@@ -2,3 +2,14 @@ __pycache__/
 # Test runs with a fake HOME must never leave caches or locks in the repo.
 Library/
 .local/
+# Runtime state of live watchers (never in git): dose logs, chase/poll state, account lists.
+*.state.json
+chase.json
+nagstate.json
+taken.json
+moved.json
+lift-state.json
+accounts.json
+last_fired
+# Private account, payment and mail context for live watchers: never versioned.
+custom/**/context.txt

@@ -13,9 +13,15 @@ import time
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
-                     offsets_path, read_json, say)
+                     offsets_path, out, read_json, say, silence)
 
 WAIT_POLL_S = 5
+# A lock-blocked waiter asks boat about the process this often, and once boat has said it ended for HOLDER_GRACE_S
+# while the holder still hasn't recorded the end, the waiter stops waiting for that holder (it looks stuck).
+STATUS_POLL_S = 30
+HOLDER_GRACE_S = 60
+# A holder with --pull paths copies them back after the process ends (up to 30 min a path), so it gets longer.
+PULL_GRACE_S = 1860
 
 
 def parse_ttl(s: str) -> int:
@@ -321,7 +327,7 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r) -> int:
-    print(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
+    out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
 
@@ -335,8 +341,13 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
     except OSError:
         return pos
     if data and echo:
-        sys.stdout.write(data.decode(errors="replace"))
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(data.decode(errors="replace"))
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            # A dead stdout (closed pipe, a redirect on a volume that went away: EIO) must not end the wait before it
+            # reports the exit code; the run's local log still has every byte.
+            silence(sys.stdout)
     return pos + len(data)
 
 
@@ -356,6 +367,7 @@ def _wait_locked(r, echo, timeout=None):
     `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
     over, only checkpointed bytes are delivered (see runs.follow): a takeover replays everything past the checkpoint,
     and a log with no checkpoint at all (a holder from before checkpoints) is replayed whole into an emptied log."""
+    from .runs import _ended
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     r = _wait_for_start(r, deadline)
@@ -363,6 +375,9 @@ def _wait_locked(r, echo, timeout=None):
         _tail(log_path, 0, echo)
         return _settled(r)
     pos, said = 0, False
+    polled, ended_at = None, None
+    # The row we poll: refreshed each loop, so a PID the holder records later (it starts with NULL) is picked up.
+    probe_pid, last_size = None, -1
     while True:
         guard = file_lock('box-' + r['box_id'], timeout=0)
         try:
@@ -405,12 +420,75 @@ def _wait_locked(r, echo, timeout=None):
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                               f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        # Output still arriving means the holder is alive and following: the grace restarts with each new byte.
+        size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        if size != last_size:
+            last_size, ended_at = size, None
+        if cur['process_id'] != probe_pid:
+            probe_pid, polled, ended_at = cur['process_id'], None, None
+        if cur['process_id'] and (polled is None or now() - polled >= STATUS_POLL_S):
+            polled = now()
+            st = _ended(cur['box_id'], cur['process_id'], deadline)
+            # The deadline may pass during the status request: such an answer is not accepted (--timeout is 124).
+            if deadline is not None and now() >= deadline:
+                raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                                  f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+            # Output that arrived during the status request is progress too: re-read the log before deciding.
+            grown = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            if grown != last_size:
+                last_size, ended_at = grown, None
+            else:
+                ended_at = (ended_at or now()) if st else None
+            if st and ended_at is not None and now() - ended_at >= _grace(cur):
+                return _holder_stuck(cur, st, log_path, pos, echo, deadline)
         if not said:
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
                 f"waiting for it to record the end")
             said = True
         pause = WAIT_POLL_S if deadline is None else max(0.0, min(WAIT_POLL_S, deadline - now()))
         time.sleep(pause)
+
+
+def _grace(r) -> int:
+    try:
+        pulls = json.loads(r["pulls"] or "[]")
+    except (ValueError, TypeError):
+        pulls = []
+    return PULL_GRACE_S if pulls else HOLDER_GRACE_S
+
+
+def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
+    """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
+    instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
+    A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
+    from .runs import _status_code
+    code, how = _status_code(st), "boat's process status"
+    if code is None:
+        code, how = _recover_by(r, log_path, deadline)
+    _tail(log_path, pos, echo)
+    say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
+        f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
+    out(f"{r['run_id']}: exit={code}")
+    return 90 if code is None else code
+
+
+def _recover_by(r, log_path, deadline):
+    """recover_lost_exit for a wait: the box read gets only what is left of the caller's deadline (20 s without one),
+    and an answer that arrives at or past the deadline is not accepted, so nothing is published or settled from it
+    (--timeout is 124 and the run is left alone)."""
+    from .runs import recover_lost_exit
+    budget = 20.0 if deadline is None else deadline - now()
+    if budget <= 0:
+        raise _wait_timeout(r)
+    code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+    if deadline is not None and now() >= deadline:
+        raise _wait_timeout(r)
+    return code, how
+
+
+def _wait_timeout(r) -> OffboxError:
+    return OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
+                       f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
 
 
 def _not_started(r) -> str:
@@ -532,15 +610,14 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
     `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
     only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
-    from .runs import follow, recover_lost_exit
+    from .runs import follow
     code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
                   start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
                   mirror_keep=mirror_keep)
     if code is None:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
+        code, how = _recover_by(r, log_path, until)
         if code is not None:
-            print(f"offbox: boat lost track of the remote process after it ended; exit {code} taken from {how}",
-                  file=sys.stderr)
+            say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
     return code
 
 
@@ -556,7 +633,7 @@ def _finalize(r, code, log_path) -> int:
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
     go_std_glitch(r["box_id"], r["run_id"], log_path, code)
-    print(f"{r['run_id']}: exit={code}")
+    out(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
 
 

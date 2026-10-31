@@ -43,6 +43,10 @@ class Clock:
             self.on_sleep(self.t)
 
 
+def _no_network(*a, **k):
+    raise AssertionError('offline test: a real network call was attempted')
+
+
 class WaitLockTests(Isolated):
     def setUp(self):
         super().setUp()
@@ -50,6 +54,10 @@ class WaitLockTests(Isolated):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', common.LOGS_DIR))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
+        # The wait polls boat's status for a lock-held run. Offline: the default answer is "still running"; a test that
+        # needs boat to say the process ended sets its own `_ended`. Any real request is a failure.
+        self.ended = self.stack.enter_context(patch.object(runs, '_ended', return_value=None))
+        self.stack.enter_context(patch.object(runs.api.urllib.request, 'urlopen', _no_network))
         self.con.execute("INSERT INTO runs(run_id,box_id,status,process_id,pulls,start_at) "
                          "VALUES ('run-x','bx_a','running',7,'[]',900)")
         self.con.commit()
@@ -82,6 +90,158 @@ class WaitLockTests(Isolated):
         self.assertFalse(any(l.startswith('offbox:') and 'timed out waiting for lock' in l
                              for l in err.splitlines()), err)
         self.assertEqual(err.count('still followed by another offbox process'), 1)
+
+    def test_active_output_restarts_the_holder_grace(self):
+        # The holder is alive: its log grows every poll and boat says the process ended. The grace must not elapse.
+        self.hold_box()
+        self.ended.side_effect = lambda *a, **k: {'running': False, 'status': 'exited', 'exitCode': 0}
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        state = {'n': 0}
+
+        def grow(t):
+            state['n'] += 1
+            with open(log, 'ab') as f:
+                f.write(b'chunk\n')
+            if t >= 1200:
+                self.end_run(0)
+        clock = Clock(on_sleep=grow)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('looks stuck', err)
+        # The holder kept writing across more than two grace windows (2 x 60 s), so the grace really was restarted.
+        self.assertGreater(state['n'], 2 * 60 // 5)
+
+    def test_output_during_the_status_call_restarts_the_grace(self):
+        # Boat says "ended" from the first poll on, so the grace clock starts at the first answer (t=1000). Each poll
+        # every 30 s sees the log unchanged, except the third one: its answer is in flight while the holder writes, at
+        # t=1060+5. That byte is progress, so the grace restarts there and must not be judged stuck at t=1060.
+        self.hold_box()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        calls = {'n': 0}
+        clock = None
+
+        def ended_with_late_output(*a, **k):
+            calls['n'] += 1
+            if calls['n'] == 3:
+                # The third answer is in flight while the holder writes at t=1065 (nothing was written before).
+                clock.t = 1065.0
+                with open(log, 'ab') as f:
+                    f.write(b'late\n')
+            return {'running': False, 'status': 'exited', 'exitCode': 0}
+
+        def holder(t):
+            # From t=1065 the holder keeps writing every poll and records its end at t=1200, so the grace never elapses.
+            if t >= 1200:
+                self.end_run(0)
+            elif t >= 1065:
+                with open(log, 'ab') as f:
+                    f.write(b'more\n')
+        self.ended.side_effect = ended_with_late_output
+        clock = Clock(on_sleep=holder)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('looks stuck', err)
+        self.assertGreaterEqual(calls['n'], 3)
+
+    def test_near_deadline_lost_status_recovery_is_capped_to_the_budget(self):
+        # The holder's grace has already elapsed when boat says "lost" at t=1060 with one second of --timeout 61 left.
+        # The recovery read must get that second, not 20 s, and the wait must end at the deadline with 124.
+        self.hold_box()
+        clock = Clock()  # the wait starts at t=1000, so --timeout 61 ends at t=1061
+        seen = {}
+
+        def lost(*a, **k):
+            return {'running': False, 'status': 'lost', 'exitCode': None}
+        self.ended.side_effect = lost
+
+        def fake_recorded(box_id, run_id, timeout=20):
+            seen['timeout'] = timeout
+            clock.t += timeout
+            return None
+        # Polls at t=1000, 1030, 1060: the grace (60 s since the first "lost" answer) elapses at t=1060, one second
+        # before the deadline. Recovery must read the box for that one second only, not for its usual 20 s.
+        with patch.object(runs, 'recorded_exit', side_effect=fake_recorded), \
+                patch.object(runs, 'steps_exit', return_value=None), \
+                patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '61'], clock)
+        self.assertIn('timeout', seen, 'recovery must have been attempted near the deadline')
+        self.assertLessEqual(seen['timeout'], 1.0 + 1e-6)
+        self.assertLessEqual(clock.t, 1061.0 + 1e-6)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+
+    def test_lock_free_takeover_lost_status_recovery_keeps_to_the_deadline(self):
+        # The lock is free, so the wait takes over the follow. boat answers two reconnects (0.1 s each) and says the
+        # process is "lost", so follow() returns None and the exit is recovered from the box. With --timeout 1 that
+        # read gets only the 0.8 s left, its answer (7) comes at the deadline and is not accepted: 124 at t=1001, the
+        # row still running, no replacement log published.
+        clock = Clock()
+        seen = {}
+
+        def reconnects(box, pid, o, e, **kw):
+            clock.t += 0.1
+            return iter([{'type': 'attached', 'stdoutOffset': o, 'stderrOffset': e},
+                         {'type': 'reconnect', 'stdoutOffset': o, 'stderrOffset': e}])
+        self.ended.side_effect = lambda *a, **k: {'running': False, 'status': 'lost', 'exitCode': None}
+
+        def fake_recorded(box_id, run_id, timeout=20):
+            seen['timeout'] = timeout
+            clock.t += timeout  # the box read runs out its whole timeout, then finds the exit file
+            return 7
+        with patch.object(runs, '_ttl_keeper'), patch.object(runs.api, 'cmd_attach', reconnects), \
+                patch.object(runs.api, 'cmd_status', side_effect=AssertionError('probe goes through _ended')), \
+                patch.object(runs, 'recorded_exit', side_effect=fake_recorded), \
+                patch.object(runs, 'finish', side_effect=AssertionError('a late recovery must not settle the row')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+        self.assertNotIn('exit=7', out)
+        self.assertIn('timeout', seen, 'the lost process must have gone to recovery')
+        self.assertLessEqual(seen['timeout'], 0.8 + 1e-6)
+        self.assertLessEqual(clock.t, 1001.0 + 1e-6)
+        self.assertEqual(self.con.execute("SELECT status, exit_code FROM runs WHERE run_id='run-x'").fetchone()[:],
+                         ('running', None))
+        self.assertFalse((common.LOGS_DIR / 'run-x.log.takeover').exists())
+
+    def test_status_answer_after_the_deadline_is_not_accepted(self):
+        # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
+        self.hold_box()
+        clock = Clock()
+
+        def late_ended(*a, **k):
+            clock.t = 1061.0
+            return {'running': False, 'status': 'exited', 'exitCode': 8}
+        self.ended.side_effect = late_ended
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '60'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+
+    def test_a_pid_recorded_after_the_wait_started_is_probed(self):
+        # The waiter starts while the holder has no PID yet (NULL); once it records PID 7, boat's end must be seen.
+        self.hold_box()
+        self.con.execute("UPDATE runs SET process_id=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        calls = {'n': 0}
+
+        def ended_after_pid(*a, **k):
+            calls['n'] += 1
+            return {'running': False, 'status': 'exited', 'exitCode': 6}
+        self.ended.side_effect = ended_after_pid
+
+        def record_pid(t):
+            if t >= 1010:
+                self.con.execute("UPDATE runs SET process_id=7 WHERE run_id='run-x'")
+                self.con.commit()
+        clock = Clock(on_sleep=record_pid)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertGreater(calls['n'], 0)
+        self.assertEqual(rc, 6, err)
 
     def test_wait_timeout_while_lock_held_is_124_and_run_untouched(self):
         self.hold_box()

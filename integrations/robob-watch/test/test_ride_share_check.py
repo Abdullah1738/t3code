@@ -28,6 +28,9 @@ if args[:2] == ["rides", "status"]:
 elif args[:2] == ["trips", "get"]:
     t = state.get("history", {}).get(args[2])
     out = {"ok": True, "result": t} if t else {"ok": False, "error": "not found"}
+elif args[:2] == ["trips", "receipt"]:
+    text = state.get("receipts", {}).get(args[2])
+    out = {"ok": True, "result": {"uuid": args[2], "text": text}} if text is not None else {"ok": False, "error": "no receipt"}
 else:
     out = {"ok": False, "error": "unexpected args " + " ".join(args)}
 print(json.dumps(out))
@@ -223,9 +226,9 @@ class Base(unittest.TestCase):
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return p
 
-    def set_state(self, trip, history):
+    def set_state(self, trip, history, receipts=None):
         with open(self.fixture, "w") as f:
-            json.dump({"trip": trip, "history": history}, f)
+            json.dump({"trip": trip, "history": history, "receipts": receipts or {}}, f)
 
     def run_check(self, now, **extra):
         env = dict(self.env, RIDE_SHARE_NOW=str(now), **extra)
@@ -344,6 +347,35 @@ class WatcherTest(Base):
         self.assertEqual(self.run_check(400), [])
         self.assertEqual(self.card(A)["state"], "cancelled")
         self.assertEqual(self.card(B)["plate"], "J 11111")
+
+    def test_cancel_fee_prints_even_when_rebooked(self):
+        self.mark_sent(A)
+        self.run_check(0)
+        receipt = {A: "Fare\tAED 0.00\nCancellation Fee\tAED 28.00\nNew Total\tAED 28.00"}
+        self.set_state(trip(B, "Searching"), {A: {"status": "CANCELED"}}, receipt)
+        self.assertEqual(self.run_check(30), [f"CANCEL_FEE trip={A} rider=abdullah(assumed) fee=AED 28.00 refunded=no"])
+        self.set_state(trip(B, "Accepted", plate="J 11111"), {A: {"status": "CANCELED"}}, receipt)
+        self.assertEqual(self.run_check(60), [])
+        out = self.run_check(120)
+        self.assertEqual(len(out), 1, out)
+        self.assertTrue(out[0].startswith(f"CARD_READY trip={B}"), out)
+        self.assertEqual(self.run_check(400), [], "no cancel line for the rebooked trip, fee not repeated")
+        with open(self.fixture + ".calls") as f:
+            self.assertEqual(f.read().splitlines().count(f"trips receipt {A}"), 1)
+
+    def test_cancel_without_fee_prints_nothing_new(self):
+        self.mark_sent(A)
+        self.run_check(0)
+        self.set_state(trip(B, "Searching"), {A: {"status": "CANCELED"}}, {A: "Fare\tAED 0.00\nTotal\tAED 0.00"})
+        self.assertEqual(self.run_check(30), [])
+        self.assertEqual(self.run_check(240), [f"CANCELED trip={A} rider=abdullah(assumed)"])
+
+    def test_receipt_failure_is_silent(self):
+        self.mark_sent(A)
+        self.run_check(0)
+        self.set_state(trip(B, "Searching"), {A: {"status": "CANCELED"}}, None)
+        self.assertEqual(self.run_check(30), [])
+        self.assertEqual(self.run_check(240), [f"CANCELED trip={A} rider=abdullah(assumed)"])
 
     def test_late_cancel_history_after_rebook_card_ready_is_silent(self):
         self.mark_sent(A)

@@ -102,10 +102,14 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
-  large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
+  large), `crpko-harness` (large, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
+- Other automatic xlarge (no `--size` given; offbox says why): compose/LocalStack/testcontainers in the command,
+  any run in a `*harness*` repo, a whole suite (`./...`, `make test`, bare `pytest`) in a repo whose manifests use
+  testcontainers, and any run in a repo that had an exit 137 on a smaller box in the last 14 days. Everything else
+  runs at the template/base size (large; generic default). Real per-job peak is ~12 GB, which large (16 GB) holds.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
   the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
@@ -136,7 +140,9 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
-its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
+minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
+`--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
 If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
 

@@ -468,7 +468,7 @@ class PoolTests(Isolated):
         self.con.execute("INSERT INTO bases(name,repo_key,box_id,size,is_default) VALUES ('repo:default','repo','bx_b','default',1)")
         self.con.commit()
         self.assertEqual(lease.natural_size(self.con,{'source':'base:repo:default'}),'large')  # floored at large
-        self.assertEqual(lease.natural_size(self.con,{'source':'template:crpko-harness'}),'xlarge')
+        self.assertEqual(lease.natural_size(self.con,{'source':'template:crpko-harness'}),'large')  # xlarge is per run (auto_size)
         self.assertEqual(lease.natural_size(self.con,{'source':'template:generic'}),'default')
         self.assertEqual(lease.natural_size(self.con,{'source':'fresh'}),'large')
 

@@ -21,7 +21,9 @@ SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the sma
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
                           re.I)  # boat's 409 for a stopped box whose disk outgrew every machine of its size
-DEFAULT_SIZE = {"crpko-harness": "xlarge", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
+# Template sizes for new boxes and resumes. The harness template is large too (2026-11-01): xlarge is picked per run
+# by auto_size for container stacks; 0 of ~2,300 harness-template runs in 13-31 Oct hit an OOM.
+DEFAULT_SIZE = {"crpko-harness": "large", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
 
 
 def _rank(size: str | None) -> int:
@@ -75,6 +77,40 @@ def typecheck_size(cmd: str, repo_root: str, size: str | None) -> str | None:
     if TYPECHECK_CMD.search(cmd or "") and os.path.isfile(os.path.join(repo_root or "", "package.json")):
         return "xlarge"
     return None
+
+
+# A run that starts a big container stack: compose/LocalStack in the command, the harness repo itself, or a whole
+# suite (`./...`, a bare pytest/make test) in a repo whose tests pull in testcontainers. Single containers and
+# narrow tests fit large (16 GB; measured per-job peak ~12 GB, 13-31 Oct).
+BIG_STACK_CMD = re.compile(r"\bcompose\b|docker-compose|localstack|testcontainers")
+WHOLE_SUITE_CMD = re.compile(r"\./\.\.\.|\bmake\s+test|\bpytest(?![^;&|]*::)")
+OOM_WINDOW_S = 14 * 86400
+
+
+def oom_recent(con, repo_key: str, within: int = OOM_WINDOW_S) -> bool:
+    """A box in this repo killed a run for memory (exit 137) on a smaller size lately."""
+    return con.execute("SELECT 1 FROM runs r JOIN leases l USING(box_id) WHERE l.repo_key=? AND r.exit_code=137 "
+                       "AND COALESCE(r.size,'') != 'xlarge' AND r.start_at>? LIMIT 1",
+                       (repo_key, now() - within)).fetchone() is not None
+
+
+def auto_size(con, cmd: str, me: dict, size: str | None) -> tuple[str | None, str]:
+    """Size for a run that didn't pass --size (an explicit size always wins) -> (size or None, reason).
+
+    None means the template/base size (large for Go/Node/harness, default for generic)."""
+    if size:
+        return size, ""
+    tc = typecheck_size(cmd, me.get("repo_root") or "", None)
+    if tc:
+        return tc, "typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override"
+    rk = me.get("repo_key") or ""
+    if BIG_STACK_CMD.search(cmd or "") or "harness" in rk:
+        return "xlarge", "container stack run: using an xlarge box; pass --size to override"
+    if WHOLE_SUITE_CMD.search(cmd or "") and uses_docker("", me.get("repo_root") or ""):
+        return "xlarge", "whole suite in a testcontainers repo: using an xlarge box; pass --size to override"
+    if oom_recent(con, rk):
+        return "xlarge", "a run in this repo was killed for memory in the last 14 days: using an xlarge box"
+    return None, ""
 
 
 def docker_recent(con, box_id: str | None = None, within: int = 7200, repo_root: str | None = None,
