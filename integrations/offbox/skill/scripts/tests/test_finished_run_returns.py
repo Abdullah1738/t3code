@@ -215,6 +215,18 @@ class ReconnectAndHeartbeatTests(FollowFixture):
             self.follow(attach, status, until=self.clock.t + 100)
         self.assertEqual(cm.exception.code, common.EXIT_WAIT_TIMEOUT)
 
+    def test_ended_status_answered_after_the_deadline_is_not_accepted(self):
+        # The reconnect's probe gets "exited 7" only after --timeout: the follow must raise 124, not return 7.
+        def attach(box, pid, o, e, **kw):
+            return iter([{"type": "attached"}, {"type": "reconnect", "stdoutOffset": o, "stderrOffset": e}])
+
+        def status():
+            self.clock.t += 200
+            return ended(7)
+        with self.assertRaises(common.OffboxError) as cm:
+            self.follow(attach, status, until=self.clock.t + 100)
+        self.assertEqual(cm.exception.code, common.EXIT_WAIT_TIMEOUT)
+
     def test_status_code_reads_like_an_exit_frame(self):
         self.assertEqual(runs._status_code(ended(0)), 0)
         self.assertEqual(runs._status_code(ended(2)), 2)

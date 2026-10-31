@@ -41,6 +41,10 @@ class Clock:
             self.on_sleep(self.t)
 
 
+def _no_network(*a, **k):
+    raise AssertionError('offline test: a real network call was attempted')
+
+
 class WaitLockTests(Isolated):
     def setUp(self):
         super().setUp()
@@ -48,6 +52,10 @@ class WaitLockTests(Isolated):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', common.LOGS_DIR))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
+        # The wait polls boat's status for a lock-held run. Offline: the default answer is "still running"; a test that
+        # needs boat to say the process ended sets its own `_ended`. Any real request is a failure.
+        self.ended = self.stack.enter_context(patch.object(runs, '_ended', return_value=None))
+        self.stack.enter_context(patch.object(runs.api.urllib.request, 'urlopen', _no_network))
         self.con.execute("INSERT INTO runs(run_id,box_id,status,process_id,pulls,start_at) "
                          "VALUES ('run-x','bx_a','running',7,'[]',900)")
         self.con.commit()
@@ -80,6 +88,64 @@ class WaitLockTests(Isolated):
         self.assertFalse(any(l.startswith('offbox:') and 'timed out waiting for lock' in l
                              for l in err.splitlines()), err)
         self.assertEqual(err.count('still followed by another offbox process'), 1)
+
+    def test_active_output_restarts_the_holder_grace(self):
+        # The holder is alive: its log grows every poll and boat says the process ended. The grace must not elapse.
+        self.hold_box()
+        self.ended.side_effect = lambda *a, **k: {'running': False, 'status': 'exited', 'exitCode': 0}
+        log = common.LOGS_DIR / 'run-x.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        state = {'n': 0}
+
+        def grow(t):
+            state['n'] += 1
+            with open(log, 'ab') as f:
+                f.write(b'chunk\n')
+            if t >= 1200:
+                self.end_run(0)
+        clock = Clock(on_sleep=grow)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('looks stuck', err)
+        # The holder kept writing across more than two grace windows (2 x 60 s), so the grace really was restarted.
+        self.assertGreater(state['n'], 2 * 60 // 5)
+
+    def test_status_answer_after_the_deadline_is_not_accepted(self):
+        # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
+        self.hold_box()
+        clock = Clock()
+
+        def late_ended(*a, **k):
+            clock.t = 1061.0
+            return {'running': False, 'status': 'exited', 'exitCode': 8}
+        self.ended.side_effect = late_ended
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '60'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+
+    def test_a_pid_recorded_after_the_wait_started_is_probed(self):
+        # The waiter starts while the holder has no PID yet (NULL); once it records PID 7, boat's end must be seen.
+        self.hold_box()
+        self.con.execute("UPDATE runs SET process_id=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        calls = {'n': 0}
+
+        def ended_after_pid(*a, **k):
+            calls['n'] += 1
+            return {'running': False, 'status': 'exited', 'exitCode': 6}
+        self.ended.side_effect = ended_after_pid
+
+        def record_pid(t):
+            if t >= 1010:
+                self.con.execute("UPDATE runs SET process_id=7 WHERE run_id='run-x'")
+                self.con.commit()
+        clock = Clock(on_sleep=record_pid)
+        with patch.object(runs, 'follow', side_effect=AssertionError('no attach')):
+            rc, out, err = self.cli_wait(['wait', 'run-x'], clock)
+        self.assertGreater(calls['n'], 0)
+        self.assertEqual(rc, 6, err)
 
     def test_wait_timeout_while_lock_held_is_124_and_run_untouched(self):
         self.hold_box()

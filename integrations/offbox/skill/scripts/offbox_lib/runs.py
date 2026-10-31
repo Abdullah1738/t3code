@@ -790,6 +790,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         twice with no output in between (None when boat lost it), else _RUNNING."""
         probed["at"] = now()
         st = _ended(box_id, pid, until)
+        # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
+        if until is not None and now() >= until:
+            raise timed_out()
         if st is None or ended_again() < 2:
             return _RUNNING
         return _status_code(st)

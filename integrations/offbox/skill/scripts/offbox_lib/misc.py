@@ -367,6 +367,8 @@ def _wait_locked(r, echo, timeout=None):
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     pos, said = 0, False
     polled, ended_at = None, None
+    # The row we poll: refreshed each loop, so a PID the holder records later (it starts with NULL) is picked up.
+    probe_pid, last_size = None, -1
     while True:
         guard = file_lock('box-' + r['box_id'], timeout=0)
         try:
@@ -409,12 +411,22 @@ def _wait_locked(r, echo, timeout=None):
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                               f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
-        if r['process_id'] and (polled is None or now() - polled >= STATUS_POLL_S):
+        # Output still arriving means the holder is alive and following: the grace restarts with each new byte.
+        size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        if size != last_size:
+            last_size, ended_at = size, None
+        if cur['process_id'] != probe_pid:
+            probe_pid, polled, ended_at = cur['process_id'], None, None
+        if cur['process_id'] and (polled is None or now() - polled >= STATUS_POLL_S):
             polled = now()
-            st = _ended(r['box_id'], r['process_id'], deadline)
+            st = _ended(cur['box_id'], cur['process_id'], deadline)
+            # The deadline may pass during the status request: such an answer is not accepted (--timeout is 124).
+            if deadline is not None and now() >= deadline:
+                raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                                  f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
             ended_at = (ended_at or now()) if st else None
             if st and now() - ended_at >= _grace(cur):
-                return _holder_stuck(cur, st, log_path, pos, echo)
+                return _holder_stuck(cur, st, log_path, pos, echo, deadline)
         if not said:
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
                 f"waiting for it to record the end")
@@ -431,13 +443,20 @@ def _grace(r) -> int:
     return PULL_GRACE_S if pulls else HOLDER_GRACE_S
 
 
-def _holder_stuck(r, st, log_path, pos: int, echo: bool) -> int:
+def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
-    instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone)."""
+    instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
+    A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
     from .runs import _status_code, recover_lost_exit
     code, how = _status_code(st), "boat's process status"
     if code is None:
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                              f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
         code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                              f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
     _tail(log_path, pos, echo)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
