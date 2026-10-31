@@ -5,6 +5,7 @@ import {
   activeGoals,
   BOARD_COLUMN_LABELS,
   boardFilter,
+  clampColumnWidth,
   clearFilters,
   filterFacets,
   sanitizeBoardColumnPrefs,
@@ -38,7 +39,6 @@ import { ChoiceRow, LinkButton } from "../common/parts";
 import {
   applyColumnAction,
   BOARD_PAD,
-  clampColumnWidth,
   boardLayout,
   COLUMN_RAIL_WIDTH,
   STAGE_COLUMN_KEYS,
