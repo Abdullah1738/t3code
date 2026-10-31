@@ -168,10 +168,7 @@ export function parseColumnAction(id: string): ColumnAction | null {
     : null;
 }
 
-export function applyColumnAction(
-  prefs: BoardColumnPrefs,
-  action: ColumnAction,
-): BoardColumnPrefs {
+export function applyColumnAction(prefs: BoardColumnPrefs, action: ColumnAction): BoardColumnPrefs {
   if (action.kind === "show-all") return showAllColumns(prefs);
   if (action.kind === "reset") return resetColumnWidths(prefs);
   return toggleColumn(prefs, action.key);
