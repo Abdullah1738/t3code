@@ -266,6 +266,23 @@ class Explain(unittest.TestCase):
         r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
         self.assertEqual(r['verdict'], 'owner')
 
+    def test_paying_the_merchant_with_my_card_still_explains_the_charge(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I paid Apple USD 99 with my ENBD card', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'owner')
+
+    def test_a_purchase_from_another_seller_for_my_apple_laptop_explains_nothing(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+        for text in ('I ordered from Amazon for my Apple laptop', 'I ordered from Amazon using my Apple laptop'):
+            with self.subTest(text=text):
+                def said(since, until, deadline=None, text=text):
+                    return [('2026-10-24T00:20:00.000Z', text, 'iMessage')]
+                r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+                self.assertEqual(r['verdict'], 'ask')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 

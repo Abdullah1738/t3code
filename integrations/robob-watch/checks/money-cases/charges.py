@@ -327,7 +327,14 @@ _CODES = r'(?:AED|USD|EUR|GBP|INR|JPY|CNY|SAR|QAR|KWD|OMR|BHD|CAD|AUD|CHF|SGD|HK
 MONEY = re.compile(rf'(?:\b{_CODES}\b|[$€£¥₹])\s?\d|\d[\d,.]*\s?(?:\b{_CODES}\b|[$€£¥₹])', re.I)
 
 
-SELLER_FROM = re.compile(r"\b(?:from|at|on|with|via|through)\s+(?P<seller>[\w.*/&' -]+)", re.I)
+# The seller after "from/at/on/via/through": one to four words, never starting with a determiner ("with my
+# ENBD card" is an instrument, not a seller), and stopping before a purpose, instrument or product phrase
+# ("from Amazon for my Apple laptop" buys from Amazon). A missing seller falls back to the payee after the verb.
+SELLER_STOP = r"(?:for|using|with|via|through|by|on|in|my|your|our|the|a|an|this|that|to|and|but|then|so)"
+SELLER_FROM = re.compile(
+    r"\b(?:from|at|on|via|through)\s+(?!" + SELLER_STOP + r"\b)"
+    r"(?P<seller>[\w.*/&'-]+(?:\s+(?!" + SELLER_STOP + r"\b)[\w.*/&'-]+){0,3})(?=\s+" + SELLER_STOP + r"\b|[.,;!?]|$)",
+    re.I)
 
 
 OWNS = re.compile(r"\b(?:(?:is|are|was|it'?s|that'?s) mine|mine)\b", re.I)
