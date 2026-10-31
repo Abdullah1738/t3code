@@ -62,6 +62,26 @@ def guard_home(path: str) -> None:
             raise HomeError(f"refusing home {path}: it is inside personal home {forbidden}")
 
 
+def guard_outputs(paths: list[str]) -> None:
+    """Refuse any output path whose existing ancestor (or itself, if a symlink) resolves
+    into a personal home. Runs before any mutation, so a symlinked skills/ or home
+    ancestor cannot leak writes or chmods into ~/.claude, ~/.codex or the external codex dir.
+    """
+    forbidden = [os.path.realpath(expand(p)) for p in PERSONAL_HOMES]
+    for path in paths:
+        probe = os.path.abspath(path)
+        while True:
+            if os.path.lexists(probe):
+                real = os.path.realpath(probe)
+                for f in forbidden:
+                    if real == f or real.startswith(f + os.sep):
+                        raise HomeError(f"refusing to write {path}: {probe} resolves into personal home {f}")
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+
+
 def read_bytes(path: str) -> bytes | None:
     try:
         return Path(path).read_bytes()
@@ -462,7 +482,7 @@ def plan_all(home_root: str | None) -> tuple[dict, str, str, list[tuple[str, str
     files = build(manifest, claude, codex, skills)
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
-            print(f"warning: secret-looking value in {path}; check will fail", file=sys.stderr)
+            raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
     return manifest, claude, codex, skills, files
 
 
@@ -524,9 +544,12 @@ class Writer:
 
 def generate(home_root: str | None, dry_run: bool) -> int:
     manifest, claude, codex, skills, files = plan_all(home_root)
+    farms = [os.path.join(claude, "skills"), os.path.join(codex, "skills")]
+    guard_outputs([claude, codex, *farms, *files])
     roots = [expand(r) for r in manifest["skillRoots"]]
-    ops = skill_ops(os.path.join(claude, "skills"), skills, roots)
-    ops_codex = skill_ops(os.path.join(codex, "skills"), skills, roots)
+    ops = skill_ops(farms[0], skills, roots)
+    ops_codex = skill_ops(farms[1], skills, roots)
+    guard_outputs([op[1] for op in ops + ops_codex])
     writer = Writer(dry_run)
     for home in (claude, codex):
         writer.ensure_dir(home, dry_run)
@@ -549,6 +572,7 @@ def check(home_root: str | None) -> int:
     manifest = load_manifest()
     validate_manifest(manifest)
     claude, codex = resolve_homes(manifest, home_root)
+    guard_outputs([claude, codex, os.path.join(claude, "skills"), os.path.join(codex, "skills")])
     failures: list[str] = []
 
     def fail(msg: str) -> None:

@@ -275,18 +275,69 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("memories", out)
 
-    def test_check_fails_on_secret_in_overlay(self) -> None:
+    def test_secret_in_overlay_refuses_generate_and_writes_nothing(self) -> None:
         overlay = self.tmp / "claude-overlay.md"
         overlay.write_text("token sk-abcdefghijklmnop here\n")
         m = self.manifest()
         m["instructions"]["overlays"]["claude"] = str(overlay)  # absolute: never touch the package file
-        self.run_gen(m)
         with mock.patch.object(gh, "load_manifest", return_value=m):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                rc = gh.main(["check", "--home-root", str(self.root)])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = gh.main(["generate", "--home-root", str(self.root)])
         self.assertEqual(rc, 1)
-        self.assertIn("secret-looking", out.getvalue())
+        self.assertIn("secret-looking", err.getvalue())
+        self.assertFalse(self.root.exists(), "no home directory may be created on refusal")
+        self.assertFalse((self.claude / "overlay.md").exists())
+        self.assertFalse((self.codex / "AGENTS.md").exists())
+
+    def test_secret_in_already_generated_file_fails_check(self) -> None:
+        self.run_gen()
+        p = self.codex / "AGENTS.md"
+        p.write_text(p.read_text() + "\nleak sk-abcdefghijklmnop\n")
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("secret-looking", out)
+
+    def test_symlinked_claude_skills_farm_into_personal_home_writes_nothing(self) -> None:
+        personal_skills = self.home / ".claude/skills"
+        personal_skills.mkdir(parents=True)
+        (personal_skills / "keep.txt").write_text("personal")
+        mode_before = os.stat(personal_skills).st_mode
+        self.claude.mkdir(parents=True)
+        os.symlink(personal_skills, self.claude / "skills")
+        err = io.StringIO()
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stderr(err):
+                rc = gh.main(["generate", "--home-root", str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertIn("personal home", err.getvalue())
+        self.assertEqual(sorted(os.listdir(personal_skills)), ["keep.txt"])
+        self.assertEqual(os.stat(personal_skills).st_mode, mode_before)
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_symlinked_codex_skills_farm_into_personal_home_writes_nothing(self) -> None:
+        personal_skills = self.home / ".codex/skills"
+        personal_skills.mkdir(parents=True)
+        self.codex.mkdir(parents=True)
+        os.symlink(personal_skills, self.codex / "skills")
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = gh.main(["generate", "--home-root", str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(os.listdir(personal_skills), [])
+        self.assertFalse((self.codex / "config.toml").exists())
+
+    def test_symlinked_home_ancestor_into_personal_home_writes_nothing(self) -> None:
+        personal = self.home / ".codex"
+        personal.mkdir(parents=True)
+        self.root.mkdir(parents=True)
+        os.symlink(personal, self.root / "codex")  # <root>/codex -> ~/.codex
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = gh.main(["generate", "--home-root", str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(os.listdir(personal), [])
+        self.assertFalse((self.root / "claude").exists())
 
     def test_hooks_list_yields_claude_block_and_hooks_json(self) -> None:
         m = self.manifest()
