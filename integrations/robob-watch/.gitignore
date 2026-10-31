@@ -11,3 +11,5 @@ moved.json
 lift-state.json
 accounts.json
 last_fired
+# Private account, payment and mail context for live watchers: never versioned.
+custom/**/context.txt
