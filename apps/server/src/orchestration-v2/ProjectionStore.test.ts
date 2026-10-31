@@ -6829,15 +6829,6 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   );
 });
 
-const pullRequestCandidateFixture = {
-  branch: "feature/pr-candidate",
-  branchPullRequest: {
-    number: 42,
-    url: "https://github.com/example/repo/pull/42",
-    state: "open",
-  },
-} as const;
-
 const prCandidateShellSelectionBody = (label: string, sql: SqlClient.SqlClient | null) =>
   Effect.gen(function* () {
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
