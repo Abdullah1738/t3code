@@ -370,7 +370,7 @@ class FollowTimeoutClockTests(OutageBase):
     hangs for the timeout urllib was given, then fails the way a silent boat does. The 30-minute outage bound must
     hold on that clock, not only on mocked cmd_status results."""
 
-    def run_follow(self, attach_timeout_s, status_timeout_s):
+    def run_follow(self, attach_timeout_s, status_timeout_s, until=None):
         clock = {"t": 1000.0, "first_fail": None}
 
         def fake_urlopen(req, timeout=None):
@@ -381,16 +381,13 @@ class FollowTimeoutClockTests(OutageBase):
             raise OSError("timed out")
 
         self.urlopen.side_effect = fake_urlopen
-        import time as real_time
         with patch.object(runs, "_ttl_keeper", return_value=None), \
                 patch.object(runs.api, "time", types.SimpleNamespace(
                     time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s))), \
                 patch.object(runs, "now", lambda: clock["t"]), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(OffboxError) as cm:
-                runs.follow("bx", 1, None, echo=False, stop_evt=FollowOutageTests.Evt(),
-                            until=None)
-        del real_time
+                runs.follow("bx", 1, None, echo=False, stop_evt=FollowOutageTests.Evt(), until=until)
         return clock, cm.exception
 
     def test_slow_timeouts_hold_the_30_minute_bound(self):
@@ -399,6 +396,21 @@ class FollowTimeoutClockTests(OutageBase):
         self.assertIn("lost the output stream", str(e))
         self.assertLessEqual(outage_s, runs.OUTAGE_FOLLOW_S + 150)  # one slow attach past the window at most
         self.assertGreater(outage_s, runs.OUTAGE_FOLLOW_S - 150)    # and the window is actually used
+
+    def test_fast_attach_slow_status_holds_the_30_minute_bound(self):
+        clock, e = self.run_follow(attach_timeout_s=1, status_timeout_s=60)
+        outage_s = clock["t"] - clock["first_fail"]
+        self.assertIn("lost the output stream", str(e))
+        self.assertLessEqual(outage_s, runs.OUTAGE_FOLLOW_S + 150)
+        self.assertGreater(outage_s, runs.OUTAGE_FOLLOW_S - 150)
+
+    def test_until_still_exits_124_during_an_outage(self):
+        # The caller's --timeout keeps its own exit (124, the run keeps going) even while boat is down.
+        start = 1000.0
+        clock, e = self.run_follow(attach_timeout_s=90, status_timeout_s=60, until=start + 600)
+        self.assertEqual(e.code, common.EXIT_WAIT_TIMEOUT)
+        self.assertTrue(e.started)
+        self.assertLessEqual(clock["t"], start + 600 + 90)
 
     def test_fast_failures_hold_the_30_minute_bound(self):
         clock, e = self.run_follow(attach_timeout_s=1, status_timeout_s=1)
