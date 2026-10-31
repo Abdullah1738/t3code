@@ -4172,6 +4172,74 @@ test("a refused /new is dropped once a reply went out after it", async () => {
   expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
 });
 
+test("a refused /new is dropped when a watcher wake sends its result directly and ends with NO_REPLY", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // A real watcher wake whose result goes out through the bridge's direct send, then NO_REPLY.
+  h.input("wake:search", "[Watcher event from watch, not typed by the owner.]\nSearch finished");
+  await h.router.tick();
+  h.store.enqueue({ id: "send:search", kind: "conversation", text: "Found three options.", sessionId: "ses_1", generation: 2 });
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  setSystemTime(start + 20 * 60_000);
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("owner text in the gap before a queued deferred /new is sent cancels that reset", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The work finishes and the nudge is queued, but the owner writes before the reset is POSTed.
+  h.backend.settle();
+  setSystemTime(start + 20 * 60_000);
+  h.input("owner", "Actually, keep this chat");
+  await h.router.tick();
+  expect(h.store.pendingInbound().some(row => row.id.startsWith("reset:"))).toBe(false);
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+});
+
+test("a refused /new waits while a busy child of the root is still running", async () => {
+  const start = Date.parse("2026-10-30T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  // The root is idle, but its subagent is still busy: the refusal would just repeat.
+  setSystemTime(start + 20 * 60_000);
+  h.backend.states.ses_child = { type: "busy" };
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(1);
+  // Once the child finishes, the reset is asked again, once.
+  delete h.backend.states.ses_child;
+  h.backend.settle();
+  setSystemTime(start + 40 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === NEW_CHAT_NUDGE)).toHaveLength(2);
+});
+
 test("a refused /new is dropped when the owner writes", async () => {
   const start = Date.parse("2026-10-30T12:00:00Z");
   setSystemTime(start);

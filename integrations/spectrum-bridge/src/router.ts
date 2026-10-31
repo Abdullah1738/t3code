@@ -240,7 +240,7 @@ const STATUS_LIST_MS = 10_000;
 const FAILURE_NOTICE_GRACE = 5 * 60_000;
 type DeferredNotice = { turn: Turn; text: string; at: number };
 /** A /new the agent refused because background work ran: asked again once the chat is idle and nothing happened since. */
-type NewDeferred = { generation: number; since: number };
+type NewDeferred = { generation: number; since: number; outbox: number };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const MiB = 1024 * 1024;
 /** imsg lookups, a Messages iCloud download of up to 90 seconds, and the copy. */
@@ -802,6 +802,7 @@ export class Router {
 
   private sealBatch(handled: Set<string>): InboundRecord | undefined {
     return this.store.db.transaction(() => {
+      this.cancelQueuedNew();
       const rows = this.store.pendingInbound();
       const now = Date.now();
       let latestReceivedAt = 0;
@@ -1175,6 +1176,24 @@ export class Router {
       && this.threadAge(route) < (this.options.resetChatForMs ?? RESET_CHAT_FOR);
   }
 
+  /**
+   * Whether the owner was sent anything in this generation after the outbox
+   * row `since`: a reply, a direct /send, /files, /app or /poll. Each is a
+   * conversation outbox row; a wake's own result sent before NO_REPLY counts too.
+   */
+  private sentSince(generation: number, since: number): boolean {
+    // `generation` is the last key when no optional field follows it, so both forms are matched.
+    return this.store.db.query<{ one: number }, [number, string, string]>(
+      `SELECT 1 AS one FROM outbox WHERE rowid > ? AND state IN ('pending', 'sending', 'sent', 'uncertain')
+        AND payload LIKE '%"kind":"conversation"%' AND (payload LIKE ? OR payload LIKE ?) LIMIT 1`,
+    ).get(since, `%"generation":${generation},%`, `%"generation":${generation}}`) !== null;
+  }
+
+  /** The outbox rowid a deferred /new is measured from. Call after the refusal reply is queued. */
+  private outboxMark(): number {
+    return this.store.db.query<{ mark: number }, []>("SELECT COALESCE(MAX(rowid), 0) AS mark FROM outbox").get()?.mark ?? 0;
+  }
+
   /** The insertion order of an inbound row: the baseline a deferred /new is measured from. */
   private rowidOf(id: string): number {
     return this.store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM inbound WHERE id = ?").get(id)?.rowid ?? 0;
@@ -1188,6 +1207,29 @@ export class Router {
   private movedOn(since: number): boolean {
     return this.store.db.query<{ one: number }, [number]>(`SELECT 1 AS one FROM inbound WHERE rowid > ?
       AND id NOT LIKE 'wake:%' AND id NOT LIKE 'reset:%' AND id NOT LIKE 'secret:%' LIMIT 1`).get(since) !== null;
+  }
+
+  /**
+   * Cancels a deferred reset nudge already queued but not yet POSTed, when the
+   * conversation moved on in the meantime (owner text, or any reply or direct
+   * send after the deferral). Runs before the batch is sealed, so the queued
+   * reset can never jump ahead of text that arrived in the gap.
+   */
+  private cancelQueuedNew(): void {
+    const queued = this.store.get<{ id: string; since: number } | null>("newQueued");
+    if (!queued) return;
+    const row = this.store.db.query<{ state: string; payload: string }, [string]>("SELECT state, payload FROM inbound WHERE id = ?").get(queued.id);
+    if (!row || row.state !== "pending") {
+      // Already POSTed (or retired): the deferral is consumed.
+      this.store.set("newQueued", null);
+      return;
+    }
+    const deferred = this.store.get<NewDeferred | null>("newDeferred");
+    if (!this.movedOn(queued.since) && !(deferred && this.sentSince(deferred.generation, deferred.outbox))) return;
+    this.store.updateInbound(queued.id, "cancelled");
+    this.store.set("newQueued", null);
+    this.store.set("newDeferred", null);
+    this.options.log?.("context-reset-dropped", "moved-on");
   }
 
   /**
@@ -1210,19 +1252,46 @@ export class Router {
     if (this.store.pendingInbound().length) return;
     const settledAt = this.store.get<number>("settledAt");
     if (settledAt === undefined || Date.now() - settledAt < (this.options.resetIdleMs ?? RESET_IDLE)) return;
-    const statuses = await this.statusesFor(route).catch(() => undefined);
-    if (!statuses || statuses[route.id] !== undefined) return;
+    // The route itself is idle, but a background child of its family may still be running
+    // (the root can wait while its subagent works), so the refusal would just repeat.
+    if (await this.familyBusy(route)) return;
     const nudged = this.store.db.transaction(() => {
       if (!this.current(route) || this.store.pendingInbound().length) return false;
       if (this.store.get<NewDeferred | null>("newDeferred")?.since !== deferred.since) return false;
       if (this.movedOn(deferred.since)) return false;
       const turn = this.store.get<Turn | null>("activeTurn");
       if (turn && turn.phase !== "failed" && this.current(turn)) return false;
-      this.store.set("newDeferred", null);
+      // The deferral stays set until the reset is POSTed: owner text in that gap cancels the queued nudge.
       this.store.set("newNudge", this.nudgeReset(route, NEW_CHAT_NUDGE));
+      this.store.set("newQueued", { id: this.store.get<string>("newNudge")!, since: deferred.since });
       return true;
     }).immediate();
     if (nudged) this.options.log?.("context-reset-nudged", "new-deferred");
+  }
+
+  /** Whether the route or any session in its family is still running. Call only with statuses that match the route. */
+  private async familyBusy(route: Route): Promise<boolean> {
+    const statuses = await this.statusesFor(route).catch(() => undefined);
+    if (!statuses) return true;
+    if (statuses[route.id] !== undefined) return true;
+    const seen = new Set<string>([route.id]);
+    let parents: Pick<Route, "id" | "directory">[] = [route];
+    for (let depth = 0; parents.length && depth < MAX_SUBAGENT_DEPTH; depth++) {
+      const next: Pick<Route, "id" | "directory">[] = [];
+      for (const parent of parents) {
+        const children = await bounded(this.backend.children(parent.id, parent.directory)).catch(() => undefined);
+        // A family we can't list counts as busy: the deferral waits instead of repeating the refusal.
+        if (!children) return true;
+        for (const child of children) {
+          if (seen.has(child.id)) continue;
+          seen.add(child.id);
+          if (statuses[child.id] !== undefined) return true;
+          next.push({ id: child.id, directory: child.directory });
+        }
+      }
+      parents = next;
+    }
+    return false;
   }
 
   /** Queues a reset nudge for the route's agent and returns its row id. Call inside a transaction. */
@@ -1272,6 +1341,9 @@ export class Router {
         // The old context's undelivered recap and size no longer apply.
         this.store.set(`seed:${old.id}`, null);
         this.store.set("routeContext", null);
+        // A fresh /new supersedes any earlier deferral.
+        this.store.set("newDeferred", null);
+        this.store.set("newQueued", null);
         this.store.set("newNudge", this.nudgeReset(route, NEW_CHAT_NUDGE));
         this.acknowledge(inboundId, "Fresh start. What's up?");
       }).immediate();
@@ -2692,9 +2764,10 @@ export class Router {
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
         // The agent refused a /new nudge and said why: ask again once it's idle with nothing said in the meantime.
         // Any other reply of the same context means the conversation moved on, so the deferred reset is dropped.
+        const deferred = this.store.get<NewDeferred | null>("newDeferred");
         if (text && turn!.inboundId && turn!.inboundId === this.store.get<string | null>("newNudge")) {
-          this.store.set("newDeferred", { generation: turn!.generation, since: this.rowidOf(turn!.inboundId) } satisfies NewDeferred);
-        } else if ((text || earlier.length) && this.store.get<NewDeferred | null>("newDeferred")?.generation === turn!.generation) {
+          this.store.set("newDeferred", { generation: turn!.generation, since: this.rowidOf(turn!.inboundId), outbox: this.outboxMark() } satisfies NewDeferred);
+        } else if (deferred && deferred.generation === turn!.generation && this.sentSince(turn!.generation, deferred.outbox)) {
           this.store.set("newDeferred", null);
           this.options.log?.("context-reset-dropped", "moved-on");
         }
