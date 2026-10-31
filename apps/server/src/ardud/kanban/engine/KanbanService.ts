@@ -4544,8 +4544,11 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     // `pools` is read before the move: a card is on `from` when its model resolves to it now.
     const onPool = (entry: ModelSelection) => Rules.poolOf(pools, entry) === from.key;
-    const moved: Array<{ readonly card: KanbanCard; readonly leveled: boolean; readonly work: boolean }> =
-      [];
+    const moved: Array<{
+      readonly card: KanbanCard;
+      readonly leveled: boolean;
+      readonly work: boolean;
+    }> = [];
     for (const card of yield* store.cards(board.id)) {
       const moveSlot = card.activePool === from.key;
       const open = card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage);
@@ -4557,7 +4560,9 @@ const make = Effect.gen(function* () {
           ...card,
           model: work ? to.model : card.model,
           models: weighted
-            ? card.models.map((entry) => (onPool(entry.model) ? { ...entry, model: to.model } : entry))
+            ? card.models.map((entry) =>
+                onPool(entry.model) ? { ...entry, model: to.model } : entry,
+              )
             : card.models,
           activePool: moveSlot ? to.key : card.activePool,
           updatedAt: work || weighted ? at : card.updatedAt,
@@ -4585,11 +4590,13 @@ const make = Effect.gen(function* () {
         !switched.has(card.activeThreadId)
       ) {
         switched.add(card.activeThreadId);
-        yield* threads.setModel(card.activeThreadId, to.model).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
-          ),
-        );
+        yield* threads
+          .setModel(card.activeThreadId, to.model)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
+            ),
+          );
       }
     }
     // A held slot (a work thread between cards) moves with its pool and keeps its start time.
@@ -4600,11 +4607,13 @@ const make = Effect.gen(function* () {
       if (hold.boardId !== board.id || hold.pool !== from.key) continue;
       if (!switched.has(threadId)) {
         switched.add(threadId);
-        yield* threads.setModel(threadId, to.model).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
-          ),
-        );
+        yield* threads
+          .setModel(threadId, to.model)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
+            ),
+          );
       }
     }
     yield* Ref.update(
