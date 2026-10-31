@@ -468,6 +468,63 @@ class ReaperProtection(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 backend.thread_for_session("ses_x")
 
+    def pending_retry_env(self):
+        logs = os.path.join(self.tmp.name, "logs")
+        return mock.patch.object(session_reaper, "LOGS", logs), logs
+
+    def test_archive_timeout_is_queued_and_retried(self):
+        p, logs = self.pending_retry_env()
+        q = "2026-09-22T00:00:00.000Z"
+        with p:
+            with mock.patch.object(session_reaper, "archive_robob_thread",
+                                   side_effect=TimeoutError("timed out")):
+                session_reaper.queue_archive_retry("ses_x", "timed out")
+            pending = json.load(open(os.path.join(logs, "state", "reaper_pending_archive.json")))
+            self.assertEqual(pending["ses_x"]["attempts"], 0)
+            self.assertIn("timed out", pending["ses_x"]["last_error"])
+            st = {"errors": []}
+            with mock.patch.object(session_reaper, "archive_robob_thread",
+                                   return_value=("t1", True, None)) as arch:
+                session_reaper.retry_pending_archives(q, st)
+            arch.assert_called_once_with("ses_x", q)
+            self.assertEqual(json.load(open(os.path.join(logs, "state", "reaper_pending_archive.json"))), {})
+            self.assertEqual(st["archive_retried"], 1)
+            self.assertEqual(st["errors"], [])
+
+    def test_retry_clears_entry_when_kept_or_no_thread(self):
+        p, logs = self.pending_retry_env()
+        q = "2026-09-22T00:00:00.000Z"
+        with p:
+            for result, kept in [(("t1", False, "background-work"), 1), ((None, False, None), 0)]:
+                session_reaper.save_pending({"ses_x": {"attempts": 1, "first_ts": 0, "last_error": "timed out"}})
+                st = {"errors": []}
+                with mock.patch.object(session_reaper, "archive_robob_thread", return_value=result):
+                    session_reaper.retry_pending_archives(q, st)
+                self.assertEqual(session_reaper.load_pending(), {})
+                self.assertEqual(st["errors"], [])
+                self.assertEqual(st["archive_retried"], 1)
+                self.assertEqual(st.get("kept_threads", 0), kept)
+
+    def test_persistent_archive_failure_alerts_once_after_five_tries(self):
+        p, logs = self.pending_retry_env()
+        q = "2026-09-22T00:00:00.000Z"
+        with p:
+            session_reaper.queue_archive_retry("ses_x", "timed out")
+            for n in range(1, 5):
+                st = {"errors": []}
+                with mock.patch.object(session_reaper, "archive_robob_thread",
+                                       side_effect=TimeoutError("timed out")):
+                    session_reaper.retry_pending_archives(q, st)
+                self.assertEqual(st["errors"], [], f"retry {n} must not alert")
+                self.assertIn("ses_x", session_reaper.load_pending())
+            st = {"errors": []}
+            with mock.patch.object(session_reaper, "archive_robob_thread",
+                                   side_effect=TimeoutError("timed out")):
+                session_reaper.retry_pending_archives(q, st)
+            self.assertEqual(len(st["errors"]), 1)
+            self.assertIn("ses_x: archiving its Robob thread failed 5 times", st["errors"][0])
+            self.assertEqual(session_reaper.load_pending(), {})
+
 
 if __name__ == "__main__":
     unittest.main()
