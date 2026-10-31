@@ -307,19 +307,60 @@ class RobobState(unittest.TestCase):
             self.assertEqual(backend.scheduled_task_session_ids(con), {"ses_a_new", "ses_b"})
             con.close()
 
-    def test_board_backlog(self):
+    def test_kanban_session_ids_protects_open_references_only(self):
         make_state_db(self.db)
+        add_kanban(self.db)
         with clean_env(ROBOB_STATE_DB=self.db):
             con = backend.robob_ro()
-            self.assertEqual(backend.board_backlog_session_ids(con), {"ses_th_back"})
+            self.assertEqual(backend.kanban_session_ids(con), {"ses_card_active", "ses_card_review",
+                                                              "ses_link_open"})
             con.close()
 
-    def test_board_missing_is_none(self):
-        make_state_db(self.db, board=False)
+    def test_kanban_missing_tables_fail_closed(self):
+        make_state_db(self.db)
+        con = sqlite3.connect(self.db)
+        con.execute("DROP TABLE IF EXISTS ardud_kanban_cards")
+        con.commit()
+        con.close()
         with clean_env(ROBOB_STATE_DB=self.db):
             con = backend.robob_ro()
-            self.assertIsNone(backend.board_backlog_session_ids(con))
+            with self.assertRaises(RuntimeError):
+                backend.kanban_session_ids(con)
             con.close()
+
+
+def add_kanban(path):
+    """Kanban fixture: card A (unsettled, active + review), card B (settled, must not protect),
+    thread link C (open, protects) and link D (ended, must not protect)."""
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, board_id TEXT, number INTEGER,
+          stage TEXT, active_thread_id TEXT, json TEXT);
+        CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, board_id TEXT, card_id TEXT,
+          ended INTEGER NOT NULL DEFAULT 0, json TEXT);
+    """)
+    para = [
+        ("card-a", "b", 1, "working", "th-active",
+         {"activeThreadId": "th-active", "workThreadId": "th-active", "reviewThreadId": "th-review",
+          "settledAt": None}),
+        ("card-b", "b", 2, "verified", "th-settled",
+         {"activeThreadId": None, "workThreadId": "th-settled", "reviewThreadId": None,
+          "settledAt": "2026-10-20T00:00:00Z"}),
+    ]
+    for cid, board, num, stage, active, payload in para:
+        con.execute("INSERT INTO ardud_kanban_cards VALUES (?,?,?,?,?,?)",
+                    (cid, board, num, stage, active, json.dumps(payload)))
+    con.execute("INSERT INTO ardud_kanban_threads VALUES (?,?,?,?,?)",
+                ("th-link-open", "b", "card-a", 0, json.dumps({})))
+    con.execute("INSERT INTO ardud_kanban_threads VALUES (?,?,?,?,?)",
+                ("th-link-ended", "b", "card-b", 1, json.dumps({})))
+    # provider rows map the kanban thread ids to native OpenCode sessions
+    for th, ses in (("th-active", "ses_card_active"), ("th-review", "ses_card_review"),
+                    ("th-settled", "ses_card_settled"), ("th-link-open", "ses_link_open"),
+                    ("th-link-ended", "ses_link_ended")):
+        provider_thread(con, th, ses)
+    con.commit()
+    con.close()
 
 
 class ReaperProtection(unittest.TestCase):
@@ -350,30 +391,72 @@ class ReaperProtection(unittest.TestCase):
 
     def test_robob_protected_ids(self):
         make_state_db(self.db)
+        add_kanban(self.db)
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
             self.assertEqual(session_reaper.protected_ids(),
-                             {"ses_kept", "ses_a_new", "ses_b", "ses_th_back"})
+                             {"ses_kept", "ses_a_new", "ses_b",
+                              "ses_card_active", "ses_card_review", "ses_link_open"})
             # old OpenChamber task sessions stay protected; its board is not consulted
             self.write_openchamber()
-            self.assertEqual(session_reaper.protected_ids(),
-                             {"ses_kept", "ses_a_new", "ses_b", "ses_th_back", "ses_task"})
+            self.assertIn("ses_task", session_reaper.protected_ids())
 
-    def test_robob_without_board_table_still_runs(self):
-        make_state_db(self.db, board=False)
-        with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
-            self.assertEqual(session_reaper.backlog_ids(), set())
-            self.assertEqual(session_reaper.protected_ids(), {"ses_kept", "ses_a_new", "ses_b"})
-
-    def test_robob_unreadable_board_fails_closed(self):
-        make_state_db(self.db, board=False)
-        con = sqlite3.connect(self.db)
-        con.execute("CREATE TABLE ardud_board_rows (id TEXT)")
-        con.commit()
-        con.close()
+    def test_robob_missing_kanban_tables_fail_closed(self):
+        make_state_db(self.db)
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
             with self.assertRaises(session_reaper.Gate) as cm:
                 session_reaper.backlog_ids()
-            self.assertIn("board", str(cm.exception))
+            self.assertIn("kanban", str(cm.exception))
+
+    def test_migrated_thread_old_ses_protected_90_days(self):
+        import datetime
+        make_state_db(self.db)
+        add_kanban(self.db)
+        now = datetime.datetime(2026, 11, 1, tzinfo=datetime.timezone.utc)
+        con = sqlite3.connect(self.db)
+        # a migrated thread: OpenCode session ses_mig, then a Claude provider row 30 days ago
+        provider_thread(con, "th-mig", "ses_mig")
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pt-claude-mig", "th-mig", None, "claude", None, "idle", 2, 2,
+                     (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S"),
+                     json.dumps({"nativeThreadRef": {"driver": "claude", "nativeId": "uuid-x"}}),
+                     "claude", "claude"))
+        # a thread moved 120 days ago is outside the window
+        provider_thread(con, "th-old", "ses_old")
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pt-codex-old", "th-old", None, "codex", None, "idle", 2, 2,
+                     (now - datetime.timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%S"),
+                     json.dumps({"nativeThreadRef": {"driver": "codex", "nativeId": "uuid-y"}}),
+                     "codex", "codex"))
+        con.commit()
+        con.close()
+        with clean_env(ROBOB_STATE_DB=self.db):
+            con = backend.robob_ro()
+            ids = backend.migrated_rollback_session_ids(con, now=now)
+            con.close()
+        self.assertIn("ses_mig", ids)
+        self.assertNotIn("ses_old", ids)
+
+    def test_migrated_thread_protected_end_to_end(self):
+        import datetime
+        make_state_db(self.db)
+        add_kanban(self.db)
+        con = sqlite3.connect(self.db)
+        provider_thread(con, "th-mig", "ses_mig")
+        # the Claude row is recent (inside the window), so ses_mig must be pinned
+        recent = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pt-claude-mig", "th-mig", None, "claude", None, "idle", 2, 2, recent,
+                     json.dumps({}), "claude", "claude"))
+        con.commit()
+        con.close()
+        with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
+            self.assertIn("ses_mig", session_reaper.rollback_ids())
+            self.assertIn("ses_mig", session_reaper.protected_ids())
+
+    def test_unreadable_rollback_pins_fail_closed(self):
+        with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=os.path.join(self.tmp.name, "nope.sqlite")):
+            with self.assertRaises(session_reaper.Gate):
+                session_reaper.rollback_ids()
 
     def test_robob_missing_state_db_fails_closed(self):
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=os.path.join(self.tmp.name, "nope.sqlite")):

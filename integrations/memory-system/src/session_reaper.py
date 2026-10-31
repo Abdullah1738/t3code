@@ -156,7 +156,7 @@ def keep_file_ids():
 
 
 def protected_ids():
-    return keep_file_ids() | scheduled_ids() | backlog_ids()
+    return keep_file_ids() | scheduled_ids() | backlog_ids() | rollback_ids()
 
 
 def scheduled_ids():
@@ -211,18 +211,33 @@ def openchamber_backlog_ids():
 
 
 def robob_backlog_ids():
-    # Same rule for the old Robob session board. The board is retired (its API is
-    # gone, the table stays as an archive); a DB without the table has no Backlog
-    # to protect, so that doesn't stop the run. A table that can't be read does.
+    # Protects OpenCode sessions behind unsettled kanban cards (active, work and
+    # review threads) and open kanban thread links. The retired ardud_board_rows
+    # Backlog is no longer read. Fail closed: a state DB that can't be read stops the run.
     try:
         con = backend.robob_ro()
         try:
-            ids = backend.board_backlog_session_ids(con)
+            ids = backend.kanban_session_ids(con)
         finally:
             con.close()
     except Exception as e:
-        raise Gate(f"cannot read Robob session board backlog ({e!r})")
-    return set() if ids is None else ids
+        raise Gate(f"cannot read Robob kanban references ({e!r})")
+    return ids
+
+
+def rollback_ids():
+    # OpenCode sessions behind threads that moved to another driver within 90 days.
+    # They are the migration's rollback source and stay until that window passes.
+    if not backend.is_robob():
+        return set()
+    try:
+        con = backend.robob_ro()
+        try:
+            return backend.migrated_rollback_session_ids(con)
+        finally:
+            con.close()
+    except Exception as e:
+        raise Gate(f"cannot read migrated thread rollback pins ({e!r})")
 
 
 def control_gate():
