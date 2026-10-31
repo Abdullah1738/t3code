@@ -22,6 +22,7 @@ import {
   ModelSelection,
   ProjectId,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -172,9 +173,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
     ) {
       const request = yield* HttpServerRequest.HttpServerRequest;
-      const session = yield* auth
-        .authenticateHttpRequest(request)
-        .pipe(Effect.mapError(() => fail("denied", "A valid bearer token is required.")));
+      // Token checks only read; keep them off the writer like the board reads.
+      const session = yield* auth.authenticateHttpRequest(request).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError(() => fail("denied", "A valid bearer token is required.")),
+      );
       if (!session.scopes.includes(scope)) {
         return yield* fail("denied", `This token lacks the ${scope} scope.`);
       }

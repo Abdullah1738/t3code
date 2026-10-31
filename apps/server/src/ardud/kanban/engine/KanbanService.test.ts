@@ -2,6 +2,8 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -11,6 +13,7 @@ import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -178,6 +181,19 @@ const testLayer = (
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer(providers)),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+/** testLayer on a real file database, which has a reader connection. */
+const fileTestLayer = (fake: Layer.Layer<KanbanThreads>, dbPath: string) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
 
@@ -7170,4 +7186,55 @@ it.effect("a worker waiting on its own subagents isn't nudged", () =>
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.live("answers board reads while the SQLite writer is held", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-reader-" });
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const sql = yield* SqlClient.SqlClient;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Read me", title: "Reader" },
+        owner,
+      );
+
+      const writerHeld = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          Deferred.succeed(writerHeld, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        ),
+      );
+      yield* Deferred.await(writerHeld);
+      const reads = yield* Effect.all({
+        boards: kanban.boards,
+        snapshot: kanban.snapshot(board.id),
+        card: kanban.card(created.id),
+        threads: kanban.threads(board.id),
+        discussions: kanban.discussions(board.id),
+        wiki: kanban.wiki(board.id),
+      }).pipe(Effect.timeout("5 seconds"));
+      yield* Deferred.succeed(releaseWriter, undefined);
+      yield* Fiber.join(writer);
+
+      assert.isTrue(reads.boards.some((entry) => entry.id === board.id));
+      assert.deepEqual(
+        reads.snapshot.cards.map((card) => card.id),
+        [created.id],
+      );
+      assert.strictEqual(reads.card.card.id, created.id);
+    }).pipe(Effect.provide(fileTestLayer(fake.layer, path.join(directory, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

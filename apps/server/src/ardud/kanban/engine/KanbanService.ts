@@ -45,6 +45,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -3323,6 +3324,10 @@ const make = Effect.gen(function* () {
     lock.withPermits(1)(effect).pipe(Effect.mapError(toKanbanError));
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(toKanbanError));
+  // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
+  // which a single write can hold for 15 s under load.
+  const readDb = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(NodeSqliteClient.readOnly, Effect.mapError(toKanbanError));
 
   /** Every model a board uses, deduped by pool key. */
   const boardModels = (board: KanbanBoard): Array<ModelSelection> => {
@@ -5063,7 +5068,7 @@ const make = Effect.gen(function* () {
     Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
-        const snapshot = yield* read(snapshotOf(boardId));
+        const snapshot = yield* readDb(snapshotOf(boardId));
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
           Stream.map((entry): KanbanWatchEvent => ({
@@ -5158,17 +5163,17 @@ const make = Effect.gen(function* () {
       );
 
   return KanbanService.of({
-    boards: read(store.boards),
+    boards: readDb(store.boards),
     ensureBoard,
     createBoard,
     updateBoard,
-    snapshot: (boardId) => read(snapshotOf(boardId)),
+    snapshot: (boardId) => readDb(snapshotOf(boardId)),
     watch,
     boardSummaries,
     announce: (boardId, change) => Effect.asVoid(publish(boardId, change)),
     changes: Effect.map(PubSub.subscribe(changes), Stream.fromSubscription),
     card: (cardId) =>
-      read(
+      readDb(
         Effect.gen(function* () {
           const card = yield* cardOf(cardId);
           return {
@@ -5193,18 +5198,18 @@ const make = Effect.gen(function* () {
     removePool,
     setGoal,
     setGroups,
-    discussions: (boardId) => read(store.discussions(boardId)),
-    threads: (boardId) => read(threadRowsOf(boardId)),
-    discussion: (id) => read(discussionOf(id)),
+    discussions: (boardId) => readDb(store.discussions(boardId)),
+    threads: (boardId) => readDb(threadRowsOf(boardId)),
+    discussion: (id) => readDb(discussionOf(id)),
     createDiscussion,
     updateDiscussion,
     cardDiscussion: (cardId) => guard(cardDiscussionUnlocked(cardId)),
-    messages: (id, options) => read(store.messages(id, options)),
+    messages: (id, options) => readDb(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
-    wiki: (boardId) => read(store.wiki(boardId)),
+    wiki: (boardId) => readDb(store.wiki(boardId)),
     writeWiki,
     endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
     startSetup: (boardId, input) =>
