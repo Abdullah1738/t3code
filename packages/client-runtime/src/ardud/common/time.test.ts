@@ -114,31 +114,29 @@ describe("display times", () => {
     expect(explicit.filter((o) => o.timeZone === "Pacific/Auckland").length).toBeLessThanOrEqual(1);
   });
 
-  for (const [tz, expected] of [
+  it.each([
     ["UTC", "Fri 30 Oct"],
     ["Asia/Dubai", "00:10"],
     ["America/New_York", "Fri 30 Oct"],
-  ] as const) {
-    it(`local day comparison matches the old algorithm under TZ=${tz}`, () => {
-      const output = NodeChildProcess.execFileSync(
-        process.execPath,
-        ["--input-type=module", "-e", LOCAL_SCRIPT],
-        {
-          env: { ...process.env, TZ: tz },
-          encoding: "utf8",
-        },
-      );
-      const result = JSON.parse(output.trim().split("\n").at(-1) ?? "{}") as {
-        checked: number;
-        mismatches: unknown[];
-        boundary: string;
-      };
-      expect(result.checked).toBe(21);
-      expect(result.mismatches).toEqual([]);
-      // 2026-10-30 20:10Z is 00:10 on the 31st in Dubai, the same day as "now"; elsewhere it is still the 30th.
-      expect(result.boundary).toBe(expected);
-    });
-  }
+  ])("local day comparison matches the old algorithm under TZ=%s", (tz, expected) => {
+    const output = NodeChildProcess.execFileSync(
+      process.execPath,
+      ["--input-type=module", "-e", LOCAL_SCRIPT],
+      {
+        env: { ...process.env, TZ: tz },
+        encoding: "utf8",
+      },
+    );
+    const result = JSON.parse(output.trim().split("\n").at(-1) ?? "{}") as {
+      checked: number;
+      mismatches: unknown[];
+      boundary: string;
+    };
+    expect(result.checked).toBe(21);
+    expect(result.mismatches).toEqual([]);
+    // 2026-10-30 20:10Z is 00:10 on the 31st in Dubai, the same day as "now"; elsewhere it is still the 30th.
+    expect(result.boundary).toBe(expected);
+  });
 });
 
 function recordCalendarFormatters(run: () => void): Intl.DateTimeFormatOptions[] {
