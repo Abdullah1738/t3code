@@ -307,14 +307,15 @@ def _wait_locked(r, echo, timeout=None):
                 if deadline is not None and now() >= deadline:
                     raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
                                       f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
-                if ck:
+                # `ck is not None` is the validity test; a checkpoint at zero bytes is valid and committed.
+                if ck is not None:
                     _tail(log_path, pos, echo, ck["logBytes"])
                     start = (ck["stdoutOffset"], ck["stderrOffset"])
                     keep = ck["logBytes"]
                 else:
                     # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
                     start, keep = (0, 0), 0
-                return _replay_takeover(cur, echo, deadline, start, log_path, keep)
+                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None)
             finally:
                 guard.__exit__(None, None, None)
         ck = checkpoint(log_path)
@@ -336,7 +337,16 @@ def _wait_locked(r, echo, timeout=None):
         time.sleep(pause)
 
 
-def _replay_takeover(cur, echo, deadline, start, log_path, keep):
+def _has_data(log_path) -> bool:
+    """True when the local log exists and holds bytes. Such a log may be legacy output with no checkpoint, which must
+    never be rewritten in place before the replay is confirmed."""
+    try:
+        return os.path.getsize(log_path) > 0
+    except OSError:
+        return False
+
+
+def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False):
     """Take over a run's follow without touching the original local log until the replay is confirmed.
 
     The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
@@ -352,9 +362,10 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep):
         with open(tmp, "wb") as dst:
             dst.write(prefix)
         # The replay's follow commits checkpoints into tmp: it starts at the committed prefix, then tracks the stream.
-        # Only a checkpointed log can be mirrored: its committed length says where new output goes. A legacy log has
-        # no committed length, so it stays as it is until the replay is confirmed and published.
-        mirror = log_path if keep else None
+        # Mirroring makes new output visible to a lock-blocked follower of the original log. It is safe when the
+        # original has a committed length (`has_checkpoint`), or when it holds no data at all (absent or empty, so the
+        # mirror creates it). A nonempty log with no checkpoint (a legacy holder) is never written in place.
+        mirror = log_path if (has_checkpoint or not _has_data(log_path)) else None
         code = _resolve_exit(cur, log_path, deadline, start, tmp, echo=echo, mirror_path=mirror, mirror_keep=keep)
         if code is None:
             raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")

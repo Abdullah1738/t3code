@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import api, cli, common, misc, runs  # noqa: E402
-from offbox_lib.common import OffboxError  # noqa: E402
+from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
 
@@ -412,6 +412,22 @@ class FollowUntilTests(unittest.TestCase):
         self.assertEqual(log.read_bytes(), b'o1\ne1\no2\n')
 
 
+def _wait_until(pred, budget=0.2):
+    """Poll a predicate for a bounded time (the owner thread takes the lock and writes its first chunk)."""
+    end = time.time() + budget
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _text(stream):
+    """Text written through a _bytes_stdout() stand-in."""
+    stream.flush()
+    return stream.buffer.getvalue().decode("utf-8", errors="replace")
+
+
 def _bytes_stdout():
     """A stdout stand-in that has a byte buffer, as follow()'s echo writes to it through .buffer."""
     import io as _io
@@ -553,7 +569,7 @@ class LiveAndEchoTests(unittest.TestCase):
         self.addCleanup(out.close)
         with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
                 contextlib.redirect_stdout(out):
-            rc = misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed))
+            rc = misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed), has_checkpoint=True)
         self.assertEqual(rc, 0)
         out.flush()
         self.assertIn(b'o2\n', out.buffer.getvalue())
@@ -576,9 +592,154 @@ class LiveAndEchoTests(unittest.TestCase):
         out = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
         self.addCleanup(out.close)
         with patch.object(runs.api, 'cmd_attach', held_stream), contextlib.redirect_stdout(out):
-            misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed))
+            misc._replay_takeover(self.row, True, None, (3, 0), log, len(committed), has_checkpoint=True)
         self.assertEqual(seen_by_follower['bytes'], b'o1\no2\n')
         self.assertEqual(seen_by_follower['ck']['logBytes'], len(b'o1\no2\n'))
+
+
+class LockBlockedFollowerTests(unittest.TestCase):
+    """Round 7: a lock-blocked logs --follow (the real _wait_locked poll loop) receives an owner's chunk before the
+    owner's exit frame, for a fresh run with no checkpoint, with a zero checkpoint, and with an empty original log.
+    The owner is a real takeover in a background thread, paused between its chunk and its exit frame."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
+        self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
+        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
+        self.stack.enter_context(patch.object(misc, 'WAIT_POLL_S', 0))
+        # logs --follow only enters the lock-blocked path for a live box.
+        self.stack.enter_context(patch.object(runs.api, 'get', return_value={'state': 'running'}))
+        self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
+        self.con = db()
+        self.con.execute("INSERT OR REPLACE INTO runs(run_id,box_id,status,process_id,pulls,start_at) "
+                         "VALUES ('run-f','bx_a','running',7,'[]',900)")
+        self.con.commit()
+        self.row = {'run_id': 'run-f', 'box_id': 'bx_a', 'process_id': 7, 'pulls': '[]', 'status': 'running',
+                    'exit_code': None}
+
+    def _settle_run(self):
+        self.con.execute("UPDATE runs SET status='done', exit_code=0 WHERE run_id='run-f'")
+        self.con.commit()
+
+    def _run_owner(self, frames_before_exit):
+        """Owner takeover in a thread: it yields chunk frames, then blocks on `gate` before its exit frame."""
+        gate = threading.Event()
+
+        def stream(box, pid, o, e, **kw):
+            for fr in frames_before_exit:
+                yield fr
+            gate.wait(10)  # the follower reads the original log here, before the owner's exit frame
+            yield {'type': 'exit', 'exitCode': 0}
+
+        self.owner_holds = threading.Event()
+
+        def owner():
+            # The owner is the lock holder: it holds the box lock for the whole replay, as _wait_locked does.
+            guard = common.file_lock('box-bx_a', timeout=0)
+            guard.__enter__()
+            self.owner_holds.set()  # from here on the follower can only poll, never replay
+            try:
+                with patch.object(runs.api, 'cmd_attach', stream):
+                    misc._replay_takeover(self.row, False, None, (0, 0), self.logs / 'run-f.log',
+                                          0, has_checkpoint=False)
+            except BaseException as e:  # noqa: BLE001  (recorded, and the test fails on it below)
+                self.owner_error = e
+            finally:
+                guard.__exit__(None, None, None)
+        self.owner_error = None
+        t = threading.Thread(target=owner, daemon=True)
+        t.start()
+        self.addCleanup(lambda: (gate.set(), t.join(5)))
+        return gate, t
+
+    def test_follower_sees_chunk_with_no_checkpoint(self):
+        # Fresh --bg run (never followed): no log, no sidecar. The owner's first chunk must reach a lock-blocked
+        # follower before the owner's exit frame.
+        log = self.logs / 'run-f.log'
+        self.assertIsNone(common.checkpoint(log))
+        self.assertFalse(log.exists())
+        gate, owner = self._run_owner([{'type': 'stdout', 'data': 'first\n', 'nextOffset': 6}])
+        # The owner holds the lock and is blocked before its exit frame; the follower can only poll.
+        self.assertTrue(_wait_until(lambda: log.exists() and log.read_bytes() == b'first\n', 5),
+                        'owner never wrote its first chunk to the original log')
+        self.assertTrue(self.owner_holds.wait(5), 'owner never took the box lock')
+        seen = _bytes_stdout()
+        with patch.object(misc, 'WAIT_POLL_S', 0), contextlib.redirect_stdout(seen):
+            result = {}
+
+            def follower():
+                result['rc'] = misc.logs('run-f', do_follow=True)
+            f = threading.Thread(target=follower, daemon=True)
+            f.start()
+            # The follower polls the lock; join it however this test ends so its lock never outlives the test.
+            # Settle the run the way the owner's finish() does, so the follower's poll loop returns (a real run
+            # settles through finish(); this test patches finish out). Then join.
+            self.addCleanup(lambda: (gate.set(), owner.join(5), self._settle_run(), f.join(10)))
+            # Poll until the follower has printed the chunk, while the owner is still before its exit frame.
+            for _ in range(200):
+                if 'first' in _text(seen):
+                    break
+                time.sleep(0.02)
+            seen_before_exit = 'first' in _text(seen)
+            gate.set()
+            owner.join(5)
+            # The owner has exited. Settle the run the way its finish() does, so the follower's poll returns.
+            self._settle_run()
+            f.join(10)
+        self.assertFalse(owner.is_alive(), 'owner thread must end')
+        self.assertFalse(f.is_alive(), 'follower thread must end')
+        self.assertIsNone(self.owner_error, f'owner failed: {self.owner_error!r}')
+        self.assertTrue(seen_before_exit, 'follower must receive the owner chunk before its exit frame')
+        self.assertEqual(log.read_bytes(), b'first\n')
+        self.assertEqual(_text(seen).count('first'), 1)
+
+    def test_follower_sees_chunk_with_zero_checkpoint_and_empty_log(self):
+        # A holder died before its first committed chunk: an empty log and a zero-length checkpoint.
+        log = self.logs / 'run-f.log'
+        log.write_bytes(b'')
+        runs._commit(log, 0, 0, 0)
+        self.assertEqual(common.checkpoint(log)['logBytes'], 0)
+        gate, owner = self._run_owner([{'type': 'stdout', 'data': 'second\n', 'nextOffset': 7}])
+        self.assertTrue(self.owner_holds.wait(5), 'owner never took the box lock')
+        self.assertTrue(_wait_until(lambda: log.exists() and log.read_bytes() == b'second\n', 5),
+                        'owner never wrote its first chunk to the original log')
+        seen = _bytes_stdout()
+        with contextlib.redirect_stdout(seen):
+            result = {}
+
+            def follower():
+                result['rc'] = misc.logs('run-f', do_follow=True)
+            f = threading.Thread(target=follower, daemon=True)
+            f.start()
+            # The follower polls the lock; join it however this test ends so its lock never outlives the test.
+            # Settle the run the way the owner's finish() does, so the follower's poll loop returns (a real run
+            # settles through finish(); this test patches finish out). Then join.
+            self.addCleanup(lambda: (gate.set(), owner.join(5), self._settle_run(), f.join(10)))
+            for _ in range(200):
+                if 'second' in _text(seen):
+                    break
+                time.sleep(0.02)
+            seen_before_exit = 'second' in _text(seen)
+            gate.set()
+            owner.join(5)
+            # The owner has exited. Settle the run the way its finish() does, so the follower's poll returns.
+            self._settle_run()
+            f.join(10)
+        self.assertFalse(owner.is_alive(), 'owner thread must end')
+        self.assertFalse(f.is_alive(), 'follower thread must end')
+        self.assertIsNone(self.owner_error, f'owner failed: {self.owner_error!r}')
+        self.assertTrue(seen_before_exit, 'follower must receive the owner chunk before its exit frame')
+        self.assertEqual(log.read_bytes(), b'second\n')
+        self.assertEqual(_text(seen).count('second'), 1)
 
 
 class _Boat(http.server.BaseHTTPRequestHandler):

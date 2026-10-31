@@ -648,15 +648,22 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     # A takeover also mirrors every committed chunk into the original log (`mirror_path`), so a lock-blocked
     # `logs --follow` sees the new output while the owner runs. The mirror is opened for append, never truncated.
     # Never truncated: the original keeps its committed prefix, and readers only trust bytes up to its checkpoint.
-    mf = open(mirror_path, "r+b") if mirror_path else None
-    if mf:
-        # The original already holds the committed prefix; new output continues at that point.
-        mf.seek(mirror_keep)
+    # A missing or empty original is created here (nothing in it to lose); a nonempty one is continued in place.
+    mf = None
+    if mirror_path:
+        if mirror_keep == 0 and not (Path(mirror_path).exists() and Path(mirror_path).stat().st_size > 0):
+            mf = open(mirror_path, "ab")
+        else:
+            mf = open(mirror_path, "r+b")
+            # The original already holds the committed prefix; new output continues at that point.
+            mf.seek(mirror_keep)
     if lf:
         # Checkpoint before the first byte: a holder that dies inside its first chunk still leaves one, so a waiter
         # never prints bytes that its takeover will replay (no checkpoint at all = a holder from before checkpoints).
         _commit(target, out_off, err_off, lf.tell())
         if mf:
+            # The mirror's zero (or current) checkpoint, written before the first byte, so a follower that reads the
+            # original right away sees a valid committed length rather than none.
             _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
     frames = None
