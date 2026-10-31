@@ -2830,9 +2830,13 @@ export class Router {
     // exception: its nudge waits for the work to finish, so background follow-ups
     // still deliver, and whichever lands first decides (see cancelQueuedNew).
     const queued = this.store.get<{ id: string } | null>("newQueued");
-    if (this.store.pendingInbound().some(row => resetRow(row.id) && row.id !== queued?.id)) return;
+    const pending = this.store.pendingInbound();
+    if (pending.some(row => resetRow(row.id) && row.id !== queued?.id)) return;
     const now = Date.now();
-    if (now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
+    // While a deferred /new waits to be sent, look every tick: an answer the resumed work just
+    // wrote must start its background turn (which cancels the reset) before the reset is POSTed.
+    const deferredWaiting = !!queued && pending.some(row => row.id === queued.id);
+    if (!deferredWaiting && now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
     this.watchedAt = now;
     try {
       const mark = this.store.get<Watermark | null>("watermark");
