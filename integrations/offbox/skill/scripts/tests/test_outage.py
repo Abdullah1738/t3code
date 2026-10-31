@@ -312,6 +312,76 @@ sys.exit(rc)
 '''
 
 
+class HealthyStreamClearsOutageTests(OutageBase):
+    def test_outage_then_healthy_output_then_disconnect_reattaches(self):
+        # One brief 525, then the stream recovers and runs an hour. A later ordinary socket timeout must reattach
+        # normally, not fail as "API was down for 1800s" from the earlier outage's start.
+        clock = {"t": 1000.0}
+        attaches = []
+
+        def attach(box, pid, o, e, timeout=90, deadline=None):
+            attaches.append(clock["t"])
+            if len(attaches) == 1:
+                clock["t"] += 5
+                raise api.ApiError(525, "http_525", "")
+            if len(attaches) == 2:
+                # healthy stream: frames for an hour, then a socket timeout mid-run
+                def frames():
+                    yield {"type": "stdout", "data": "ok\n", "nextOffset": 3}
+                    clock["t"] += 3600
+                    raise OSError("timed out")
+                return frames()
+            return iter([{"type": "exit", "exitCode": 0}])
+
+        def status(box, pid, timeout=60, retries=2, deadline=None):
+            return {"running": True, "status": "running"}
+
+        with patch.object(runs, "_ttl_keeper", return_value=None), \
+                patch.object(runs.api, "cmd_attach", side_effect=attach), \
+                patch.object(runs.api, "cmd_status", side_effect=status), \
+                patch.object(runs, "now", lambda: clock["t"]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = runs.follow("bx", 1, None, echo=False, stop_evt=FollowOutageTests.Evt())
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(attaches), 3)
+
+
+class StatusConnectRetryTests(OutageBase):
+    def test_status_inside_the_window_sends_a_52x_once_through_the_real_call(self):
+        # Real api.cmd_status -> api.call (no cmd_status mock). A not-delivered 525 must not get connect retries
+        # or their sleeps once the outage window is what bounds the request.
+        import time as real_time
+        self.urlopen.side_effect = cf(525)
+        # api deadlines are real time.time(): an outage window that started now has its whole length left.
+        with self.assertRaises(api.ApiError):
+            api.cmd_status("bx", 1, timeout=60, retries=0, deadline=real_time.time() + runs.OUTAGE_FOLLOW_S)
+        self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_status_without_absolute_end_still_bounded_by_connect_retries_only_when_asked(self):
+        # Documents the reason for the deadline: no deadline keeps the connect retries (5 extra sends).
+        self.urlopen.side_effect = cf(525)
+        with self.assertRaises(api.ApiError):
+            api.cmd_status("bx", 1, timeout=60, retries=0)
+        self.assertGreater(self.urlopen.call_count, 1)
+
+
+class ClosedStderrSubprocessTests(Isolated):
+    def test_say_then_exit_code_survives_a_closed_stderr_pipe(self):
+        code = (
+            "import os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from offbox_lib import common\n"
+            "r, w = os.pipe(); os.close(r); os.dup2(w, 2); os.close(w)\n"
+            "common.say('hello'); common.warn_loud('careful')\n"
+            "sys.exit(3)\n"
+        )
+        import subprocess
+        scripts = str(Path(__file__).resolve().parents[1])
+        p = subprocess.run([sys.executable, "-W", "ignore", "-c", code, scripts], capture_output=True, timeout=60)
+        self.assertEqual(p.returncode, 3, p.stderr.decode(errors="replace")[-500:])
+        self.assertNotIn(b"BrokenPipeError", p.stderr)
+
+
 class ClosedPipeSubprocessTests(Isolated):
     def test_exit_code_survives_a_closed_stdout_pipe(self):
         # A real closed pipe: the interpreter's shutdown flush must not raise and replace the remote exit code.

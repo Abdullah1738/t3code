@@ -106,12 +106,25 @@ def log(msg: str) -> None:
         f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
+def silence(stream) -> None:
+    """Point a dead output descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
+    again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(fd, stream.fileno())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def _emit(text: str) -> None:
     # The caller's pipe can close first (tool timeout, | head); progress lines are best effort.
     try:
         print(text, file=sys.stderr, flush=True)
     except (BrokenPipeError, ValueError):
-        pass
+        silence(sys.stderr)
 
 
 def say(msg: str) -> None:

@@ -17,7 +17,7 @@ from pathlib import Path
 from . import api, lease, node_version, pool, ssh_sync
 from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
-                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say)
+                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
 
 BG_TTL_S = 6 * 3600
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -674,21 +674,8 @@ def _echo(stream, b: bytes) -> bool:
         stream.flush()
         return True
     except (BrokenPipeError, ValueError):
-        _silence(stream)
+        silence(stream)
         return False
-
-
-def _silence(stream) -> None:
-    """Point the dead descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
-    again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
-    try:
-        fd = os.open(os.devnull, os.O_WRONLY)
-        try:
-            os.dup2(fd, stream.fileno())
-        finally:
-            os.close(fd)
-    except (OSError, ValueError, AttributeError):
-        pass
 
 
 def _close(frames) -> None:
@@ -781,6 +768,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 for fr in frames:
                     if stop_evt.is_set():
                         return None
+                    # A frame from a live attach means boat answers: this stream's outage (if any) is over.
+                    down_from = None
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
@@ -844,9 +833,15 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                     status_s = max(1.0, min(60.0, left() if until is not None else 60.0))
                     if down_from is not None:
                         status_s = max(1.0, min(status_s, OUTAGE_FOLLOW_S - (now() - down_from)))
+                    # An absolute end (the caller's until, the outage window) is what makes api.cmd_status skip the
+                    # connect retries: without it a not-delivered 52x would be sent six times, outside the window.
+                    ends = [now() + status_s]
+                    if until is not None:
+                        ends.append(until)
+                    if down_from is not None:
+                        ends.append(down_from + OUTAGE_FOLLOW_S)
                     try:
-                        st = api.cmd_status(box_id, pid, timeout=status_s, retries=0, deadline=until) \
-                            if until is not None else api.cmd_status(box_id, pid, timeout=status_s, retries=0)
+                        st = api.cmd_status(box_id, pid, timeout=status_s, retries=0, deadline=min(ends))
                     except OffboxError as se:
                         boat_down = getattr(se, "outage", False)
                 except OffboxError:
