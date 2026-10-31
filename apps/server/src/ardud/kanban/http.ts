@@ -174,12 +174,10 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     ) {
       const request = yield* HttpServerRequest.HttpServerRequest;
       // Token checks only read; keep them off the writer like the board reads.
-      const session = yield* auth
-        .authenticateHttpRequest(request)
-        .pipe(
-          NodeSqliteClient.readOnly,
-          Effect.mapError(() => fail("denied", "A valid bearer token is required.")),
-        );
+      const session = yield* auth.authenticateHttpRequest(request).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError(() => fail("denied", "A valid bearer token is required.")),
+      );
       if (!session.scopes.includes(scope)) {
         return yield* fail("denied", `This token lacks the ${scope} scope.`);
       }
