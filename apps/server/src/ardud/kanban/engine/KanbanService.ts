@@ -1592,9 +1592,10 @@ const make = Effect.gen(function* () {
     const board = yield* boardOf(boardId);
     for (;;) {
       const queue = yield* store.evaluatorQueue(boardId);
-      if (queue.length === 0) return;
+      const first = queue[0];
+      if (first === undefined) return;
       if (board.evaluatorSlots !== null && (yield* admittedCount(boardId)) >= board.evaluatorSlots) return;
-      const threadId = ThreadId.make(queue[0]!.threadId);
+      const threadId = ThreadId.make(first.threadId);
       const mine = queue.filter((item) => item.threadId === threadId);
       const text = mine.map((item) => item.entry.text).join("\n\n");
       const model = mine.at(-1)?.entry.model ?? undefined;
