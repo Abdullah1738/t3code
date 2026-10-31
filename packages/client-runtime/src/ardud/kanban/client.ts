@@ -86,7 +86,13 @@ export interface KanbanClient {
   changeAsk(cardId: string, askId: string, action: "block" | "drop"): Promise<void>;
   /** The card's discussion, created on first use. */
   cardDiscussion(boardId: string, cardId: string): Promise<KanbanDiscussion>;
-  setPool(boardId: string, model: ModelSelection, slots: number): Promise<void>;
+  /** With `replaces` (a pool key), changes that pool's level to `model`'s. */
+  setPool(
+    boardId: string,
+    model: ModelSelection,
+    slots: number | undefined,
+    options?: { readonly replaces?: string },
+  ): Promise<void>;
   removePool(boardId: string, model: ModelSelection): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
   /** Owner's New board: creates the board with its project and evaluator model. */
@@ -800,8 +806,13 @@ export function createKanbanClient(
       withDiscussion(boardId, discussion);
       return discussion;
     },
-    async setPool(boardId, model, slots) {
-      await transport.request(M.poolSet, { boardId: boardId as never, model, slots });
+    async setPool(boardId, model, slots, options) {
+      await transport.request(M.poolSet, {
+        boardId: boardId as never,
+        model,
+        ...(slots === undefined ? {} : { slots }),
+        ...(options?.replaces === undefined ? {} : { replaces: options.replaces }),
+      });
     },
     async removePool(boardId, model) {
       await transport.request(M.poolRemove, { boardId: boardId as never, model });
