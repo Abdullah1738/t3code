@@ -81,6 +81,9 @@ VETO = re.compile(r"\b(?:not\s+me|not\s+mine|wasn'?t\s+(?:me|mine)|isn'?t\s+(?:m
                   r"|\b(?:none|nothing|never|not|n't)\b"
                   # "No Apple orders from me", "no charges from Apple": a "no" in front of a purchase object.
                   r"|\bno\s+(?:\w+\s+)?(?:orders?|purchases?|payments?|charges?|subscriptions?|mine|from\s+me)\b", re.I)
+CORRECTION = re.compile(r"\b(?:wrong\s+(?:charge|one|transaction|payment)|nothing\s+to\s+do\s+with\s+(?:me|us|this)|"
+                        r"not\s+(?:my|for)\s+(?:charge|one|transaction|payment|me)|not\s+mine|isn'?t\s+mine|"
+                        r"someone\s+else'?s?|belongs?\s+to\s+(?:someone|somebody|another|anyone))\b", re.I)
 # A statement that opens like a question is one, with or without its "?": "Is this Apple charge mine".
 ASKS = re.compile(r"^\W*(?:is|are|was|were|am|do|does|did|have|has|had|can|could|would|will|should|shall|may)\b",
                   re.I)
@@ -401,7 +404,8 @@ def owner_said(charge, at, now, said=None, deadline=None):
         # A denial in any clause vetoes the whole message before any clause is accepted, so a later "No Apple
         # orders from me" can't be outvoted by an earlier "I paid Apple". A clause about the merchant or the
         # charge that denies it is a denial; "no need to ask" names neither, so it doesn't veto.
-        denied = any(VETO.search(c) and (pattern.search(c) or OWNS.search(c) or OWNER_BUYS.search(c)) for c in parts)
+        denied = any(CORRECTION.search(c) or (VETO.search(c) and (pattern.search(c) or OWNS.search(c) or OWNER_BUYS.search(c)))
+                     for c in parts)
         if NOT_MINE.search(text) or denied or any(ASKS.search(c) for c in parts):
             continue
         # The purchase words have to be about this merchant, in the same statement: "I paid Amazon AED 50.
