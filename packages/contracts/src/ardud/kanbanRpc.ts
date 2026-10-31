@@ -15,7 +15,6 @@ import {
 import {
   IsoDateTime,
   NonNegativeInt,
-  PositiveInt,
   ProjectId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -121,7 +120,6 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   managerModel: Schema.optional(ModelSelection),
   evaluatorModel: Schema.optional(ModelSelection),
   defaultCardModel: Schema.optional(ModelSelection),
-  evaluatorSlots: Schema.optional(Schema.NullOr(PositiveInt)),
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
   instructions: Schema.optional(KanbanInstructions),

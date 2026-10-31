@@ -34,7 +34,6 @@ const board: KanbanBoard = {
   managerModel: model,
   evaluatorModel: model,
   defaultCardModel: model,
-  evaluatorSlots: null,
   reviewChains: [],
   defaultReviewChain: null,
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
@@ -288,56 +287,6 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
       assert.deepStrictEqual(
         (yield* store.pools(fresh.id)).map((pool) => pool.key),
         ["opencode/opus/a#max", "opencode/opus/b"],
-      );
-    }),
-  );
-});
-
-it.layer(TestLayer)("kanban store: evaluator admissions", (it) => {
-  it.effect("drops an admission only when its turn matches", () =>
-    Effect.gen(function* () {
-      const store = yield* KanbanStore.KanbanStore;
-      yield* store.putBoard(board);
-      yield* store.putAdmission({ threadId: "thread-a", boardId, turn: "run-a", at: 1 });
-      yield* store.putAdmission({ threadId: "thread-b", boardId, turn: "run-b", at: 2 });
-      yield* store.dropAdmission("thread-a", "run-b");
-      assert.deepStrictEqual(
-        (yield* store.admissions()).map((row) => [row.threadId, row.turn]),
-        [
-          ["thread-a", "run-a"],
-          ["thread-b", "run-b"],
-        ],
-      );
-      yield* store.dropAdmission("thread-a", "run-a");
-      assert.deepStrictEqual(
-        (yield* store.admissions()).map((row) => [row.threadId, row.turn]),
-        [["thread-b", "run-b"]],
-      );
-    }),
-  );
-});
-
-it.layer(TestLayer)("kanban store: evaluator queue", (it) => {
-  it.effect("reads queued evaluator sends oldest first and drops one thread", () =>
-    Effect.gen(function* () {
-      const store = yield* KanbanStore.KanbanStore;
-      yield* store.putBoard(board);
-      const entry = (text: string) => ({ text, model: null, queuedAt: at });
-      yield* store.enqueueEvaluator(boardId, "thread-a", entry("one"));
-      yield* store.enqueueEvaluator(boardId, "thread-b", entry("two"));
-      yield* store.enqueueEvaluator(boardId, "thread-a", entry("three"));
-      assert.deepStrictEqual(
-        (yield* store.evaluatorQueue(boardId)).map((item) => [item.threadId, item.entry.text]),
-        [
-          ["thread-a", "one"],
-          ["thread-b", "two"],
-          ["thread-a", "three"],
-        ],
-      );
-      yield* store.dropEvaluatorQueue("thread-a");
-      assert.deepStrictEqual(
-        (yield* store.evaluatorQueue(boardId)).map((item) => [item.threadId, item.entry.text]),
-        [["thread-b", "two"]],
       );
     }),
   );

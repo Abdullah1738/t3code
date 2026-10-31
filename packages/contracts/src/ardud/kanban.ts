@@ -540,8 +540,6 @@ export const KanbanBoard = Schema.Struct({
   managerModel: ModelSelection,
   evaluatorModel: ModelSelection,
   defaultCardModel: ModelSelection,
-  /** Most evaluator turns that run at once; null is no limit. Separate from the card pools. */
-  evaluatorSlots: Schema.NullOr(PositiveInt).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   instructions: KanbanInstructions,
@@ -772,12 +770,6 @@ export const KanbanBoardSnapshot = Schema.Struct({
   threads: Schema.Array(KanbanThreadState),
   /** Unread owner messages per discussion. */
   unread: Schema.Array(Schema.Struct({ discussionId: KanbanDiscussionId, count: NonNegativeInt })),
-  /** The evaluator pool: its limit, the turns running now and the threads waiting for a slot. */
-  evaluators: Schema.Struct({
-    slots: Schema.NullOr(PositiveInt),
-    busy: NonNegativeInt,
-    queued: NonNegativeInt,
-  }).pipe(Schema.withDecodingDefault(Effect.succeed({ slots: null, busy: 0, queued: 0 }))),
 });
 export type KanbanBoardSnapshot = typeof KanbanBoardSnapshot.Type;
 
