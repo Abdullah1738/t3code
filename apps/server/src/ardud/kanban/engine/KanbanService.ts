@@ -484,6 +484,7 @@ const HOLD_MAX_MS = 30 * 60_000;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
+const EVALUATOR_ERRORS_TITLE = "Evaluator errors";
 // A todo card whose step is only evaluator subtasks (its packet) nobody has done
 // gets its evaluator woken once: a card made by an evaluator wakes nobody else.
 const STEP_WAIT_P1_MS = 15 * 60_000;
@@ -633,6 +634,16 @@ const make = Effect.gen(function* () {
    * or that outlived HOLD_MAX_MS.
    */
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
+  // Evaluators whose last run failed for a non-outage reason: retried once, then given up.
+  // In memory on purpose: a restart starts the streaks over.
+  const evaluatorFailures = yield* Ref.make<
+    ReadonlyMap<
+      ThreadId,
+      { readonly dueAt: number; readonly message: string; readonly state: "retry" | "sent" | "gone" }
+    >
+  >(new Map());
+  // Discussions that already got a fresh evaluator after a give-up, until one finishes a run cleanly.
+  const replaced = yield* Ref.make<ReadonlySet<KanbanDiscussion["id"]>>(new Set());
   // Evaluator threads asked for a status: the run it was asked in and when. A new run starts over.
   const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
     new Map(),
@@ -1694,8 +1705,12 @@ const make = Effect.gen(function* () {
     return ids;
   });
 
-  /** An evaluator that exists and is not archived. Archived ones are gone for routing. */
+  /**
+   * An evaluator that exists, is not archived, and was not given up after failing.
+   * Archived and given-up ones are gone for routing.
+   */
   const liveEvaluator = Effect.fn("KanbanService.liveEvaluator")(function* (threadId: ThreadId) {
+    if ((yield* Ref.get(evaluatorFailures)).get(threadId)?.state === "gone") return false;
     const view = yield* threads.view(threadId);
     return !!view && !view.archived;
   });
@@ -2588,6 +2603,79 @@ const make = Effect.gen(function* () {
     yield* kick;
   });
 
+  /**
+   * An evaluator failed twice (or ran out of context): it is given up. Its discussions
+   * get a fresh evaluator once; a one-shot evaluator is handed to its card or reported.
+   */
+  const evaluatorGiveUp = Effect.fn("KanbanService.evaluatorGiveUp")(function* (
+    link: KanbanThreadLink,
+    message: string,
+  ) {
+    const threadId = link.threadId;
+    yield* Ref.update(evaluatorFailures, (all) =>
+      new Map(all).set(threadId, { dueAt: 0, message, state: "gone" }),
+    );
+    if (link.discussionId === null) {
+      const current = (yield* store.threadLink(threadId)) ?? link;
+      if (current.endedAt === null) {
+        yield* store.putThreadLink({ ...current, endedAt: yield* nowIso });
+      }
+    }
+    const actor: KanbanActor = { _tag: "system", component: "evaluator-watch" };
+    const homes = (yield* store.discussions(link.boardId)).filter(
+      (entry) => entry.evaluatorThreadId === threadId && entry.archivedAt === null,
+    );
+    for (const home of homes) {
+      yield* Effect.gen(function* () {
+        const fresh = !(yield* Ref.get(replaced)).has(home.id);
+        yield* postUnlocked(
+          home.id,
+          actor,
+          [{ _tag: "md", text: Briefs.evaluatorGoneText(message, fresh) }],
+          false,
+        );
+        const cleared = { ...(yield* discussionOf(home.id)), evaluatorThreadId: null };
+        if (fresh) {
+          yield* Ref.update(replaced, (all) => new Set(all).add(home.id));
+          yield* toEvaluator(cleared, Briefs.evaluatorTakeoverText(threadId, message));
+        } else {
+          yield* saveDiscussion(cleared);
+        }
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator give-up failed", { threadId, cause }),
+        ),
+      );
+    }
+    if (homes.length > 0) return;
+    yield* Effect.gen(function* () {
+      const card = link.cardId !== null ? yield* store.card(link.cardId) : null;
+      if (card) {
+        yield* noteDiscussion(card, Briefs.evaluatorTakeoverText(threadId, message));
+        return;
+      }
+      const title = (yield* threads.view(threadId))?.title ?? link.purpose ?? "evaluator";
+      const existing = (yield* store.discussions(link.boardId)).find(
+        (entry) =>
+          entry.cardId === null &&
+          entry.archivedAt === null &&
+          entry.title === EVALUATOR_ERRORS_TITLE,
+      );
+      const channel =
+        existing ?? (yield* newDiscussion(link.boardId, EVALUATOR_ERRORS_TITLE, null, actor));
+      yield* postUnlocked(
+        channel.id,
+        actor,
+        [{ _tag: "md", text: Briefs.evaluatorLostText(title, threadId, message) }],
+        false,
+      );
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban evaluator give-up failed", { threadId, cause }),
+      ),
+    );
+  });
+
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
   ) {
@@ -2677,12 +2765,51 @@ const make = Effect.gen(function* () {
     }
 
     if (link.role === "evaluator") {
-      // A paused evaluator stays open so it can be woken. `link` is stale once its
-      // pause was set or cleared above, so the current row is ended.
-      if (link.discussionId === null && link.endedAt === null && outage === null) {
+      const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
+      // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
+      if (failure === null) {
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        for (const discussion of yield* store.discussions(link.boardId)) {
+          if (discussion.evaluatorThreadId !== threadId) continue;
+          yield* Ref.update(replaced, (all) => {
+            const next = new Set(all);
+            next.delete(discussion.id);
+            return next;
+          });
+        }
+      }
+      // A paused evaluator stays open so it can be woken, and a retry keeps the link
+      // open so the run after it can end it. `link` is stale once its pause was set
+      // or cleared above, so the current row is ended.
+      const endLink = Effect.gen(function* () {
+        if (link.discussionId !== null || link.endedAt !== null) return;
         const current = (yield* store.threadLink(threadId)) ?? link;
         yield* store.putThreadLink({ ...current, endedAt: at });
+      });
+      if (failure === null) {
+        yield* endLink;
+        return;
       }
+      if (outage !== null) return;
+      if (entry?.state === "gone") {
+        yield* endLink;
+        return;
+      }
+      if (entry !== undefined || Rules.isContextFull(failure)) {
+        yield* evaluatorGiveUp(link, failure.message);
+        return;
+      }
+      yield* Ref.update(evaluatorFailures, (all) =>
+        new Map(all).set(threadId, {
+          dueAt: (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS,
+          message: failure.message,
+          state: "retry",
+        }),
+      );
       return;
     }
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
@@ -2822,6 +2949,40 @@ const make = Effect.gen(function* () {
       if (!view || view.state !== "running" || now - held.at > HOLD_MAX_MS) {
         yield* dropHold(threadId);
         yield* kick;
+      }
+    }
+    // A failed evaluator's one retry, once its wait is over.
+    for (const [threadId, entry] of yield* Ref.get(evaluatorFailures)) {
+      if (entry.state !== "retry" || entry.dueAt > now) continue;
+      const view = yield* threads.view(threadId);
+      if (!view || view.archived) {
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        continue;
+      }
+      const setState = (state: "sent") =>
+        Ref.update(evaluatorFailures, (all) => new Map(all).set(threadId, { ...entry, state }));
+      if (view.state !== "idle") {
+        yield* setState("sent");
+        continue;
+      }
+      const sent = yield* threads
+        .send({ threadId, text: Briefs.evaluatorRetryText(entry.message) })
+        .pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban evaluator retry failed", { threadId, cause }).pipe(
+              Effect.as(false),
+            ),
+          ),
+        );
+      yield* setState("sent");
+      if (!sent) {
+        const link = yield* store.threadLink(threadId);
+        if (link) yield* evaluatorGiveUp(link, entry.message);
       }
     }
     const missed = new Set<ThreadId>();
