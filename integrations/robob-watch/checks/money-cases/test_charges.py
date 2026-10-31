@@ -301,6 +301,14 @@ class Explain(unittest.TestCase):
                 r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
                 self.assertEqual(r['verdict'], 'ask')
 
+    def test_topping_up_the_merchant_account_still_explains_the_charge(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
+
+        def said(since, until, deadline=None):
+            return [('2026-10-24T00:20:00.000Z', 'I topped up my Apple account USD 99', 'iMessage')]
+        r = ch.explain(apple, at('2026-10-24T00:45'), at('2026-10-24T00:47'), find=Finder([]), said=said)
+        self.assertEqual(r['verdict'], 'owner')
+
     def test_an_order_of_something_else_explains_nothing(self):
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00')
 

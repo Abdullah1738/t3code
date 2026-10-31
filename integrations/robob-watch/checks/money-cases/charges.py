@@ -340,10 +340,12 @@ SELLER_FROM = re.compile(
 OWNS = re.compile(r"\b(?:(?:is|are|was|it'?s|that'?s) mine|mine)\b", re.I)
 # A payment method is how he paid, never who was paid: "with Apple Pay", "via Apple Pay", "on my card".
 # It is cut from the clause before any payee or seller is read, so "Apple Pay" can't stand in for Apple.
-PAYMENT_METHOD = re.compile(r"\b(?:(?:with|via|using|through|on|by)\s+)?(?:my\s+|the\s+|his\s+|our\s+)?"
-                            r"(?:(?:[A-Za-z]+\s+)?(?:card|account|wallet|cheque)|apple\s+pay|google\s+pay|"
-                            r"samsung\s+pay|paypal|bank\s+transfer|transfer|cash|check)\b"
-                            r"(?:\s+(?:ending|no\.?|number)?\s*\d{4})?", re.I)
+# How he paid, never who was paid. Only a method phrase is cut: "with/via/using/on" a payment method, or a
+# card with its issuer ("with my ENBD card"). A bare "account" or "wallet" is a destination, not a method:
+# "I topped up my Apple account" funds Apple, so it stays as the payee.
+PAYMENT_METHOD = re.compile(r"\b(?:with|via|using|through|on|by)\s+(?:my\s+|the\s+|his\s+|our\s+)?"
+                            r"(?:(?:[A-Za-z]+\s+)?(?:card|cheque)|(?:apple|google|samsung)\s+pay|paypal|"
+                            r"bank\s+transfer|cash)\b(?:\s+(?:ending|no\.?|number)?\s*\d{4})?", re.I)
 
 
 def buys_from(clause, pattern):
