@@ -77,7 +77,7 @@ NEGATED = re.compile(r"\b(?:no|none|nothing|never|not|n't|didn't|haven't|hasn't|
 # Only a denial of buying or owning vetoes: a bare "no", "actually" or "no need to ask" is discourse, not a denial.
 VETO = re.compile(r"\b(?:not\s+me|not\s+mine|wasn'?t\s+(?:me|mine)|isn'?t\s+(?:me|mine)|that\s+wasn'?t|"
                   r"it\s+wasn'?t|wrong\s+(?:charge|one|order|account)|incorrect\s+(?:charge|one)|"
-                  r"belongs?\s+to\s+(?:someone|somebody|another|anyone)|someone\s+else'?s?)\b"
+                  r"belongs?\s+to\s+(?:someone|somebody|another|anyone))\b"
                   r"|\b(?:none|nothing|never|not|n't)\b"
                   # "No Apple orders from me", "no charges from Apple": a "no" in front of a purchase object.
                   r"|\bno\s+(?:\w+\s+)?(?:orders?|purchases?|payments?|charges?|subscriptions?|mine|from\s+me)\b", re.I)
