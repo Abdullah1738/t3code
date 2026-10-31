@@ -306,7 +306,7 @@ const WikiRead = tool(
 const CardCreate = tool(
   "card_create",
   "Create a card",
-  "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; from an evaluator it is the packet (scope, files, steps, tests, when it's done). A card a thread makes without assignToSelf waits for an evaluator to write its packet. Title and description are written for you when left out.",
+  "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; from an evaluator it is the packet (scope, files, steps, tests, when it's done). A card a thread makes without assignToSelf waits for an evaluator to write its packet. Title and description are written for you when left out. Refused when an open card on the board has the same title or the same source link (not card, PR or Linear links).",
   {
     prompt: Schema.String,
     assignToSelf: Schema.optional(
@@ -420,7 +420,16 @@ const PoolSet = tool(
   "pool_set",
   "Set a model pool",
   "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
-  { model: ModelInput, slots: NonNegativeInt },
+  {
+    model: ModelInput,
+    slots: Schema.optional(NonNegativeInt),
+    replaces: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Key of the pool to move to this model's level (board_get pools); its open cards follow. Leave out slots to keep its count.",
+      ),
+    ),
+  },
   { pools: Records },
   { readonly: false },
 );

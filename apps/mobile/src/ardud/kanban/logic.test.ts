@@ -1,9 +1,12 @@
 import type { KanbanAnswer, KanbanBlock } from "@t3tools/contracts";
-import type { StageBoard } from "@t3tools/client-runtime/ardud/kanban";
+import type { BoardColumnPrefs, StageBoard } from "@t3tools/client-runtime/ardud/kanban";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  applyColumnAction,
   boardLayout,
+  columnActionId,
+  parseColumnAction,
   boardTabs,
   choiceView,
   COLUMNS_MIN_WIDTH,
@@ -80,17 +83,108 @@ describe("boardLayout", () => {
 
   it("scrolls the stage columns until five fit beside Needs Owner", () => {
     const narrow = boardLayout(COLUMNS_MIN_WIDTH);
-    expect(narrow).toMatchObject({ kind: "columns", column: 196, scrolls: true });
+    expect(narrow).toMatchObject({ kind: "columns", scrolls: true });
+    if (narrow.kind !== "columns") throw new Error("columns");
+    expect(narrow.columns.todo).toBe(196);
     const wide = boardLayout(1366);
     expect(wide).toMatchObject({ kind: "columns", scrolls: false });
     if (wide.kind !== "columns") throw new Error("columns");
     // Five columns and their gaps fit in what Needs Owner leaves.
-    expect(wide.column * 5 + 4 * 10).toBeLessThanOrEqual(1366 - wide.owner - 16 - 10);
+    const widths = Object.values(wide.columns).reduce((total, width) => total + width, 0);
+    expect(widths + 5 * 10).toBeLessThanOrEqual(1366 - wide.owner - 16);
   });
 
   it("caps the column width on very wide screens", () => {
     const layout = boardLayout(2400);
-    expect(layout).toMatchObject({ kind: "columns", column: 280, scrolls: false });
+    expect(layout).toMatchObject({ kind: "columns", scrolls: false });
+    if (layout.kind !== "columns") throw new Error("columns");
+    expect(layout.columns.working).toBe(280);
+  });
+
+  it("gives no prefs the same numbers as before", () => {
+    const layout = boardLayout(1366);
+    if (layout.kind !== "columns") throw new Error("columns");
+    expect(layout.owner).toBe(264);
+    expect(layout.hidden).toEqual([]);
+    expect(layout.ownerHidden).toBe(false);
+    expect(Object.values(layout.columns).every((width) => width === 207)).toBe(true);
+  });
+
+  it("honours saved widths, clamped to the column range", () => {
+    const layout = boardLayout(1366, {
+      widths: { working: 300, todo: 100 },
+      hidden: [],
+      groupWidth: null,
+    });
+    if (layout.kind !== "columns") throw new Error("columns");
+    // Saved widths clamp to the shared range (140-560): 300 stays, 100 rises to 140.
+    expect(layout.columns.working).toBe(300);
+    expect(layout.columns.todo).toBe(140);
+    expect(layout.columns.needs_review).toBe(207);
+    const capped = boardLayout(1366, { widths: { in_review: 900 }, hidden: [], groupWidth: null });
+    if (capped.kind !== "columns") throw new Error("columns");
+    expect(capped.columns.in_review).toBe(560);
+  });
+
+  it("drops hidden columns and lets the rest reflow", () => {
+    const layout = boardLayout(1366, {
+      widths: {},
+      hidden: ["shipped", "todo"],
+      groupWidth: null,
+    });
+    if (layout.kind !== "columns") throw new Error("columns");
+    expect(layout.hidden).toEqual(["todo", "shipped"]);
+    expect(Object.keys(layout.columns).sort()).toEqual(["in_review", "needs_review", "working"]);
+    expect(layout.scrolls).toBe(false);
+  });
+
+  it("stops scrolling once hiding columns frees the room", () => {
+    const all = boardLayout(1000);
+    expect(all).toMatchObject({ scrolls: true });
+    const fewer = boardLayout(1000, {
+      widths: {},
+      hidden: ["todo", "shipped"],
+      groupWidth: null,
+    });
+    expect(fewer).toMatchObject({ kind: "columns", scrolls: false });
+  });
+
+  it("a hidden Needs Owner gives the rail width", () => {
+    const layout = boardLayout(1366, {
+      widths: {},
+      hidden: ["needs_owner"],
+      groupWidth: null,
+    });
+    if (layout.kind !== "columns") throw new Error("columns");
+    expect(layout.ownerHidden).toBe(true);
+    expect(layout.owner).toBe(36);
+    // The stages get the room the wider pane gave back.
+    expect(Object.values(layout.columns)[0]).toBeGreaterThan(207);
+  });
+});
+
+describe("column menu actions", () => {
+  it("round-trips each action id through the menu", () => {
+    const actions = [
+      { kind: "toggle", key: "shipped" },
+      { kind: "show-all" },
+      { kind: "reset" },
+    ] as const;
+    for (const action of actions) {
+      expect(parseColumnAction(columnActionId(action))).toEqual(action);
+    }
+    expect(parseColumnAction("column:bogus")).toBeNull();
+    expect(parseColumnAction("priority:1")).toBeNull();
+  });
+
+  it("applies one pick to the prefs", () => {
+    const base: BoardColumnPrefs = { widths: { todo: 200 }, hidden: ["shipped"], groupWidth: null };
+    expect(applyColumnAction(base, { kind: "toggle", key: "todo" }).hidden).toEqual([
+      "shipped",
+      "todo",
+    ]);
+    expect(applyColumnAction(base, { kind: "show-all" }).hidden).toEqual([]);
+    expect(applyColumnAction(base, { kind: "reset" }).widths).toEqual({});
   });
 });
 

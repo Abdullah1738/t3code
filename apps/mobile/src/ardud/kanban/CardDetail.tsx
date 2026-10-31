@@ -369,7 +369,7 @@ function CardFacts(props: {
         <DetailRow label="Models">
           {card.models.map((entry) => (
             <KChip
-              key={`${entry.model.instanceId}/${entry.model.model}`}
+              key={`${entry.model.instanceId}/${entry.model.model}#${modelVariant(entry.model) ?? ""}`}
               label={`${modelName(entry.model)} ${entry.weight}`}
             />
           ))}

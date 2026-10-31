@@ -124,7 +124,7 @@ class ExpiryTests(Isolated):
                 patch.object(lease, "_bring_up") as up, patch.object(lease, "pick_template", return_value="crpko-node"):
             row = lease.acquire_private(dict(self.me, owner="pool:repo"))
         self.assertEqual(row["source"], "recipe:crpko-node")
-        self.assertEqual(up.call_args.kwargs, {"fresh": False, "recipe": "crpko-node"})
+        self.assertEqual(up.call_args.kwargs, {"fresh": False, "recipe": "crpko-node", "box_held": True})
         self.assertEqual(lease.natural_size(self.con, row), "large")
         self.con.execute("INSERT INTO pool_members VALUES ('bx_r','repo')")
         self.con.commit()
@@ -544,7 +544,7 @@ class ExpiryTests(Isolated):
         import threading
         closed = threading.Event()
 
-        def endless(box_id, pid, out_off=0, err_off=0):
+        def endless(box_id, pid, out_off=0, err_off=0, **kw):
             n = out_off
             try:
                 while True:

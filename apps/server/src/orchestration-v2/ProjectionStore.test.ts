@@ -8,6 +8,8 @@ import {
   CheckpointScopeId,
   MessageId,
   type ModelSelection,
+  type OrchestrationV2ProviderSession,
+  OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2TurnItem,
   type OrchestrationV2ThreadShellSnapshot,
@@ -30,6 +32,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
@@ -37,6 +40,9 @@ import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EventSink from "./EventSink.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   buildBoundedThreadProjection,
@@ -1221,6 +1227,213 @@ it.effect("memory shell snapshots scope to one project", () =>
     Effect.provide(ProjectionStore.layerMemory),
   ),
 );
+
+it.effect("one shared session update carrier survives SQL rebuild and memory replay", () => {
+  const database = SqlitePersistence.layerMemory;
+  const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
+    Layer.provideMerge(database),
+  );
+  const isolated = Layer.mergeAll(EventSink.layer, ProjectionMaintenance.layer).pipe(
+    Layer.provideMerge(stores),
+  );
+  return Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const events = yield* EventStore.EventStoreV2;
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const sql = yield* SqlClient.SqlClient;
+    const createdAt = DateTime.makeUnsafe("2026-10-30T12:00:00.000Z");
+    const updatedAt = DateTime.add(createdAt, { minutes: 1 });
+    const boundThreadIds = Array.from({ length: 16 }, (_, index) =>
+      ThreadId.make(`thread:session-carrier:${String(index).padStart(2, "0")}`),
+    );
+    const unboundThreadId = ThreadId.make("thread:session-carrier:unbound");
+    const threadIds = [...boundThreadIds, unboundThreadId];
+    const session: OrchestrationV2ProviderSession = {
+      id: ProviderSessionId.make("session:single-carrier"),
+      driver: ProviderDriverKind.make("opencode"),
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      status: "ready",
+      cwd: "/workspace/carrier-replay",
+      model: "gpt-6-astra",
+      capabilities: {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsMultipleProviderThreadsPerSession: true,
+        },
+      },
+      createdAt,
+      updatedAt: createdAt,
+      lastError: null,
+    };
+    for (const threadId of threadIds) {
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${threadId}:created`),
+            type: "thread.created",
+            threadId,
+            occurredAt: createdAt,
+            payload: {
+              id: threadId,
+              projectId: ProjectId.make("project:session-carrier"),
+              title: threadId,
+              providerInstanceId: session.providerInstanceId,
+              modelSelection: { instanceId: session.providerInstanceId, model: session.model! },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt,
+              updatedAt: createdAt,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          },
+        ],
+      });
+      if (threadId !== unboundThreadId) {
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`event:${threadId}:attached`),
+              type: "provider-session.attached",
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: createdAt,
+              payload: session,
+            },
+          ],
+        });
+      }
+    }
+    const readBindings = sql<{
+      readonly provider_session_id: string;
+      readonly thread_id: string;
+    }>`SELECT provider_session_id, thread_id
+      FROM orchestration_v2_projection_provider_session_bindings
+      ORDER BY thread_id, provider_session_id`;
+    const bindings = yield* readBindings;
+    assert.deepEqual(
+      bindings,
+      boundThreadIds.map((threadId) => ({
+        provider_session_id: session.id,
+        thread_id: threadId,
+      })),
+    );
+    const heads = yield* Effect.forEach(threadIds, (threadId) =>
+      events.latestSequence({ threadId }),
+    );
+    const previousHead = yield* events.latestSequence();
+    const running = { ...session, status: "running" as const, updatedAt };
+    const committed = yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:session-carrier:running"),
+          type: "provider-session.updated",
+          threadId: boundThreadIds[0]!,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: updatedAt,
+          payload: running,
+        },
+      ],
+    });
+    assert.lengthOf(committed, 1);
+    const carrier = committed[0]!;
+    assert.isAbove(carrier.sequence, previousHead);
+    assert.equal(carrier.event.threadId, boundThreadIds[0]);
+    assert.deepEqual(
+      yield* events.read({ afterSequence: previousHead }).pipe(Stream.runCollect),
+      committed,
+    );
+    for (const [index, threadId] of threadIds.entries()) {
+      assert.equal(
+        yield* events.latestSequence({ threadId }),
+        index === 0 ? carrier.sequence : heads[index],
+      );
+    }
+
+    const readBoundSessions = (projectionStore: ProjectionStore.ProjectionStoreV2Shape) =>
+      Effect.forEach(threadIds, (threadId) =>
+        projectionStore
+          .getThreadRecords(threadId, ["providerSessions"])
+          .pipe(Effect.map((records) => ({ threadId, sessions: records.providerSessions }))),
+      );
+    const expected = threadIds.map((threadId) => ({
+      threadId,
+      sessions: threadId === unboundThreadId ? [] : [running],
+    }));
+    const sqlSessions = yield* readBoundSessions(store);
+    assert.deepEqual(sqlSessions, expected);
+    assert.deepEqual(yield* readBindings, bindings);
+    const decodeSession = Schema.decodeUnknownEffect(
+      Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+    );
+    const canonicalRows = yield* sql<{ readonly payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_provider_sessions
+      ORDER BY provider_session_id`;
+    assert.deepEqual(
+      yield* Effect.forEach(canonicalRows, (row) => decodeSession(row.payload_json)),
+      [running],
+    );
+
+    const wholeLog = yield* events.read().pipe(Stream.runCollect);
+    assert.lengthOf(wholeLog, boundThreadIds.length * 2 + 2);
+    assert.deepEqual(
+      wholeLog.filter((stored) => stored.event.type === "provider-session.updated"),
+      committed,
+    );
+    const memorySessions = yield* Effect.gen(function* () {
+      const memory = yield* ProjectionStore.ProjectionStoreV2;
+      for (const stored of wholeLog) yield* memory.apply(stored.event);
+      return yield* readBoundSessions(memory);
+    }).pipe(Effect.provide(ProjectionStore.layerMemory));
+    assert.deepEqual(memorySessions, sqlSessions);
+    assert.deepEqual(
+      memorySessions.flatMap(({ threadId, sessions }) =>
+        sessions.map((value) => ({
+          provider_session_id: value.id,
+          thread_id: threadId,
+        })),
+      ),
+      bindings,
+    );
+
+    // Remove one binding so a no-op maintenance call cannot pass as a rebuild.
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings
+      WHERE thread_id = ${boundThreadIds.at(-1)!}`;
+    assert.lengthOf(yield* readBindings, boundThreadIds.length - 1);
+    const rebuilt = yield* maintenance.rebuild;
+    assert.deepEqual(rebuilt, {
+      valid: true,
+      schemaVersion: ProjectionStore.ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+      expectedSequence: carrier.sequence,
+      projectionSequence: carrier.sequence,
+      unreadableThreadIds: [],
+      missingThreadIds: [],
+      unexpectedThreadIds: [],
+    });
+    assert.deepEqual(yield* readBoundSessions(store), memorySessions);
+    assert.deepEqual(yield* readBindings, bindings);
+    assert.deepEqual(
+      yield* sql`SELECT payload_json FROM orchestration_v2_projection_provider_sessions
+        ORDER BY provider_session_id`,
+      canonicalRows,
+    );
+    assert.deepEqual(yield* events.read().pipe(Stream.runCollect), wholeLog);
+  }).pipe(Effect.provide(isolated));
+});
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect("returns a typed read error for malformed stored plan JSON", () =>
@@ -6828,3 +7041,297 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 });
+
+const prCandidateShellSelectionBody = (label: string, sql: SqlClient.SqlClient | null) =>
+  Effect.gen(function* () {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const projectId = ProjectId.make("project:pr-candidates");
+    const threadIds = {
+      branchOnly: ThreadId.make("thread:pr-candidates:branch-only"),
+      prOnly: ThreadId.make("thread:pr-candidates:pr-only"),
+      neither: ThreadId.make("thread:pr-candidates:neither"),
+      archivedBranch: ThreadId.make("thread:pr-candidates:archived-branch"),
+      settledBranch: ThreadId.make("thread:pr-candidates:settled-branch"),
+      forkSource: ThreadId.make("thread:pr-candidates:fork-source"),
+      forkCandidate: ThreadId.make("thread:pr-candidates:fork-candidate"),
+    } as const;
+    const runId = RunId.make("run:pr-candidates:fork-source");
+    const rootNodeId = NodeId.make("node:pr-candidates:fork-source");
+    const pullRequest = {
+      projectId,
+      repository: "example/repo",
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+    };
+
+    const created = (threadId: ThreadId, overrides: Record<string, unknown> = {}) =>
+      projectionStore.apply({
+        id: EventId.make(`event:pr-candidates:${label}:${threadId}`),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId,
+          title: threadId,
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+          ...overrides,
+        } as never,
+      });
+
+    yield* created(threadIds.branchOnly, { branch: "feature/a" });
+    yield* created(threadIds.prOnly, { branchPullRequest: pullRequest });
+    yield* created(threadIds.neither);
+    yield* created(threadIds.archivedBranch, { branch: "feature/archived", archivedAt: now });
+    yield* created(threadIds.settledBranch, {
+      branch: "feature/settled",
+      settledOverride: "settled",
+      settledAt: now,
+    });
+    yield* created(threadIds.forkSource);
+    yield* created(threadIds.forkCandidate, {
+      branch: "feature/fork",
+      forkedFrom: { type: "run", threadId: threadIds.forkSource, runId },
+      lineage: {
+        parentThreadId: threadIds.forkSource,
+        relationshipToParent: "fork",
+        rootThreadId: threadIds.forkSource,
+      },
+    });
+    yield* projectionStore.apply({
+      id: EventId.make(`event:pr-candidates:${label}:fork-source-run`),
+      type: "run.created",
+      threadId: threadIds.forkSource,
+      runId,
+      nodeId: rootNodeId,
+      driver,
+      occurredAt: now,
+      payload: {
+        id: runId,
+        threadId: threadIds.forkSource,
+        ordinal: 1,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:pr-candidates:${label}:fork-source`),
+        rootNodeId,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    } as never);
+    // Inherited fork items on the source: one runless imported item and one native-run item.
+    const applySourceItem = (suffix: string, itemRunId: RunId | null, ordinal: number) =>
+      projectionStore.apply({
+        id: EventId.make(`event:pr-candidates:${label}:item:${suffix}`),
+        type: "turn-item.updated",
+        threadId: threadIds.forkSource,
+        ...(itemRunId === null ? {} : { runId: itemRunId }),
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`turn-item:pr-candidates:${label}:${suffix}`),
+          threadId: threadIds.forkSource,
+          runId: itemRunId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "assistant_message",
+          messageId: MessageId.make(`message:pr-candidates:${label}:${suffix}`),
+          text: suffix,
+          streaming: false,
+        },
+      } as never);
+    yield* applySourceItem("imported", null, 1);
+    yield* applySourceItem("native", runId, 2);
+
+    const ids = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
+      threads.map((thread) => thread.id).toSorted();
+
+    const defaultSnapshot = yield* projectionStore.getShellSnapshot();
+    if (sql !== null) {
+      const readDefault = yield* yield* sql.withTransaction(projectionStore.readShellSnapshot());
+      assert.deepEqual(ids(readDefault.threads), ids(defaultSnapshot.threads));
+    }
+    assert.isTrue(defaultSnapshot.threads.some((thread) => thread.id === threadIds.neither));
+
+    for (const unsettledOnly of [false, true]) {
+      const unfiltered = yield* projectionStore.getShellSnapshot({
+        location: "active",
+        unsettledOnly,
+      });
+      const filtered = yield* projectionStore.getShellSnapshot({
+        location: "active",
+        unsettledOnly,
+        pullRequestCandidatesOnly: true,
+      });
+      const expected = unfiltered.threads.filter(
+        (thread) => thread.branch !== null || thread.branchPullRequest != null,
+      );
+      assert.deepEqual(ids(filtered.threads), ids(expected));
+      assert.strictEqual(filtered.snapshotSequence, unfiltered.snapshotSequence);
+      for (const expectedThread of expected) {
+        const retained = filtered.threads.find((thread) => thread.id === expectedThread.id);
+        assert.deepEqual(retained, expectedThread);
+      }
+      const forkFiltered = filtered.threads.find((thread) => thread.id === threadIds.forkCandidate);
+      const forkUnfiltered = unfiltered.threads.find(
+        (thread) => thread.id === threadIds.forkCandidate,
+      );
+      assert.isDefined(forkUnfiltered);
+      assert.strictEqual(forkFiltered?.itemCount, forkUnfiltered?.itemCount);
+      assert.strictEqual(forkFiltered?.visibleItemCount, forkUnfiltered?.visibleItemCount);
+      assert.isAbove(forkFiltered!.visibleItemCount, 0);
+    }
+
+    if (sql !== null) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* projectionStore
+        .getShellSnapshot({ location: "active", pullRequestCandidatesOnly: true })
+        .pipe(Effect.withTracer(tracer));
+      const outerEligibility = statements.filter(
+        (statement) =>
+          statement.includes("FROM orchestration_v2_projection_threads") &&
+          statement.includes("'$.branchPullRequest'"),
+      );
+      assert.isAtLeast(outerEligibility.length, 1);
+      assert.lengthOf(
+        statements.filter((statement) => /WHERE t\.thread_id = \?/.test(statement)),
+        0,
+      );
+
+      const unflaggedTrace = traceSqlStatements();
+      yield* projectionStore
+        .getShellSnapshot({ location: "active" })
+        .pipe(Effect.withTracer(unflaggedTrace.tracer));
+      assert.lengthOf(
+        unflaggedTrace.statements.filter((statement) =>
+          statement.includes("'$.branchPullRequest'"),
+        ),
+        0,
+      );
+
+      const [stored] = yield* sql<{ readonly payload_json: string }>`
+            SELECT payload_json FROM orchestration_v2_projection_threads
+            WHERE thread_id = ${threadIds.neither}
+          `;
+      yield* sql`UPDATE orchestration_v2_projection_threads
+            SET payload_json = json_set(payload_json, '$.title', 123)
+            WHERE thread_id = ${threadIds.neither}`;
+      const filteredRead = yield* sql
+        .withTransaction(
+          projectionStore.readShellSnapshot({
+            location: "active",
+            pullRequestCandidatesOnly: true,
+          }),
+        )
+        .pipe(
+          Effect.flatMap((decode) => decode),
+          Effect.exit,
+        );
+      const unfilteredRead = yield* sql
+        .withTransaction(projectionStore.readShellSnapshot({ location: "active" }))
+        .pipe(
+          Effect.flatMap((decode) => decode),
+          Effect.exit,
+        );
+      yield* sql`UPDATE orchestration_v2_projection_threads
+            SET payload_json = ${stored!.payload_json}
+            WHERE thread_id = ${threadIds.neither}`;
+      assert.isTrue(filteredRead._tag === "Success");
+      assert.isTrue(unfilteredRead._tag === "Failure");
+    }
+  });
+
+it.effect("memory PR candidate shell selection preserves default snapshots and fork counts", () =>
+  prCandidateShellSelectionBody("memory", null).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("SQL PR candidate shell selection preserves default snapshots and fork counts", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    return yield* prCandidateShellSelectionBody("SQL", sql);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("latest authored timestamp follows message replacement and removal", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = "thread:authored-replacement";
+    const oldSelect = (indexed: boolean) => `
+      SELECT message.updated_at
+      FROM orchestration_v2_projection_messages message${indexed ? " INDEXED BY ardud_v2_messages_latest_user_authored_idx" : ""}
+      WHERE message.thread_id = ?
+        AND message.role = 'user'
+        AND json_extract(message.payload_json, '$.createdBy') = 'user'
+      ORDER BY message.updated_at DESC, message.message_id DESC
+      LIMIT 1`;
+    const readBoth = Effect.gen(function* () {
+      const exact = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(false), [
+        threadId,
+      ]);
+      const indexed = yield* sql.unsafe<{ readonly updated_at: string }>(oldSelect(true), [
+        threadId,
+      ]);
+      assert.deepEqual(indexed, exact);
+      return exact[0]?.updated_at ?? null;
+    });
+    const insert = (id: string, role: string, createdBy: string | null, at: string) =>
+      sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, NULL, NULL, ${role}, 0, ${at}, ${at},
+          ${createdBy === null ? "{}" : JSON.stringify({ createdBy })})`;
+
+    yield* insert("m:user-system", "user", "system", "2026-03-01T00:00:00.000Z");
+    yield* insert("m:assistant-user", "assistant", "user", "2026-03-02T00:00:00.000Z");
+    yield* insert("m:missing", "user", null, "2026-03-03T00:00:00.000Z");
+    yield* insert("m:genuine", "user", "user", "2026-03-04T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-04T00:00:00.000Z");
+
+    yield* sql`UPDATE orchestration_v2_projection_messages SET updated_at = ${"2026-03-09T00:00:00.000Z"}
+      WHERE message_id = ${"m:genuine"}`;
+    assert.equal(yield* readBoth, "2026-03-09T00:00:00.000Z");
+
+    yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${"m:genuine"}`;
+    assert.isNull(yield* readBoth);
+
+    yield* insert("m:genuine-a", "user", "user", "2026-03-05T00:00:00.000Z");
+    yield* insert("m:genuine-b", "user", "user", "2026-03-05T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-05T00:00:00.000Z");
+
+    yield* sql`BEGIN`;
+    yield* insert("m:speculative", "user", "user", "2026-03-20T00:00:00.000Z");
+    assert.equal(yield* readBoth, "2026-03-20T00:00:00.000Z");
+    yield* sql`ROLLBACK`;
+    assert.equal(yield* readBoth, "2026-03-05T00:00:00.000Z");
+  }).pipe(Effect.provide(layerTest)),
+);

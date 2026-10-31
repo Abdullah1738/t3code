@@ -228,7 +228,11 @@ class MonitorTests(unittest.TestCase):
             fake.write_text("#!/bin/zsh\nprint -r -- fake-real-docker \"$@\"\n")
             fake.chmod(0o755)
             shim = Path(monitor.__file__).parent / "blockers/docker"
-            env = dict(os.environ, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
+            # The shim only enforces when offbox is installed (~/.local/bin/offbox); give it a home that has one.
+            (root / ".local/bin").mkdir(parents=True)
+            (root / ".local/bin/offbox").write_text("#!/bin/sh\n")
+            (root / ".local/bin/offbox").chmod(0o755)
+            env = dict(os.environ, HOME=directory, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
                        OPENCODE_SESSION_ID="ses_test", OFFBOX_STATE_DIR=directory, OFFBOX_GATE_MODE="enforce")
             for expiry, expected in (("2030-01-01T00:00:00Z", 0), ("2000-01-01T00:00:00Z", 3)):
                 (root / "exemptions.json").write_text(json.dumps([{"session_id": "ses_test", "expires_at": expiry}]))

@@ -7,6 +7,9 @@ import commerce_receipts as receipts
 import noon_marketplace_checkout as market
 
 NO_CAPTURE = "Your payment was not captured by noon, so you won't be charged."
+# A 3DS/approval timeout (31 Oct) reports status failed with this message and
+# paymentError/paymentErrorMsg null; the refund proof below still applies.
+PAYMENT_TIMED_OUT = 'Payment timed out'
 
 
 def failed_evidence(status, detail, refund, order, amount):
@@ -14,7 +17,9 @@ def failed_evidence(status, detail, refund, order, amount):
         if not ok:
             journal.fail('MARKETPLACE_NO_CHARGE_UNPROVEN')
 
-    require(status.get('status') == 'failed' and bool(status.get('paymentError')))
+    require(status.get('status') == 'failed'
+            and (bool(status.get('paymentError')) or bool(status.get('paymentErrorMsg'))
+                 or status.get('statusMessage') == PAYMENT_TIMED_OUT))
     require(detail.get('orderNr') == order and detail.get('paymentMethodCode') == 'cc_noonpay')
     groups = detail.get('itemGroups')
     require(isinstance(groups, list) and bool(groups))

@@ -14,6 +14,7 @@ import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -21,6 +22,7 @@ import * as Fiber from "effect/Fiber";
 import * as Ref from "effect/Ref";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 
@@ -412,5 +414,115 @@ it.effect("automatic pull only updates enabled, behind, clean default-branch che
       { ...overrides({ "/opted-out": false }), defaultAutoPull: true },
     ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git));
     assert.deepStrictEqual(pulled, ["/inherited"]);
+  }),
+);
+
+class HeartbeatProjectionError extends Schema.TaggedError<HeartbeatProjectionError>()(
+  "HeartbeatProjectionError",
+  {},
+) {}
+
+const heartbeatDependencies = (options: {
+  readonly projectsFail?: boolean;
+  readonly projectCount?: number;
+  readonly active?: number;
+  readonly archived?: number;
+  readonly records: Array<{ event: string; properties: unknown }>;
+  readonly snapshotCalls: { count: number };
+}) =>
+  Layer.mergeAll(
+    Layer.mock(AnalyticsService.AnalyticsService)({
+      record: (event: string, properties: unknown) =>
+        Effect.sync(() => {
+          options.records.push({ event, properties });
+        }),
+    } as never),
+    Layer.mock(ProjectService.ProjectService)({
+      snapshot: options.projectsFail
+        ? Effect.fail(new HeartbeatProjectionError())
+        : Effect.sync(() => {
+            options.snapshotCalls.count += 1;
+            return {
+              projects: Array.from({ length: options.projectCount ?? 2 }, (_, index) => ({
+                id: ProjectId.make(`heartbeat-project-${index}`),
+              })),
+            };
+          }),
+    } as never),
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      getShellSnapshot: () =>
+        Effect.sync(() => {
+          options.snapshotCalls.count += 1;
+          return {
+            threads: Array.from({ length: options.active ?? 0 }, (_, index) => ({
+              id: `active-${index}`,
+            })),
+            archivedThreads: Array.from({ length: options.archived ?? 0 }, (_, index) => ({
+              id: `archived-${index}`,
+            })),
+            schemaVersion: 1,
+            snapshotSequence: 0,
+          };
+        }),
+    } as never),
+  );
+
+const runHeartbeat = (
+  config: Record<string, string>,
+  options: Parameters<typeof heartbeatDependencies>[0],
+) =>
+  ServerRuntimeStartup.recordStartupHeartbeat.pipe(
+    Effect.provide(
+      heartbeatDependencies(options).pipe(
+        Layer.provideMerge(ConfigProvider.layer(ConfigProvider.fromUnknown(config))),
+      ),
+    ),
+  );
+
+it.effect(
+  "disabled startup telemetry skips snapshots while enabled telemetry keeps counts and fallback",
+  () =>
+    Effect.gen(function* () {
+      for (const config of [{}, { T3CODE_TELEMETRY_ENABLED: "false" }]) {
+        const records: Array<{ event: string; properties: unknown }> = [];
+        const snapshotCalls = { count: 0 };
+        yield* runHeartbeat(config, {
+          records,
+          snapshotCalls,
+          active: 3,
+          archived: 4,
+        });
+        assert.equal(snapshotCalls.count, 0);
+        assert.deepEqual(records, []);
+      }
+    }),
+);
+
+it.effect("enabled startup telemetry records thread and project counts", () =>
+  Effect.gen(function* () {
+    const records: Array<{ event: string; properties: unknown }> = [];
+    const snapshotCalls = { count: 0 };
+    yield* runHeartbeat(
+      { T3CODE_TELEMETRY_ENABLED: "true" },
+      { records, snapshotCalls, projectCount: 2, active: 3, archived: 4 },
+    );
+    assert.equal(snapshotCalls.count, 2);
+    assert.deepEqual(records, [
+      { event: "server.boot.heartbeat", properties: { threadCount: 7, projectCount: 2 } },
+    ]);
+  }),
+);
+
+it.effect("enabled startup telemetry records zero counts when projection fails", () =>
+  Effect.gen(function* () {
+    const records: Array<{ event: string; properties: unknown }> = [];
+    const snapshotCalls = { count: 0 };
+    yield* runHeartbeat(
+      { T3CODE_TELEMETRY_ENABLED: "true" },
+      { records, snapshotCalls, projectsFail: true, active: 3, archived: 4 },
+    );
+    assert.deepEqual(records, [
+      { event: "server.boot.heartbeat", properties: { threadCount: 0, projectCount: 0 } },
+    ]);
   }),
 );

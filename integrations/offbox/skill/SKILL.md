@@ -23,7 +23,8 @@ offbox run --size xlarge -- make test-integration
 ```
 
 offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
-gitignored files, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent), `cd`s into the same relative
+gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
+file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
 **Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
@@ -121,12 +122,12 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 | Flag | Use |
 |---|---|
 | `--size S` / `--template T` | machine size / template for a new lease |
-| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. |
+| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. Box runs also get AWS_EC2_METADATA_DISABLED=true (boxes have no AWS metadata service); `--env AWS_EC2_METADATA_DISABLED=false` turns it off. Other AWS_*, tokens and keys are **never** forwarded unless you name them. For a secret, export it and pass the name only (`export LOCALSTACK_AUTH_TOKEN=...; offbox run --env LOCALSTACK_AUTH_TOKEN ...`): a `NAME=value` value sits on offbox's command line, where ps and transcripts see it (offbox.log keeps only the name). |
 | `--pull PATH` | copy an artifact back after the run (coverage.out, junit.xml, `test-results/`), relative to your cwd |
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
-| `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
+| `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id>` (exits with its code, does `--pull`) |
+| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
@@ -134,6 +135,10 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+`offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
+its end and returns its code. `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
+On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
+If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -210,11 +215,19 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **92** = every pool box stayed busy for the whole queue wait (or other runs held the pool's lock that long). Nothing
+  ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
+- **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
   semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.
+- **90 + "boat.dev is down (HTTP 525 since HH:MM, waited Ns); nothing ran"** = boat's own API was unreachable
+  (Cloudflare 520-526 or no answer), not your box. Before a run starts, offbox waits up to 600 s for it to come back
+  (`OFFBOX_OUTAGE_WAIT_SECONDS`, max 1800), prints a line every minute and retries by itself. Small commands that may
+  fall back locally don't wait. A run that already started keeps reattaching for up to 30 min of outage and keeps its
+  box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
+  shows `boat.dev: DOWN since ...` during one.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
@@ -230,9 +243,13 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
 - A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
+- Sync fails with rsync 23 `delete_file: unlink(...) failed: Permission denied (13)`: a container wrote root-owned files into the checkout on the box (LocalStack's `tmp/localstack`). offbox gives them back to the box user (`sudo chown -R`) and syncs once more by itself. If that fails too it exits 90 before your command and names the `offbox ssh <box> -- sudo chown ...` to run.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
-- Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
-  `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+- Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
+  ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+  Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
+  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
+  lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.

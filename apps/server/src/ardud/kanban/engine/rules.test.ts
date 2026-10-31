@@ -23,9 +23,12 @@ import {
   isOutage,
   MAX_BATCH,
   maskDownPools,
+  modelKey,
+  modelLevel,
   modelOnPool,
   nextProbeDelay,
   planDispatch,
+  poolFor,
   poolKey,
   prsLanded,
   relatedCandidates,
@@ -932,6 +935,18 @@ describe("isContextFull", () => {
     expect(
       isContextFull({ message: "This model's maximum context length is 200000 tokens" }),
     ).toBe(true);
+    expect(
+      isContextFull({
+        message:
+          "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.",
+      }),
+    ).toBe(true);
+    expect(
+      isContextFull({
+        message:
+          "The request leaves too little context for a provider handoff. Shorten the request or use a larger-context model; the current request has not been truncated.",
+      }),
+    ).toBe(true);
   });
 
   it("leaves model, variant and empty failures alone", () => {
@@ -970,6 +985,13 @@ describe("isOutage", () => {
         message: "OAuth access token has expired",
       }),
     ).toBe(true);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Timed out waiting for response headers",
+      }),
+    ).toBe(true);
   });
 
   it("keeps request, model and content failures on the flag path", () => {
@@ -978,6 +1000,13 @@ describe("isOutage", () => {
         class: "provider_error",
         code: "provider.invalid-request",
         message: "prompt is too long: 1200000 tokens > 1000000 maximum",
+      }),
+    ).toBe(false);
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Request timed out while reading tool output",
       }),
     ).toBe(false);
     expect(
@@ -1018,5 +1047,81 @@ describe("probe backoff and pool masking", () => {
     ] as unknown as ReadonlyArray<KanbanPool>;
     const masked = maskDownPools(pools, new Set(["opencode/opus/claude-opus-5-5"]));
     expect(masked.map((pool) => pool.slots)).toEqual([0, 1]);
+  });
+
+  it("zeroes every level of a down model", () => {
+    const high = { ...opus, options: [{ id: "variant", value: "high" }] } as ModelSelection;
+    const max = { ...opus, options: [{ id: "variant", value: "max" }] } as ModelSelection;
+    const masked = maskDownPools(
+      pools([
+        [high, 2],
+        [max, 3],
+        [sol, 1],
+      ]),
+      new Set([modelKey(opus)]),
+    );
+    expect(masked.map((pool) => pool.slots)).toEqual([0, 0, 1]);
+  });
+});
+
+describe("pool levels", () => {
+  const at = (m: ModelSelection, level: string): ModelSelection => ({
+    ...m,
+    options: [{ id: "variant", value: level }],
+  });
+
+  it("keys a pool by model and level, and leaves a model with no level as it was", () => {
+    expect(poolKey(haiku)).toBe("opencode/opus/cc/claude-haiku-5-5");
+    expect(poolKey(at(haiku, "max"))).toBe("opencode/opus/cc/claude-haiku-5-5#max");
+    expect(modelKey(at(haiku, "max"))).toBe("opencode/opus/cc/claude-haiku-5-5");
+    expect(modelLevel(at(haiku, "max"))).toBe("max");
+    expect(modelLevel(haiku)).toBeNull();
+  });
+
+  it("finds the exact level's pool, else the model's first pool", () => {
+    const all = pools([
+      [at(haiku, "max"), 3],
+      [at(haiku, "xhigh"), 1],
+      [opus, 1],
+    ]);
+    expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
+    expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
+    expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
+    expect(poolFor(all, at(opus, "high"))?.key).toBe(poolKey(opus));
+    expect(poolFor(all, sol)).toBeUndefined();
+  });
+
+  it("runs each level's cards on its own pool, and a card at an unpooled level on the model's first", () => {
+    const max = at(haiku, "max");
+    const xhigh = at(haiku, "xhigh");
+    const all = pools([
+      [max, 1],
+      [xhigh, 1],
+    ]);
+    const plan = planDispatch(
+      board,
+      [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
+      all,
+    );
+    // The low card would run on max (the first Haiku pool), but max's one slot is taken.
+    expect(plan.map((d) => d.pool)).toEqual([poolKey(xhigh), poolKey(max)]);
+    const alone = planDispatch(board, [card({ model: at(haiku, "low") })], all);
+    expect(alone.map((d) => d.pool)).toEqual([poolKey(max)]);
+  });
+
+  it("lets a thread claim a card whose level runs on the thread's pool", () => {
+    const max = at(haiku, "max");
+    const c = card({ model: at(haiku, "low") });
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(max),
+      projectId: null,
+      byId: new Map([[c.id as string, c]]),
+      carrying: 0,
+      slots: 1,
+    };
+    expect(checkClaim(board, c, ctx).ok).toBe(false);
+    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(true);
+    expect(modelOnPool(c, poolKey(max), pools([[max, 1]]))).toEqual(c.model);
   });
 });

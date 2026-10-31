@@ -210,7 +210,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
 export const NEW_CHAT_NUDGE = [
   "[Bridge request, not typed by the owner.] The owner sent /new and has already been told \"Fresh start. What's up?\".",
   "Call t3_context_reset (the T3 Code MCP tool) now with exactly this note: \"iMessage chat with the owner. They asked for a fresh start, so nothing from before carries over. Reply exactly NO_REPLY to this note and wait for their next message.\"",
-  "If the tool refuses, reply with one short line telling the owner why the fresh start has to wait. Otherwise end with exactly NO_REPLY.",
+  "If the tool refuses, reply with one short line telling the owner the fresh start happens once the running work finishes. Don't call t3_context_reset again for this /new: the bridge asks again when it's safe. Otherwise end with exactly NO_REPLY.",
 ].join("\n");
 /** Asks the agent to hand its context off to a fresh one, invisibly. */
 export const ROTATE_NUDGE = [
@@ -239,6 +239,8 @@ const STATUS_LIST_MS = 10_000;
  */
 const FAILURE_NOTICE_GRACE = 5 * 60_000;
 type DeferredNotice = { turn: Turn; text: string; at: number };
+/** A /new the agent refused because background work ran: asked again once the chat is idle and nothing happened since. */
+type NewDeferred = { generation: number; since: number; outbox: number };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const MiB = 1024 * 1024;
 /** imsg lookups, a Messages iCloud download of up to 90 seconds, and the copy. */
@@ -773,6 +775,7 @@ export class Router {
       for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row);
       await this.watch();
       await this.nudgeDue();
+      await this.nudgeDeferredNew();
       this.flushNotice();
       this.flushDropped();
       if (this.isGroup()) await this.gateGroup();
@@ -799,6 +802,7 @@ export class Router {
 
   private sealBatch(handled: Set<string>): InboundRecord | undefined {
     return this.store.db.transaction(() => {
+      this.cancelQueuedNew();
       const rows = this.store.pendingInbound();
       const now = Date.now();
       let latestReceivedAt = 0;
@@ -1172,10 +1176,166 @@ export class Router {
       && this.threadAge(route) < (this.options.resetChatForMs ?? RESET_CHAT_FOR);
   }
 
-  /** Queues a reset nudge for the route's agent. Call inside a transaction. */
-  private nudgeReset(route: Route, text: string): void {
+  /**
+   * Whether the owner was sent anything in this generation after the outbox
+   * row `since`: a reply, a direct /send, /files, /app or /poll. Each is a
+   * conversation outbox row; a wake's own result sent before NO_REPLY counts too.
+   */
+  private sentSince(generation: number, since: number): boolean {
+    // `generation` is the last key when no optional field follows it, so both forms are matched.
+    return this.store.db.query<{ one: number }, [number, string, string]>(
+      `SELECT 1 AS one FROM outbox WHERE rowid > ? AND state IN ('pending', 'sending', 'sent', 'uncertain')
+        AND payload LIKE '%"kind":"conversation"%' AND (payload LIKE ? OR payload LIKE ?) LIMIT 1`,
+    ).get(since, `%"generation":${generation},%`, `%"generation":${generation}}`) !== null;
+  }
+
+  /** The outbox rowid a deferred /new is measured from. Call after the refusal reply is queued. */
+  private outboxMark(): number {
+    return this.store.db.query<{ mark: number }, []>("SELECT COALESCE(MAX(rowid), 0) AS mark FROM outbox").get()?.mark ?? 0;
+  }
+
+  /** The insertion order of an inbound row: the baseline a deferred /new is measured from. */
+  private rowidOf(id: string): number {
+    return this.store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM inbound WHERE id = ?").get(id)?.rowid ?? 0;
+  }
+
+  /**
+   * Whether someone other than the bridge wrote in the chat after a deferred /new
+   * was refused. Rows the bridge itself injects (wakes, resets, secret notices)
+   * don't count, and neither does anything older than the refusal.
+   */
+  private movedOn(since: number): boolean {
+    return this.store.db.query<{ one: number }, [number]>(`SELECT 1 AS one FROM inbound WHERE rowid > ?
+      AND id NOT LIKE 'wake:%' AND id NOT LIKE 'reset:%' AND id NOT LIKE 'secret:%' LIMIT 1`).get(since) !== null;
+  }
+
+  /**
+   * Cancels a deferred reset nudge already queued but not yet POSTed, when the
+   * conversation moved on in the meantime (owner text, or any reply or direct
+   * send after the deferral). Runs before the batch is sealed, so the queued
+   * reset can never jump ahead of text that arrived in the gap.
+   */
+  private cancelQueuedNew(): void {
+    const queued = this.store.get<{ id: string; since: number } | null>("newQueued");
+    if (!queued) return;
+    const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(queued.id);
+    if (!row || row.state !== "pending") {
+      // Already POSTed (or retired): the deferral is consumed.
+      this.store.set("newQueued", null);
+      return;
+    }
+    this.dropQueuedNewIfMovedOn();
+  }
+
+  /**
+   * Cancels a queued deferred reset when the conversation moved on since the
+   * deferral was recorded. Returns true when it did. Called at the batch seal
+   * and again inside the final pre-POST transaction, so an arrival during
+   * preparation (awaited status or config reads) is never missed. Call inside a transaction.
+   */
+  private dropQueuedNewIfMovedOn(): boolean {
+    const queued = this.store.get<{ id: string; since: number } | null>("newQueued");
+    if (!queued) return false;
+    const deferred = this.store.get<NewDeferred | null>("newDeferred");
+    if (!this.movedOn(queued.since) && !(deferred && this.sentSince(deferred.generation, deferred.outbox))) return false;
+    this.store.updateInbound(queued.id, "cancelled");
+    this.clearDeferredNew();
+    this.options.log?.("context-reset-dropped", "moved-on");
+    return true;
+  }
+
+  /** Forgets the deferred /new and its queued retry: consumed, superseded, or moved on. Call inside a transaction. */
+  private clearDeferredNew(): void {
+    this.store.set("newQueued", null);
+    this.store.set("newDeferred", null);
+  }
+
+  /**
+   * A /new the agent refused (background work running) is asked again only when
+   * nothing happened since: the chat is idle for the reset window, no work is
+   * running, and the same context is still current. Asked once per deferral.
+   */
+  private async nudgeDeferredNew(): Promise<void> {
+    const deferred = this.store.get<NewDeferred | null>("newDeferred");
+    const route = this.store.get<Route | null>("route");
+    if (!deferred || !route) return;
+    if (route.generation !== deferred.generation || this.movedOn(deferred.since)) {
+      this.store.set("newDeferred", null);
+      this.options.log?.("context-reset-dropped", "moved-on");
+      return;
+    }
+    if (!this.resetsInPlace(route)) return;
+    const turn = this.store.get<Turn | null>("activeTurn");
+    if (turn && turn.phase !== "failed" && this.current(turn)) return;
+    if (this.store.pendingInbound().length) return;
+    const settledAt = this.store.get<number>("settledAt");
+    if (settledAt === undefined || Date.now() - settledAt < (this.options.resetIdleMs ?? RESET_IDLE)) return;
+    // The route itself is idle, but a background child of its family may still be running
+    // (the root can wait while its subagent works), so the refusal would just repeat.
+    if (await this.familyBusy(route)) return;
+    const nudged = this.store.db.transaction(() => {
+      if (!this.current(route) || this.store.pendingInbound().length) return false;
+      if (this.store.get<NewDeferred | null>("newDeferred")?.since !== deferred.since) return false;
+      if (this.movedOn(deferred.since)) return false;
+      const turn = this.store.get<Turn | null>("activeTurn");
+      if (turn && turn.phase !== "failed" && this.current(turn)) return false;
+      // The deferral stays set until the reset is POSTed: owner text in that gap cancels the queued nudge.
+      this.store.set("newNudge", this.nudgeReset(route, NEW_CHAT_NUDGE));
+      this.store.set("newQueued", { id: this.store.get<string>("newNudge")!, since: deferred.since });
+      return true;
+    }).immediate();
+    if (nudged) this.options.log?.("context-reset-nudged", "new-deferred");
+  }
+
+  /**
+   * Whether the route's session has nothing after the watermark, read fresh from the backend.
+   * An unknown answer counts as not quiet: a deferred reset is never sent on a guess.
+   */
+  private async contextQuiet(route: Route): Promise<boolean> {
+    const mark = this.store.get<Watermark | null>("watermark");
+    if (!mark || mark.sessionId !== route.id) return false;
+    try {
+      const messages = await bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
+      return messages.at(-1)?.id === mark.id;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether the route or any session in its family is still running. Call only with statuses that match the route. */
+  private async familyBusy(route: Route): Promise<boolean> {
+    // A waiting root can still owe background work (commands, monitors) with no child session,
+    // which statuses() and sessionBusy() both call idle, so the reset check asks resetBlocked.
+    const blocked = await bounded(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => undefined);
+    if (blocked === undefined || blocked) return true;
+    const statuses = await this.statusesFor(route).catch(() => undefined);
+    if (!statuses) return true;
+    if (statuses[route.id] !== undefined) return true;
+    const seen = new Set<string>([route.id]);
+    let parents: Pick<Route, "id" | "directory">[] = [route];
+    for (let depth = 0; parents.length && depth < MAX_SUBAGENT_DEPTH; depth++) {
+      const next: Pick<Route, "id" | "directory">[] = [];
+      for (const parent of parents) {
+        const children = await bounded(this.backend.children(parent.id, parent.directory)).catch(() => undefined);
+        // A family we can't list counts as busy: the deferral waits instead of repeating the refusal.
+        if (!children) return true;
+        for (const child of children) {
+          if (seen.has(child.id)) continue;
+          seen.add(child.id);
+          if (statuses[child.id] !== undefined) return true;
+          next.push({ id: child.id, directory: child.directory });
+        }
+      }
+      parents = next;
+    }
+    return false;
+  }
+
+  /** Queues a reset nudge for the route's agent and returns its row id. Call inside a transaction. */
+  private nudgeReset(route: Route, text: string): string {
     const id = `reset:${route.generation}:${Date.now()}`;
     this.store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+    return id;
   }
 
   /**
@@ -1218,7 +1378,10 @@ export class Router {
         // The old context's undelivered recap and size no longer apply.
         this.store.set(`seed:${old.id}`, null);
         this.store.set("routeContext", null);
-        this.nudgeReset(route, NEW_CHAT_NUDGE);
+        // A fresh /new supersedes any earlier deferral.
+        this.store.set("newDeferred", null);
+        this.store.set("newQueued", null);
+        this.store.set("newNudge", this.nudgeReset(route, NEW_CHAT_NUDGE));
         this.acknowledge(inboundId, "Fresh start. What's up?");
       }).immediate();
       this.options.log?.("context-reset-nudged", "new");
@@ -2174,9 +2337,27 @@ export class Router {
       && members.length === 1 && members[0] === row.id && !synthetic(row.id)
       && input.source === "typed" && input.attachments.length === 0 && typed && body.endsWith(typed)
       ? { inboundId: row.id, text: typed } : undefined;
+    // A deferred reset goes out only if the old context wrote nothing since the bridge last
+    // looked. An answer that finished during preparation is left to watch/poll, whose reply
+    // then cancels the reset (see dropQueuedNewIfMovedOn).
+    const queuedNew = this.store.get<{ id: string } | null>("newQueued");
+    if (queuedNew && members.includes(queuedNew.id) && !(await this.contextQuiet(activeRoute))) {
+      this.unsealBatch(row.id);
+      return;
+    }
     // Commit the final arrival check and acceptance fence together, before POST.
     const submitting = this.store.db.transaction(() => {
       if (interrupted() || !this.current(turn)) return false;
+      // A deferred /new whose conversation moved on during preparation is dropped here, not sent late.
+      const queued = this.store.get<{ id: string } | null>("newQueued");
+      if (queued && members.includes(queued.id)) {
+        if (this.dropQueuedNewIfMovedOn()) {
+          this.store.updateInbound(row.id, "cancelled");
+          return false;
+        }
+        // Submitted: the deferral is consumed here, so only a fresh refusal can recreate it.
+        this.clearDeferredNew();
+      }
       this.store.set(`batch-phase:${row.id}`, "submitting");
       if (this.options.swipes) this.freezeSwipe(row.id);
       this.store.set("activeTurn", turn);
@@ -2636,6 +2817,16 @@ export class Router {
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
         if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
+        // The agent refused a /new nudge and said why: ask again once it's idle with nothing said in the meantime.
+        // Any other reply of the same context means the conversation moved on, so the deferred reset is dropped.
+        const deferred = this.store.get<NewDeferred | null>("newDeferred");
+        if (text && turn!.inboundId && turn!.inboundId === this.store.get<string | null>("newNudge")) {
+          this.store.set("newDeferred", { generation: turn!.generation, since: this.rowidOf(turn!.inboundId), outbox: this.outboxMark() } satisfies NewDeferred);
+        } else if (deferred && deferred.generation === turn!.generation && this.sentSince(turn!.generation, deferred.outbox)) {
+          // The conversation moved on: a queued reset row for it must not be POSTed either.
+          this.dropQueuedNewIfMovedOn();
+          this.clearDeferredNew();
+        }
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
         this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
         this.store.set("activeTurn", null);
@@ -2658,10 +2849,17 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     if (!route || (turn && turn.phase !== "failed" && this.current(turn))) return;
     // Until a reset nudge is handled, whatever the old context still says (an
-    // answer /new cut off, say) is not for the owner.
-    if (this.store.pendingInbound().some(row => resetRow(row.id))) return;
+    // answer /new cut off, say) is not for the owner. A deferred /new is the
+    // exception: its nudge waits for the work to finish, so background follow-ups
+    // still deliver, and whichever lands first decides (see cancelQueuedNew).
+    const queued = this.store.get<{ id: string } | null>("newQueued");
+    const pending = this.store.pendingInbound();
+    if (pending.some(row => resetRow(row.id) && row.id !== queued?.id)) return;
     const now = Date.now();
-    if (now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
+    // While a deferred /new waits to be sent, look every tick: an answer the resumed work just
+    // wrote must start its background turn (which cancels the reset) before the reset is POSTed.
+    const deferredWaiting = !!queued && pending.some(row => row.id === queued.id);
+    if (!deferredWaiting && now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
     this.watchedAt = now;
     try {
       const mark = this.store.get<Watermark | null>("watermark");

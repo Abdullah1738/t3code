@@ -1,0 +1,167 @@
+import { randomUUID } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import {
+  callTarget,
+  closeTarget,
+  evaluateTarget,
+  getBrowserContexts,
+  getBrowserTargets,
+  getVersion,
+  navigateTarget,
+  resolvePageProfile,
+  resolveProfileContexts,
+  resolveTabTarget,
+  screenshotTarget,
+  uploadFilesTarget,
+  withDeadline,
+  withStaleRetry
+} from "./cdp.js";
+import {
+  closeDiaTab,
+  createDiaTab,
+  describeDiaProfiles,
+  executeDiaJavascript,
+  findDiaProfiles,
+  focusDiaProfile,
+  focusDiaTab,
+  getDiaActiveProfile,
+  getDiaInventory
+} from "./dia.js";
+import { createMappedTab, pruneTabBindings, tabBindings } from "./tabs.js";
+
+const server = new McpServer({
+  name: "dia-agent-bridge",
+  version: "0.1.0"
+});
+
+function textResult(value) {
+  return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+}
+
+function errorResult(error) {
+  return { isError: true, content: [{ type: "text", text: error?.message || String(error) }] };
+}
+
+const TOOL_TIMEOUT_MS = Number(process.env.DIA_TOOL_TIMEOUT_MS) || 90_000;
+
+async function safely(fn, label = "Dia tool call") {
+  try { return textResult(await withDeadline(Promise.resolve().then(fn), TOOL_TIMEOUT_MS, label)); } catch (error) { return errorResult(error); }
+}
+
+// For CDP page tools: if the target socket is stale (tab reloaded/replaced, Dia restarted),
+// re-read inventory + targets once and retry. Only connection-phase failures qualify.
+function safelyCdp(fn, label) {
+  return safely(() => withStaleRetry(fn), label);
+}
+
+async function readMappedState() {
+  const [inventory, targetInfos] = await Promise.all([getDiaInventory(), getBrowserTargets()]);
+  pruneTabBindings(inventory, targetInfos);
+  return { inventory, targetInfos, profiles: resolveProfileContexts(inventory, targetInfos, tabBindings) };
+}
+
+async function profileContext(profileName) {
+  const state = await readMappedState();
+  return { ...state, profile: resolvePageProfile(state.profiles, profileName) };
+}
+
+async function tabTarget({ profileName, tabId, targetId }) {
+  const state = await profileContext(profileName);
+  return { ...state, ...resolveTabTarget({ profile: state.profile, targetInfos: state.targetInfos, tabId, targetId, bindings: tabBindings }) };
+}
+
+server.tool("dia_profiles", "List Dia windows, profiles, tabs, and best-effort CDP context mappings. This is read-only.", {}, async () => {
+  return safely(async () => {
+    const state = await readMappedState();
+    return {
+      active: await getDiaActiveProfile(),
+      cdp: { endpoint: process.env.DIA_CDP_ENDPOINT || "http://127.0.0.1:9222", version: await getVersion(), browserContexts: await getBrowserContexts() },
+      profiles: state.profiles
+    };
+  }, "dia_profiles");
+});
+
+server.tool("dia_profile_focus", "Focus a Dia profile in the native app. This is intentionally foregrounding because Dia's supported focus command brings its window forward.", { profileName: z.string().min(1) }, async ({ profileName }) => safely(() => focusDiaProfile(profileName), "dia_profile_focus"));
+
+server.tool("dia_tab_focus", "Focus a Dia tab in the native app. This is intentionally foregrounding because Dia's supported focus command brings its window forward.", { tabId: z.string().min(1) }, async ({ tabId }) => safely(() => focusDiaTab(tabId), "dia_tab_focus"));
+
+server.tool("dia_tab_execute", "Execute JavaScript through Dia's supported AppleScript tab API. Prefer dia_evaluate for background CDP execution when the tab maps cleanly.", { tabId: z.string().min(1), javascript: z.string() }, async ({ tabId, javascript }) => safely(() => executeDiaJavascript(tabId, javascript), "dia_tab_execute"));
+
+server.tool("dia_tab_create", "Create a new Dia tab in a selected profile. Dia's supported native creation route may bring its window forward or change the active profile; use existing-tab CDP tools for background work.", { profileName: z.string().min(1), url: z.string().url().default("about:blank"), windowId: z.string().min(1).optional() }, async ({ profileName, url, windowId }) => safely(async () => {
+  const inventory = await getDiaInventory();
+  const matches = findDiaProfiles(windowId ? inventory.filter(window => window.id === windowId) : inventory, profileName);
+  if (matches.length !== 1) throw new Error(`Expected exactly one Dia profile named ${profileName}, found ${matches.length}: ${describeDiaProfiles(matches)}`);
+  const activeBefore = await getDiaActiveProfile();
+  const created = await createMappedTab(profileName, url, windowId ? { create: (profile, seed) => createDiaTab(profile, seed, windowId) } : {});
+  const activeAfter = await getDiaActiveProfile();
+  return {
+    ...created,
+    activeBefore,
+    activeAfter,
+    background: false,
+    mayChangeActiveProfile: activeBefore.profile !== activeAfter.profile
+  };
+}, "dia_tab_create"));
+
+server.tool("dia_tab_close", "Close an exact Dia tab or page target. CDP target closure is background; native Dia tab closure uses the supported app API and may affect visible app state.", { profileName: z.string().min(1), tabId: z.string().min(1).optional(), targetId: z.string().min(1).optional() }, async ({ profileName, tabId, targetId }) => safely(async () => {
+  if (!tabId && !targetId) throw new Error("Provide tabId or targetId");
+  if (tabId && targetId) {
+    const state = await tabTarget({ profileName, tabId, targetId });
+    const closed = await closeTarget(targetId);
+    return { profileName, diaTabId: state.tab.id, targetId, route: "background_cdp", ...closed };
+  }
+  if (targetId) {
+    await tabTarget({ profileName, targetId });
+    return { profileName, route: "background_cdp", ...await closeTarget(targetId) };
+  }
+  const inventory = await getDiaInventory();
+  const matches = findDiaProfiles(inventory, profileName);
+  if (matches.length !== 1) throw new Error(matches.length ? `Expected exactly one Dia profile named ${profileName}, found ${matches.length}: ${describeDiaProfiles(matches)}` : `Unknown Dia profile: ${profileName}`);
+  const [profile] = matches;
+  if (!profile.tabs.some(tab => tab.id === tabId)) throw new Error(`Unknown tab ${tabId} in Dia profile ${profileName}`);
+  return { profileName, route: "native_tab_close", ...(await closeDiaTab(tabId)) };
+}, "dia_tab_close"));
+
+server.tool("dia_navigate", "Navigate an exact page in a selected Dia profile in the background.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional(), url: z.string().url() }, async ({ profileName, tabId, targetId, url }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const result = await navigateTarget(state.target, url);
+  return { profileName, tabId: state.tab?.id || null, targetId: state.target.targetId, url, result };
+}, "dia_navigate"));
+
+server.tool("dia_page_state", "Read an exact Dia page's current URL, title, and basic document state in the background.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional() }, async ({ profileName, tabId, targetId }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const result = await evaluateTarget(state.target, "({url: location.href, title: document.title, readyState: document.readyState, text: document.body ? document.body.innerText.slice(0, 20000) : ''})");
+  return { profileName, diaTabId: state.tab?.id || null, target: state.target, result: result.result?.value ?? result };
+}, "dia_page_state"));
+
+server.tool("dia_evaluate", "Evaluate arbitrary JavaScript in an exact Dia page target in the background. Broad page access is intentional.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional(), expression: z.string(), awaitPromise: z.boolean().default(true), returnByValue: z.boolean().default(true) }, async ({ profileName, tabId, targetId, expression, awaitPromise, returnByValue }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const result = await evaluateTarget(state.target, expression, awaitPromise, returnByValue);
+  return { profileName, diaTabId: state.tab?.id || null, target: state.target, result };
+}, "dia_evaluate"));
+
+server.tool("dia_cdp", "Send an arbitrary Chrome DevTools Protocol command to an exact Dia page target. Broad CDP access is intentional.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional(), method: z.string().min(1), params: z.record(z.string(), z.unknown()).default({}) }, async ({ profileName, tabId, targetId, method, params }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const result = await callTarget(state.target, method, params);
+  return { profileName, diaTabId: state.tab?.id || null, target: state.target, method, result };
+}, "dia_cdp"));
+
+server.tool("dia_screenshot", "Capture an exact Dia page in the background and return a temporary PNG/JPEG file path.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional(), format: z.enum(["png", "jpeg"]).default("png"), quality: z.number().int().min(0).max(100).optional() }, async ({ profileName, tabId, targetId, format, quality }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const data = await screenshotTarget(state.target, format, quality);
+  const path = `/tmp/dia-${randomUUID()}.${format}`;
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(path, Buffer.from(data, "base64"));
+  return { profileName, diaTabId: state.tab?.id || null, targetId: state.target.targetId, path, format };
+}, "dia_screenshot"));
+
+server.tool("dia_upload", "Set files on an exact input[type=file] in a selected Dia page in the background. Paths must be absolute local regular files.", { profileName: z.string().min(1), tabId: z.string().optional(), targetId: z.string().optional(), selector: z.string().min(1), paths: z.array(z.string().min(1)).min(1) }, async ({ profileName, tabId, targetId, selector, paths }) => safelyCdp(async () => {
+  const state = await tabTarget({ profileName, tabId, targetId });
+  const result = await uploadFilesTarget(state.target, selector, paths);
+  return { profileName, diaTabId: state.tab?.id || null, targetId: state.target.targetId, selector, paths, result };
+}, "dia_upload"));
+
+const transport = new StdioServerTransport();
+await server.connect(transport);

@@ -22,6 +22,7 @@ import {
   ModelSelection,
   ProjectId,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -140,7 +141,11 @@ const BoardBody = Schema.Struct({
   evaluatorSlots: Schema.optional(Schema.NullOr(Schema.Number)),
 });
 
-const PoolBody = Schema.Struct({ model: ModelBody, slots: Schema.Number });
+const PoolBody = Schema.Struct({
+  model: ModelBody,
+  slots: Schema.optional(Schema.Number),
+  replaces: Schema.optional(Schema.String),
+});
 
 const ScriptBody = Schema.Struct({
   name: Schema.String,
@@ -169,9 +174,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
     ) {
       const request = yield* HttpServerRequest.HttpServerRequest;
-      const session = yield* auth
-        .authenticateHttpRequest(request)
-        .pipe(Effect.mapError(() => fail("denied", "A valid bearer token is required.")));
+      // Token checks only read; keep them off the writer like the board reads.
+      const session = yield* auth.authenticateHttpRequest(request).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError(() => fail("denied", "A valid bearer token is required.")),
+      );
       if (!session.scopes.includes(scope)) {
         return yield* fail("denied", `This token lacks the ${scope} scope.`);
       }
@@ -314,10 +321,17 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(PoolBody);
-        if (!Number.isInteger(input.slots) || input.slots < 0) {
+        // A level change (replaces) may leave slots out to keep the pool's count.
+        const slotsOk =
+          input.slots === undefined
+            ? input.replaces !== undefined
+            : Number.isInteger(input.slots) && input.slots >= 0;
+        if (!slotsOk) {
           return yield* fail("invalid", "slots must be a whole number, 0 or more.");
         }
-        return yield* service.setPool(board.id, modelSelectionOf(input.model), input.slots);
+        return yield* service.setPool(board.id, modelSelectionOf(input.model), input.slots, {
+          replaces: input.replaces,
+        });
       }),
     );
 

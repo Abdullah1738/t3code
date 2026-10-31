@@ -423,6 +423,25 @@ class CommerceCardRefusalTests(TempState):
         code, _, _ = self.run_card('check', '2342')
         self.assertEqual(code, 0)
 
+    def test_replace_new_records_replaced_by_and_prints_the_money_cases_hint(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        code, out, err = self.run_card('replace', '5542', '--new', '2342', '--source', 'owner')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['replaced_by'], '2342')
+        self.assertEqual(self.stored()['5542']['replaced_by'], '2342')
+        self.assertFalse(cs.check('5542', now=AT + 60)['blocked'])
+        self.assertIn('next: money-cases card-swap --old 5542 --new 2342 --dry-run', err)
+        self.assertNotIn('2342', self.run_card('replace', '5542')[2])
+
+    def test_replace_new_refuses_a_non_4_digit_value(self):
+        cs.record_cancelled('5542', reason='lost card', now=AT)
+        for bad in ('23421', '23', '4242 4242 4242 4242'):
+            with self.subTest(new=bad):
+                code, _, err = self.run_card('replace', '5542', '--new', bad)
+                self.assertEqual(code, cs.EXIT_USAGE)
+                self.assertIn('exactly the last 4 digits', err)
+                self.assertEqual(cs.check('5542', now=AT + 60)['blocked'], True)
+
     def test_cancelled_card_refuses_every_paying_lane(self):
         cs.record_cancelled('2342', reason='lost card')
         forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')

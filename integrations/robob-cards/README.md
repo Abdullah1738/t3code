@@ -36,7 +36,7 @@ unguessable `/c/<token>/` path:
 2. The tool registers the device with the App Store Connect API, replaces the
    ad hoc profile "Robob Cards Ad Hoc - <name>" (wildcard App ID, Apple
    Distribution certificate) with one covering that person's phones, and
-   re-signs the current build with it. Ad hoc builds don't need Developer Mode.
+   re-signs the current build with it. Ad hoc builds need Developer Mode on iOS 16 and later. The first time the app is opened, iOS says "Developer Mode Required", and until it's on, every card opens blank in Messages. So the steps have the person open the app once and turn Developer Mode on if asked.
 3. The same page turns into an Install page. Telegram and `--thread` hear
    about each step.
 

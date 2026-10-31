@@ -4021,6 +4021,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      sessionUpdateFanout: "interested_threads",
       instanceId,
       driver,
       providerSessionId: input.providerSessionId,

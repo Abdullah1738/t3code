@@ -7,8 +7,9 @@ refuses the card until Abdullah says it is fine again (`card-status ok`).
 Only the last four digits of a card are ever stored.
 
 State: ${CARD_STATUS_FILE:-~/.local/state/card-status.json}, one record per
-last4: {state: declined|ok, reason, source, at (epoch), note[, recorded_at, events]}.
+last4: {state: declined|ok|cancelled, reason, source, at (epoch), note[, recorded_at, events, replaced_by]}.
 For a decline, `at` is when it happened and `recorded_at` when it was written.
+`replaced_by` is the last 4 of the card that replaced it (`replace --new`).
 """
 import argparse
 import contextlib
@@ -239,7 +240,7 @@ def record_declined(last4, *, reason, source=None, event=None, not_before=None, 
     return {**_public(last4, record), 'recorded': True}
 
 
-def _write_state(last4, *, state, reason, source, note, now):
+def _write_state(last4, *, state, reason, source, note, now, replaced_by=None):
     last4 = _last4(last4)
     path = state_path()
     with _locked(path):
@@ -249,9 +250,11 @@ def _write_state(last4, *, state, reason, source, note, now):
                   'at': int(time.time() if now is None else now), 'note': note}
         if previous.get('events'):
             record['events'] = previous['events']
+        if replaced_by is not None:
+            record['replaced_by'] = replaced_by
         data[last4] = record
         _save(path, data)
-    return {**_public(last4, record), 'recorded': True}
+    return {**_public(last4, record), 'recorded': True, 'replaced_by': replaced_by}
 
 
 def record_cancelled(last4, *, reason, source=None, now=None):
@@ -260,10 +263,11 @@ def record_cancelled(last4, *, reason, source=None, now=None):
                         source=_text(source, 'source'), note=None, now=now)
 
 
-def record_replaced(last4, *, note=None, source=None, now=None):
+def record_replaced(last4, *, note=None, source=None, new=None, now=None):
     note = _text(note, 'note')
+    new = _last4(new) if new is not None else None
     return _write_state(last4, state='ok', reason=None, source=_text(source, 'source'),
-                        note=f'replaced: {note}' if note else 'replaced', now=now)
+                        note=f'replaced: {note}' if note else 'replaced', now=now, replaced_by=new)
 
 
 def record_ok(last4, *, note=None, source=None, now=None):
@@ -310,6 +314,7 @@ def main(argv=None):
     replace.add_argument('last4')
     replace.add_argument('--note')
     replace.add_argument('--source')
+    replace.add_argument('--new', metavar='LAST4', help='last 4 digits of the replacement card')
     check_cmd = commands.add_parser('check', help='exit 3 when the card is cancelled or was declined in the last 12h')
     check_cmd.add_argument('last4')
     check_cmd.add_argument('--json', action='store_true')
@@ -336,10 +341,12 @@ def main(argv=None):
         elif args.command == 'cancel':
             result = record_cancelled(args.last4, reason=args.reason, source=args.source)
         elif args.command == 'replace':
-            result = record_replaced(args.last4, note=args.note, source=args.source)
+            result = record_replaced(args.last4, note=args.note, source=args.source, new=args.new)
         else:
             result = record_ok(args.last4, note=args.note, source=args.source)
         print(json.dumps(result))
+        if args.command == 'replace' and args.new:
+            print(f'next: money-cases card-swap --old {args.last4} --new {args.new} --dry-run', file=sys.stderr)
         return 0
     except CardStatusError as exc:
         print(f'card-status: {exc}', file=sys.stderr)

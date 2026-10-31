@@ -134,21 +134,23 @@ export const STEPS = {
   ],
   install: [
     "Tap Install, then tap Install in the pop-up.",
-    "Wait for Robob Cards to finish loading on your Home Screen. You don't need to open it.",
-    "Done. Robob's cards now open right inside your Messages chat. To find the app, open any chat, tap + next to the message box, then More.",
+    "Wait for Robob Cards to finish loading on your Home Screen, then open it once.",
+    "If it says Developer Mode Required, tap OK. Open Settings, tap Privacy & Security, scroll down to Developer Mode, turn it on and tap Restart. After the restart, unlock your iPhone, tap Turn On (it may say Enable) and enter your passcode. Then open Robob Cards again.",
+    "When it says Robob Cards is installed, you're done. Robob's cards now open right inside your Messages chat. To find the app, open any chat, tap + next to the message box, then More.",
   ],
 };
 
 export function stepsText(link) {
   return [
-    "Here's how to get Robob Cards on your iPhone. It takes about two minutes.",
+    "Here's how to get Robob Cards on your iPhone. It takes about five minutes.",
     "",
     `1. Open this link in Safari on your iPhone: ${link}`,
     `2. Tap "Register this iPhone", then tap Allow.`,
     `3. Open Settings and tap "Profile Downloaded" near the top. Tap Install, enter your passcode, then tap Install again if asked. It may say "Not Verified"; that's fine.`,
     "4. Safari comes back by itself (if not, open Safari again). In a minute or two the page shows an Install button. Tap it, then tap Install in the pop-up.",
-    "5. Wait for Robob Cards to finish loading on your Home Screen. You don't need to open it.",
-    "6. Done. Robob's cards now open right inside Messages. To find the app, open any chat, tap + next to the message box, then More.",
+    "5. Wait for Robob Cards to finish loading on your Home Screen, then open it once.",
+    `6. If it says "Developer Mode Required", tap OK. Open Settings > Privacy & Security, scroll down to Developer Mode, turn it on and tap Restart. After the restart, unlock your iPhone, tap Turn On (it may say Enable) and enter your passcode. Then open Robob Cards again.`,
+    `7. When it says "Robob Cards is installed", you're done. Robob's cards now open right inside Messages. To find the app, open any chat, tap + next to the message box, then More.`,
   ].join("\n");
 }
 
@@ -235,7 +237,7 @@ ${list(STEPS.install)}
   return layout({
     title: "Get Robob Cards",
     body: `<h1>Get Robob Cards</h1>
-<p>Robob's cards will open right inside Messages. It takes about two minutes.</p>
+<p>Robob's cards will open right inside Messages. It takes about five minutes.</p>
 <a class="action" href="profile.mobileconfig">Register this iPhone</a>
 ${list(STEPS.register)}
 <p class="note">Open this page in Safari on the iPhone that should get the app.</p>`,

@@ -123,6 +123,20 @@ export const evaluatorStepText = (card: KanbanCard) =>
     "Do them, mark each with subtask_done, then move the card on. Anything outward (a message, a ticket update, a merge or deploy) follows the board's approval rules: ask the owner first where they say so.",
   );
 
+/** The tick's reminder when a card's evaluator step has sat unclaimed for a while. */
+export const evaluatorStepWaitingText = (card: KanbanCard, minutes: number) =>
+  lines(
+    `Card #${card.number} (${card.title || "untitled"}, P${card.priority}) has waited ${minutes} minutes on evaluator subtasks nobody has done: ${subtaskIds(kanbanStepSubtasks(card, "evaluator"))}.`,
+    "",
+    evaluatorStepText(card),
+    "",
+    "Do them now (read the card's events first: another evaluator may be partway through), or post one line in the card's discussion saying who is doing them and when.",
+  );
+
+/** The tick's reminder when an owner message in a discussion has no evaluator reply yet. */
+export const ownerWaitingText = (discussion: { readonly title: string }, minutes: number) =>
+  `Abdullah wrote in "${discussion.title}" ${minutes} minutes ago and has no reply yet. Post a reply there now with discussion_post (an answer, or one line on what you're doing about it and when he'll have it), then carry on.`;
+
 /** Sent to the card discussion's evaluator once when a board script hands a subtask back. */
 export const handBackText = (
   card: KanbanCard,

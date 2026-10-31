@@ -87,8 +87,11 @@ def extract_selected_card(session) -> SelectedCard:
     card = selected[0]
     # confirmPaymentMethod: card.id -> cardToken; checkout card.mask -> cardMask
     # (4895765-4895775). Selected-card consumers use .type (4893890-4893894).
+    card_id = card.get('id')
+    if type(card_id) is int and card_id > 0:
+        card_id = str(card_id)
     return SelectedCard(
-        token=_text(card.get('id'), 'SCHEMA_CARD_ID'),
+        token=_text(card_id, 'SCHEMA_CARD_ID'),
         mask=_text(card.get('mask'), 'SCHEMA_CARD_MASK'),
         network=_text(card.get('type'), 'SCHEMA_CARD_TYPE'),
         payment_method=active[0]['code'],

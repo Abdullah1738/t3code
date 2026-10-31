@@ -12,6 +12,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { WAL_SIZE_LIMIT_BYTES } from "./Sqlite.ts";
+import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
 
 const lockHolderSource = `
@@ -104,6 +105,46 @@ it.effect("drops planner statistics a database already has", () => {
         "SEARCH parent USING INDEX sqlite_autoindex_walk_probe_1 (node_id=?)",
       );
     }).pipe(Effect.provide(persistence()));
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+  );
+});
+
+const authoredIndexSql = (sql: SqlClient.SqlClient) =>
+  sql<{ readonly sql: string }>`
+    SELECT sql FROM sqlite_schema
+    WHERE type = 'index' AND name = 'ardud_v2_messages_latest_user_authored_idx'
+  `;
+
+it.effect("installs the authored-message shell index on fresh and reopened databases", () => {
+  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-authored-"));
+  const dbPath = NodePath.join(tempDir, "state.sqlite");
+  const persistence = () =>
+    SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer));
+
+  return Effect.gen(function* () {
+    const first = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      return yield* authoredIndexSql(sql);
+    }).pipe(Effect.provide(persistence()));
+    assert.lengthOf(first, 1);
+    assert.include(
+      first[0]!.sql,
+      "WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'",
+    );
+
+    const reopened = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* ensureShellLookupIndexes();
+      return yield* authoredIndexSql(sql);
+    }).pipe(Effect.provide(persistence()));
+    assert.deepEqual(reopened, first);
+
+    const memory = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      return yield* authoredIndexSql(sql);
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory));
+    assert.lengthOf(memory, 1);
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
   );

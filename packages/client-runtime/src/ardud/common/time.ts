@@ -65,13 +65,27 @@ export function formatTimeOfDay(atIso: string, timeZone?: string): string {
   return formatter.format(atMs);
 }
 
+const calendarDayFormatters = new Map<string, Intl.DateTimeFormat>();
+
 function calendarDay(atMs: number, timeZone?: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    ...(timeZone ? { timeZone } : {}),
-  }).format(atMs);
+  if (!timeZone) {
+    // @effect-diagnostics-next-line globalDate:off -- local calendar day follows the device zone, as the old Intl call did.
+    const at = new Date(atMs);
+    if (!Number.isFinite(at.getTime())) throw new RangeError("Invalid time value");
+    // Date follows the current device zone, including a zone change while the app stays open.
+    return `${at.getFullYear()}-${at.getMonth()}-${at.getDate()}`;
+  }
+  let formatter = calendarDayFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-GB", {
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      timeZone,
+    });
+    calendarDayFormatters.set(timeZone, formatter);
+  }
+  return formatter.format(atMs);
 }
 
 /** "15:41" for today, "Wed 14 Oct" for anything earlier. */

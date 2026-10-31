@@ -45,6 +45,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -325,14 +326,20 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
 
+  /**
+   * Sets one pool's slots. With `replaces` (a pool key), that pool moves to `model`'s level
+   * and its open cards follow; `slots` undefined keeps its slot count.
+   */
   readonly setPool: (
     boardId: KanbanBoard["id"],
     model: ModelSelection,
-    slots: number,
+    slots: number | undefined,
+    options?: { readonly replaces?: string | undefined },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly removePool: (
     boardId: KanbanBoard["id"],
     model: ModelSelection,
+    options?: { readonly replaces?: string | undefined },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly setGoal: (
     boardId: KanbanBoard["id"],
@@ -487,6 +494,13 @@ const ADMIT_GRACE_MS = 2 * 60_000;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
+// A todo card whose step is only evaluator subtasks (its packet) nobody has done
+// gets its evaluator woken once: a card made by an evaluator wakes nobody else.
+const STEP_WAIT_P1_MS = 15 * 60_000;
+const STEP_WAIT_MS = 60 * 60_000;
+// An owner message a running evaluator hasn't answered gets one reminder; its turn
+// end covers an idle evaluator, so the tick doesn't double it.
+const OWNER_WAIT_MS = 15 * 60_000;
 // A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
@@ -639,6 +653,15 @@ const make = Effect.gen(function* () {
   const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
     new Map(),
   );
+  // Cards waiting on evaluator subtasks: the step's subtask ids, when the wait began, and whether woken.
+  const stepWaits = yield* Ref.make<
+    ReadonlyMap<
+      KanbanCard["id"],
+      { readonly key: string; readonly since: number; readonly woken: boolean }
+    >
+  >(new Map());
+  // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
+  const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
@@ -754,15 +777,25 @@ const make = Effect.gen(function* () {
     model: ModelSelection,
   ) {
     const pools = yield* store.pools(boardId);
-    const key = Rules.poolKey(model);
     const joined = `${model.instanceId}/${model.model}`;
-    const match =
-      pools.find((pool) => pool.key === key) ??
-      pools.find((pool) => pool.model.model === joined || pool.model.model === model.model) ??
-      (() => {
-        const suffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-        return suffix.length === 1 ? suffix[0] : undefined;
-      })();
+    // An alias names the model without its instance; resolve it to the pool model it means,
+    // then pick the level among that model's pools (never the first row when a level is named).
+    const aliased = (): KanbanPool | undefined => {
+      const byName = pools.filter(
+        (pool) => pool.model.model === joined || pool.model.model === model.model,
+      );
+      const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
+      // A short name is unambiguous when its pools all belong to one model (one key per
+      // level is still one model); two different models or instances stay refused.
+      const suffixModels = new Set(bySuffix.map((pool) => Rules.modelKey(pool.model)));
+      const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
+      if (same.length === 0) return undefined;
+      const level = Rules.modelLevel(model);
+      if (level === null) return same[0];
+      // The requested level's pool when the model has one; else the first, as Rules.poolFor does.
+      return same.find((pool) => Rules.modelLevel(pool.model) === level) ?? same[0];
+    };
+    const match = Rules.poolFor(pools, model) ?? aliased();
     if (!match) {
       // A model the provider refuses is named as such, even when no pool exists for it.
       yield* checkModel(model);
@@ -790,14 +823,15 @@ const make = Effect.gen(function* () {
     models: ReadonlyArray<KanbanCardModel>,
   ) {
     if (models.length === 0) return yield* failWith("invalid", "models needs at least one model");
+    const pools = yield* store.pools(boardId);
     const mapped: Array<KanbanCardModel> = [];
     for (const entry of models) {
       if (!Number.isInteger(entry.weight) || entry.weight < 1) {
         return yield* failWith("invalid", "each model's weight is a whole number above 0");
       }
       const model = yield* poolModel(boardId, entry.model);
-      if (mapped.some((other) => Rules.poolKey(other.model) === Rules.poolKey(model))) {
-        return yield* failWith("invalid", `${Rules.poolKey(model)} is listed twice`);
+      if (mapped.some((other) => Rules.poolOf(pools, other.model) === Rules.poolOf(pools, model))) {
+        return yield* failWith("invalid", `${Rules.poolOf(pools, model)} is listed twice`);
       }
       mapped.push({ model, weight: entry.weight });
     }
@@ -2546,9 +2580,9 @@ const make = Effect.gen(function* () {
     }
   });
 
-  /** The pool key a board thread runs on. */
+  /** The outage key of the model a board thread runs on: per model, whatever its level. */
   const linkKey = (link: KanbanThreadLink, board: KanbanBoard) =>
-    Rules.poolKey(link.model ?? board.evaluatorModel);
+    Rules.modelKey(link.model ?? board.evaluatorModel);
 
   /**
    * Every paused thread link on every live board, ended or not: a reused evaluator is
@@ -2610,7 +2644,7 @@ const make = Effect.gen(function* () {
       endedAt: link.role === "evaluator" ? null : link.endedAt,
       paused: { at: link.paused?.at ?? at, message },
     });
-    const key = Rules.poolKey(model);
+    const key = Rules.modelKey(model);
     yield* Ref.update(down, (map) =>
       map.has(key)
         ? map
@@ -3208,6 +3242,111 @@ const make = Effect.gen(function* () {
           );
         }
       }
+      // A todo card whose step is only evaluator subtasks (its packet) and nobody has
+      // done them: its discussion's evaluator is woken once, after a wait.
+      for (const card of yield* store.cards(board.id)) {
+        const waiting =
+          card.stage === "todo" &&
+          card.settledAt === null &&
+          card.activeThreadId === null &&
+          kanbanEvaluatorStep(card);
+        if (!waiting) {
+          yield* Ref.update(stepWaits, (all) => {
+            if (!all.has(card.id)) return all;
+            const next = new Map(all);
+            next.delete(card.id);
+            return next;
+          });
+          continue;
+        }
+        const key = Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"));
+        const wait = (yield* Ref.get(stepWaits)).get(card.id);
+        if (wait === undefined || wait.key !== key) {
+          yield* Ref.update(stepWaits, (all) =>
+            new Map(all).set(card.id, { key, since: now, woken: false }),
+          );
+          continue;
+        }
+        const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
+        if (wait.woken || now - wait.since < limit) continue;
+        const minutes = Math.round((now - wait.since) / 60_000);
+        // A settled or archived discussion is finished: its evaluator isn't woken for it.
+        const woke = yield* cardDiscussionUnlocked(card.id).pipe(
+          Effect.flatMap((discussion) =>
+            discussion.settledAt !== null || discussion.archivedAt !== null
+              ? Effect.succeed(false)
+              : toEvaluator(discussion, Briefs.evaluatorStepWaitingText(card, minutes), true).pipe(
+                  Effect.as(true),
+                ),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban evaluator step wake failed", { cardId: card.id, cause }).pipe(
+              Effect.as(false),
+            ),
+          ),
+        );
+        if (woke) {
+          yield* Ref.update(stepWaits, (all) =>
+            new Map(all).set(card.id, { ...wait, woken: true }),
+          );
+        }
+      }
+      // An owner message a running evaluator hasn't answered gets one reminder. An idle
+      // evaluator is covered by its turn-end nudge, so it isn't pinged here.
+      for (const discussion of yield* store.discussions(board.id)) {
+        if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
+        // Only a discussion whose evaluator owes a reply can have an owner reminder due.
+        const owing = discussion.participants.filter(
+          (participant) => participant.actor._tag === "evaluator" && participant.owes === "asked",
+        );
+        if (owing.length === 0) continue;
+        // A failed read skips only this discussion, never the tick.
+        yield* Effect.gen(function* () {
+          // The whole history, not a window: the owner's message may be older than any recent page.
+          const messages = yield* store.allMessages(discussion.id);
+          const ask = messages.findLast((message) => message.author._tag === "owner");
+          if (ask === undefined) return;
+          const answered = messages.some(
+            (message) => message.seq > ask.seq && message.author._tag === "evaluator",
+          );
+          if (answered) return;
+          const idleMs = now - Date.parse(ask.createdAt);
+          if (idleMs < OWNER_WAIT_MS) return;
+          if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) return;
+          for (const participant of owing) {
+            const actor = participant.actor;
+            if (actor._tag !== "evaluator") continue;
+            const evaluatorId = actor.threadId;
+            const read = yield* Effect.result(threads.find(evaluatorId));
+            if (read._tag === "Failure" || read.success?.state !== "running") continue;
+            const minutes = Math.round(idleMs / 60_000);
+            const sent = yield* threads
+              .send({
+                threadId: evaluatorId,
+                text: Briefs.ownerWaitingText(discussion, minutes),
+              })
+              .pipe(
+                Effect.as(true),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("kanban owner message reminder failed", {
+                    threadId: evaluatorId,
+                    cause,
+                  }).pipe(Effect.as(false)),
+                ),
+              );
+            if (sent) {
+              yield* Ref.update(ownerWaits, (all) => new Map(all).set(discussion.id, ask.seq));
+            }
+          }
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban owner wait check failed", {
+              discussionId: discussion.id,
+              cause,
+            }),
+          ),
+        );
+      }
       // Typing heartbeat.
       for (const discussion of yield* store.discussions(board.id)) {
         let next = discussion;
@@ -3357,7 +3496,7 @@ const make = Effect.gen(function* () {
         const found = new Map<string, ModelSelection>();
         for (const { link, board } of yield* pausedLinks) {
           const model = link.model ?? board.evaluatorModel;
-          found.set(Rules.poolKey(model), model);
+          found.set(Rules.modelKey(model), model);
         }
         // A key whose threads all came back on their own is up again. A key with paused
         // links but no state is marked down now, so dispatch holds it while the probe
@@ -3443,6 +3582,10 @@ const make = Effect.gen(function* () {
     lock.withPermits(1)(effect).pipe(Effect.mapError(toKanbanError));
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(toKanbanError));
+  // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
+  // which a single write can hold for 15 s under load.
+  const readDb = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(NodeSqliteClient.readOnly, Effect.mapError(toKanbanError));
 
   /** Every model a board uses, deduped by pool key. */
   const boardModels = (board: KanbanBoard): Array<ModelSelection> => {
@@ -3458,18 +3601,18 @@ const make = Effect.gen(function* () {
     return [...seen.values()];
   };
 
-  /** The 0-slot pools a board still needs for its models; existing pools are never touched. */
+  /**
+   * The 0-slot pools a board still needs for its models; existing pools are never touched.
+   * A model with a pool at any level needs none, so a new board default level adds no pool.
+   */
   const missingPools = (
     existing: ReadonlyArray<KanbanPool>,
     models: ReadonlyArray<ModelSelection>,
   ): Array<KanbanPool> => {
-    const have = new Set(existing.map((pool) => pool.key));
     const added: Array<KanbanPool> = [];
     for (const model of models) {
-      const key = Rules.poolKey(model);
-      if (have.has(key)) continue;
-      have.add(key);
-      added.push({ key, model, slots: 0 });
+      if (Rules.poolFor([...existing, ...added], model)) continue;
+      added.push({ key: Rules.poolKey(model), model, slots: 0 });
     }
     return added;
   };
@@ -3579,6 +3722,54 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * The open card an evaluator's or a thread's new card would duplicate: the same
+   * title, or the same source link. PR, Linear and card links are left out, since
+   * follow-up cards share those legitimately.
+   */
+  const openTwin = (
+    cards: ReadonlyArray<KanbanCard>,
+    input: NewCard,
+  ): { readonly card: KanbanCard; readonly why: "title" | "source link" } | null => {
+    const squash = (text: string) => text.trim().replace(/\s+/g, " ").toLowerCase();
+    // The title draftCard will save, so an omitted title matches its fallback.
+    const prompt = input.prompt.trim();
+    const saved = input.title?.trim() || (prompt.length > 0 ? fallbackTitle(prompt) : "");
+    const title = saved ? squash(saved) : "";
+    // Shared follow-up links don't count: study parents (t3-context) and PR or Linear links.
+    const sourceUrl = (url: string) => !url.startsWith("t3-context://") && linkKind(url) === "url";
+    const urls = new Set(
+      (input.links ?? [])
+        .filter((link) => (link.kind ?? linkKind(link.url.trim())) === "url")
+        .map((link) => link.url.trim())
+        .filter(sourceUrl),
+    );
+    for (const card of cards) {
+      if (card.settledAt !== null || KANBAN_DONE_STAGES.has(card.stage)) continue;
+      if (title && squash(card.title) === title) return { card, why: "title" };
+      if (card.links.some((link) => link.kind === "url" && urls.has(link.url))) {
+        return { card, why: "source link" };
+      }
+    }
+    return null;
+  };
+
+  /** Evaluators and threads don't file a second open card for the same request. */
+  const refuseTwin = Effect.fn("KanbanService.refuseTwin")(function* (
+    boardId: KanbanBoard["id"],
+    input: NewCard,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "evaluator" && actor._tag !== "thread") return;
+    const twin = openTwin(yield* store.cards(boardId), input);
+    if (twin) {
+      return yield* failWith(
+        "conflict",
+        `card #${twin.card.number} "${twin.card.title}" is already open with the same ${twin.why}; add to it (card_edit / comment) instead of a second card`,
+      );
+    }
+  });
+
   /** A new card as it would be saved; nothing is written yet. */
   const draftCard = Effect.fn("KanbanService.draftCard")(function* (
     boardId: KanbanBoard["id"],
@@ -3679,6 +3870,7 @@ const make = Effect.gen(function* () {
     const fields = packet
       ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
       : input;
+    yield* refuseTwin(boardId, fields, actor);
     const card = yield* insertCard(yield* draftCard(boardId, fields, actor), fields);
     if (packet) yield* evaluatorTurn(null, card, actor);
     const ask = Asks.openBlockingAsk(card);
@@ -3706,7 +3898,8 @@ const make = Effect.gen(function* () {
     const pool =
       carried[0]?.activePool ??
       held?.pool ??
-      Rules.poolKey(
+      Rules.poolOf(
+        yield* store.pools(board.id),
         (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
       );
     const origin = carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null);
@@ -3762,8 +3955,8 @@ const make = Effect.gen(function* () {
       return yield* failWith("denied", `card #${card.number} is on another board`);
     }
     const cards = yield* store.cards(card.boardId);
-    const slots =
-      (yield* store.pools(card.boardId)).find((pool) => pool.key === thread.pool)?.slots ?? 0;
+    const pools = yield* store.pools(card.boardId);
+    const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
     const check = Rules.checkClaim(thread.board, card, {
       threadId,
       pool: thread.pool,
@@ -3771,6 +3964,7 @@ const make = Effect.gen(function* () {
       byId: new Map(cards.map((entry) => [entry.id as string, entry])),
       carrying: thread.carried.length,
       slots,
+      pools,
     });
     if (!check.ok) return yield* failWith("denied", check.reason);
     if (!thread.holdsSlot) {
@@ -3793,7 +3987,7 @@ const make = Effect.gen(function* () {
     const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
       ...card,
-      model: Rules.modelOnPool(card, pool) ?? card.model,
+      model: Rules.modelOnPool(card, pool, yield* store.pools(card.boardId)) ?? card.model,
       stage: "working",
       activeThreadId: threadId,
       activeRole: "work",
@@ -3841,18 +4035,19 @@ const make = Effect.gen(function* () {
         // The thread's live model comes first: a switch moves the thread even after every
         // card that carried the switch is released, and the held slot follows it.
         const live = yield* threads.model(threadId);
+        const pools = yield* store.pools(thread.board.id);
         const model = input.model
           ? yield* poolModel(thread.board.id, input.model)
           : (live ??
             thread.carried[0]?.model ??
             thread.link.model ??
-            (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.model ??
+            pools.find((pool) => pool.key === thread.pool)?.model ??
             thread.board.defaultCardModel);
         // A weighted list is checked by the take: one of its models must run here.
-        if (!input.models && Rules.poolKey(model) !== thread.pool) {
+        if (!input.models && Rules.poolOf(pools, model) !== thread.pool) {
           return yield* failWith(
             "denied",
-            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolKey(model)}`,
+            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolOf(pools, model)}`,
           );
         }
         const fields: NewCard = {
@@ -3867,7 +4062,9 @@ const make = Effect.gen(function* () {
           reviewChain: thread.origin ? thread.origin.reviewChain : (input.reviewChain ?? null),
           goalId: input.goalId ?? thread.origin?.goalId ?? null,
         };
-        const draft = yield* draftCard(thread.board.id, fields, { _tag: "thread", threadId });
+        const actor: KanbanActor = { _tag: "thread", threadId };
+        yield* refuseTwin(thread.board.id, fields, actor);
+        const draft = yield* draftCard(thread.board.id, fields, actor);
         yield* checkTake(thread, threadId, draft);
         const card = yield* insertCard(draft, fields);
         return yield* takeCard(threadId, thread.pool, card, "Created and taken by its work thread");
@@ -3880,9 +4077,8 @@ const make = Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
         const cards = yield* store.cards(thread.board.id);
         const mine = yield* ownCards(threadId, cards);
-        const slots =
-          (yield* store.pools(thread.board.id)).find((pool) => pool.key === thread.pool)?.slots ??
-          0;
+        const pools = yield* store.pools(thread.board.id);
+        const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
         // Without a slot of its own the thread can only claim while the pool has room.
         const full =
           !thread.holdsSlot &&
@@ -3902,6 +4098,7 @@ const make = Effect.gen(function* () {
                 projectId: thread.projectId,
                 carrying: thread.carried.length,
                 slots,
+                pools,
               }),
           holdsSlot: thread.holdsSlot,
         } satisfies NextCards;
@@ -3944,13 +4141,15 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
+        const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
         const model = models
           ? // A card with a work thread stays on its pool while the list still has it; the list's
             // entry carries the pool's variant, so a variant change sticks.
             (card.workThreadId !== null
-              ? models.find((entry) => Rules.poolKey(entry.model) === Rules.poolKey(card.model))
-                  ?.model
+              ? models.find(
+                  (entry) => Rules.poolOf(pools, entry.model) === Rules.poolOf(pools, card.model),
+                )?.model
               : undefined) ?? (models[0]?.model ?? card.model)
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
@@ -3999,8 +4198,8 @@ const make = Effect.gen(function* () {
         const saved =
           paused.activeThreadId !== null &&
           paused.activeRole === "work" &&
-          paused.activePool !== Rules.poolKey(paused.model)
-            ? { ...paused, activePool: Rules.poolKey(paused.model) }
+          paused.activePool !== Rules.poolOf(pools, paused.model)
+            ? { ...paused, activePool: Rules.poolOf(pools, paused.model) }
             : paused;
         yield* saveCard(saved);
         yield* evaluatorTurn(card, saved, actor);
@@ -4021,7 +4220,7 @@ const make = Effect.gen(function* () {
           // The thread now runs the new model's pool; its slot follows, so the pool
           // counts and the one-slot limit stay right. Cards sharing the thread take the
           // same model, so a steer or wake to any of them keeps the thread on it.
-          const newPool = Rules.poolKey(saved.model);
+          const newPool = Rules.poolOf(pools, saved.model);
           for (const other of yield* store.cardsByThread(saved.activeThreadId)) {
             if (other.id === saved.id) continue;
             yield* saveCard({ ...other, model: saved.model, activePool: newPool });
@@ -4638,43 +4837,239 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots) =>
+  /**
+   * The pool a pool request names: its exact level's pool; else, for a request with no
+   * level, the model's only pool. A model with pools at several levels needs the level.
+   * Undefined: no pool yet.
+   */
+  const namedPool = Effect.fn("KanbanService.namedPool")(function* (
+    pools: ReadonlyArray<KanbanPool>,
+    model: ModelSelection,
+  ) {
+    const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
+    const exact = same.find((pool) => Rules.poolKey(pool.model) === Rules.poolKey(model));
+    // A named level is exact: its pool, or none (a new pool at that level).
+    if (Rules.modelLevel(model) !== null) return exact;
+    // A request with no level must name one only when the model has several pools.
+    if (same.length > 1) {
+      const levels = same.map((pool) => Rules.modelLevel(pool.model) ?? "no level").join(", ");
+      return yield* failWith("invalid", `${model.model} has pools at ${levels}; name the level`);
+    }
+    return same[0];
+  });
+
+  /**
+   * Moves pool `from` to `to` (same row, new key and level) with the cards still to run on it,
+   * in one transaction (store.rekeyBoard). An open card's work model and weighted entries that
+   * resolve to `from` take the new level; a slot a card or a thread between cards holds on
+   * `from` moves to `to`. Done and settled cards keep the level they ran at. A running work
+   * thread switches for its next turn; review threads aren't switched, their next step reads
+   * the chain.
+   */
+  const movePoolLevel = Effect.fn("KanbanService.movePoolLevel")(function* (
+    board: KanbanBoard,
+    pools: ReadonlyArray<KanbanPool>,
+    from: KanbanPool,
+    to: KanbanPool,
+  ) {
+    const at = yield* nowIso;
+    // `pools` is read before the move: a card is on `from` when its model resolves to it now.
+    const onPool = (entry: ModelSelection) => Rules.poolOf(pools, entry) === from.key;
+    const moved: Array<{
+      readonly card: KanbanCard;
+      readonly leveled: boolean;
+      readonly work: boolean;
+    }> = [];
+    for (const card of yield* store.cards(board.id)) {
+      const moveSlot = card.activePool === from.key;
+      const open = card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage);
+      const work = open && onPool(card.model);
+      const weighted = open && card.models.some((entry) => onPool(entry.model));
+      if (!moveSlot && !work && !weighted) continue;
+      moved.push({
+        card: {
+          ...card,
+          model: work ? to.model : card.model,
+          models: weighted
+            ? card.models.map((entry) =>
+                onPool(entry.model) ? { ...entry, model: to.model } : entry,
+              )
+            : card.models,
+          activePool: moveSlot ? to.key : card.activePool,
+          updatedAt: work || weighted ? at : card.updatedAt,
+        },
+        leveled: work || weighted,
+        work,
+      });
+    }
+    yield* store.rekeyBoard(
+      board.id,
+      [{ from: from.key, pool: to }],
+      moved.map((entry) => entry.card),
+    );
+    const actor: KanbanActor = { _tag: "system", component: "pools" };
+    const level = Rules.modelLevel(to.model) ?? "default";
+    const switched = new Set<string>();
+    for (const { card, leveled, work } of moved) {
+      // Logged before the publish: clients re-read the card's history when it's published.
+      if (leveled) yield* logEvent(card, actor, "edited", { body: `model level: ${level}` });
+      yield* publish(board.id, { _tag: "card", card });
+      if (
+        work &&
+        card.activeRole === "work" &&
+        card.activeThreadId !== null &&
+        !switched.has(card.activeThreadId)
+      ) {
+        switched.add(card.activeThreadId);
+        yield* threads
+          .setModel(card.activeThreadId, to.model)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
+            ),
+          );
+      }
+    }
+    // A held slot (a work thread between cards) moves with its pool and keeps its start time.
+    // Its thread also switches: its last card may already be in review, so `moved` may not
+    // name it.
+    const held = yield* Ref.get(holds);
+    for (const [threadId, hold] of held) {
+      if (hold.boardId !== board.id || hold.pool !== from.key) continue;
+      if (!switched.has(threadId)) {
+        switched.add(threadId);
+        yield* threads
+          .setModel(threadId, to.model)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
+            ),
+          );
+      }
+    }
+    yield* Ref.update(
+      holds,
+      (all) =>
+        new Map(
+          [...all].map(([threadId, hold]) =>
+            hold.boardId === board.id && hold.pool === from.key
+              ? [threadId, { ...hold, pool: to.key }]
+              : [threadId, hold],
+          ),
+        ),
+    );
+  });
+
+  /** Moves the pool at `replaces` to `model`'s level, keeping its row and, unless given, its slots. */
+  const changePoolLevel = Effect.fn("KanbanService.changePoolLevel")(function* (
+    board: KanbanBoard,
+    model: ModelSelection,
+    slots: number | undefined,
+    replaces: string,
+  ) {
+    const pools = yield* store.pools(board.id);
+    const from = pools.find((pool) => pool.key === replaces);
+    if (!from) return yield* failWith("not-found", `pool ${replaces}`);
+    if (Rules.modelKey(from.model) !== Rules.modelKey(model)) {
+      return yield* failWith(
+        "invalid",
+        `${replaces} runs ${from.model.model}; a level change keeps the model`,
+      );
+    }
+    const key = Rules.poolKey(model);
+    const count = slots === undefined ? from.slots : Math.max(0, Math.round(slots));
+    // A pause (0 slots) of the same pool may keep an unoffered level, as on the plain path.
+    // A level change always stores `model`, and a running card is switched to it, so it
+    // always passes the same checks as a plain setPool.
+    const pausingSame = count === 0 && key === from.key;
+    if (!pausingSame) {
+      yield* checkModel(model);
+      const listed = isListed(yield* models.listed, model);
+      if (listed === false) {
+        return yield* failWith(
+          "invalid",
+          `${key} isn't in the model list; pick a model the composer offers`,
+        );
+      }
+    }
+    if (key === from.key) {
+      if (count === from.slots) return pools;
+      yield* store.putPool(board.id, { ...from, slots: count });
+      return yield* store.pools(board.id);
+    }
+    if (pools.some((pool) => pool.key === key)) {
+      return yield* failWith(
+        "conflict",
+        `${model.model} already has a pool at ${Rules.modelLevel(model) ?? "no level"}`,
+      );
+    }
+    yield* movePoolLevel(board, pools, from, { key, model, slots: count });
+    return yield* store.pools(board.id);
+  });
+
+  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots, options) =>
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
-        const key = Rules.poolKey(model);
+        if (options?.replaces !== undefined) {
+          const changed = yield* changePoolLevel(board, model, slots, options.replaces);
+          yield* publish(boardId, { _tag: "pools", pools: changed });
+          yield* kick;
+          return changed;
+        }
+        if (slots === undefined) return yield* failWith("invalid", "slots is required");
         const count = Math.max(0, Math.round(slots));
-        const existing = (yield* store.pools(board.id)).find((pool) => pool.key === key);
+        const pools = yield* store.pools(board.id);
+        const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
+        const offered = Result.isSuccess(yield* Effect.result(checkModel(model)));
+        // A pause at a level the provider doesn't offer pauses the model's only pool.
+        const existing =
+          (yield* namedPool(pools, model)) ??
+          (count === 0 && !offered && same.length === 1 ? same[0] : undefined);
         // Pausing an existing pool must always work, even when its model has left the
         // provider's catalog: the pool is being stopped, not started.
         const pausing = count === 0 && existing !== undefined;
-        // A pause that names a variant the provider doesn't offer keeps the pool's stored
-        // model, so the board's model for this pool is never replaced by an unoffered one.
+        // A resize that names no level, or a pause at an unoffered level, keeps the pool's
+        // stored model, so a pool's level is never dropped or replaced by an unoffered one.
         const stored =
-          pausing && existing !== undefined && Result.isFailure(yield* Effect.result(checkModel(model)))
+          existing !== undefined && (Rules.modelLevel(model) === null || (pausing && !offered))
             ? existing.model
             : model;
-        if (!pausing) yield* checkModel(model);
+        if (!pausing) yield* checkModel(stored);
         // Unknown (null) never blocks; only a model the composer is known not to offer does.
-        const listed = isListed(yield* models.listed, model);
+        const listed = isListed(yield* models.listed, stored);
         if (listed === false && !pausing) {
-          return yield* failWith("invalid", `${key} isn't in the model list; pick a model the composer offers`);
+          return yield* failWith(
+            "invalid",
+            `${Rules.poolKey(stored)} isn't in the model list; pick a model the composer offers`,
+          );
         }
-        yield* store.putPool(boardId, { key, model: stored, slots: count });
-        const pools = yield* store.pools(boardId);
-        yield* publish(boardId, { _tag: "pools", pools });
+        yield* store.putPool(boardId, {
+          key: existing?.key ?? Rules.poolKey(stored),
+          model: stored,
+          slots: count,
+        });
+        const saved = yield* store.pools(boardId);
+        yield* publish(boardId, { _tag: "pools", pools: saved });
         yield* kick;
-        return pools;
+        return saved;
       }),
     );
 
-  const removePool: KanbanServiceShape["removePool"] = (boardId, model) =>
+  const removePool: KanbanServiceShape["removePool"] = (boardId, model, options) =>
     guard(
       Effect.gen(function* () {
         const board = yield* boardOf(boardId);
-        const key = Rules.poolKey(model);
-        const pool = (yield* store.pools(board.id)).find((candidate) => candidate.key === key);
-        if (!pool) return yield* failWith("not-found", `pool ${key}`);
+        const pools = yield* store.pools(board.id);
+        // A named key is the exact pool, even for a level-less request on a model with several pools.
+        const pool =
+          options?.replaces !== undefined
+            ? pools.find((candidate) => candidate.key === options.replaces)
+            : yield* namedPool(pools, model);
+        if (!pool) return yield* failWith("not-found", `pool ${Rules.poolKey(model)}`);
+        const key = pool.key;
+        // A model with no pool at its own level runs on its model's first pool (Rules.poolFor).
+        const runsHere = (used: ModelSelection) => Rules.poolFor(pools, used)?.key === key;
         if (pool.slots > 0) {
           return yield* failWith("invalid", `${key} has ${pool.slots} slots; set it to 0 before removing`);
         }
@@ -4684,12 +5079,12 @@ const make = Effect.gen(function* () {
           ["the default card model", board.defaultCardModel],
         ];
         for (const [label, used] of boardUses) {
-          if (used && Rules.poolKey(used) === key) {
+          if (used && runsHere(used)) {
             return yield* failWith("invalid", `${label} uses ${key}`);
           }
         }
         for (const chain of board.reviewChains) {
-          if (chain.steps.some((step) => Rules.poolKey(step) === key)) {
+          if (chain.steps.some(runsHere)) {
             return yield* failWith("invalid", `a review chain uses ${key}`);
           }
         }
@@ -4699,15 +5094,15 @@ const make = Effect.gen(function* () {
           }
           if (card.settledAt !== null) continue;
           // card.model is the pinned work model, kept even when weighted candidates exist.
-          if (Rules.modelOnPool(card, key) !== null) {
+          if (Rules.modelOnPool(card, key, pools) !== null) {
             return yield* failWith("invalid", `card #${card.number} uses ${key}`);
           }
         }
         yield* store.removePool(board.id, key);
-        const pools = yield* store.pools(board.id);
-        yield* publish(boardId, { _tag: "pools", pools });
+        const left = yield* store.pools(board.id);
+        yield* publish(boardId, { _tag: "pools", pools: left });
         yield* kick;
-        return pools;
+        return left;
       }),
     );
 
@@ -4947,7 +5342,7 @@ const make = Effect.gen(function* () {
     Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
-        const snapshot = yield* read(snapshotOf(boardId));
+        const snapshot = yield* readDb(snapshotOf(boardId));
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
           Stream.map((entry): KanbanWatchEvent => ({
@@ -4974,7 +5369,7 @@ const make = Effect.gen(function* () {
           Effect.forEach(all, (board) =>
             Effect.all({
               board: Effect.succeed(board),
-              cards: store.cards(board.id),
+              cards: store.summaryCards(board.id),
               discussions: store.discussions(board.id),
               threadIds: Effect.map(
                 store.threadLinks({ boardId: board.id, open: false }),
@@ -4987,6 +5382,50 @@ const make = Effect.gen(function* () {
       return Summaries.follow(Summaries.tallyBoards(boards), Stream.fromSubscription(subscription));
     }),
   );
+
+  /**
+   * Pool keys carry the level (`instance/model#level`) since one model can run as several
+   * pools. Pools stored before that are rekeyed in place (UPDATE keeps the row, so pool
+   * order stays), and cards whose activePool names an old key follow. Each board's pools
+   * and cards move in one transaction, so a failed write leaves that board on its old keys
+   * and consistent; the next start tries again. Runs before the worker or any request; a
+   * board with no stale pool costs one pools read.
+   */
+  const rekeyBoard = Effect.fn("KanbanService.rekeyBoard")(
+    function* (board: KanbanBoard) {
+      const pools = yield* store.pools(board.id);
+      const moves = new Map<string, string>();
+      for (const pool of pools) {
+        const key = Rules.poolKey(pool.model);
+        if (pool.key === key) continue;
+        if (pools.some((other) => other.key === key)) {
+          yield* Effect.logWarning(
+            `board ${board.slug}: pool ${pool.key} can't become ${key}, taken`,
+          );
+          continue;
+        }
+        moves.set(pool.key, key);
+      }
+      if (moves.size === 0) return;
+      const cards = (yield* store.cards(board.id))
+        .filter((card) => card.activePool !== null && moves.has(card.activePool))
+        .map((card) => ({ ...card, activePool: moves.get(card.activePool!)! }));
+      const rekeyed = pools
+        .filter((pool) => moves.has(pool.key))
+        .map((pool) => ({ from: pool.key, pool: { ...pool, key: moves.get(pool.key)! } }));
+      yield* store.rekeyBoard(board.id, rekeyed, cards);
+      for (const { from, pool } of rekeyed) {
+        yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
+      }
+    },
+    (effect, board) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`kanban pool rekey failed for board ${board.slug}`, { cause }),
+        ),
+      ),
+  );
+  yield* Effect.forEach(yield* store.boards, rekeyBoard, { discard: true });
 
   const runJob = (job: Job) =>
     lock
@@ -5003,17 +5442,17 @@ const make = Effect.gen(function* () {
   // drain against an empty pool after a restart.
   yield* restoreAdmissions();
   return KanbanService.of({
-    boards: read(store.boards),
+    boards: readDb(store.boards),
     ensureBoard,
     createBoard,
     updateBoard,
-    snapshot: (boardId) => read(snapshotOf(boardId)),
+    snapshot: (boardId) => readDb(snapshotOf(boardId)),
     watch,
     boardSummaries,
     announce: (boardId, change) => Effect.asVoid(publish(boardId, change)),
     changes: Effect.map(PubSub.subscribe(changes), Stream.fromSubscription),
     card: (cardId) =>
-      read(
+      readDb(
         Effect.gen(function* () {
           const card = yield* cardOf(cardId);
           return {
@@ -5038,18 +5477,18 @@ const make = Effect.gen(function* () {
     removePool,
     setGoal,
     setGroups,
-    discussions: (boardId) => read(store.discussions(boardId)),
-    threads: (boardId) => read(threadRowsOf(boardId)),
-    discussion: (id) => read(discussionOf(id)),
+    discussions: (boardId) => readDb(store.discussions(boardId)),
+    threads: (boardId) => readDb(threadRowsOf(boardId)),
+    discussion: (id) => readDb(discussionOf(id)),
     createDiscussion,
     updateDiscussion,
     cardDiscussion: (cardId) => guard(cardDiscussionUnlocked(cardId)),
-    messages: (id, options) => read(store.messages(id, options)),
+    messages: (id, options) => readDb(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
-    wiki: (boardId) => read(store.wiki(boardId)),
+    wiki: (boardId) => readDb(store.wiki(boardId)),
     writeWiki,
     endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
     startSetup: (boardId, input) =>

@@ -10,9 +10,12 @@ import subprocess
 import sys
 import time
 
-from . import api, capacity, lease, pool, ssh_sync
-from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, LOGS_DIR, TOO_BIG_NOTE, OffboxError, ago, atomic_write_json, db, event, file_lock, iso,
-                     month_key, now, read_json, say)
+from . import api, capacity, lease, outage, pool, ssh_sync
+from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
+                     offsets_path, read_json, say)
+
+WAIT_POLL_S = 5
 
 
 def parse_ttl(s: str) -> int:
@@ -235,28 +238,37 @@ def ports(me: dict, remote: int, local: int | None, box_id: str | None, reverse:
     return 0
 
 
+STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (each call gets its own budget)
+
+
 def status(me: dict) -> None:
     con = db()
     cap = read_json(CAP_PATH, {})
+    d = outage.current()
+    if d:
+        print(f"boat.dev: DOWN since {iso(d['since'])} ({d.get('reason')}), last failure {ago(d.get('seen'))} ago")
     try:
-        L = api.limits()
+        with api.budget(STATUS_CALL_S):
+            L = api.limits()
         sps = L.get("creditSecondsPerDollar") or 100000
         print(f"account: plan {L.get('sandboxPlanKey')} {L.get('subscriptionStatus')}, can start: {L.get('canStart')}, "
               f"active boxes {L.get('activeSandboxes')}/{L.get('maxActiveSandboxes')}, "
               f"plan left ${(L.get('subscriptionRemainingSeconds') or 0) / sps:.2f}, packs ${L.get('packBalanceDollars')}")
     except OffboxError as e:
-        print(f"account: unreachable ({e})")
+        print(f"account: boat API unreachable ({e})")
     capped = cap.get("capped")
     print(f"cap: {'CAPPED' if capped else 'ok'} (last spend ${cap.get('spend', 0):.2f})")
     s = capacity.snapshot(con)
     print('starts: ' + ', '.join(f"{w['used']}/{w['cap']} in {w['window']}s" for w in s['counts']) +
           (f"; next local allowance {iso(s['retry_at'])}" if s['blocked'] else '; allowance available'))
     try:
-        for b in api.list_boxes():
+        with api.budget(STATUS_CALL_S):
+            boxes = api.list_boxes()
+        for b in boxes:
             r = con.execute("SELECT repo_key, owner FROM leases WHERE box_id=?", (b["id"],)).fetchone()
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}")
     except OffboxError as e:
-        print(f"boxes: {e}")
+        print(f"boxes: boat API unreachable ({e})")
     print(f"you: {me['owner']} repo {me['repo_root']}")
 
 
@@ -271,6 +283,11 @@ def _run_row(run_id: str):
 def logs(run_id: str, do_follow: bool) -> int:
     from .runs import finish, follow
     r = _run_row(run_id)
+    if r["status"] in ("starting", "running") and not (r["box_id"] and r["process_id"]):
+        if do_follow:
+            return _wait_locked(r, echo=True)
+        if r['mode'] != 'local':
+            say(f"{_not_started(r)}; no output yet. Follow it with: offbox logs {r['run_id']} --follow")
     if r["status"] in ("starting", "running") and r["box_id"] and r["process_id"]:
         s = api.get(r["box_id"])
         if s and s.get("state") in api.LIVE_STATES:
@@ -299,26 +316,238 @@ def logs(run_id: str, do_follow: bool) -> int:
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
     if r["status"] not in ("starting", "running"):
-        print(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
-        return r["exit_code"] if r["exit_code"] is not None else 90
-    return _wait_locked(r, echo=False)
+        return _settled(r)
+    return _wait_locked(r, echo=False, timeout=timeout)
 
 
-def _wait_locked(r, echo):
-    with file_lock('box-'+r['box_id'], timeout=120):
-        return _wait_run(_run_row(r['run_id']), echo)
+def _settled(r) -> int:
+    print(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
+    return r["exit_code"] if r["exit_code"] is not None else 90
 
 
-def _wait_run(r, echo):
-    from .runs import do_pulls, finish, follow, go_std_glitch, recover_lost_exit
-    if r['status'] not in ('starting','running'):
-        return r['exit_code'] if r['exit_code'] is not None else 90
-    code = follow(r["box_id"], r["process_id"], LOGS_DIR / f"{r['run_id']}.log", echo=echo)
+def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
+    """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
+    are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            data = f.read() if limit is None else f.read(max(0, limit - pos))
+    except OSError:
+        return pos
+    if data and echo:
+        sys.stdout.write(data.decode(errors="replace"))
+        sys.stdout.flush()
+    return pos + len(data)
+
+
+def _truncate(path, size: int) -> None:
+    """Cut a local log back to its committed length (a holder died after writing a chunk but before committing it)."""
+    try:
+        if os.path.getsize(path) > size:
+            with open(path, "r+b") as f:
+                f.truncate(size)
+    except OSError:
+        pass
+
+
+def _wait_locked(r, echo, timeout=None):
+    """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
+    holds the lock, poll the run row (and tail the local log) instead of failing on the lock.
+    `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
+    over, only checkpointed bytes are delivered (see runs.follow): a takeover replays everything past the checkpoint,
+    and a log with no checkpoint at all (a holder from before checkpoints) is replayed whole into an emptied log."""
+    deadline = None if timeout is None else now() + timeout
+    log_path = LOGS_DIR / f"{r['run_id']}.log"
+    r = _wait_for_start(r, deadline)
+    if r['status'] not in ('starting', 'running'):
+        _tail(log_path, 0, echo)
+        return _settled(r)
+    pos, said = 0, False
+    while True:
+        guard = file_lock('box-' + r['box_id'], timeout=0)
+        try:
+            guard.__enter__()
+        except OffboxError:
+            pass
+        else:
+            try:
+                cur = _run_row(r['run_id'])
+                if cur['status'] not in ('starting', 'running'):
+                    # The holder wrote its last output, recorded the end and released the lock between two polls.
+                    # Nothing will be replayed now, so drain the whole rest of the log.
+                    _tail(log_path, pos, echo)
+                    return _settled(cur)
+                ck = checkpoint(log_path)
+                # Nothing below may touch the original log before the replay is confirmed. A deadline that has already
+                # passed ends the wait here, with the log and its checkpoint exactly as they were.
+                if deadline is not None and now() >= deadline:
+                    raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
+                                      f"stopped). Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+                # `ck is not None` is the validity test; a checkpoint at zero bytes is valid and committed.
+                if ck is not None:
+                    _tail(log_path, pos, echo, ck["logBytes"])
+                    start = (ck["stdoutOffset"], ck["stderrOffset"])
+                    keep = ck["logBytes"]
+                else:
+                    # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
+                    start, keep = (0, 0), 0
+                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None)
+            finally:
+                guard.__exit__(None, None, None)
+        ck = checkpoint(log_path)
+        if ck:
+            pos = _tail(log_path, pos, echo, ck["logBytes"])
+        cur = _run_row(r['run_id'])
+        if cur['status'] not in ('starting', 'running'):
+            # Settled: nothing will be replayed, so drain the whole rest of the log.
+            _tail(log_path, pos, echo)
+            return _settled(cur)
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
+                              f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        if not said:
+            say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
+                f"waiting for it to record the end")
+            said = True
+        pause = WAIT_POLL_S if deadline is None else max(0.0, min(WAIT_POLL_S, deadline - now()))
+        time.sleep(pause)
+
+
+def _not_started(r) -> str:
+    if r['mode'] == 'local':
+        return f"{r['run_id']} runs on this Mac (local-first), not on a box"
+    if not r['box_id']:
+        return f"{r['run_id']} has no box yet (queued for a pool box)"
+    return f"{r['run_id']} has {r['box_id']} but its command hasn't started yet"
+
+
+def _pid_started_at(pid: int) -> float | None:
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+                             env=dict(os.environ, LC_ALL="C")).stdout.strip()
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y")) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _client_alive(pid: int | None, start_at: float | None) -> bool:
+    """Is the `offbox run` that inserted this row still running? Unknown (no pid recorded) counts as alive.
+    A live pid that started after the run did is a reused pid, so the client is gone."""
+    if not pid:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    began = _pid_started_at(pid)
+    return began is None or start_at is None or began <= start_at + 2
+
+
+def _wait_for_start(r, deadline):
+    """Poll a run row until it has a box and a started command (box_id and process_id), or settles; return that row.
+    A run queued for a pool box has no box_id, and one still syncing has no process_id: there is no box lock to
+    take and no process to attach to yet (31 Oct: `wait` crashed on 'box-' + None while a run waited for its pool)."""
+    said = None
+    while True:
+        cur = _run_row(r['run_id'])
+        if cur['status'] not in ('starting', 'running') or (cur['box_id'] and cur['process_id']):
+            return cur
+        pid = cur['client_pid'] if 'client_pid' in cur.keys() else None
+        if not _client_alive(pid, cur['start_at']):
+            if not cur['box_id']:
+                con = db()
+                con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
+                            "AND status IN ('starting','running')",
+                            (now(), "client ended before it got a box", cur['run_id']))
+                con.commit()
+                say(f"{cur['run_id']}: its offbox client (pid {pid}) ended before it got a box; never started, "
+                    "nothing ran")
+                continue
+            # It had a box, so the start request may have reached boat: leave the row to the reaper.
+            raise OffboxError(f"{cur['run_id']}: its offbox client (pid {pid}) ended on {cur['box_id']} before the "
+                              "command was recorded as started, so there is nothing to follow. `offbox reap` settles "
+                              "the row; check `offbox list` before running it again", code=EXIT_INFRA)
+        if deadline is not None and now() >= deadline:
+            raise OffboxError(f"--timeout reached; {_not_started(cur)} (nothing was stopped). "
+                              f"Wait again: offbox wait {cur['run_id']}", code=EXIT_WAIT_TIMEOUT)
+        msg = f"{_not_started(cur)}; " + ("waiting for it to end" if cur['mode'] == 'local' else
+                                          "waiting for a box" if not cur['box_id'] else "waiting for it to start")
+        if msg != said:
+            say(msg)
+            said = msg
+        pause = WAIT_POLL_S if deadline is None else max(0.0, min(WAIT_POLL_S, deadline - now()))
+        time.sleep(pause)
+
+
+def _has_data(log_path) -> bool:
+    """True when the local log exists and holds bytes. Such a log may be legacy output with no checkpoint, which must
+    never be rewritten in place before the replay is confirmed."""
+    try:
+        return os.path.getsize(log_path) > 0
+    except OSError:
+        return False
+
+
+def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False):
+    """Take over a run's follow without touching the original local log until the replay is confirmed.
+
+    The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
+    run still produces. It replaces the original log and checkpoint only when the replay ends with a real exit code.
+    A deadline, a lost stream (unknown exit) or any error removes the temp files and keeps the original."""
+    tmp = log_path.with_name(log_path.name + ".takeover")
+    tmp_ck = offsets_path(tmp)
+    try:
+        prefix = b""
+        if keep:
+            with open(log_path, "rb") as src:
+                prefix = src.read(keep)
+        with open(tmp, "wb") as dst:
+            dst.write(prefix)
+        # The replay's follow commits checkpoints into tmp: it starts at the committed prefix, then tracks the stream.
+        # Mirroring makes new output visible to a lock-blocked follower of the original log. It is safe when the
+        # original has a committed length (`has_checkpoint`), or when it holds no data at all (absent or empty, so the
+        # mirror creates it). A nonempty log with no checkpoint (a legacy holder) is never written in place.
+        mirror = log_path if (has_checkpoint or not _has_data(log_path)) else None
+        code = _resolve_exit(cur, log_path, deadline, start, tmp, echo=echo, mirror_path=mirror, mirror_keep=keep)
+        if code is None:
+            raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
+        # Publish the replacement log and checkpoint before the run is recorded as settled.
+        os.replace(tmp, log_path)
+        if os.path.exists(tmp_ck):
+            os.replace(tmp_ck, offsets_path(log_path))
+        return _finalize(cur, code, log_path)
+    except BaseException:
+        for p in (tmp, tmp_ck):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        raise
+
+
+def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mirror_path=None, mirror_keep=0):
+    """Attach and follow the run to its end. Returns the real exit code, or None when the outcome is unknown (the
+    stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
+    `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
+    only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
+    from .runs import follow, recover_lost_exit
+    code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
+                  start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
+                  mirror_keep=mirror_keep)
     if code is None:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", 0)
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0)
         if code is not None:
             print(f"offbox: boat lost track of the remote process after it ended; exit {code} taken from {how}",
                   file=sys.stderr)
+    return code
+
+
+def _finalize(r, code, log_path) -> int:
+    """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
+    describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
+    from .runs import do_pulls, finish, go_std_glitch
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
         con = db()
@@ -326,6 +555,16 @@ def _wait_run(r, echo):
                                (r["run_id"],)).fetchone())
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
-    go_std_glitch(r["box_id"], r["run_id"], LOGS_DIR / f"{r['run_id']}.log", code)
+    go_std_glitch(r["box_id"], r["run_id"], log_path, code)
     print(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
+
+
+def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
+    """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
+    from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
+    if r['status'] not in ('starting','running'):
+        return r['exit_code'] if r['exit_code'] is not None else 90
+    log_path = LOGS_DIR / f"{r['run_id']}.log"
+    code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
+    return _finalize(r, code, log_path)

@@ -72,7 +72,7 @@ class MarketplacePayment:
                     and str(card.get('mask', '')).endswith(order_card.LAST4)]
         if len(selected) != 1:
             journal.fail('MARKETPLACE_SAVED_CARD_MISMATCH')
-        self.payment_card_token = market._id(selected[0].get('id'))
+        self.payment_card_token = market.card_token(selected[0].get('id'))
         self.cvv_encryption = None
         if cvv is not None:
             from noon_cvv import encrypt

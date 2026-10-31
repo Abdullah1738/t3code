@@ -200,7 +200,7 @@ export const KanbanCard = Schema.Struct({
   reviewRound: NonNegativeInt,
   activeThreadId: Schema.NullOr(ThreadId),
   activeRole: Schema.NullOr(Schema.Literals(["work", "review"])),
-  /** Pool key (instance/model) the active thread holds a slot in. */
+  /** Pool key (instance/model#level) the active thread holds a slot in. */
   activePool: Schema.NullOr(Schema.String),
   workThreadId: Schema.NullOr(ThreadId),
   reviewThreadId: Schema.NullOr(ThreadId),
@@ -453,7 +453,7 @@ export const KanbanGoal = Schema.Struct({
 export type KanbanGoal = typeof KanbanGoal.Type;
 
 export const KanbanPool = Schema.Struct({
-  /** `instanceId/model`. */
+  /** `instanceId/model#level`, or `instanceId/model` for a model with no level. */
   key: TrimmedNonEmptyString,
   model: ModelSelection,
   slots: NonNegativeInt,

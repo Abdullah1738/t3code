@@ -98,6 +98,8 @@ const PoolCommand = Schema.Struct({
   /** Model id as the board's pools list it, e.g. "opus/claude-opus-5-5". */
   model: Schema.String,
   instanceId: Schema.optional(Schema.String),
+  /** The pool's level, e.g. "max"; needed when the board runs the model at several levels. */
+  variant: Schema.optional(Schema.String),
   slots: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 50 })),
 });
 

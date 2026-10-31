@@ -1,0 +1,15 @@
+import { KanbanCard } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
+/**
+ * The few card fields the board list's badges read. Internal to the store:
+ * not a wire schema, and no persistence columns.
+ */
+export const SummaryCard = Schema.Struct({
+  id: KanbanCard.fields.id,
+  stage: KanbanCard.fields.stage,
+  settledAt: KanbanCard.fields.settledAt,
+  activeThreadId: KanbanCard.fields.activeThreadId,
+  asks: Schema.Array(Schema.Struct({ closedAt: Schema.NullOr(Schema.String) })),
+});
+export type SummaryCard = typeof SummaryCard.Type;

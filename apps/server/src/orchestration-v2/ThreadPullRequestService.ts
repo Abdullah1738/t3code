@@ -126,6 +126,7 @@ export const make = Effect.gen(function* () {
           .getShellSnapshot({
             location: "active",
             unsettledOnly: !(backfill || pendingBackfill.size > 0),
+            pullRequestCandidatesOnly: true,
           })
           .pipe(NodeSqliteClient.readOnly)
       : Effect.gen(function* () {

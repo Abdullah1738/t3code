@@ -488,6 +488,93 @@ it.effect(
     }).pipe(Effect.provide(layerSql)),
 );
 
+it.effect("shell and settlement authored-message lookups use the authored index", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = yield* createThread("authored-index");
+    const noMatch = yield* createThread("authored-none");
+    const genuineAt = "2026-01-01T00:00:00.000Z";
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${"message:genuine"}, ${threadId}, NULL, NULL, 'user', 0, ${genuineAt}, ${genuineAt},
+        '{"createdBy":"user"}')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      SELECT 'message:system:' || value, ${threadId}, NULL, NULL, 'user', 0,
+        '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z', '{"createdBy":"system"}'
+      FROM json_each(${JSON.stringify(Array.from({ length: 3000 }, (_, i) => i + 1))})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${"message:noise-assistant"}, ${noMatch}, NULL, NULL, 'user', 0,
+        '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z', '{"createdBy":"system"}')`;
+    const queries: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+    const record: Statement.Transformer = (statement) =>
+      Effect.sync(() => {
+        queries.push(statement.compile());
+        return statement;
+      });
+    const candidates = yield* store
+      .getSettlementCandidates()
+      .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    const settlement = candidates.find((thread) => thread.id === threadId);
+    assert.isDefined(settlement);
+    assert.equal(
+      DateTime.toEpochMillis(settlement!.latestUserAuthoredMessageAt!),
+      DateTime.toEpochMillis(DateTime.makeUnsafe(genuineAt)),
+    );
+    assert.isNull(
+      candidates.find((thread) => thread.id === noMatch)?.latestUserAuthoredMessageAt ?? null,
+    );
+    const shell = yield* store
+      .getShellSnapshot({ location: "active" })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    const shellThread = shell.threads.find((thread) => thread.id === threadId);
+    assert.isDefined(shellThread);
+    assert.equal(
+      DateTime.toEpochMillis(shellThread!.latestUserAuthoredMessageAt!),
+      DateTime.toEpochMillis(DateTime.makeUnsafe(genuineAt)),
+    );
+    const authoredQueries = queries.filter(([query]) =>
+      query.includes("AS latest_user_authored_message_at"),
+    );
+    assert.isAtLeast(authoredQueries.length, 2);
+    for (const [query, params] of authoredQueries) {
+      const plan = yield* sql.unsafe<{
+        readonly id: number;
+        readonly parent: number;
+        readonly detail: string;
+      }>(`EXPLAIN QUERY PLAN ${query}`, params);
+      // Walk the authored scalar subquery's subtree: the SEARCH on the authored index and
+      // every node below its scalar-subquery parent. The outer thread sort is not in it.
+      const authoredSearch = plan.find((row) =>
+        row.detail.includes("USING INDEX ardud_v2_messages_latest_user_authored_idx"),
+      );
+      assert.isDefined(authoredSearch);
+      const subqueryId = authoredSearch!.parent;
+      const subtree = new Set<number>([subqueryId]);
+      let grew = true;
+      while (grew) {
+        grew = false;
+        for (const row of plan) {
+          if (!subtree.has(row.id) && subtree.has(row.parent)) {
+            subtree.add(row.id);
+            grew = true;
+          }
+        }
+      }
+      const subtreeRows = plan.filter((row) => subtree.has(row.id));
+      assert.isTrue(subtreeRows.some((row) => row.id === authoredSearch!.id));
+      assert.isFalse(subtreeRows.some((row) => row.detail.includes("TEMP B-TREE")));
+    }
+    const neighbour = yield* sql<{ readonly updated_at: string }>`
+      SELECT updated_at FROM orchestration_v2_projection_messages
+      WHERE thread_id = ${threadId} AND role = 'user'
+      ORDER BY updated_at DESC, message_id DESC LIMIT 1`;
+    assert.equal(neighbour[0]?.updated_at, "2026-02-01T00:00:00.000Z");
+  }).pipe(Effect.provide(layerSql)),
+);
+
 it.effect("shell failure lookups stay on the thread's own turn items", () =>
   Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;
