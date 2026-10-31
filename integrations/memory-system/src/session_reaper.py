@@ -584,7 +584,9 @@ def main():
             st["deleted_roots"] = 0
         st["state"] = "error" if st["errors"] else "done"
     except Gate as e:
-        st["state"] = "gated"
+        # A Gate after an error was recorded (e.g. an exhausted archive retry)
+        # must not hide it: health_check treats "gated" as healthy.
+        st["state"] = "error" if st["errors"] else "gated"
         st["message"] = str(e)
     except Exception as e:
         st["state"] = "error"

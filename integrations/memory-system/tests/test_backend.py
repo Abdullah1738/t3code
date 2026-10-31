@@ -4,11 +4,14 @@ Runs on the system python, touches no real data:
   python3 -m unittest discover -s tests -p 'test_*.py'
 """
 import base64
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -524,6 +527,52 @@ class ReaperProtection(unittest.TestCase):
             self.assertEqual(len(st["errors"]), 1)
             self.assertIn("ses_x: archiving its Robob thread failed 5 times", st["errors"][0])
             self.assertEqual(session_reaper.load_pending(), {})
+
+    def run_main_gated(self, pending_attempts=None, gate_msg="stop"):
+        # Runs main() with the external pieces stubbed; a Gate raised after the
+        # retry pass (at Verifier construction) ends the run.
+        logs = os.path.join(self.tmp.name, "logs")
+        os.makedirs(logs)
+        status = os.path.join(logs, "session_reaper_last.json")
+        oc_db = os.path.join(self.tmp.name, "oc.sqlite")
+        sqlite3.connect(oc_db).close()
+        patches = [
+            mock.patch.object(session_reaper, "LOGS", logs),
+            mock.patch.object(session_reaper, "STATUS", status),
+            mock.patch.object(session_reaper, "OC_DB", oc_db),
+            mock.patch.object(session_reaper, "backup_gate", return_value={"snapshot": "abcd1234", "backup_ts": 0}),
+            mock.patch.object(session_reaper, "running_ids", return_value=set()),
+            mock.patch.object(session_reaper, "control_gate"),
+            mock.patch.object(session_reaper, "load_sessions", return_value=({}, set())),
+            mock.patch.object(session_reaper, "protected_ids", return_value=set()),
+            mock.patch.object(session_reaper, "Verifier", side_effect=session_reaper.Gate(gate_msg)),
+            mock.patch.object(session_reaper, "archive_robob_thread",
+                              side_effect=TimeoutError("timed out")),
+            mock.patch.object(sys, "argv", ["session_reaper.py"]),
+            clean_env(MEMORY_BACKEND="robob"),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            if pending_attempts is not None:
+                session_reaper.save_pending({"ses_x": {"attempts": pending_attempts, "first_ts": 0, "last_error": "timed out"}})
+            with contextlib.redirect_stdout(io.StringIO()):
+                session_reaper.main()
+            pending = session_reaper.load_pending()
+        return json.load(open(status)), pending
+
+    def test_exhausted_retry_then_gate_stays_error(self):
+        status, pending = self.run_main_gated(pending_attempts=4)
+        self.assertEqual(pending, {})
+        self.assertEqual(len(status["errors"]), 1)
+        self.assertIn("ses_x: archiving its Robob thread failed 5 times", status["errors"][0])
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["message"], "stop")
+
+    def test_gate_without_errors_stays_gated(self):
+        status, _ = self.run_main_gated(pending_attempts=None)
+        self.assertEqual(status["errors"], [])
+        self.assertEqual(status["state"], "gated")
 
 
 if __name__ == "__main__":
