@@ -218,11 +218,14 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     key: string,
   ) => Effect.Effect<void, KanbanStoreError>;
-  /** Gives the pool at `from` a new key and record in place; its row, and so its order, stay. */
-  readonly rekeyPool: (
+  /**
+   * Gives each pool in `pools` (keyed by its old key) a new key and record in place, and
+   * writes the cards, in one transaction: a failure leaves the board as it was.
+   */
+  readonly rekeyBoard: (
     boardId: KanbanBoardId,
-    from: string,
-    pool: KanbanPool,
+    pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
+    cards: ReadonlyArray<KanbanCard>,
   ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
@@ -521,16 +524,28 @@ const make = Effect.gen(function* () {
         `;
       }),
     );
-  const rekeyPool = (boardId: KanbanBoardId, from: string, pool: KanbanPool) =>
+  const rekeyBoard = (
+    boardId: KanbanBoardId,
+    pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
+    cards: ReadonlyArray<KanbanCard>,
+  ) =>
     run(
-      "rekey pool",
-      Effect.gen(function* () {
-        const json = yield* Pool.encode(pool);
-        yield* sql`
-          UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${json}
-          WHERE board_id = ${boardId} AND key = ${from}
-        `;
-      }),
+      "rekey board",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          for (const { from, pool } of pools) {
+            const json = yield* Pool.encode(pool);
+            yield* sql`
+              UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${json}
+              WHERE board_id = ${boardId} AND key = ${from}
+            `;
+          }
+          for (const card of cards) {
+            const json = yield* Card.encode(card);
+            yield* sql`UPDATE ardud_kanban_cards SET json = ${json} WHERE id = ${card.id}`;
+          }
+        }),
+      ),
     );
   const removePool = (boardId: KanbanBoardId, key: string) =>
     run(
@@ -838,7 +853,7 @@ const make = Effect.gen(function* () {
     pools,
     putPool,
     removePool,
-    rekeyPool,
+    rekeyBoard,
     groups,
     putGroups,
     discussions,

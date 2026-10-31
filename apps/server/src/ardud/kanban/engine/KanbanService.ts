@@ -4769,12 +4769,13 @@ const make = Effect.gen(function* () {
   /**
    * Pool keys carry the level (`instance/model#level`) since one model can run as several
    * pools. Pools stored before that are rekeyed in place (UPDATE keeps the row, so pool
-   * order stays), and cards whose activePool names an old key follow. Cards go first: a
-   * crash in between leaves the pool stale, so the next start does both again. Runs before
-   * the worker or any request; a board with no stale pool costs one pools read.
+   * order stays), and cards whose activePool names an old key follow. Each board's pools
+   * and cards move in one transaction, so a failed write leaves that board on its old keys
+   * and consistent; the next start tries again. Runs before the worker or any request; a
+   * board with no stale pool costs one pools read.
    */
-  const rekeyPools = Effect.gen(function* () {
-    for (const board of yield* store.boards) {
+  const rekeyBoard = (board: KanbanBoard) =>
+    Effect.gen(function* () {
       const pools = yield* store.pools(board.id);
       const moves = new Map<string, string>();
       for (const pool of pools) {
@@ -4786,20 +4787,23 @@ const make = Effect.gen(function* () {
         }
         moves.set(pool.key, key);
       }
-      if (moves.size === 0) continue;
-      for (const card of yield* store.cards(board.id)) {
-        const key = card.activePool === null ? undefined : moves.get(card.activePool);
-        if (key !== undefined) yield* store.putCard({ ...card, activePool: key });
+      if (moves.size === 0) return;
+      const cards = (yield* store.cards(board.id))
+        .filter((card) => card.activePool !== null && moves.has(card.activePool))
+        .map((card) => ({ ...card, activePool: moves.get(card.activePool!)! }));
+      const rekeyed = pools
+        .filter((pool) => moves.has(pool.key))
+        .map((pool) => ({ from: pool.key, pool: { ...pool, key: moves.get(pool.key)! } }));
+      yield* store.rekeyBoard(board.id, rekeyed, cards);
+      for (const { from, pool } of rekeyed) {
+        yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
       }
-      for (const pool of pools) {
-        const key = moves.get(pool.key);
-        if (key === undefined) continue;
-        yield* store.rekeyPool(board.id, pool.key, { ...pool, key });
-        yield* Effect.logInfo(`board ${board.slug}: pool ${pool.key} is now ${key}`);
-      }
-    }
-  }).pipe(Effect.catchCause((cause) => Effect.logWarning("kanban pool rekey failed", { cause })));
-  yield* rekeyPools;
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning(`kanban pool rekey failed for board ${board.slug}`, { cause }),
+      ),
+    );
+  yield* Effect.forEach(yield* store.boards, rekeyBoard, { discard: true });
 
   const runJob = (job: Job) =>
     lock

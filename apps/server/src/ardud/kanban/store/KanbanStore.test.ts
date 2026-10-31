@@ -269,10 +269,10 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
       const a = { key: "opencode/opus/a", model, slots: 1 };
       const b = { key: "opencode/opus/b", model, slots: 2 };
       yield* store.putBoardWithPools(fresh, [a, b]);
-      yield* store.rekeyPool(fresh.id, a.key, { ...a, key: "opencode/opus/a#max" });
+      yield* store.rekeyBoard(fresh.id, [{ from: a.key, pool: { ...a, key: "opencode/opus/a#max" } }], []);
       assert.deepStrictEqual(yield* store.pools(fresh.id), [{ ...a, key: "opencode/opus/a#max" }, b]);
       // An unknown key changes nothing.
-      yield* store.rekeyPool(fresh.id, "opencode/opus/none", { ...b, key: "x" });
+      yield* store.rekeyBoard(fresh.id, [{ from: "opencode/opus/none", pool: { ...b, key: "x" } }], []);
       assert.deepStrictEqual((yield* store.pools(fresh.id)).map((pool) => pool.key), [
         "opencode/opus/a#max",
         "opencode/opus/b",
