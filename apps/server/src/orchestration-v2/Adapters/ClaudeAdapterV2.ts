@@ -155,6 +155,10 @@ import {
 import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  t3ToolInstructions,
+  type T3CodeToolAvailability,
+} from "../../provider/T3ToolInstructions.ts";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import {
   mcpToolPresentation,
@@ -1197,6 +1201,8 @@ export function makeClaudeQueryOptions(input: {
   readonly sdkSettings?: string | ClaudeSdkSettings;
   readonly environment?: NodeJS.ProcessEnv;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
+  /** Which preview/device tools the MCP credential grants; gates the guidance text. */
+  readonly t3ToolAvailability?: T3CodeToolAvailability;
   readonly tools?: ClaudeAgentSdkQueryTools;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly disallowedTools?: ReadonlyArray<string>;
@@ -1289,7 +1295,10 @@ export function makeClaudeQueryOptions(input: {
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
+        (input.mcpServers === undefined
+          ? ""
+          : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
+            t3ToolInstructionsSuffix(input.t3ToolAvailability ?? { browser: false, device: false })),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -1300,6 +1309,24 @@ export function makeClaudeQueryOptions(input: {
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+}
+
+/**
+ * Mirrors Codex's `toolInstructions`: the same capability-gated text for the same
+ * MCP credential, so Claude sessions learn about preview/device tools on the same terms.
+ */
+export function claudeT3ToolAvailability(
+  session: McpProviderSession.McpProviderSessionConfig | undefined,
+): T3CodeToolAvailability {
+  return {
+    browser: session?.browserToolsAvailable ?? true,
+    device: session?.capabilities?.has("device") ?? false,
+  };
+}
+
+function t3ToolInstructionsSuffix(availability: T3CodeToolAvailability): string {
+  const text = t3ToolInstructions(availability);
+  return text === "" ? "" : `\n\n${text}`;
 }
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
@@ -8923,8 +8950,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           nativeThreadId: string,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({
-            mcpSession: yield* mcpSessions.read(turnInput.threadId),
+            mcpSession,
             readOnlySandbox:
               sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly",
             ...(queryPolicy.allowedTools === undefined
@@ -9029,6 +9057,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(mcpOverrides.mcpServers === undefined
               ? {}
               : { mcpServers: mcpOverrides.mcpServers }),
+            t3ToolAvailability: claudeT3ToolAvailability(mcpSession),
             permissionMode: queryPolicy.permissionMode,
             ...(queryPolicy.allowDangerouslySkipPermissions === undefined
               ? {}
