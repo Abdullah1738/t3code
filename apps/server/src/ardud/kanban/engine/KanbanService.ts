@@ -622,10 +622,11 @@ const make = Effect.gen(function* () {
    * or that outlived HOLD_MAX_MS.
    */
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
-  // Evaluator turns this board started or woke and that haven't ended: the pool's busy count.
-  const admitted = yield* Ref.make<ReadonlyMap<ThreadId, { readonly boardId: string; readonly at: number }>>(
-    new Map(),
-  );
+  // Evaluator turns this board started or woke and that haven't ended, limit or not: the pool's busy
+  // count. `turn` is unique per admission, so a stale turn end can't release a newer admission.
+  const admitted = yield* Ref.make<
+    ReadonlyMap<ThreadId, { readonly boardId: string; readonly at: number; readonly turn: string }>
+  >(new Map());
   // Evaluator threads asked for a status: the run it was asked in and when. A new run starts over.
   const statusAsked = yield* Ref.make<ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>>(
     new Map(),
@@ -1533,27 +1534,66 @@ const make = Effect.gen(function* () {
     return next;
   });
 
+  /**
+   * Records an evaluator turn the board started, keyed to the run it started in
+   * (the thread's current run, when it has one).
+   */
   const admit = (threadId: ThreadId, boardId: string) =>
-    Effect.flatMap(nowMillis, (at) =>
-      Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at })),
-    );
-  const releaseSlot = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const at = yield* nowMillis;
+      const view = yield* threads.view(threadId);
+      const run = view?.runStartedAt ?? `admitted:${at}:${NodeCrypto.randomUUID()}`;
+      yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn: run }));
+    });
+
+  /**
+   * Releases a thread's admission when `turn` (the run that ended) is the one it
+   * was admitted in. A newer admission on the same thread is left alone, so a
+   * stale or repeated turn end can't free a slot a newer turn holds.
+   */
+  const releaseTurn = (threadId: ThreadId, turn: string) =>
     Ref.update(admitted, (all) => {
-      if (!all.has(threadId)) return all;
+      const entry = all.get(threadId);
+      if (!entry || entry.turn !== turn) return all;
       const next = new Map(all);
       next.delete(threadId);
       return next;
     });
+
+  /**
+   * Drops admitted turns the board can no longer see as running: idle or gone, and
+   * past the launch grace. Runs before any slot decision, so a restart or a limit
+   * change starts from the live count instead of stale entries.
+   */
+  const reconcileAdmitted = Effect.fn("KanbanService.reconcileAdmitted")(function* (
+    boardId: KanbanBoard["id"],
+  ) {
+    const now = yield* nowMillis;
+    for (const [threadId, entry] of yield* Ref.get(admitted)) {
+      if (entry.boardId !== boardId || now - entry.at < ADMIT_GRACE_MS) continue;
+      const view = yield* threads.view(threadId);
+      if (!view || view.state === "idle") yield* releaseTurn(threadId, entry.turn);
+    }
+  });
+
   const admittedCount = (boardId: string) =>
     Effect.map(
       Ref.get(admitted),
       (all) => [...all.values()].filter((entry) => entry.boardId === boardId).length,
     );
 
+  /** Whether the board's pool has no free slot. Reconciles first. */
+  const poolFull = Effect.fn("KanbanService.poolFull")(function* (board: KanbanBoard) {
+    if (board.evaluatorSlots === null) return false;
+    yield* reconcileAdmitted(board.id);
+    return (yield* admittedCount(board.id)) >= board.evaluatorSlots;
+  });
+
   /**
-   * An evaluator send through the board's evaluator pool. With no limit, or a
-   * thread already running (a steer), it goes straight through. Otherwise it
-   * takes a free slot, or waits in the queue for one.
+   * An evaluator send through the board's evaluator pool. A steer (a running
+   * turn) goes straight through, with no slot. Otherwise it takes a free slot,
+   * or waits in the queue for one. Every board-started turn is admitted, even
+   * with no limit, so a later limit counts it.
    */
   const sendEvaluator = Effect.fn("KanbanService.sendEvaluator")(function* (
     board: KanbanBoard,
@@ -1561,16 +1601,12 @@ const make = Effect.gen(function* () {
     text: string,
     model?: ModelSelection,
   ) {
-    if (board.evaluatorSlots === null) {
-      yield* threads.send({ threadId, ...(model ? { model } : {}), text });
-      return "sent" as const;
-    }
     const view = yield* threads.view(threadId);
     if (view && view.state !== "idle") {
       yield* threads.send({ threadId, ...(model ? { model } : {}), text });
       return "sent" as const;
     }
-    if ((yield* admittedCount(board.id)) < board.evaluatorSlots) {
+    if (!(yield* poolFull(board))) {
       yield* threads.send({ threadId, ...(model ? { model } : {}), text });
       yield* admit(threadId, board.id);
       return "sent" as const;
@@ -1585,8 +1621,9 @@ const make = Effect.gen(function* () {
 
   /**
    * Starts queued evaluator sends while the pool has room, oldest first. A
-   * thread's queued texts go as one send. A failed send drops its rows and
-   * the drain goes on, so a dead thread can't jam the queue.
+   * thread's queued texts go as one send. The rows are deleted only after the
+   * send is accepted, so an interruption leaves them queued. A failed send
+   * keeps its rows and ends this pass, so a dead thread can't spin the drain.
    */
   const drainEvaluators = Effect.fn("KanbanService.drainEvaluators")(function* (boardId: KanbanBoard["id"]) {
     const board = yield* boardOf(boardId);
@@ -1594,27 +1631,36 @@ const make = Effect.gen(function* () {
       const queue = yield* store.evaluatorQueue(boardId);
       const first = queue[0];
       if (first === undefined) return;
-      if (board.evaluatorSlots !== null && (yield* admittedCount(boardId)) >= board.evaluatorSlots) return;
+      if (yield* poolFull(board)) return;
       const threadId = ThreadId.make(first.threadId);
       const mine = queue.filter((item) => item.threadId === threadId);
       const text = mine.map((item) => item.entry.text).join("\n\n");
       const model = mine.at(-1)?.entry.model ?? undefined;
-      yield* store.dropEvaluatorQueue(threadId);
-      const sent = yield* threads
-        .send({ threadId, text, ...(model ? { model } : {}) })
-        .pipe(
-          Effect.as(true),
-          Effect.catchCause((cause) =>
-            Effect.logWarning("kanban evaluator queue send failed", { boardId, threadId, cause }).pipe(
-              Effect.as(false),
-            ),
+      const sent = yield* threads.send({ threadId, text, ...(model ? { model } : {}) }).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator queue send failed", { boardId, threadId, cause }).pipe(
+            Effect.as(false),
           ),
-        );
-      if (sent) yield* admit(threadId, boardId);
+        ),
+      );
+      if (!sent) return;
+      yield* admit(threadId, boardId);
+      yield* store.dropEvaluatorQueue(threadId);
     }
   });
 
   const startEvaluatorUnlocked = Effect.fn("KanbanService.startEvaluatorUnlocked")(function* (
+    board: KanbanBoard,
+    purpose: Briefs.EvaluatorPurpose,
+    extra: { readonly text?: string | undefined; readonly cardId?: KanbanCard["id"] | null } = {},
+  ) {
+    const started = yield* startEvaluatorThread(board, purpose, extra);
+    return started.threadId;
+  });
+
+  /** Starts an evaluator; `queued` says its brief waits for a pool slot (the thread is idle). */
+  const startEvaluatorThread = Effect.fn("KanbanService.startEvaluatorThread")(function* (
     board: KanbanBoard,
     purpose: Briefs.EvaluatorPurpose,
     extra: { readonly text?: string | undefined; readonly cardId?: KanbanCard["id"] | null } = {},
@@ -1647,22 +1693,21 @@ const make = Effect.gen(function* () {
     const title = Briefs.evaluatorTitle(purpose);
     const fullText = extra.text ? `${brief}\n\n${extra.text}` : brief;
     // A full pool launches the thread idle and queues its brief; drain sends it when a slot frees.
-    const full =
-      board.evaluatorSlots !== null && (yield* admittedCount(board.id)) >= board.evaluatorSlots;
+    const queued = yield* poolFull(board);
     const threadId = yield* threads.launch({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${at}`,
       projectId: board.defaultProjectId,
       title,
       model: board.evaluatorModel,
-      ...(full ? {} : { text: fullText }),
+      ...(queued ? {} : { text: fullText }),
     });
-    if (full) {
+    if (queued) {
       yield* store.enqueueEvaluator(board.id, threadId, {
         text: fullText,
         model: board.evaluatorModel,
         queuedAt: at,
       });
-    } else if (board.evaluatorSlots !== null) {
+    } else {
       yield* admit(threadId, board.id);
     }
     yield* linkThread(
@@ -1707,7 +1752,7 @@ const make = Effect.gen(function* () {
       yield* store.putBoard(running);
       yield* publish(board.id, { _tag: "board", board: running });
     }
-    return threadId;
+    return { threadId, queued };
   });
 
   /**
@@ -1820,7 +1865,7 @@ const make = Effect.gen(function* () {
     // One evaluator per card discussion: the evaluators that asked on the card
     // hear it is handed over, and stop typing there.
     const priors = card ? yield* liveEvaluatorAskers(card) : [];
-    const threadId = yield* startEvaluatorUnlocked(
+    const { threadId, queued } = yield* startEvaluatorThread(
       board,
       {
         kind: "discussion",
@@ -1833,13 +1878,18 @@ const make = Effect.gen(function* () {
         cardId: discussion.cardId,
       },
     );
+    // A queued start is idle until its slot frees, so nobody shows as typing.
     let next = withParticipant(
       { ...discussion, evaluatorThreadId: threadId },
       actorOf(threadId),
       "Evaluator",
       note
         ? { lastReadSeq: discussion.lastSeq }
-        : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
+        : {
+            lastReadSeq: discussion.lastSeq,
+            typingUntil: queued ? null : yield* typingUntil,
+            owes: "asked",
+          },
     );
     if (card) {
       for (const priorId of priors) {
@@ -2689,6 +2739,12 @@ const make = Effect.gen(function* () {
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
+    // The run that just ended. Released before anything else can admit a turn here (the
+    // nudge below is a new turn, a new admission). A run with no admission releases nothing.
+    // The admission that turn held is released before anything else can admit a turn here (the
+    // nudge below is a new turn, a new admission).
+    const endedRun = (yield* Ref.get(admitted)).get(threadId)?.turn;
+    if (endedRun !== undefined) yield* releaseTurn(threadId, endedRun);
     const at = yield* nowIso;
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
@@ -2779,7 +2835,6 @@ const make = Effect.gen(function* () {
         const current = (yield* store.threadLink(threadId)) ?? link;
         yield* store.putThreadLink({ ...current, endedAt: at });
       }
-      yield* releaseSlot(threadId);
       yield* drainEvaluators(link.boardId);
       return;
     }
@@ -2924,16 +2979,9 @@ const make = Effect.gen(function* () {
     }
     // A turn end the board missed (a restart, a turn the provider ended oddly) must not hold a slot.
     // Launches are given two minutes to show as running before they count as idle.
-    for (const [threadId, entry] of yield* Ref.get(admitted)) {
-      if (now - entry.at < ADMIT_GRACE_MS) continue;
-      const view = yield* threads.view(threadId);
-      if (!view || view.state === "idle") {
-        yield* releaseSlot(threadId);
-        yield* kick;
-      }
-    }
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
+      yield* reconcileAdmitted(board.id);
       yield* drainEvaluators(board.id);
     }
     const missed = new Set<ThreadId>();

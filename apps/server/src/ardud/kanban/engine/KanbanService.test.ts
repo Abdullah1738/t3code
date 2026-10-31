@@ -1842,6 +1842,108 @@ it.effect("queued messages to one evaluator go as one turn", () =>
   }),
 );
 
+it.effect("a limit set over running unlimited turns counts them, so a new evaluator queues", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const threads = [];
+      for (const text of ["A", "B", "C"]) {
+        const id = yield* kanban.startEvaluator(board.id, { kind: "request", text });
+        yield* setRunStart(fake, id, true, "2026-10-25T13:00:00.000Z");
+        threads.push(id);
+      }
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const d = yield* kanban.startEvaluator(board.id, { kind: "request", text: "D" });
+      assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(d)?.messages, []);
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).evaluators, {
+        slots: 1,
+        busy: 3,
+        queued: 1,
+      });
+      // Finishing the unlimited turns frees the slots, oldest queued first.
+      for (const id of threads) yield* kanban.turnEnded(id);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(d)?.messages.length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a stale turn end cannot release a newer admission on the same thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 2 });
+      const channel = yield* kanban.createDiscussion(board.id, "Stale", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "first" }]);
+      const a = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      // A's first turn is running; it still owes the discussion a reply.
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 1);
+      // The turn ends. Its owed reply is nudged: the nudge is a new turn, a new admission.
+      yield* setRunStart(fake, a, false, "2026-10-25T13:00:00.000Z");
+      yield* kanban.turnEnded(a);
+      const nudged = (yield* Ref.get(fake.threads)).get(a)?.messages ?? [];
+      assert.strictEqual(nudged.length, 2, "the nudge reached A");
+      // The nudge starts a new run, with its own start time, as a real provider reports it.
+      yield* setRunStart(fake, a, true, "2026-10-25T13:01:00.000Z");
+      const busy = (yield* kanban.snapshot(board.id)).evaluators.busy;
+      assert.strictEqual(busy, 1, "the nudged turn holds one admission");
+      // A stale end for the first run arrives while the nudged run is still going: it must keep that admission.
+      yield* kanban.turnEnded(a);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, busy);
+      // The nudged run really ends: now its own slot is released.
+      yield* setRunStart(fake, a, false, "2026-10-25T13:01:00.000Z");
+      yield* kanban.turnEnded(a);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.busy, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a queued send survives a failed drain and goes out on the next one", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      const b = yield* kanban.startEvaluator(board.id, { kind: "request", text: "B" });
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
+      // B's send is refused on the drain: its rows must stay queued, not vanish.
+      fake.rejectSends.add(b);
+      yield* kanban.turnEnded(a);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(b)?.messages.length, 0);
+      // The refusal lifts: the next drain (a tick) delivers it.
+      fake.rejectSends.delete(b);
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 0);
+      assert.strictEqual((yield* Ref.get(fake.threads)).get(b)?.messages.length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the first post to a new discussion with a full pool shows no typing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, { evaluatorSlots: 1 });
+      const a = yield* kanban.startEvaluator(board.id, { kind: "request", text: "A" });
+      yield* setRunStart(fake, a, true, "2026-10-25T13:00:00.000Z");
+      const channel = yield* kanban.createDiscussion(board.id, "New", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Hello" }]);
+      const discussion = yield* kanban.discussion(channel.id);
+      const evaluator = discussion.participants.find((p) => p.actor._tag === "evaluator");
+      assert.isNotNull(evaluator);
+      assert.isNull(evaluator?.typingUntil, "a queued start must not show typing");
+      assert.strictEqual(evaluator?.owes, "asked");
+      assert.strictEqual((yield* kanban.snapshot(board.id)).evaluators.queued, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("no limit keeps today's behaviour", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -1853,9 +1955,10 @@ it.effect("no limit keeps today's behaviour", () =>
       }
       const all = yield* Ref.get(fake.threads);
       for (const id of threads) assert.strictEqual(all.get(id)?.messages.length, 1);
+      // Unlimited turns still count as busy, so a later limit starts from the live count.
       assert.deepStrictEqual((yield* kanban.snapshot(board.id)).evaluators, {
         slots: null,
-        busy: 0,
+        busy: 3,
         queued: 0,
       });
     }).pipe(Effect.provide(testLayer(fake.layer)));
