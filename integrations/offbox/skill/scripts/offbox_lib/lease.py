@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
@@ -296,10 +297,13 @@ def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
         return False
 
 
-def run_recipe(box_id: str, name: str) -> None:
+def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
     """Build a template's environment on this box (the script `offbox template build` runs). Only a recipe that
     exits 0 makes the box ready. Any other outcome (failure, error, lost stream, timeout) retires the box and
-    raises, so a half-built box is never marked ready or reused."""
+    raises, so a half-built box is never marked ready or reused.
+
+    box_held: the caller already holds box-<id> (a pool creator). flock is not reentrant, so the recipe must not
+    take it again: that second attempt waits 60 s, fails, and retires the box."""
     from . import bases
     from .common import LOGS_DIR
     t = now()
@@ -308,7 +312,9 @@ def run_recipe(box_id: str, name: str) -> None:
     code = None
     try:
         # The box lock keeps the reaper from idle-stopping the box while the recipe runs.
-        with file_lock("box-" + box_id, timeout=60):
+        with contextlib.ExitStack() as held:
+            if not box_held:
+                held.enter_context(file_lock("box-" + box_id, timeout=60))
             script, _sha = bases.recipe(name)
             ssh_sync.put_file(box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700")
             bases.template_uploads(name, box_id)
@@ -358,12 +364,12 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 _FOLLOW_STOP_S = 160
 
 
-def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None) -> dict:
+def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False) -> dict:
     s = api.wait_state(box_id, api.LIVE_STATES, timeout=900)
     ssh_sync.setup(box_id)
     ssh_sync.wait_ssh(box_id)
     if recipe:
-        run_recipe(box_id, recipe)
+        run_recipe(box_id, recipe, box_held=box_held)
     elif fresh:
         bootstrap_fresh(box_id)
     return s
@@ -415,7 +421,7 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             hold = file_lock(f"box-{box_id}", timeout=0)
             hold.__enter__()
         try:
-            got = _create_row(con, me, box_id, source, base_dir, sz, t)
+            got = _create_row(con, me, box_id, source, base_dir, sz, t, box_held=hold is not None)
         except BaseException:
             if hold is not None:
                 hold.__exit__(None, None, None)
@@ -428,7 +434,7 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
-def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t) -> dict:
+def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False) -> dict:
     rdir = remote_dir_for(me["repo_root"])
     is_recipe = source.startswith("recipe:")
     # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
@@ -444,7 +450,7 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t) -> dic
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
         _bring_up(box_id, fresh=(source == "fresh"),
-                  recipe=source.split(":", 1)[1] if is_recipe else None)
+                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held)
         try:
             api.rename(box_id, box_name(me, me["repo_key"]))
         except OffboxError:

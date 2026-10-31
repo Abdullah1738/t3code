@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import capacity, cli, common, lease, pool, runs  # noqa: E402
+from offbox_lib import api, capacity, cli, common, lease, pool, runs  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
 
@@ -234,6 +234,35 @@ class PoolLockTests(Isolated):
             self.assertEqual([r['box_id'] for r in pool.members(self.con, 'repo')], ['bx_a'])
         finally:
             pool.release_guard(row)
+
+    def test_pooled_recipe_creation_runs_with_creator_box_lock_held(self):
+        """Integration through pool.acquire: a pool-created recipe box runs its recipe under the lock the creator
+        already holds (flock is not reentrant). Only boat and ssh are faked; _bring_up and file_lock run for real."""
+        from offbox_lib import bases
+        errors, retired = [], []
+        row = None
+
+        with patch.object(lease, '_new_box', return_value=({'id': 'recipe_box'}, 'recipe:crpko-node', None, 'large')), \
+                patch.object(api, 'wait_state', return_value={'state': 'running', 'type': 'large'}), \
+                patch.object(lease.ssh_sync, 'setup'), patch.object(lease.ssh_sync, 'wait_ssh'), \
+                patch.object(bases, 'recipe', return_value=('true', 'sha')) as recipe, \
+                patch.object(lease.ssh_sync, 'put_file'), patch.object(bases, 'template_uploads'), \
+                patch.object(api, 'cmd_start', return_value={'processId': 9}), \
+                patch.object(lease, '_follow_bounded', return_value=0), patch.object(api, 'rename'), \
+                patch.object(lease, '_retire_recipe_box', side_effect=lambda *a, **k: retired.append(a) or True), \
+                patch.object(api, 'call', side_effect=AssertionError('network forbidden')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                row = pool.acquire(self.me)
+            except common.OffboxError as e:
+                errors.append((e.code, str(e)))
+            finally:
+                pool.release_guard(row)
+        self.assertEqual(errors, [])
+        self.assertEqual(retired, [])
+        recipe.assert_called_once_with('crpko-node')
+        self.assertEqual(row['box_id'], 'recipe_box')
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
 
 
 if __name__ == '__main__':
