@@ -17,6 +17,7 @@ import {
 } from "./boardState.ts";
 import {
   askViews,
+  blockText,
   canSendChoice,
   cardSteps,
   discussionPresence,
@@ -707,6 +708,113 @@ describe("discussions", () => {
       "disc-1",
     ]);
     expect(discussionRows(state, NOW, { query: "nothing" }).active).toEqual([]);
+  });
+
+  it("reuses unchanged message previews across board changes and minute ticks", () => {
+    // A message whose `blocks` getter counts reads: normalizing a preview reads it once.
+    const countedMessage = (
+      seq: number,
+      owner: boolean,
+      blocks: KanbanBlock[],
+      reads: { count: number },
+      answers: unknown[] = [],
+    ): KanbanMessage =>
+      ({
+        discussionId: "disc-1",
+        seq,
+        author: owner ? { _tag: "owner" } : { _tag: "evaluator", threadId: "t-1" },
+        authorName: owner ? "You" : "Evaluator",
+        get blocks() {
+          reads.count += 1;
+          return blocks;
+        },
+        answers,
+        createdAt: "2026-10-25T11:00:00.000Z",
+      }) as never;
+
+    const reads = { count: 0 };
+    const last = countedMessage(3, false, [{ _tag: "md", text: "Window?" }], reads);
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [discussion(3, 1)]);
+    state = withDiscussions(state, [], [last]);
+    expect(discussionRows(state, NOW).active[0]?.preview).toBe("Evaluator: Window?");
+
+    // A board change and a minute tick: same message object, new state wrapper.
+    const ticked = { ...state, cards: new Map(state.cards) };
+    expect(discussionRows(ticked, NOW + 60_000).active[0]?.preview).toBe("Evaluator: Window?");
+    expect(reads.count).toBe(1);
+
+    // A replacement at the same seq is a new object: it reformats, with its own author prefix.
+    const edited = countedMessage(3, true, [{ _tag: "md", text: "Shipped" }], reads);
+    const swapped = { ...state, lastMessages: new Map([["disc-1", edited]]) };
+    expect(discussionRows(swapped, NOW).active[0]?.preview).toBe("Shipped");
+
+    // Answers don't change the preview text, but a new object with them must not throw or go stale.
+    const answered = countedMessage(
+      3,
+      false,
+      [{ _tag: "md", text: "Window?" }],
+      reads,
+      [{ blockId: "q1", by: { _tag: "owner" }, choice: ["yes"] }],
+    );
+    const answeredState = { ...state, lastMessages: new Map([["disc-1", answered]]) };
+    expect(discussionRows(answeredState, NOW).active[0]?.preview).toBe("Evaluator: Window?");
+  });
+
+  it("caches an empty owner preview after one normalization", () => {
+    const reads = { count: 0 };
+    const empty = {
+      discussionId: "disc-1",
+      seq: 3,
+      author: { _tag: "owner" },
+      authorName: "You",
+      get blocks() {
+        reads.count += 1;
+        return [];
+      },
+      answers: [],
+      createdAt: "2026-10-25T11:00:00.000Z",
+    } as never as KanbanMessage;
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [discussion(3, 1)]);
+    state = withDiscussions(state, [], [empty]);
+    expect(discussionRows(state, NOW).active[0]?.preview).toBe("");
+    expect(discussionRows(state, NOW + 60_000).active[0]?.preview).toBe("");
+    expect(reads.count).toBe(1);
+  });
+
+  it("previews every block kind the way blockText reads them", () => {
+    const blocks: KanbanBlock[] = [
+      { _tag: "md", text: "see [docs](https://example.com/docs)   now" },
+      { _tag: "collapse", title: "Details", text: "hidden" },
+      { _tag: "html", html: "<p>x</p>", title: "Report", height: null },
+      { _tag: "html", html: "<p>y</p>", title: null, height: null },
+      { _tag: "choice", id: "q1" as never, style: "poll", question: "Ship?", options: [], multi: false },
+      { _tag: "card", cardId: "card-1" as never },
+      { _tag: "image", url: "https://example.com/a.png", alt: null },
+      { _tag: "attachment", attachment: { type: "file", name: "spec.pdf" } as never },
+      { _tag: "attachment", attachment: { type: "file", name: "" } as never },
+    ];
+    const expected = `Evaluator: ${blocks.map(blockText).join(" ").replace(/\s+/g, " ").trim()}`;
+    const reads = { count: 0 };
+    const full = {
+      discussionId: "disc-1",
+      seq: 3,
+      author: { _tag: "evaluator", threadId: "t-1" },
+      authorName: "Evaluator",
+      get blocks() {
+        reads.count += 1;
+        return blocks;
+      },
+      answers: [],
+      createdAt: "2026-10-25T11:00:00.000Z",
+    } as never as KanbanMessage;
+    let state = boardStateFromSnapshot(snapshot([]));
+    state = withDiscussionList(state, [discussion(3, 1)]);
+    state = withDiscussions(state, [], [full]);
+    expect(discussionRows(state, NOW).active[0]?.preview).toBe(expected);
+    expect(discussionRows(state, NOW + 60_000).active[0]?.preview).toBe(expected);
+    expect(reads.count).toBe(1);
   });
 
   it("keeps a live change that landed during a list read, and drops stale entries", () => {
