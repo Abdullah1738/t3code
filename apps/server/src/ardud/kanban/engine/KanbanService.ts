@@ -3452,7 +3452,10 @@ const make = Effect.gen(function* () {
     input: NewCard,
   ): { readonly card: KanbanCard; readonly why: "title" | "source link" } | null => {
     const squash = (text: string) => text.trim().replace(/\s+/g, " ").toLowerCase();
-    const title = input.title?.trim() ? squash(input.title) : "";
+    // The title draftCard will save, so an omitted title matches its fallback.
+    const prompt = input.prompt.trim();
+    const saved = input.title?.trim() || (prompt.length > 0 ? fallbackTitle(prompt) : "");
+    const title = saved ? squash(saved) : "";
     // Shared follow-up links don't count: study parents (t3-context) and PR or Linear links.
     const sourceUrl = (url: string) => !url.startsWith("t3-context://") && linkKind(url) === "url";
     const urls = new Set(

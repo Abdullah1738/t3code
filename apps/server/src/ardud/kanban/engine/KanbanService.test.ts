@@ -2655,6 +2655,22 @@ it.effect("a same title, different case and spacing, is refused for an evaluator
   }),
 );
 
+it.effect("a card with no title is refused when its fallback title matches an open card", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.createCard(board.id, { prompt: "A", title: "Fix the fanout" }, evaluator);
+      const refused = yield* kanban
+        .createCard(board.id, { prompt: "  fix   THE fanout " }, evaluator)
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, "same title");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the same title is allowed once the first card is verified", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
