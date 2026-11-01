@@ -103,6 +103,9 @@ MODEL_CANARIES = {
     "claude": ["claude-opus-5-5", "claude-haiku-5-5"],
     "codex": ["gpt-6-astra", "gpt-6.1-sol"],
 }
+# Terra runs on its own home: Robob's codex-cu instance is the one that uses it, so its
+# memory-off result has to be proven separately (card F1 routes Terra through codex-cu).
+CODEX_CU_MODELS = ["gpt-6.1-terra"]
 CLAUDE_MODEL_IDS = {
     "claude-opus-5-5": "cc/claude-opus-5-5",
     "claude-haiku-5-5": "cc/claude-haiku-5-5",
@@ -521,24 +524,43 @@ def nine_router_key() -> str:
     return key if key else "dummy"
 
 
-def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300) -> subprocess.CompletedProcess:
-    return subprocess.run([str(binary), *args], env=env, capture_output=True, text=True, timeout=timeout)
+def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
+            cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Run a CLI with an explicit cwd, so per-project state (memory) is the one the canary seeded."""
+    return subprocess.run([str(binary), *args], env=env, capture_output=True, text=True,
+                          timeout=timeout, cwd=str(cwd) if cwd else None)
 
 
 def make_throwaway_homes(work: Path) -> tuple[Path, Path]:
-    """Generate both harness homes into a throwaway dir with the B1 generator."""
+    """Generate both harness homes with the real B1 generator, in a throwaway HOME.
+
+    The manifest points at ~/.config/opencode (AGENTS.md and skills). The throwaway HOME gets
+    read-only copies of those sources, so the generator runs unmodified and the canary tests
+    the homes Robob would really use. Nothing under the real HOME is written.
+    """
     gen = harness_homes_pkg() / "generate_homes.py"
     if not gen.is_file():
         raise HarnessError("harness-homes generator is not installed (card B1); cannot canary")
+    fake_home = work / "home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    live_cfg = Path(os.environ.get("HARNESS_CLI_SOURCE_HOME", Path.home())) / ".config" / "opencode"
+    dst_cfg = fake_home / ".config" / "opencode"
+    if not (live_cfg / "AGENTS.md").is_file():
+        raise HarnessError(f"instruction source missing: {live_cfg / 'AGENTS.md'}")
+    dst_cfg.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(live_cfg / "AGENTS.md", dst_cfg / "AGENTS.md")
+    skills_src = live_cfg / "skills"
+    if skills_src.is_dir():
+        # Copy the real skill directories (following links) so discovery sees the same set.
+        shutil.copytree(skills_src, dst_cfg / "skills", symlinks=False, dirs_exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = str(work / "home")
-    (work / "home").mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(fake_home)
     for sub in ("generate", "check"):
         proc = subprocess.run([python_bin(), str(gen), sub, "--home-root", str(work / "homes")], env=env,
                               capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
-            raise HarnessError(f"harness-homes {sub} failed on throwaway homes: "
-                               f"{(proc.stdout + proc.stderr).strip().splitlines()[-1:]}")
+            tail = (proc.stdout + proc.stderr).strip().splitlines()[-1:]
+            raise HarnessError(f"harness-homes {sub} failed on throwaway homes: {tail}")
     return work / "homes" / "claude", work / "homes" / "codex"
 
 
@@ -559,56 +581,99 @@ def claude_env(home: Path, config_dir: Path, base: str) -> dict:
     }
 
 
+def claude_project_slug(project_dir: Path) -> str:
+    """Claude Code's per-project memory folder name: the absolute path with '/' turned into '-'."""
+    return str(project_dir.resolve()).replace("/", "-")
+
+
 def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> dict:
+    """Run the real CLI in a fixed project dir with a seeded MEMORY.md for that exact dir.
+
+    The seed is only meaningful if the CLI reads memory for the directory it runs in, so the
+    project directory and its memory slug are created here and the CLI runs with that cwd.
+    """
     home = work / "claude-home"
     cdir = home / ".claude"
     homes_claude, _ = make_throwaway_homes(work / "gen")
     shutil.copytree(homes_claude, cdir, dirs_exist_ok=True)
-    slug = "-" + str(work).replace("/", "-").lstrip("-")
-    mem_dir = cdir / "projects" / slug / "memory"
+    project = work / "project"
+    project.mkdir(parents=True, exist_ok=True)
+    mem_dir = cdir / "projects" / claude_project_slug(project) / "memory"
     mem_dir.mkdir(parents=True, exist_ok=True)
     (mem_dir / "MEMORY.md").write_text(f"canary memory {CLAUDE_MEMORY_CANARY}\n", encoding="utf-8")
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
-    results = {}
+    results: dict = {}
     try:
         env = claude_env(home, cdir, base)
         for model in MODEL_CANARIES["claude"]:
             routed = CLAUDE_MODEL_IDS.get(model, model)
             proc = run_cli(binary, ["-p", "Reply exactly OK.", "--model", routed, "--effort", "low",
-                                    "--output-format", "text"], env=env, timeout=240)
+                                    "--output-format", "text"], env=env, timeout=240, cwd=project)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             results[model] = {"ok": ok, "stdoutLen": len(proc.stdout)}
+        # The marker must be absent from every request body the CLI sent, and the seed must
+        # have been there to be read (a seed the CLI never reads proves nothing).
+        seed_present = (mem_dir / "MEMORY.md").is_file()
         leaked = any(CLAUDE_MEMORY_CANARY.encode() in body for body in recorder.bodies)
         results["memoryCanaryLeaked"] = leaked
-        results["memoryCanaryChecked"] = True
+        results["memoryCanaryChecked"] = seed_present and len(recorder.bodies) > 0
         results["requests"] = len(recorder.bodies)
     finally:
         recorder.stop()
     return results
 
 
-def canary_codex(binary: Path, version: str, work: Path, key_present: bool) -> dict:
-    home = work / "codex-home"
+# Names the memory pipeline writes: the memories folder and its stores (memories_1.sqlite and
+# -wal/-shm), the phase-2 consolidation files, and raw_memories. Codex's own thread state
+# (state_*.sqlite, sessions, rollouts) never matches these prefixes.
+CODEX_MEMORY_ARTIFACT_RE = re.compile(r"^(memories(_\w+)?(\.sqlite(-wal|-shm)?)?|phase2\w*|raw_memories\w*|memory_summary\.md|MEMORY\.md)$")
+CODEX_MEMORY_SECTION_MARKERS = (b"## Memory", b"<memories>", b"memory_summary", b"Memory Phase 2")
+
+
+def codex_memory_artifacts(chome: Path) -> list[str]:
+    """Every memory-pipeline file or folder under the Codex home, at any depth."""
+    found = []
+    for dirpath, dirs, files in os.walk(chome):
+        for name in dirs + files:
+            if CODEX_MEMORY_ARTIFACT_RE.match(name):
+                found.append(os.path.relpath(os.path.join(dirpath, name), chome))
+    return sorted(found)
+
+
+def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
+                 models: list[str] | None = None, chome_name: str = "codex-home") -> dict:
+    """Run Codex in the generated home with the proxy recording every request body.
+
+    Two checks: no request body may carry a memory section, and no memory-pipeline artifact may
+    appear anywhere in the home. Both are checked for each model, including Terra (which the
+    `codex-cu` instance uses).
+    """
+    home = work / chome_name
     chome = home / ".codex"
-    _, homes_codex = make_throwaway_homes(work / "gen")
+    _, homes_codex = make_throwaway_homes(work / f"gen-{chome_name}")
     shutil.copytree(homes_codex, chome, dirs_exist_ok=True)
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
-    results = {}
+    results: dict = {}
     try:
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "CODEX_HOME": str(chome),
                "NINEROUTER_KEY": nine_router_key(), "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
-        for model in MODEL_CANARIES["codex"]:
+        for model in models or MODEL_CANARIES["codex"]:
+            before = len(recorder.bodies)
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
                                     "-m", model, *cfg, "Reply exactly OK."], env=env, timeout=240)
             ok = proc.returncode == 0 and "OK" in proc.stdout
-            results[model] = {"ok": ok}
-        made = [name for name in CODEX_MEMORY_DIRS if (chome / name).exists()]
-        results["memoryArtifacts"] = made
-        results["memoryPipelineRan"] = bool(made)
-        results["memoryCanaryChecked"] = True
+            bodies = recorder.bodies[before:]
+            section = any(marker in body for body in bodies for marker in CODEX_MEMORY_SECTION_MARKERS)
+            results[model] = {"ok": ok, "requests": len(bodies), "memorySectionInRequest": section}
+        artifacts = codex_memory_artifacts(chome)
+        results["memoryArtifacts"] = artifacts
+        results["memoryPipelineRan"] = bool(artifacts)
+        results["memoryPromptSeen"] = any(
+            r.get("memorySectionInRequest") for r in results.values() if isinstance(r, dict))
+        results["memoryCanaryChecked"] = len(recorder.bodies) > 0
         results["requests"] = len(recorder.bodies)
     finally:
         recorder.stop()
@@ -616,40 +681,74 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool) -> d
 
 
 def canary(tool: str, version: str) -> dict:
+    """Run the full canary and write one durable record for the outcome.
+
+    Every outcome is recorded: a pass, a failed check, or an exception (generation, version,
+    timeout, proxy). A failure record supersedes an older pass, so a stale pass can never
+    authorize a promotion.
+    """
     if tool not in TOOLS:
         raise HarnessError(f"unknown tool {tool}")
-    check_minimums(tool, version)
     binary = version_dir(tool, version) / "bin" / ("claude" if tool == "claude" else "codex")
-    if not binary.is_file():
-        raise HarnessError(f"{binary} not staged")
-    if binary_version(binary, tool) != version:
-        raise HarnessError(f"{binary} does not report {version}")
-    work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-"))
-    key_present = bool(os.environ.get("NINEROUTER_KEY"))
+    reasons: list[str] = []
+    result: dict = {}
+    digest = None
     try:
-        if tool == "claude":
-            result = canary_claude(binary, version, work, key_present)
-            failed = [m for m in MODEL_CANARIES["claude"] if not result[m]["ok"]]
-            memory_bad = result["memoryCanaryLeaked"]
-        else:
-            result = canary_codex(binary, version, work, key_present)
-            failed = [m for m in MODEL_CANARIES["codex"] if not result[m]["ok"]]
-            memory_bad = result["memoryPipelineRan"]
-        passed = not failed and not memory_bad and result.get("requests", 0) > 0
-        reason = []
-        if failed:
-            reason.append(f"model prompt failed: {', '.join(failed)}")
-        if memory_bad:
-            reason.append("memory-off canary failed (memory reached the model or the pipeline ran)")
-        if result.get("requests", 0) == 0:
-            reason.append("no request reached the recording proxy")
+        check_minimums(tool, version)
+        if not binary.is_file():
+            raise HarnessError(f"{binary} not staged")
         digest = sha256_file(binary)
-        write_record("canary", tool, version, "passed" if passed else "failed",
-                     binarySha256=digest, canary=result, reasons=reason,
-                     harnessHomes=harness_home_hashes(), keyPresent=key_present)
-        return {"passed": passed, "reasons": reason, "result": result}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if binary_version(binary, tool) != version:
+            raise HarnessError(f"{binary} does not report {version}")
+        key_present = bool(os.environ.get("NINEROUTER_KEY"))
+        if tool == "claude":
+            work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-"))
+            try:
+                result = canary_claude(binary, version, work, key_present)
+            finally:
+                remove_tree(work)
+            models = MODEL_CANARIES["claude"]
+            failed = [m for m in models if not result.get(m, {}).get("ok")]
+            memory_fail = result.get("memoryCanaryLeaked") is True
+            memory_checked = result.get("memoryCanaryChecked") is True
+            requests = result.get("requests", 0)
+        else:
+            # Two homes: the plain Codex home (Astra, Sol) and the codex-cu home (Terra).
+            plain_work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-"))
+            cu_work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-cu-"))
+            try:
+                plain = canary_codex(binary, version, plain_work, key_present,
+                                     models=MODEL_CANARIES["codex"], chome_name="codex-home")
+                cu = canary_codex(binary, version, cu_work, key_present,
+                                  models=CODEX_CU_MODELS, chome_name="codex-cu-home")
+            finally:
+                remove_tree(plain_work)
+                remove_tree(cu_work)
+            result = {**plain, **{f"cu:{k}": v for k, v in cu.items()}, "cu": cu}
+            models = MODEL_CANARIES["codex"] + CODEX_CU_MODELS
+            failed = [m for m in MODEL_CANARIES["codex"] if not plain.get(m, {}).get("ok")]
+            failed += [m for m in CODEX_CU_MODELS if not cu.get(m, {}).get("ok")]
+            memory_fail = (plain.get("memoryPipelineRan") or cu.get("memoryPipelineRan")
+                           or plain.get("memoryPromptSeen") or cu.get("memoryPromptSeen"))
+            memory_checked = plain.get("memoryCanaryChecked") is True and cu.get("memoryCanaryChecked") is True
+            requests = plain.get("requests", 0) + cu.get("requests", 0)
+        if failed:
+            reasons.append(f"model prompt failed: {', '.join(failed)}")
+        if memory_fail:
+            reasons.append("memory-off canary failed (memory reached the model or the pipeline ran)")
+        if not memory_checked:
+            reasons.append("memory-off check did not run")
+        if requests == 0:
+            reasons.append("no request reached the recording proxy")
+    except HarnessError as exc:
+        reasons.append(str(exc))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        reasons.append(f"canary error: {type(exc).__name__}")
+    passed = not reasons
+    write_record("canary", tool, version, "passed" if passed else "failed",
+                 binarySha256=digest, canary=result, reasons=reasons,
+                 harnessHomes=harness_home_hashes(), keyPresent=bool(os.environ.get("NINEROUTER_KEY")))
+    return {"passed": passed, "reasons": reasons, "result": result}
 
 
 # ---------- promote / rollback ----------
@@ -730,24 +829,35 @@ def latest_canary(tool: str, version: str) -> dict | None:
     if found is None:
         return None
     canary_body = found.get("canary") or {}
-    memory_ok = canary_body.get("memoryCanaryChecked") is True and (
-        canary_body.get("memoryCanaryLeaked") is False if tool == "claude"
-        else canary_body.get("memoryPipelineRan") is False)
+    # Same rule as canary(): a pass needs no reasons, the memory check ran, and it found nothing.
+    memory_ok = canary_body.get("memoryCanaryChecked") is True and not (
+        canary_body.get("memoryCanaryLeaked") is True if tool == "claude"
+        else (canary_body.get("memoryPipelineRan") or canary_body.get("memoryPromptSeen")
+              or (canary_body.get("cu") or {}).get("memoryPipelineRan")
+              or (canary_body.get("cu") or {}).get("memoryPromptSeen")))
+    passed = found.get("result") == "passed" and not found.get("reasons") and memory_ok
     return {
-        "passed": found.get("result") == "passed" and memory_ok,
+        "passed": passed,
         "binarySha256": found.get("binarySha256"),
-        "memoryCheckedAt": found.get("at") if memory_ok else None,
+        "memoryCheckedAt": found.get("at") if passed else None,
     }
 
 
 # ---------- Codex rotation ----------
 
-def rotate_codex(*, when_idle: bool, quiet_seconds: int = 300, checker=None, refresher=None,
+def rotate_codex(*, when_idle: bool = True, quiet_seconds: int = 300, checker=None, refresher=None,
                  sleep=time.sleep, clock=time.monotonic, max_wait_seconds: int = 1800) -> str:
+    """Rotate the shared Codex app-server onto the promoted binary, but only when all of these hold.
+
+    1. Codex is actually pending a rotation.
+    2. Abdullah's standing OK is recorded (autoRotateCodex). This applies to every call, with or
+       without --when-idle, so omitting a flag can never bypass it.
+    3. The recovery snapshot is valid and shows no busy Codex thread for quiet_seconds.
+    """
     state = load_state()
     if not state["codex"].get("rotationPending"):
         return "no Codex rotation pending"
-    if when_idle and not state.get("autoRotateCodex"):
+    if state.get("autoRotateCodex") is not True:
         return "autoRotateCodex is off; Codex rotates only at the next Robob release (standing OK not recorded)"
     checker = checker or idle_snapshot
     try:
@@ -756,7 +866,11 @@ def rotate_codex(*, when_idle: bool, quiet_seconds: int = 300, checker=None, ref
     except HarnessError as exc:
         return str(exc)
     refresher = refresher or refresh_codex_provider
-    refresher()
+    try:
+        refresher()
+    except HarnessError as exc:
+        write_record("rotate-codex", "codex", state["codex"].get("current"), f"failed: {exc}")
+        return str(exc)
     state["codex"]["rotationPending"] = False
     state["codex"]["rotatedAt"] = now_iso()
     save_state(state)
@@ -792,21 +906,29 @@ def control_token() -> str:
     return token
 
 
+SNAPSHOT_THREAD_FIELDS = ("threadId", "provider", "runningRun", "heldWork", "pendingRequest")
+
+
 def codex_busy(snapshot: dict) -> bool:
     """True when any Codex thread has a running run, held work or a pending request.
 
-    The field names are the contract this job expects from card E7's recovery snapshot. E7 is
-    not on ardud/main yet, so they are unverified: confirm them against E7 before the rotation
-    is enabled. Until E7 ships the route is missing and rotation is skipped.
+    Fails closed: a snapshot without a `threads` list, or a thread missing any required field,
+    raises HarnessError. An empty or changed response must never read as "idle". The field names
+    are the contract this job expects from card E7's recovery snapshot, which is not on ardud/main
+    yet, so they are unverified until E7 ships.
     """
-    threads = snapshot.get("threads") or []
-    for thread in threads:
-        provider = (thread.get("provider") or thread.get("driver") or "").lower()
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("threads"), list):
+        raise HarnessError("recovery snapshot has no threads list; not rotating")
+    busy = False
+    for thread in snapshot["threads"]:
+        if not isinstance(thread, dict) or any(f not in thread for f in SNAPSHOT_THREAD_FIELDS):
+            raise HarnessError("recovery snapshot thread is missing required fields; not rotating")
+        provider = str(thread.get("provider") or "").lower()
         if not provider.startswith("codex"):
             continue
         if thread.get("runningRun") or thread.get("heldWork") or thread.get("pendingRequest"):
-            return True
-    return False
+            busy = True
+    return busy
 
 
 def wait_for_idle(checker: Callable[[], dict], quiet_seconds: int, *, sleep=time.sleep,
@@ -832,21 +954,157 @@ def wait_for_idle(checker: Callable[[], dict], quiet_seconds: int, *, sleep=time
         sleep(poll_seconds)
 
 
-def refresh_codex_provider() -> None:
-    """WS RPC server.refreshProviders {instanceId}: re-probes the instance, no restart."""
-    raise HarnessError("refreshProviders transport not wired in this build; rotation skipped")
+CODEX_INSTANCE_IDS = ("codex", "codex-cu")
+
+
+class WsClient:
+    """A minimal RFC 6455 client over a plain socket (ws:// to loopback only), stdlib only.
+
+    Enough for Robob's RPC: the upgrade handshake, masked text frames out, unmasked frames in
+    (server frames may span continuations), and close. Refuses anything that isn't loopback.
+    """
+
+    def __init__(self, url: str, headers: dict[str, str], timeout: float = 90.0):
+        import urllib.parse
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "ws" or parsed.hostname not in ("127.0.0.1", "localhost"):
+            raise HarnessError("refusing a non-loopback or non-ws control URL")
+        self.host = parsed.hostname
+        self.port = parsed.port or 80
+        self.path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+        self.headers = headers
+        self.timeout = timeout
+        self.sock = None
+        self.buffer = b""
+
+    def __enter__(self):
+        import base64
+        import socket
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        lines = [f"GET {self.path} HTTP/1.1", f"Host: {self.host}:{self.port}", "Upgrade: websocket",
+                 "Connection: Upgrade", f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
+        lines += [f"{k}: {v}" for k, v in self.headers.items()]
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise HarnessError("websocket closed during handshake")
+            head += chunk
+        header, _, rest = head.partition(b"\r\n\r\n")
+        if not header.startswith(b"HTTP/1.1 101"):
+            raise HarnessError("websocket upgrade refused")
+        self.buffer = rest
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _recv_exact(self, n: int) -> bytes:
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise HarnessError("websocket closed")
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:n], self.buffer[n:]
+        return out
+
+    def send_text(self, text: str) -> None:
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        n = len(payload)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header += n.to_bytes(2, "big")
+        else:
+            header.append(0x80 | 127)
+            header += n.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def recv_text(self) -> str:
+        message = b""
+        while True:
+            b1, b2 = self._recv_exact(2)
+            fin = b1 & 0x80
+            opcode = b1 & 0x0F
+            n = b2 & 0x7F
+            if n == 126:
+                n = int.from_bytes(self._recv_exact(2), "big")
+            elif n == 127:
+                n = int.from_bytes(self._recv_exact(8), "big")
+            payload = self._recv_exact(n) if n else b""
+            if opcode == 0x8:  # close
+                raise HarnessError("websocket closed by server")
+            if opcode == 0x9:  # ping: answer with pong (masked, as clients must)
+                self.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+                continue
+            if opcode in (0x1, 0x0):
+                message += payload
+                if fin:
+                    return message.decode("utf-8")
+
+
+def refresh_codex_provider(instance_id: str = "codex") -> None:
+    """Ask Robob to re-probe a Codex instance: WS RPC server.refreshProviders {instanceId}.
+
+    Same framing as catalog-guard's client: a Request frame with the bearer token; the reply is an
+    Exit frame. Only Codex instance ids are accepted, and only a Success Exit counts as refreshed.
+    No restart happens here: Robob re-probes the instance and the shared app-server rotates.
+    """
+    import json as _json
+    if instance_id not in CODEX_INSTANCE_IDS:
+        raise HarnessError(f"refusing to refresh non-Codex instance {instance_id!r}")
+    token = control_token()
+    base = os.environ.get("T3_CONTROL_URL", "http://127.0.0.1:3773").rstrip("/")
+    ws_url = base.replace("http", "ws", 1) + "/ws?orchestrationProtocol=2"
+    request_id = os.urandom(6).hex()
+    frame = _json.dumps({"_tag": "Request", "id": request_id, "tag": "server.refreshProviders",
+                         "payload": {"instanceId": instance_id}, "headers": []})
+    with WsClient(ws_url, {"authorization": f"Bearer {token}"}) as ws:
+        ws.send_text(frame)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            msg = _json.loads(ws.recv_text())
+            items = msg if isinstance(msg, list) else [msg]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("_tag") == "Ping":
+                    ws.send_text(_json.dumps({"_tag": "Pong"}))
+                    continue
+                # Same as catalog-guard's client: the first Exit answers the one Request we sent.
+                if item.get("_tag") == "Exit":
+                    exit_ = item.get("exit") or {}
+                    if exit_.get("_tag") != "Success":
+                        raise HarnessError(f"server.refreshProviders failed: {exit_.get('_tag', 'unknown')}")
+                    return
+                if item.get("_tag") == "Defect":
+                    raise HarnessError("server.refreshProviders defect")
+    raise HarnessError("server.refreshProviders timed out")
 
 
 # ---------- auto + before-release ----------
 
 def notify(key: str, severity: str, text: str, source: str = "harness-cli") -> bool:
-    """Send one Telegram notification. HARNESS_CLI_NOTIFY can stub it (tests use that)."""
+    """Send one Telegram notification. True only when the CLI exits 0 (the bridge accepted it).
+
+    The Telegram CLI prints JSON and exits 1 on any failure, so the exit code is the signal.
+    HARNESS_CLI_NOTIFY can stub it; tests use that.
+    """
     cmd = notify_cmd().split() + ["--source", source, "--severity", severity, "--text", text, "--key", key]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
-        return True
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
     except (OSError, subprocess.SubprocessError):
         return False
+    return proc.returncode == 0
 
 
 def notified_before(key: str) -> bool:
@@ -859,9 +1117,14 @@ def notified_before(key: str) -> bool:
 
 
 def auto(*, dry: bool = False) -> dict:
-    """The daily job: discover -> stage -> canary -> promote Claude; Codex stops at pending."""
-    report = {"discover": discover()}
-    outcome = {}
+    """The daily job: discover -> stage -> canary -> promote Claude; Codex stops at pending.
+
+    A candidate that fails is retried on the next run (the notice is deduplicated, the work is
+    not). When Codex is pending and Abdullah's standing OK is recorded, it also tries the gated
+    rotation; rotate_codex enforces the OK and the idle snapshot itself.
+    """
+    report: dict = {"discover": discover()}
+    outcome: dict = {}
     for tool in TOOLS:
         slot = load_state()[tool]  # reread: discover just saved the candidate
         candidate = slot.get("candidate")
@@ -869,30 +1132,32 @@ def auto(*, dry: bool = False) -> dict:
             outcome[tool] = "up to date"
             continue
         key = f"harness-cli:{tool}:{candidate}"
-        if notified_before(key):
-            outcome[tool] = f"{candidate} already handled"
-            continue
         try:
             if not version_dir(tool, candidate).is_dir():
                 stage(tool, candidate)
             verdict = canary(tool, candidate)
             if not verdict["passed"]:
                 outcome[tool] = f"canary failed for {candidate}: {'; '.join(verdict['reasons'])}"
-                notify_once(key, "error", f"Harness CLI canary failed: {tool} {candidate}. "
+                notify_once(f"{key}:canary-failed", "error",
+                            f"Harness CLI canary failed: {tool} {candidate}. "
                             f"{'; '.join(verdict['reasons'])}. Current pin unchanged.")
                 continue
             promoted = promote(tool, candidate)
             outcome[tool] = promoted["status"]
-            notify_once(key, "info", f"Harness CLI: {tool} {candidate} {promoted['status']} "
-                        f"(previous {promoted['previous']}).")
+            notify_once(f"{key}:promoted", "info",
+                        f"Harness CLI: {tool} {candidate} {promoted['status']} (previous {promoted['previous']}).")
         except HarnessError as exc:
             outcome[tool] = f"stopped: {exc}"
-            notify_once(key, "error", f"Harness CLI job stopped for {tool} {candidate}: {exc}")
+            notify_once(f"{key}:stopped", "error", f"Harness CLI job stopped for {tool} {candidate}: {exc}")
+    if load_state()["codex"].get("rotationPending"):
+        report["codexRotation"] = rotate_codex(when_idle=True)
     report["outcome"] = outcome
     return report
 
 
 def notify_once(key: str, severity: str, text: str) -> None:
+    """Send one notice per key. A key is recorded only after the Telegram CLI accepts it, so a
+    failed send is retried on the next run instead of being marked sent."""
     if notified_before(key):
         return
     if notify(key, severity, text):
@@ -955,12 +1220,61 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+LOCKED_COMMANDS = {"discover", "stage", "canary", "promote", "rollback", "rotate-codex", "auto"}
+
+
+class StateLock:
+    """One advisory lock for every command that changes pins, state or records.
+
+    Without it the daily job and a manual promote or rollback can interleave and leave `current`,
+    `state.current` and `lastKnownGood` disagreeing. Read-only commands (status) take no lock.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self):
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.handle.close()
+            raise HarnessError("another harness-cli job holds the lock; try again later") from exc
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        if self.handle:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.before_release or args.cmd in LOCKED_COMMANDS:
+        try:
+            with StateLock(root() / "lock"):
+                return _dispatch(args)
+        except HarnessError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    try:
+        return _dispatch(args)
+    except HarnessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(args) -> int:
     try:
         if args.before_release:
-            print(json.dumps(before_release(), indent=2, sort_keys=True))
-            return 0
+            pins = before_release()
+            print(json.dumps(pins, indent=2, sort_keys=True))
+            # A failed canary in either tool fails the release gate, so the release chain stops.
+            return 0 if all(pin["passed"] for pin in pins.values()) else 1
         if args.cmd == "discover":
             print(json.dumps(discover(), indent=2, sort_keys=True))
         elif args.cmd == "stage":

@@ -365,7 +365,8 @@ class CodexRotationTests(FakeCliTestCase):
         state = hc.load_state()
         state["autoRotateCodex"] = True
         hc.save_state(state)
-        busy = {"threads": [{"provider": "codex", "runningRun": {"runId": "r1"}}]}
+        busy = {"threads": [{"threadId": "t1", "provider": "codex", "runningRun": {"runId": "r1"},
+                             "heldWork": False, "pendingRequest": None}]}
         refresh = mock.Mock()
         now = [0.0]
 
@@ -481,36 +482,47 @@ class CanaryTests(FakeCliTestCase):
         self.assertFalse(verdict["passed"])
         self.assertTrue(any("memory-off canary failed" in r for r in verdict["reasons"]), verdict)
 
-    def test_canary_refuses_when_homes_generator_missing(self) -> None:
+    def test_canary_missing_generator_records_failure_that_blocks_promote(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         (self.homes_pkg / "generate_homes.py").unlink()
-        with self.assertRaises(hc.HarnessError) as ctx:
-            hc.canary("codex", "0.166.0")
-        self.assertIn("harness-homes", str(ctx.exception))
+        verdict = hc.canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(any("harness-homes" in r for r in verdict["reasons"]), verdict)
+        record = hc.latest_canary("codex", "0.166.0")
+        self.assertFalse(record["passed"])
 
     def test_canary_proxy_refuses_non_loopback_upstream(self) -> None:
         with self.assertRaises(hc.HarnessError):
             hc.Recorder("https://api.example.com", "k")
 
-    def run_canary(self, tool: str, version: str, fake_proxy_body) -> dict:
-        # Put the fake binary in place as stage() would, then run canary() with the generator on PATH.
-        with mock.patch.object(hc, "make_throwaway_homes", wraps=hc.make_throwaway_homes) as mk:
-            mk.side_effect = self.throwaway_homes_for_test
-            verdict = hc.canary(tool, version)
-        return verdict
+    def test_stale_pass_cannot_promote_after_a_later_failed_canary(self) -> None:
+        # Reviewer's reproduction: a pass is recorded, then the next check fails, and promote must
+        # refuse on the newer failure rather than the old pass.
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        first = self.run_canary("claude", "2.1.316")
+        self.assertTrue(first["passed"], first)
+        self.assertTrue(hc.latest_canary("claude", "2.1.316")["passed"])
+        with mock.patch.object(hc, "make_throwaway_homes", side_effect=hc.HarnessError("generator broke")):
+            second = hc.canary("claude", "2.1.316")
+        self.assertFalse(second["passed"])
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.promote("claude", "2.1.316")
+        self.assertIn("no passing canary", str(ctx.exception))
+        self.assertFalse((self.root / "claude" / "current").is_symlink())
 
-    def throwaway_homes_for_test(self, root: Path):
-        """Stand-in for the real generator: write the two homes with the files the canary reads."""
-        claude = root / "homes" / "claude"
-        codex = root / "homes" / "codex"
-        claude.mkdir(parents=True, exist_ok=True)
-        codex.mkdir(parents=True, exist_ok=True)
-        (claude / "settings.json").write_text(json.dumps({
-            "autoMemoryEnabled": False, "env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}}), encoding="utf-8")
-        (codex / "config.toml").write_text(
-            "[features]\nmemories = false\n\n[memories]\ngenerate_memories = false\nuse_memories = false\n",
-            encoding="utf-8")
-        return claude, codex
+    def test_canary_exception_is_recorded_as_failure(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        with mock.patch.object(hc, "run_cli", side_effect=OSError("exec failed")):
+            verdict = hc.canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+
+    def run_canary(self, tool: str, version: str, fake_proxy_body=None) -> dict:
+        """Run the real canary: the real generator (with the real manifest) builds the homes from
+        copies of the live instruction sources, and only the CLI binaries are fake."""
+        with mock.patch.dict(os.environ, {"HARNESS_CLI_SOURCE_HOME": str(self.tmp / "home"),
+                                          "HARNESS_HOMES_PKG": str(self.homes_pkg)}):
+            return hc.canary(tool, version)
 
 
 def passing_canary(tool: str, version: str) -> dict:
@@ -547,7 +559,8 @@ class AutoTests(FakeCliTestCase):
             hc.auto()
         lines = [line for line in self.notify_log.read_text(encoding="utf-8").splitlines() if line.strip()]
         keys = [line.split("--key ")[-1] for line in lines]
-        self.assertEqual(keys.count("harness-cli:claude:2.1.316"), 1, keys)
+        # One promotion notice per version, however many runs happen.
+        self.assertEqual(keys.count("harness-cli:claude:2.1.316:promoted"), 1, keys)
 
     def test_auto_stops_codex_at_rotation_pending(self) -> None:
         self.publish_both("2.1.316", "0.166.0")
@@ -572,6 +585,199 @@ class DiscoverTests(FakeCliTestCase):
         state = hc.load_state()
         self.assertEqual(state["claude"]["candidate"], "2.1.316")
         self.assertIsNone(state["claude"]["current"])
+
+
+class FakeRobobServer:
+    """A loopback WebSocket server that does the real upgrade, answers Ping with Pong, and replies to
+    the first Request with an Exit. `exit_tag` picks Success or a failure, so the client's
+    fail-closed handling is exercised against the framing it would meet in production."""
+
+    def __init__(self, exit_tag: str = "Success", ping_first: bool = True):
+        import socket
+        import threading
+        self.exit_tag = exit_tag
+        self.ping_first = ping_first
+        self.requests: list[dict] = []
+        self.auth_headers: list[str] = []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _read_frame(conn) -> bytes:
+        def take(n):
+            data = b""
+            while len(data) < n:
+                chunk = conn.recv(n - len(data))
+                if not chunk:
+                    raise OSError("closed")
+                data += chunk
+            return data
+        b1, b2 = take(2)
+        n = b2 & 0x7F
+        if n == 126:
+            n = int.from_bytes(take(2), "big")
+        elif n == 127:
+            n = int.from_bytes(take(8), "big")
+        mask = take(4) if b2 & 0x80 else b"\x00\x00\x00\x00"
+        payload = take(n) if n else b""
+        return bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+    @staticmethod
+    def _send_text(conn, text: str) -> None:
+        data = text.encode("utf-8")
+        header = bytearray([0x81])
+        if len(data) < 126:
+            header.append(len(data))
+        else:
+            header.append(126)
+            header += len(data).to_bytes(2, "big")
+        conn.sendall(bytes(header) + data)
+
+    def _serve(self) -> None:
+        import base64
+        import hashlib
+        import json as _json
+        conn, _ = self.sock.accept()
+        with conn:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += conn.recv(4096)
+            headers = head.decode("ascii", "replace").split("\r\n")
+            key = next(h.split(": ", 1)[1] for h in headers if h.lower().startswith("sec-websocket-key"))
+            self.auth_headers = [h for h in headers if h.lower().startswith("authorization")]
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            request = _json.loads(self._read_frame(conn).decode("utf-8"))
+            self.requests.append(request)
+            if self.ping_first:
+                self._send_text(conn, _json.dumps({"_tag": "Ping"}))
+                # the client must answer with a Pong frame
+                self.pong = _json.loads(self._read_frame(conn).decode("utf-8"))
+            exit_frame = {"_tag": "Exit", "exit": {"_tag": self.exit_tag, "value": {"providers": []}}}
+            self._send_text(conn, _json.dumps(exit_frame))
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+class RefreshTests(FakeCliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.token_file = self.tmp / "watchers.json"
+        self.token_file.write_text(json.dumps({"url": "http://127.0.0.1", "token": "t-secret"}), encoding="utf-8")
+        self.token_file.chmod(0o600)
+
+    def test_refresh_sends_request_answers_ping_and_accepts_success(self) -> None:
+        server = FakeRobobServer(exit_tag="Success")
+        try:
+            with mock.patch.dict(os.environ, {"T3_CONTROL_URL": server.url(),
+                                              "T3_CONTROL_TOKEN_FILE": str(self.token_file)}):
+                hc.refresh_codex_provider("codex")
+        finally:
+            server.close()
+        self.assertEqual(server.requests[0]["tag"], "server.refreshProviders")
+        self.assertEqual(server.requests[0]["payload"], {"instanceId": "codex"})
+        self.assertEqual(server.pong, {"_tag": "Pong"})
+        self.assertTrue(server.auth_headers and "t-secret" in server.auth_headers[0])
+
+    def test_refresh_failure_exit_is_an_error_not_a_rotation(self) -> None:
+        server = FakeRobobServer(exit_tag="Failure")
+        try:
+            with mock.patch.dict(os.environ, {"T3_CONTROL_URL": server.url(),
+                                              "T3_CONTROL_TOKEN_FILE": str(self.token_file)}):
+                with self.assertRaises(hc.HarnessError) as ctx:
+                    hc.refresh_codex_provider("codex")
+        finally:
+            server.close()
+        self.assertIn("refreshProviders failed", str(ctx.exception))
+
+    def test_refresh_refuses_non_codex_instance(self) -> None:
+        with self.assertRaises(hc.HarnessError):
+            hc.refresh_codex_provider("opencode")
+
+    def test_refresh_refuses_non_loopback_url(self) -> None:
+        with mock.patch.dict(os.environ, {"T3_CONTROL_URL": "http://10.0.0.5:3773",
+                                          "T3_CONTROL_TOKEN_FILE": str(self.token_file)}):
+            with self.assertRaises(hc.HarnessError):
+                hc.refresh_codex_provider("codex")
+
+
+class RotationGateTests(FakeCliTestCase):
+    """The standing OK, the snapshot's fail-closed rule, and the rotation path end to end."""
+
+    def install_codex(self, version: str = "0.166.0") -> None:
+        bin_dir = self.root / "codex" / version / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "codex").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        (bin_dir / "codex").chmod(0o555)
+
+    def pend(self, version: str = "0.166.0") -> None:
+        self.install_codex(version)
+        hc.write_record("canary", "codex", version, "passed", binarySha256="x",
+                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False})
+        hc.promote("codex", version)
+
+    def test_rotation_refused_without_standing_ok_even_without_when_idle_flag(self) -> None:
+        self.pend()
+        refresh = mock.Mock()
+        msg = hc.rotate_codex(checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
+        self.assertIn("autoRotateCodex is off", msg)
+        refresh.assert_not_called()
+
+    def test_empty_snapshot_fails_closed(self) -> None:
+        self.pend()
+        state = hc.load_state()
+        state["autoRotateCodex"] = True
+        hc.save_state(state)
+        refresh = mock.Mock()
+        msg = hc.rotate_codex(checker=lambda: {}, refresher=refresh, quiet_seconds=0)
+        refresh.assert_not_called()
+        self.assertIn("not rotating", msg)
+        self.assertTrue(hc.load_state()["codex"]["rotationPending"])
+
+    def test_thread_missing_fields_fails_closed(self) -> None:
+        with self.assertRaises(hc.HarnessError):
+            hc.codex_busy({"threads": [{"provider": "codex"}]})
+
+    def test_rotation_with_standing_ok_and_idle_calls_refresh_and_clears_pending(self) -> None:
+        self.pend()
+        state = hc.load_state()
+        state["autoRotateCodex"] = True
+        hc.save_state(state)
+        refresh = mock.Mock()
+        msg = hc.rotate_codex(checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
+        refresh.assert_called_once()
+        self.assertIn("refreshed", msg)
+        self.assertFalse(hc.load_state()["codex"]["rotationPending"])
+
+    def test_failed_refresh_keeps_rotation_pending(self) -> None:
+        self.pend()
+        state = hc.load_state()
+        state["autoRotateCodex"] = True
+        hc.save_state(state)
+        refresh = mock.Mock(side_effect=hc.HarnessError("server.refreshProviders failed: Failure"))
+        msg = hc.rotate_codex(checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
+        self.assertIn("refreshProviders failed", msg)
+        self.assertTrue(hc.load_state()["codex"]["rotationPending"])
+
+    def test_auto_drives_codex_rotation_when_standing_ok_recorded(self) -> None:
+        self.pend()
+        state = hc.load_state()
+        state["autoRotateCodex"] = True
+        hc.save_state(state)
+        with mock.patch.object(hc, "rotate_codex", return_value="Codex app-server refreshed onto the current binary") as rot:
+            report = hc.auto()
+        rot.assert_called_once()
+        self.assertEqual(report["codexRotation"], "Codex app-server refreshed onto the current binary")
 
 
 class BeforeReleaseTests(FakeCliTestCase):
