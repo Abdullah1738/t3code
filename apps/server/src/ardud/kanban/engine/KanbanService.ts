@@ -3167,7 +3167,7 @@ const make = Effect.gen(function* () {
         const sent = yield* threads
           .send({
             threadId: link.threadId,
-            text: `Board check: this turn has been running for ${minutes} minutes. Post a one-line status where Abdullah reads it (your discussion, with discussion_post): what you're doing and when you expect to finish. Then carry on; don't stop for this.`,
+            text: `Board check: this turn has been running for ${minutes} minutes. If your last ETA in the discussion still holds, carry on without posting. Otherwise post one line there with discussion_post: what's done and the new ETA. After a second missed ETA, stop researching: file what's left as cards with what you know, post the summary, and end the turn.`,
           })
           .pipe(
             Effect.as(true),

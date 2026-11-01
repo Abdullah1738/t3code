@@ -1876,7 +1876,10 @@ it.effect("a long evaluator turn is asked for a status at 45 minutes, then hourl
       yield* kanban.tick;
       assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
       const ask = (yield* Ref.get(fake.threads)).get(evaluator)!.messages.at(-1) ?? "";
-      assert.include(ask, "running for 46 minutes");
+      assert.strictEqual(
+        ask,
+        "Board check: this turn has been running for 46 minutes. If your last ETA in the discussion still holds, carry on without posting. Otherwise post one line there with discussion_post: what's done and the new ETA. After a second missed ETA, stop researching: file what's left as cards with what you know, post the summary, and end the turn.",
+      );
       yield* kanban.tick;
       assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
       yield* TestClock.adjust("60 minutes");
