@@ -49,44 +49,44 @@ const caller = (input: { driver: string; nativeId: string; agentId?: string | un
   ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
 });
 
-const body = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>) =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const text = yield* request.text.pipe(
-      Effect.mapError(() => routeError("invalid_request", "Unable to read body.", 400)),
-    );
-    const value = yield* decodedJson(text).pipe(
-      Effect.mapError(() => routeError("invalid_request", "Body is not JSON.", 400)),
-    );
-    return yield* decode(value).pipe(
-      Effect.mapError((error) => routeError("invalid_request", error.message, 400)),
-    );
-  });
+const body = Effect.fn("DesktopLeaseHttp.body")(function* <A>(
+  decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const text = yield* request.text.pipe(
+    Effect.mapError(() => routeError("invalid_request", "Unable to read body.", 400)),
+  );
+  const value = yield* decodedJson(text).pipe(
+    Effect.mapError(() => routeError("invalid_request", "Body is not JSON.", 400)),
+  );
+  return yield* decode(value).pipe(
+    Effect.mapError((error) => routeError("invalid_request", error.message, 400)),
+  );
+});
 
 export const desktopLeaseRoutes = HttpRouter.addAll(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
     const lease = yield* DesktopLeaseService.DesktopLeaseService;
-    const authenticate = (
+    const authenticate = Effect.fn("DesktopLeaseHttp.authenticate")(function* (
       scope:
         | typeof AuthOrchestrationReadScope
         | typeof AuthOrchestrationOperateScope
         | typeof AuthEnvironmentMaintainScope,
-    ) =>
-      Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        const session = yield* auth
-          .authenticateHttpRequest(request)
-          .pipe(
-            Effect.mapError((error) =>
-              EnvironmentAuth.isServerAuthCredentialError(error)
-                ? routeError("unauthorized", "A valid bearer token is required.", 401)
-                : routeError("unavailable", "Authentication unavailable.", 503),
-            ),
-          );
-        if (!session.scopes.includes(scope))
-          return yield* routeError("forbidden", `This token lacks ${scope}.`, 403);
-      });
+    ) {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const session = yield* auth
+        .authenticateHttpRequest(request)
+        .pipe(
+          Effect.mapError((error) =>
+            EnvironmentAuth.isServerAuthCredentialError(error)
+              ? routeError("unauthorized", "A valid bearer token is required.", 401)
+              : routeError("unavailable", "Authentication unavailable.", 503),
+          ),
+        );
+      if (!session.scopes.includes(scope))
+        return yield* routeError("forbidden", `This token lacks ${scope}.`, 403);
+    });
     const handle = <R>(
       effect: Effect.Effect<
         HttpServerResponse.HttpServerResponse,
@@ -138,12 +138,13 @@ export const desktopLeaseRoutes = HttpRouter.addAll(
         }),
       );
     });
-    const ticketAction = (action: "heartbeat" | "release") =>
-      Effect.gen(function* () {
-        yield* authenticate(AuthOrchestrationOperateScope);
-        const input = yield* body(Schema.decodeUnknownEffect(TicketBody));
-        return json(yield* lease[action](caller(input), input.ticket));
-      });
+    const ticketAction = Effect.fn("DesktopLeaseHttp.ticketAction")(function* (
+      action: "heartbeat" | "release",
+    ) {
+      yield* authenticate(AuthOrchestrationOperateScope);
+      const input = yield* body(Schema.decodeUnknownEffect(TicketBody));
+      return json(yield* lease[action](caller(input), input.ticket));
+    });
     const startCall = Effect.gen(function* () {
       yield* authenticate(AuthOrchestrationOperateScope);
       const input = yield* body(Schema.decodeUnknownEffect(CallStartBody));

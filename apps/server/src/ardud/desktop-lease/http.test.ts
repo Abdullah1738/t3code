@@ -1,6 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - these use isolated file-backed SQLite stores.
-import * as FS from "node:fs";
-import * as Path from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { AuthSessionId, type AuthEnvironmentScope } from "@t3tools/contracts";
@@ -28,10 +28,12 @@ const makeHarness = (
 ) =>
   Effect.gen(function* () {
     const dir = yield* Effect.acquireRelease(
-      Effect.sync(() => FS.mkdtempSync(Path.join(process.cwd(), ".desktop-lease-http-test-"))),
-      (dir) => Effect.sync(() => FS.rmSync(dir, { recursive: true, force: true })),
+      Effect.sync(() =>
+        NodeFS.mkdtempSync(NodePath.join(process.cwd(), ".desktop-lease-http-test-")),
+      ),
+      (dir) => Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
     );
-    const filename = Path.join(dir, "lease.sqlite");
+    const filename = NodePath.join(dir, "lease.sqlite");
     const resolvedInputs: ExecutionIdentity.ResolveInput[] = [];
     let opens = 0;
     let now = 1_750_000_000_000;
@@ -347,7 +349,7 @@ describe("desktop lease HTTP", () => {
           });
           assert.strictEqual(forbidden.status, 403);
           assert.strictEqual(opens(), 0);
-          assert.isFalse(FS.existsSync(filename));
+          assert.isFalse(NodeFS.existsSync(filename));
 
           const unavailable = yield* request("GET", "");
           assert.strictEqual(unavailable.status, 503);

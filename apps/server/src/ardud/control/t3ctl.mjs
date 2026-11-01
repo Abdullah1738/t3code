@@ -133,10 +133,13 @@ async function main() {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";
       if (action === "status") return print(await client.request("GET", path));
-      if (action === "reconcile") return print(await client.request("POST", `${path}/reconcile`, {
-        ticket: need(flags.ticket, "--ticket"),
-        evidence: need(flags.evidence, "--evidence"),
-      }));
+      if (action === "reconcile")
+        return print(
+          await client.request("POST", `${path}/reconcile`, {
+            ticket: need(flags.ticket, "--ticket"),
+            evidence: need(flags.evidence, "--evidence"),
+          }),
+        );
       if (!["acquire", "heartbeat", "release"].includes(action)) {
         console.error(`unknown desktop-lease action ${action}`);
         process.exit(2);
@@ -147,24 +150,27 @@ async function main() {
           ? { driver: "opencode", nativeId: process.env.OPENCODE_SESSION_ID }
           : null;
       const explicit = flags.driver !== undefined || flags["native-id"] !== undefined;
-      const caller = explicit
-        ? { driver: flags.driver, nativeId: flags["native-id"] }
-        : envCaller;
+      const caller = explicit ? { driver: flags.driver, nativeId: flags["native-id"] } : envCaller;
       if (!caller?.driver || !caller.nativeId) {
         console.error("no caller identity");
         process.exit(2);
       }
       const identity = { ...caller, ...(flags["agent-id"] ? { agentId: flags["agent-id"] } : {}) };
-      if (action === "acquire") return print(await client.request("POST", `${path}/acquire`, {
-        ...identity,
-        taskId: need(flags.task, "--task"),
-        scope: need(flags.scope, "--scope"),
-        mode: need(flags.mode, "--mode"),
-      }));
-      return print(await client.request("POST", `${path}/${action}`, {
-        ...identity,
-        ticket: need(flags.ticket, "--ticket"),
-      }));
+      if (action === "acquire")
+        return print(
+          await client.request("POST", `${path}/acquire`, {
+            ...identity,
+            taskId: need(flags.task, "--task"),
+            scope: need(flags.scope, "--scope"),
+            mode: need(flags.mode, "--mode"),
+          }),
+        );
+      return print(
+        await client.request("POST", `${path}/${action}`, {
+          ...identity,
+          ticket: need(flags.ticket, "--ticket"),
+        }),
+      );
     }
     case "threads": {
       const result = await client.listThreads({

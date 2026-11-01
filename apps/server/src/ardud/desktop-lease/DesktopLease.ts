@@ -1,10 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off - the host-global store is separate from every server home.
 // @effect-diagnostics globalDate:off - the clock can be injected in tests.
-import * as Crypto from "node:crypto";
-import * as FS from "node:fs";
-import * as OS from "node:os";
-import * as Path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 export const STALE_MS = 120_000;
 export const QUIET_MS = 600_000;
@@ -112,7 +112,7 @@ const leaseOf = (row: Row): Lease => ({
 });
 
 export const defaultDesktopLeasePath = () =>
-  Path.join(OS.userInfo().homedir, ".robob", "desktop-lease", "lease.sqlite");
+  NodePath.join(NodeOS.userInfo().homedir, ".robob", "desktop-lease", "lease.sqlite");
 
 const requestsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_requests (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,29 +143,29 @@ const callsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_calls (
 
 /** One host-wide lock, independent of T3 home and project database. */
 export class DesktopLease {
-  private readonly db: DatabaseSync;
+  private readonly db: NodeSqlite.DatabaseSync;
   private readonly now: () => number;
 
   constructor(options: { filename?: string; now?: () => number } = {}) {
     const filename = options.filename ?? defaultDesktopLeasePath();
     if (filename !== ":memory:") {
-      const directory = Path.dirname(filename);
-      FS.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const directory = NodePath.dirname(filename);
+      NodeFS.mkdirSync(directory, { recursive: true, mode: 0o700 });
       if (options.filename === undefined) {
-        FS.chmodSync(directory, 0o700);
-      } else if ((FS.statSync(directory).mode & 0o777) !== 0o700) {
+        NodeFS.chmodSync(directory, 0o700);
+      } else if ((NodeFS.statSync(directory).mode & 0o777) !== 0o700) {
         // Do not chmod an arbitrary injected parent such as a shared temp directory.
         throw new Error("Desktop lease directory must be private (0700).");
       }
-      const fd = FS.openSync(filename, "a", 0o600);
+      const fd = NodeFS.openSync(filename, "a", 0o600);
       try {
-        FS.fchmodSync(fd, 0o600);
+        NodeFS.fchmodSync(fd, 0o600);
       } finally {
-        FS.closeSync(fd);
+        NodeFS.closeSync(fd);
       }
     }
     this.now = options.now ?? Date.now;
-    this.db = new DatabaseSync(filename);
+    this.db = new NodeSqlite.DatabaseSync(filename);
     try {
       // Failure to get the writer is a closed failure, never an uncoordinated grant.
       this.db.exec(`PRAGMA busy_timeout = 1000; PRAGMA journal_mode = WAL;
@@ -174,7 +174,7 @@ export class DesktopLease {
       if (filename !== ":memory:") {
         for (const suffix of ["-wal", "-shm"]) {
           try {
-            FS.chmodSync(filename + suffix, 0o600);
+            NodeFS.chmodSync(filename + suffix, 0o600);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           }
@@ -192,20 +192,24 @@ export class DesktopLease {
       const requestColumns = this.db.prepare("PRAGMA table_info(ardud_desktop_requests)").all() as {
         name: string;
       }[];
-      const oldRequests = requestColumns.length > 0 &&
+      const oldRequests =
+        requestColumns.length > 0 &&
         (requestColumns.some((column) => column.name === "quiescent") ||
           !requestColumns.some((column) => column.name === "stopping_reason"));
       const hasLastPoll = requestColumns.some((column) => column.name === "last_polled_at");
-      const calls = this.db.prepare(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ardud_desktop_calls'",
-      ).get() as { sql: string } | undefined;
+      const calls = this.db
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ardud_desktop_calls'",
+        )
+        .get() as { sql: string } | undefined;
       const oldCalls = calls !== undefined && !calls.sql.includes("'failed'");
       if (oldRequests) {
         this.db.exec(`ALTER TABLE ardud_desktop_requests RENAME TO ardud_desktop_requests_old;
           DROP INDEX IF EXISTS ardud_desktop_one_holder;
           DROP INDEX IF EXISTS ardud_desktop_one_child;`);
       }
-      if (oldCalls) this.db.exec("ALTER TABLE ardud_desktop_calls RENAME TO ardud_desktop_calls_old");
+      if (oldCalls)
+        this.db.exec("ALTER TABLE ardud_desktop_calls RENAME TO ardud_desktop_calls_old");
       this.db.exec(`${requestsTable}; ${callsTable};`);
       if (!oldRequests && requestColumns.length > 0 && !hasLastPoll) {
         this.db.exec("ALTER TABLE ardud_desktop_requests ADD COLUMN last_polled_at INTEGER");
@@ -225,8 +229,10 @@ export class DesktopLease {
       }
       if (oldRequests || (requestColumns.length > 0 && !hasLastPoll)) {
         // Existing waiters get a full poll interval after migration, not from their original enqueue.
-        this.db.prepare(`UPDATE ardud_desktop_requests SET last_polled_at = ?
-          WHERE request_state = 'queued' AND last_polled_at IS NULL`).run(this.now());
+        this.db
+          .prepare(`UPDATE ardud_desktop_requests SET last_polled_at = ?
+          WHERE request_state = 'queued' AND last_polled_at IS NULL`)
+          .run(this.now());
       }
       if (oldCalls) {
         this.db.exec(`INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at, ended_at)
@@ -283,38 +289,48 @@ export class DesktopLease {
       row.request_state !== "held" ||
       row.root_thread_id !== caller.rootThreadId ||
       row.child_thread_id !== caller.robobThreadId
-    ) return fail("Only the current lease holder may perform this operation.");
+    )
+      return fail("Only the current lease holder may perform this operation.");
     return row;
   }
 
   private hasOpenCall(ticket: string) {
-    return this.db.prepare(
-      "SELECT 1 FROM ardud_desktop_calls WHERE ticket = ? AND state = 'started' LIMIT 1",
-    ).get(ticket) !== undefined;
+    return (
+      this.db
+        .prepare("SELECT 1 FROM ardud_desktop_calls WHERE ticket = ? AND state = 'started' LIMIT 1")
+        .get(ticket) !== undefined
+    );
   }
 
   private finish(row: Row) {
-    this.db.prepare("UPDATE ardud_desktop_requests SET request_state = 'finished' WHERE seq = ?").run(row.seq);
+    this.db
+      .prepare("UPDATE ardud_desktop_requests SET request_state = 'finished' WHERE seq = ?")
+      .run(row.seq);
   }
 
   private advance(now: number) {
     // A returning caller at the deadline must observe cancellation, not revive its old ticket.
-    this.db.prepare(`UPDATE ardud_desktop_requests SET request_state = 'cancelled'
-      WHERE request_state = 'queued' AND last_polled_at <= ?`).run(now - QUEUE_POLL_TIMEOUT_MS);
+    this.db
+      .prepare(`UPDATE ardud_desktop_requests SET request_state = 'cancelled'
+      WHERE request_state = 'queued' AND last_polled_at <= ?`)
+      .run(now - QUEUE_POLL_TIMEOUT_MS);
     let holder = this.holder();
     if (!holder || holder.lease_state === "quarantined") return;
     if (holder.lease_state === "held" && now - holder.heartbeat_at! >= STALE_MS) {
-      this.db.prepare(`UPDATE ardud_desktop_requests
+      this.db
+        .prepare(`UPDATE ardud_desktop_requests
         SET lease_state = 'stopping', stopping_at = ?, stopping_reason = 'stale' WHERE seq = ?`)
         .run(now, holder.seq);
       holder = this.holder()!;
     }
     // On-demand checks enforce the age limit even while a caller heartbeats.
-    const expiredCall = this.db.prepare(`SELECT 1 FROM ardud_desktop_calls
+    const expiredCall = this.db
+      .prepare(`SELECT 1 FROM ardud_desktop_calls
       WHERE ticket = ? AND state = 'started' AND started_at <= ? LIMIT 1`)
       .get(holder.ticket, now - QUIET_MS);
     if (expiredCall) {
-      this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'quarantined' WHERE seq = ?")
+      this.db
+        .prepare("UPDATE ardud_desktop_requests SET lease_state = 'quarantined' WHERE seq = ?")
         .run(holder.seq);
       return;
     }
@@ -327,13 +343,15 @@ export class DesktopLease {
 
   private snapshot(): LeaseStatus {
     const holder = this.holder();
-    const queued = this.db.prepare(
-      "SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq",
-    ).all() as Row[];
+    const queued = this.db
+      .prepare("SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq")
+      .all() as Row[];
     return {
       lease: holder ? leaseOf(holder) : null,
       queue: queued.map((row, index) => ({
-        ...requestOf(row), enqueuedAt: iso(row.enqueued_at), position: index + 1,
+        ...requestOf(row),
+        enqueuedAt: iso(row.enqueued_at),
+        position: index + 1,
       })),
     };
   }
@@ -354,31 +372,51 @@ export class DesktopLease {
     }
     return this.transaction((now) => {
       this.advance(now);
-      let row = this.one(`SELECT * FROM ardud_desktop_requests
+      let row = this.one(
+        `SELECT * FROM ardud_desktop_requests
         WHERE root_thread_id = ? AND child_thread_id = ? AND task_id = ?`,
-        caller.rootThreadId, caller.robobThreadId, input.taskId);
+        caller.rootThreadId,
+        caller.robobThreadId,
+        input.taskId,
+      );
       if (row) {
         // Terminal retries are observable but must not create an obsolete queue entry.
         if (row.scope !== input.scope || row.mode !== input.mode) {
           return fail("This caller and taskId already have a different lease request.");
         }
         if (row.request_state === "queued") {
-          this.db.prepare(`UPDATE ardud_desktop_requests SET last_polled_at = MAX(COALESCE(last_polled_at, ?), ?)
-            WHERE seq = ?`).run(now, now, row.seq);
+          this.db
+            .prepare(`UPDATE ardud_desktop_requests SET last_polled_at = MAX(COALESCE(last_polled_at, ?), ?)
+            WHERE seq = ?`)
+            .run(now, now, row.seq);
         }
       } else {
-        const ticket = Crypto.randomUUID();
-        this.db.prepare(`INSERT INTO ardud_desktop_requests
+        const ticket = NodeCrypto.randomUUID();
+        this.db
+          .prepare(`INSERT INTO ardud_desktop_requests
           (ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state, enqueued_at, last_polled_at)
           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-          .run(ticket, caller.rootThreadId, caller.robobThreadId, input.taskId, input.scope, input.mode, now, now);
+          .run(
+            ticket,
+            caller.rootThreadId,
+            caller.robobThreadId,
+            input.taskId,
+            input.scope,
+            input.mode,
+            now,
+            now,
+          );
         row = this.byTicket(ticket);
       }
       if (row.request_state === "queued" && !this.holder()) {
-        const head = this.one("SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq LIMIT 1");
+        const head = this.one(
+          "SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq LIMIT 1",
+        );
         if (head?.seq === row.seq) {
-          this.db.prepare(`UPDATE ardud_desktop_requests SET request_state = 'held', lease_state = 'held',
-            acquired_at = ?, heartbeat_at = ? WHERE seq = ?`).run(now, now, row.seq);
+          this.db
+            .prepare(`UPDATE ardud_desktop_requests SET request_state = 'held', lease_state = 'held',
+            acquired_at = ?, heartbeat_at = ? WHERE seq = ?`)
+            .run(now, now, row.seq);
           row = this.byTicket(row.ticket);
         }
       }
@@ -398,7 +436,9 @@ export class DesktopLease {
       this.advance(now);
       const row = this.ownedHolder(caller, ticket);
       if (row.lease_state !== "held") return fail("Lease is not held; do not start desktop work.");
-      this.db.prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?").run(now, row.seq);
+      this.db
+        .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
+        .run(now, row.seq);
       return this.snapshot();
     });
   }
@@ -410,8 +450,10 @@ export class DesktopLease {
       const row = this.ownedHolder(caller, ticket);
       if (row.lease_state === "held") {
         if (this.hasOpenCall(ticket)) {
-          this.db.prepare(`UPDATE ardud_desktop_requests SET lease_state = 'stopping',
-            stopping_at = ?, stopping_reason = 'release' WHERE seq = ?`).run(now, row.seq);
+          this.db
+            .prepare(`UPDATE ardud_desktop_requests SET lease_state = 'stopping',
+            stopping_at = ?, stopping_reason = 'release' WHERE seq = ?`)
+            .run(now, row.seq);
         } else {
           this.finish(row);
         }
@@ -428,13 +470,19 @@ export class DesktopLease {
       this.advance(now);
       const row = this.holder();
       if (
-        !row || row.lease_state !== "held" ||
-        row.root_thread_id !== caller.rootThreadId || row.child_thread_id !== caller.robobThreadId
-      ) return fail("Only the current lease holder may start desktop work.");
+        !row ||
+        row.lease_state !== "held" ||
+        row.root_thread_id !== caller.rootThreadId ||
+        row.child_thread_id !== caller.robobThreadId
+      )
+        return fail("Only the current lease holder may start desktop work.");
       if (this.db.prepare("SELECT 1 FROM ardud_desktop_calls WHERE call_id = ?").get(toolUseId)) {
         return fail("toolUseId was already used; do not replay the call.");
       }
-      this.db.prepare("INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at) VALUES (?, ?, 'started', ?)")
+      this.db
+        .prepare(
+          "INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at) VALUES (?, ?, 'started', ?)",
+        )
         .run(toolUseId, row.ticket, now);
       return this.snapshot();
     });
@@ -446,7 +494,8 @@ export class DesktopLease {
       throw new DesktopLeaseError("invalid_request", "Invalid call outcome.");
     }
     return this.transaction((now) => {
-      const call = this.db.prepare("SELECT ticket, state FROM ardud_desktop_calls WHERE call_id = ?")
+      const call = this.db
+        .prepare("SELECT ticket, state FROM ardud_desktop_calls WHERE call_id = ?")
         .get(toolUseId) as CallRow | undefined;
       if (!call) throw new DesktopLeaseError("not_found", "Unknown desktop call.");
       if (call.state !== "started") {
@@ -456,7 +505,8 @@ export class DesktopLease {
       // A delayed completion may close its own row, never advance a newer holder.
       const isCurrent = this.holder()?.ticket === call.ticket;
       if (isCurrent) this.advance(now);
-      this.db.prepare("UPDATE ardud_desktop_calls SET state = ?, ended_at = ? WHERE call_id = ?")
+      this.db
+        .prepare("UPDATE ardud_desktop_calls SET state = ?, ended_at = ? WHERE call_id = ?")
         .run(outcome, now, toolUseId);
       if (isCurrent && this.holder()?.ticket === call.ticket) this.advance(now);
       return this.snapshot();
@@ -472,7 +522,9 @@ export class DesktopLease {
       if (row.request_state !== "held" || row.lease_state !== "quarantined") {
         return fail("Only a quarantined lease may be reconciled.");
       }
-      this.db.prepare("UPDATE ardud_desktop_requests SET evidence = ? WHERE seq = ?").run(evidence, row.seq);
+      this.db
+        .prepare("UPDATE ardud_desktop_requests SET evidence = ? WHERE seq = ?")
+        .run(evidence, row.seq);
       this.finish(row);
       return this.snapshot();
     });
