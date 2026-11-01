@@ -411,6 +411,80 @@ describe("review regressions", () => {
   });
 });
 
+describe("non-string effort values", () => {
+  const maxBase = sel("codex", "gpt-6.1-sol", [{ id: "reasoningEffort", value: "max" }]);
+
+  it("a boolean under reasoningEffort is a conflict, not a silent clear of max", () => {
+    const result = mergeSelection(maxBase, {
+      options: [{ id: "reasoningEffort", value: false }],
+    });
+    expect(result.kind).toBe("conflict");
+    expect(result.kind === "conflict" ? result.reason : "").toMatch(
+      /reasoningEffort must be a level name/,
+    );
+  });
+
+  it("a boolean under effort or variant is a conflict too, on Claude and OpenCode", () => {
+    expect(
+      mergeSelection(sel("claudeAgent", "claude-opus-5-5"), {
+        options: [{ id: "effort", value: true }],
+      }).kind,
+    ).toBe("conflict");
+    expect(
+      mergeSelection(sel("opencode", "opus/gpt-6-astra"), {
+        options: [{ id: "variant", value: false }],
+      }).kind,
+    ).toBe("conflict");
+  });
+
+  it("a boolean under an effort id stored on the base is refused, not dropped", () => {
+    const stored = sel("codex", "gpt-6.1-sol", [{ id: "reasoningEffort", value: false }]);
+    expect(mergeSelection(stored, {}).kind).toBe("conflict");
+    expect(resolveSelection(stored).kind).toBe("conflict");
+  });
+
+  it("a boolean fastMode still carries through a merge on Claude", () => {
+    expect(
+      mergeSelection(sel("claudeAgent", "claude-opus-5-5", [{ id: "effort", value: "max" }]), {
+        options: [
+          { id: "effort", value: "max" },
+          { id: "fastMode", value: true },
+        ],
+      }),
+    ).toEqual({
+      kind: "selection",
+      selection: {
+        instanceId: "claudeAgent",
+        model: "claude-opus-5-5",
+        options: [
+          { id: "fastMode", value: true },
+          { id: "effort", value: "max" },
+        ],
+      },
+    });
+  });
+
+  it("a boolean fastMode still carries through a resolve on Claude", () => {
+    expect(
+      resolveSelection(
+        sel("opencode", "opus/claude-opus-5-5", [
+          { id: "variant", value: "max" },
+          { id: "fastMode", value: false },
+        ]),
+      ),
+    ).toMatchObject({
+      kind: "mapped",
+      selection: {
+        instanceId: "claudeAgent",
+        options: [
+          { id: "effort", value: "max" },
+          { id: "fastMode", value: false },
+        ],
+      },
+    });
+  });
+});
+
 describe("conflicting efforts in resolveSelection", () => {
   it("reports a variant list with two values against a legacy suffix", () => {
     expect(

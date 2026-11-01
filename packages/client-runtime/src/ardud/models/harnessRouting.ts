@@ -96,7 +96,22 @@ function effortIds(instanceId: string): ReadonlyArray<string> {
   return native === "variant" ? ["variant"] : [native, "variant"];
 }
 
-/** The string values of the options named by `ids`, in order. Booleans are never efforts. */
+/** Every option id that carries an effort, on any instance. */
+const EFFORT_IDS: ReadonlyArray<string> = ["variant", "effort", "reasoningEffort"];
+
+/**
+ * An effort option (variant, effort, reasoningEffort) must hold a string. A boolean or other
+ * value there is an invalid effort, and it must be reported rather than silently dropped. This
+ * covers every effort id on any instance, so a stored or patched invalid effort never vanishes.
+ */
+function invalidEffort(options: ReadonlyArray<ProviderOptionSelection> | undefined): string | null {
+  const bad = (options ?? []).find(
+    (option) => EFFORT_IDS.includes(option.id) && typeof option.value !== "string",
+  );
+  return bad === undefined ? null : `${bad.id} must be a level name, not ${String(bad.value)}`;
+}
+
+/** The string values of the options named by `ids`, in order. */
 function valuesOf(
   options: ReadonlyArray<ProviderOptionSelection> | undefined,
   ids: ReadonlyArray<string>,
@@ -161,6 +176,9 @@ export type SelectionResolution =
  * A selection that is already mapped comes back unchanged.
  */
 export function resolveSelection(selection: ModelSelection): SelectionResolution {
+  // An invalid effort is refused on every route, mapped or not, so it is never passed on silently.
+  const invalid = invalidEffort(selection.options);
+  if (invalid !== null) return { kind: "conflict", reason: `${selection.model}: ${invalid}` };
   const split = splitRouteSuffix(selection.instanceId, selection.model);
   const row = ROWS_BY_SOURCE.get(rowKey(selection.instanceId, split.model));
   if (row === undefined) return { kind: "unchanged", selection };
@@ -217,6 +235,8 @@ const conflict = (reason: string): MergeResult => ({ kind: "conflict", reason })
  * merge rules see one effort. A suffix that disagrees with the option is a conflict.
  */
 function foldSuffix(selection: ModelSelection): MergeResult {
+  const invalid = invalidEffort(selection.options);
+  if (invalid !== null) return conflict(`${selection.model}: ${invalid}`);
   const split = splitRouteSuffix(selection.instanceId, selection.model);
   if (split.effort === null) return { kind: "selection", selection };
   const ids = effortIds(selection.instanceId);
@@ -250,6 +270,8 @@ export function mergeSelection(base: ModelSelection, patch: SelectionPatch): Mer
   if (folded.kind === "conflict") return folded;
   const start = folded.selection;
 
+  const invalidPatch = invalidEffort(patch.options);
+  if (invalidPatch !== null) return conflict(invalidPatch);
   const instanceId = patch.instanceId ?? start.instanceId;
   const named = splitRouteSuffix(instanceId, patch.model ?? start.model);
   const model = named.model;
