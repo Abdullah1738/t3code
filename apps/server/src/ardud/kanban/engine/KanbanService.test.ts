@@ -6008,6 +6008,30 @@ it.effect("an alias with an explicit level runs on that level's pool, not the fi
   }),
 );
 
+it.effect("an effort alias at a level no pool has is refused, not run on another level's pool", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const claudeXhigh: ModelSelection = {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        options: [{ id: "effort", value: "xhigh" }],
+      };
+      yield* kanban.setPool(board.id, claudeXhigh, 1);
+      const alias: ModelSelection = {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        options: [{ id: "effort", value: "max" }],
+      };
+      const refused = yield* kanban
+        .createCard(board.id, { prompt: "a", title: "a", model: alias }, owner)
+        .pipe(Effect.flip);
+      assert.include(String(refused.message ?? refused), "no pool runs");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a short model name with two level pools of one model still resolves to the level", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

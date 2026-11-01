@@ -15,7 +15,10 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
-import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import {
+  effortOptionId,
+  selectionEffort,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -38,10 +41,10 @@ export const poolKey = (model: ModelSelection): string => {
 };
 
 /**
- * The pool a model runs on: the pool at its exact level. A model with a level never
- * falls back to another level's pool (max and xhigh are different pools). A model with
- * no level takes the first pool (in pool order) of the same model, so a board with one
- * pool per model behaves as before levels were part of the key.
+ * The pool a model runs on: the pool at its exact level. An effort pool (Claude, Codex)
+ * never runs a named level on another level's pool, so max and xhigh stay apart. A model
+ * with no level takes the first pool of its model. OpenCode variant pools keep the
+ * first-pool fallback they had before levels were keyed.
  */
 export function poolFor(
   pools: ReadonlyArray<KanbanPool>,
@@ -50,9 +53,37 @@ export function poolFor(
   const key = poolKey(model);
   // Compared by each pool's model, not its stored key, so a pool not yet rekeyed still matches.
   const exact = pools.find((pool) => poolKey(pool.model) === key);
-  if (exact !== undefined || modelLevel(model) !== null) return exact;
+  if (exact !== undefined) return exact;
+  if (modelLevel(model) !== null && effortOptionId(model.instanceId) !== "variant")
+    return undefined;
   const base = modelKey(model);
   return pools.find((pool) => modelKey(pool.model) === base);
+}
+
+/**
+ * The pool an alias names. An alias is written without its instance, or with a short name,
+ * so it is matched to the pool model it means: a short name is unambiguous when its pools all
+ * belong to one model (one key per level is still one model). The level rule is poolFor's:
+ * an effort pool never gives a named level to another level's pool.
+ */
+export function aliasPool(
+  pools: ReadonlyArray<KanbanPool>,
+  model: ModelSelection,
+): KanbanPool | undefined {
+  const joined = `${model.instanceId}/${model.model}`;
+  const byName = pools.filter(
+    (pool) => pool.model.model === joined || pool.model.model === model.model,
+  );
+  const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
+  const suffixModels = new Set(bySuffix.map((pool) => modelKey(pool.model)));
+  const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
+  const [first] = same;
+  if (first === undefined) return undefined;
+  const level = modelLevel(model);
+  if (level === null) return first;
+  const exact = same.find((pool) => modelLevel(pool.model) === level);
+  if (exact !== undefined) return exact;
+  return effortOptionId(first.model.instanceId) === "variant" ? first : undefined;
 }
 
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);

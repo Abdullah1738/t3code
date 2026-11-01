@@ -778,24 +778,8 @@ const make = Effect.gen(function* () {
   ) {
     const pools = yield* store.pools(boardId);
     const joined = `${model.instanceId}/${model.model}`;
-    // An alias names the model without its instance; resolve it to the pool model it means,
-    // then pick the level among that model's pools (never the first row when a level is named).
-    const aliased = (): KanbanPool | undefined => {
-      const byName = pools.filter(
-        (pool) => pool.model.model === joined || pool.model.model === model.model,
-      );
-      const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-      // A short name is unambiguous when its pools all belong to one model (one key per
-      // level is still one model); two different models or instances stay refused.
-      const suffixModels = new Set(bySuffix.map((pool) => Rules.modelKey(pool.model)));
-      const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
-      if (same.length === 0) return undefined;
-      const level = Rules.modelLevel(model);
-      if (level === null) return same[0];
-      // The requested level's pool when the model has one; else the first, as Rules.poolFor does.
-      return same.find((pool) => Rules.modelLevel(pool.model) === level) ?? same[0];
-    };
-    const match = Rules.poolFor(pools, model) ?? aliased();
+    // An alias names the model without its instance; Rules.aliasPool matches it to its pool.
+    const match = Rules.poolFor(pools, model) ?? Rules.aliasPool(pools, model);
     if (!match) {
       // A model the provider refuses is named as such, even when no pool exists for it.
       yield* checkModel(model);
