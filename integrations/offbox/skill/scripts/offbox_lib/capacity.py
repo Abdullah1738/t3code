@@ -6,6 +6,7 @@ import email.utils
 import json
 import os
 import re
+import sqlite3
 
 from .common import IDLE_STOP_S, OffboxError, db, event, iso, now
 
@@ -21,6 +22,18 @@ def setting(name: str, default: int, minimum: int = 1, maximum: int = 86400) -> 
         return max(minimum, min(maximum, int(os.environ.get(name, default))))
     except ValueError:
         return default
+
+
+def _add_columns(con, table: str, cols) -> None:
+    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    for col in cols:
+        if col.split()[0] in have:
+            continue
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):  # another process added it between the check and the ALTER
+                raise
 
 
 def schema(con):
@@ -47,6 +60,8 @@ def schema(con):
           box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL
         );
     """)
+    # CREATE TABLE IF NOT EXISTS never changes a table that already exists: columns added later need a migration.
+    _add_columns(con, "pool_pending", ("source TEXT",))
     # Preserve the rolling history on deployment. New clients record before sending; older
     # clients still in flight may emit legacy events, so import only unmatched events.
     con.execute("""INSERT OR IGNORE INTO start_requests(ts,operation,box_id,outcome,legacy_event)
