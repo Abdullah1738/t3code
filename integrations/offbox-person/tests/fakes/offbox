@@ -26,6 +26,19 @@ if sub in ("list", "bases") and os.environ.get(f"FAKE_{sub.upper()}_JSON"):
     print(open(os.environ[f"FAKE_{sub.upper()}_JSON"]).read())
     sys.exit(0)
 if sub == "ssh":
+    responses = os.environ.get("FAKE_SSH_RESPONSES")
+    if responses:
+        with open(responses) as f:
+            queued = json.load(f)
+        if not queued:
+            print("fake offbox: unexpected ssh call", file=sys.stderr)
+            sys.exit(86)
+        result = queued.pop(0)
+        with open(responses, "w") as f:
+            json.dump(queued, f)
+        sys.stdout.write(result.get("stdout", ""))
+        sys.stderr.write(result.get("stderr", ""))
+        sys.exit(result["exit"])
     cmd = remote_cmd(args)
     if "bash ~/person/session.sh" in cmd:
         sys.exit(0)

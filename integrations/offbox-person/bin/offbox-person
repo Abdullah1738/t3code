@@ -302,6 +302,22 @@ cmd_backup() {
   exec "$BACKUP" "$p" "$@"
 }
 
+# Only explicitly read-only WA commands can be repeated after an ambiguous box failure.
+wa_box_ssh() {
+  local p=$1 retry=$2 rc=0; shift 2
+  box_ssh "$p" "$@" || rc=$?
+  if [[ $rc == (90|92) && $retry == 1 ]]; then
+    print -u2 -- "offbox-person: her box didn't start in time (offbox exit $rc); retrying once"
+    rc=0
+    box_ssh "$p" "$@" || rc=$?
+  fi
+  if [[ $rc == (90|92) ]]; then
+    print -u2 -- "offbox-person: her box didn't start (offbox exit $rc). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes."
+    return 90
+  fi
+  return $rc
+}
+
 # Her own WhatsApp (wacli linked device) on her box. No `up`: the desktop, browser and tunnels would keep the box
 # warm; a plain ssh resumes a stopped box and the systemd --user sync service starts with it.
 cmd_wa() {
@@ -312,14 +328,17 @@ cmd_wa() {
     local f
     for f in wa:"$OFFBOX_PERSON_HOME/box/wa" wa-db:"$OFFBOX_PERSON_HOME/../robob-watch/helpers/wa-db"; do
       [[ -f ${f#*:} ]] || die "missing ${f#*:}"
-      box_ssh "$p" "mkdir -p ~/person/run && cat > ~/person/run/push-${f%%:*}" < "${f#*:}" >&2
+      wa_box_ssh "$p" 0 "mkdir -p ~/person/run && cat > ~/person/run/push-${f%%:*}" < "${f#*:}" >&2
     done
-    box_ssh "$p" 'bash -s' < "$OFFBOX_PERSON_HOME/box/wa-setup.sh"
+    wa_box_ssh "$p" 0 'bash -s' < "$OFFBOX_PERSON_HOME/box/wa-setup.sh"
     return
   fi
-  local a q=()
+  local a retry=0 q=()
+  case $1 in
+    status|link-status|chats|find|read|search|ids|events) retry=1 ;;
+  esac
   for a in "$@"; do q+=("${(qq)a}"); done
-  box_ssh "$p" "~/person/bin/wa ${q[*]}"
+  wa_box_ssh "$p" "$retry" "~/person/bin/wa ${q[*]}"
 }
 
 cmd_list() {
