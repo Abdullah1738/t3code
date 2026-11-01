@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,8 +34,19 @@ class FixtureHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/credential-sink":
+            self.server.redirected.append(self.headers.get("Authorization"))
+            self.send_response(204)
+            self.end_headers()
+            return
         query = parse_qs(urlsplit(self.path).query)
         self.server.queries.append(query)
+        self.server.authorizations.append(self.headers.get("Authorization"))
+        if self.server.redirect:
+            self.send_response(302)
+            self.send_header("Location", self.server.redirect)
+            self.end_headers()
+            return
         driver = query["driver"][0]
         child = "agentId" in query or query["nativeId"][0] == "codex-child"
         value = {"identity": {"resolution": self.server.resolution,
@@ -62,6 +74,7 @@ class RecallHookTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(dir=base))
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
         self.server.requests, self.server.queries = [], []
+        self.server.authorizations, self.server.redirected, self.server.redirect = [], [], None
         self.server.resolution = "resolved"
         self.server.answer = {"note": "past fact", "sources": [{"session_id": "old"}]}
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -70,7 +83,7 @@ class RecallHookTests(unittest.TestCase):
         self.config_file = self.tmp / "recall.json"
         self.config_file.write_text("{}")
         self.state_file = self.tmp / "state.db"
-        self.env = {"HOME": str(self.tmp), "T3_CONTROL_URL": self.url, "T3_CONTROL_TOKEN": "fixture",
+        self.env = {"HOME": str(self.tmp), "T3_CONTROL_URL": self.url, "T3_CONTROL_TOKEN": "dummy-control-token",
                     "RECALL_INJECT_URL": self.url + "/api/inject", "RECALL_HOOK_STATE": str(self.state_file),
                     "RECALL_PLUGIN_CONFIG": str(self.config_file)}
         self.env_patch = mock.patch.dict(os.environ, self.env, clear=True)
@@ -156,6 +169,18 @@ class RecallHookTests(unittest.TestCase):
         self.assertEqual(self.state()["calls"], 1)
         self.assertEqual(self.jobs, [])
 
+    def test_distinct_failure_signatures_keep_only_safe_diagnostic_markers(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUseFailure", tool_use_id="err-a", tool_name="Bash",
+                             error="ECONNREFUSED password=fixtureSuperSecret"), now=1100)
+        self.call(self.event("PostToolUseFailure", tool_use_id="err-b", tool_name="Bash",
+                             error="ModuleNotFoundError token=fixtureOtherSecret"), now=1103)
+        errors = self.state()["errors"]
+        self.assertNotEqual(errors[-2][0], errors[-1][0])
+        self.assertIn("ECONNREFUSED", errors[-2][1])
+        self.assertIn("ModuleNotFoundError", errors[-1][1])
+        self.assertNotIn("fixture", json.dumps(errors))
+
     def test_first_work_mailbox_next_hook_and_known_cited(self):
         self.call(self.event())
         self.work(8)
@@ -166,7 +191,9 @@ class RecallHookTests(unittest.TestCase):
         self.assertEqual(body["known"], ["past fact"])
         self.assertEqual(body["already"], ["old"])
         self.assertEqual(body["session_id"], "root")
-        self.assertIn("make thing", body["activity"])
+        self.assertIn("[tool input omitted]", body["activity"])
+        self.assertIn("[tool output omitted]", body["activity"])
+        self.assertNotIn("make thing", body["activity"])
         output = self.call(self.event("PostToolUse", tool_use_id="next"), now=1200)
         self.assertEqual(output["hookSpecificOutput"]["additionalContext"], "<recall>\npast fact\n</recall>")
         self.assertIsNone(self.call(self.event("PostToolUse", tool_use_id="next2"), now=1201))
@@ -179,6 +206,82 @@ class RecallHookTests(unittest.TestCase):
         hook.worker(job)
         self.assertIsNone(self.call(self.event("PostToolUse", prompt_id="turn-2", tool_use_id="x"), now=1140))
         self.assertEqual(self.state()["task"], "Please investigate another task")
+
+    def test_superseded_prompt_cannot_consume_its_previously_queued_note(self):
+        self.config_file.write_text(json.dumps({"wait_ms": 0}))
+        self.call(self.event())
+        self.assertIsNone(self.call(self.event(prompt_id="turn-2", prompt="Investigate another task"), now=1010))
+        out = self.call(self.event("PostToolUse", prompt_id="turn-2", tool_use_id="new"), now=1020)
+        self.assertIn("past fact", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_failed_prompt_resolution_quarantines_only_matching_native_identity(self):
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                self.config_file.write_text(json.dumps({"wait_ms": 0}))
+                parent = self.event(harness=harness, session_id=f"native-{harness}")
+                child = self.event(harness=harness, session_id=f"native-{harness}",
+                                   agent_id="agent-other" if harness == "claude" else "codex-child")
+                self.call(parent, harness)
+                self.call(child, harness)
+                self.work(8, harness=harness, session_id=f"native-{harness}")
+                job = self.jobs.pop()
+                hook.worker(job)
+                self.server.resolution = "pending"
+                next_prompt = {**parent, "prompt": "Investigate the next task",
+                               ("prompt_id" if harness == "claude" else "turn_id"): "turn-2"}
+                self.assertIsNone(self.call(next_prompt, harness, now=1200))
+                self.server.resolution = "resolved"
+                tool = self.event("PostToolUse", harness, session_id=f"native-{harness}", tool_use_id="later")
+                tool.pop("prompt_id" if harness == "claude" else "turn_id")
+                self.assertIsNone(self.call(tool, harness, now=1210))
+                self.assertIsNone(self.call(tool, harness, now=1213))
+                # The other agent's active state was not quarantined.
+                child_identity = {"driver": "claudeAgent" if harness == "claude" else "codex",
+                                  "providerInstanceId": "claude-instance" if harness == "claude" else "cu",
+                                  "robobThreadId": "child", "_agent": "agent-other" if harness == "claude" else None}
+                self.assertFalse(self.state(child_identity).get("invalidated", False))
+                # A later prompt which resolves may start a fresh turn normally.
+                out = self.call(next_prompt, harness, now=1220)
+                self.assertIsNone(out)  # wait_ms=0 leaves the new note queued
+                tool["tool_use_id"] = "new"
+                self.assertIn("past fact", self.call(tool, harness, now=1230)["hookSpecificOutput"]["additionalContext"])
+
+    def test_prompt_guard_blocks_tools_while_identity_lookup_is_in_flight(self):
+        self.config_file.write_text(json.dumps({"wait_ms": 0}))
+        self.call(self.event())
+        actual_resolve = hook.resolve
+        def pending_resolve(harness, event):
+            if event.get("hook_event_name") == "UserPromptSubmit":
+                tool = self.event("PostToolUse", tool_use_id="during-lookup")
+                tool.pop("prompt_id")
+                self.assertIsNone(self.call(tool, now=1010))
+                return None
+            return actual_resolve(harness, event)
+        with mock.patch.object(hook, "resolve", side_effect=pending_resolve):
+            self.assertIsNone(self.call(self.event(prompt_id="turn-2"), now=1005))
+        self.assertNotIn("during-lookup", self.state()["seen_tools"])
+
+    def test_tool_content_is_never_persisted_or_sent_in_work_payload(self):
+        self.call(self.event())
+        dummy_secrets = ["dummy-password-abc", "dummy-otp-741983", "dummy-token-qwerty",
+                         "dummy-output-secret", "dummy-raw-code-390872"]
+        self.call(self.event("PostToolUseFailure", tool_use_id="private", tool_name="Bash",
+                             tool_input={"password": dummy_secrets[0], "otpCode": dummy_secrets[1],
+                                         "nested": {"accessToken": dummy_secrets[2]}},
+                             tool_response="error: " + " ".join(dummy_secrets[3:])), now=1100)
+        self.work(7, start=1103)
+        hook.worker(self.jobs.pop())
+        self.assertEqual(self.server.requests[-1]["mode"], "work")
+        self.assertEqual(self.server.requests[-1]["errors"][0], "Bash: tool failure")
+        db = sqlite3.connect(self.state_file)
+        try:
+            persisted = " ".join(str(cell) for table in ("sessions", "jobs", "notes", "mailbox", "seeds")
+                                 for row in db.execute(f"SELECT * FROM {table}") for cell in row)
+        finally:
+            db.close()
+        for secret in dummy_secrets:
+            self.assertNotIn(secret, persisted)
+            self.assertNotIn(secret, json.dumps(self.server.requests))
 
     def test_backoff_error_trigger_limit_and_compaction(self):
         self.server.answer = {"note": None, "sources": []}
@@ -295,11 +398,11 @@ class RecallHookTests(unittest.TestCase):
                 self.call(self.event(prompt_id=f"skip-{i}", prompt=prompt), now=1130 + n)
                 count = len(self.server.requests)
                 hook.worker(job)
-                self.assertEqual(len(self.server.requests), count + 1)
+                self.assertEqual(len(self.server.requests), count)
                 self.assertIsNone(self.call(self.event("PostToolUse", prompt_id=f"skip-{i}",
                                                       tool_use_id=f"next-{i}"), now=1140 + n))
                 self.assertEqual(self.state()["task"], "")
-                self.assertEqual(len(self.server.requests), count + 1)
+                self.assertEqual(len(self.server.requests), count)
 
     def test_provisional_turn_adopts_real_id_and_rejects_stale_events(self):
         self.config_file.write_text(json.dumps({"wait_ms": 0}))
@@ -386,19 +489,48 @@ class RecallHookTests(unittest.TestCase):
 
     def test_control_token_only_uses_localhost_and_missing_token_fails_closed(self):
         event = self.event()
-        with mock.patch.dict(os.environ, {"T3_CONTROL_TOKEN": "fixture"}, clear=True), \
-             mock.patch.object(hook.urllib.request, "urlopen") as open_url:
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp), "T3_CONTROL_TOKEN": "dummy-control-token"}, clear=True), \
+             mock.patch.object(hook.urllib.request, "build_opener") as build_opener:
+            open_url = build_opener.return_value.open
             open_url.return_value.__enter__.return_value.read.return_value = json.dumps({"identity": {
                 "resolution": "resolved", "robobThreadId": "root", "rootThreadId": "root",
                 "executionKind": "top-level", "driver": "claudeAgent", "providerInstanceId": "claude-instance"}}).encode()
             self.assertIsNotNone(hook.resolve("claude", event))
             request = open_url.call_args.args[0]
             self.assertTrue(request.full_url.startswith("http://127.0.0.1:3773/"))
-            self.assertEqual(request.get_header("Authorization"), "Bearer fixture")
+            self.assertEqual(request.get_header("Authorization"), "Bearer dummy-control-token")
         with mock.patch.dict(os.environ, {"HOME": str(self.tmp), "T3_CONTROL_URL": self.url}, clear=True), \
-             mock.patch.object(hook.urllib.request, "urlopen") as open_url:
+             mock.patch.object(hook.urllib.request, "build_opener") as open_url:
             self.assertIsNone(hook.resolve("claude", event))
             open_url.assert_not_called()
+
+    def test_control_url_rejects_untrusted_origins_before_sending_token(self):
+        remote_urls = ("http://example.com:3773", "https://localhost:3773", "http://127.0.0.2:3773",
+                       "http://localhost.example.com", "http://localhost@evil.example",
+                       "http://user@localhost:3773", "http://127.0.0.1:3773/path",
+                       "http://[::ffff:127.0.0.1]:3773", "http://127.0.0.1:99999", "http://localhost:0")
+        for url in remote_urls:
+            with self.subTest(url=url), mock.patch.dict(os.environ, {"T3_CONTROL_URL": url}), \
+                 mock.patch.object(hook.urllib.request, "build_opener") as opener:
+                self.assertIsNone(hook.resolve("claude", self.event()))
+                opener.assert_not_called()
+        for url in ("http://localhost:3773", "http://127.0.0.1:3773/", "http://[::1]:3773"):
+            self.assertEqual(hook.control_origin(url), url.rstrip("/"))
+
+    def test_identity_resolution_never_follows_credentialed_redirect(self):
+        sink = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        sink.redirected = []
+        thread = threading.Thread(target=sink.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.server.redirect = f"http://127.0.0.1:{sink.server_port}/credential-sink"
+            self.assertIsNone(hook.resolve("claude", self.event()))
+            self.assertEqual(self.server.authorizations, ["Bearer dummy-control-token"])
+            self.assertEqual(sink.redirected, [])
+        finally:
+            sink.shutdown()
+            sink.server_close()
+            thread.join()
 
     def test_unidentified_consecutive_turns_fail_closed_on_ambiguous_id(self):
         first = self.event()

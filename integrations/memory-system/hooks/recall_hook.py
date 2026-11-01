@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -79,6 +80,25 @@ def post(url: str, body: dict, timeout: float) -> dict:
     return value
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def control_origin(url: str) -> str | None:
+    """Credentials are only sent to an explicit, loopback HTTP origin."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1", "::1") or
+            parsed.username is not None or parsed.password is not None or parsed.port == 0 or
+            parsed.path not in ("", "/") or parsed.query or parsed.fragment or
+            any(ord(c) <= 32 or ord(c) == 127 for c in url)):
+            return None
+        return url.rstrip("/")
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve(harness: str, event: dict) -> dict | None:
     """C1 resolves a Claude (session, agent), or Codex concrete thread."""
     session = event.get("session_id")
@@ -110,12 +130,19 @@ def resolve(harness: str, event: dict) -> dict | None:
         token = token or stored.get("token")
     if not token:
         return None
-    url = url or stored.get("url") or "http://127.0.0.1:3773"
-    req = urllib.request.Request(url.rstrip("/") + "/api/ardud/control/identity/resolve?" +
+    url = control_origin(url or stored.get("url") or "http://127.0.0.1:3773")
+    if not url:
+        return None
+    req = urllib.request.Request(url + "/api/ardud/control/identity/resolve?" +
                                  urllib.parse.urlencode(params),
                                  headers={"Authorization": "Bearer " + token})
-    with urllib.request.urlopen(req, timeout=0.8) as response:
-        identity = json.load(response).get("identity")
+    try:
+        with urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({})).open(req, timeout=0.8) as response:
+            identity = json.load(response).get("identity")
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return None
+        raise
     if not isinstance(identity, dict) or identity.get("resolution") != "resolved":
         return None
     if not all(isinstance(identity.get(k), str) and identity[k] for k in
@@ -142,6 +169,19 @@ def seed_key(harness: str, event: dict, instance: str) -> str:
 
 def pending_seed_key(harness: str, event: dict) -> str:
     return "pending:" + seed_key(harness, event, os.environ.get("ROBOB_PROVIDER_INSTANCE_ID") or "")
+
+
+def native_key(harness: str, event: dict) -> str | None:
+    session, agent = event.get("session_id"), event.get("agent_id")
+    if not isinstance(session, str) or not session or len(session) > 200:
+        return None
+    if agent is not None and (not isinstance(agent, str) or len(agent) > 200):
+        return None
+    # Codex sometimes carries its concrete native thread in the environment.
+    # Keep the original session as well: two sessions must never share a guard.
+    thread = os.environ.get("CODEX_THREAD_ID") if harness == "codex" and not agent else None
+    return json.dumps([harness, os.environ.get("ROBOB_PROVIDER_INSTANCE_ID") or "",
+                       session, agent or None, thread or None], separators=(",", ":"))
 
 
 def body_base(identity: dict, event: dict, cfg: dict) -> dict:
@@ -312,7 +352,6 @@ def add_activity(state: dict, event: dict, now: float):
         state["calls"] += 1
     state["last_event"] = now
     name = str(event.get("tool_name") or "tool")[:100]
-    inp = text(event.get("tool_input") or "")[:600]
     result = text(event.get("tool_response") or event.get("tool_result") or event.get("error") or "")
     failure = event.get("hook_event_name") == "PostToolUseFailure" or event.get("is_error") is True
     if not failure and not re.search(r"(^|[_.-])(read|grep|glob|list|ls|search|fetch|view|skill|todo)", name, re.I):
@@ -325,12 +364,25 @@ def add_activity(state: dict, event: dict, now: float):
             command = command.get("command", "") if isinstance(command, dict) else ""
             if re.search(r"(?:^|[|;&(]\s*)(?:grep|egrep|fgrep|rg|ag|diff|cmp|test)\b", command):
                 failure = False
+    # Arbitrary shell output and nested inputs can contain unlabelled OTPs or
+    # credentials, so pattern-based redaction cannot make excerpts safe.
+    # Preserve tool and failure signals, never raw input or output content.
+    name = "tool" if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name) else name
+    raw_result = result
+    inp, result = "[tool input omitted]", "[tool output omitted]"
     compact = lambda x: re.sub(r"\s+", " ", x).strip()
     state["activity"].append(f"call {name}: {compact(inp)[:240]}\nresult {name}: {compact(result)[:400]}")
     state["activity"] = state["activity"][-100:]
     if failure:
-        err = f"{name}: {compact(result)[:700]}"
-        sig = re.sub(r"\d+", "#", re.sub(r"(?:0x)?[0-9a-f]{8,}", "#", err[-300:], flags=re.I))[-160:]
+        # Only fixed diagnostic vocabulary is retained; never persist arbitrary
+        # fragments of output (which can include unlabeled secrets).
+        allowed = ("ECONNREFUSED", "ETIMEDOUT", "ECONNRESET", "ENOENT", "EACCES", "EPIPE",
+                   "ModuleNotFoundError", "ImportError", "TypeError", "ValueError", "AssertionError",
+                   "PermissionError", "FileNotFoundError", "TimeoutError", "ConnectionError")
+        markers = [item for item in allowed if re.search(r"\b" + re.escape(item) + r"\b", raw_result)]
+        err = f"{name}: " + (", ".join(markers) if markers else "tool failure")
+        normalized = re.sub(r"\d+", "#", re.sub(r"(?:0x)?[0-9a-f]{8,}", "#", compact(raw_result[-300:]), flags=re.I))
+        sig = hashlib.sha256((name + "|" + normalized).encode()).hexdigest()
         state["errors"] = (state["errors"] + [[sig, err]])[-100:]
 
 
@@ -361,6 +413,17 @@ def worker(job: str):
     try:
         with db.transaction():
             row = db.job(job)
+            if row:
+                key, turn, body = row
+                state = db.get(key)
+                expected_job = "prompt_inflight" if body.get("mode") == "prompt" else "inflight"
+                if (not state or state["turn"] != turn or state.get(expected_job) != job or
+                    state.get("invalidated") or db.prompt_guarded(state.get("_native_key"))):
+                    db.db.execute("DELETE FROM jobs WHERE id=?", (job,))
+                    if state and state.get(expected_job) == job:
+                        state[expected_job] = None
+                        db.save(key, state, time.time())
+                    return
         if not row:
             return
         _, _, body = row
@@ -381,7 +444,8 @@ def worker(job: str):
                 state = db.get(key)
                 if state and state["turn"] == turn and state.get("prompt_inflight") == job:
                     state["prompt_inflight"] = None
-                    if result is not None and current["mode"] != "off":
+                    if (result is not None and current["mode"] != "off" and
+                        not state.get("invalidated") and not db.prompt_guarded(state.get("_native_key"))):
                         note = db.remember(key, state, result, time.time())
                         if note and current["mode"] == "on":
                             db.db.execute("INSERT INTO mailbox VALUES (?, ?, ?, ?)",
@@ -421,8 +485,38 @@ def handle(harness: str, event: dict):
             db.close()
     identity_event = ({k: v for k, v in event.items() if k != "agent_id"}
                       if name == "SubagentStart" and harness == "claude" else event)
-    identity = resolve(harness, identity_event)
+    native = native_key(harness, event)
+    if not native:
+        return
+    prompt_generation = uuid.uuid4().hex if name == "UserPromptSubmit" else None
+    if prompt_generation:
+        db = Store(state_path(), cfg["note_ttl_days"])
+        try:
+            with db.transaction():
+                # Commit the guard before the network lookup so tool hooks and
+                # workers cannot deliver an older turn while it is pending.
+                db.guard_prompt(native, prompt_generation)
+        finally:
+            db.close()
+    try:
+        identity = resolve(harness, identity_event)
+    except Exception:
+        if prompt_generation:
+            db = Store(state_path(), cfg["note_ttl_days"])
+            try:
+                with db.transaction():
+                    db.invalidate_prompt(native, prompt_generation, time.time())
+            finally:
+                db.close()
+        raise
     if not identity:
+        if prompt_generation:
+            db = Store(state_path(), cfg["note_ttl_days"])
+            try:
+                with db.transaction():
+                    db.invalidate_prompt(native, prompt_generation, time.time())
+            finally:
+                db.close()
         return
     is_child = identity["executionKind"] != "top-level"
     if is_child and not (cfg["work"] and cfg["work_subagents"]):
@@ -440,12 +534,28 @@ def handle(harness: str, event: dict):
                             seed, now)
                     db.take_seed(pending_seed_key(harness, event))
                     if harness == "codex" and identity["executionKind"] == "provider-native-child" and not db.get(key):
-                        db.save(key, new_turn(turn_id(harness, event) or ("seed:" + child_id), "", now,
-                                              provisional=not bool(turn_id(harness, event))), now)
+                        state = new_turn(turn_id(harness, event) or ("seed:" + child_id), "", now,
+                                         provisional=not bool(turn_id(harness, event)))
+                        state["_native_key"] = native
+                        db.save(key, state, now)
             return
         with db.transaction():
             db.prune(now)
+            if prompt_generation:
+                if not db.prompt_is_current(native, prompt_generation):
+                    return
+                db.invalidate_prompt(native, prompt_generation, now, except_key=key)
+            elif db.prompt_guarded(native):
+                return
             state = db.get(key)
+            if state and state.get("_native_key") != native:
+                # Existing pre-guard state cannot be safely bound retroactively.
+                if name != "UserPromptSubmit":
+                    return
+                db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+                state = None
+            if state and state.get("invalidated") and name != "UserPromptSubmit":
+                return
             if is_child:
                 skey = seed_key(harness, event, identity["providerInstanceId"])
                 seed = db.get_seed(skey)
@@ -457,6 +567,7 @@ def handle(harness: str, event: dict):
                     tid = turn_id(harness, event)
                     state = new_turn(tid or ("seed:" + str(child_id)), "", seed.get("started", now),
                                      provisional=not bool(tid))
+                    state["_native_key"] = native
                 if state and not state["task"]:
                     seed = seed or {}
                     task = transcript_task(harness, event.get("transcript_path") or seed.get("path"),
@@ -477,16 +588,21 @@ def handle(harness: str, event: dict):
                     provisional = False
                 if skipped:
                     state = next_turn(state, tid, "", now, provisional)
+                    state["_native_key"] = native
                     db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
                     db.save(key, state, now)
+                    db.release_prompt(native, prompt_generation)
                     return
-                if not state or state["turn"] != tid or state["task"] != prompt[:6000]:
+                if not state or state.get("invalidated") or state["turn"] != tid or state["task"] != prompt[:6000]:
                     state = next_turn(state, tid, prompt, now, provisional)
                     db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+                state["_native_key"] = native
                 if is_child:
                     db.save(key, state, now)
+                    db.release_prompt(native, prompt_generation)
                     return
-                pending = db.consume(key, tid, cfg["mode"])
+                if not db.prompt_guarded(native):
+                    pending = db.consume(key, tid, cfg["mode"])
                 if not state["prompt_checked"]:
                     state["prompt_checked"] = True
                     prompt_body = {**body_base(identity, event, cfg), "mode": "prompt", "prompt": prompt,
@@ -495,8 +611,9 @@ def handle(harness: str, event: dict):
                     state["prompt_inflight"] = prompt_job
                     db.db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?)",
                                   (prompt_job, key, tid, json.dumps(prompt_body), now))
-                prompt_generation = state.get("generation")
+                state_generation = state.get("generation")
                 db.save(key, state, now)
+                db.release_prompt(native, prompt_generation)
             else:
                 if not state:
                     return
@@ -537,7 +654,8 @@ def handle(harness: str, event: dict):
                 while time.monotonic() < deadline:
                     with db.transaction():
                         current = db.get(key)
-                        if not current or current.get("generation") != prompt_generation:
+                        if (not current or current.get("generation") != state_generation or
+                            current.get("invalidated") or db.prompt_guarded(native)):
                             break
                         if current.get("prompt_inflight") != prompt_job:
                             note = db.consume(key, current["turn"], config()["mode"])

@@ -55,6 +55,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS seeds (
                 key TEXT PRIMARY KEY, task TEXT NOT NULL, created REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS prompt_guards (
+                native_key TEXT PRIMARY KEY, generation TEXT NOT NULL
+            );
             """)
         except BaseException:
             self.db.close()
@@ -85,6 +88,36 @@ class Store:
         self.db.execute("INSERT INTO sessions VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
                         "state=excluded.state, updated=excluded.updated",
                         (key, json.dumps(state), now))
+
+    def guard_prompt(self, native_key: str, generation: str):
+        self.db.execute("INSERT INTO prompt_guards VALUES (?, ?) ON CONFLICT(native_key) "
+                        "DO UPDATE SET generation=excluded.generation", (native_key, generation))
+
+    def prompt_guarded(self, native_key: str | None) -> bool:
+        return bool(native_key and self.db.execute(
+            "SELECT 1 FROM prompt_guards WHERE native_key=?", (native_key,)).fetchone())
+
+    def prompt_is_current(self, native_key: str, generation: str) -> bool:
+        return bool(self.db.execute("SELECT 1 FROM prompt_guards WHERE native_key=? AND generation=?",
+                                    (native_key, generation)).fetchone())
+
+    def release_prompt(self, native_key: str, generation: str):
+        self.db.execute("DELETE FROM prompt_guards WHERE native_key=? AND generation=?", (native_key, generation))
+
+    def invalidate_prompt(self, native_key: str, generation: str, now: float, except_key: str | None = None):
+        # A failed older lookup must not invalidate a newer successful prompt.
+        if not self.prompt_is_current(native_key, generation):
+            return
+        rows = self.db.execute("SELECT key, state FROM sessions WHERE json_extract(state, '$._native_key')=?",
+                               (native_key,)).fetchall()
+        for key, encoded in rows:
+            if key == except_key:
+                continue
+            state = json.loads(encoded)
+            state["invalidated"] = True
+            state["inflight"] = state["prompt_inflight"] = None
+            self.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+            self.save(key, state, now)
 
     def recent(self, key: str, limit: int = 4) -> list[str]:
         rows = self.db.execute("SELECT note FROM notes WHERE key=? ORDER BY rowid DESC LIMIT ?",
@@ -161,6 +194,9 @@ class Store:
         if not state or state["turn"] != turn or state.get("inflight") != job:
             return
         state["inflight"] = None
+        if state.get("invalidated") or self.prompt_guarded(state.get("_native_key")):
+            self.save(key, state, now)
+            return
         if result is not None:
             note = self.remember(key, state, result, now)
             state["backoff"] = 1 if note else min(state["backoff"] * 2, max_backoff)
