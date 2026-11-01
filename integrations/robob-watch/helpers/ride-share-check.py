@@ -1,6 +1,6 @@
 #!/usr/bin/python3
-"""ride-share-updates: keep one live ride card per Uber trip current, and wake the agent only when
-a card has to be shared or a shared ride really got cancelled/failed.
+"""ride-share-updates: keep one live ride card per Uber trip current, and wake the agent when
+a card needs sharing, a shared ride is cancelled/failed, or a booked ride costs well over its quote.
 
 Polls `uber rides status --json` (Abdullah's account, incl. rides booked for Moni) every run, rebuilds
 the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at most:
@@ -10,8 +10,9 @@ the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at
   FAILED trip=<uuid> rider=<who>[(assumed)] result=<STATUS>            a shared ride ended UNFULFILLED/FAILED
   CANCEL_FEE trip=<uuid> rider=<who> fee=<amount> refunded=<yes|no>   a shared ride cancelled with a fee on
                                                                        its receipt (read once; printed even if rebooked)
+  FARE_OVER trip=<uuid> rider=<who> quoted=<amount> charged=<amount> extra=<fees>   a booked ride cost well over its quote
 
-Completion is quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
+Other completions are quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
 a trip that disappears without a terminal history status shows "Checking" and is retried for
 UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself; the only bridge calls
 it makes are `shares` and `unshare`, an hour after a ride ended, for that ride's public share link
@@ -27,9 +28,13 @@ Env overrides (all optional):
                      runs never touch live cards)
   RIDE_CARD_JOURNAL  share journal dir (default ~/.local/state/ride-card), read only here
   UBER_BIN           uber binary
+  UBER_AUDIT_DIR     booking audit logs (default ~/Library/Application Support/uber/audit)
   RIDE_SHARE_NOW     epoch seconds to use as "now" (tests only)
 """
 import json, os, re, shutil, subprocess, sys, time
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from math import isfinite
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +50,7 @@ if not os.environ.get("RIDE_CARD_ROOT"):
 import ride_card as rc  # noqa: E402  (after RIDE_CARD_ROOT is settled)
 
 UBER = os.environ.get("UBER_BIN") or rc.fixed_uber() or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
+AUDIT_DIR = Path(os.environ.get("UBER_AUDIT_DIR", "~/Library/Application Support/uber/audit")).expanduser()
 ENV = dict(os.environ, PATH="/Users/ardud/.nvm/versions/node/v26.2.0/bin:" + os.environ.get("PATH", ""))
 FAIL_ALERT_S = 600
 BOOK_CONFIRM_S = 60
@@ -144,6 +150,92 @@ def cancel_fee(uuid):
         return None
     refunded = bool(re.search(r"^Refund\b", text, re.M)) or "New Total\tAED 0.00" in text
     return m.group(1), refunded
+
+
+def quoted_fare(uuid):
+    """Join the booking's start and success, including across a month boundary."""
+    try:
+        current = datetime.fromtimestamp(now_ts())
+        previous = current.replace(day=1).toordinal() - 1
+        previous = datetime.fromordinal(previous)
+        started, token = {}, None
+        for month in (previous, current):
+            try:
+                with (AUDIT_DIR / f"{month:%Y-%m}.jsonl").open(encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(row, dict) or row.get("action") != "rides.request":
+                            continue
+                        detail, key = row.get("detail"), row.get("token")
+                        if not isinstance(detail, dict) or not isinstance(key, str) or not key:
+                            continue
+                        fare = detail.get("fare")
+                        if row.get("outcome") == "started" and isinstance(fare, str) and fare:
+                            started[key] = fare
+                        elif row.get("outcome") == "succeeded" and detail.get("tripUuid") == uuid:
+                            token = key
+            except OSError:
+                continue  # missing or unreadable audit files must not stop the watcher
+        return started.get(token)
+    except Exception:
+        return None
+
+
+def receipt_total(uuid):
+    """Read a completed trip's total and its itemised lines once."""
+    try:
+        r = uber("trips", "receipt", uuid)
+        if not r.get("ok"):
+            raise ValueError("receipt unavailable")
+        text = (r.get("result") or {}).get("text")
+        if not isinstance(text, str):
+            raise ValueError("receipt text missing")
+        total = re.search(r"^Total\s+([A-Z]{3})\s?([\d.,]+)", text, re.M)
+        if not total:
+            raise ValueError("receipt total missing")
+        amount = float(total.group(2).replace(",", ""))
+        if not isfinite(amount):
+            raise ValueError("invalid receipt total")
+        fees = []
+        for line in text[total.end():].splitlines():
+            if line.strip() == "Payments":
+                break
+            fee = re.fullmatch(r"\s*(.+?)\s+([A-Z]{3})\s?([\d.,]+)\s*", line)
+            if fee:
+                fees.append(f"{fee.group(1)} {fee.group(2)} {fee.group(3)}")
+        return total.group(1), amount, fees
+    except Exception as e:
+        print(f"ride-share: receipt {uuid} failed: {e!r}"[:300], file=sys.stderr)
+        return None
+
+
+def fare_over(uuid, quote):
+    receipt = receipt_total(uuid)
+    if not receipt:
+        return None
+    m = re.fullmatch(r"([A-Z]{3})\s?([\d.,]+)", quote.strip())
+    if not m or m.group(1) != receipt[0]:
+        return None
+    try:
+        quoted = Decimal(m.group(2).replace(",", ""))
+        total = Decimal(str(receipt[1]))
+    except InvalidOperation:
+        return None
+    if total - quoted <= 10 and total <= quoted * Decimal("1.10"):
+        return None
+    extra = [line for line in receipt[2]
+             if not re.match(r"^(?:Trip fare|Booking Fee|RTA fee)\s+[A-Z]{3}\s", line, re.I)]
+    return f"quoted={quote} charged={receipt[0]} {receipt[1]:.2f} extra={'; '.join(extra) or 'none listed'}"
+
+
+def mark_fare_checked(uuid, now):
+    # Persist only the receipt claim: the rest of this run's events aren't printed yet.
+    checkpoint = load()
+    checkpoint["trips"].setdefault(uuid, {})["fare_checked"] = now
+    save(checkpoint)
 
 
 def recently_requested(trips, rider, now, exclude):
@@ -288,6 +380,16 @@ def main():
                 continue
             t["ended_fired"] = now
             t["result"] = status
+            if rc.TERMINAL[status] == "done" and "fare_checked" not in t:
+                quote = quoted_fare(uuid)
+                if quote is not None:
+                    t["fare_checked"] = now
+                    # A timeout or killed check must not issue a second receipt read.
+                    mark_fare_checked(uuid, now)
+                    detail = fare_over(uuid, quote)
+                    if detail:
+                        _, _, label = who(uuid)
+                        out.append(f"FARE_OVER trip={uuid} rider={label} {detail}")
             if not card_shared(uuid, t):
                 continue  # nothing was shared: nothing to correct
             rider, _, label = who(uuid)
@@ -341,7 +443,12 @@ def main():
             out.append(f"CANCELED trip={uuid} rider={p.get('label') or p.get('rider')}")
 
     for uuid in [u for u, t in trips.items() if now - t.get("last_seen", t.get("first_seen", now)) > 14 * 86400]:
-        trips.pop(uuid, None)
+        t = trips[uuid]
+        if "fare_checked" in t:
+            # Keep a small tombstone so a reappearing trip never reads its receipt twice.
+            trips[uuid] = {k: t[k] for k in ("fare_checked", "ended_fired", "result") if k in t}
+        else:
+            trips.pop(uuid, None)
     save(s)
     if out:
         print("\n".join(out))

@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "helpers", "ride-share-check.py")
@@ -16,6 +17,9 @@ CARD = os.path.join(HERE, "..", "helpers", "ride-card", "ride_card.py")
 
 A = "aaaaaaaa-0000-4000-8000-000000000001"
 B = "bbbbbbbb-0000-4000-8000-000000000002"
+FARE_NOW = datetime(2026, 11, 15, 12, tzinfo=timezone.utc).timestamp()
+REAL_RECEIPT = ("Total\tAED 98.25\nTrip fare\tAED 74.70\nBooking Fee\tAED 5.00\n"
+                "RTA fee\tAED 5.00\nWait Time\tAED 13.55\nPayments\nCard\tAED 98.25")
 
 FAKE_UBER = """#!/usr/bin/python3
 import json, os, sys
@@ -29,6 +33,10 @@ elif args[:2] == ["trips", "get"]:
     t = state.get("history", {}).get(args[2])
     out = {"ok": True, "result": t} if t else {"ok": False, "error": "not found"}
 elif args[:2] == ["trips", "receipt"]:
+    if os.environ.get("FAKE_UBER_ABORT_WATCHER"):
+        os.kill(os.getppid(), 9); sys.exit(1)
+    if os.environ.get("FAKE_UBER_BAD_RECEIPT"):
+        print("not JSON"); sys.exit(0)
     text = state.get("receipts", {}).get(args[2])
     out = {"ok": True, "result": {"uuid": args[2], "text": text}} if text is not None else {"ok": False, "error": "no receipt"}
 else:
@@ -153,6 +161,8 @@ class Base(unittest.TestCase):
         self.set_state(None, {})
         self.hints = os.path.join(self.dir, "hints")
         os.makedirs(self.hints)
+        self.audit = os.path.join(self.dir, "audit")
+        os.makedirs(self.audit)
         self.state = os.path.join(self.dir, "rides.json")
         self.cards = os.path.join(self.dir, "cards")
         self.journal = os.path.join(self.dir, "journal")
@@ -167,6 +177,7 @@ class Base(unittest.TestCase):
             RIDE_SHARE_HINTS=self.hints, RIDE_CARD_ROOT=self.cards, RIDE_CARD_JOURNAL=self.journal,
             RIDE_CARD_NO_IMAGE="1", RIDE_CARD_BRIDGE=self.bridge, FAKE_BRIDGE_LOG=self.blog,
             RIDE_CARD_ENROLL=self.enroll, WATCH_DIR=self.dir, RIDE_CARD_BRIDGE_STATE=self.bstate,
+            UBER_AUDIT_DIR=self.audit,
         )
 
     def route(self, chat, rid, generation):
@@ -230,11 +241,36 @@ class Base(unittest.TestCase):
         with open(self.fixture, "w") as f:
             json.dump({"trip": trip, "history": history, "receipts": receipts or {}}, f)
 
-    def run_check(self, now, **extra):
+    def run_check_result(self, now, **extra):
         env = dict(self.env, RIDE_SHARE_NOW=str(now), **extra)
         p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def run_check(self, now, **extra):
+        p = self.run_check_result(now, **extra)
         return [line for line in p.stdout.splitlines() if line.strip()]
+
+    def audit_rows(self, month, *rows):
+        with open(os.path.join(self.audit, f"{month}.jsonl"), "a") as f:
+            for row in rows:
+                f.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
+
+    def audit_quote(self, uuid, fare="AED 84.70", month="2026-10"):
+        token = f"request-{uuid}"
+        self.audit_rows(month, {"action": "rides.request", "outcome": "started", "token": token,
+                                "detail": {"fare": fare}},
+                        {"action": "rides.request", "outcome": "succeeded", "token": token,
+                         "detail": {"tripUuid": uuid}})
+
+    def receipt_calls(self, uuid):
+        with open(self.fixture + ".calls") as f:
+            return f.read().splitlines().count(f"trips receipt {uuid}")
+
+    def start_completed(self, uuid, receipt):
+        self.set_state(trip(uuid, "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW), [])
+        self.set_state(None, {uuid: {"status": "COMPLETED"}}, {uuid: receipt} if receipt is not None else None)
 
     def card_cli(self, *args, ok=True, **extra):
         p = subprocess.run([sys.executable, CARD, *args], capture_output=True, text=True,
@@ -376,6 +412,126 @@ class WatcherTest(Base):
         self.set_state(trip(B, "Searching"), {A: {"status": "CANCELED"}}, None)
         self.assertEqual(self.run_check(30), [])
         self.assertEqual(self.run_check(240), [f"CANCELED trip={A} rider=abdullah(assumed)"])
+
+    def test_completed_over_quote_reports_receipt_reason_once_even_without_shared_card(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        expected = (f"FARE_OVER trip={A} rider=abdullah(assumed) quoted=AED 84.70 "
+                    "charged=AED 98.25 extra=Wait Time AED 13.55")
+        self.assertEqual(self.run_check(FARE_NOW + 30), [expected])
+        self.assertEqual(self.run_check(FARE_NOW + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["trips"][A]["fare_checked"], FARE_NOW + 30)
+
+    def test_completed_small_increase_is_quiet(self):
+        self.audit_quote(A)
+        self.start_completed(A, "Total\tAED 90.00\nPayments")
+        self.assertEqual(self.run_check(FARE_NOW + 30), [])
+        self.assertEqual(self.run_check(FARE_NOW + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_completed_without_matching_booking_does_not_read_receipt(self):
+        self.audit_quote(B)
+        self.start_completed(A, REAL_RECEIPT)
+        self.assertEqual(self.run_check(FARE_NOW + 30), [])
+        self.assertEqual(self.run_check(FARE_NOW + 60), [])
+        self.assertEqual(self.receipt_calls(A), 0)
+
+    def test_completed_receipt_failure_is_nonfatal_and_never_retried(self):
+        self.audit_quote(A)
+        self.start_completed(A, None)
+        p = self.run_check_result(FARE_NOW + 30)
+        self.assertEqual(p.stdout, "")
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertIn(f"receipt {A} failed", p.stderr)
+        self.set_state(None, {A: {"status": "COMPLETED"}}, {A: REAL_RECEIPT})
+        self.assertEqual(self.run_check(FARE_NOW + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["trips"][A]["fare_checked"], FARE_NOW + 30)
+
+    def test_malformed_receipt_response_is_nonfatal_and_never_retried(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        p = self.run_check_result(FARE_NOW + 30, FAKE_UBER_BAD_RECEIPT="1")
+        self.assertEqual(p.stdout, "")
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(self.run_check(FARE_NOW + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_interrupted_receipt_does_not_replay_or_lose_other_events(self):
+        self.audit_quote(A)
+        self.set_state(trip(A, "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW), [])
+        with open(self.state) as f:
+            state = json.load(f)
+        state["pending_cancel"][B] = {"since": FARE_NOW - 200, "rider": "abdullah", "label": "abdullah"}
+        with open(self.state, "w") as f:
+            json.dump(state, f)
+        self.set_state(None, {A: {"status": "COMPLETED"}}, {A: REAL_RECEIPT})
+        p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(FARE_NOW + 30), FAKE_UBER_ABORT_WATCHER="1"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.run_check(FARE_NOW + 60), [f"CANCELED trip={B} rider=abdullah"])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_fare_receipt_tombstone_survives_old_trip_cleanup(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        self.assertTrue(self.run_check(FARE_NOW + 30)[0].startswith("FARE_OVER "))
+        self.assertEqual(self.run_check(FARE_NOW + 15 * 86400), [])
+        with open(self.state) as f:
+            state = json.load(f)
+        self.assertIn("fare_checked", state["trips"][A])
+        self.set_state(trip(A, "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW + 15 * 86400 + 30), [])
+        self.set_state(None, {A: {"status": "COMPLETED"}}, {A: REAL_RECEIPT})
+        self.assertEqual(self.run_check(FARE_NOW + 15 * 86400 + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_audit_join_crosses_month_and_ignores_bad_rows(self):
+        token = "synthetic-request"
+        self.audit_rows("2026-10", "bad json", "null", {"action": "rides.request", "detail": []},
+                        {"action": "rides.request", "outcome": "started", "token": token,
+                         "detail": {"fare": "AED 84.70"}},
+                        {"action": "other", "outcome": "started", "token": token,
+                         "detail": {"fare": "AED 1.00"}})
+        self.audit_rows("2026-11", {"action": "rides.request", "outcome": "succeeded", "token": token,
+                                    "detail": {"tripUuid": A}})
+        self.start_completed(A, REAL_RECEIPT)
+        self.assertEqual(self.run_check(FARE_NOW + 30),
+                         [f"FARE_OVER trip={A} rider=abdullah(assumed) quoted=AED 84.70 "
+                          "charged=AED 98.25 extra=Wait Time AED 13.55"])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_currency_mismatch_and_missing_total_are_quiet(self):
+        self.audit_quote(A)
+        self.start_completed(A, "Total\tUSD 120.00\nPayments")
+        self.assertEqual(self.run_check(FARE_NOW + 30), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+        self.audit_quote(B)
+        self.start_completed(B, "Trip fare\tAED 100.00\nPayments")
+        p = self.run_check_result(FARE_NOW + 30)
+        self.assertEqual(p.stdout, "")
+        self.assertIn(f"receipt {B} failed", p.stderr)
+        self.assertEqual(self.receipt_calls(B), 1)
+
+    def test_thresholds_are_strict_and_either_limit_can_trigger(self):
+        cases = [("AED 50.00", "55.00", False), ("AED 50.00", "55.01", True),
+                 ("AED 100.00", "110.00", False), ("AED 200.00", "210.00", False),
+                 ("AED 200.00", "210.01", True)]
+        for i, (quote, total, over) in enumerate(cases, 1):
+            with self.subTest(quote=quote, total=total):
+                uuid = f"cccccccc-0000-4000-8000-{i:012d}"
+                self.audit_quote(uuid, quote)
+                self.start_completed(uuid, f"Total\tAED {total}\nTrip fare\tAED {total}\nPayments\nTip\tAED 10.00")
+                out = self.run_check(FARE_NOW + 30)
+                self.assertEqual(len(out), int(over), out)
+                if over:
+                    self.assertEqual(out[0], f"FARE_OVER trip={uuid} rider=abdullah(assumed) "
+                                     f"quoted={quote} charged=AED {total} extra=none listed")
+                self.assertEqual(self.receipt_calls(uuid), 1)
 
     def test_late_cancel_history_after_rebook_card_ready_is_silent(self):
         self.mark_sent(A)
