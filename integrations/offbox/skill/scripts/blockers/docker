@@ -18,6 +18,24 @@ if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-
 import os
 import shlex
 import sys
+import time
+started = time.monotonic()
+
+def log_native_error(error):
+    try:
+        sys.path.insert(0, os.environ.get("HARNESS_HOOKS_SRC", os.path.expanduser("~/.local/share/harness-hooks/src")))
+        import engine
+        engine._log(harness="codex" if os.environ.get("CODEX_THREAD_ID") else "claude", event="shim", tool="docker",
+                    decision="allow", rule="native-check-unavailable", error=type(error).__name__,
+                    ms=round((time.monotonic() - started) * 1000, 3))
+    except Exception:
+        pass
+
+def report_exception(error_type, error, tb):
+    log_native_error(error)
+    sys.__excepthook__(error_type, error, tb)
+
+sys.excepthook = report_exception
 sys.path.insert(0, sys.argv[1])
 from classify import classify, spec
 from monitor_support import STATE, live_exemption, mode, read_json

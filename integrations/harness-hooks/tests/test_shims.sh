@@ -29,7 +29,9 @@ def decide_coord(command, identity, cwd, approved=False):
     return {'decision': decision, 'reason': 'coord Haiku lane: blocked',
             'context': {'rule': 'approved-sha256' if approved else 'test-deny'}}
 def _log(**record):
-    pass
+    import json, os
+    with open(os.path.join(os.environ['OFFBOX_STATE_DIR'], 'shim-decisions.jsonl'), 'a') as log:
+        log.write(json.dumps(record) + '\n')
 EOF
 
 run_shim() {
@@ -43,7 +45,7 @@ run_shim() {
   esac
   env -i HOME="$tmp/home" PATH="$blockers:$tmp/bin:/usr/bin:/bin" \
     OFFBOX_GATE_MODE=enforce OFFBOX_STATE_DIR="$tmp/state" OFFBOX_RULES="${TEST_RULES:-$offbox/heavy-rules.json}" \
-    HARNESS_HOOKS_SRC="$tmp/engine" "${ident[@]}" "$blockers/$name" "$@" >"$tmp/out" 2>"$tmp/err"
+    HARNESS_HOOKS_SRC="$tmp/engine" PYTHONDONTWRITEBYTECODE=1 "${ident[@]}" "$blockers/$name" "$@" >"$tmp/out" 2>"$tmp/err"
 }
 
 for kind in claude codex marker; do
@@ -82,6 +84,7 @@ print 'offbox shims: Claude, Codex, harness marker and human checks passed'
 # errors fail open, like the new hooks, instead of blocking every docker call.
 TEST_RULES="$tmp/no-rules.json" run_shim claude docker run alpine
 grep -q 'real:docker' "$tmp/out"
+grep -q 'native-check-unavailable' "$tmp/state/shim-decisions.jsonl"
 
 coord=$pkg/coord-blockers
 run_coord() {
