@@ -585,7 +585,7 @@ def _coord_state(identity):
     uri = db_file.as_uri() + "?mode=ro"
     query = "SELECT id, thread_id FROM actors WHERE kind='thread' AND (thread_id LIKE 'ardud-control:thread:%' OR thread_id LIKE 'mcp:%')"
     try:
-    with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
             actors = db.execute(query).fetchall()
     except sqlite3.OperationalError:
         # A checkpointed WAL db may not have sidecars and may live in a
@@ -593,7 +593,7 @@ def _coord_state(identity):
         before = db_file.stat()
         if Path(str(db_file) + "-wal").exists():
             raise
-        with sqlite3.connect(uri + "&immutable=1", uri=True, timeout=1) as db:
+        with closing(sqlite3.connect(uri + "&immutable=1", uri=True, timeout=1)) as db:
             actors = db.execute(query).fetchall()
         after = db_file.stat()
         if Path(str(db_file) + "-wal").exists() or (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):
