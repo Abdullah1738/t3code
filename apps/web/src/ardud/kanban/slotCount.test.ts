@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { committedSlots } from "./slotCount";
+import { committedSlots, editedSlots } from "./slotCount";
 
 describe("committedSlots", () => {
   it("accepts whole counts without an upper cap", () => {
@@ -21,5 +21,13 @@ describe("committedSlots", () => {
   it("clamps to the supplied bounds", () => {
     expect(committedSlots("0", 3, 1)).toBe(1);
     expect(committedSlots("4", 0, 0, 0)).toBeNull();
+  });
+
+  it("does not restore an untouched draft after another client changes the pool", () => {
+    expect(editedSlots("5", 5, 0, 0)).toBeNull();
+    expect(editedSlots("005", 5, 0, 0)).toBeNull();
+    expect(editedSlots("12", 5, 0, 0)).toBe(12);
+    expect(editedSlots("12", 5, 12, 0)).toBeNull();
+    expect(editedSlots("abc", 5, 0, 0)).toBeNull();
   });
 });

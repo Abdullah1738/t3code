@@ -44,7 +44,7 @@ import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
-import { committedSlots } from "./slotCount";
+import { editedSlots } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../../components/chat/TraitsPicker";
 import {
@@ -735,10 +735,11 @@ function Stepper(props: {
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
+  const initial = useRef(props.value);
   const cancelled = useRef(false);
   const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : props.value;
   const base = Number.isSafeInteger(typed) ? typed : props.value;
-  const atMax = props.max !== undefined && base >= props.max;
+  const atMax = base >= (props.max ?? Number.MAX_SAFE_INTEGER);
   // While typing, the buttons step the draft, so a click never races the typed number.
   const step = (by: number) => {
     const next = Math.max(
@@ -774,6 +775,7 @@ function Stepper(props: {
         value={draft ?? String(props.value)}
         disabled={props.disabled}
         onFocus={(event) => {
+          initial.current = props.value;
           setDraft(String(props.value));
           event.currentTarget.select();
         }}
@@ -789,7 +791,7 @@ function Stepper(props: {
           const next =
             cancelled.current || draft === null
               ? null
-              : committedSlots(draft, props.value, props.min, props.max);
+              : editedSlots(draft, initial.current, props.value, props.min, props.max);
           cancelled.current = false;
           setDraft(null);
           if (next !== null) props.onChange(next);

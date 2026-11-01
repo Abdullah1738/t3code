@@ -12,3 +12,15 @@ export function committedSlots(
   const next = Math.max(min, max === undefined ? typed : Math.min(max, typed));
   return next === current ? null : next;
 }
+
+/** Ignore an untouched draft even if the pool changed while the field was focused. */
+export function editedSlots(
+  text: string,
+  initial: number,
+  current: number,
+  min: number,
+  max?: number | undefined,
+): number | null {
+  const next = committedSlots(text, initial, min, max);
+  return next === current ? null : next;
+}
