@@ -196,35 +196,19 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-native-bindings")),
     );
 
-  // Old callers read this as the thread's OpenCode session id. It now follows
-  // the active binding, so a migrated thread reports its new native id. Threads
-  // with no active binding keep their newest OpenCode session id.
+  // Current OpenCode-style session id per thread, read from the active binding
+  // only. A thread with no active native id (detached, or not yet created)
+  // reports nothing: its old ses_ stays reachable through aliases and by-native,
+  // never as the current id.
   const nativeSessionIds: ControlStoreShape["nativeSessionIds"] = (threadIds) =>
-    Effect.gen(function* () {
-      const bindings = yield* nativeBindings(threadIds);
-      const legacy = yield* Effect.forEach(
-        chunks([...new Set(threadIds)]),
-        (ids) =>
-          sql<{ readonly thread_id: string; readonly native_id: string | null }>`
-            SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
-            FROM orchestration_v2_projection_provider_threads
-            WHERE thread_id IN ${sql.in(ids)}
-              AND json_extract(payload_json, '$.ownerNodeId') IS NULL
-            ORDER BY updated_at ASC
-          `,
-        { concurrency: 1 },
-      ).pipe(Effect.map((pages) => pages.flat()));
-      const out = new Map<string, string>();
-      for (const row of legacy) {
-        if (row.native_id !== null && row.native_id.startsWith("ses")) {
-          out.set(row.thread_id, row.native_id);
-        }
-      }
-      for (const [threadId, binding] of bindings) {
-        out.set(threadId, binding.nativeId);
-      }
-      return out;
-    }).pipe(Effect.mapError(fail("read-native-sessions")));
+    nativeBindings(threadIds).pipe(
+      Effect.map((bindings) => {
+        const out = new Map<string, string>();
+        for (const [threadId, binding] of bindings) out.set(threadId, binding.nativeId);
+        return out;
+      }),
+      Effect.mapError(fail("read-native-sessions")),
+    );
 
   const liveThreadIds: ControlStoreShape["liveThreadIds"] = () =>
     sql<{ readonly thread_id: string }>`

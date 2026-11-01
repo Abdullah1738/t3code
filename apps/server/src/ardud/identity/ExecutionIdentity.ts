@@ -206,26 +206,37 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("read-thread")),
     );
 
-  // Claude children have no provider thread: the subagent row is the only link,
-  // and the agent id is the child's discriminator inside the shared session.
-  const subagentByAgent = (threadId: string, agentId: string) =>
+  // Claude children have no provider thread of their own. The subagent row is
+  // the link, and it must belong to the parent app thread AND to the driver +
+  // instance the caller resolved. The agent id alone is not unique across
+  // sessions, so the match is only trusted when exactly one row qualifies.
+  const subagentsByAgent = (
+    threadId: string,
+    agentId: string,
+    driver: string,
+    providerInstanceId: string,
+  ) =>
     sql<SubagentRow>`
       SELECT thread_id, child_thread_id, json_extract(payload_json, '$.modelSelection') AS model_json
       FROM orchestration_v2_projection_subagents
       WHERE thread_id = ${threadId}
+        AND COALESCE(driver, json_extract(payload_json, '$.driver')) = ${driver}
+        AND COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) = ${providerInstanceId}
         AND json_extract(payload_json, '$.nativeTaskRef.nativeId') = ${agentId}
-      ORDER BY updated_at DESC
-    `.pipe(
-      Effect.map((rows) => rows[0] ?? null),
-      Effect.mapError(fail("read-subagent-by-agent")),
-    );
+        AND origin = 'provider_native'
+        AND child_thread_id IS NOT NULL
+    `.pipe(Effect.mapError(fail("read-subagent-by-agent")));
 
   // Codex children: the subagent row points at the child's own provider thread.
+  // Only provider-native children qualify; app-owned delegation also records a
+  // provider thread, so `origin` is what separates the two.
   const subagentByProviderThread = (providerThreadId: string) =>
     sql<SubagentRow>`
       SELECT thread_id, child_thread_id, json_extract(payload_json, '$.modelSelection') AS model_json
       FROM orchestration_v2_projection_subagents
-      WHERE provider_thread_id = ${providerThreadId} AND child_thread_id IS NOT NULL
+      WHERE provider_thread_id = ${providerThreadId}
+        AND origin = 'provider_native'
+        AND child_thread_id IS NOT NULL
       ORDER BY updated_at DESC
     `.pipe(
       Effect.map((rows) => rows[0] ?? null),
@@ -256,6 +267,8 @@ const make = Effect.gen(function* () {
       const cutoff = DateTime.formatIso(
         DateTime.subtractDuration(yield* DateTime.now, PENDING_WINDOW_DURATION),
       );
+      // Measured from the provider's createdAt, not updated_at: a lifecycle
+      // write to an old unnamed thread must not restart its pending window.
       const rows = yield* sql<{
         readonly driver: string | null;
         readonly provider_instance_id: string | null;
@@ -265,7 +278,7 @@ const make = Effect.gen(function* () {
           COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS provider_instance_id,
           json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
         FROM orchestration_v2_projection_provider_threads
-        WHERE updated_at >= ${cutoff}
+        WHERE json_extract(payload_json, '$.createdAt') >= ${cutoff}
       `;
       return rows.some(
         (row) =>
@@ -308,8 +321,11 @@ const make = Effect.gen(function* () {
       const providerInstanceId = row?.provider_instance_id ?? "opencode";
 
       if (input.agentId !== undefined) {
-        const subagent = yield* subagentByAgent(threadId, input.agentId);
-        if (subagent === null || subagent.child_thread_id === null) {
+        const matches = yield* subagentsByAgent(threadId, input.agentId, driver, providerInstanceId);
+        const childIds = [...new Set(matches.map((row) => row.child_thread_id!))];
+        if (childIds.length > 1) return unresolved("ambiguous", childIds);
+        const subagent = matches[0];
+        if (subagent === undefined) {
           return (yield* hasPendingProvider(driver, providerInstanceId))
             ? unresolved("pending")
             : unresolved("unavailable");

@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -13,6 +14,7 @@ const provider = (
   nativeId: string | null,
   updatedAt: string,
   instance = driver === "opencode" ? "opencode" : driver,
+  createdAt = updatedAt,
 ) => ({
   provider_thread_id: providerThreadId,
   thread_id: threadId,
@@ -30,6 +32,7 @@ const provider = (
     driver,
     providerInstanceId: instance,
     appThreadId: threadId,
+    createdAt,
     nativeThreadRef: nativeId === null ? null : { driver, nativeId, strength: "strong" },
   }),
 });
@@ -67,6 +70,7 @@ const subagent = (
   driver: string,
   nativeTaskId: string | null,
   model = { instanceId: "claude", model: "claude-haiku-5-5" },
+  options: { origin?: string; instance?: string; updatedAt?: string } = {},
 ) => ({
   subagent_id: subagentId,
   thread_id: threadId,
@@ -75,18 +79,19 @@ const subagent = (
   provider: driver,
   provider_thread_id: providerThreadId,
   child_thread_id: childThreadId,
-  origin: "provider_native",
+  origin: options.origin ?? "provider_native",
   status: "running",
   started_at: "2026-01-01T00:00:00.000Z",
   completed_at: null,
-  updated_at: "2026-01-01T00:00:00.000Z",
+  updated_at: options.updatedAt ?? "2026-01-01T00:00:00.000Z",
   driver,
-  provider_instance_id: driver,
+  provider_instance_id: options.instance ?? driver,
   payload_json: JSON.stringify({
     id: subagentId,
     threadId,
     childThreadId,
     providerThreadId,
+    origin: options.origin ?? "provider_native",
     nativeTaskRef:
       nativeTaskId === null ? null : { driver, nativeId: nativeTaskId, strength: "strong" },
     modelSelection: model,
@@ -168,12 +173,72 @@ const seed = Effect.gen(function* () {
   yield* insertThread(thread("t-fresh", "pt-fresh", { parentThreadId: null, rootThreadId: "t-fresh" }));
   const now = DateTime.formatIso(yield* DateTime.now);
   yield* insertProvider(provider("pt-fresh", "t-fresh", "codex", null, now));
+
+  // Review r1 (pending window): an old unnamed Codex thread whose row was
+  // written just now. Only createdAt may decide the pending window.
+  yield* insertThread(thread("t-stale-unnamed", "pt-stale-unnamed", { parentThreadId: null, rootThreadId: "t-stale-unnamed" }));
+  yield* insertProvider(
+    provider("pt-stale-unnamed", "t-stale-unnamed", "codex", null, now, "codex", "2026-01-01T00:00:00.000Z"),
+  );
+
+  // Review r2 (detached binding): a migrated thread whose Claude provider row
+  // has lost its native id. The old ses_ must not come back as current.
+  yield* insertThread(thread("t-detached", "pt-detached-claude", { parentThreadId: null, rootThreadId: "t-detached" }));
+  yield* insertProvider(provider("pt-detached-old", "t-detached", "opencode", "ses_detached_old", "2026-01-02T00:00:00.000Z"));
+  yield* insertProvider(provider("pt-detached-claude", "t-detached", "claudeAgent", null, "2026-01-01T00:00:00.000Z"));
+
+  // Review r3 (Claude ownership): a second Claude instance under the same
+  // parent app thread that reuses agent-abc. Its child must not resolve through
+  // the first instance's session, and the instance must match.
+  yield* insertProvider(
+    provider("pt-claude-parent-2", "t-claude-parent", "claudeAgent", "parent-uuid-2", "2026-01-01T00:00:00.000Z", "claudeAgent-2"),
+  );
+  yield* insertThread(thread("t-claude-child-2", null, { parentThreadId: "t-claude-parent", rootThreadId: "t-claude-parent", relationshipToParent: "subagent" }));
+  yield* insertSubagent(
+    subagent("s-claude-2", "t-claude-parent", "t-claude-child-2", null, "claudeAgent", "agent-abc", undefined, { instance: "claudeAgent-2" }),
+  );
+
+  // Review r4 (app-owned children): an app-owned delegated child whose
+  // completion records its provider thread. It is not a provider-native child.
+  yield* insertThread(thread("t-app-parent", "pt-app-parent", { parentThreadId: null, rootThreadId: "t-app-parent" }));
+  yield* insertProvider(provider("pt-app-parent", "t-app-parent", "codex", "codex-app-parent", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(thread("t-app-child", "pt-app-child", { parentThreadId: "t-app-parent", rootThreadId: "t-app-parent", relationshipToParent: "subagent" }, { instanceId: "codex", model: "gpt-6.1-sol" }));
+  yield* insertProvider(provider("pt-app-child", "t-app-child", "codex", "codex-app-child-uuid", "2026-01-01T00:00:00.000Z"));
+  yield* insertSubagent(
+    subagent("s-app-child", "t-app-parent", "t-app-child", "pt-app-child", "codex", null, { instanceId: "codex", model: "gpt-6.1-sol" }, { origin: "app_owned" }),
+  );
 });
+
+// The test clock starts at epoch 0, so the resolver's "now" must be set
+// explicitly. Fixtures are written relative to this instant.
+const CLOCK_NOW = "2026-11-01T00:00:00.000Z";
 
 const run = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.ExecutionIdentity>) =>
   Effect.scoped(
     Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(CLOCK_NOW));
       yield* seed;
+      return yield* body;
+    }).pipe(Effect.provide(ExecutionIdentity.layer)),
+  ).pipe(Effect.provide(Sqlite.layerMemory));
+
+// Only the old unnamed codex thread: nothing else can make a codex lookup pending.
+const seedStaleOnly = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const now = DateTime.formatIso(yield* DateTime.now);
+  yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
+    thread("t-only-stale", "pt-only-stale", { parentThreadId: null, rootThreadId: "t-only-stale" }),
+  )}`;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+    provider("pt-only-stale", "t-only-stale", "codex", null, now, "codex", "2026-01-01T00:00:00.000Z"),
+  )}`;
+});
+
+const runStaleOnly = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.ExecutionIdentity>) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(CLOCK_NOW));
+      yield* seedStaleOnly;
       return yield* body;
     }).pipe(Effect.provide(ExecutionIdentity.layer)),
   ).pipe(Effect.provide(Sqlite.layerMemory));
@@ -291,6 +356,91 @@ describe("ExecutionIdentity", () => {
     ),
   );
 
+  it.effect("does not report a detached Claude binding's old ses_ as current", () =>
+    run(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const current = yield* identity.currentNative(["t-detached"]);
+        assert.isFalse(current.has("t-detached"));
+        const aliases = (yield* identity.aliases("t-detached")).map((alias) => alias.nativeId);
+        assert.include(aliases, "ses_detached_old");
+        const byOld = yield* identity.resolve({ nativeId: "ses_detached_old" });
+        assert.strictEqual(byOld.robobThreadId, "t-detached");
+      }),
+    ),
+  );
+
+  it.effect("resolves a second Claude instance's child only through that instance", () =>
+    run(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const second = yield* identity.resolve({
+          nativeId: "parent-uuid-2",
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent-2",
+          agentId: "agent-abc",
+        });
+        assert.strictEqual(second.resolution, "resolved");
+        assert.strictEqual(second.robobThreadId, "t-claude-child-2");
+        assert.strictEqual(second.providerInstanceId, "claudeAgent-2");
+
+        // The first instance's session with the same agent id is its own child.
+        const first = yield* identity.resolve({
+          nativeId: "parent-uuid",
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          agentId: "agent-abc",
+        });
+        assert.strictEqual(first.robobThreadId, "t-claude-child");
+        assert.strictEqual(first.providerInstanceId, "claudeAgent");
+      }),
+    ),
+  );
+
+  it.effect("refuses a Claude child under an instance that owns no such child", () =>
+    run(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const none = yield* identity.resolve({
+          nativeId: "parent-uuid-2",
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          agentId: "agent-abc",
+        });
+        assert.notStrictEqual(none.robobThreadId, "t-claude-child-2");
+        assert.notStrictEqual(none.resolution, "resolved");
+      }),
+    ),
+  );
+
+  it.effect("classifies an app-owned child as app-managed, not provider-native", () =>
+    run(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const result = yield* identity.resolve({ nativeId: "codex-app-child-uuid", driver: "codex" });
+        assert.strictEqual(result.robobThreadId, "t-app-child");
+        assert.notStrictEqual(result.executionKind, "provider-native-child");
+        assert.strictEqual(result.executionKind, "app-managed-child");
+        assert.strictEqual(result.model?.model, "gpt-6.1-sol");
+      }),
+    ),
+  );
+
+  it.effect("reports an old unnamed provider thread as unavailable even if recently written", () =>
+    runStaleOnly(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        // The only codex row was created in January; its updated_at is now.
+        // Newest-updated must not decide the window: this is unavailable.
+        const stale = yield* identity.resolve({
+          nativeId: "22222222-3333-4444-5555-666666666666",
+          driver: "codex",
+        });
+        assert.strictEqual(stale.resolution, "unavailable");
+      }),
+    ),
+  );
+
   it.effect("reports a UUID with a fresh unnamed provider thread as pending", () =>
     run(
       Effect.gen(function* () {
@@ -314,6 +464,7 @@ describe("ExecutionIdentity", () => {
           driver: "claudeAgent",
         });
         assert.strictEqual(unknown.resolution, "unavailable");
+        // Not a UUID: never pending, whatever is fresh.
         const old = yield* identity.resolve({ nativeId: "ses_never_seen" });
         assert.strictEqual(old.resolution, "unavailable");
       }),
