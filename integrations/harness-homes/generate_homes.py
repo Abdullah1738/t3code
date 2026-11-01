@@ -296,6 +296,8 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:20128",
             "ANTHROPIC_CUSTOM_HEADERS": "x-9router-token-saver: off",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": c["autoCompactWindow"],
+            "ENABLE_PROMPT_CACHING_1H": "1",
+            "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "450000",
             "API_TIMEOUT_MS": "1800000",
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
@@ -387,9 +389,10 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
         "mcp_oauth_credentials_store": "file",
         "project_doc_max_bytes": 65536,
         "notify": [],
+        # Async compaction stays off; 9router must support the OpenAI wire fields first.
         "model_providers": {
             "ninerouter": {
-                "name": "9router",
+                "name": "OpenAI",
                 "base_url": "http://127.0.0.1:20128/v1",
                 "env_key": "NINEROUTER_KEY",
                 "wire_api": "responses",
@@ -407,6 +410,8 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
             "computer_use": False,
             "goals": False,
             "hooks": True,
+            "output_token_replay": True,
+            "concurrent_reasoning_summaries": True,
             "subagent_default_context_limits": False,
         },
         "memories": {"generate_memories": False, "use_memories": False},
@@ -528,6 +533,8 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
     old_settings = read_json_or_empty(settings_path)
     settings = deep_merge(old_settings, claude_settings_owned(manifest, old_settings),
                           replace=frozenset({"hooks"}))
+    # Idle compaction uses the CLI default; an old override must not disable it.
+    settings.pop("idleCompaction", None)
 
     claude_json_path = os.path.join(claude, ".claude.json")
     claude_json = read_json_or_empty(claude_json_path)
