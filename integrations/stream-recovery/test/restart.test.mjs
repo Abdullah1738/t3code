@@ -223,17 +223,18 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.equal(calls.telegram.length, 1);
 });
 
-test('restartScan waits to settle, for the installer, and never acts on a dry run or seed', async () => {
+test('restartScan waits only briefly to settle, never for the installer, and never acts on a dry run or seed', async () => {
+  assert.ok(RESTART_SETTLE_MS <= 30_000, 'resumes must be fast');
   const fresh = fakeIo({ subs: restartBurst(), threads });
   const state = { handled: {}, servers: [] };
   await restartScan(scanArgs(state, { now: T0 + RESTART_SETTLE_MS - 10_000 }), fresh.io);
   assert.equal(fresh.calls.send.length + fresh.calls.telegram.length, 0);
   assert.deepEqual(state.handled, {});
 
+  // Owner, 1 Nov: an installer's pending resume no longer holds the notes back.
   const installer = fakeIo({ subs: restartBurst(), threads, installerMs: T0 - 300_000 });
-  await restartScan(scanArgs(state), installer.io);
-  assert.equal(installer.calls.send.length, 0);
-  assert.deepEqual(state.handled, {});
+  await restartScan(scanArgs({ handled: {}, servers: [] }), installer.io);
+  assert.deepEqual(installer.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
 
   const dry = fakeIo({ subs: restartBurst(), threads });
   const report = await restartScan(scanArgs(state, { dryRun: true }), dry.io);
@@ -349,6 +350,28 @@ test('restartScan recovers own turns and crw reviewers without needing cancelled
   assert.match(calls.send[0].text, /dirhelper -machineBoot fully wipes \$TMPDIR/);
   assert.match(calls.send[1].text, /ses_review/);
   await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 2);
+});
+
+test('a fast scan notes threads right away and keeps the incident open for a run cut late in the window', async () => {
+  // Robob ready at T0+10s, so its start window closes at T0+70s.
+  const runs = [run('arch')];
+  const threadsById = { arch: { title: 'Architecture lane' }, late: { title: 'Late lane' } };
+  const { io, calls } = fakeIo({ runs, threads: threadsById });
+  io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state, { now: T0 + 7_000 + RESTART_SETTLE_MS + 1_000 }), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch']);
+  assert.equal(calls.telegram.length, 0);
+  const id = Object.keys(state.handled)[0];
+  assert.equal(state.handled[id].done, false);
+  runs.push(run('late', { completed_at: iso(T0 + 60_000) }));
+  await restartScan(scanArgs(state, { now: T0 + 60_000 + RESTART_SETTLE_MS + 1_000 }), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch', 'late']);
+  assert.equal(Object.keys(state.handled).length, 1);
+  await restartScan(scanArgs(state, { now: T0 + 70_000 + RESTART_SETTLE_MS + 1_000 }), io);
+  assert.equal(calls.telegram.length, 1);
+  assert.equal(state.handled[id].done, true);
   assert.equal(calls.send.length, 2);
 });
 
