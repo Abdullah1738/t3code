@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""PATH backstop for coordination guards; the Bash hook remains authoritative.
-
-Claude's shell exposes the session id, not necessarily a child agent_id. A
-session-only lookup can therefore resolve the parent rather than the executing
-child. The hook has the child identity; no session-wide identity or approval
-is exported here to try to bridge that gap.
-"""
+"""PATH backstop for coordination guards; the Bash hook remains authoritative."""
 
 import os
 from pathlib import Path
@@ -101,7 +95,7 @@ def _native():
     return None, None, None
 
 
-def _check(binary, args, harness, native_id):
+def _check(binary, args, harness, native_id, event=None, *, ignore_pin=False):
     started = time.monotonic()
     # Tests can substitute an engine without touching a live configuration.
     source = os.environ.get("HARNESS_HOOKS_SRC")
@@ -112,12 +106,13 @@ def _check(binary, args, harness, native_id):
     # Env-file approval is shared between sibling calls. The accepted token
     # comes only from this command's hook rewrite and is inherited by that
     # command's descendants, not installed by SessionStart.
-    identity = engine.resolve_identity({"session_id": native_id}, harness, fresh=True)
+    identity = engine.resolve_identity(event or {"session_id": native_id}, harness, fresh=True)
     pin = os.environ.get("HARNESS_COORD_APPROVED")
     if pin is None and not os.environ.get("AGENT_GUARD_SESSION"):
-        # The hook currently uses the legacy spelling, but binds it to one
-        # exact command with `env`, not to the shared session environment.
+        # Older hook rewrites use the legacy spelling for one command.
         pin = os.environ.get("AGENT_GUARD_APPROVED", "")
+    if ignore_pin:
+        pin = None
     approved = bool(pin and engine.approval_valid(pin))
     command = shlex.join([binary, *args])
     result = engine.decide_coord(command, identity, os.getcwd(), approved=approved)
@@ -145,8 +140,27 @@ def main():
         return 2
     binary, args = sys.argv[1], sys.argv[2:]
     harness, native_id, native_error = _native()
+    context = None
+    if os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY"):
+        try:
+            source = os.environ.get("HARNESS_HOOKS_SRC")
+            if source:
+                sys.path.insert(0, source)
+            import engine
+            context = engine.command_identity_from_env()
+        except Exception:
+            # A missing/broken hook installation must not block commands.
+            pass
+    if context:
+        harness, event = context
+        native_id, native_error = event.get("session_id"), None
     env = os.environ.copy()
     env.pop("BUN_INSPECT", None)
+    if os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY") and not context:
+        # Do not pass damaged or mismatched context on to nested wrappers.
+        env.pop("HARNESS_HOOKS_COMMAND_IDENTITY", None)
+        env.pop("AGENT_GUARD_APPROVED", None)
+        env.pop("HARNESS_COORD_APPROVED", None)
 
     if native_error:
         _warn(native_error)
@@ -156,7 +170,9 @@ def main():
         env.pop("HARNESS_COORD_APPROVED", None)
     elif harness:
         try:
-            allowed, approved = _check(binary, args, harness, native_id)
+            invalid_context = bool(os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY") and not context)
+            allowed, approved = _check(binary, args, harness, native_id, context[1] if context else None,
+                                       ignore_pin=invalid_context)
             if not allowed:
                 return 3
             # A stale OpenCode marker must not be carried into a native child.

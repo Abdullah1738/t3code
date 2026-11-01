@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -418,6 +419,24 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(json.loads((self.codex_cu / "hooks.json").read_text()), {"hooks": {}})
         cfg = tomllib.loads((self.codex / "config.toml").read_text())
         self.assertNotIn("hooks", cfg)
+
+    def test_hooks_are_selected_by_harness(self) -> None:
+        m = self.manifest()
+        self.run_gen(m)
+        claude_hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        codex_hooks = json.loads((self.codex / "hooks.json").read_text())["hooks"]
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "SessionStart"})
+        self.assertEqual(set(codex_hooks), {"PreToolUse"})
+        for group in claude_hooks["PreToolUse"] + claude_hooks["SessionStart"]:
+            self.assertTrue(group["hooks"][0]["command"].endswith("/claude.py"))
+        for group in codex_hooks["PreToolUse"]:
+            self.assertTrue(group["hooks"][0]["command"].endswith("/codex.py"))
+        for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
+            patterns = [re.compile(group["matcher"]) for group in groups]
+            for tool in ("Bash", "mcp__betterstack__monitor", "mcp__example__exec_command",
+                         "mcp__example__shell_command"):
+                self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
+            self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))
 
     def test_home_root_pointing_at_personal_claude_is_refused(self) -> None:
         personal = self.home / ".claude"

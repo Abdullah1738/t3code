@@ -42,7 +42,7 @@ run_shim() {
     human) ident=() ;;
   esac
   env -i HOME="$tmp/home" PATH="$blockers:$tmp/bin:/usr/bin:/bin" \
-    OFFBOX_GATE_MODE=enforce OFFBOX_STATE_DIR="$tmp/state" OFFBOX_RULES="$offbox/heavy-rules.json" \
+    OFFBOX_GATE_MODE=enforce OFFBOX_STATE_DIR="$tmp/state" OFFBOX_RULES="${TEST_RULES:-$offbox/heavy-rules.json}" \
     HARNESS_HOOKS_SRC="$tmp/engine" "${ident[@]}" "$blockers/$name" "$@" >"$tmp/out" 2>"$tmp/err"
 }
 
@@ -77,6 +77,11 @@ for name in wacli himalaya himalaya-heal docker; do
   grep -q "real:$name" "$tmp/out"
 done
 print 'offbox shims: Claude, Codex, harness marker and human checks passed'
+
+# Preserve the existing fail-closed OpenCode Docker backstop. Native policy
+# errors fail open, like the new hooks, instead of blocking every docker call.
+TEST_RULES="$tmp/no-rules.json" run_shim claude docker run alpine
+grep -q 'real:docker' "$tmp/out"
 
 coord=$pkg/coord-blockers
 run_coord() {

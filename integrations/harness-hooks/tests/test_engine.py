@@ -230,6 +230,7 @@ class EngineTests(unittest.TestCase):
             "bash -n scripts/deploy-x": None, "bash -c 'psql'": "database-direct",
             "echo $(aws ssm get-parameter --with-decryption)": "secret-read",
             "aws ecs run-task": "aws-mutation", "aws ecs describe-services": None,
+            "aws logs start-query --log-group-name x; aws ecs run-task": "aws-mutation",
             "terraform state rm item": "terraform-mutation", "git push -f": "force-push",
             "gh api -X POST repos/x": "github-write", "npm run deploy:dev": "deploy-script",
             "offbox run -- bash -c 'psql'": "database-direct",
@@ -290,12 +291,13 @@ class EngineTests(unittest.TestCase):
         self.assertIn("nativeId=codex-child", self.state.calls[-1])
         self.assertNotIn("agentId", self.state.calls[-1])
 
-    def test_codex_uses_thread_env_before_shared_session_but_event_agent_first(self):
+    def test_codex_never_uses_stale_hook_thread_environment(self):
         self.add_identity("codex-env", "env-child", parent="parent", model="gpt-6-astra")
         self.add_identity("codex-agent", "agent-child", parent="parent", model="gpt-6-astra")
+        self.add_identity("codex-shared", "root", model="gpt-6-astra")
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "codex-env"}):
             event = self.event("echo", session="codex-shared", agent=None)
-            self.assertEqual(engine.resolve_identity(event, "codex")["robobThreadId"], "env-child")
+            self.assertEqual(engine.resolve_identity(event, "codex")["robobThreadId"], "root")
             event["agent_id"] = "codex-agent"
             self.assertEqual(engine.resolve_identity(event, "codex")["robobThreadId"], "agent-child")
 
@@ -425,8 +427,11 @@ class EngineTests(unittest.TestCase):
         self.add_identity("codex-child", "child", parent="parent", model="gpt-6-astra")
         codex = self.run_adapter("codex", self.event("npm ci", session="codex-child", agent=None))["hookSpecificOutput"]
         self.assertEqual(codex["permissionDecision"], "deny")
-        self.assertIsNone(self.run_adapter("codex", self.event("printf ok", session="codex-child", agent=None)))
-        self.assertIsNone(self.run_adapter("claude", self.event("printf ok")))
+        for harness, allowed_event in (("codex", self.event("printf ok", session="codex-child", agent=None)),
+                                       ("claude", self.event("printf ok"))):
+            allowed = self.run_adapter(harness, allowed_event)["hookSpecificOutput"]
+            self.assertEqual(allowed["permissionDecision"], "allow")
+            self.assertIn(engine.COMMAND_IDENTITY_ENV + "=", allowed["updatedInput"]["command"])
         target = self.root / "claude-env"
         self.assertIsNone(self.run_adapter("claude", {"hook_event_name": "SessionStart"}, CLAUDE_ENV_FILE=str(target),
                                           HARNESS_HOOKS_OFFBOX_BLOCKERS=str(self.root / "offbox blockers"),
@@ -439,6 +444,250 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("BUN_INSPECT", text)
         self.assertNotIn("AGENT_GUARD_APPROVED", text)
         self.assertNotIn("AGENT_GUARD_SESSION", text)
+
+    def shell_environment(self, **values):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        real_psql = bin_dir / "psql"
+        real_psql.write_text("#!/bin/sh\nprintf 'real-psql\\n'\n")
+        real_psql.chmod(0o755)
+        env = dict(os.environ)
+        for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
+                     "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED", engine.COMMAND_IDENTITY_ENV):
+            env.pop(name, None)
+        env.update({"PATH": os.pathsep.join([str(SRC.parent / "coord-blockers"), str(bin_dir), "/usr/bin", "/bin"]),
+                    "HARNESS_HOOKS_SRC": str(SRC), **values})
+        return env
+
+    def run_shell(self, command, env, shell="/bin/bash"):
+        return subprocess.run([shell, "-c", command], cwd=self.root, env=env,
+                              text=True, capture_output=True, timeout=10)
+
+    def test_rewrite_identifies_both_native_children_and_scopes_compound_commands(self):
+        self.actor()
+        # Both native children share this parent session, but have different models.
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\nexec /bin/sh -c 'psql -c select'\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        commands = ["printf 'head\\n'; true | cat; ./probe.sh", "printf 'head\\n'; ./probe.sh | cat"]
+        for agent, code, command in (("agent-child", 3, commands[0]), ("agent-sibling", 0, commands[0]),
+                                     ("agent-child", 3, commands[1]), ("agent-sibling", 0, commands[1])):
+            with self.subTest(agent=agent, command=command):
+                response = self.run_adapter("claude", self.event(command, agent=agent))["hookSpecificOutput"]
+                self.assertEqual(response["permissionDecision"], "allow")
+                result = self.run_shell("set -o pipefail\n" + response["updatedInput"]["command"], env)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout, "head\n" + ("real-psql\n" if code == 0 else ""))
+                self.assertEqual(result.stderr, engine.COORD_REASON + "\n" if code == 3 else "")
+
+        # Reversing the parent and child models must not incorrectly deny Opus.
+        self.state.identities[("session", None)]["model"] = {"model": "claude-haiku-5-5"}
+        response = self.run_adapter("claude", self.event(commands[0], agent="agent-sibling"))["hookSpecificOutput"]
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "head\nreal-psql\n", ""))
+
+    def test_context_fallback_tampering_and_fresh_model(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        raw = self.run_shell("./probe.sh", env)
+        self.assertEqual((raw.returncode, raw.stdout, raw.stderr), (0, "real-psql\n", ""))
+        response = self.run_adapter("claude", self.event("./probe.sh"))["hookSpecificOutput"]
+        rewritten = response["updatedInput"]["command"]
+        denied = self.run_shell(rewritten, env)
+        self.assertEqual((denied.returncode, denied.stderr), (3, engine.COORD_REASON + "\n"))
+
+        # Verification is integrity-only: a changed token or a mismatched
+        # session falls back to normal environment attribution, not its child.
+        changed = rewritten.replace("HARNESS_HOOKS_COMMAND_IDENTITY=", "HARNESS_HOOKS_COMMAND_IDENTITY=x", 1)
+        result = self.run_shell(changed, env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "real-psql\n", ""))
+        self.add_identity("another", "other-parent", model="claude-opus-5-5")
+        result = self.run_shell(rewritten, {**env, "CLAUDE_CODE_SESSION_ID": "another"})
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "real-psql\n", ""))
+
+        # Tokens carry native lookup inputs, not a model/authorization snapshot.
+        self.state.identities[("session", "agent-child")]["model"] = {"model": "claude-opus-5-5"}
+        result = self.run_shell(rewritten, env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "real-psql\n", ""))
+        self.state.fail = True
+        result = self.run_shell(rewritten, env)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "real-psql\n")
+        self.assertIn("allowing due to guard error", result.stderr)
+
+    def test_codex_child_context_outranks_parent_environment(self):
+        self.actor()
+        self.add_identity("codex-parent", "parent", model="claude-opus-5-5")
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CODEX_THREAD_ID="codex-parent", ROBOB_HARNESS="codex")
+        # A stale app-server environment is unrelated to the hook payload.
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "stale-unrelated"}):
+            response = self.run_adapter("codex", self.event("./probe.sh", session="codex-parent", agent="codex-child"))["hookSpecificOutput"]
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", engine.COORD_REASON + "\n"))
+        self.assertTrue(any("nativeId=codex-child" in call for call in self.state.calls))
+        self.state.identities[("codex-parent", None)]["model"] = {"model": "claude-haiku-5-5"}
+        self.state.identities[("codex-child", None)]["model"] = {"model": "claude-opus-5-5"}
+        response = self.run_adapter("codex", self.event("./probe.sh", session="codex-parent", agent="codex-child"))["hookSpecificOutput"]
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "real-psql\n", ""))
+
+    def test_top_level_codex_payload_ignores_stale_hook_env_in_shell_context(self):
+        self.actor()
+        self.add_identity("actual-root", "parent", model="claude-haiku-5-5")
+        self.add_identity("stale", "stale-thread", model="claude-opus-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "stale"}):
+            response = self.run_adapter("codex", self.event("./probe.sh", session="actual-root", agent=None))["hookSpecificOutput"]
+        env = self.shell_environment(CODEX_THREAD_ID="actual-root", ROBOB_HARNESS="codex")
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", engine.COORD_REASON + "\n"))
+        shell_event = self.event("./probe.sh", session="actual-root", agent=None, tool_name="shell")
+        response = self.run_adapter("codex", shell_event)["hookSpecificOutput"]
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", engine.COORD_REASON + "\n"))
+
+    def test_unavailable_policy_emits_no_rewrite_without_inherited_context(self):
+        self.state.fail = True
+        event = self.event("printf ok")
+        self.assertIsNone(self.run_adapter("claude", event))
+        self.assertIsNone(self.run_adapter("codex", event))
+
+    def test_fresh_nested_hook_replaces_parent_context_and_approval(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}):
+            parent_token = engine._command_identity(self.event("./probe.sh", agent="agent-sibling"), "claude")
+        response = self.run_adapter("claude", self.event("./probe.sh"),
+                                    CLAUDE_CODE_SESSION_ID="session",
+                                    HARNESS_HOOKS_COMMAND_IDENTITY=parent_token,
+                                    HARNESS_COORD_APPROVED="stale-pin")["hookSpecificOutput"]
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude",
+                                     HARNESS_HOOKS_COMMAND_IDENTITY=parent_token,
+                                     HARNESS_COORD_APPROVED="stale-pin")
+        result = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", engine.COORD_REASON + "\n"))
+
+    def test_rewrite_preserves_shell_state_and_does_not_leak_to_siblings(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        child = self.root / "dir with space"
+        child.mkdir()
+        command = """cd 'dir with space'; set -- 'a b' c; export SAMPLE='x y'; printf '%s|%s|%s\\n' "$1" "$SAMPLE" "$PWD"; cat <<'END'
+quoted $HOME
+END
+printf done | cat"""
+        response = self.run_adapter("claude", self.event(command, tool_input={"command": command, "timeout": 123, "description": "test"}))["hookSpecificOutput"]
+        rewritten = response["updatedInput"]
+        self.assertEqual((rewritten["timeout"], rewritten["description"]), (123, "test"))
+        suffix = "\nprintf '\\n%s|%s|%s|%s\\n' \"$PWD\" \"$1\" \"$SAMPLE\" \"${HARNESS_HOOKS_COMMAND_IDENTITY-unset}\"; psql"
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell(rewritten["command"] + suffix, env, shell=shell)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"a b|x y|{child.resolve()}\nquoted $HOME\ndone\n{child.resolve()}|a b|x y|unset\nreal-psql\n")
+                self.assertEqual(result.stderr, "")
+
+    def test_wrapper_preserves_status_and_handles_bad_syntax(self):
+        self.actor()
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        for command in ("false", "true; false", "printf 'unterminated", "cat <<EOF\nunterminated"):
+            with self.subTest(command=command):
+                response = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]
+                self.assertIn("updatedInput", response)
+                for shell in ("/bin/bash", "/bin/zsh"):
+                    raw = self.run_shell(command, env, shell=shell)
+                    rewritten = self.run_shell(response["updatedInput"]["command"], env, shell=shell)
+                    self.assertEqual(rewritten.returncode, raw.returncode, (shell, rewritten.stderr))
+                    self.assertEqual(rewritten.stdout, raw.stdout, shell)
+
+    def test_approved_script_rewrite_carries_identity_and_approval_once(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        script, sql = self.root / "scripts/deploy-health.sh", self.root / "replica-health.sql"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\n/bin/sh -c 'psql'\n")
+        script.chmod(0o755)
+        sql.write_text("SELECT 1;\n")
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        self.allow.write_text(json.dumps({"scripts": [{"path": str(script), "sha256": digest(script),
+            "inputs": [{"path": str(sql), "sha256": digest(sql)}]}]}))
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        response = self.run_adapter("claude", self.event("scripts/deploy-health.sh replica-health.sql"))["hookSpecificOutput"]
+        rewritten = response["updatedInput"]["command"]
+        self.assertEqual(sum(line.startswith("export HARNESS_HOOKS_COMMAND_IDENTITY=") for line in rewritten.splitlines()), 1)
+        self.assertEqual(sum(line.startswith("export AGENT_GUARD_APPROVED=") for line in rewritten.splitlines()), 1)
+        run = self.run_shell(rewritten, env)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "real-psql\n", ""))
+        sql.write_text("SELECT 2;\n")
+        run = self.run_shell(rewritten, env)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (3, "", engine.COORD_REASON + "\n"))
+
+    def test_docker_wrapper_uses_command_child_and_not_exempt_parent(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        offbox = SRC.parents[1] / "offbox/skill"
+        blocker = offbox / "scripts/blockers"
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude",
+                                     OFFBOX_RULES=str(offbox / "heavy-rules.json"))
+        bin_dir = self.root / "bin"
+        docker = bin_dir / "docker"
+        docker.write_text("#!/bin/sh\nprintf 'real-docker\\n'\n")
+        docker.chmod(0o755)
+        env["PATH"] = str(blocker) + os.pathsep + env["PATH"]
+        # Docker uses the user's executable offbox path for its availability check.
+        fake_home = self.root / "home"
+        offbox_bin = fake_home / ".local/bin/offbox"
+        offbox_bin.parent.mkdir(parents=True)
+        offbox_bin.write_text("#!/bin/sh\nexit 0\n")
+        offbox_bin.chmod(0o755)
+        env["HOME"] = str(fake_home)
+        (self.offbox_state / "exemptions.json").write_text(json.dumps([{"thread_id": "parent-only", "expires_at": time.time() + 60}]))
+        self.state.identities[("session", None)]["robobThreadId"] = "parent-only"
+        script = self.root / "docker-probe.sh"
+        script.write_text("#!/bin/sh\n/bin/sh -c 'docker run alpine'\n")
+        script.chmod(0o755)
+        response = self.run_adapter("claude", self.event("./docker-probe.sh"))["hookSpecificOutput"]
+        run = self.run_shell(response["updatedInput"]["command"], env)
+        self.assertEqual(run.returncode, 3, run.stderr)
+        self.assertEqual(run.stdout, "")
+        import importlib.util
+        with patch.dict(os.environ, {"OFFBOX_RULES": str(offbox / "heavy-rules.json")}):
+            spec = importlib.util.spec_from_file_location("docker_test_classifier", offbox / "scripts/classify.py")
+            classifier = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(classifier)
+            self.assertEqual(run.stderr, engine._offbox_denial(classifier.classify("docker run alpine", str(self.root))) + "\n")
+        raw = self.run_shell("./docker-probe.sh", env)
+        self.assertEqual((raw.returncode, raw.stdout, raw.stderr), (0, "real-docker\n", ""))
+        # Classifier failures are fail-open for native shells but retain the
+        # legacy fail-closed result for an OpenCode-only environment.
+        env["OFFBOX_RULES"] = str(self.root / "missing-rules.json")
+        failed = self.run_shell("./docker-probe.sh", env)
+        self.assertEqual((failed.returncode, failed.stdout), (0, "real-docker\n"))
+        self.assertIn("native Docker check unavailable; allowing due to guard error", failed.stderr)
+        for name in ("CLAUDE_CODE_SESSION_ID", "ROBOB_HARNESS"):
+            env.pop(name)
+        env["OPENCODE_SESSION_ID"] = "oc-session"
+        failed = self.run_shell("./docker-probe.sh", env)
+        self.assertEqual((failed.returncode, failed.stdout), (3, ""))
+        self.assertIn("Docker policy check failed", failed.stderr)
 
     def test_sessionstart_export_failure_is_logged_once(self):
         missing = self.root / "does-not-exist" / "env"

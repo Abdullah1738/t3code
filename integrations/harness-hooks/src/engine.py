@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import datetime
 from contextlib import closing
+import base64
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -119,11 +123,136 @@ def _native(event, harness):
     session = event.get("session_id")
     agent = event.get("agent_id")
     if harness == "codex":
-        # Hook agent_id is the concrete child thread. Some hook subprocesses
-        # also inherit CODEX_THREAD_ID, but a stale app-server environment must
-        # not override a concrete ID explicitly present in the hook payload.
-        return agent or os.environ.get("CODEX_THREAD_ID") or session, None, "codex"
+        # The hook inherits the app-server's environment, not the tool shell's.
+        # Only payload IDs identify the executing agent; shim fallbacks pass
+        # CODEX_THREAD_ID explicitly as their synthetic event's session_id.
+        return agent or session, None, "codex"
     return session, agent or None, "claudeAgent"
+
+
+COMMAND_IDENTITY_ENV = "HARNESS_HOOKS_COMMAND_IDENTITY"
+
+
+def _command_identity_key(*, create=False):
+    """Publish a complete private key atomically when concurrent hooks first run."""
+    directory = _state()
+    path = directory / "command-identity.key"
+    if create:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.exists():
+            fd, tmp = tempfile.mkstemp(prefix="command-key-", dir=directory)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(secrets.token_bytes(32))
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass
+            finally:
+                os.unlink(tmp)
+    with open(path, "rb") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise ValueError("command-key-permissions")
+        key = f.read(33)
+    if len(key) != 32:
+        raise ValueError("command-key-invalid")
+    return key
+
+
+def _command_identity(event, harness):
+    """Carry only native lookup inputs, never a cached model or exemption."""
+    native, agent, _ = _native(event, harness)
+    if not isinstance(native, str) or not native or "\x00" in native:
+        return None
+    if agent is not None and (not isinstance(agent, str) or not agent or "\x00" in agent):
+        return None
+    session = event.get("session_id")
+    if not isinstance(session, str) or not session or "\x00" in session:
+        return None
+    data = {"v": 1, "harness": harness, "session": session,
+            "native": native, "agent": agent,
+            "instance": os.environ.get("HARNESS_HOOKS_PROVIDER_INSTANCE", "")}
+    raw = json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(_command_identity_key(create=True), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def command_identity_from_env():
+    """Return (harness, lookup event), or None for missing/invalid context.
+
+    The MAC catches damaged or accidentally inherited context, not a hostile
+    same-user process. The hook scopes it to the command and its descendants.
+    """
+    try:
+        value = os.environ.get(COMMAND_IDENTITY_ENV, "")
+        if not value or len(value) > 16384:
+            return None
+        encoded, signature = value.split(".")
+        expected = hmac.new(_command_identity_key(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        data = json.loads(raw)
+        if not isinstance(data, dict) or data.get("v") != 1 or data.get("harness") not in ("claude", "codex"):
+            return None
+        harness = data["harness"]
+        session, native, agent = data.get("session"), data.get("native"), data.get("agent")
+        if not all(isinstance(x, str) and x and "\x00" not in x for x in (session, native)):
+            return None
+        if agent is not None and (not isinstance(agent, str) or not agent or "\x00" in agent):
+            return None
+        if data.get("instance") != os.environ.get("HARNESS_HOOKS_PROVIDER_INSTANCE", ""):
+            return None
+        if harness == "claude":
+            current = os.environ.get("CLAUDE_CODE_SESSION_ID")
+            if native != session or (current and current != session):
+                return None
+            event = {"session_id": session, "agent_id": agent}
+        else:
+            current = os.environ.get("CODEX_THREAD_ID")
+            if current and current not in (session, native):
+                return None
+            # Codex's agent_id is the concrete native thread and outranks a
+            # possibly parent-bound CODEX_THREAD_ID in resolve_identity.
+            event = {"session_id": session, "agent_id": native}
+        return harness, event
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None
+
+
+def _command_needs_eval(command):
+    """Heredocs need an EOF boundary before the wrapper's cleanup commands."""
+    try:
+        # A final newline keeps shell comments from consuming shlex's EOF.
+        lexer = shlex.shlex(command + "\n", posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return any(token in ("<<", "<<-") for token in lexer)
+    except ValueError:
+        # Leave malformed quoting to the actual shell, including its exit code.
+        return False
+
+
+def _command_with_context(command, identity, pin):
+    """Scope exports to this execution without losing shell cwd changes."""
+    name = "__harness_hook_" + secrets.token_hex(8)
+    values = {COMMAND_IDENTITY_ENV: identity or "", "HARNESS_COORD_APPROVED": pin or "",
+              "AGENT_GUARD_APPROVED": pin or ""}
+    setup, cleanup, scratch = [], [], []
+    for index, (key, value) in enumerate(values.items()):
+        present, previous = name + "_p" + str(index), name + "_v" + str(index)
+        scratch.extend([present, previous])
+        setup.extend([present + "=${" + key + "+x}", previous + "=${" + key + "-}",
+                      "export " + key + "=" + shlex.quote(value)])
+        cleanup.append('if [ "${' + present + '-}" = x ]; then export ' + key + '="${' + previous + '-}"; else unset ' + key + "; fi")
+    status = name + "_status"
+    # A group runs the original in the current shell (including positional
+    # parameters, functions and cwd). eval preserves a heredoc's EOF boundary.
+    # Restore inherited context before this shell can run another command.
+    body = "eval " + shlex.quote(command) if _command_needs_eval(command) else command
+    return ("{\n" + "\n".join(setup) + "\n" + body + "\n" + status + "=$?\n" + "\n".join(cleanup) +
+            "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')'\n}")
 
 
 def resolve_identity(event, harness, *, fresh=False):
@@ -489,7 +618,7 @@ def classify_coord(source, depth=0):
             return "database-direct"
         if binary == "aws":
             if (first == "logs" and second in {"start-query", "stop-query", "start-live-tail"}) or (first == "athena" and second in {"start-query-execution", "stop-query-execution"}):
-                return None
+                continue
             if first == "rds-data" or (first == "secretsmanager" and second == "get-secret-value") or (first == "ssm" and re.fullmatch(r"get-parameters?(?:-by-path)?", second) and "--with-decryption" in args):
                 return "secret-read"
             if re.match(r"^(?:run|start|stop|create|delete|put|update|modify|register|deregister|attach|detach|send|invoke|tag|untag)(?:-|$)", second) or second == "execute-command":
@@ -650,6 +779,8 @@ def _command(event):
         return None
     if tool == "Bash":
         command = value.get("command")
+    elif tool == "shell" and isinstance(value.get("command"), str):
+        command = value["command"]
     elif re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command)", tool):
         command = value.get("command") or value.get("cmd")
     else:
@@ -661,6 +792,7 @@ def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
     start = time.monotonic()
     command = None
+    pin = None
     identity = {}
     error_type = None
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
@@ -683,6 +815,7 @@ def decide(event, harness):
             command = _command(event)
             if command:
                 inp = event.get("tool_input", {})
+                shell_input = tool == "Bash" or (harness == "codex" and tool == "shell")
                 cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
                 mode = _offbox_mode()
                 if mode != "off":
@@ -704,22 +837,33 @@ def decide(event, harness):
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
-                    coord = decide_coord(command, identity, cwd, approval_allowed=(tool == "Bash"))
+                    coord = decide_coord(command, identity, cwd, approval_allowed=shell_input)
                     if coord["context"].get("rule") == "coord-unresolved" and not error_type:
                         error_type = "coord-unresolved"
                     if coord["decision"] == "deny":
                         result = coord
                     elif coord["context"].get("guarded"):
-                        pin = approval(command, cwd)
+                        pin = approval(command, cwd) if shell_input else None
                         result = coord
-                        if pin:
-                            # One exact invocation only; it is not a SessionStart or
-                            # shared-process environment variable.
-                            updated = dict(inp)
-                            updated["command"] = "env AGENT_GUARD_APPROVED=" + shlex.quote(pin) + " " + command
-                            result["context"]["updatedInput"] = updated
                     elif result["context"]["rule"] == "no-policy":
                         result = coord
+                if result["decision"] != "deny" and shell_input:
+                    # Always refresh or clear this execution's context, even if
+                    # the service is unavailable. Inherited tokens must not
+                    # attribute a later nested hook call to its parent/sibling.
+                    try:
+                        token = None
+                        if identity.get("resolution") == "resolved":
+                            try:
+                                token = _command_identity(event, harness)
+                            except Exception as error:
+                                error_type = type(error).__name__
+                        if token or pin or any(os.environ.get(k) for k in (COMMAND_IDENTITY_ENV, "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED")):
+                            updated = dict(inp)
+                            updated["command"] = _command_with_context(command, token, pin)
+                            result["context"]["updatedInput"] = updated
+                    except Exception as error:
+                        error_type = type(error).__name__
     except Exception as error:
         error_type = type(error).__name__
         result = {"decision": "allow", "reason": "", "context": {"rule": "hook-error"}}

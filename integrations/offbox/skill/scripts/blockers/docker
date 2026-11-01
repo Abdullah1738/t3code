@@ -13,7 +13,7 @@ for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin; do
   fi
 done
 
-if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}" ]]; then
+if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}${HARNESS_HOOKS_COMMAND_IDENTITY:-}" ]]; then
   /opt/homebrew/bin/python3 - "$blockers:h" "$@" <<'PY'
 import os
 import shlex
@@ -45,35 +45,59 @@ if mode() == "enforce" and offbox_usable():
                or verbs == ["compose", "up"] or verbs == ["buildx", "build"])
     command = shlex.join(["docker", *args])
     verdict = classify(command, os.getcwd())
-    native = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("ROBOB_HARNESS")
+    native = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("ROBOB_HARNESS") or os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY")
     if native:
         # Native identities are not OpenCode session IDs. Resolve ancestry through
         # the same per-call hook policy rather than borrowing an inherited OC ID.
         try:
             sys.path.insert(0, os.environ.get("HARNESS_HOOKS_SRC", os.path.expanduser("~/.local/share/harness-hooks/src")))
-            from engine import decide
-            harness = "codex" if os.environ.get("CODEX_THREAD_ID") or os.environ.get("ROBOB_HARNESS") == "codex" else "claude"
-            event = {"hook_event_name": "PreToolUse", "session_id": os.environ.get("CODEX_THREAD_ID") if harness == "codex" else os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "tool_name": "Bash", "tool_input": {"command": command}}
-            allowed = decide(event, harness).get("decision") != "deny"
-        except Exception:
+            import engine
+            context = engine.command_identity_from_env() if os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY") else None
+            if context:
+                harness, event = context
+            elif os.environ.get("CODEX_THREAD_ID") and os.environ.get("CLAUDE_CODE_SESSION_ID"):
+                # Ambiguous inherited harnesses are not evidence of either.
+                event, harness = {}, None
+            else:
+                harness = "codex" if os.environ.get("CODEX_THREAD_ID") or os.environ.get("ROBOB_HARNESS") == "codex" else "claude"
+                event = {"session_id": os.environ.get("CODEX_THREAD_ID") if harness == "codex" else os.environ.get("CLAUDE_CODE_SESSION_ID")}
+            event.update({"hook_event_name": "PreToolUse", "cwd": os.getcwd(), "tool_name": "Bash", "tool_input": {"command": command}})
+            allowed = not harness or engine.decide(event, harness).get("decision") != "deny"
+        except Exception as error:
+            print("offbox gate: native Docker check unavailable; allowing due to guard error", file=sys.stderr)
+            try:
+                engine._log(harness=None, event="shim", tool="docker", decision="allow",
+                            rule="native-check-unavailable", error=type(error).__name__)
+            except Exception:
+                pass
             allowed = True  # The native hook, like the OpenCode gate, fails open.
     else:
         allowed = live_exemption(os.environ.get("OPENCODE_SESSION_ID", ""))
     if guarded and verdict.get("heavy") and not allowed:
-        print("offbox gate: this command was NOT run on the Mac (owner rule 2026-10-13, remote-compute skill).", file=sys.stderr)
-        print(f"Why: {verdict['why']} [rule {verdict['rule']}].", file=sys.stderr)
-        print("Run it on a boat.dev box instead (same repo dir, output streams back, same exit code):", file=sys.stderr)
-        print("  " + verdict["rewrite"], file=sys.stderr)
-        print("Narrow single tests stay local (go test -run X ./pkg, jest path/file.test.ts, pytest path::test).", file=sys.stderr)
-        print('Only if it truly must run here (e.g. needs local creds/devices): offbox local --reason "<why>" [--ttl 2h], then rerun.', file=sys.stderr)
-        sys.exit(3)
+        try:
+            message = (
+                "offbox gate: this command was NOT run on the Mac (owner rule 2026-10-13, remote-compute skill).\n"
+                f"Why: {verdict['why']} [rule {verdict['rule']}].\n"
+                "Run it on a boat.dev box instead (same repo dir, output streams back, same exit code):\n"
+                "  " + verdict["rewrite"] + "\n"
+                "Narrow single tests stay local (go test -run X ./pkg, jest path/file.test.ts, pytest path::test).\n"
+                'Only if it truly must run here (e.g. needs local creds/devices): offbox local --reason "<why>" [--ttl 2h], then rerun.'
+            )
+        except Exception:
+            sys.exit(1)
+        print(message, file=sys.stderr)
+        sys.exit(42)  # reserved for an intentional denial, not a helper error
 PY
   typeset result=$?
-  (( result == 3 )) && exit 3
-  # A failed policy helper must not silently bypass enforcement.
+  (( result == 42 )) && exit 3
   if (( result != 0 )); then
-    print -u2 -- 'offbox gate: Docker policy check failed; load remote-compute and use offbox run -- docker ...'
-    exit 3
+    if [[ -n "${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}${HARNESS_HOOKS_COMMAND_IDENTITY:-}" ]]; then
+      print -u2 -- 'offbox gate: native Docker check unavailable; allowing due to guard error'
+    else
+      # Preserve the existing OpenCode-only fail-closed behavior.
+      print -u2 -- 'offbox gate: Docker policy check failed; load remote-compute and use offbox run -- docker ...'
+      exit 3
+    fi
   fi
 fi
 if [[ -z "$real" ]]; then
