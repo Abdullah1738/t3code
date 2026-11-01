@@ -224,14 +224,9 @@ def command_identity_from_env():
 
 def _command_needs_eval(command):
     """Heredocs need an EOF boundary before the wrapper's cleanup commands."""
-    try:
-        # A final newline keeps shell comments from consuming shlex's EOF.
-        lexer = shlex.shlex(command + "\n", posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        return any(token in ("<<", "<<-") for token in lexer)
-    except ValueError:
-        # Leave malformed quoting to the actual shell, including its exit code.
-        return False
+    # Over-approximate: a heredoc body is not shell syntax, and punctuation
+    # can join `<<` to other operators. Missing it can consume our cleanup.
+    return "<<" in command
 
 
 def _command_with_context(command, identity, pin):
@@ -252,7 +247,7 @@ def _command_with_context(command, identity, pin):
     # Restore inherited context before this shell can run another command.
     body = "eval " + shlex.quote(command) if _command_needs_eval(command) else command
     return ("{\n" + "\n".join(setup) + "\n" + body + "\n" + status + "=$?\n" + "\n".join(cleanup) +
-            "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')'\n}")
+            "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
 def resolve_identity(event, harness, *, fresh=False):
@@ -788,6 +783,20 @@ def _command(event):
     return command if isinstance(command, str) and command else None
 
 
+def _shell_input_field(event, harness):
+    """Only rewrite an unambiguous shell string, using its original field."""
+    tool, value = event.get("tool_name", ""), event.get("tool_input")
+    if not isinstance(tool, str) or not isinstance(value, dict):
+        return None
+    if tool == "Bash" or (harness == "codex" and tool == "shell"):
+        return "command" if isinstance(value.get("command"), str) else None
+    if re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command)", tool):
+        fields = [field for field in ("command", "cmd") if field in value]
+        if len(fields) == 1 and isinstance(value[fields[0]], str):
+            return fields[0]
+    return None
+
+
 def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
     start = time.monotonic()
@@ -815,7 +824,10 @@ def decide(event, harness):
             command = _command(event)
             if command:
                 inp = event.get("tool_input", {})
-                shell_input = tool == "Bash" or (harness == "codex" and tool == "shell")
+                shell_field = _shell_input_field(event, harness)
+                # A matched MCP server may be remote: a local script pin cannot
+                # authorize code at the server's potentially different path.
+                approval_allowed = bool(shell_field and not tool.startswith("mcp__"))
                 cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
                 mode = _offbox_mode()
                 if mode != "off":
@@ -837,17 +849,17 @@ def decide(event, harness):
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
-                    coord = decide_coord(command, identity, cwd, approval_allowed=shell_input)
+                    coord = decide_coord(command, identity, cwd, approval_allowed=approval_allowed)
                     if coord["context"].get("rule") == "coord-unresolved" and not error_type:
                         error_type = "coord-unresolved"
                     if coord["decision"] == "deny":
                         result = coord
                     elif coord["context"].get("guarded"):
-                        pin = approval(command, cwd) if shell_input else None
+                        pin = approval(command, cwd) if approval_allowed else None
                         result = coord
                     elif result["context"]["rule"] == "no-policy":
                         result = coord
-                if result["decision"] != "deny" and shell_input:
+                if result["decision"] != "deny" and shell_field:
                     # Always refresh or clear this execution's context, even if
                     # the service is unavailable. Inherited tokens must not
                     # attribute a later nested hook call to its parent/sibling.
@@ -860,7 +872,7 @@ def decide(event, harness):
                                 error_type = type(error).__name__
                         if token or pin or any(os.environ.get(k) for k in (COMMAND_IDENTITY_ENV, "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED")):
                             updated = dict(inp)
-                            updated["command"] = _command_with_context(command, token, pin)
+                            updated[shell_field] = _command_with_context(command, token, pin)
                             result["context"]["updatedInput"] = updated
                     except Exception as error:
                         error_type = type(error).__name__

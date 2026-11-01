@@ -326,6 +326,48 @@ class EngineTests(unittest.TestCase):
         event["tool_name"] = "mcp__test_server__apply_patch"
         self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
 
+    def test_mcp_shell_rewrites_original_field_and_propagates_child_to_shim(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.add_identity("agent-child", "child", parent="parent", model="claude-haiku-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        for harness in ("claude", "codex"):
+            for tool in ("exec_command", "shell_command"):
+                for field in ("cmd", "command"):
+                    with self.subTest(harness=harness, tool=tool, field=field):
+                        inp = {field: "./probe.sh", "workdir": str(self.root), "timeout": 123}
+                        event = self.event("ignored", tool_name=f"mcp__test_server__{tool}", tool_input=inp)
+                        response = self.run_adapter(harness, event)["hookSpecificOutput"]
+                        self.assertEqual(response["permissionDecision"], "allow")
+                        updated = response["updatedInput"]
+                        self.assertEqual(set(updated), set(inp))
+                        self.assertEqual(updated["workdir"], inp["workdir"])
+                        self.assertEqual(updated["timeout"], 123)
+                        self.assertIn(engine.COMMAND_IDENTITY_ENV + "=", updated[field])
+                        env = self.shell_environment(**({"CLAUDE_CODE_SESSION_ID": "session"} if harness == "claude"
+                                                       else {"CODEX_THREAD_ID": "session"}))
+                        result = self.run_shell(updated[field], env)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                         (3, "", engine.COORD_REASON + "\n"))
+        event = self.event("ignored", tool_name="mcp__test_server__exec_command",
+                           tool_input={"command": "./probe.sh", "cmd": "./other.sh"})
+        self.assertNotIn("updatedInput", engine.decide(event, "claude")["context"])
+
+    def test_mcp_approved_script_is_not_trusted_as_same_host(self):
+        self.actor()
+        script, sql = self.root / "scripts/deploy-health.sh", self.root / "replica-health.sql"
+        script.parent.mkdir()
+        script.write_text("psql -f replica-health.sql\n")
+        sql.write_text("SELECT 1;\n")
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        self.allow.write_text(json.dumps({"scripts": [{"path": str(script), "sha256": digest(script),
+            "inputs": [{"path": str(sql), "sha256": digest(sql)}]}]}))
+        command = "scripts/deploy-health.sh replica-health.sql"
+        event = self.event(command, tool_name="mcp__test_server__exec_command", tool_input={"cmd": command})
+        self.assertEqual(engine.decide(event, "claude")["decision"], "deny")
+
     def test_missing_intermediate_and_cycle_fail_open(self):
         self.add_identity("deep", "leaf", parent="middle", agent=None)
         self.actor("parent")
@@ -617,6 +659,56 @@ printf done | cat"""
                     rewritten = self.run_shell(response["updatedInput"]["command"], env, shell=shell)
                     self.assertEqual(rewritten.returncode, raw.returncode, (shell, rewritten.stderr))
                     self.assertEqual(rewritten.stdout, raw.stdout, shell)
+
+    def test_err_trap_fires_once_with_child_identity_and_no_sibling_leak(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\nprintf 'called\\n' >> calls\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        command = "trap './probe.sh' ERR; false"
+        response = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]
+        suffix = "\nresult=$?; trap - ERR; printf 'status=%s context=%s\\n' \"$result\" \"${HARNESS_HOOKS_COMMAND_IDENTITY-unset}\"; psql"
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                calls = self.root / "calls"
+                calls.unlink(missing_ok=True)
+                result = self.run_shell(response["updatedInput"]["command"] + suffix, env, shell=shell)
+                self.assertEqual(calls.read_text(), "called\n")
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (0, "status=1 context=unset\nreal-psql\n", engine.COORD_REASON + "\n"))
+
+    def test_heredocs_at_eof_preserve_behavior_and_cleanup(self):
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        commands = (
+            "echo first;<<EOF\nIt's data",
+            "cat <<EOF\nIt's data\nEOF",
+            "cat <<'EOF'\nIt's data",
+            "cat <<EOF;<<OTHER\nIt's first\nEOF\nIt's second",
+            "cat <<-EOF\n\tIt's data\n\tEOF",
+        )
+        suffix = "\nresult=$?; printf 'status=%s context=%s\\n' \"$result\" \"${HARNESS_HOOKS_COMMAND_IDENTITY-unset}\""
+        for shell in ("/bin/bash", "/bin/zsh"):
+            for command in commands:
+                with self.subTest(shell=shell, command=command):
+                    raw = self.run_shell(command, env, shell=shell)
+                    response = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]
+                    rewritten = self.run_shell(response["updatedInput"]["command"] + suffix, env, shell=shell)
+                    self.assertEqual(rewritten.returncode, 0, rewritten.stderr)
+                    self.assertEqual(rewritten.stdout, raw.stdout + f"status={raw.returncode} context=unset\n")
+
+    def test_heredoc_does_not_duplicate_err_traps(self):
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        for command in ("trap 'echo trapped' ERR; cat <<EOF\nIt's data\nEOF\nfalse",
+                        "trap 'echo trapped' ERR; false <<EOF\nIt's data"):
+            for shell in ("/bin/bash", "/bin/zsh"):
+                with self.subTest(shell=shell, command=command):
+                    raw = self.run_shell(command, env, shell=shell)
+                    response = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]
+                    rewritten = self.run_shell(response["updatedInput"]["command"], env, shell=shell)
+                    self.assertEqual((rewritten.returncode, rewritten.stdout), (raw.returncode, raw.stdout))
 
     def test_approved_script_rewrite_carries_identity_and_approval_once(self):
         self.actor()
