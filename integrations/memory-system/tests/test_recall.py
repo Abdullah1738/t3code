@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, SRC)
@@ -97,8 +98,38 @@ def build_fixture(root: Path) -> Fixture:
     oc.execute("INSERT INTO session_v2 VALUES ('ses_resume_new', NULL, '/Users/ardud/crpko', 'Risk cell lane (resume)', NULL)")
     oc.execute("INSERT INTO session_v2 VALUES ('ses_migrated', NULL, '/x', 'old', ?)",
                (json.dumps({"migration": {"sourceSessionID": "019e-kafka"}}),))
+    oc.execute("INSERT INTO session_v2 VALUES ('ses_migration_new', NULL, '/y', 'renamed', ?)",
+               (json.dumps({"migration": {"sourceSessionID": "ses_unmapped_old"}}),))
+    oc.execute("INSERT INTO session_v2 VALUES ('ses_unmapped_old', NULL, '/y', 'previous title', NULL)")
     oc.commit()
     oc.close()
+    state = sqlite3.connect(root / "statev2.sqlite")
+    state.executescript("""
+      CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
+      CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT);
+      CREATE INDEX provider_thread ON orchestration_v2_projection_provider_threads(thread_id);
+      CREATE TABLE orchestration_v2_projection_subagents (thread_id TEXT, child_thread_id TEXT, payload_json TEXT);
+      CREATE INDEX subagent_thread ON orchestration_v2_projection_subagents(thread_id);
+      CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
+    """)
+    for i in range(101):
+        tid = f"thread-{i}"
+        parent = f"thread-{i-1}" if i else None
+        state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                      (tid, json.dumps({"lineage": {"rootThreadId": "thread-0", "parentThreadId": parent}})))
+        state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+                      (tid, json.dumps({"nativeThreadRef": {"nativeId": f"native-{i}"}})))
+        if parent:
+            state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+                          (parent, tid, json.dumps({"nativeTaskRef": {"nativeId": f"agent-{i}"}})))
+    state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                  ("thread-other", json.dumps({"lineage": {"rootThreadId": "thread-other"}})))
+    state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+                  ("thread-other", json.dumps({"nativeThreadRef": {"nativeId": "other-native"}})))
+    state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_resume_old", "thread-0"))
+    state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_migration_new", "thread-other"))
+    state.commit()
+    state.close()
     return f
 
 
@@ -108,14 +139,19 @@ class RecallTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         root = Path(cls.tmp.name)
         build_fixture(root)
-        cls.saved = (rc.MEM_DB, rc.CATALOG_DB, rc.OPENCODE_DB)
+        cls.saved = (rc.MEM_DB, rc.CATALOG_DB, rc.OPENCODE_DB, rc.STATE_DB)
         rc.MEM_DB, rc.CATALOG_DB, rc.OPENCODE_DB = root / "memory.db", root / "catalog.db", root / "opencode.db"
+        rc.STATE_DB = root / "statev2.sqlite"
         rc._local = threading.local()
         rc.refresh_catalog(full=True)
 
     @classmethod
     def tearDownClass(cls):
-        rc.MEM_DB, rc.CATALOG_DB, rc.OPENCODE_DB = cls.saved
+        for key in ("mem", "catalog_r", "catalog_w", "opencode"):
+            con = getattr(rc._local, key, None)
+            if con is not None:
+                con.close()
+        rc.MEM_DB, rc.CATALOG_DB, rc.OPENCODE_DB, rc.STATE_DB = cls.saved
         rc._local = threading.local()
         cls.tmp.cleanup()
 
@@ -314,6 +350,113 @@ class RecallTest(unittest.TestCase):
         self.assertIn("ses_resume_old", rc.lineage("ses_resume_new"))
         self.assertEqual(rc.base_title("Crpko risk3 cell (pbv2 Risk) (resume) (resume c)"), "Crpko risk3 cell (pbv2 Risk)")
 
+    def test_mapped_tree_excludes_old_alias_deep_children_and_siblings(self):
+        con = sqlite3.connect(rc.MEM_DB)
+        for n, sid in enumerate(("ses_resume_old", "native-100", "native-30", "other-native")):
+            con.execute(
+                "INSERT INTO episodic_events(source, session_id, turn_id, timestamp, speaker, content, content_type, metadata_json) "
+                "VALUES ('opencode',?,?,?,'user','quixotic pangolin investigation','text',?)",
+                (sid, f"lineage{n}", NOW - (60 * DAY if n == 0 else 0),
+                 json.dumps({"title": "Same misleading title", "cwd": "/same"})),
+            )
+        con.commit()
+        con.close()
+        excluded = rc.lineage_exclusions("native-50")
+        self.assertTrue({"ses_resume_old", "native-100", "native-30", "thread-0", "native-0:agent:agent-1"} <= excluded)
+        self.assertNotIn("other-native", excluded)
+        found = self.ids(rc.search("quixotic pangolin", exclude_sessions=excluded))
+        self.assertEqual(found, ["other-native"])
+
+    def test_exclusions_are_not_capped_at_two_thousand(self):
+        excluded = {f"unrelated-{i:05}" for i in range(3000)} | {"ses_parent1", "ses_child1"}
+        self.assertEqual(self.ids(rc.search("negative balance", exclude_sessions=excluded)), [])
+        self.assertEqual(self.ids(rc.search("liquidation-engine", include_tools=True, exclude_sessions=excluded)), [])
+
+    def test_unmapped_old_alias_finds_new_binding_and_its_tree(self):
+        excluded = rc.lineage_exclusions("ses_unmapped_old")
+        self.assertIn("ses_migration_new", excluded)
+        self.assertIn("other-native", excluded)
+
+    def test_unknown_caller_never_auto_injects(self):
+        with patch.object(ra, "_recall_note") as model:
+            result = ra.inject("Please investigate the pangolin regression", session_id="unknown-thread")
+            self.assertEqual(result["skipped"], "unknown-caller")
+            self.assertIsNone(result["note"])
+            model.assert_not_called()
+
+    def test_known_thread_excludes_explicit_catalog_children(self):
+        con = sqlite3.connect(rc.CATALOG_DB)
+        con.execute("INSERT INTO sessions(session_id,source,parent_id) VALUES('muse-child','muse','native-50')")
+        con.commit()
+        con.close()
+        self.assertIn("muse-child", rc.lineage_exclusions("thread-0"))
+
+    def test_unavailable_state_fails_closed_even_with_alias_row(self):
+        con = sqlite3.connect(rc.MEM_DB)
+        con.execute("CREATE TABLE IF NOT EXISTS thread_aliases(canonical_thread_id,root_thread_id,native_id,agent_id)")
+        con.execute("INSERT INTO thread_aliases VALUES ('thread-0','thread-0','native-0',NULL)")
+        con.commit()
+        con.close()
+        with patch.object(rc, "STATE_DB", rc.STATE_DB.parent / "missing.sqlite"):
+            with self.assertRaises(rc.UnknownCaller):
+                rc.lineage_exclusions("native-0")
+
+    def test_invalid_agent_and_driver_fail_closed(self):
+        with self.assertRaises(rc.UnknownCaller):
+            ra.lineage_of(None, None, caller_thread="thread-0", caller_native="native-0", caller_agent="bad-agent")
+        with self.assertRaises(rc.UnknownCaller):
+            ra.lineage_of(None, None, caller_thread="thread-0", caller_native="native-0", caller_driver="bad-driver")
+
+    def test_anonymous_cli_preview_does_not_open_automatic_injection(self):
+        with patch.object(ra, "_recall_note", return_value={"note": "preview"}) as note:
+            self.assertEqual(ra.inject("Investigate the pangolin regression", anonymous_preview=True)["note"], "preview")
+            self.assertEqual(note.call_args.kwargs["exclude"], set())
+            self.assertEqual(ra.inject("Investigate the pangolin regression")["skipped"], "unknown-caller")
+            self.assertEqual(ra.inject("Investigate the pangolin regression", session_id="missing",
+                                       anonymous_preview=True)["skipped"], "unknown-caller")
+
+    def test_stale_root_fork_is_still_excluded(self):
+        con = sqlite3.connect(rc.STATE_DB)
+        con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                    ("fork-child", json.dumps({"lineage": {"parentThreadId": "thread-0"}})))
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+                    ("fork-child", json.dumps({"nativeThreadRef": {"nativeId": "native-fork"}})))
+        con.commit()
+        con.close()
+        self.assertIn("native-fork", rc.lineage_exclusions("thread-0"))
+
+    def test_mcp_headers_are_request_scoped(self):
+        try:
+            import httpx  # noqa: F401
+            import recall_server as server
+            from starlette.testclient import TestClient
+        except ImportError:
+            self.skipTest("recall server dependencies not installed in this Python")
+        app = server.server.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True,
+                                                 host="127.0.0.1")
+        headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "recall_search", "arguments": {"query": "risk lane walrus"}}}
+        with TestClient(server._no_standalone_sse(app), base_url="http://127.0.0.1:18765") as client:
+            anonymous = client.post("/mcp", headers=headers, json=request)
+            own = client.post("/mcp", headers=dict(headers, **{"X-Robob-Thread": "thread-0"}), json=request)
+            unknown = client.post("/mcp", headers=dict(headers, **{"X-Robob-Thread": "no-such-thread"}), json=request)
+            empty = client.post("/mcp", headers=dict(headers, **{"X-Robob-Thread": ""}), json=request)
+            again = client.post("/mcp", headers=headers, json=request)
+            with patch.object(server.ra, "ask", return_value={"answer": "ok", "sources": []}) as ask:
+                ask_request = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "recall_ask", "arguments": {"question": "risk lane?"}}}
+                result = client.post("/mcp", headers=dict(headers, **{"X-Robob-Thread": "thread-0"}), json=ask_request)
+                self.assertEqual(result.status_code, 200)
+                self.assertIn("ses_resume_old", ask.call_args.kwargs["exclude"])
+                client.post("/mcp", headers=headers, json=ask_request)
+                self.assertEqual(ask.call_args.kwargs["exclude"], [])
+        self.assertIn("ses_resume_old", anonymous.text)
+        self.assertNotIn("ses_resume_old", own.text)
+        self.assertIn("caller identity is unknown", unknown.text)
+        self.assertIn("empty caller identity", empty.text)
+        self.assertIn("ses_resume_old", again.text)
+
     def test_view_formats(self):
         import recall_cli as cli
 
@@ -401,8 +544,9 @@ class GateTest(unittest.TestCase):
         orig = ra.llm
         ra.llm = fake
         try:
-            ra.work_check("x " * 2000, "agent: step one two three four five six\n" * 200,
-                          errors=["head of a long error " + "y" * 400 + " ECONNREFUSED 127.0.0.1:5432"])
+            with patch.object(ra, "lineage_of", return_value=set()):
+                ra.work_check("x " * 2000, "agent: step one two three four five six\n" * 200,
+                              errors=["head of a long error " + "y" * 400 + " ECONNREFUSED 127.0.0.1:5432"])
         finally:
             ra.llm = orig
         plan_user = seen[0]

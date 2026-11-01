@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 import urllib.error
 import urllib.request
@@ -480,9 +481,27 @@ NOTE_HEAD = {
 }
 
 
-def lineage_of(session_id: str | None, parent_id: str | None) -> set[str]:
+def lineage_of(session_id: str | None, parent_id: str | None, *, caller_thread: str | None = None,
+               caller_native: str | None = None, caller_driver: str | None = None,
+               caller_agent: str | None = None) -> set[str]:
     """This thread, its subagents and its earlier (resumed) incarnations are not memory."""
-    return set(rc.lineage(session_id)) | set(rc.lineage(parent_id)) | {x for x in (session_id, parent_id) if x}
+    ids = [x for x in (caller_thread, caller_native, session_id, parent_id) if x]
+    if not ids:
+        raise rc.UnknownCaller("caller identity is missing")
+    if caller_driver:
+        try:
+            rc.validate_driver(caller_native or caller_thread, caller_driver)
+        except (sqlite3.Error, TypeError):
+            raise rc.UnknownCaller("caller driver could not be verified") from None
+    excluded = set()
+    if caller_agent and not caller_native:
+        raise rc.UnknownCaller("caller agent has no native session")
+    for ident in ids:
+        if ident not in excluded:
+            excluded.update(rc.lineage_exclusions(ident))
+    if caller_agent and f"{caller_native}:agent:{caller_agent}" not in excluded:
+        raise rc.UnknownCaller("caller agent is unknown")
+    return excluded
 
 
 def _recall_note(
@@ -585,11 +604,24 @@ def inject(
     already: list[str] | None = None,
     known: list[str] | None = None,
     timeout: float = 12,
+    caller_thread: str | None = None,
+    caller_native: str | None = None,
+    caller_driver: str | None = None,
+    caller_agent: str | None = None,
+    anonymous_preview: bool = False,
 ) -> dict:
     """Check a new user prompt against past sessions."""
     reason = should_skip(prompt)
     if reason:
         return {"note": None, "skipped": reason, "sources": []}
+    if anonymous_preview and not any((session_id, parent_id, caller_thread, caller_native, caller_driver, caller_agent)):
+        exclude = set()
+    else:
+        try:
+            exclude = lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
+                                 caller_driver=caller_driver, caller_agent=caller_agent)
+        except rc.UnknownCaller:
+            return {"note": None, "skipped": "unknown-caller", "sources": []}
     text = rc.clean_text(prompt, "user")[:6000]
     return _recall_note(
         kind="prompt",
@@ -598,7 +630,7 @@ def inject(
         raw_text=text,
         gate_system=GATE_SYSTEM,
         gate_msg=f"<message>\n{neutral(text[:3000])}\n</message>",
-        exclude=lineage_of(session_id, parent_id),
+        exclude=exclude,
         cwd=cwd,
         context=context,
         already=already,
@@ -623,12 +655,21 @@ def work_check(
     cwd: str | None = None,
     already: list[str] | None = None,
     timeout: float = 12,
+    caller_thread: str | None = None,
+    caller_native: str | None = None,
+    caller_driver: str | None = None,
+    caller_agent: str | None = None,
 ) -> dict:
     """Mid-task check: given what the agent is doing right now, is there something from past sessions it should know?"""
     task_text = rc.clean_text(task or "", "user")
     steps = rc.clean_text(activity or "", "assistant")
     if len(rc.words_of(steps, drop_meta=False)) < 6:
         return {"note": None, "skipped": "thin", "sources": []}
+    try:
+        exclude = lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
+                             caller_driver=caller_driver, caller_agent=caller_agent)
+    except rc.UnknownCaller:
+        return {"note": None, "skipped": "unknown-caller", "sources": []}
     task_part = neutral(task_text[:1500]) or "(not given)"
     steps_part = neutral(steps[-4500:])
     if errors is None:
@@ -652,7 +693,7 @@ def work_check(
         raw_text=raw,
         gate_system=WORK_GATE_SYSTEM,
         gate_msg=gate_msg,
-        exclude=lineage_of(session_id, parent_id),
+        exclude=exclude,
         cwd=cwd,
         context="",
         already=already,
