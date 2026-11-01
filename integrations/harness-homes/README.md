@@ -21,8 +21,9 @@ instance's environment, and OAuth state stays in the home it was created in.
 - `vendor/codex-models-0.166.0.json`: Codex's model catalog at rust-v0.166.0
   (Apache-2.0). `vendor/README.md` has the URL and sha256.
 - `overlays/claude.md`, `overlays/codex.md`, `overlays/codex-cu.md`:
-  per-harness instructions. The `codex-cu` overlay must be owner-approved before
-  it is placed in the package; generation fails closed if it is missing or empty.
+  per-harness instructions. `codex-cu` gets the shared Codex overlay first,
+  then its own draft overlay; generation fails if the latter is missing or empty.
+  Its deployment still requires owner approval.
 - `install.zsh`: copies the package to `~/.local/share/harness-homes`, generates,
   checks. `--check` only checks. `--with-agent` also loads the LaunchAgent.
 - `launchd/com.ardud.harness-homes.plist`: runs `generate` every 5 minutes so
@@ -36,23 +37,19 @@ cd integrations/harness-homes
 /opt/homebrew/bin/python3 tests/test_generate_homes.py
 ```
 
-Before approval, an isolated proof can supply the draft explicitly, without
-copying it into the package or live homes. Use a fresh temporary root outside the
-configured homes and the same source for both commands:
+To verify the packaged draft without touching live homes, use a fresh temporary
+root outside the configured homes:
 
 ```sh
-/opt/homebrew/bin/python3 generate_homes.py generate --home-root /path/to/isolated-homes \
-  --codex-cu-overlay /Volumes/ExternalSSD/t3code-fork/tmp/robob-board/computer-use/integrations/harness-homes/overlays/codex-cu.md
-/opt/homebrew/bin/python3 generate_homes.py check --home-root /path/to/isolated-homes \
-  --codex-cu-overlay /Volumes/ExternalSSD/t3code-fork/tmp/robob-board/computer-use/integrations/harness-homes/overlays/codex-cu.md
+/opt/homebrew/bin/python3 generate_homes.py generate --home-root /path/to/isolated-homes
+/opt/homebrew/bin/python3 generate_homes.py check --home-root /path/to/isolated-homes
 ```
 
-The draft override is rejected without `--home-root` and for a root overlapping
-any configured home. It is not an approval or a production install mechanism.
 The production model is `gpt-6.1-terra`; it depends on the plain-ID 9router combo
 from #226. Until that is live, an isolated Codex CLI proof can pass
 `-m cx/gpt-6.1-terra`; the CU catalog carries the same upstream metadata and
-1,050,000/450,000 limits for both IDs.
+1,050,000/450,000 limits for both IDs. Activation also needs the pinned binary
+from #249.
 
 Deploy with `integrations/deploy.zsh harness-homes [--with-agent]`. Nothing uses
 the homes until the release; the evaluator installs them.
@@ -72,5 +69,6 @@ the homes until the release; the evaluator installs them.
   `node_repl` is exclusive to that home. Codex has `computer_use=false`;
   Claude denies its computer and node-repl tool names.
 - Hook manifest entries apply to all harnesses by default. An optional
-  `harnesses` list restricts them; `codex` also selects `codex-cu`.
+  `harness` string (`claude` or `codex`) restricts them; `codex` also selects
+  `codex-cu`.
 - `t3-code` is never in the manifest: Robob injects it per thread.

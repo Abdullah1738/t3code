@@ -61,19 +61,6 @@ def resolve_homes(manifest: dict, home_root: str | None) -> dict[str, str]:
     return resolved
 
 
-def guard_overlay_override(manifest: dict, homes: dict[str, str], home_root: str | None,
-                           overlay_override: str | None) -> None:
-    if not overlay_override:
-        return
-    if not home_root:
-        raise HomeError("--codex-cu-overlay is only permitted with an isolated --home-root")
-    live_homes = [os.path.realpath(expand(p)) for p in manifest["homes"].values()]
-    for home in homes.values():
-        real_home = os.path.realpath(home)
-        if any(os.path.commonpath((real_home, live)) in (real_home, live) for live in live_homes):
-            raise HomeError("--codex-cu-overlay cannot target a configured live home")
-
-
 def read_overlay(path: Path, *, require_content: bool = False) -> bytes:
     try:
         overlay = path.read_bytes()
@@ -252,8 +239,8 @@ def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) 
 
 def hooks_for_harness(hooks: list[dict], harness: str) -> list[dict]:
     # codex-cu is a Codex harness, so Codex-scoped hooks follow it as well.
-    selectors = {harness, "codex"} if harness == "codex-cu" else {harness}
-    return [hook for hook in hooks if "harnesses" not in hook or selectors.intersection(hook["harnesses"])]
+    selector = "codex" if harness == "codex-cu" else harness
+    return [hook for hook in hooks if hook.get("harness", selector) == selector]
 
 
 def claude_hooks(hooks: list[dict]) -> dict:
@@ -514,25 +501,24 @@ def validate_manifest(manifest: dict) -> None:
         if ("url" in s) == ("command" in s):
             raise HomeError(f"mcpServers.{s['id']} needs exactly one of url or command")
     for h in manifest["hooks"]:
-        if "harnesses" in h and (not isinstance(h["harnesses"], list)
-                                  or not h["harnesses"]
-                                  or any(name not in HARNESSES for name in h["harnesses"])):
-            raise HomeError("hook harnesses must be a non-empty list of known harness names")
+        if "harnesses" in h:
+            raise HomeError("hook harnesses is no longer supported; use harness")
+        if "harness" in h and h["harness"] not in ("claude", "codex"):
+            raise HomeError("hook harness must be claude or codex")
         if h["event"] not in HOOK_EVENTS:
             raise HomeError(f"unknown hook event {h['event']!r}")
         if not os.path.isabs(h["command"]):
             raise HomeError(f"hook command must be an absolute path: {h['command']}")
 
 
-def build(manifest: dict, homes: dict[str, str], overlay_override: str | None = None) -> dict:
+def build(manifest: dict, homes: dict[str, str]) -> dict:
     """Compute every generated file in memory. Reads only; writes nothing."""
     canonical_path = expand(manifest["instructions"]["canonical"])
     canonical = read_bytes(canonical_path)
     if canonical is None:
         raise HomeError(f"canonical AGENTS.md missing: {canonical_path}")
     overlays = {
-        name: read_overlay(Path(overlay_override) if name == "codex-cu" and overlay_override
-                           else PKG / manifest["instructions"]["overlays"][name],
+        name: read_overlay(PKG / manifest["instructions"]["overlays"][name],
                            require_content=name == "codex-cu")
         for name in HARNESSES
     }
@@ -565,7 +551,10 @@ def build(manifest: dict, homes: dict[str, str], overlay_override: str | None = 
                 raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
             existing_state = (prior.get("hooks") or {}).get("state")
         files[config_path] = toml_dump(codex_config(manifest, home, existing_state, name)).encode("utf-8")
-        files[os.path.join(home, "AGENTS.md")] = canonical + b"\n\n" + overlays[name]
+        instructions = canonical + b"\n\n" + overlays["codex"]
+        if name == "codex-cu":
+            instructions += b"\n\n" + overlays["codex-cu"]
+        files[os.path.join(home, "AGENTS.md")] = instructions
         files[os.path.join(home, "models.json")] = models_json(
             PKG / manifest["codexModels"]["catalogSource"], manifest, cu=name == "codex-cu")
         hooks = hooks_for_harness(manifest["hooks"], name)
@@ -573,13 +562,12 @@ def build(manifest: dict, homes: dict[str, str], overlay_override: str | None = 
     return files
 
 
-def plan_all(home_root: str | None, overlay_override: str | None = None) -> tuple[dict, dict, list, dict]:
+def plan_all(home_root: str | None) -> tuple[dict, dict, list, dict]:
     manifest = load_manifest()
     validate_manifest(manifest)
     homes = resolve_homes(manifest, home_root)
-    guard_overlay_override(manifest, homes, home_root, overlay_override)
     skills = discover_skills([expand(r) for r in manifest["skillRoots"]])
-    files = build(manifest, homes, overlay_override)
+    files = build(manifest, homes)
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
             raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
@@ -642,8 +630,8 @@ class Writer:
             os.unlink(path)
 
 
-def generate(home_root: str | None, dry_run: bool, overlay_override: str | None = None) -> int:
-    manifest, homes, skills, files = plan_all(home_root, overlay_override)
+def generate(home_root: str | None, dry_run: bool) -> int:
+    manifest, homes, skills, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
     guard_outputs([*homes.values(), *farms, *files])
     roots = [expand(r) for r in manifest["skillRoots"]]
@@ -667,8 +655,8 @@ def generate(home_root: str | None, dry_run: bool, overlay_override: str | None 
 
 # ---------- check ----------
 
-def check(home_root: str | None, overlay_override: str | None = None) -> int:
-    manifest, homes, skills, files = plan_all(home_root, overlay_override)
+def check(home_root: str | None) -> int:
+    manifest, homes, skills, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
 
@@ -733,15 +721,13 @@ def main(argv: list[str] | None = None) -> int:
     gen = sub.add_parser("generate", help="write the homes")
     gen.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
-    gen.add_argument("--codex-cu-overlay", help="draft overlay for an isolated --home-root only")
     chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
-    chk.add_argument("--codex-cu-overlay", help="draft overlay for an isolated --home-root only")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
-            return generate(args.home_root, args.dry_run, args.codex_cu_overlay)
-        return check(args.home_root, args.codex_cu_overlay)
+            return generate(args.home_root, args.dry_run)
+        return check(args.home_root)
     except HomeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -35,6 +35,8 @@ class HarnessTestCase(unittest.TestCase):
         self.make_skill("cat/beta", None, name="beta")
         self.make_skill("cat/deep/gamma", "gamma")
         self.root = self.tmp / "homes"
+        self.codex_overlay = self.tmp / "codex.md"
+        write(self.codex_overlay, "# Shared Codex fixture\nShared instructions.\n")
         self.cu_overlay = self.tmp / "codex-cu-draft.md"
         write(self.cu_overlay, "# CU draft fixture\nUse the desktop lease.\n")
         self.env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
@@ -58,6 +60,7 @@ class HarnessTestCase(unittest.TestCase):
         m = json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
         m["skillRoots"] = [str(self.skill_root)]
         m["instructions"]["canonical"] = str(self.canonical)
+        m["instructions"]["overlays"]["codex"] = str(self.codex_overlay)
         m["instructions"]["overlays"]["codex-cu"] = str(self.cu_overlay)
         return m
 
@@ -147,7 +150,7 @@ class GenerateTests(HarnessTestCase):
             {"type": "command", "command": "/usr/bin/true", "timeout": 5}]}]}})
 
         agents = (self.codex / "AGENTS.md").read_bytes()
-        self.assertEqual(agents, self.canonical.read_bytes() + b"\n\n" + (PKG / "overlays/codex.md").read_bytes())
+        self.assertEqual(agents, self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes())
 
         models = json.loads((self.codex / "models.json").read_text())
         by_slug = {x["slug"]: x for x in models["models"]}
@@ -399,8 +402,8 @@ class GenerateTests(HarnessTestCase):
         m = self.manifest()
         m["hooks"] = [
             {"event": "PreToolUse", "matcher": "Bash", "command": "/bin/echo", "timeoutSec": 3},
-            {"event": "SessionStart", "command": "/usr/bin/true", "timeoutSec": 4, "harnesses": ["codex"]},
-            {"event": "PostToolUse", "command": "/bin/echo", "timeoutSec": 5, "harnesses": ["claude"]},
+            {"event": "SessionStart", "command": "/usr/bin/true", "timeoutSec": 4, "harness": "codex"},
+            {"event": "PostToolUse", "command": "/bin/echo", "timeoutSec": 5, "harness": "claude"},
         ]
         self.run_gen(m)
         base = tomllib.loads((self.codex / "config.toml").read_text())
@@ -450,7 +453,8 @@ class GenerateTests(HarnessTestCase):
                               "beta": str(self.skill_root / "cat/beta"),
                               "gamma": str(self.skill_root / "cat/deep/gamma")})
         self.assertEqual((self.codex_cu / "AGENTS.md").read_bytes(),
-                         self.canonical.read_bytes() + b"\n\n" + self.cu_overlay.read_bytes())
+                         self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes()
+                         + b"\n\n" + self.cu_overlay.read_bytes())
         rc, output = self.run_check(m)
         self.assertEqual(rc, 0, output)
 
@@ -481,6 +485,7 @@ class GenerateTests(HarnessTestCase):
             ("CU hooks", self.codex_cu, "hooks.json", '"hooks": {}', '"hooks": {"PreToolUse": []}'),
             ("Claude deny", self.claude, "settings.json", '"Computer"', '"Other"'),
             ("Claude MCP", self.claude, ".claude.json", '"https://mcp.betterstack.com"', '"http://example.invalid"'),
+            ("CU shared instructions", self.codex_cu, "AGENTS.md", "Shared instructions.", "Lost instructions."),
             ("CU instructions", self.codex_cu, "AGENTS.md", "desktop lease", "no lease"),
         )
         for description, home, filename, original, corrupted in cases:
@@ -497,17 +502,25 @@ class GenerateTests(HarnessTestCase):
     def test_hooks_are_selected_by_harness_not_command_name(self) -> None:
         m = self.manifest()
         m["hooks"] = [
-            {"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 1, "harnesses": ["codex-cu"]},
-            {"event": "SessionStart", "command": "/bin/echo", "timeoutSec": 2, "harnesses": ["codex"]},
-            {"event": "UserPromptSubmit", "command": "/bin/echo", "timeoutSec": 3, "harnesses": ["claude"]},
+            {"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 1},
+            {"event": "SessionStart", "command": "/bin/echo", "timeoutSec": 2, "harness": "codex"},
+            {"event": "UserPromptSubmit", "command": "/bin/echo", "timeoutSec": 3, "harness": "claude"},
         ]
         self.run_gen(m)
-        self.assertEqual(set(json.loads((self.claude / "settings.json").read_text())["hooks"]), {"UserPromptSubmit"})
-        self.assertEqual(set(json.loads((self.codex / "hooks.json").read_text())["hooks"]), {"SessionStart"})
+        self.assertEqual(set(json.loads((self.claude / "settings.json").read_text())["hooks"]),
+                         {"PreToolUse", "UserPromptSubmit"})
+        self.assertEqual(set(json.loads((self.codex / "hooks.json").read_text())["hooks"]),
+                         {"PreToolUse", "SessionStart"})
         self.assertEqual(set(json.loads((self.codex_cu / "hooks.json").read_text())["hooks"]),
                          {"PreToolUse", "SessionStart"})
         self.assertEqual(self.run_check(m)[0], 0)
-        m["hooks"][0]["harnesses"] = ["unknown"]
+        for bad in ("unknown", "codex-cu", ["codex"], None, True, {}):
+            with self.subTest(bad=bad):
+                m["hooks"][0]["harness"] = bad
+                with self.assertRaises(gh.HomeError):
+                    gh.validate_manifest(m)
+        del m["hooks"][0]["harness"]
+        m["hooks"][0]["harnesses"] = ["codex"]
         with self.assertRaises(gh.HomeError):
             gh.validate_manifest(m)
 
@@ -526,25 +539,35 @@ class GenerateTests(HarnessTestCase):
                 self.assertIn("overlay", errors.getvalue())
                 self.assertFalse(self.root.exists())
 
-    def test_draft_override_requires_isolated_root_and_check_uses_same_source(self) -> None:
+    def test_manifest_cu_overlay_is_used_by_generate_and_check(self) -> None:
         m = self.manifest()
-        m["instructions"]["overlays"]["codex-cu"] = str(self.tmp / "absent-approved.md")
-        with mock.patch.object(gh, "load_manifest", return_value=m):
-            with contextlib.redirect_stderr(io.StringIO()):
-                rc = gh.main(["generate", "--codex-cu-overlay", str(self.cu_overlay)])
-            self.assertEqual(rc, 1)
-            with contextlib.redirect_stdout(io.StringIO()):
-                rc = gh.main(["generate", "--home-root", str(self.root), "--codex-cu-overlay", str(self.cu_overlay)])
-            self.assertEqual(rc, 0)
-            with contextlib.redirect_stdout(io.StringIO()):
-                rc = gh.main(["check", "--home-root", str(self.root), "--codex-cu-overlay", str(self.cu_overlay)])
-            self.assertEqual(rc, 0)
-            live_root = self.tmp / "live-homes"
-            m["homes"] = {name: str(live_root / name) for name in gh.HARNESSES}
-            with contextlib.redirect_stderr(io.StringIO()):
-                rc = gh.main(["generate", "--home-root", str(live_root), "--codex-cu-overlay", str(self.cu_overlay)])
-            self.assertEqual(rc, 1)
-            self.assertFalse(live_root.exists())
+        self.run_gen(m)
+        self.assertEqual(self.run_check(m)[0], 0)
+        self.cu_overlay.write_text("# Changed CU fixture\n")
+        rc, output = self.run_check(m)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("AGENTS.md", output)
+        self.run_gen(m)
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_packaged_cu_overlay_builds_without_override(self) -> None:
+        m = self.manifest()
+        m["instructions"]["overlays"]["codex-cu"] = "overlays/codex-cu.md"
+        self.run_gen(m)
+        self.assertEqual((self.codex_cu / "AGENTS.md").read_bytes(),
+                         self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes()
+                         + b"\n\n" + (PKG / "overlays/codex-cu.md").read_bytes())
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_shared_codex_overlay_changes_require_both_homes_to_regenerate(self) -> None:
+        self.run_gen()
+        self.codex_overlay.write_text("# Changed shared Codex instructions\n")
+        rc, output = self.run_check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn(str(self.codex / "AGENTS.md"), output)
+        self.assertIn(str(self.codex_cu / "AGENTS.md"), output)
+        self.run_gen()
+        self.assertEqual(self.run_check()[0], 0)
 
     def test_cu_symlink_into_personal_home_refuses_all_writes(self) -> None:
         personal = self.home / ".codex/skills"
@@ -586,6 +609,19 @@ class GenerateTests(HarnessTestCase):
         for home in (self.codex, self.codex_cu):
             self.assertEqual(json.loads((home / "hooks.json").read_text()), {"hooks": {}})
         self.assertEqual(self.run_check()[0], 0)
+
+    def test_rescoping_hook_removes_it_from_both_codex_homes(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [{"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 3,
+                       "harness": "codex"}]
+        self.run_gen(m)
+        m["hooks"][0]["harness"] = "claude"
+        self.run_gen(m)
+        self.assertIn("PreToolUse", json.loads((self.claude / "settings.json").read_text())["hooks"])
+        for home in (self.codex, self.codex_cu):
+            self.assertEqual(json.loads((home / "hooks.json").read_text()), {"hooks": {}})
+            self.assertNotIn("hooks", tomllib.loads((home / "config.toml").read_text()))
+        self.assertEqual(self.run_check(m)[0], 0)
 
     def test_secret_in_cu_overlay_refuses_all_writes(self) -> None:
         self.cu_overlay.write_text("draft sk-abcdefghijklmnop\n")
