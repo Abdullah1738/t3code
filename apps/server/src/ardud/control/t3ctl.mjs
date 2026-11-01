@@ -33,11 +33,9 @@ const HELP = `t3ctl <command> [options]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
   desktop-lease status
-  desktop-lease acquire --root-thread ID --child-thread ID --task ID --scope TARGET --mode native|cua-driver
-  desktop-lease heartbeat|stop|release --ticket TICKET
-  desktop-lease call-start --ticket TICKET --call-id ID
-  desktop-lease call-end --ticket TICKET --call-id ID --outcome completed|uncertain
-  desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain; only after independently proving quiescence
+  desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
+  desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
+  desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
@@ -81,13 +79,11 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     unsettle: { type: "boolean" },
     thread: { type: "string" },
     session: { type: "string" },
-    "root-thread": { type: "string" },
-    "child-thread": { type: "string" },
+    "native-id": { type: "string" },
+    "agent-id": { type: "string" },
     task: { type: "string" },
     scope: { type: "string" },
     ticket: { type: "string" },
-    "call-id": { type: "string" },
-    outcome: { type: "string" },
     evidence: { type: "string" },
     types: { type: "string" },
     after: { type: "string" },
@@ -137,22 +133,38 @@ async function main() {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";
       if (action === "status") return print(await client.request("GET", path));
+      if (action === "reconcile") return print(await client.request("POST", `${path}/reconcile`, {
+        ticket: need(flags.ticket, "--ticket"),
+        evidence: need(flags.evidence, "--evidence"),
+      }));
+      if (!["acquire", "heartbeat", "release"].includes(action)) {
+        console.error(`unknown desktop-lease action ${action}`);
+        process.exit(2);
+      }
+      const envCaller = process.env.CODEX_THREAD_ID
+        ? { driver: "codex", nativeId: process.env.CODEX_THREAD_ID }
+        : process.env.OPENCODE_SESSION_ID
+          ? { driver: "opencode", nativeId: process.env.OPENCODE_SESSION_ID }
+          : null;
+      const explicit = flags.driver !== undefined || flags["native-id"] !== undefined;
+      const caller = explicit
+        ? { driver: flags.driver, nativeId: flags["native-id"] }
+        : envCaller;
+      if (!caller?.driver || !caller.nativeId) {
+        console.error("no caller identity");
+        process.exit(2);
+      }
+      const identity = { ...caller, ...(flags["agent-id"] ? { agentId: flags["agent-id"] } : {}) };
       if (action === "acquire") return print(await client.request("POST", `${path}/acquire`, {
-        rootThreadId: need(flags["root-thread"], "--root-thread"),
-        childThreadId: need(flags["child-thread"], "--child-thread"),
+        ...identity,
         taskId: need(flags.task, "--task"),
         scope: need(flags.scope, "--scope"),
         mode: need(flags.mode, "--mode"),
       }));
-      if (!["heartbeat", "stop", "release", "call-start", "call-end", "reconcile"].includes(action)) {
-        console.error(`unknown desktop-lease action ${action}`);
-        process.exit(2);
-      }
-      const payload = { ticket: need(flags.ticket, "--ticket") };
-      if (action === "call-start" || action === "call-end") payload.callId = need(flags["call-id"], "--call-id");
-      if (action === "call-end") payload.outcome = need(flags.outcome, "--outcome");
-      if (action === "reconcile") payload.evidence = need(flags.evidence, "--evidence");
-      return print(await client.request("POST", `${path}/${action}`, payload));
+      return print(await client.request("POST", `${path}/${action}`, {
+        ...identity,
+        ticket: need(flags.ticket, "--ticket"),
+      }));
     }
     case "threads": {
       const result = await client.listThreads({
