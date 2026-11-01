@@ -13,7 +13,10 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { mergeSelection, selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import {
+  mergeSelection,
+  selectionEffort,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
 
 /**
  * The coarse state external callers act on:
@@ -114,13 +117,16 @@ export function formatModel(selection: ModelSelection) {
 /**
  * Builds a model selection from the OpenChamber-style `provider/model` string plus
  * an optional reasoning variant (see mergeSelection for the inherit and clear rules).
+ * A conflicting effort comes back as `conflict` rather than a guessed selection.
  */
 export function modelSelectionFrom(input: {
   readonly model?: string | undefined;
   readonly variant?: string | null | undefined;
   readonly instanceId?: string | undefined;
   readonly base: ModelSelection;
-}): ModelSelection {
+}):
+  | { readonly kind: "selection"; readonly selection: ModelSelection }
+  | { readonly kind: "conflict"; readonly reason: string } {
   return mergeSelection(input.base, {
     ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),

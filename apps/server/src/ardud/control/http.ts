@@ -108,6 +108,16 @@ const STATUS: Record<ControlErrorCode, number> = {
 
 const fail = (code: ControlErrorCode, message: string) => new ControlError({ code, message });
 
+/** A merged selection, or the conflict as a 400: a stale effort is never silently picked. */
+const selectionOrFail = (
+  result:
+    | { readonly kind: "selection"; readonly selection: ModelSelection }
+    | { readonly kind: "conflict"; readonly reason: string },
+) =>
+  result.kind === "selection"
+    ? Effect.succeed(result.selection)
+    : Effect.fail(fail("invalid_request", result.reason));
+
 const errorDetail = (cause: unknown): string =>
   userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
 
@@ -708,12 +718,14 @@ const makeRoutes = Effect.gen(function* () {
     if (base === null && body.model === undefined) {
       return yield* fail("invalid_request", "No default model is configured; pass model.");
     }
-    const modelSelection = modelSelectionFrom({
-      model: body.model,
-      variant: body.variant,
-      instanceId: body.providerInstanceId,
-      base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
-    });
+    const modelSelection = yield* selectionOrFail(
+      modelSelectionFrom({
+        model: body.model,
+        variant: body.variant,
+        instanceId: body.providerInstanceId,
+        base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
+      }),
+    );
     const commandId = yield* commandIdFor("thread", body.clientRequestId);
     const threadId = ThreadId.make(commandId);
     const prompt = body.prompt?.trim() ?? "";
@@ -957,11 +969,13 @@ const makeRoutes = Effect.gen(function* () {
     const modelSelection =
       body.model === undefined && body.variant === undefined
         ? undefined
-        : modelSelectionFrom({
-            model: body.model,
-            variant: body.variant,
-            base: shell.modelSelection,
-          });
+        : yield* selectionOrFail(
+            modelSelectionFrom({
+              model: body.model,
+              variant: body.variant,
+              base: shell.modelSelection,
+            }),
+          );
     const result = yield* startup
       .enqueueCommand(
         ThreadMessageIntake.sendToThread({
@@ -1129,11 +1143,13 @@ const makeRoutes = Effect.gen(function* () {
       });
     }
     if (body.model !== undefined || body.variant !== undefined) {
-      const modelSelection = modelSelectionFrom({
-        model: body.model,
-        variant: body.variant,
-        base: shell.modelSelection,
-      });
+      const modelSelection = yield* selectionOrFail(
+        modelSelectionFrom({
+          model: body.model,
+          variant: body.variant,
+          base: shell.modelSelection,
+        }),
+      );
       yield* dispatch({
         type:
           modelSelection.instanceId === shell.providerInstanceId

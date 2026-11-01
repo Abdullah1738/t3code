@@ -8,6 +8,8 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 
 import { controlEventFromStored } from "./http.ts";
+import { mergeSelection } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+
 import {
   lastAssistantText,
   modelSelectionFrom,
@@ -23,6 +25,12 @@ const selection = (options?: ModelSelection["options"]): ModelSelection =>
     model: "opus/claude-opus-5-5",
     ...(options === undefined ? {} : { options }),
   }) as ModelSelection;
+
+/** The merged selection, or a failing test when the merge reports a conflict. */
+const selectionOf = (result: ReturnType<typeof modelSelectionFrom>): ModelSelection => {
+  if (result.kind !== "selection") throw new Error(`unexpected conflict: ${result.reason}`);
+  return result.selection;
+};
 
 const run = (ordinal: number, status: OrchestrationV2Run["status"]) =>
   ({ id: `run-${ordinal}`, ordinal, status }) as unknown as OrchestrationV2Run;
@@ -67,7 +75,9 @@ describe("state mapping", () => {
 describe("model selection", () => {
   it("parses provider/model with a variant", () => {
     expect(
-      modelSelectionFrom({ model: "opus/gpt-6-astra", variant: "xhigh", base: selection() }),
+      selectionOf(
+        modelSelectionFrom({ model: "opus/gpt-6-astra", variant: "xhigh", base: selection() }),
+      ),
     ).toEqual({
       instanceId: "opencode",
       model: "opus/gpt-6-astra",
@@ -80,22 +90,22 @@ describe("model selection", () => {
       { id: "agent", value: "build" },
       { id: "variant", value: "high" },
     ]);
-    expect(modelSelectionFrom({ base }).options).toEqual([
+    expect(selectionOf(modelSelectionFrom({ base })).options).toEqual([
       { id: "agent", value: "build" },
       { id: "variant", value: "high" },
     ]);
-    expect(modelSelectionFrom({ variant: "low", base }).options).toEqual([
+    expect(selectionOf(modelSelectionFrom({ variant: "low", base })).options).toEqual([
       { id: "agent", value: "build" },
       { id: "variant", value: "low" },
     ]);
-    expect(modelSelectionFrom({ variant: null, base }).options).toEqual([
+    expect(selectionOf(modelSelectionFrom({ variant: null, base })).options).toEqual([
       { id: "agent", value: "build" },
     ]);
   });
 
   it("drops the old model's options when the model changes", () => {
     const base = selection([{ id: "variant", value: "high" }]);
-    expect(modelSelectionFrom({ model: "opus/other", base })).toEqual({
+    expect(selectionOf(modelSelectionFrom({ model: "opus/other", base }))).toEqual({
       instanceId: "opencode",
       model: "opus/other",
     });
@@ -194,9 +204,12 @@ describe("effort compatibility", () => {
     model: "claude-opus-5-5",
     options: [{ id: "effort", value: "max" }],
   } as unknown as ModelSelection;
-
+  const suffixed = {
+    instanceId: "opencode",
+    model: "opus/cx/gpt-6.1-sol#xhigh",
+  } as unknown as ModelSelection;
   it("a variant patch replaces an existing effort with one effort option", () => {
-    expect(modelSelectionFrom({ variant: "xhigh", base: claude })).toEqual({
+    expect(selectionOf(modelSelectionFrom({ variant: "xhigh", base: claude }))).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-5-5",
       options: [{ id: "effort", value: "xhigh" }],
@@ -204,9 +217,78 @@ describe("effort compatibility", () => {
   });
 
   it("a null variant clears the effort", () => {
-    expect(modelSelectionFrom({ variant: null, base: claude })).toEqual({
+    expect(selectionOf(modelSelectionFrom({ variant: null, base: claude }))).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-5-5",
     });
+  });
+
+  it("clears a legacy suffix effort on variant null, so resolution no longer restores it", () => {
+    const cleared = selectionOf(modelSelectionFrom({ variant: null, base: suffixed }));
+    expect(cleared).toEqual({ instanceId: "opencode", model: "opus/cx/gpt-6.1-sol" });
+  });
+
+  it("clears a legacy suffix effort on an explicit empty options list", () => {
+    const emptied = mergeSelection(suffixed, { options: [] });
+    expect(emptied).toEqual({
+      kind: "selection",
+      selection: { instanceId: "opencode", model: "opus/cx/gpt-6.1-sol" },
+    });
+  });
+
+  it("a variant max over a legacy xhigh suffix replaces the effort, not a conflict", () => {
+    expect(selectionOf(modelSelectionFrom({ variant: "max", base: suffixed }))).toEqual({
+      instanceId: "opencode",
+      model: "opus/cx/gpt-6.1-sol",
+      options: [{ id: "variant", value: "max" }],
+    });
+  });
+
+  it("a lone variant patch overrides the base's old effort", () => {
+    expect(selectionOf(modelSelectionFrom({ variant: "low", base: claude }))).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "low" }],
+    });
+  });
+
+  it("reports an explicit effort and a variant that disagree, instead of picking one", () => {
+    const result = mergeSelection(
+      { instanceId: "claudeAgent", model: "claude-opus-5-5" } as unknown as ModelSelection,
+      {
+        options: [{ id: "effort", value: "max" }],
+        variant: "xhigh",
+      },
+    );
+    expect(result.kind).toBe("conflict");
+  });
+
+  it("reports duplicate native efforts in one patch as a conflict", () => {
+    const result = mergeSelection(
+      { instanceId: "codex", model: "gpt-6.1-sol" } as unknown as ModelSelection,
+      {
+        options: [
+          { id: "reasoningEffort", value: "high" },
+          { id: "reasoningEffort", value: "xhigh" },
+        ],
+      },
+    );
+    expect(result.kind).toBe("conflict");
+  });
+
+  it("reports a suffix and an explicit effort that disagree in one patch", () => {
+    const result = mergeSelection(
+      { instanceId: "opencode", model: "opus/gpt-6-astra" } as unknown as ModelSelection,
+      { model: "opus/cx/gpt-6.1-sol#xhigh", options: [{ id: "variant", value: "max" }] },
+    );
+    expect(result.kind === "conflict" ? result.reason : null).toMatch(/conflicting efforts/);
+  });
+
+  it("reports a variant set together with a clear as a conflict", () => {
+    const result = mergeSelection(claude, {
+      variant: null,
+      options: [{ id: "effort", value: "low" }],
+    });
+    expect(result.kind).toBe("conflict");
   });
 });
