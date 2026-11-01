@@ -209,8 +209,12 @@ interface ActiveTurn {
   };
   steps: number;
   lastStep: Tokens | undefined;
-  /** The native finish of the turn's last step (session.step.ended); null until one ends. */
+  /** The turn's last step's native finish (session.step.ended); null until one ends. */
   lastFinish: string | null;
+  /** Native finish per assistant message: a text's phase comes from its step. */
+  readonly finishByMessage: Map<string, string>;
+  /** Completed texts whose step has not ended yet; they are re-emitted with their phase then. */
+  readonly awaitingFinish: Map<string, { readonly block: OpenBlock["block"]; readonly text: string }>;
   before: string | null | undefined;
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -362,6 +366,13 @@ interface ThreadState {
     | undefined;
   instructions: string | undefined;
 }
+
+/**
+ * A text's phase from its step's native finish. `stop` ends the reply, `tool-calls` means the
+ * text came before a tool call. Any other finish (length, error, content-filter) is not proven.
+ */
+const phaseFromFinish = (finish: string | undefined): OrchestrationV2AssistantPhase =>
+  finish === "stop" ? "answer" : finish === "tool-calls" ? "narration" : "unknown";
 
 /** The thread's turn that owns its session's executions; a parked one does not yet. */
 const runningTurn = (state: ThreadState | undefined) =>
@@ -1060,8 +1071,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         text: "",
       };
       entry.text = update(entry.text);
-      if (completed) turn.texts.delete(nativeId);
-      else turn.texts.set(nativeId, entry);
+      if (completed) {
+        turn.texts.delete(nativeId);
+        if (kind === "text" && entry.text.length > 0 && !turn.finishByMessage.has(data.assistantMessageID)) {
+          turn.awaitingFinish.set(nativeId, { block: entry.block, text: entry.text });
+        }
+      } else turn.texts.set(nativeId, entry);
       if (entry.text.length === 0) return;
       const status = completed ? "completed" : "running";
       const completedAt = completed ? updatedAt : null;
@@ -1080,6 +1095,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         driver,
         nativeItemId: nativeId,
       });
+      const phase = phaseFromFinish(turn.finishByMessage.get(data.assistantMessageID));
       const message: OrchestrationV2ConversationMessage = {
         createdBy: "agent",
         creationSource: "provider",
@@ -1089,6 +1105,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         nodeId: base.nodeId,
         role: "assistant",
         text: entry.text,
+        phase,
         attachments: [],
         streaming: !completed,
         createdAt: entry.startedAt,
@@ -1103,6 +1120,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           type: "assistant_message",
           messageId,
           text: entry.text,
+          phase,
           streaming: !completed,
         },
       });
@@ -1208,6 +1226,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       steps: 0,
       lastStep: undefined,
       lastFinish: null,
+      finishByMessage: new Map(),
+      awaitingFinish: new Map(),
       before: undefined,
       compaction: undefined,
       compactions: 0,
@@ -2212,7 +2232,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           return yield* emitCompaction(state, turn, "failed");
         case "session.step.ended":
         case "session.step.failed": {
-          if (event.type === "session.step.ended") turn.lastFinish = event.data.finish;
+          if (event.type === "session.step.ended") {
+            const messageID = event.data.assistantMessageID;
+            turn.finishByMessage.set(messageID, event.data.finish);
+            turn.lastFinish = event.data.finish;
+            // Snapshot: re-emitting stores the text again while it awaits a finish, and a live iterator would revisit it forever.
+            for (const [nativeId, waiting] of [...turn.awaitingFinish]) {
+              if (waiting.block.assistantMessageID !== messageID) continue;
+              turn.awaitingFinish.delete(nativeId);
+              yield* emitText(state, turn, waiting.block, "text", () => waiting.text, true);
+            }
+          }
           const tokens = event.data.tokens;
           if (tokens === undefined) return;
           turn.steps += 1;
