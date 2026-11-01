@@ -44,6 +44,7 @@ import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
+import { committedSlots } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../../components/chat/TraitsPicker";
 import {
@@ -57,8 +58,6 @@ import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { getProviderModelCapabilities } from "../../providerModels";
-
-const MAX_SLOTS = 8;
 
 type SelectionResult = ReturnType<typeof mergeSelection>;
 type ModelCatalog = ReadonlyArray<Pick<ProviderInstanceEntry, "instanceId" | "models">>;
@@ -357,7 +356,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 label={`${pool.name} slots`}
                 value={pool.slots}
                 min={0}
-                max={unlisted ? 0 : MAX_SLOTS}
+                max={unlisted ? 0 : undefined}
                 disabled={blocked}
                 disabledReason={blockedReason}
                 onChange={(slots) =>
@@ -720,11 +719,27 @@ function Stepper(props: {
   label: string;
   value: number;
   min: number;
-  max: number;
+  max?: number | undefined;
   disabled?: boolean;
   disabledReason?: string | undefined;
   onChange: (value: number) => void;
 }) {
+  // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
+  const [draft, setDraft] = useState<string | null>(null);
+  const cancelled = useRef(false);
+  const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : props.value;
+  const base = Number.isSafeInteger(typed) ? typed : props.value;
+  const atMax = props.max !== undefined && base >= props.max;
+  // While typing, the buttons step the draft, so a click never races the typed number.
+  const step = (by: number) => {
+    const next = Math.max(
+      props.min,
+      props.max === undefined ? base + by : Math.min(props.max, base + by),
+    );
+    if (!Number.isSafeInteger(next)) return;
+    if (draft === null) props.onChange(next);
+    else setDraft(String(next));
+  };
   return (
     <span
       role="group"
@@ -735,18 +750,49 @@ function Stepper(props: {
       <button
         type="button"
         aria-label="Fewer"
-        disabled={props.disabled || props.value <= props.min}
-        onClick={() => props.onChange(props.value - 1)}
+        disabled={props.disabled || base <= props.min}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => step(-1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
         <MinusIcon className="size-3.5" />
       </button>
-      <span className="w-5 text-center text-sm font-medium tabular-nums">{props.value}</span>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        aria-label={`${props.label} count`}
+        value={draft ?? String(props.value)}
+        disabled={props.disabled}
+        onFocus={(event) => {
+          setDraft(String(props.value));
+          event.currentTarget.select();
+        }}
+        onChange={(event) => setDraft(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+          if (event.key === "Escape") {
+            cancelled.current = true;
+            event.currentTarget.blur();
+          }
+        }}
+        onBlur={() => {
+          const next =
+            cancelled.current || draft === null
+              ? null
+              : committedSlots(draft, props.value, props.min, props.max);
+          cancelled.current = false;
+          setDraft(null);
+          if (next !== null) props.onChange(next);
+        }}
+        className="w-9 rounded-md bg-transparent text-center text-sm font-medium tabular-nums text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      />
       <button
         type="button"
         aria-label="More"
-        disabled={props.disabled || props.value >= props.max}
-        onClick={() => props.onChange(props.value + 1)}
+        disabled={props.disabled || atMax}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => step(1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
         <PlusIcon className="size-3.5" />
