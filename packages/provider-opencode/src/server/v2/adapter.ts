@@ -18,6 +18,7 @@ import {
   isOrchestrationV2WorkActive,
   type ChatAttachment,
   type OrchestrationV2AppThread,
+  type OrchestrationV2AssistantPhase,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
