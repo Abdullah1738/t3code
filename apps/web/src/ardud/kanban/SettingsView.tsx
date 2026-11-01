@@ -735,7 +735,7 @@ function Stepper(props: {
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
-  const initial = useRef(props.value);
+  const edited = useRef(false);
   const cancelled = useRef(false);
   const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : props.value;
   const base = Number.isSafeInteger(typed) ? typed : props.value;
@@ -748,7 +748,10 @@ function Stepper(props: {
     );
     if (!Number.isSafeInteger(next)) return;
     if (draft === null) props.onChange(next);
-    else setDraft(String(next));
+    else {
+      edited.current = true;
+      setDraft(String(next));
+    }
   };
   return (
     <span
@@ -775,11 +778,14 @@ function Stepper(props: {
         value={draft ?? String(props.value)}
         disabled={props.disabled}
         onFocus={(event) => {
-          initial.current = props.value;
+          edited.current = false;
           setDraft(String(props.value));
           event.currentTarget.select();
         }}
-        onChange={(event) => setDraft(event.currentTarget.value)}
+        onChange={(event) => {
+          edited.current = true;
+          setDraft(event.currentTarget.value);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
           if (event.key === "Escape") {
@@ -791,8 +797,9 @@ function Stepper(props: {
           const next =
             cancelled.current || draft === null
               ? null
-              : editedSlots(draft, initial.current, props.value, props.min, props.max);
+              : editedSlots(draft, edited.current, props.value, props.min, props.max);
           cancelled.current = false;
+          edited.current = false;
           setDraft(null);
           if (next !== null) props.onChange(next);
         }}

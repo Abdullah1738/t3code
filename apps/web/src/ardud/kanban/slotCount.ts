@@ -16,11 +16,10 @@ export function committedSlots(
 /** Ignore an untouched draft even if the pool changed while the field was focused. */
 export function editedSlots(
   text: string,
-  initial: number,
+  edited: boolean,
   current: number,
   min: number,
   max?: number | undefined,
 ): number | null {
-  const next = committedSlots(text, initial, min, max);
-  return next === current ? null : next;
+  return edited ? committedSlots(text, current, min, max) : null;
 }

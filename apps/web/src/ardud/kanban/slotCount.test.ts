@@ -24,10 +24,10 @@ describe("committedSlots", () => {
   });
 
   it("does not restore an untouched draft after another client changes the pool", () => {
-    expect(editedSlots("5", 5, 0, 0)).toBeNull();
-    expect(editedSlots("005", 5, 0, 0)).toBeNull();
-    expect(editedSlots("12", 5, 0, 0)).toBe(12);
-    expect(editedSlots("12", 5, 12, 0)).toBeNull();
-    expect(editedSlots("abc", 5, 0, 0)).toBeNull();
+    expect(editedSlots("5", false, 0, 0)).toBeNull();
+    expect(editedSlots("5", true, 0, 0)).toBe(5);
+    expect(editedSlots("12", true, 0, 0)).toBe(12);
+    expect(editedSlots("12", true, 12, 0)).toBeNull();
+    expect(editedSlots("abc", true, 0, 0)).toBeNull();
   });
 });
