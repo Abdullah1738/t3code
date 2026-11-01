@@ -1,8 +1,8 @@
 #!/opt/homebrew/bin/python3
-"""Generate Robob's Claude Code and Codex homes from one non-secret manifest.
+"""Generate Robob's Claude Code, Codex and Codex CU homes from one manifest.
 
-generate  writes both homes; prints one line per file or link that changed.
-check     verifies both homes against the manifest; exit 1 lists each failure.
+generate  writes the homes; prints one line per file or link that changed.
+check     verifies the homes against the manifest; exit 1 lists each failure.
 
 Stdlib only. Never reads or writes the personal homes (~/.claude, ~/.codex,
 /Volumes/ExternalSSD/codex). Auth lives in the instance environment, not here.
@@ -26,6 +26,8 @@ CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
 HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "SessionStart")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
+HARNESSES = ("claude", "codex", "codex-cu")
+NODE_REPL = "node_repl"
 
 
 class HomeError(Exception):
@@ -42,16 +44,44 @@ def load_manifest() -> dict:
     return json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
 
 
-def resolve_homes(manifest: dict, home_root: str | None) -> tuple[str, str]:
+def resolve_homes(manifest: dict, home_root: str | None) -> dict[str, str]:
     if home_root:
         root = expand(home_root)
-        claude, codex = os.path.join(root, "claude"), os.path.join(root, "codex")
+        homes = {name: os.path.join(root, name) for name in HARNESSES}
     else:
-        claude = expand(manifest["homes"]["claude"])
-        codex = expand(manifest["homes"]["codex"])
-    for home in (claude, codex):
+        homes = {name: expand(manifest["homes"][name]) for name in HARNESSES}
+    for home in homes.values():
         guard_home(home)
-    return os.path.abspath(claude), os.path.abspath(codex)
+    resolved = {name: os.path.abspath(home) for name, home in homes.items()}
+    real_homes = [os.path.realpath(home) for home in resolved.values()]
+    for index, left in enumerate(real_homes):
+        for right in real_homes[index + 1:]:
+            if os.path.commonpath((left, right)) in (left, right):
+                raise HomeError("harness homes must be distinct and non-overlapping")
+    return resolved
+
+
+def guard_overlay_override(manifest: dict, homes: dict[str, str], home_root: str | None,
+                           overlay_override: str | None) -> None:
+    if not overlay_override:
+        return
+    if not home_root:
+        raise HomeError("--codex-cu-overlay is only permitted with an isolated --home-root")
+    live_homes = [os.path.realpath(expand(p)) for p in manifest["homes"].values()]
+    for home in homes.values():
+        real_home = os.path.realpath(home)
+        if any(os.path.commonpath((real_home, live)) in (real_home, live) for live in live_homes):
+            raise HomeError("--codex-cu-overlay cannot target a configured live home")
+
+
+def read_overlay(path: Path, *, require_content: bool = False) -> bytes:
+    try:
+        overlay = path.read_bytes()
+    except OSError as exc:
+        raise HomeError(f"required overlay missing or unreadable: {path} ({exc})") from exc
+    if require_content and not re.sub(rb"<!--.*?-->", b"", overlay, flags=re.DOTALL).strip():
+        raise HomeError(f"required overlay is empty: {path}")
+    return overlay
 
 
 def guard_home(path: str) -> None:
@@ -220,6 +250,12 @@ def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) 
 
 # ---------- content builders ----------
 
+def hooks_for_harness(hooks: list[dict], harness: str) -> list[dict]:
+    # codex-cu is a Codex harness, so Codex-scoped hooks follow it as well.
+    selectors = {harness, "codex"} if harness == "codex-cu" else {harness}
+    return [hook for hook in hooks if "harnesses" not in hook or selectors.intersection(hook["harnesses"])]
+
+
 def claude_hooks(hooks: list[dict]) -> dict:
     out: dict[str, list] = {}
     for hook in hooks:
@@ -246,8 +282,14 @@ def claude_mcp(servers: list[dict]) -> dict:
     return out
 
 
-def claude_settings_owned(manifest: dict) -> dict:
+def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
     c = manifest["claude"]
+    permissions = (existing or {}).get("permissions", {})
+    deny = permissions.get("deny", []) if isinstance(permissions, dict) else []
+    if not isinstance(deny, list):
+        raise HomeError("claude permissions.deny must be a list")
+    # Keep user-supplied deny rules while explicitly disabling the CU tool names.
+    deny = list(dict.fromkeys([*deny, "Computer", "mcp__node_repl"]))
     return {
         "autoMemoryEnabled": False,
         "autoDreamEnabled": False,
@@ -255,6 +297,7 @@ def claude_settings_owned(manifest: dict) -> dict:
         "skipWebFetchPreflight": True,
         "skipDangerousModePermissionPrompt": True,
         "includeCoAuthoredBy": False,
+        "permissions": {"deny": deny},
         "pluginConfigs": {CLAUDE_PLUGIN_KEY: {"options": {"instructionFiles": "claude-md-and-agents-md"}}},
         "env": {
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
@@ -272,7 +315,7 @@ def claude_settings_owned(manifest: dict) -> dict:
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "900000",
             "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": str(c["subagentDepth"]),
         },
-        "hooks": claude_hooks(manifest["hooks"]),
+        "hooks": claude_hooks(hooks_for_harness(manifest["hooks"], "claude")),
     }
 
 
@@ -339,7 +382,8 @@ def codex_mcp(servers: list[dict]) -> dict:
     return out
 
 
-def codex_config(manifest: dict, codex_home: str, existing_state: dict | None) -> dict:
+def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
+                 harness: str = "codex") -> dict:
     path_value = ":".join(list(manifest["shellPathPrefix"]) + list(manifest["shellPath"]))
     config = {
         "model": "gpt-6-astra",
@@ -374,6 +418,7 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None) -
             "chronicle": False,
             "shell_snapshot": False,
             "computer_use": False,
+            "goals": False,
             "hooks": True,
             "subagent_default_context_limits": False,
         },
@@ -391,7 +436,28 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None) -
         "shell_environment_policy": {"inherit": "all", "set": {"PATH": path_value}},
         "mcp_servers": codex_mcp(manifest["mcpServers"]),
     }
-    if manifest["hooks"]:
+    if harness == "codex-cu":
+        spec = manifest["codexCu"]
+        config["model"] = spec["model"]
+        config["model_context_window"] = spec["contextWindow"]
+        config["model_auto_compact_token_limit"] = spec["autoCompactTokenLimit"]
+        config["model_reasoning_effort"] = "low"
+        config["features"]["computer_use"] = True
+        config["mcp_servers"][NODE_REPL] = {
+            "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "startup_timeout_sec": 30,
+            "tool_timeout_sec": 120,
+            "env": {
+                "CODEX_HOME": codex_home,
+                "NODE_REPL_NODE_PATH": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+                "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+                "NODE_REPL_TRUSTED_CODE_PATHS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+                "SKY_CUA_SERVICE_PATH": "/Volumes/ExternalSSD/codex/computer-use/Codex Computer Use.app",
+                "NODE_REPL_DISABLE_ANALYTICS": "1",
+                "BROWSER_USE_DISABLE_AMBIENT_NETWORK": "1",
+            },
+        }
+    if hooks_for_harness(manifest["hooks"], harness):
         config["hooks"] = {"state": existing_state or {}}
     return config
 
@@ -400,12 +466,16 @@ def codex_hooks_json(hooks: list[dict]) -> dict:
     return {"hooks": claude_hooks(hooks)}
 
 
-def models_json(vendor_path: Path, manifest: dict) -> bytes:
+def models_json(vendor_path: Path, manifest: dict, *, cu: bool = False) -> bytes:
     data = json.loads(vendor_path.read_text(encoding="utf-8"))
     spec = manifest["codexModels"]
     extended = set(spec["extended"])
     found = set()
+    cu_spec = manifest["codexCu"]
+    upstream_terra = None
     for model in data["models"]:
+        if model.get("slug") == cu_spec["model"]:
+            upstream_terra = dict(model)
         if model.get("slug") in extended:
             found.add(model["slug"])
             for key in CODEX_MODEL_KEYS:
@@ -414,6 +484,21 @@ def models_json(vendor_path: Path, manifest: dict) -> bytes:
     missing = extended - found
     if missing:
         raise HomeError(f"catalog is missing extended slugs: {sorted(missing)}")
+    if cu:
+        if upstream_terra is None:
+            raise HomeError(f"catalog is missing CU upstream slug: {cu_spec['model']}")
+        if any(model.get("slug") == cu_spec["prefixedModel"] for model in data["models"]):
+            raise HomeError(f"catalog already has CU prefixed slug: {cu_spec['prefixedModel']}")
+        upstream_terra["slug"] = cu_spec["prefixedModel"]
+        for key in CODEX_MODEL_KEYS:
+            upstream_terra[key] = cu_spec["contextWindow"]
+        upstream_terra["auto_compact_token_limit"] = cu_spec["autoCompactTokenLimit"]
+        for model in data["models"]:
+            if model.get("slug") == cu_spec["model"]:
+                for key in CODEX_MODEL_KEYS:
+                    model[key] = cu_spec["contextWindow"]
+                model["auto_compact_token_limit"] = cu_spec["autoCompactTokenLimit"]
+        data["models"].append(upstream_terra)
     return json_bytes(data)
 
 
@@ -422,28 +507,40 @@ def validate_manifest(manifest: dict) -> None:
     if len(ids) != len(set(ids)):
         raise HomeError("duplicate mcpServers id in manifest")
     for s in manifest["mcpServers"]:
+        if s["id"] == NODE_REPL:
+            raise HomeError("node_repl is reserved for the codex-cu home")
         if s["id"] in RESERVED_IDS:
             raise HomeError(f"{s['id']} must not be in the manifest; Robob injects it per thread")
         if ("url" in s) == ("command" in s):
             raise HomeError(f"mcpServers.{s['id']} needs exactly one of url or command")
     for h in manifest["hooks"]:
+        if "harnesses" in h and (not isinstance(h["harnesses"], list)
+                                  or not h["harnesses"]
+                                  or any(name not in HARNESSES for name in h["harnesses"])):
+            raise HomeError("hook harnesses must be a non-empty list of known harness names")
         if h["event"] not in HOOK_EVENTS:
             raise HomeError(f"unknown hook event {h['event']!r}")
         if not os.path.isabs(h["command"]):
             raise HomeError(f"hook command must be an absolute path: {h['command']}")
 
 
-def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]]) -> dict:
+def build(manifest: dict, homes: dict[str, str], overlay_override: str | None = None) -> dict:
     """Compute every generated file in memory. Reads only; writes nothing."""
     canonical_path = expand(manifest["instructions"]["canonical"])
     canonical = read_bytes(canonical_path)
     if canonical is None:
         raise HomeError(f"canonical AGENTS.md missing: {canonical_path}")
-    overlay_claude = (PKG / manifest["instructions"]["overlays"]["claude"]).read_bytes()
-    overlay_codex = (PKG / manifest["instructions"]["overlays"]["codex"]).read_bytes()
+    overlays = {
+        name: read_overlay(Path(overlay_override) if name == "codex-cu" and overlay_override
+                           else PKG / manifest["instructions"]["overlays"][name],
+                           require_content=name == "codex-cu")
+        for name in HARNESSES
+    }
 
+    claude = homes["claude"]
     settings_path = os.path.join(claude, "settings.json")
-    settings = deep_merge(read_json_or_empty(settings_path), claude_settings_owned(manifest),
+    old_settings = read_json_or_empty(settings_path)
+    settings = deep_merge(old_settings, claude_settings_owned(manifest, old_settings),
                           replace=frozenset({"hooks"}))
 
     claude_json_path = os.path.join(claude, ".claude.json")
@@ -451,39 +548,42 @@ def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]]
     claude_json["mcpServers"] = claude_mcp(manifest["mcpServers"])
     claude_json["hasCompletedOnboarding"] = True
 
-    existing_state = None
-    config_path = os.path.join(codex, "config.toml")
-    if os.path.exists(config_path):
-        try:
-            prior = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
-            raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
-        existing_state = (prior.get("hooks") or {}).get("state")
-
     files = {
         settings_path: json_bytes(settings),
         claude_json_path: json_bytes(claude_json),
         os.path.join(claude, "CLAUDE.md"): f"@{canonical_path}\n@{os.path.join(claude, 'overlay.md')}\n".encode(),
-        os.path.join(claude, "overlay.md"): overlay_claude,
-        config_path: toml_dump(codex_config(manifest, codex, existing_state)).encode("utf-8"),
-        os.path.join(codex, "AGENTS.md"): canonical + b"\n\n" + overlay_codex,
-        os.path.join(codex, "models.json"): models_json(PKG / manifest["codexModels"]["catalogSource"], manifest),
+        os.path.join(claude, "overlay.md"): overlays["claude"],
     }
-    if manifest["hooks"]:
-        files[os.path.join(codex, "hooks.json")] = json_bytes(codex_hooks_json(manifest["hooks"]))
+    for name in ("codex", "codex-cu"):
+        home = homes[name]
+        existing_state = None
+        config_path = os.path.join(home, "config.toml")
+        if os.path.exists(config_path):
+            try:
+                prior = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
+            except tomllib.TOMLDecodeError as exc:
+                raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
+            existing_state = (prior.get("hooks") or {}).get("state")
+        files[config_path] = toml_dump(codex_config(manifest, home, existing_state, name)).encode("utf-8")
+        files[os.path.join(home, "AGENTS.md")] = canonical + b"\n\n" + overlays[name]
+        files[os.path.join(home, "models.json")] = models_json(
+            PKG / manifest["codexModels"]["catalogSource"], manifest, cu=name == "codex-cu")
+        hooks = hooks_for_harness(manifest["hooks"], name)
+        files[os.path.join(home, "hooks.json")] = json_bytes(codex_hooks_json(hooks))
     return files
 
 
-def plan_all(home_root: str | None) -> tuple[dict, str, str, list[tuple[str, str]], dict]:
+def plan_all(home_root: str | None, overlay_override: str | None = None) -> tuple[dict, dict, list, dict]:
     manifest = load_manifest()
     validate_manifest(manifest)
-    claude, codex = resolve_homes(manifest, home_root)
+    homes = resolve_homes(manifest, home_root)
+    guard_overlay_override(manifest, homes, home_root, overlay_override)
     skills = discover_skills([expand(r) for r in manifest["skillRoots"]])
-    files = build(manifest, claude, codex, skills)
+    files = build(manifest, homes, overlay_override)
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
             raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
-    return manifest, claude, codex, skills, files
+    return manifest, homes, skills, files
 
 
 # ---------- writing ----------
@@ -542,21 +642,20 @@ class Writer:
             os.unlink(path)
 
 
-def generate(home_root: str | None, dry_run: bool) -> int:
-    manifest, claude, codex, skills, files = plan_all(home_root)
-    farms = [os.path.join(claude, "skills"), os.path.join(codex, "skills")]
-    guard_outputs([claude, codex, *farms, *files])
+def generate(home_root: str | None, dry_run: bool, overlay_override: str | None = None) -> int:
+    manifest, homes, skills, files = plan_all(home_root, overlay_override)
+    farms = [os.path.join(home, "skills") for home in homes.values()]
+    guard_outputs([*homes.values(), *farms, *files])
     roots = [expand(r) for r in manifest["skillRoots"]]
-    ops = skill_ops(farms[0], skills, roots)
-    ops_codex = skill_ops(farms[1], skills, roots)
-    guard_outputs([op[1] for op in ops + ops_codex])
+    plans = {home: skill_ops(os.path.join(home, "skills"), skills, roots) for home in homes.values()}
+    guard_outputs([op[1] for plan in plans.values() for op in plan])
     writer = Writer(dry_run)
-    for home in (claude, codex):
+    for home in homes.values():
         writer.ensure_dir(home, dry_run)
     for path, data in files.items():
         mode = 0o644
         writer.file(path, data, mode)
-    for home, plan in ((claude, ops), (codex, ops_codex)):
+    for home, plan in plans.items():
         writer.ensure_dir(os.path.join(home, "skills"), dry_run)
         for op in plan:
             if op[0] == "unlink":
@@ -568,118 +667,57 @@ def generate(home_root: str | None, dry_run: bool) -> int:
 
 # ---------- check ----------
 
-def check(home_root: str | None) -> int:
-    manifest = load_manifest()
-    validate_manifest(manifest)
-    claude, codex = resolve_homes(manifest, home_root)
-    guard_outputs([claude, codex, os.path.join(claude, "skills"), os.path.join(codex, "skills")])
+def check(home_root: str | None, overlay_override: str | None = None) -> int:
+    manifest, homes, skills, files = plan_all(home_root, overlay_override)
+    guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
 
-    def fail(msg: str) -> None:
-        failures.append(msg)
+    # Compare complete owned structures, not just MCP IDs or the extended slugs.
+    # build() incorporates the Claude foreign keys and each Codex trust state.
+    claude_settings_path = os.path.join(homes["claude"], "settings.json")
+    for path, expected in files.items():
+        actual = read_bytes(path)
+        if actual is None:
+            failures.append(f"{path}: missing")
+            continue
+        try:
+            if path.endswith(".json"):
+                actual_value, expected_value = json.loads(actual), json.loads(expected)
+            elif path.endswith(".toml"):
+                actual_value = tomllib.loads(actual.decode("utf-8"))
+                expected_value = tomllib.loads(expected.decode("utf-8"))
+            else:
+                actual_value, expected_value = actual, expected
+            if actual_value != expected_value:
+                if isinstance(actual_value, dict) and isinstance(expected_value, dict):
+                    keys = sorted(key for key in actual_value.keys() | expected_value.keys()
+                                  if actual_value.get(key) != expected_value.get(key))
+                    failures.append(f"{path}: differs in {', '.join(keys)}")
+                else:
+                    failures.append(f"{path}: differs from expected content")
+            if path == claude_settings_path:
+                deny = actual_value.get("permissions", {}).get("deny", [])
+                if not isinstance(deny, list) or any(rule not in deny for rule in ("Computer", "mcp__node_repl")):
+                    failures.append(f"{path}: CU deny rules missing")
+        except (ValueError, UnicodeDecodeError) as exc:
+            failures.append(f"{path}: unreadable: {exc}")
+        if SECRET_RE.search(actual.decode("utf-8", errors="replace")):
+            failures.append(f"secret-looking value in {path}")
 
-    want_ids = {s["id"] for s in manifest["mcpServers"]}
-    canonical_path = expand(manifest["instructions"]["canonical"])
-
-    # Claude
-    settings = read_json_or_empty(os.path.join(claude, "settings.json"))
-    if settings.get("autoMemoryEnabled") is not False:
-        fail("claude settings.json: autoMemoryEnabled is not false")
-    if settings.get("autoDreamEnabled") is not False:
-        fail("claude settings.json: autoDreamEnabled is not false")
-    env = settings.get("env", {})
-    for key in ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_ORG_MEMORY"):
-        if env.get(key) != "1":
-            fail(f"claude settings.json: env.{key} is not \"1\"")
-    claude_json = read_json_or_empty(os.path.join(claude, ".claude.json"))
-    if set((claude_json.get("mcpServers") or {}).keys()) != want_ids:
-        fail("claude .claude.json: mcpServers ids differ from manifest")
-    claude_md = read_bytes(os.path.join(claude, "CLAUDE.md"))
-    first = (claude_md or b"").decode("utf-8", errors="replace").splitlines()[:1]
-    if first != [f"@{canonical_path}"]:
-        fail("claude CLAUDE.md first line does not import the canonical AGENTS.md")
-    if read_bytes(os.path.join(claude, "overlay.md")) != (PKG / manifest["instructions"]["overlays"]["claude"]).read_bytes():
-        fail("claude overlay.md differs from the package overlay")
-
-    # Codex
-    try:
-        config = tomllib.loads(Path(codex, "config.toml").read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        config = {}
-        fail(f"codex config.toml unreadable: {exc}")
-    feats = config.get("features", {})
-    for key in ("memories", "chronicle"):
-        if feats.get(key) is not False:
-            fail(f"codex config.toml: features.{key} is not false")
-    mem = config.get("memories", {})
-    for key in ("generate_memories", "use_memories"):
-        if mem.get(key) is not False:
-            fail(f"codex config.toml: memories.{key} is not false")
-    if config.get("approval_policy") != "never":
-        fail("codex config.toml: approval_policy is not \"never\"")
-    if config.get("sandbox_mode") != "danger-full-access":
-        fail("codex config.toml: sandbox_mode is not \"danger-full-access\"")
-    if set((config.get("mcp_servers") or {}).keys()) != want_ids:
-        fail("codex config.toml: mcp_servers ids differ from manifest")
-    agents_md = read_bytes(os.path.join(codex, "AGENTS.md"))
-    canonical = read_bytes(canonical_path)
-    if canonical is None:
-        fail(f"canonical AGENTS.md missing: {canonical_path}")
-    elif agents_md is None or not agents_md.startswith(canonical):
-        fail("codex AGENTS.md does not start with the canonical AGENTS.md")
-    try:
-        models = json.loads(Path(codex, "models.json").read_text(encoding="utf-8"))
-        by_slug = {m.get("slug"): m for m in models["models"]}
-        for slug in manifest["codexModels"]["extended"]:
-            model = by_slug.get(slug)
-            if model is None:
-                fail(f"codex models.json: missing {slug}")
-                continue
-            for key in CODEX_MODEL_KEYS:
-                if model.get(key) != manifest["codexModels"]["contextWindow"]:
-                    fail(f"codex models.json: {slug}.{key} is not the extended window")
-            if model.get("auto_compact_token_limit") != manifest["codexModels"]["autoCompactTokenLimit"]:
-                fail(f"codex models.json: {slug}.auto_compact_token_limit is wrong")
-    except (OSError, ValueError, KeyError) as exc:
-        fail(f"codex models.json unreadable: {exc}")
-    if config.get("model_catalog_json") != os.path.join(codex, "models.json"):
-        fail("codex config.toml: model_catalog_json does not point at the generated models.json")
-
-    # Skills farms
-    try:
-        roots = [expand(r) for r in manifest["skillRoots"]]
-        skills = discover_skills(roots)
-    except HomeError as exc:
-        skills = []
-        fail(str(exc))
     desired = {name: path for name, path in skills}
-    for home, label in ((claude, "claude"), (codex, "codex")):
+    for label, home in homes.items():
         farm = os.path.join(home, "skills")
         links = [e for e in (os.listdir(farm) if os.path.isdir(farm) else []) if os.path.islink(os.path.join(farm, e))]
         if len(links) != len(desired):
-            fail(f"{label} skills: {len(links)} symlinks, {len(desired)} discovered skills")
+            failures.append(f"{label} skills: {len(links)} symlinks, {len(desired)} discovered skills")
         for name, path in desired.items():
             link = os.path.join(farm, name)
             if not os.path.islink(link):
-                fail(f"{label} skills: missing link {name}")
+                failures.append(f"{label} skills: missing link {name}")
             elif not os.path.exists(link):
-                fail(f"{label} skills: link {name} does not resolve")
+                failures.append(f"{label} skills: link {name} does not resolve")
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
-                fail(f"{label} skills: link {name} points at the wrong directory")
-
-    # Secrets: nothing generated may hold a secret-looking value.
-    scan = [
-        os.path.join(claude, "settings.json"), os.path.join(claude, ".claude.json"),
-        os.path.join(claude, "CLAUDE.md"), os.path.join(claude, "overlay.md"),
-        os.path.join(codex, "config.toml"), os.path.join(codex, "AGENTS.md"),
-        os.path.join(codex, "hooks.json"), os.path.join(codex, "models.json"),
-        str(PKG / manifest["instructions"]["overlays"]["claude"]),
-        str(PKG / manifest["instructions"]["overlays"]["codex"]),
-    ]
-    for path in scan:
-        data = read_bytes(path)
-        if data is not None and SECRET_RE.search(data.decode("utf-8", errors="replace")):
-            fail(f"secret-looking value in {path}")
+                failures.append(f"{label} skills: link {name} points at the wrong directory")
 
     for msg in failures:
         print(f"FAIL {msg}")
@@ -692,16 +730,18 @@ def check(home_root: str | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    gen = sub.add_parser("generate", help="write both homes")
+    gen = sub.add_parser("generate", help="write the homes")
     gen.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
-    chk = sub.add_parser("check", help="verify both homes; exit 1 on failure")
+    gen.add_argument("--codex-cu-overlay", help="draft overlay for an isolated --home-root only")
+    chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
+    chk.add_argument("--codex-cu-overlay", help="draft overlay for an isolated --home-root only")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
-            return generate(args.home_root, args.dry_run)
-        return check(args.home_root)
+            return generate(args.home_root, args.dry_run, args.codex_cu_overlay)
+        return check(args.home_root, args.codex_cu_overlay)
     except HomeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
