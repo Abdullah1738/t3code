@@ -29,11 +29,26 @@ from sync_opencode_v2 import with_retry  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
-SEEDED = os.environ.get("HARNESS_SEEDED_MANIFEST", os.path.join(HOME, ".robob/harness-migrate/seeded.jsonl"))
+SEEDED_DEFAULT = os.path.join(HOME, ".robob/harness-migrate/seeded.jsonl")
 SOURCE = "claude"
 DRIVER = "claudeAgent"
 MAX_CONTENT = 1 << 20
 RECALL_PREFIX = "<recall>"
+
+
+def parse_ts(value):
+    """Unix seconds from an ISO-8601 timestamp; a 'Z' or offset is honoured, a naive value is UTC."""
+    from datetime import datetime, timezone
+
+    if not isinstance(value, str) or len(value) < 19:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 def clip(text):
@@ -44,7 +59,12 @@ def clip(text):
     return text if len(text) <= MAX_CONTENT else text[:MAX_CONTENT] + "\n[truncated]"
 
 
-def load_seeded(path=SEEDED):
+def seeded_path():
+    """Read at call time, so each run (and test) sees its own environment."""
+    return os.environ.get("HARNESS_SEEDED_MANIFEST", SEEDED_DEFAULT)
+
+
+def load_seeded(path=None):
     """{native_session_id: [(first_line, last_line, file_name|None), ...]} from an optional JSONL manifest.
 
     The card that writes seeded.jsonl owns its format; a missing file means
@@ -52,15 +72,15 @@ def load_seeded(path=SEEDED):
     """
     out = {}
     try:
-        f = open(path)
+        f = open(path or seeded_path())
     except FileNotFoundError:
         return out
     with f:
         for line in f:
             try:
                 e = json.loads(line)
-                out.setdefault(e["native_session_id"], []).append(
-                    (int(e["first_line"]), int(e["last_line"]), e.get("path") and os.path.basename(e["path"])))
+                file_hint = tc.logical_name(e["path"]) if isinstance(e.get("path"), str) and e["path"] else None
+                out.setdefault(e["native_session_id"], []).append((int(e["first_line"]), int(e["last_line"]), file_hint))
             except (ValueError, KeyError, TypeError):
                 continue
     return out
@@ -135,8 +155,7 @@ def project(rec, path, line_no):
     if is_child_path(path) and not agent:
         agent = os.path.basename(path)[len("agent-"):-len(".jsonl")]
     key = session_key(sid, agent)
-    ts_raw = rec.get("timestamp")
-    ts = int(time.mktime(time.strptime(ts_raw[:19], "%Y-%m-%dT%H:%M:%S"))) if isinstance(ts_raw, str) and len(ts_raw) >= 19 else int(time.time())
+    ts = parse_ts(rec.get("timestamp"))
     base = {"file": os.path.basename(path), "line": line_no, "cwd": rec.get("cwd"), "parent_session": sid,
             "agent_id": agent, "sidechain": bool(rec.get("isSidechain"))}
     model = msg.get("model") if isinstance(msg.get("model"), str) else None
@@ -148,34 +167,37 @@ def project(rec, path, line_no):
             text = b["text"]
             if role == "user" and text.lstrip().startswith(RECALL_PREFIX):
                 continue
-            rows.append((tid, ts, role, "text", clip(text), model, dict(base, kind=role), key))
+            rows.append((tid, ts or int(time.time()), role, "text", clip(text), model, dict(base, kind=role), key))
         elif t == "thinking" and isinstance(b.get("thinking"), str) and b["thinking"].strip():
-            rows.append((tid, ts, "assistant", "text", clip(b["thinking"]), model, dict(base, kind="thinking"), key))
+            rows.append((tid, ts or int(time.time()), "assistant", "text", clip(b["thinking"]), model,
+                         dict(base, kind="thinking"), key))
         elif t == "tool_use":
             name = b.get("name") if isinstance(b.get("name"), str) else ""
             args = json.dumps(b.get("input"), ensure_ascii=False) if b.get("input") is not None else ""
-            rows.append((tid, ts, "assistant", "tool_call", clip(name + "\n" + args), model,
+            rows.append((tid, ts or int(time.time()), "assistant", "tool_call", clip(name + "\n" + args), model,
                          dict(base, kind="tool_call", tool=name, call_id=b.get("id")), key))
         elif t == "tool_result":
             text = _tool_result_text(b)
             if not text:
                 continue
             ctype = "error" if b.get("is_error") else "tool_result"
-            rows.append((tid, ts, "system", ctype, clip(text), None,
+            rows.append((tid, ts or int(time.time()), "system", ctype, clip(text), None,
                          dict(base, kind=ctype, call_id=b.get("tool_use_id")), key))
     return rows
 
 
-def is_seeded(seeded, path, line_no, sid):
-    """True when this line sits in a seeded (transplanted) range for its native session.
+def is_seeded(seeded, path, line_no, key):
+    """True when this line sits in a seeded (transplanted) range for its capture key.
 
-    Ranges are keyed by native session id and match on file name, so a
-    re-homed copy of the same transcript is still recognised.
+    `key` is the capture identity of the transcript line: the top-level
+    sessionId, or "<sessionId>:agent:<agentId>" for a child. Ranges are keyed by
+    the same identity, and an optional file name narrows them further.
     """
-    if not isinstance(sid, str):
+    if not isinstance(key, str):
         return False
-    base = os.path.basename(path)
-    for first, last, file_hint in seeded.get(sid, ()):
+    # Compare logical names: a transcript that became .jsonl.zst (or moved archives) keeps its range.
+    base = tc.logical_name(path)
+    for first, last, file_hint in seeded.get(key, ()):
         if (not file_hint or file_hint == base) and first <= line_no <= last:
             return True
     return False
@@ -192,54 +214,57 @@ class ClaudeSync:
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seeded = load_seeded()
-        self.stats = dict(files=0, rows=0, raw=0, skipped_seeded=0, errors=0, quarantined=0, missing_roots=[])
+        self.stats = dict(files=0, rows=0, raw=0, skipped_seeded=0, errors=0, quarantined=0, unchanged=0,
+                          missing_roots=[])
         self.errors = []
 
+    def _key_of_line(self, path, rec):
+        """Capture identity of one line; child files use their own agentId (the parent id is not a key)."""
+        if not isinstance(rec, dict) or not isinstance(rec.get("sessionId"), str):
+            return None
+        agent = rec.get("agentId") if isinstance(rec.get("agentId"), str) and rec.get("agentId") else None
+        if is_child_path(path) and not agent:
+            agent = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+        return session_key(rec["sessionId"], agent)
+
     def sync_file(self, path, st):
-        rep = tc.open_representation(self.mem, path, st)
+        logical = tc.logical_name(path)
+        if tc.quarantined(self.mem, logical):
+            self.stats["quarantined"] += 1
+            return
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
-        if rep["offset"] == st.st_size and rep["size"] == st.st_size and not rep["error"]:
+        if rep["offset"] == st.st_size and not rep["error"]:
+            self.stats["unchanged"] += 1
             return  # nothing new since the last clean pass
-        first_line = self._line_of(path, rep["offset"])  # lines already consumed
-        events, raw, pos = [], [], rep["offset"]
-        try:
-            for line, end in tc.read_complete_lines(path, rep["offset"]):
-                first_line += 1
-                pos = end
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    raw.append((line, first_line, None))
-                    continue
-                raw.append((line, first_line, rec))
-                rec_sid = rec.get("sessionId") if isinstance(rec, dict) else None
-                if is_seeded(self.seeded, path, first_line, rec_sid):
-                    self.stats["skipped_seeded"] += 1
-                    continue
-                events.extend(project(rec, path, first_line))
-        except OSError as e:
-            tc.record_error(self.mem, rep["rep_id"], f"read: {e}")
-            self.stats["errors"] += 1
-            self.errors.append(f"{os.path.basename(path)}: {e}")
-            return
-        self._write(path, rep, pos, st, events, raw)
+        events, raw = [], []
+        pos = rep["offset"]
+        line_no = rep["lines"]  # lines already journaled for this representation
+        for line, end in tc.read_complete_lines(path, pos):
+            line_no += 1
+            pos = end
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rec = None
+            raw.append((line, line_no))
+            if rec is None:
+                continue
+            key = self._key_of_line(path, rec)
+            if is_seeded(self.seeded, path, line_no, key):
+                self.stats["skipped_seeded"] += 1
+                continue
+            events.extend(project(rec, path, line_no))
+        self._write(path, rep, pos, st, events, raw, line_no)
 
-    def _line_of(self, path, offset):
-        """Lines before a byte offset (the raw journal numbers lines from 1)."""
-        if offset == 0:
-            return 0
-        with open(path, "rb") as f:
-            return f.read(offset).count(b"\n")
-
-    def _write(self, path, rep, pos, st, events, raw):
+    def _write(self, path, rep, pos, st, events, raw, lines_total):
         def txn():
             if raw:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line),
-                      line.decode("utf-8", "replace")) for line, ln, _ in raw],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line)) for line, ln in raw],
                 )
             if events:
                 self.mem.executemany(
@@ -249,11 +274,21 @@ class ClaudeSync:
                     [(SOURCE, key, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
                      for tid, ts, spk, ctype, content, model, m, key in events],
                 )
-            tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime)
+            tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)
         self.stats["raw"] += len(raw)
+
+    def _fail(self, path, msg):
+        self.stats["errors"] += 1
+        self.errors.append(f"{os.path.basename(path)}: {msg}")
+        print(f"error in {path}: {msg}", flush=True)
+        row = self.mem.execute(
+            "SELECT rep_id FROM native_capture_files WHERE logical=? AND retired=0 ORDER BY rep_id DESC LIMIT 1",
+            (tc.logical_name(path),)).fetchone()
+        if row:
+            with_retry(self.mem, lambda: tc.record_error(self.mem, row[0], msg))
 
     def run(self):
         t0 = time.time()
@@ -274,12 +309,9 @@ class ClaudeSync:
                 except sqlite3.OperationalError as e:
                     if "locked" in str(e) or "busy" in str(e):
                         raise
-                    self.stats["errors"] += 1
-                    self.errors.append(f"{os.path.basename(path)}: {e}")
+                    self._fail(path, str(e))
                 except Exception as e:  # noqa: BLE001 - one bad file must not block the others
-                    self.stats["errors"] += 1
-                    self.errors.append(f"{os.path.basename(path)}: {type(e).__name__}: {str(e)[:200]}")
-                    print(f"error in {path}: {type(e).__name__}: {e}", flush=True)
+                    self._fail(path, f"{type(e).__name__}: {str(e)[:200]}")
         self.stats["secs"] = round(time.time() - t0, 2)
         self.mem.close()
         print("DONE", json.dumps(self.stats), flush=True)

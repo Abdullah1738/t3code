@@ -55,11 +55,17 @@ class IdentityTest(unittest.TestCase):
                   (json.dumps({"nativeThreadRef": {"driver": "codex", "nativeId": "V-NATIVE"}}),))
         # deep chain: 100 children, each a thread whose parent is the previous one, plus a native agent
         s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("R", "Root"))
+        s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('ptR','R','claudeAgent','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "ROOT-SESS"}}),))
         prev = "R"
         for i in range(1, 101):
             tid = f"C{i}"
             s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)",
                       thread(tid, f"child {i}", parent=prev))
+            # every link is a native parent: each level has its own provider thread (native session)
+            s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?,?,?,?)",
+                      (f"ptC{i}", tid, "claudeAgent", "claudeAgent", "claudeAgent",
+                       json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": f"SESS-C{i}"}})))
             s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
                       (f"sub{i}", prev, tid, "claudeAgent", "claudeAgent",
                        json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": f"agent-{i}"},
@@ -98,8 +104,34 @@ class IdentityTest(unittest.TestCase):
     def test_depth_100_child_resolves_to_root(self):
         ti.sync(self.mem, self.state)
         rows = {r[0]: r for r in self.aliases()}
-        self.assertEqual(rows["C100"][1], "R")
+        # C100's native key is its direct parent's native session (C99), agent = its own task id
+        self.assertEqual(rows["C100"][2], "SESS-C99")
         self.assertEqual(rows["C100"][3], "agent-100")
+        self.assertEqual(rows["C100"][1], "R")  # the canonical root still resolves to the top thread
+
+    def test_claude_child_keyed_by_parent_native_session_and_agent(self):
+        """Capture key for a Claude child is '<parent native sessionId>:agent:<agentId>'.
+
+        The alias must carry the parent's NATIVE session (from its provider thread's
+        nativeThreadRef), not the app thread id, and not providerThreadId (null for native tasks).
+        """
+        s = sqlite3.connect(self.state)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("CP", "Claude parent"))
+        s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('ptc','CP','claudeAgent','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "SESS-PARENT"}}),))
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("CC", "Claude child", parent="CP"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
+                  ("subC", "CP", "CC", "claudeAgent", "claudeAgent",
+                   json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-7"},
+                               "providerThreadId": None, "threadId": "CP"})))
+        s.commit()
+        s.close()
+        ti.sync(self.mem, self.state)
+        rows = [r for r in self.aliases() if r[0] == "CC"]
+        self.assertEqual(len(rows), 1)
+        canonical, root, native, agent = rows[0]
+        self.assertEqual((native, agent), ("SESS-PARENT", "AGT-7"))
+        self.assertNotEqual(native, "CP")
 
     def test_refresh_updates_title_and_bumps_revision_without_new_rows(self):
         ti.sync(self.mem, self.state)

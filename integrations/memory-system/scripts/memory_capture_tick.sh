@@ -24,6 +24,9 @@ stage_log "start"
 # Every stage runs even when an earlier one fails; the aggregate status below
 # is failed if any of them failed (the stage's own status only reflects the
 # last command, which hid Muse and Claude failures before).
+# The one-time source CHECK widening (schema_migrations) is an in-place catalog
+# edit, measured in well under a second on the 97 GB memory.db, so it fits any
+# stage budget below. The full 12-step table rebuild is never run by a tick.
 agg=0
 stage_run "$MUSE_HARD" $PY -u src/sync_muse.py --deadline 120 >> "$STAGE_LOG" 2>&1
 muse_rc=$?

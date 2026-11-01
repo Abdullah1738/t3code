@@ -177,6 +177,55 @@ class ClaudeSyncTest(unittest.TestCase):
         self.assertIn(("assistant", "tool_call"), kinds)
         self.assertIn(("system", "error"), kinds)
 
+    def test_timestamps_keep_transcript_time_not_local(self):
+        rec_ = rec("u1", "user", "old work", ts="2026-07-31T06:53:47.268Z")
+        write_lines(self.top, [rec_])
+        self.sync()
+        con = sqlite3.connect(self.db)
+        ts = con.execute("SELECT timestamp FROM episodic_events WHERE source='claude'").fetchone()[0]
+        con.close()
+        import datetime
+        self.assertEqual(ts, int(datetime.datetime(2026, 7, 31, 6, 53, 47, 268000,
+                                                    tzinfo=datetime.timezone.utc).timestamp()))
+
+    def test_raw_journal_keeps_invalid_utf8_exactly(self):
+        bad = (json.dumps(rec("u1", "user", "caf")) + "\n").encode()
+        bad = bad.replace(b"caf", b"caf\xff")
+        os.makedirs(os.path.dirname(self.top), exist_ok=True)
+        with open(self.top, "wb") as f:
+            f.write(bad)
+        self.sync()
+        con = sqlite3.connect(self.db)
+        raw = bytes(con.execute("SELECT raw FROM native_capture_raw ORDER BY line_no").fetchone()[0])
+        sha = con.execute("SELECT sha1 FROM native_capture_raw ORDER BY line_no").fetchone()[0]
+        con.close()
+        import hashlib
+        self.assertEqual(raw, bad)
+        self.assertEqual(sha, hashlib.sha1(bad).hexdigest())
+
+    def test_failing_file_is_recorded_and_quarantined(self):
+        bad = os.path.join(self.home, "projects/-repo/broken.jsonl")
+        write_lines(bad, [rec("x1", "user", "fine")])
+        real = self.sc.project
+
+        def boom(r, path, n):
+            if "broken" in path:
+                raise ValueError("boom")
+            return real(r, path, n)
+
+        self.sc.project = boom
+        try:
+            self.sync()
+        finally:
+            self.sc.project = real
+        con = sqlite3.connect(self.db)
+        err, count, until = con.execute(
+            "SELECT error, error_count, quarantined_until FROM native_capture_files WHERE path=?", (bad,)).fetchone()
+        con.close()
+        self.assertIn("boom", err)
+        self.assertEqual(count, 1)
+        self.assertGreater(until, time.time())
+
 
 if __name__ == "__main__":
     unittest.main()

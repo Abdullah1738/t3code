@@ -13,6 +13,9 @@ import schema_migrations  # noqa: E402
 OLD = open(os.path.join(SRC, "schema.sql")).read()  # current 4-source shape (muse included)
 
 
+BIG_ROWS = 60000  # enough that a row copy is clearly slower than the in-place edit
+
+
 class MigrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -69,6 +72,46 @@ class MigrationTest(unittest.TestCase):
                     " VALUES('claude','C','u:0',9,'user','new','text')")
         new_id = con.execute("SELECT id FROM episodic_events WHERE source='claude'").fetchone()[0]
         self.assertGreater(new_id, top)
+        con.close()
+
+    def test_widening_is_in_place_and_fast_on_a_large_table(self):
+        """The migration never copies rows: a large table widens in well under a tick budget."""
+        import time
+        con = sqlite3.connect(self.db)
+        con.execute("BEGIN")
+        con.executemany("INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type)"
+                        " VALUES('codex','S',?,?,'user',?,'text')",
+                        [(f"big{i}", i, "payload " * 60 + str(i)) for i in range(BIG_ROWS)])
+        con.execute("COMMIT")
+        con.close()
+        con = self.open()
+        t0 = time.time()
+        self.assertTrue(schema_migrations.migrate(con))
+        dt = time.time() - t0
+        # A 12-step copy of this table takes seconds (about 24x longer than the in-place edit);
+        # the bound is loose for slow CI but far below a copy of 150k rows.
+        self.assertLess(dt, 0.25, f"widening took {dt:.3f}s; it must not copy rows")
+        self.assertEqual(con.execute("SELECT count(*) FROM episodic_events").fetchone()[0], BIG_ROWS + 2)
+        con.close()
+
+    def test_widening_rolls_back_when_verification_fails(self):
+        """A failed verification leaves the old CHECK in place: no half-migrated schema."""
+        con = self.open()
+        real = schema_migrations._table_sql
+        calls = {"n": 0}
+
+        def flaky(c):
+            calls["n"] += 1
+            sql = real(c)
+            return sql.replace("'claude'", "'nope'") if calls["n"] > 2 else sql
+
+        schema_migrations._table_sql = flaky
+        try:
+            with self.assertRaises(schema_migrations.SchemaError):
+                schema_migrations.migrate(con)
+        finally:
+            schema_migrations._table_sql = real
+        self.assertNotIn("'claude'", real(con))
         con.close()
 
     def test_unknown_shape_is_refused(self):

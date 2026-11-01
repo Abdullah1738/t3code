@@ -81,6 +81,12 @@ def gather(state):
         threads[tid] = dict(title=title, cwd=_str(p.get("worktreePath")),
                             parent=_str(lineage.get("parentThreadId")), model=_str(model_sel.get("model")),
                             instance=_str(p.get("providerInstanceId")))
+    # Native session id per app thread: the provider thread's nativeThreadRef (the id the adapter
+    # passes to the SDK as sessionId, and the sessionId transcript records carry). A child
+    # subagent is keyed by its PARENT's native session plus its own native agent id, so the
+    # parent is resolved through the owning provider thread, never through providerThreadId
+    # (an internal projection id, null for native Claude tasks) or the app thread id.
+    native_of = {}
     out = []
     for tid, payload, driver, instance in state.execute(
         "SELECT thread_id, payload_json, driver, provider_instance_id FROM orchestration_v2_projection_provider_threads"
@@ -91,6 +97,7 @@ def gather(state):
         native = _str(ref.get("nativeId"))
         if not native:
             continue
+        native_of.setdefault(tid, (native, driver or _str(ref.get("driver")), instance or _str(p.get("providerInstanceId"))))
         out.append(dict(canonical=tid, native=native, agent=None, driver=driver or _str(ref.get("driver")),
                         instance=instance or _str(p.get("providerInstanceId")),
                         model=threads.get(tid, {}).get("model")))
@@ -101,11 +108,13 @@ def gather(state):
         p = _j(payload)
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
         task = _str(ref.get("nativeId"))
-        if not task:
-            continue  # no native task id: nothing native to key this child by
-        out.append(dict(canonical=child_tid, native=_str(p.get("providerThreadId")) or parent_tid,
-                        agent=task, driver=driver or _str(ref.get("driver")),
-                        instance=instance or _str(p.get("providerInstanceId")), model=None))
+        parent = native_of.get(parent_tid)
+        if not task or not parent:
+            continue  # no native task id, or the parent has no native session yet: nothing to key by
+        parent_native, parent_driver, parent_instance = parent
+        out.append(dict(canonical=child_tid, native=parent_native, agent=task,
+                        driver=driver or parent_driver or _str(ref.get("driver")),
+                        instance=instance or parent_instance, model=None))
     for native, tid in state.execute("SELECT native_session_id, thread_id FROM ardud_opencode_import"):
         out.append(dict(canonical=tid, native=native, agent=None, driver="opencode", instance="opencode", model=None))
     for row in out:

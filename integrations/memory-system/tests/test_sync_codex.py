@@ -90,7 +90,8 @@ class CodexSyncTest(unittest.TestCase):
         self.assertEqual({r[5] for r in rows}, {ROOT_ID})
 
     def test_inherited_history_before_ordinal_skipped_but_raw_kept(self):
-        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID, ordinal=2), msg("user", "inherited prompt"),
+        # start = 3: records 1 and 2 are inherited, record 3 is the child's first own record
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID, ordinal=3), msg("user", "inherited prompt"),
                                      msg("assistant", "inherited answer"), msg("user", "own prompt")])
         s = self.sync()
         self.assertEqual([r[4] for r in self.rows()], ["own prompt"])
@@ -98,6 +99,28 @@ class CodexSyncTest(unittest.TestCase):
         self.assertEqual(con.execute("SELECT count(*) FROM native_capture_raw").fetchone()[0], 4)
         con.close()
         self.assertEqual(s["skipped_inherited"], 2)
+
+    def test_boundary_uses_record_ordinal_not_line_count(self):
+        """0.166 paginated records carry their own 'ordinal'; the first child record is ordinal == start.
+
+        Records before the start are inherited (dropped). Non-message records (event lines) still
+        occupy ordinals, so counting response_item lines would shift the boundary.
+        """
+        def stamped(rec, ordinal):
+            rec = dict(rec, ordinal=ordinal)
+            return rec
+        lines = [
+            meta(CHILD_ID, ROOT_ID, ordinal=3),
+            stamped({"type": "event_msg", "payload": {"type": "task_started"}}, 0),
+            stamped(msg("user", "inherited 1"), 1),
+            stamped({"type": "event_msg", "payload": {"type": "agent_message"}}, 2),
+            stamped(msg("assistant", "first own record"), 3),
+        ]
+        write_rollout(self.rollout, lines)
+        s = self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["first own record"])
+        # records with ordinal 0, 1, 2 are inherited (strictly before the start, 3)
+        self.assertEqual(s["skipped_inherited"], 3)
 
     def test_tool_call_output_and_error_projected(self):
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), fcall("shell", "{\"cmd\":\"ls\"}", "c1"),
@@ -142,14 +165,146 @@ class CodexSyncTest(unittest.TestCase):
         with open(zst, "wb") as f:
             f.write(b"not really zstd")
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "still here")])
-        old = self.sx.ZSTD
-        self.sx.ZSTD = None
+        import transcript_capture as tc
+        real = tc.zstd_bin
+        tc.zstd_bin = lambda: None
         try:
             s = self.sync()
         finally:
-            self.sx.ZSTD = old
+            tc.zstd_bin = real  # restored even when the run fails: no state leaks into other tests
         self.assertEqual(s["errors"], 1)
         self.assertIn("still here", [r[4] for r in self.rows()])
+        con = sqlite3.connect(self.db)
+        err, count, quarantined = con.execute(
+            "SELECT error, error_count, quarantined_until FROM native_capture_files WHERE path=?", (zst,)).fetchone()
+        con.close()
+        self.assertIn("zstd missing", err)
+        self.assertEqual(count, 1)
+        self.assertGreater(quarantined, 0)
+
+    def test_resumed_pass_equals_single_pass(self):
+        """Chunked resume and one full pass produce the same rows (same turn ids, same count)."""
+        pad = "y" * 40000
+        base = [meta(CHILD_ID, ROOT_ID, ordinal=2)] + [msg("user", f"inh {i} {pad}") for i in range(3)]
+        base[1]["ordinal"] = 0
+        own = [dict(msg("user", f"own {i} {pad}"), ordinal=i + 2) for i in range(300)]
+        # a single pass over everything
+        write_rollout(self.rollout, base + own)
+        self.sync()
+        single = sorted(r[1] for r in self.rows())
+        con = sqlite3.connect(self.db)
+        con.execute("DELETE FROM episodic_events WHERE source='codex'")
+        con.execute("DELETE FROM native_capture_raw")
+        con.execute("DELETE FROM native_capture_files")
+        con.commit()
+        con.close()
+        # the same content, written and synced in several passes
+        os.remove(self.rollout)
+        write_rollout(self.rollout, base + own[:120])
+        self.sync()
+        write_rollout(self.rollout, own[120:200])
+        self.sync()
+        write_rollout(self.rollout, own[200:])
+        self.sync()
+        chunked = sorted(r[1] for r in self.rows())
+        self.assertEqual(len(chunked), len(single))
+        self.assertEqual(chunked, single)
+
+    def test_replay_past_eight_mib_keeps_numbering(self):
+        """Resume must replay the whole consumed prefix; a single 8 MiB batch restarted line numbers."""
+        pad = "x" * 60000
+        lines = [meta(CHILD_ID, ROOT_ID)]
+        for i in range(400):  # ~24 MB of prefix: several 8 MiB batches
+            lines.append(msg("user", f"row {i} {pad}"))
+        write_rollout(self.rollout, lines)
+        self.sync()
+        first_rows = len(self.rows())
+        write_rollout(self.rollout, [msg("assistant", "after the prefix")])
+        self.sync()
+        rows = self.rows()
+        self.assertEqual(len(rows), first_rows + 1)
+        self.assertEqual(rows[-1][4], "after the prefix")
+        ids = [r[1] for r in rows]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_unchanged_zst_is_not_rejournaled(self):
+        plain = os.path.join(self.tmp.name, "plain.jsonl")
+        write_rollout(plain, [meta(CHILD_ID, ROOT_ID), msg("user", "stable")] + [msg("user", "x" * 3000)] * 20)
+        zst = self.rollout + ".zst"
+        os.makedirs(os.path.dirname(zst), exist_ok=True)
+        import subprocess
+        subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
+        self.sync()
+        con = sqlite3.connect(self.db)
+        raw1 = con.execute("SELECT count(*) FROM native_capture_raw").fetchone()[0]
+        con.close()
+        self.sync()
+        self.sync()
+        con = sqlite3.connect(self.db)
+        raw2 = con.execute("SELECT count(*) FROM native_capture_raw").fetchone()[0]
+        reps = con.execute("SELECT count(*) FROM native_capture_files WHERE retired=0").fetchone()[0]
+        con.close()
+        self.assertEqual(raw2, raw1)
+        self.assertEqual(reps, 1)
+
+    def test_seeded_record_still_advances_identity_state(self):
+        """A seeded record's effect on the projector must match the replay path (no events, but state)."""
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "transplanted"),
+                                     msg("assistant", "transplanted answer"), msg("user", "genuine child work")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": self.rollout, "first_line": 2,
+                                "last_line": 3}) + "\n")
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["genuine child work"])
+        write_rollout(self.rollout, [msg("assistant", "later")])
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["genuine child work", "later"])
+
+    def test_seeded_range_matches_after_compression(self):
+        """A manifest written for the .jsonl must still suppress the same lines after .jsonl.zst."""
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "transplanted")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": self.rollout, "first_line": 2,
+                                "last_line": 2}) + "\n")
+        self.sync()
+        self.assertEqual(self.rows(), [])
+        zst = self.rollout + ".zst"
+        import subprocess
+        if ZSTD:
+            subprocess.run([ZSTD, "-q", "-o", zst, self.rollout], check=True)
+            os.remove(self.rollout)
+            write_rollout(zst.replace(".zst", ""), [])  # no-op: keep the plain path absent
+            os.remove(zst.replace(".zst", "")) if os.path.exists(zst.replace(".zst", "")) else None
+            self.sync()
+            self.assertEqual(self.rows(), [])
+            raw = sqlite3.connect(self.db).execute("SELECT count(*) FROM native_capture_raw").fetchone()[0]
+            self.assertGreaterEqual(raw, 2)
+
+    def test_timestamps_keep_the_transcript_time(self):
+        rec = msg("user", "old work")
+        rec["timestamp"] = "2026-07-31T06:53:47.268Z"
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), rec])
+        self.sync()
+        con = sqlite3.connect(self.db)
+        ts = con.execute("SELECT timestamp FROM episodic_events WHERE source='codex'").fetchone()[0]
+        con.close()
+        import datetime
+        self.assertEqual(ts, int(datetime.datetime(2026, 7, 31, 6, 53, 47, tzinfo=datetime.timezone.utc).timestamp()))
+
+    def test_raw_journal_keeps_invalid_utf8_exactly(self):
+        bad = b'{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"caf\xff"}]},"timestamp":"2026-10-31T10:00:00Z"}\n'
+        os.makedirs(os.path.dirname(self.rollout), exist_ok=True)
+        with open(self.rollout, "wb") as f:
+            f.write((json.dumps(meta(CHILD_ID, ROOT_ID)) + "\n").encode())
+            f.write(bad)
+        self.sync()
+        con = sqlite3.connect(self.db)
+        raws = [bytes(r[0]) for r in con.execute("SELECT raw FROM native_capture_raw ORDER BY line_no")]
+        shas = [r[0] for r in con.execute("SELECT sha1 FROM native_capture_raw ORDER BY line_no")]
+        con.close()
+        self.assertEqual(raws[1], bad)
+        self.assertEqual(shas[1], hashlib.sha1(bad).hexdigest())
 
 
 if __name__ == "__main__":

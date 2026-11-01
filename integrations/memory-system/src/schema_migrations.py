@@ -62,47 +62,45 @@ def _set_version(con):
     )
 
 
-def _rebuild(con):
-    """Rebuild episodic_events with 'claude' in its CHECK. Caller holds no transaction."""
+def _widen_in_place(con):
+    """Loosen the source CHECK in the stored schema (sqlite_master), in one short transaction.
+
+    Widening a CHECK cannot invalidate an existing row, so no table copy is needed. This is
+    the route sync_muse already uses (sqlite.org/lang_altertable.html, "other kinds of
+    changes"). It takes milliseconds on the 97 GB memory.db where a 12-step rebuild would
+    run for about an hour in one non-resumable transaction. The schema_version bump makes
+    other connections re-read the schema. Verified before commit: the new CHECK parses, the
+    row count and FTS counts are unchanged, and a 'claude' insert succeeds.
+    """
     old_sql = _table_sql(con)
-    allowed = _allowed(old_sql) + ["claude"]
-    check = "CHECK(source IN (" + ", ".join(f"'{s}'" for s in allowed) + "))"
-    new_sql = SOURCE_CHECK.sub(check, old_sql, count=1)
-    new_sql = TABLE_HEAD.sub(r"\1episodic_events_new", new_sql, count=1)
-    if "'claude'" not in new_sql or "episodic_events_new" not in new_sql:
-        raise SchemaError("could not rewrite the episodic_events definition; refusing to migrate")
-    objs = con.execute(
-        "SELECT type, name, sql FROM sqlite_master WHERE tbl_name='episodic_events'"
-        " AND type IN ('index','trigger') AND sql IS NOT NULL"
-    ).fetchall()
-    old_seq_row = con.execute("SELECT seq FROM sqlite_sequence WHERE name='episodic_events'").fetchone()
-    old_seq = old_seq_row[0] if old_seq_row else 0
+    allowed = _allowed(old_sql)
+    new_check = "CHECK(source IN (" + ", ".join(f"'{x}'" for x in allowed + ["claude"]) + "))"
+    new_sql = SOURCE_CHECK.sub(new_check, old_sql, count=1)
+    if "'claude'" not in new_sql or new_sql == old_sql:
+        raise SchemaError("could not widen the episodic_events source CHECK; refusing to migrate")
+    n_before = con.execute("SELECT count(*) FROM episodic_events").fetchone()[0]
+    fts_before = con.execute("SELECT count(*) FROM episodic_fts").fetchone()[0]
     con.execute("BEGIN IMMEDIATE")
     try:
-        # Re-check under the write lock: another tailer may have migrated first.
         if not needs_migration(_table_sql(con)):
             con.execute("COMMIT")
-            return False
-        con.execute(new_sql)
-        cols = ", ".join(r[1] for r in con.execute("PRAGMA table_info(episodic_events)"))
-        con.execute(f"INSERT INTO episodic_events_new({cols}) SELECT {cols} FROM episodic_events")
-        old_n = con.execute("SELECT count(*) FROM episodic_events").fetchone()[0]
-        new_n = con.execute("SELECT count(*) FROM episodic_events_new").fetchone()[0]
-        if old_n != new_n:
-            raise SchemaError(f"row count mismatch during rebuild: {old_n} -> {new_n}")
-        con.execute("DROP TABLE episodic_events")
-        con.execute("ALTER TABLE episodic_events_new RENAME TO episodic_events")
-        for _typ, _name, sql in objs:
-            con.execute(sql)
-        new_seq = con.execute("SELECT seq FROM sqlite_sequence WHERE name='episodic_events'").fetchone()
-        new_seq = new_seq[0] if new_seq else 0
-        con.execute("DELETE FROM sqlite_sequence WHERE name='episodic_events'")
-        con.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('episodic_events', ?)", (max(old_seq, new_seq),))
+            return False  # another tailer widened it first
+        version = con.execute("PRAGMA schema_version").fetchone()[0]
+        con.execute("PRAGMA writable_schema=ON")
+        try:
+            con.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name='episodic_events'", (new_sql,))
+            con.execute(f"PRAGMA schema_version={version + 1}")
+        finally:
+            con.execute("PRAGMA writable_schema=OFF")
         _set_version(con)
-        if not needs_migration(_table_sql(con)) and "'claude'" in _table_sql(con):
-            con.execute("COMMIT")
-        else:
-            raise SchemaError("episodic_events still rejects 'claude' after rebuild")
+        # verify inside the transaction; any mismatch rolls the whole edit back
+        if "'claude'" not in _table_sql(con):
+            raise SchemaError("episodic_events still rejects 'claude' after widening")
+        if con.execute("SELECT count(*) FROM episodic_events").fetchone()[0] != n_before:
+            raise SchemaError("row count changed during widening")
+        if con.execute("SELECT count(*) FROM episodic_fts").fetchone()[0] != fts_before:
+            raise SchemaError("FTS count changed during widening")
+        con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
@@ -110,13 +108,18 @@ def _rebuild(con):
 
 
 def migrate(con):
-    """Bring memory.db to TARGET_VERSION. Safe to call on every run. Returns True if it rebuilt the table."""
+    """Bring memory.db to TARGET_VERSION. Safe to call on every run; returns True when it changed the schema.
+
+    The common case is an in-place CHECK widening (milliseconds). The full table rebuild is
+    kept only for explicit maintenance (rebuild_episodic_events) because it copies every row
+    and is not resumable; it must never run inside a tailer's kill budget.
+    """
     prev = con.isolation_level
-    con.isolation_level = None  # explicit BEGIN/COMMIT for the rebuild
+    con.isolation_level = None  # explicit BEGIN/COMMIT
     try:
         con.execute(META_DDL)
         if needs_migration(_table_sql(con)):
-            return _rebuild(con)
+            return _widen_in_place(con)
         _set_version(con)
         return False
     finally:
