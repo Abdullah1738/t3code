@@ -84,6 +84,19 @@ describe("board scripts", () => {
     expect(parsed.text).toBe('checked 3 repos\n{"other": 1}');
   });
 
+  it("takes a pool command of any size", () => {
+    const parsed = parseOutput(
+      [
+        '{"kanban":"pool","model":"opus/claude-opus-5-5","slots":120}',
+        '{"kanban":"pool","model":"opus/claude-opus-5-5","slots":-1}',
+      ].join("\n"),
+    );
+    expect(parsed.commands).toEqual([
+      { kanban: "pool", model: "opus/claude-opus-5-5", slots: 120 },
+    ]);
+    expect(parsed.errors).toHaveLength(1);
+  });
+
   it("decodes the subtask, handback and move commands", () => {
     const parsed = parseOutput(
       [
