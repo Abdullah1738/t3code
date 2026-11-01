@@ -119,7 +119,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
   A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
   stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
   lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
-  When boat has no machines of a size ("supply for size xlarge is over"), offbox stops trying that size for 10 min (OFFBOX_SUPPLY_COOLDOWN_SECONDS) and resumes or creates the pool box one size smaller (never below large), unless you passed --size: then it queues and returns 90 "nothing ran" if the size doesn't come back. `offbox status` shows `boat supply: ... out until`.
+  When boat has no machines of a size ("supply for size xlarge is over"), offbox stops trying that size for 10 min (OFFBOX_SUPPLY_COOLDOWN_SECONDS) and resumes or creates the pool box one size smaller (never below large), unless you passed --size or offbox picked xlarge for the run itself (container stack, typecheck, recent OOM): then it queues and returns 90 "nothing ran" if the size doesn't come back. `offbox status` shows `boat supply: ... out until`.
   A box whose filesystem has died (`Transport endpoint is not connected`) is caught by a write check before the sync, or by the sync itself: it is stopped, marked `dead-mount:` and taken out of the pool, and the run moves to another box (once). `offbox list --all` shows it; `offbox release <id> --delete` removes it.
 
 ## Options

@@ -113,6 +113,8 @@ class ResumeAndCreate(Isolated):
     def setUp(self):
         super().setUp()
         self.stack.enter_context(patch.object(api.time, "sleep", lambda s: None))
+        # These cases need a template whose natural size is xlarge; crpko-harness starts large since 01a99a6fd1.
+        self.stack.enter_context(patch.dict(lease.DEFAULT_SIZE, {"crpko-harness": "xlarge"}))
         capacity.supply_out("xlarge", None, SUPPLY_MSG)
 
     def stopped_harness(self, state="stopped", size="xlarge"):
