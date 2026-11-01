@@ -1,7 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off - exercises the CLI against a local fake HTTP endpoint.
 import * as ChildProcess from "node:child_process";
 import * as Http from "node:http";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 
 const cli = fileURLToPath(new URL("../control/t3ctl.mjs", import.meta.url));
 let server: Http.Server;
