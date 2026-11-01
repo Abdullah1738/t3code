@@ -373,6 +373,81 @@ class CodexSyncTest(unittest.TestCase):
         self.assertIn("PermissionError", row[0])
         self.assertGreater(row[1], time.time())
 
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_killed_zst_pass_is_finished_on_rerun_not_skipped(self):
+        """A .zst killed after its first batch must not be treated as unchanged on the next tick.
+
+        Rerun finishes the remaining lines with no duplicates; a further rerun takes the shortcut.
+        """
+        import subprocess
+        import transcript_capture as tc
+        plain = os.path.join(self.tmp.name, "big.jsonl")
+        lines = [meta(CHILD_ID, ROOT_ID)] + [msg("user", f"row {i} " + "p" * 400) for i in range(1200)]
+        write_rollout(plain, lines)
+        zst = self.rollout + ".zst"
+        os.makedirs(os.path.dirname(zst), exist_ok=True)
+        subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
+        real_batch = tc.BATCH_BYTES
+        tc.BATCH_BYTES = 60000
+        real_write = self.sx.CodexSync._write
+        calls = {"n": 0}
+
+        def killing(obj, *a, **k):
+            real_write(obj, *a, **k)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyboardInterrupt("killed after the first committed batch")
+
+        self.sx.CodexSync._write = killing
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        finally:
+            self.sx.CodexSync._write = real_write
+        partial = len(self.rows())
+        self.assertGreater(partial, 0)
+        self.assertLess(partial, 1200)
+        s2 = self.sync()
+        self.assertEqual(s2["unchanged"], 0, "a partially checkpointed .zst was skipped as unchanged")
+        self.assertEqual(len(self.rows()), 1200)
+        s3 = self.sync()
+        self.assertEqual(s3["unchanged"], 1)
+        self.assertEqual(len(self.rows()), 1200)
+        self.assertEqual(len({r[1] for r in self.rows()}), 1200)
+        tc.BATCH_BYTES = real_batch
+
+    def test_seeded_rollout_archived_before_first_capture_is_not_projected(self):
+        """A manifest written for sessions/ still suppresses the same lines once the file is in archived_sessions/."""
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "seeded one"), msg("user", "seeded two"),
+                                     msg("user", "genuine child work")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": self.rollout,
+                                "first_line": 2, "last_line": 3}) + "\n")
+        archived = self.rollout.replace(os.sep + "sessions" + os.sep, os.sep + "archived_sessions" + os.sep)
+        os.makedirs(os.path.dirname(archived), exist_ok=True)
+        os.rename(self.rollout, archived)
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["genuine child work"])
+
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_seeded_rollout_captured_then_moved_and_compressed_adds_nothing(self):
+        """Seeded lines stay out of memory across a later archive move and .zst conversion."""
+        import subprocess
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "seeded one"), msg("user", "seeded two"),
+                                     msg("user", "genuine child work")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": self.rollout,
+                                "first_line": 2, "last_line": 3}) + "\n")
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["genuine child work"])
+        archived = self.rollout.replace(os.sep + "sessions" + os.sep, os.sep + "archived_sessions" + os.sep)
+        os.makedirs(os.path.dirname(archived), exist_ok=True)
+        subprocess.run([ZSTD, "-q", "-o", archived + ".zst", self.rollout], check=True)
+        os.remove(self.rollout)
+        self.sync()
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["genuine child work"])
+
     def test_seeded_record_still_advances_identity_state(self):
         """A seeded record's effect on the projector must match the replay path (no events, but state)."""
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "transplanted"),

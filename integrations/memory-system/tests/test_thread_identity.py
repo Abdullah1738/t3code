@@ -24,6 +24,18 @@ CREATE TABLE ardud_opencode_import(native_session_id TEXT PRIMARY KEY, thread_id
 """
 
 
+TURN_DDL = ("CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_turns(provider_turn_id TEXT PRIMARY KEY,"
+            " thread_id TEXT, provider_thread_id TEXT, node_id TEXT, run_attempt_id TEXT, ordinal INTEGER, status TEXT,"
+            " started_at TEXT, completed_at TEXT, payload_json TEXT)")
+
+
+def add_turn(con, turn_id, thread_id, provider_thread_id, node_id):
+    """A provider turn that ran at node_id on provider_thread_id: the link a child's parent chain resolves to."""
+    con.execute(TURN_DDL)
+    con.execute("INSERT INTO orchestration_v2_projection_provider_turns VALUES(?,?,?,?,NULL,1,'completed',NULL,NULL,'{}')",
+                (turn_id, thread_id, provider_thread_id, node_id))
+
+
 def thread(tid, title, parent=None, cwd="/repo", model="m"):
     return (tid, title, json.dumps({"worktreePath": cwd, "modelSelection": {"model": model},
                                     "lineage": {"parentThreadId": parent,
@@ -66,10 +78,11 @@ class IdentityTest(unittest.TestCase):
             s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?,?,?,?)",
                       (f"ptC{i}", tid, "claudeAgent", "claudeAgent", "claudeAgent",
                        json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": f"SESS-C{i}"}})))
+            add_turn(s, f"turn-{i}", prev, f"ptC{i-1}" if i > 1 else "ptR", f"node-{i-1}")
             s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
                       (f"sub{i}", prev, tid, "claudeAgent", "claudeAgent",
                        json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": f"agent-{i}"},
-                                   "providerThreadId": None})))
+                                   "parentNodeId": f"node-{i-1}", "providerThreadId": None})))
             prev = tid
         s.commit()
         s.close()
@@ -120,10 +133,11 @@ class IdentityTest(unittest.TestCase):
         s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('ptc','CP','claudeAgent','claudeAgent','claudeAgent',?)",
                   (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "SESS-PARENT"}}),))
         s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("CC", "Claude child", parent="CP"))
+        add_turn(s, "turn-cp", "CP", "ptc", "node-cp-root")
         s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
                   ("subC", "CP", "CC", "claudeAgent", "claudeAgent",
                    json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-7"},
-                               "providerThreadId": None, "threadId": "CP"})))
+                               "parentNodeId": "node-cp-root", "providerThreadId": None, "threadId": "CP"})))
         s.commit()
         s.close()
         ti.sync(self.mem, self.state)
@@ -165,6 +179,77 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0][2], rows[0][3]), ("CLAUDE-2", "AGT-MX"))
         self.assertNotEqual(rows[0][2], "ses_MX_OC")
+
+    def test_grandchild_under_claude_subagent_walks_to_the_owning_incarnation(self):
+        """Native children have no provider_threads rows, so a grandchild is found by walking the
+        parentNodeId chain: grandchild -> Claude subagent task node -> provider turn -> CLAUDE-2.
+        """
+        s = sqlite3.connect(self.state)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("GC", "Grand"))
+        s.execute("INSERT INTO ardud_opencode_import VALUES('ses_GC_OC','GC','2026-10-01')")
+
+        def pt(pid, drv, native):
+            s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?,?,?,?)",
+                      (pid, "GC", drv, drv, drv, json.dumps({"nativeThreadRef": {"driver": drv, "nativeId": native}})))
+
+        pt("gc-oc", "opencode", "ses_GC_OC")
+        pt("gc-cl1", "claudeAgent", "CLAUDE-G1")
+        pt("gc-cx", "codex", "CODEX-G")
+        pt("gc-cl2", "claudeAgent", "CLAUDE-G2")
+        s.execute("CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_turns(provider_turn_id TEXT PRIMARY KEY,"
+                  " thread_id TEXT, provider_thread_id TEXT, node_id TEXT, run_attempt_id TEXT, ordinal INTEGER, status TEXT,"
+                  " started_at TEXT, completed_at TEXT, payload_json TEXT)")
+        # the root node of the second Claude incarnation's turn
+        s.execute("INSERT INTO orchestration_v2_projection_provider_turns VALUES('gc-turn','GC','gc-cl2','node-root-cl2',NULL,1,'completed',NULL,NULL,'{}')")
+        # a Claude subagent task (its own node id is task-node-A) spawned by that turn
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("GCH", "Claude subagent", parent="GC"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES('sub-A','GC','GCH','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"id": "task-node-A", "nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-A"},
+                               "parentNodeId": "node-root-cl2", "providerThreadId": None}),))
+        # the grandchild, spawned by task-node-A (not by a turn)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("GCC", "Grandchild", parent="GCH"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES('sub-B','GCH','GCC','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"id": "task-node-B", "nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-B"},
+                               "parentNodeId": "task-node-A", "providerThreadId": None}),))
+        # an unresolvable child: its parent node exists nowhere in the state
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("ORPH", "Orphan", parent="GC"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES('sub-C','GC','ORPH','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"id": "task-node-C", "nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-C"},
+                               "parentNodeId": "node-that-does-not-exist", "providerThreadId": None}),))
+        s.commit()
+        s.close()
+        ti.sync(self.mem, self.state)
+        grand = [r for r in self.aliases() if r[0] == "GCC"]
+        self.assertEqual(len(grand), 1)
+        self.assertEqual((grand[0][2], grand[0][3]), ("CLAUDE-G2", "AGT-B"))
+        self.assertNotEqual(grand[0][2], "ses_GC_OC")
+        self.assertEqual([r for r in self.aliases() if r[0] == "ORPH"], [])
+
+    def test_child_claimed_by_two_provider_threads_gets_no_alias(self):
+        """Two different provider threads ran a turn at the same chain node: the child is ambiguous and
+        gets no alias at all (logged), rather than a guess.
+        """
+        s = sqlite3.connect(self.state)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("AMB", "Ambiguous"))
+        s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('amb-1','AMB','claudeAgent','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "AMB-S1"}}),))
+        s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('amb-2','AMB','claudeAgent','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "AMB-S2"}}),))
+        add_turn(s, "amb-t1", "AMB", "amb-1", "node-shared")
+        add_turn(s, "amb-t2", "AMB", "amb-2", "node-shared")
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("AMBC", "Ambiguous child", parent="AMB"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES('amb-sub','AMB','AMBC','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-AMB"},
+                               "parentNodeId": "node-shared", "providerThreadId": None}),))
+        s.commit()
+        s.close()
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            ti.sync(self.mem, self.state)
+        self.assertEqual([r for r in self.aliases() if r[0] == "AMBC"], [])
+        self.assertIn("AMBC", buf.getvalue())
+        self.assertIn("provider threads claim", buf.getvalue())
 
     def test_refresh_updates_title_and_bumps_revision_without_new_rows(self):
         ti.sync(self.mem, self.state)

@@ -101,41 +101,49 @@ def gather(state):
         out.append(dict(canonical=tid, native=native, agent=None, driver=driver or _str(ref.get("driver")),
                         instance=instance or _str(p.get("providerInstanceId")),
                         model=threads.get(tid, {}).get("model")))
-    # Owning incarnation of each child. One app thread can have several provider rows (one per
-    # harness incarnation: OpenCode, then Claude, then Codex, ...). A subagent belongs to the
-    # provider thread that ran its parent node: subagent.parentNodeId -> provider_turns.node_id
-    # -> provider_thread_id -> that row's native session. Read-only, verified against live state.
-    # Only when no turn links the node does the app-thread fallback apply.
+    # A child's owning incarnation is found by walking its parentNodeId chain upward until a node
+    # is a provider turn's node: that turn's provider thread ran the child. A grandchild under a
+    # Claude subagent points at the subagent's task node, which points at the turn, so the walk
+    # follows task nodes. No app-thread fallback: a child that resolves to nothing, or to two
+    # different provider threads, gets NO alias (logged), never a guessed one.
     by_provider = {pt_id: (native, driver, instance) for pt_id, native, driver, instance in state.execute(
         "SELECT provider_thread_id, json_extract(payload_json,'$.nativeThreadRef.nativeId'), driver, provider_instance_id"
         " FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id IS NOT NULL")}
-    owner_of_node = {}
+    turn_owner = {}  # node_id -> set of provider threads that ran a turn at that node
     has_turns = state.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orchestration_v2_projection_provider_turns'"
     ).fetchone()
-    if has_turns:  # an older or partial state DB has no turn table: every child uses the fallback
+    if has_turns:
         for node_id, provider_thread_id in state.execute(
             "SELECT node_id, provider_thread_id FROM orchestration_v2_projection_provider_turns"
         ):
-            owner_of_node.setdefault(node_id, provider_thread_id)
-    for child_tid, parent_tid, payload, driver, instance in state.execute(
+            turn_owner.setdefault(node_id, set()).add(provider_thread_id)
+    task_parent = {}  # a subagent's own task node id -> its parentNodeId
+    subagent_rows = list(state.execute(
         "SELECT child_thread_id, thread_id, payload_json, driver, provider_instance_id"
-        " FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"
-    ):
+        " FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"))
+    for _c, _p, payload, _d, _i in subagent_rows:
+        pj = _j(payload)
+        if _str(pj.get("id")) and _str(pj.get("parentNodeId")):
+            task_parent[_str(pj.get("id"))] = _str(pj.get("parentNodeId"))
+    for child_tid, parent_tid, payload, driver, instance in subagent_rows:
         p = _j(payload)
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
         task = _str(ref.get("nativeId"))
         if not task:
             continue  # no native task id: nothing native to key this child by
-        parent = None
-        owning_pt = owner_of_node.get(_str(p.get("parentNodeId")))
-        if owning_pt and owning_pt in by_provider and by_provider[owning_pt][0]:
-            parent = by_provider[owning_pt]
-        else:
-            parent = native_of.get(parent_tid)  # fallback: the app thread's first native session
-        if not parent or not parent[0]:
+        owners = resolve_owner(_str(p.get("parentNodeId")), turn_owner, task_parent)
+        if owners is None:
+            log_unresolved(child_tid, "no provider turn in the parent chain")
             continue
-        parent_native, parent_driver, parent_instance = parent
+        if len(owners) != 1:
+            log_unresolved(child_tid, f"{len(owners)} provider threads claim the parent chain")
+            continue
+        pt = next(iter(owners))
+        if pt not in by_provider or not by_provider[pt][0]:
+            log_unresolved(child_tid, "owning provider thread has no native session")
+            continue
+        parent_native, parent_driver, parent_instance = by_provider[pt]
         out.append(dict(canonical=child_tid, native=parent_native, agent=task,
                         driver=driver or parent_driver or _str(ref.get("driver")),
                         instance=instance or parent_instance, model=None))
@@ -148,6 +156,32 @@ def gather(state):
         row["model"] = row.get("model") or t.get("model")
         row["root"] = _root_of(row["canonical"], threads)
     return out
+
+
+MAX_CHAIN = 200
+
+
+def resolve_owner(node_id, turn_owner, task_parent):
+    """Walk up from a parent node until a provider turn's node is found.
+
+    Returns the set of provider threads that ran a turn at that node, or None when no turn
+    is reached. Cycle-safe (a visited set) and depth-capped at MAX_CHAIN hops.
+    """
+    seen = set()
+    cur = node_id
+    for _ in range(MAX_CHAIN):
+        if not cur or cur in seen:
+            return None
+        seen.add(cur)
+        if cur in turn_owner:
+            return turn_owner[cur]
+        cur = task_parent.get(cur)
+    return None
+
+
+def log_unresolved(child_tid, reason):
+    """A child that cannot be bound gets no alias; the reason goes to stderr for the tick log."""
+    print(f"thread identity: no alias for child {child_tid}: {reason}", file=sys.stderr, flush=True)
 
 
 def _root_of(tid, threads, limit=200):

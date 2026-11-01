@@ -253,9 +253,14 @@ class CodexSync:
 
     @staticmethod
     def _zst_unchanged(known, st):
-        """A .zst is written once and never edited in place, so its inode and size identify it."""
+        """A .zst is written once and never edited in place, so its inode and size identify it.
+
+        The shortcut is taken only when the last pass reached the end of the decompressed stream
+        (complete). A pass killed partway leaves complete = 0 and the next tick finishes the file.
+        """
         return bool(known and known["error"] is None and known["quarantined_until"] <= time.time()
-                    and known["inode"] == st.st_ino and known["phys_size"] == st.st_size and known["offset"])
+                    and known["inode"] == st.st_ino and known["phys_size"] == st.st_size and known["offset"]
+                    and known["complete"])
 
     def sync_file(self, path, st):
         key = self.key_of(path)
@@ -280,11 +285,11 @@ class CodexSync:
 
     def _latest(self, key):
         row = self.mem.execute(
-            "SELECT rep_id, offset, phys_size, inode, error, quarantined_until FROM native_capture_files"
+            "SELECT rep_id, offset, phys_size, inode, error, quarantined_until, complete FROM native_capture_files"
             " WHERE logical=? AND retired=0 ORDER BY rep_id DESC LIMIT 1", (key,)).fetchone()
         if not row:
             return None
-        return dict(zip(("rep_id", "offset", "phys_size", "inode", "error", "quarantined_until"), row))
+        return dict(zip(("rep_id", "offset", "phys_size", "inode", "error", "quarantined_until", "complete"), row))
 
     @staticmethod
     def _plain_unchanged(path, st, rep):
@@ -333,13 +338,14 @@ class CodexSync:
                     for row in proj.feed(rec, line_no, line_sha=tc.raw_sha1(line)):
                         batch_rows.append(row)
             if sum(len(x[0]) for x in batch_raw) >= tc.BATCH_BYTES:
-                self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no)
+                self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=False)
                 batch_rows, batch_raw = [], []
-        if batch_raw or batch_end != rep["offset"]:
-            self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no)
+        # the loop ran to the end of the stream: this final commit is the one that marks it complete
+        if batch_raw or batch_end != rep["offset"] or not rep.get("complete"):
+            self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=True)
         self.stats["skipped_inherited"] += proj.inherited
 
-    def _write(self, path, logical, rep, pos, st, proj, events, raw, lines_total):
+    def _write(self, path, logical, rep, pos, st, proj, events, raw, lines_total, eof=False):
         def txn():
             if raw:
                 self.mem.executemany(
@@ -356,7 +362,8 @@ class CodexSync:
                       json.dumps(m, ensure_ascii=False)) for tid, spk, ctype, text, model, m, ts in events],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
-                         tail=tc.tail_sha1(path, pos) if pos and not path.endswith(tc.ZST) else None)
+                         tail=tc.tail_sha1(path, pos) if pos and not path.endswith(tc.ZST) else None,
+                         complete=eof)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)

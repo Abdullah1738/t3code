@@ -65,10 +65,12 @@ def seeded_path():
 
 
 def load_seeded(path=None):
-    """{native_session_id: [(first_line, last_line, file_name|None), ...]} from an optional JSONL manifest.
+    """{native_session_id: [(first_line, last_line, seed_stem|None), ...]} from an optional JSONL manifest.
 
     The card that writes seeded.jsonl owns its format; a missing file means
-    nothing is seeded, and a malformed line is ignored rather than fatal.
+    nothing is seeded, and a malformed line is ignored rather than fatal. The
+    file part of an entry is reduced to its seed stem (see tc.seed_stem), the
+    same normalisation applied to the live file it is matched against.
     """
     out = {}
     try:
@@ -79,7 +81,7 @@ def load_seeded(path=None):
         for line in f:
             try:
                 e = json.loads(line)
-                file_hint = tc.logical_name(e["path"]) if isinstance(e.get("path"), str) and e["path"] else None
+                file_hint = tc.seed_stem(e["path"]) if isinstance(e.get("path"), str) and e["path"] else None
                 out.setdefault(e["native_session_id"], []).append((int(e["first_line"]), int(e["last_line"]), file_hint))
             except (ValueError, KeyError, TypeError):
                 continue
@@ -195,8 +197,8 @@ def is_seeded(seeded, path, line_no, key):
     """
     if not isinstance(key, str):
         return False
-    # Compare logical names: a transcript that became .jsonl.zst (or moved archives) keeps its range.
-    base = tc.logical_name(path)
+    # Compare seed stems: a transcript that became .jsonl.zst or moved archives keeps its range.
+    base = tc.seed_stem(path)
     for first, last, file_hint in seeded.get(key, ()):
         if (not file_hint or file_hint == base) and first <= line_no <= last:
             return True

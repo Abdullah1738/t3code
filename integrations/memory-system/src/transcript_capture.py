@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS native_capture_files(
   head_len INTEGER NOT NULL DEFAULT 0,
   head_sha1 TEXT,
   tail_sha1 TEXT,
+  complete INTEGER NOT NULL DEFAULT 0,
   offset INTEGER NOT NULL DEFAULT 0,
   phys_size INTEGER,
   mtime REAL,
@@ -85,6 +86,20 @@ def logical_name(path, root=None):
     return os.sep.join(parts)
 
 
+def seed_stem(path):
+    """Identity used to match seeded (transplanted) ranges, independent of directory and compression.
+
+    The file stem of the rollout: 'rollout-X' for rollout-X.jsonl, rollout-X.jsonl.zst and a copy
+    moved between sessions/ and archived_sessions/. Both the manifest and the live file go through
+    this same function, so the two sides cannot normalise differently.
+    """
+    base = os.path.basename(path)
+    for ext in (ZST, ".jsonl"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    return base
+
+
 def zstd_bin():
     import shutil
 
@@ -126,9 +141,13 @@ def ensure_schema(con):
     cols = {r[1] for r in con.execute("PRAGMA table_info(native_capture_files)")}
     if "tail_sha1" not in cols:
         con.execute("ALTER TABLE native_capture_files ADD COLUMN tail_sha1 TEXT")
+    # complete = 1 only when the pass that committed it reached the end of the stream. A .zst
+    # checkpoint from a killed pass has complete = 0 and must not take the unchanged shortcut.
+    if "complete" not in cols:
+        con.execute("ALTER TABLE native_capture_files ADD COLUMN complete INTEGER NOT NULL DEFAULT 0")
 
 
-_COLS = ("rep_id", "head_len", "head_sha1", "tail_sha1", "offset", "phys_size", "mtime", "lines", "last_ok_at",
+_COLS = ("rep_id", "head_len", "head_sha1", "tail_sha1", "complete", "offset", "phys_size", "mtime", "lines", "last_ok_at",
          "error", "error_count", "quarantined_until", "inode")
 
 
@@ -251,11 +270,16 @@ def record_error(con, rep_id, message, now=None):
     )
 
 
-def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None):
-    """Commit a clean pass. `tail` is the tail checksum at `offset` (plain files), the value the next pass verifies."""
+def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None, complete=None):
+    """Commit a batch. `tail` is the tail checksum at `offset` (plain files), the value the next pass verifies.
+
+    `complete` says whether this batch reached the end of the stream. It is set to 1 only then,
+    and a later partial batch never clears it: a finished file stays finished unless it changes.
+    """
     now = int(time.time()) if now is None else now
     con.execute(
         "UPDATE native_capture_files SET offset=?, phys_size=?, mtime=?, lines=?, last_ok_at=?, error=NULL,"
-        " error_count=0, quarantined_until=0, tail_sha1=coalesce(?, tail_sha1) WHERE rep_id=?",
-        (offset, phys_size, mtime, lines, now, tail, rep_id),
+        " error_count=0, quarantined_until=0, tail_sha1=coalesce(?, tail_sha1),"
+        " complete=CASE WHEN ? THEN 1 ELSE 0 END WHERE rep_id=?",
+        (offset, phys_size, mtime, lines, now, tail, 1 if complete else 0, rep_id),
     )
