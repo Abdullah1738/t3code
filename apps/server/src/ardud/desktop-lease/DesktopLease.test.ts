@@ -34,6 +34,15 @@ function setup() {
   return { dir, filename, open, addTime: (ms: number) => { now += ms; } };
 }
 
+function pollFor(addTime: (ms: number) => void, duration: number, poll: () => void) {
+  while (duration > 0) {
+    const step = Math.min(duration, 15_000);
+    addTime(step);
+    poll();
+    duration -= step;
+  }
+}
+
 const caller = (id: string): Caller => ({
   rootThreadId: `root-${id}`,
   robobThreadId: `child-${id}`,
@@ -72,6 +81,90 @@ describe("desktop lease", () => {
     expect(a.acquire(caller("3"), request("3"))).toMatchObject({ state: "queued", position: 2 });
     expect(b.acquire(caller("2"), request("2"))).toMatchObject({ ticket: second.ticket, state: "held" });
     expect(b.status().lease).toMatchObject({ ticket: second.ticket, childThreadId: "child-2" });
+  });
+
+  it("cancels an abandoned head without blocking a polling successor across stores", () => {
+    const { open, addTime } = setup();
+    const firstStore = open();
+    const secondStore = open();
+    const held = firstStore.acquire(caller("1"), request("1"));
+    const abandoned = secondStore.acquire(caller("2"), request("2"));
+    const waiting = firstStore.acquire(caller("3"), request("3"));
+
+    pollFor(addTime, STALE_MS - 1, () => {
+      firstStore.heartbeat(caller("1"), held.ticket);
+      expect(secondStore.acquire(caller("3"), request("3")))
+        .toMatchObject({ ticket: waiting.ticket, state: "queued", position: 2 });
+    });
+    expect(firstStore.status().queue.map(({ ticket }) => ticket))
+      .toEqual([abandoned.ticket, waiting.ticket]);
+    addTime(1);
+    expect(secondStore.acquire(caller("3"), request("3")))
+      .toMatchObject({ ticket: waiting.ticket, state: "queued", position: 1 });
+    expect(firstStore.release(caller("1"), held.ticket).lease).toBeNull();
+    expect(secondStore.acquire(caller("3"), request("3")))
+      .toMatchObject({ ticket: waiting.ticket, state: "held" });
+    expect(open().acquire(caller("2"), request("2")))
+      .toMatchObject({ ticket: abandoned.ticket, state: "cancelled", position: null });
+    const replacement = firstStore.acquire(caller("2"), request("replacement"));
+    expect(replacement).toMatchObject({ state: "queued", position: 1 });
+    expect(replacement.ticket).not.toBe(abandoned.ticket);
+  });
+
+  it("keeps polling callers in FIFO order for longer than the queue deadline", () => {
+    const { open, addTime } = setup();
+    const firstStore = open();
+    const secondStore = open();
+    const held = firstStore.acquire(caller("1"), request("1"));
+    const head = secondStore.acquire(caller("2"), request("2"));
+    const next = firstStore.acquire(caller("3"), request("3"));
+    pollFor(addTime, STALE_MS * 2, () => {
+      firstStore.heartbeat(caller("1"), held.ticket);
+      expect(secondStore.acquire(caller("2"), request("2")))
+        .toMatchObject({ ticket: head.ticket, state: "queued", position: 1 });
+      expect(firstStore.acquire(caller("3"), request("3")))
+        .toMatchObject({ ticket: next.ticket, state: "queued", position: 2 });
+    });
+    secondStore.release(caller("1"), held.ticket);
+    expect(firstStore.acquire(caller("3"), request("3")))
+      .toMatchObject({ ticket: next.ticket, state: "queued", position: 2 });
+    expect(secondStore.acquire(caller("2"), request("2")))
+      .toMatchObject({ ticket: head.ticket, state: "held" });
+  });
+
+  it("does not revive a queue entry whose own first retry is at the deadline", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    const abandoned = store.acquire(caller("2"), request("2"));
+    store.release(caller("1"), held.ticket);
+    addTime(STALE_MS);
+    expect(store.acquire(caller("2"), request("2")))
+      .toMatchObject({ ticket: abandoned.ticket, state: "cancelled", position: null });
+    expect(store.acquire(caller("2"), request("new"))).toMatchObject({ state: "held" });
+  });
+
+  it("expires non-head waiters without changing an open call or the stopping holder", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "open-call");
+    const head = store.acquire(caller("2"), request("2"));
+    const abandoned = store.acquire(caller("3"), request("3"));
+    expect(store.release(caller("1"), held.ticket).lease?.state).toBe("stopping");
+    pollFor(addTime, STALE_MS, () => {
+      expect(store.acquire(caller("2"), request("2")))
+        .toMatchObject({ ticket: head.ticket, state: "queued", position: 1 });
+    });
+    expect(store.status()).toMatchObject({
+      lease: { ticket: held.ticket, state: "stopping" },
+      queue: [{ ticket: head.ticket }],
+    });
+    expect(store.acquire(caller("3"), request("3")))
+      .toMatchObject({ ticket: abandoned.ticket, state: "cancelled" });
+    expect(store.callEnd("open-call", "completed").lease).toBeNull();
+    expect(store.acquire(caller("2"), request("2")))
+      .toMatchObject({ ticket: head.ticket, state: "held" });
   });
 
   it("keys idempotence to the exact caller and task without allowing changes or reviving a closed ticket", () => {
@@ -129,11 +222,13 @@ describe("desktop lease", () => {
     const store = open();
     const first = store.acquire(caller("1"), request("1"));
     const second = store.acquire(caller("2"), request("2"));
-    addTime(STALE_MS);
+    pollFor(addTime, STALE_MS - 15_000, () => store.acquire(caller("2"), request("2")));
+    addTime(15_000);
     conflict(() => store.heartbeat(caller("1"), first.ticket));
     addTime(-STALE_MS);
     expect(open().status().lease?.state).toBe("stopping");
-    addTime(STALE_MS + 9 * 60_000);
+    addTime(STALE_MS);
+    pollFor(addTime, 9 * 60_000, () => store.acquire(caller("2"), request("2")));
     expect(store.release(caller("1"), first.ticket).lease?.state).toBe("stopping");
     expect(store.acquire(caller("2"), request("2"))).toMatchObject({ ticket: second.ticket, state: "queued" });
     addTime(60_000 - 1);
@@ -149,11 +244,14 @@ describe("desktop lease", () => {
     const first = store.acquire(caller("1"), request("1"));
     store.callStart(caller("1"), "call-1");
     store.acquire(caller("2"), request("2"));
-    addTime(STALE_MS);
+    pollFor(addTime, STALE_MS - 15_000, () => store.acquire(caller("2"), request("2")));
+    addTime(15_000);
     expect(store.status().lease?.state).toBe("stopping");
     expect(store.release(caller("1"), first.ticket).lease?.state).toBe("stopping");
     expect(store.callEnd("call-1", "completed").lease?.state).toBe("stopping");
-    addTime(QUIET_MS - 1);
+    pollFor(addTime, QUIET_MS - 1, () => {
+      expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
+    });
     expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
     addTime(1);
     expect(store.acquire(caller("2"), request("2")).state).toBe("held");
@@ -166,7 +264,8 @@ describe("desktop lease", () => {
     store.callStart(caller("1"), "hanging-after-release");
     expect(store.release(caller("1"), first.ticket).lease?.state).toBe("stopping");
     store.acquire(caller("2"), request("2"));
-    addTime(QUIET_MS);
+    pollFor(addTime, QUIET_MS - 15_000, () => store.acquire(caller("2"), request("2")));
+    addTime(15_000);
     expect(store.callEnd("hanging-after-release", "failed").lease?.state).toBe("quarantined");
     expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
     store.reconcile(first.ticket, "operator checked");
@@ -182,6 +281,7 @@ describe("desktop lease", () => {
     for (let i = 0; i < 5; i++) {
       addTime(100_000);
       expect(store.heartbeat(caller("1"), first.ticket).lease?.state).toBe("held");
+      expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
     }
     addTime(100_000);
     expect(open().status().lease?.state).toBe("quarantined");
@@ -349,6 +449,53 @@ describe("desktop lease", () => {
     expect(FS.statSync(sharedDir).mode & 0o777).toBe(0o755);
   });
 
+  it("migrates the current old schema with a full grace period only once", () => {
+    const { filename, open, addTime } = setup();
+    const db = new DatabaseSync(filename);
+    try {
+      db.exec(`CREATE TABLE ardud_desktop_requests (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, ticket TEXT NOT NULL UNIQUE,
+        root_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL,
+        task_id TEXT NOT NULL, scope TEXT NOT NULL, mode TEXT NOT NULL,
+        request_state TEXT NOT NULL, lease_state TEXT, enqueued_at INTEGER NOT NULL,
+        acquired_at INTEGER, heartbeat_at INTEGER, stopping_at INTEGER,
+        stopping_reason TEXT, evidence TEXT,
+        UNIQUE (root_thread_id, child_thread_id, task_id));
+        CREATE TABLE ardud_desktop_calls (call_id TEXT PRIMARY KEY, ticket TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'failed')),
+          started_at INTEGER NOT NULL, ended_at INTEGER);
+        INSERT INTO ardud_desktop_requests VALUES
+          (1, 'holder', 'root-1', 'child-1', 'task-1', 'fixture app / window 1', 'native',
+           'held', 'held', 1749999400000, 1749999400000, 1750000000000, NULL, NULL, NULL),
+          (2, 'head', 'root-2', 'child-2', 'task-2', 'fixture app / window 1', 'native',
+           'queued', NULL, 1749999400000, NULL, NULL, NULL, NULL, NULL),
+          (3, 'abandoned', 'root-3', 'child-3', 'task-3', 'fixture app / window 1', 'native',
+           'queued', NULL, 1749999400000, NULL, NULL, NULL, NULL, NULL);
+        INSERT INTO ardud_desktop_calls VALUES ('existing-call', 'holder', 'started', 1750000000000, NULL);`);
+    } finally {
+      db.close();
+    }
+    const first = open();
+    expect(first.status()).toMatchObject({
+      lease: { ticket: "holder", state: "held" },
+      queue: [{ ticket: "head" }, { ticket: "abandoned" }],
+    });
+    addTime(60_000);
+    first.heartbeat(caller("1"), "holder");
+    expect(first.acquire(caller("2"), request("2"))).toMatchObject({ ticket: "head", state: "queued" });
+    addTime(30_000);
+    const second = open();
+    expect(second.status().queue).toHaveLength(2);
+    addTime(30_000);
+    expect(second.heartbeat(caller("1"), "holder").lease?.state).toBe("held");
+    expect(second.status().queue.map(({ ticket }) => ticket)).toEqual(["head"]);
+    expect(second.acquire(caller("3"), request("3")))
+      .toMatchObject({ ticket: "abandoned", state: "cancelled" });
+    expect(second.release(caller("1"), "holder").lease?.state).toBe("stopping");
+    expect(first.callEnd("existing-call", "completed").lease).toBeNull();
+    expect(second.acquire(caller("2"), request("2"))).toMatchObject({ ticket: "head", state: "held" });
+  });
+
   it("migrates the prototype without reviving old stops or reusing old call IDs", () => {
     const { filename, open, addTime } = setup();
     const db = new DatabaseSync(filename);
@@ -370,6 +517,9 @@ describe("desktop lease", () => {
         INSERT INTO ardud_desktop_requests VALUES (1, 'old', 'root-1', 'child-1', 'task-1',
           'fixture app / window 1', 'native', 'held', 'stopping', 1750000000000,
           1750000000000, 1750000000000, 1750000000000, 1, 'old evidence');
+        INSERT INTO ardud_desktop_requests VALUES (2, 'legacy-queued', 'root-2', 'child-2', 'task-2',
+          'fixture app / window 1', 'native', 'queued', NULL, 1749999400000,
+          NULL, NULL, NULL, 0, NULL);
         INSERT INTO ardud_desktop_calls VALUES ('old-call', 'old', 'uncertain',
           1750000000000, 1750000000000);`);
     } finally {
@@ -377,13 +527,16 @@ describe("desktop lease", () => {
     }
     const store = open();
     expect(store.status().lease).toMatchObject({ ticket: "old", state: "stopping" });
-    const next = store.acquire(caller("2"), request("1"));
-    expect(next.state).toBe("queued");
+    const next = store.acquire(caller("2"), request("2"));
+    expect(next).toMatchObject({ ticket: "legacy-queued", state: "queued" });
     expect(store.release(caller("1"), "old").lease?.state).toBe("stopping");
     expect(store.callEnd("old-call", "failed").lease?.state).toBe("stopping");
     conflict(() => store.reconcile("old", "premature"));
-    addTime(QUIET_MS);
-    expect(store.acquire(caller("2"), request("1"))).toMatchObject({ ticket: next.ticket, state: "held" });
+    pollFor(addTime, QUIET_MS - 1, () => {
+      expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
+    });
+    addTime(1);
+    expect(store.acquire(caller("2"), request("2"))).toMatchObject({ ticket: next.ticket, state: "held" });
     conflict(() => store.callStart(caller("2"), "old-call"));
   });
 });

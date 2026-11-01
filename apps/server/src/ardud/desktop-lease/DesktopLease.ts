@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 
 export const STALE_MS = 120_000;
 export const QUIET_MS = 600_000;
+export const QUEUE_POLL_TIMEOUT_MS = 120_000;
 export type DesktopMode = "native" | "cua-driver";
 export type LeaseState = "held" | "stopping" | "quarantined";
 export type RequestState = "queued" | LeaseState | "finished" | "cancelled";
@@ -124,6 +125,7 @@ const requestsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_requests (
   request_state TEXT NOT NULL CHECK (request_state IN ('queued', 'held', 'finished', 'cancelled')),
   lease_state TEXT CHECK (lease_state IN ('held', 'stopping', 'quarantined')),
   enqueued_at INTEGER NOT NULL,
+  last_polled_at INTEGER,
   acquired_at INTEGER,
   heartbeat_at INTEGER,
   stopping_at INTEGER,
@@ -193,6 +195,7 @@ export class DesktopLease {
       const oldRequests = requestColumns.length > 0 &&
         (requestColumns.some((column) => column.name === "quiescent") ||
           !requestColumns.some((column) => column.name === "stopping_reason"));
+      const hasLastPoll = requestColumns.some((column) => column.name === "last_polled_at");
       const calls = this.db.prepare(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ardud_desktop_calls'",
       ).get() as { sql: string } | undefined;
@@ -204,16 +207,26 @@ export class DesktopLease {
       }
       if (oldCalls) this.db.exec("ALTER TABLE ardud_desktop_calls RENAME TO ardud_desktop_calls_old");
       this.db.exec(`${requestsTable}; ${callsTable};`);
+      if (!oldRequests && requestColumns.length > 0 && !hasLastPoll) {
+        this.db.exec("ALTER TABLE ardud_desktop_requests ADD COLUMN last_polled_at INTEGER");
+      }
       if (oldRequests) {
         // Earlier stopped leases have no reliable release reason; retain the quiet window.
         this.db.exec(`INSERT INTO ardud_desktop_requests
           (seq, ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state,
-           lease_state, enqueued_at, acquired_at, heartbeat_at, stopping_at, stopping_reason, evidence)
+           lease_state, enqueued_at, acquired_at, heartbeat_at, stopping_at, stopping_reason, evidence,
+           last_polled_at)
           SELECT seq, ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state,
            lease_state, enqueued_at, acquired_at, heartbeat_at, stopping_at,
-           CASE WHEN lease_state IN ('stopping', 'quarantined') THEN 'stale' ELSE NULL END, evidence
+           CASE WHEN lease_state IN ('stopping', 'quarantined') THEN 'stale' ELSE NULL END, evidence,
+           ${hasLastPoll ? "last_polled_at" : "NULL"}
           FROM ardud_desktop_requests_old;
           DROP TABLE ardud_desktop_requests_old;`);
+      }
+      if (oldRequests || (requestColumns.length > 0 && !hasLastPoll)) {
+        // Existing waiters get a full poll interval after migration, not from their original enqueue.
+        this.db.prepare(`UPDATE ardud_desktop_requests SET last_polled_at = ?
+          WHERE request_state = 'queued' AND last_polled_at IS NULL`).run(this.now());
       }
       if (oldCalls) {
         this.db.exec(`INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at, ended_at)
@@ -285,6 +298,9 @@ export class DesktopLease {
   }
 
   private advance(now: number) {
+    // A returning caller at the deadline must observe cancellation, not revive its old ticket.
+    this.db.prepare(`UPDATE ardud_desktop_requests SET request_state = 'cancelled'
+      WHERE request_state = 'queued' AND last_polled_at <= ?`).run(now - QUEUE_POLL_TIMEOUT_MS);
     let holder = this.holder();
     if (!holder || holder.lease_state === "quarantined") return;
     if (holder.lease_state === "held" && now - holder.heartbeat_at! >= STALE_MS) {
@@ -346,12 +362,16 @@ export class DesktopLease {
         if (row.scope !== input.scope || row.mode !== input.mode) {
           return fail("This caller and taskId already have a different lease request.");
         }
+        if (row.request_state === "queued") {
+          this.db.prepare(`UPDATE ardud_desktop_requests SET last_polled_at = MAX(COALESCE(last_polled_at, ?), ?)
+            WHERE seq = ?`).run(now, now, row.seq);
+        }
       } else {
         const ticket = Crypto.randomUUID();
         this.db.prepare(`INSERT INTO ardud_desktop_requests
-          (ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state, enqueued_at)
-          VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`)
-          .run(ticket, caller.rootThreadId, caller.robobThreadId, input.taskId, input.scope, input.mode, now);
+          (ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state, enqueued_at, last_polled_at)
+          VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+          .run(ticket, caller.rootThreadId, caller.robobThreadId, input.taskId, input.scope, input.mode, now, now);
         row = this.byTicket(ticket);
       }
       if (row.request_state === "queued" && !this.holder()) {
