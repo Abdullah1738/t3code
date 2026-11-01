@@ -79,6 +79,16 @@ class RecallHomeTests(unittest.TestCase):
         for name in ("codex", "codex-cu"):
             self.seed_trust(self.root / name)
 
+    def test_unscoped_recall_is_not_generated_or_kept(self):
+        home = self.root / "codex-cu"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.toml").write_text('[mcp_servers.recall]\nurl = "http://127.0.0.1:18765/mcp"\n')
+        self.assertEqual(self.invoke("generate")[0], 0)
+        cfg = tomllib.loads((home / "config.toml").read_text())
+        self.assertNotIn("recall", cfg.get("mcp_servers", {}))
+        claude = json.loads((self.root / "claude" / ".claude.json").read_text())
+        self.assertNotIn("recall", claude.get("mcpServers", {}))
+
     def test_preserves_foreign_config_and_hooks_idempotently(self):
         claude = self.root / "claude"
         codex = self.root / "codex"

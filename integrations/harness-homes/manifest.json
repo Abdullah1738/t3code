@@ -19,7 +19,6 @@
   },
   "mcpServers": [
     {"id": "betterstack", "url": "https://mcp.betterstack.com", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
-    {"id": "recall", "url": "http://127.0.0.1:18765/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "perplexity", "command": "/Users/ardud/bin/perplexity-mcp", "args": [], "env": {}, "toolTimeoutSec": 660, "startupTimeoutSec": 30},
     {"id": "inbody", "command": "/Users/ardud/bin/inbody-mcp", "args": [], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "flighty", "command": "/opt/homebrew/bin/uv", "args": ["--directory", "/Users/ardud/.local/share/flighty-mcp", "run", "--quiet", "main.py"], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},

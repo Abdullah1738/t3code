@@ -682,6 +682,9 @@ def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]]
         config = deep_merge(config, {"features": {"hooks": True}})
     else:
         config = deep_merge(prior, defaults)
+    # Only the adapters can attach a thread identity; a home-level entry would
+    # silently turn a missing adapter override into anonymous self-recall.
+    config.get("mcp_servers", {}).pop("recall", None)
 
     files = {
         settings_path: json_bytes(settings),
@@ -863,6 +866,8 @@ def check(home_root: str | None) -> int:
         fail("codex config.toml: sandbox_mode is not \"danger-full-access\"")
     if not want_ids.issubset((config.get("mcp_servers") or {}).keys()):
         fail("codex config.toml: mcp_servers ids missing from manifest")
+    if "recall" in (config.get("mcp_servers") or {}):
+        fail("codex config.toml: unscoped recall must be removed")
     agents_md = read_bytes(os.path.join(codex, "AGENTS.md"))
     canonical = read_bytes(canonical_path)
     if canonical is None:
@@ -900,6 +905,8 @@ def check(home_root: str | None) -> int:
             positions = owned_hook_positions(actual_file.get("hooks", {}), expected_hooks,
                                              f"{home} hooks.json", fail)
             extra_config = tomllib.loads(Path(home, "config.toml").read_text(encoding="utf-8"))
+            if "recall" in (extra_config.get("mcp_servers") or {}):
+                fail(f"{home} config.toml: unscoped recall must be removed")
             features = extra_config.get("features", {})
             if not isinstance(features, dict) or features.get("hooks") is not True:
                 fail(f"{home} config.toml: features.hooks is not true")
