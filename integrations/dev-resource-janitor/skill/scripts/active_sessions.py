@@ -98,7 +98,9 @@ def _control_get(path, timeout=20):
 def robob_active(timeout=20):
     """Every active Robob thread, or (None, error). Pages past the 500 cap by widening nothing: the API has
     no cursor, so a result larger than one page is reported incomplete and the caller keeps everything."""
-    query = "/threads?" + urllib.parse.urlencode({"active": "true", "limit": CONTROL_PAGE})
+    # includeSubagents: the control API drops subagent threads by default, and a live subagent can own a worktree
+    # the reaper must keep.
+    query = "/threads?" + urllib.parse.urlencode({"active": "true", "includeSubagents": "true", "limit": CONTROL_PAGE})
     status, body = _control_get(query, timeout)
     if status == 0 and isinstance(body, str):
         return None, f"control api: {body}"

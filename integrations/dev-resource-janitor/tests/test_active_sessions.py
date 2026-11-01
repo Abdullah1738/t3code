@@ -115,6 +115,13 @@ class ActiveSetTests(unittest.TestCase):
         self.assertTrue(any("truncated" in p for p in snap["problems"]), snap["problems"])
         self.assertTrue(any("limit=500" in r for r in stub.requests))
 
+    def test_active_query_includes_subagent_threads(self):
+        # The control API drops subagent threads unless asked. A live subagent that owns a worktree must still be
+        # in the active set, or the reaper would remove it.
+        stub = self.serve(threads=[thread(1)], opencode={})
+        active.snapshot()
+        self.assertTrue(any("includeSubagents=true" in r for r in stub.requests), stub.requests)
+
     def test_exactly_one_full_page_with_matching_total_is_complete(self):
         self.serve(threads=[thread(i) for i in range(500)], total=500)
         snap = active.snapshot()
