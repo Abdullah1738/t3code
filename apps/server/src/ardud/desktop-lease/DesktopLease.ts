@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - this host-global database is deliberately separate from every server home.
+// @effect-diagnostics nodeBuiltinImport:off - the host-global store is separate from every server home.
 // @effect-diagnostics globalDate:off - the clock can be injected in tests.
 import * as Crypto from "node:crypto";
 import * as FS from "node:fs";
@@ -10,26 +10,50 @@ export const STALE_MS = 120_000;
 export const QUIET_MS = 600_000;
 export type DesktopMode = "native" | "cua-driver";
 export type LeaseState = "held" | "stopping" | "quarantined";
-export interface LeaseRequest {
+export type RequestState = "queued" | LeaseState | "finished" | "cancelled";
+export type CallOutcome = "completed" | "failed";
+
+/** This identity must come from the server's ExecutionIdentity resolver. */
+export interface Caller {
+  readonly robobThreadId: string;
   readonly rootThreadId: string;
-  readonly childThreadId: string;
+}
+
+export interface LeaseRequest {
   readonly taskId: string;
   readonly scope: string;
   readonly mode: DesktopMode;
 }
-export interface Lease extends LeaseRequest {
+
+interface IdentifiedRequest extends LeaseRequest {
+  readonly ticket: string;
+  readonly rootThreadId: string;
+  readonly childThreadId: string;
+}
+
+export interface Lease extends IdentifiedRequest {
   readonly acquiredAt: string;
   readonly heartbeatAt: string;
   readonly state: LeaseState;
 }
-export interface QueuedRequest extends LeaseRequest {
+
+export interface QueuedRequest extends IdentifiedRequest {
   readonly enqueuedAt: string;
   readonly position: number;
 }
+
 export interface LeaseStatus {
   readonly lease: Lease | null;
   readonly queue: ReadonlyArray<QueuedRequest>;
 }
+
+export interface AcquireResult {
+  readonly ticket: string;
+  readonly state: RequestState;
+  readonly position: number | null;
+  readonly status: LeaseStatus;
+}
+
 type Row = {
   seq: number;
   ticket: string;
@@ -44,14 +68,14 @@ type Row = {
   acquired_at: number | null;
   heartbeat_at: number | null;
   stopping_at: number | null;
-  quiescent: number;
+  stopping_reason: "stale" | "release" | null;
 };
+
+type CallRow = { ticket: string; state: "started" | CallOutcome };
+
 export class DesktopLeaseError extends Error {
   readonly code: "invalid_request" | "conflict" | "not_found";
-  constructor(
-    code: "invalid_request" | "conflict" | "not_found",
-    message: string,
-  ) {
+  constructor(code: "invalid_request" | "conflict" | "not_found", message: string) {
     super(message);
     this.code = code;
   }
@@ -66,8 +90,13 @@ const nonempty = (value: unknown, name: string) => {
   }
   return value;
 };
+const validateCaller = (caller: Caller) => {
+  nonempty(caller?.robobThreadId, "robobThreadId");
+  nonempty(caller?.rootThreadId, "rootThreadId");
+};
 const iso = (time: number | null) => new Date(time!).toISOString();
-const requestOf = (row: Row): LeaseRequest => ({
+const requestOf = (row: Row): IdentifiedRequest => ({
+  ticket: row.ticket,
   rootThreadId: row.root_thread_id,
   childThreadId: row.child_thread_id,
   taskId: row.task_id,
@@ -84,6 +113,32 @@ const leaseOf = (row: Row): Lease => ({
 export const defaultDesktopLeasePath = () =>
   Path.join(OS.userInfo().homedir, ".robob", "desktop-lease", "lease.sqlite");
 
+const requestsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_requests (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket TEXT NOT NULL UNIQUE,
+  root_thread_id TEXT NOT NULL,
+  child_thread_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('native', 'cua-driver')),
+  request_state TEXT NOT NULL CHECK (request_state IN ('queued', 'held', 'finished', 'cancelled')),
+  lease_state TEXT CHECK (lease_state IN ('held', 'stopping', 'quarantined')),
+  enqueued_at INTEGER NOT NULL,
+  acquired_at INTEGER,
+  heartbeat_at INTEGER,
+  stopping_at INTEGER,
+  stopping_reason TEXT CHECK (stopping_reason IN ('stale', 'release')),
+  evidence TEXT,
+  UNIQUE (root_thread_id, child_thread_id, task_id)
+)`;
+const callsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_calls (
+  call_id TEXT PRIMARY KEY,
+  ticket TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'failed')),
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER
+)`;
+
 /** One host-wide lock, independent of T3 home and project database. */
 export class DesktopLease {
   private readonly db: DatabaseSync;
@@ -94,48 +149,87 @@ export class DesktopLease {
     if (filename !== ":memory:") {
       const directory = Path.dirname(filename);
       FS.mkdirSync(directory, { recursive: true, mode: 0o700 });
-      // The live host-global database contains task scopes and fencing tickets.
-      if (options.filename === undefined) FS.chmodSync(directory, 0o700);
+      if (options.filename === undefined) {
+        FS.chmodSync(directory, 0o700);
+      } else if ((FS.statSync(directory).mode & 0o777) !== 0o700) {
+        // Do not chmod an arbitrary injected parent such as a shared temp directory.
+        throw new Error("Desktop lease directory must be private (0700).");
+      }
       const fd = FS.openSync(filename, "a", 0o600);
       try {
-        if (options.filename === undefined) FS.fchmodSync(fd, 0o600);
+        FS.fchmodSync(fd, 0o600);
       } finally {
         FS.closeSync(fd);
       }
     }
     this.now = options.now ?? Date.now;
     this.db = new DatabaseSync(filename);
-    // Failure to get the writer is a closed failure, never an uncoordinated grant.
-    this.db.exec(`PRAGMA busy_timeout = 1000; PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = FULL; PRAGMA fullfsync = ON;
-      CREATE TABLE IF NOT EXISTS ardud_desktop_requests (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticket TEXT NOT NULL UNIQUE,
-        root_thread_id TEXT NOT NULL,
-        child_thread_id TEXT NOT NULL,
-        task_id TEXT NOT NULL UNIQUE,
-        scope TEXT NOT NULL,
-        mode TEXT NOT NULL CHECK (mode IN ('native', 'cua-driver')),
-        request_state TEXT NOT NULL CHECK (request_state IN ('queued', 'held', 'finished', 'cancelled')),
-        lease_state TEXT CHECK (lease_state IN ('held', 'stopping', 'quarantined')),
-        enqueued_at INTEGER NOT NULL,
-        acquired_at INTEGER,
-        heartbeat_at INTEGER,
-        stopping_at INTEGER,
-        quiescent INTEGER NOT NULL DEFAULT 0 CHECK (quiescent IN (0, 1)),
-        evidence TEXT
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS ardud_desktop_one_holder
+    try {
+      // Failure to get the writer is a closed failure, never an uncoordinated grant.
+      this.db.exec(`PRAGMA busy_timeout = 1000; PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = FULL; PRAGMA fullfsync = ON;`);
+      this.initialize();
+      if (filename !== ":memory:") {
+        for (const suffix of ["-wal", "-shm"]) {
+          try {
+            FS.chmodSync(filename + suffix, 0o600);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  private initialize() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const requestColumns = this.db.prepare("PRAGMA table_info(ardud_desktop_requests)").all() as {
+        name: string;
+      }[];
+      const oldRequests = requestColumns.length > 0 &&
+        (requestColumns.some((column) => column.name === "quiescent") ||
+          !requestColumns.some((column) => column.name === "stopping_reason"));
+      const calls = this.db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ardud_desktop_calls'",
+      ).get() as { sql: string } | undefined;
+      const oldCalls = calls !== undefined && !calls.sql.includes("'failed'");
+      if (oldRequests) {
+        this.db.exec(`ALTER TABLE ardud_desktop_requests RENAME TO ardud_desktop_requests_old;
+          DROP INDEX IF EXISTS ardud_desktop_one_holder;
+          DROP INDEX IF EXISTS ardud_desktop_one_child;`);
+      }
+      if (oldCalls) this.db.exec("ALTER TABLE ardud_desktop_calls RENAME TO ardud_desktop_calls_old");
+      this.db.exec(`${requestsTable}; ${callsTable};`);
+      if (oldRequests) {
+        // Earlier stopped leases have no reliable release reason; retain the quiet window.
+        this.db.exec(`INSERT INTO ardud_desktop_requests
+          (seq, ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state,
+           lease_state, enqueued_at, acquired_at, heartbeat_at, stopping_at, stopping_reason, evidence)
+          SELECT seq, ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state,
+           lease_state, enqueued_at, acquired_at, heartbeat_at, stopping_at,
+           CASE WHEN lease_state IN ('stopping', 'quarantined') THEN 'stale' ELSE NULL END, evidence
+          FROM ardud_desktop_requests_old;
+          DROP TABLE ardud_desktop_requests_old;`);
+      }
+      if (oldCalls) {
+        this.db.exec(`INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at, ended_at)
+          SELECT call_id, ticket, CASE WHEN state = 'uncertain' THEN 'failed' ELSE state END,
+            started_at, ended_at FROM ardud_desktop_calls_old;
+          DROP TABLE ardud_desktop_calls_old;`);
+      }
+      this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ardud_desktop_one_holder
         ON ardud_desktop_requests(request_state) WHERE request_state = 'held';
-      CREATE UNIQUE INDEX IF NOT EXISTS ardud_desktop_one_child
-        ON ardud_desktop_requests(child_thread_id) WHERE request_state IN ('queued', 'held');
-      CREATE TABLE IF NOT EXISTS ardud_desktop_calls (
-        call_id TEXT PRIMARY KEY,
-        ticket TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'uncertain')),
-        started_at INTEGER NOT NULL,
-        ended_at INTEGER
-      );`);
+        CREATE INDEX IF NOT EXISTS ardud_desktop_open_calls
+        ON ardud_desktop_calls(ticket, started_at) WHERE state = 'started';
+        COMMIT;`);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   close() {
@@ -145,13 +239,11 @@ export class DesktopLease {
   private transaction<T>(f: (now: number) => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const now = this.now();
-      const result = f(now);
+      const result = f(this.now());
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
-      // Rejected requests must not roll back a stale holder's stop/quarantine.
-      // Every domain rejection occurs before its own mutation.
+      // Domain rejections follow any stale transition, but precede their own mutation.
       this.db.exec(error instanceof DesktopLeaseError ? "COMMIT" : "ROLLBACK");
       throw error;
     }
@@ -172,11 +264,20 @@ export class DesktopLease {
     return row;
   }
 
-  private byTask(taskId: string) {
-    nonempty(taskId, "taskId");
-    const row = this.one("SELECT * FROM ardud_desktop_requests WHERE task_id = ?", taskId);
-    if (!row) throw new DesktopLeaseError("not_found", "Unknown desktop lease task.");
+  private ownedHolder(caller: Caller, ticket: string) {
+    const row = this.byTicket(ticket);
+    if (
+      row.request_state !== "held" ||
+      row.root_thread_id !== caller.rootThreadId ||
+      row.child_thread_id !== caller.robobThreadId
+    ) return fail("Only the current lease holder may perform this operation.");
     return row;
+  }
+
+  private hasOpenCall(ticket: string) {
+    return this.db.prepare(
+      "SELECT 1 FROM ardud_desktop_calls WHERE ticket = ? AND state = 'started' LIMIT 1",
+    ).get(ticket) !== undefined;
   }
 
   private finish(row: Row) {
@@ -185,28 +286,39 @@ export class DesktopLease {
 
   private advance(now: number) {
     let holder = this.holder();
-    if (holder?.lease_state === "held" && now - holder.heartbeat_at! >= STALE_MS) {
-      this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'stopping', stopping_at = ? WHERE seq = ?").run(now, holder.seq);
-      holder = this.holder();
+    if (!holder || holder.lease_state === "quarantined") return;
+    if (holder.lease_state === "held" && now - holder.heartbeat_at! >= STALE_MS) {
+      this.db.prepare(`UPDATE ardud_desktop_requests
+        SET lease_state = 'stopping', stopping_at = ?, stopping_reason = 'stale' WHERE seq = ?`)
+        .run(now, holder.seq);
+      holder = this.holder()!;
     }
-    if (holder?.lease_state === "stopping" && now - holder.stopping_at! >= QUIET_MS) {
-      if (holder.quiescent === 1) {
+    // On-demand checks enforce the age limit even while a caller heartbeats.
+    const expiredCall = this.db.prepare(`SELECT 1 FROM ardud_desktop_calls
+      WHERE ticket = ? AND state = 'started' AND started_at <= ? LIMIT 1`)
+      .get(holder.ticket, now - QUIET_MS);
+    if (expiredCall) {
+      this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'quarantined' WHERE seq = ?")
+        .run(holder.seq);
+      return;
+    }
+    if (holder.lease_state === "stopping" && !this.hasOpenCall(holder.ticket)) {
+      if (holder.stopping_reason === "release" || now - holder.stopping_at! >= QUIET_MS) {
         this.finish(holder);
-        holder = undefined;
-      } else {
-        this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'quarantined' WHERE seq = ?").run(holder.seq);
       }
     }
-    // A queued child may have been cancelled or its parent may have crashed.
-    // Only its own retry can activate the head, never an unrelated release.
   }
 
   private snapshot(): LeaseStatus {
     const holder = this.holder();
-    const queued = this.db.prepare("SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq").all() as Row[];
+    const queued = this.db.prepare(
+      "SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq",
+    ).all() as Row[];
     return {
       lease: holder ? leaseOf(holder) : null,
-      queue: queued.map((row, index) => ({ ...requestOf(row), enqueuedAt: iso(row.enqueued_at), position: index + 1 })),
+      queue: queued.map((row, index) => ({
+        ...requestOf(row), enqueuedAt: iso(row.enqueued_at), position: index + 1,
+      })),
     };
   }
 
@@ -217,28 +329,29 @@ export class DesktopLease {
     });
   }
 
-  acquire(input: LeaseRequest): { ticket: string; state: "queued" | LeaseState; status: LeaseStatus } {
-    for (const key of ["rootThreadId", "childThreadId", "taskId", "scope"] as const) nonempty(input[key], key);
+  acquire(caller: Caller, input: LeaseRequest): AcquireResult {
+    validateCaller(caller);
+    nonempty(input?.taskId, "taskId");
+    nonempty(input?.scope, "scope");
     if (input.mode !== "native" && input.mode !== "cua-driver") {
       throw new DesktopLeaseError("invalid_request", "mode must be native or cua-driver.");
     }
     return this.transaction((now) => {
       this.advance(now);
-      let row = this.one("SELECT * FROM ardud_desktop_requests WHERE task_id = ?", input.taskId);
+      let row = this.one(`SELECT * FROM ardud_desktop_requests
+        WHERE root_thread_id = ? AND child_thread_id = ? AND task_id = ?`,
+        caller.rootThreadId, caller.robobThreadId, input.taskId);
       if (row) {
-        const previous = requestOf(row);
-        if (Object.keys(previous).some((key) => previous[key as keyof LeaseRequest] !== input[key as keyof LeaseRequest])) {
-          return fail("taskId already belongs to a different lease request.");
+        // Terminal retries are observable but must not create an obsolete queue entry.
+        if (row.scope !== input.scope || row.mode !== input.mode) {
+          return fail("This caller and taskId already have a different lease request.");
         }
-        if (row.request_state !== "queued" && row.request_state !== "held") return fail("This task's lease is already closed.");
       } else {
-        const activeChild = this.one("SELECT * FROM ardud_desktop_requests WHERE child_thread_id = ? AND request_state IN ('queued', 'held')", input.childThreadId);
-        if (activeChild) return fail("This child already has a desktop request.");
         const ticket = Crypto.randomUUID();
         this.db.prepare(`INSERT INTO ardud_desktop_requests
           (ticket, root_thread_id, child_thread_id, task_id, scope, mode, request_state, enqueued_at)
-          VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`).run(ticket, input.rootThreadId, input.childThreadId, input.taskId, input.scope, input.mode, now);
-        this.advance(now);
+          VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`)
+          .run(ticket, caller.rootThreadId, caller.robobThreadId, input.taskId, input.scope, input.mode, now);
         row = this.byTicket(ticket);
       }
       if (row.request_state === "queued" && !this.holder()) {
@@ -249,128 +362,98 @@ export class DesktopLease {
           row = this.byTicket(row.ticket);
         }
       }
-      return { ticket: row.ticket, state: row.request_state === "queued" ? "queued" : row.lease_state!, status: this.snapshot() };
+      const status = this.snapshot();
+      return {
+        ticket: row.ticket,
+        state: row.request_state === "held" ? row.lease_state! : row.request_state,
+        position: status.queue.find((request) => request.ticket === row.ticket)?.position ?? null,
+        status,
+      };
     });
   }
 
-  heartbeat(ticket: string): LeaseStatus {
+  heartbeat(caller: Caller, ticket: string): LeaseStatus {
+    validateCaller(caller);
     return this.transaction((now) => {
       this.advance(now);
-      const row = this.byTicket(ticket);
-      if (row.request_state !== "held" || row.lease_state !== "held") return fail("Lease is not held; do not start desktop work.");
+      const row = this.ownedHolder(caller, ticket);
+      if (row.lease_state !== "held") return fail("Lease is not held; do not start desktop work.");
       this.db.prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?").run(now, row.seq);
       return this.snapshot();
     });
   }
 
-  /** Stop never revokes a running native operation. It prevents new authorized starts. */
-  stop(ticket: string): LeaseStatus {
+  release(caller: Caller, ticket: string): LeaseStatus {
+    validateCaller(caller);
     return this.transaction((now) => {
       this.advance(now);
-      const row = this.byTicket(ticket);
-      if (row.request_state === "queued") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET request_state = 'cancelled' WHERE seq = ?").run(row.seq);
-      } else if (row.request_state === "held" && row.lease_state === "held") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'stopping', stopping_at = ? WHERE seq = ?").run(now, row.seq);
-      }
-      this.advance(now);
-      return this.snapshot();
-    });
-  }
-
-  /** Called by the delegation lifecycle when a pending or active task is stopped. */
-  stopTask(taskId: string): LeaseStatus {
-    return this.transaction((now) => {
-      this.advance(now);
-      const row = this.byTask(taskId);
-      if (row.request_state === "queued") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET request_state = 'cancelled' WHERE seq = ?").run(row.seq);
-      } else if (row.request_state === "held" && row.lease_state === "held") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'stopping', stopping_at = ? WHERE seq = ?").run(now, row.seq);
-      }
-      return this.snapshot();
-    });
-  }
-
-  /** A release is only final after an independent quiescence proof. */
-  release(ticket: string): LeaseStatus {
-    return this.transaction((now) => {
-      this.advance(now);
-      const row = this.byTicket(ticket);
-      if (row.request_state === "queued") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET request_state = 'cancelled' WHERE seq = ?").run(row.seq);
-      } else if (row.request_state === "held") {
-        if (row.quiescent === 1 && row.lease_state !== "held" && now - row.stopping_at! >= QUIET_MS) {
+      const row = this.ownedHolder(caller, ticket);
+      if (row.lease_state === "held") {
+        if (this.hasOpenCall(ticket)) {
+          this.db.prepare(`UPDATE ardud_desktop_requests SET lease_state = 'stopping',
+            stopping_at = ?, stopping_reason = 'release' WHERE seq = ?`).run(now, row.seq);
+        } else {
           this.finish(row);
-        } else if (row.lease_state === "held") {
-          this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'stopping', stopping_at = ? WHERE seq = ?").run(now, row.seq);
         }
       }
-      this.advance(now);
+      // A stale or quarantined lease cannot be accelerated by a manual release.
       return this.snapshot();
     });
   }
 
-  startCall(ticket: string, callId: string): LeaseStatus {
-    nonempty(callId, "callId");
+  callStart(caller: Caller, toolUseId: string): LeaseStatus {
+    validateCaller(caller);
+    nonempty(toolUseId, "toolUseId");
     return this.transaction((now) => {
       this.advance(now);
-      const row = this.byTicket(ticket);
-      if (row.request_state !== "held" || row.lease_state !== "held") return fail("Lease is not held; do not start desktop work.");
-      if (this.db.prepare("SELECT 1 FROM ardud_desktop_calls WHERE call_id = ?").get(callId)) return fail("callId was already used; do not replay the call.");
-      if (this.db.prepare("SELECT 1 FROM ardud_desktop_calls WHERE ticket = ? AND state = 'started'").get(ticket)) return fail("Another desktop call has not completed.");
-      this.db.prepare("INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at) VALUES (?, ?, 'started', ?)").run(callId, ticket, now);
+      const row = this.holder();
+      if (
+        !row || row.lease_state !== "held" ||
+        row.root_thread_id !== caller.rootThreadId || row.child_thread_id !== caller.robobThreadId
+      ) return fail("Only the current lease holder may start desktop work.");
+      if (this.db.prepare("SELECT 1 FROM ardud_desktop_calls WHERE call_id = ?").get(toolUseId)) {
+        return fail("toolUseId was already used; do not replay the call.");
+      }
+      this.db.prepare("INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at) VALUES (?, ?, 'started', ?)")
+        .run(toolUseId, row.ticket, now);
       return this.snapshot();
     });
   }
 
-  endCall(ticket: string, callId: string, outcome: "completed" | "uncertain"): LeaseStatus {
-    nonempty(callId, "callId");
-    if (outcome !== "completed" && outcome !== "uncertain") throw new DesktopLeaseError("invalid_request", "Invalid call outcome.");
+  callEnd(toolUseId: string, outcome: CallOutcome): LeaseStatus {
+    nonempty(toolUseId, "toolUseId");
+    if (outcome !== "completed" && outcome !== "failed") {
+      throw new DesktopLeaseError("invalid_request", "Invalid call outcome.");
+    }
     return this.transaction((now) => {
-      this.advance(now);
-      const row = this.byTicket(ticket);
-      const call = this.db.prepare("SELECT state FROM ardud_desktop_calls WHERE call_id = ? AND ticket = ?").get(callId, ticket) as { state: string } | undefined;
+      const call = this.db.prepare("SELECT ticket, state FROM ardud_desktop_calls WHERE call_id = ?")
+        .get(toolUseId) as CallRow | undefined;
       if (!call) throw new DesktopLeaseError("not_found", "Unknown desktop call.");
       if (call.state !== "started") {
         if (call.state === outcome) return this.snapshot();
         return fail("Desktop call already has a different outcome.");
       }
-      this.db.prepare("UPDATE ardud_desktop_calls SET state = ?, ended_at = ? WHERE call_id = ?").run(outcome, now, callId);
-      if (outcome === "uncertain" && row.request_state === "held") {
-        this.db.prepare("UPDATE ardud_desktop_requests SET lease_state = 'quarantined', stopping_at = COALESCE(stopping_at, ?), quiescent = 0 WHERE seq = ?").run(now, row.seq);
-      }
+      // A delayed completion may close its own row, never advance a newer holder.
+      const isCurrent = this.holder()?.ticket === call.ticket;
+      if (isCurrent) this.advance(now);
+      this.db.prepare("UPDATE ardud_desktop_calls SET state = ?, ended_at = ? WHERE call_id = ?")
+        .run(outcome, now, toolUseId);
+      if (isCurrent && this.holder()?.ticket === call.ticket) this.advance(now);
       return this.snapshot();
     });
   }
 
-  /**
-   * Only an in-process supervisor that has independently stopped the controller
-   * and verified native-service quiescence may call this. A JS return, timeout,
-   * heartbeat, or elapsed quiet period is not that proof. Not exposed to hooks.
-   */
-  recordVerifiedQuiescence(ticket: string, evidence: string): LeaseStatus {
-    nonempty(evidence, "evidence");
-    return this.transaction((now) => {
-      this.advance(now);
-      const row = this.byTicket(ticket);
-      if (row.request_state !== "held" || row.lease_state === "held") return fail("Stop the controller before recording quiescence.");
-      this.db.prepare("UPDATE ardud_desktop_requests SET quiescent = 1, evidence = ? WHERE seq = ?").run(evidence, row.seq);
-      this.advance(now);
-      return this.snapshot();
-    });
-  }
-
-  /** Privileged manual reconciliation is an assertion, not automatic proof. */
+  /** Caller authorization for maintenance is enforced by the service transport. */
   reconcile(ticket: string, evidence: string): LeaseStatus {
     nonempty(evidence, "evidence");
     return this.transaction((now) => {
       this.advance(now);
       const row = this.byTicket(ticket);
-      if (row.request_state !== "held" || row.lease_state === "held") return fail("Stop the controller before reconciliation.");
-      this.db.prepare("UPDATE ardud_desktop_requests SET evidence = ?, quiescent = 1 WHERE seq = ?").run(evidence, row.seq);
+      if (row.request_state !== "held" || row.lease_state !== "quarantined") {
+        return fail("Only a quarantined lease may be reconciled.");
+      }
+      this.db.prepare("UPDATE ardud_desktop_requests SET evidence = ? WHERE seq = ?").run(evidence, row.seq);
       this.finish(row);
-      this.advance(now);
       return this.snapshot();
     });
   }
