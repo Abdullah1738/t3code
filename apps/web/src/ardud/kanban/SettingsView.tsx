@@ -239,6 +239,9 @@ function reportSelectionConflict(result: SelectionResult): ModelSelection | null
   return null;
 }
 
+// Past this many slots the row shows "busy of slots" as text instead of squares.
+const SLOT_SQUARES_MAX = 16;
+
 export function SettingsView(props: { state: KanbanBoardState }) {
   const environmentId = usePrimaryEnvironmentId();
   if (environmentId === null) return null;
@@ -342,15 +345,21 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 role="img"
                 aria-label={`${pool.busy} of ${pool.slots} busy`}
               >
-                {Array.from({ length: pool.slots }, (_, index) => (
-                  <i
-                    key={index}
-                    className={cn(
-                      "size-3.5 rounded-sm",
-                      index < pool.busy ? "bg-(--m-accent)" : "bg-(--m-bar-4)",
-                    )}
-                  />
-                ))}
+                {pool.slots > SLOT_SQUARES_MAX ? (
+                  <span className="text-xs text-(--m-muted) tabular-nums">
+                    {pool.busy} of {pool.slots} busy
+                  </span>
+                ) : (
+                  Array.from({ length: pool.slots }, (_, index) => (
+                    <i
+                      key={index}
+                      className={cn(
+                        "size-3.5 rounded-sm",
+                        index < pool.busy ? "bg-(--m-accent)" : "bg-(--m-bar-4)",
+                      )}
+                    />
+                  ))
+                )}
               </span>
               <Stepper
                 label={`${pool.name} slots`}
