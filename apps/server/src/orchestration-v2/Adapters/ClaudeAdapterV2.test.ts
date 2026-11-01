@@ -830,6 +830,74 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
     assert.notInclude(JSON.stringify(logged), "secret-claude-token");
   });
 
+  it("marks text before a tool call as narration and the end_turn text as the answer", () => {
+    const assistant = (
+      content: ReadonlyArray<Record<string, unknown>>,
+      stopReason: string | null,
+    ) =>
+      ({
+        type: "assistant",
+        uuid: "uuid-x",
+        message: { id: "msg-x", model: "claude-sonnet-4-6", content, stop_reason: stopReason },
+      }) as unknown as Parameters<typeof ClaudeAdapterV2.claudeAssistantPhase>[0];
+    const text = { type: "text", text: "Let me check." };
+    const toolUse = { type: "tool_use", id: "toolu_1", name: "Bash", input: {} };
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([text, toolUse], "tool_use")),
+      "narration",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Done." }], "end_turn")),
+      "answer",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Cut" }], "max_tokens")),
+      "unknown",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Mid" }], null)),
+      "unknown",
+    );
+  });
+
+  it.effect("appends the browser and device guidance only when those tools are granted", () =>
+    Effect.gen(function* () {
+      const withTools = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-4-6",
+        },
+        nativeThreadId: "native-thread-claude-tools-on",
+        resume: false,
+        cwd: "/workspace",
+        allowedTools: [],
+        mcpServers: {},
+        t3ToolAvailability: { browser: true, device: true },
+        environment: {},
+      });
+      const withoutTools = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-4-6",
+        },
+        nativeThreadId: "native-thread-claude-tools-off",
+        resume: false,
+        cwd: "/workspace",
+        allowedTools: [],
+        mcpServers: {},
+        t3ToolAvailability: { browser: false, device: false },
+        environment: {},
+      });
+      const appended = (options: unknown) =>
+        (options as { readonly systemPrompt: { readonly append?: string } }).systemPrompt.append ??
+        "";
+      assert.include(appended(withTools), "T3 Code collaborative browser");
+      assert.include(appended(withTools), "T3 Code devices");
+      assert.notInclude(appended(withoutTools), "T3 Code collaborative browser");
+      assert.notInclude(appended(withoutTools), "T3 Code devices");
+    }),
+  );
+
   it.effect("writes Claude Agent SDK protocol frames to the native provider log", () =>
     Effect.gen(function* () {
       const writes: Array<{

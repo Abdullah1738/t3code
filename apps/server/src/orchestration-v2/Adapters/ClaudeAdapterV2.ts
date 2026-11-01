@@ -3231,7 +3231,7 @@ function buildAssistantArtifacts(input: {
  * reason of that line tells narration from the reply. Only `end_turn` proves the
  * reply; anything else (missing, `max_tokens`, unknown) stays unknown.
  */
-function claudeAssistantPhase(message: SDKMessage): OrchestrationV2AssistantPhase {
+export function claudeAssistantPhase(message: SDKMessage): OrchestrationV2AssistantPhase {
   if (message.type !== "assistant") return "unknown";
   const content = message.message.content;
   if (content.some((block) => block.type === "tool_use")) return "narration";

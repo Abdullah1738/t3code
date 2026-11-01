@@ -11,7 +11,7 @@ import {
   type OrchestrationV2ProviderSession,
   OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
-  type OrchestrationV2TurnItem,
+  OrchestrationV2TurnItem,
   type OrchestrationV2ThreadShellSnapshot,
   NodeId,
   PlanId,
@@ -1220,6 +1220,126 @@ const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(functio
   );
   return { projectId, activeThreadId, forkThreadId, otherThreadId };
 });
+
+it.effect("assistant phase persists through the projection, and old rows decode as unknown", () =>
+  Effect.gen(function* () {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const suffix = "assistant-phase";
+    const threadId = ThreadId.make(`thread:${suffix}`);
+    const runId = RunId.make(`run:${suffix}`);
+    const nodeId = NodeId.make(`node:${suffix}`);
+    const messageId = MessageId.make(`message:${suffix}:answer`);
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${suffix}:thread-created`),
+      type: "thread.created",
+      threadId,
+      occurredAt: now,
+      payload: {
+        createdBy: "user",
+        creationSource: "web",
+        id: threadId,
+        projectId: ProjectId.make(`project:${suffix}`),
+        title: "Assistant phase",
+        providerInstanceId,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      },
+    });
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${suffix}:run`),
+      type: "run.created",
+      threadId,
+      runId,
+      nodeId,
+      driver,
+      occurredAt: now,
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: 1,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:${suffix}:user`),
+        rootNodeId: nodeId,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${suffix}:answer`),
+      type: "turn-item.updated",
+      threadId,
+      runId,
+      occurredAt: now,
+      payload: {
+        id: TurnItemId.make(`turn-item:${suffix}:answer`),
+        threadId,
+        runId,
+        nodeId,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "assistant_message",
+        messageId,
+        text: "Done.",
+        phase: "answer",
+        streaming: false,
+      },
+    });
+    const [written] = (yield* projectionStore.getThreadRecords(threadId, ["turnItems"])).turnItems;
+    assert.strictEqual(written?.type, "assistant_message");
+    assert.strictEqual(written?.type === "assistant_message" && written.phase, "answer");
+    // A row written before `phase` existed has no such key; it must decode as unknown, never answer.
+    const legacy = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+      id: "turn-item:assistant-phase:legacy",
+      threadId,
+      runId,
+      nodeId,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 2,
+      status: "completed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "assistant_message",
+      messageId: "message:assistant-phase:legacy",
+      text: "Old row.",
+      streaming: false,
+    });
+    assert.strictEqual(legacy.type === "assistant_message" && legacy.phase, "unknown");
+  }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
 
 it.effect("memory shell snapshots scope to one project", () =>
   assertProjectScopedShells("memory-project-shell").pipe(

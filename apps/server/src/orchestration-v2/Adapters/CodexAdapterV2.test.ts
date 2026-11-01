@@ -4704,6 +4704,40 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("marks commentary as narration and the final message as the answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const transcript = finalAnswerTranscript("codex-phase-commentary-then-final", [
+          { id: "answer-commentary", text: "Looking at the repo.", phase: "commentary" },
+          { id: "answer-final", text: "All set.", phase: "final_answer" },
+        ]);
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-phase-commentary-then-final"),
+            text: "Reply with the requested recovery marker.",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+
+        const phases = new Map(
+          assistantMessages(harness.events).map((event) => [event.message.text, event.message.phase]),
+        );
+        assert.strictEqual(phases.get("Looking at the repo."), "narration");
+        assert.strictEqual(phases.get("All set."), "answer");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("preserves an empty final answer when only commentary preceded it", () =>
     Effect.scoped(
       Effect.gen(function* () {
