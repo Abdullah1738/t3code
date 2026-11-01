@@ -60,10 +60,22 @@ const seed = Effect.gen(function* () {
     threadRow("t-detached", "pt-detached-claude"),
   )}`;
   yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
-    providerRow("pt-detached-old", "t-detached", "opencode", "ses_detached_old", "2026-01-02T00:00:00.000Z"),
+    providerRow(
+      "pt-detached-old",
+      "t-detached",
+      "opencode",
+      "ses_detached_old",
+      "2026-01-02T00:00:00.000Z",
+    ),
   )}`;
   yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
-    providerRow("pt-detached-claude", "t-detached", "claudeAgent", null, "2026-01-01T00:00:00.000Z"),
+    providerRow(
+      "pt-detached-claude",
+      "t-detached",
+      "claudeAgent",
+      null,
+      "2026-01-01T00:00:00.000Z",
+    ),
   )}`;
   // A healthy migrated thread for contrast: its active Claude id is current.
   yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
@@ -73,13 +85,17 @@ const seed = Effect.gen(function* () {
     providerRow("pt-moved-old", "t-moved", "opencode", "ses_moved_old", "2026-01-02T00:00:00.000Z"),
   )}`;
   yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
-    providerRow("pt-moved-claude", "t-moved", "claudeAgent", "claude-moved-uuid", "2026-01-01T00:00:00.000Z"),
+    providerRow(
+      "pt-moved-claude",
+      "t-moved",
+      "claudeAgent",
+      "claude-moved-uuid",
+      "2026-01-01T00:00:00.000Z",
+    ),
   )}`;
 });
 
-const run = <A, E>(
-  body: Effect.Effect<A, E, ControlStore.ControlStore | SqlClient.SqlClient>,
-) =>
+const run = <A, E>(body: Effect.Effect<A, E, ControlStore.ControlStore | SqlClient.SqlClient>) =>
   Effect.scoped(
     Effect.gen(function* () {
       yield* seed;
@@ -123,7 +139,13 @@ describe("ControlStore native ids", () => {
           threadRow("t-clash", "pt-clash"),
         )}`;
         yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
-          providerRow("pt-clash", "t-clash", "opencode", "ses_detached_old", "2026-01-03T00:00:00.000Z"),
+          providerRow(
+            "pt-clash",
+            "t-clash",
+            "opencode",
+            "ses_detached_old",
+            "2026-01-03T00:00:00.000Z",
+          ),
         )}`;
         assert.isNull(yield* store.threadIdForNativeSession("ses_detached_old", "opencode"));
       }),

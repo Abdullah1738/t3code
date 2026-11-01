@@ -52,7 +52,10 @@ export interface ControlStoreShape {
   readonly nativeBindings: (
     threadIds: ReadonlyArray<string>,
   ) => Effect.Effect<
-    ReadonlyMap<string, { readonly driver: string; readonly providerInstanceId: string; readonly nativeId: string }>,
+    ReadonlyMap<
+      string,
+      { readonly driver: string; readonly providerInstanceId: string; readonly nativeId: string }
+    >,
     ControlStoreError
   >;
   /**
@@ -129,11 +132,10 @@ export const make = Effect.gen(function* () {
       `;
     }).pipe(Effect.mapError(fail("write-origin")));
 
-  const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = (
-    nativeId,
-    driver,
-  ) =>
-    Effect.gen(function* () {
+  const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = Effect.fn(
+    "ControlStore.threadIdForNativeSession",
+  )(
+    function* (nativeId, driver) {
       const imported =
         driver === undefined || driver === "opencode"
           ? yield* sql<{ readonly thread_id: string }>`
@@ -154,7 +156,9 @@ export const make = Effect.gen(function* () {
       ]);
       // Two app threads claim this id: refuse rather than pick one.
       return threadIds.size === 1 ? [...threadIds][0]! : null;
-    }).pipe(Effect.mapError(fail("read-native-session")));
+    },
+    Effect.mapError(fail("read-native-session")),
+  );
 
   const nativeBindings: ControlStoreShape["nativeBindings"] = (threadIds) =>
     Effect.forEach(
@@ -180,7 +184,11 @@ export const make = Effect.gen(function* () {
       Effect.map((pages) => {
         const out = new Map<
           string,
-          { readonly driver: string; readonly providerInstanceId: string; readonly nativeId: string }
+          {
+            readonly driver: string;
+            readonly providerInstanceId: string;
+            readonly nativeId: string;
+          }
         >();
         for (const row of pages.flat()) {
           if (row.driver !== null && row.provider_instance_id !== null && row.native_id !== null) {

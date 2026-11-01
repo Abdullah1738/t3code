@@ -368,7 +368,9 @@ describe("control listings", () => {
   it.effect("resolves a native id through /identity/resolve", () =>
     run(({ get }) =>
       Effect.gen(function* () {
-        const response = yield* get("/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent");
+        const response = yield* get(
+          "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+        );
         assert.strictEqual(response.status, 200);
         assert.strictEqual(response.body.ok, true);
         assert.strictEqual(response.body.identity.resolution, "resolved");

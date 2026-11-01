@@ -253,25 +253,24 @@ const make = Effect.gen(function* () {
 
   // Walks parentThreadId up to the root. The visited set stops cycles; there is
   // no depth cap, so a long chain still ends at its real root.
-  const rootOf = (threadId: string) =>
-    Effect.gen(function* () {
-      const start = yield* threadRow(threadId);
-      if (start?.root_thread_id) return start.root_thread_id;
-      const visited = new Set<string>([threadId]);
-      let top = threadId;
-      let parent = start?.parent_thread_id ?? null;
-      while (parent !== null && !visited.has(parent)) {
-        visited.add(parent);
-        top = parent;
-        parent = (yield* threadRow(parent))?.parent_thread_id ?? null;
-      }
-      return top;
-    });
+  const rootOf = Effect.fn("ExecutionIdentity.rootOf")(function* (threadId: string) {
+    const start = yield* threadRow(threadId);
+    if (start?.root_thread_id) return start.root_thread_id;
+    const visited = new Set<string>([threadId]);
+    let top = threadId;
+    let parent = start?.parent_thread_id ?? null;
+    while (parent !== null && !visited.has(parent)) {
+      visited.add(parent);
+      top = parent;
+      parent = (yield* threadRow(parent))?.parent_thread_id ?? null;
+    }
+    return top;
+  });
 
   // Is there a fresh provider thread still waiting for its native id? That
   // means "not yet", not "unknown".
-  const hasPendingProvider = (driver: string | undefined, instance: string | undefined) =>
-    Effect.gen(function* () {
+  const hasPendingProvider = Effect.fn("ExecutionIdentity.hasPendingProvider")(
+    function* (driver: string | undefined, instance: string | undefined) {
       const cutoff = DateTime.formatIso(
         DateTime.subtractDuration(yield* DateTime.now, PENDING_WINDOW_DURATION),
       );
@@ -294,7 +293,9 @@ const make = Effect.gen(function* () {
           (driver === undefined || row.driver === driver) &&
           (instance === undefined || row.provider_instance_id === instance),
       );
-    }).pipe(Effect.mapError(fail("read-pending-providers")));
+    },
+    Effect.mapError(fail("read-pending-providers")),
+  );
 
   const resolve: ExecutionIdentityShape["resolve"] = Effect.fn("ExecutionIdentity.resolve")(
     function* (input) {
@@ -437,8 +438,8 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("current-native")),
     );
 
-  const aliases: ExecutionIdentityShape["aliases"] = (threadId) =>
-    Effect.gen(function* () {
+  const aliases: ExecutionIdentityShape["aliases"] = Effect.fn("ExecutionIdentity.aliases")(
+    function* (threadId) {
       const providers = yield* providerRowsForThread(threadId);
       const imported = yield* importedNativesFor(threadId);
       const seen = new Map<string, NativeBinding>();
@@ -459,7 +460,8 @@ const make = Effect.gen(function* () {
         });
       }
       return [...seen.values()];
-    });
+    },
+  );
 
   return ExecutionIdentity.of({ resolve, currentNative, aliases });
 });

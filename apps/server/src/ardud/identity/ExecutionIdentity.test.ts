@@ -40,7 +40,11 @@ const provider = (
 const thread = (
   threadId: string,
   activeProviderThreadId: string | null,
-  lineage: { parentThreadId: string | null; rootThreadId: string; relationshipToParent?: string | null },
+  lineage: {
+    parentThreadId: string | null;
+    rootThreadId: string;
+    relationshipToParent?: string | null;
+  },
   model = { instanceId: "opencode", model: "opus/claude-opus-5-5" },
 ) => ({
   thread_id: threadId,
@@ -134,47 +138,120 @@ const seed = Effect.gen(function* () {
 
   // Top-level OpenCode thread.
   yield* insertThread(thread("t-oc", "pt-oc", { parentThreadId: null, rootThreadId: "t-oc" }));
-  yield* insertProvider(provider("pt-oc", "t-oc", "opencode", "ses_top", "2026-01-01T00:00:00.000Z"));
+  yield* insertProvider(
+    provider("pt-oc", "t-oc", "opencode", "ses_top", "2026-01-01T00:00:00.000Z"),
+  );
 
   // Migrated thread: the old OpenCode row was updated later than the Claude row,
   // so newest-wins would return the stale ses_ id.
-  yield* insertThread(thread("t-moved", "pt-claude", { parentThreadId: null, rootThreadId: "t-moved" }));
-  yield* insertProvider(provider("pt-old-oc", "t-moved", "opencode", "ses_old", "2026-01-02T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-moved", "pt-claude", { parentThreadId: null, rootThreadId: "t-moved" }),
+  );
   yield* insertProvider(
-    provider("pt-claude", "t-moved", "claudeAgent", "claude-session-uuid", "2026-01-01T00:00:00.000Z"),
+    provider("pt-old-oc", "t-moved", "opencode", "ses_old", "2026-01-02T00:00:00.000Z"),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-claude",
+      "t-moved",
+      "claudeAgent",
+      "claude-session-uuid",
+      "2026-01-01T00:00:00.000Z",
+    ),
   );
   yield* insertImport("ses_imported", "t-moved");
 
   // Claude parent session with a native child found only by agent id.
-  yield* insertThread(thread("t-claude-parent", "pt-claude-parent", { parentThreadId: null, rootThreadId: "t-claude-parent" }));
-  yield* insertProvider(
-    provider("pt-claude-parent", "t-claude-parent", "claudeAgent", "parent-uuid", "2026-01-01T00:00:00.000Z"),
+  yield* insertThread(
+    thread("t-claude-parent", "pt-claude-parent", {
+      parentThreadId: null,
+      rootThreadId: "t-claude-parent",
+    }),
   );
-  yield* insertThread(thread("t-claude-child", null, { parentThreadId: "t-claude-parent", rootThreadId: "t-claude-parent", relationshipToParent: "subagent" }));
+  yield* insertProvider(
+    provider(
+      "pt-claude-parent",
+      "t-claude-parent",
+      "claudeAgent",
+      "parent-uuid",
+      "2026-01-01T00:00:00.000Z",
+    ),
+  );
+  yield* insertThread(
+    thread("t-claude-child", null, {
+      parentThreadId: "t-claude-parent",
+      rootThreadId: "t-claude-parent",
+      relationshipToParent: "subagent",
+    }),
+  );
   yield* insertSubagent(
     subagent("s-claude", "t-claude-parent", "t-claude-child", null, "claudeAgent", "agent-abc"),
   );
   yield* insertNode("s-claude", "t-claude-parent", "pt-claude-parent");
 
   // Codex child owns its own provider thread.
-  yield* insertThread(thread("t-codex-parent", "pt-codex-parent", { parentThreadId: null, rootThreadId: "t-codex-parent" }));
-  yield* insertProvider(provider("pt-codex-parent", "t-codex-parent", "codex", "codex-parent", "2026-01-01T00:00:00.000Z"));
-  yield* insertThread(thread("t-codex-child", "pt-codex-child", { parentThreadId: "t-codex-parent", rootThreadId: "t-codex-parent", relationshipToParent: "subagent" }));
-  yield* insertProvider(provider("pt-codex-child", "t-codex-child", "codex", "codex-child-uuid", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-codex-parent", "pt-codex-parent", {
+      parentThreadId: null,
+      rootThreadId: "t-codex-parent",
+    }),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-codex-parent",
+      "t-codex-parent",
+      "codex",
+      "codex-parent",
+      "2026-01-01T00:00:00.000Z",
+    ),
+  );
+  yield* insertThread(
+    thread("t-codex-child", "pt-codex-child", {
+      parentThreadId: "t-codex-parent",
+      rootThreadId: "t-codex-parent",
+      relationshipToParent: "subagent",
+    }),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-codex-child",
+      "t-codex-child",
+      "codex",
+      "codex-child-uuid",
+      "2026-01-01T00:00:00.000Z",
+    ),
+  );
   yield* insertSubagent(
-    subagent("s-codex", "t-codex-parent", "t-codex-child", "pt-codex-child", "codex", null, { instanceId: "codex", model: "gpt-6.1-sol" }),
+    subagent("s-codex", "t-codex-parent", "t-codex-child", "pt-codex-child", "codex", null, {
+      instanceId: "codex",
+      model: "gpt-6.1-sol",
+    }),
   );
 
   // The same UUID under two drivers, in two different threads.
-  yield* insertThread(thread("t-dup-a", "pt-dup-a", { parentThreadId: null, rootThreadId: "t-dup-a" }));
-  yield* insertProvider(provider("pt-dup-a", "t-dup-a", "claudeAgent", "dup-uuid", "2026-01-01T00:00:00.000Z"));
-  yield* insertThread(thread("t-dup-b", "pt-dup-b", { parentThreadId: null, rootThreadId: "t-dup-b" }));
-  yield* insertProvider(provider("pt-dup-b", "t-dup-b", "codex", "dup-uuid", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-dup-a", "pt-dup-a", { parentThreadId: null, rootThreadId: "t-dup-a" }),
+  );
+  yield* insertProvider(
+    provider("pt-dup-a", "t-dup-a", "claudeAgent", "dup-uuid", "2026-01-01T00:00:00.000Z"),
+  );
+  yield* insertThread(
+    thread("t-dup-b", "pt-dup-b", { parentThreadId: null, rootThreadId: "t-dup-b" }),
+  );
+  yield* insertProvider(
+    provider("pt-dup-b", "t-dup-b", "codex", "dup-uuid", "2026-01-01T00:00:00.000Z"),
+  );
 
   // Lineage cycle: a points at b and b at a.
-  yield* insertThread(thread("t-cyc-a", null, { parentThreadId: "t-cyc-b", rootThreadId: "t-cyc-b" }));
-  yield* insertThread(thread("t-cyc-b", "pt-cyc-b", { parentThreadId: "t-cyc-a", rootThreadId: "t-cyc-a" }));
-  yield* insertProvider(provider("pt-cyc-b", "t-cyc-b", "opencode", "ses_cycle", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-cyc-a", null, { parentThreadId: "t-cyc-b", rootThreadId: "t-cyc-b" }),
+  );
+  yield* insertThread(
+    thread("t-cyc-b", "pt-cyc-b", { parentThreadId: "t-cyc-a", rootThreadId: "t-cyc-a" }),
+  );
+  yield* insertProvider(
+    provider("pt-cyc-b", "t-cyc-b", "opencode", "ses_cycle", "2026-01-01T00:00:00.000Z"),
+  );
 
   // Deep parent chain: 150 hops to a root with no rootThreadId set.
   for (let index = 0; index <= 150; index++) {
@@ -186,36 +263,92 @@ const seed = Effect.gen(function* () {
       }),
     );
   }
-  yield* insertThread(thread("t-deep-root", null, { parentThreadId: null, rootThreadId: "t-deep-root" }));
-  yield* insertProvider(provider("pt-deep-0", "t-deep-0", "opencode", "ses_deep", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-deep-root", null, { parentThreadId: null, rootThreadId: "t-deep-root" }),
+  );
+  yield* insertProvider(
+    provider("pt-deep-0", "t-deep-0", "opencode", "ses_deep", "2026-01-01T00:00:00.000Z"),
+  );
 
   // A Codex thread created just now whose native id has not arrived yet.
-  yield* insertThread(thread("t-fresh", "pt-fresh", { parentThreadId: null, rootThreadId: "t-fresh" }));
+  yield* insertThread(
+    thread("t-fresh", "pt-fresh", { parentThreadId: null, rootThreadId: "t-fresh" }),
+  );
   const now = DateTime.formatIso(yield* DateTime.now);
   yield* insertProvider(provider("pt-fresh", "t-fresh", "codex", null, now));
 
   // Review r1 (pending window): an old unnamed Codex thread whose row was
   // written just now. Only createdAt may decide the pending window.
-  yield* insertThread(thread("t-stale-unnamed", "pt-stale-unnamed", { parentThreadId: null, rootThreadId: "t-stale-unnamed" }));
+  yield* insertThread(
+    thread("t-stale-unnamed", "pt-stale-unnamed", {
+      parentThreadId: null,
+      rootThreadId: "t-stale-unnamed",
+    }),
+  );
   yield* insertProvider(
-    provider("pt-stale-unnamed", "t-stale-unnamed", "codex", null, now, "codex", "2026-01-01T00:00:00.000Z"),
+    provider(
+      "pt-stale-unnamed",
+      "t-stale-unnamed",
+      "codex",
+      null,
+      now,
+      "codex",
+      "2026-01-01T00:00:00.000Z",
+    ),
   );
 
   // Review r2 (detached binding): a migrated thread whose Claude provider row
   // has lost its native id. The old ses_ must not come back as current.
-  yield* insertThread(thread("t-detached", "pt-detached-claude", { parentThreadId: null, rootThreadId: "t-detached" }));
-  yield* insertProvider(provider("pt-detached-old", "t-detached", "opencode", "ses_detached_old", "2026-01-02T00:00:00.000Z"));
-  yield* insertProvider(provider("pt-detached-claude", "t-detached", "claudeAgent", null, "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-detached", "pt-detached-claude", {
+      parentThreadId: null,
+      rootThreadId: "t-detached",
+    }),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-detached-old",
+      "t-detached",
+      "opencode",
+      "ses_detached_old",
+      "2026-01-02T00:00:00.000Z",
+    ),
+  );
+  yield* insertProvider(
+    provider("pt-detached-claude", "t-detached", "claudeAgent", null, "2026-01-01T00:00:00.000Z"),
+  );
 
   // Review r3 (Claude ownership): a second Claude instance under the same
   // parent app thread that reuses agent-abc. Its child must not resolve through
   // the first instance's session, and the instance must match.
   yield* insertProvider(
-    provider("pt-claude-parent-2", "t-claude-parent", "claudeAgent", "parent-uuid-2", "2026-01-01T00:00:00.000Z", "claudeAgent-2"),
+    provider(
+      "pt-claude-parent-2",
+      "t-claude-parent",
+      "claudeAgent",
+      "parent-uuid-2",
+      "2026-01-01T00:00:00.000Z",
+      "claudeAgent-2",
+    ),
   );
-  yield* insertThread(thread("t-claude-child-2", null, { parentThreadId: "t-claude-parent", rootThreadId: "t-claude-parent", relationshipToParent: "subagent" }));
+  yield* insertThread(
+    thread("t-claude-child-2", null, {
+      parentThreadId: "t-claude-parent",
+      rootThreadId: "t-claude-parent",
+      relationshipToParent: "subagent",
+    }),
+  );
   yield* insertSubagent(
-    subagent("s-claude-2", "t-claude-parent", "t-claude-child-2", null, "claudeAgent", "agent-abc", undefined, { instance: "claudeAgent-2" }),
+    subagent(
+      "s-claude-2",
+      "t-claude-parent",
+      "t-claude-child-2",
+      null,
+      "claudeAgent",
+      "agent-abc",
+      undefined,
+      { instance: "claudeAgent-2" },
+    ),
   );
   yield* insertNode("s-claude-2", "t-claude-parent", "pt-claude-parent-2");
 
@@ -224,17 +357,61 @@ const seed = Effect.gen(function* () {
   // (agent-abc, node under pt-claude-parent) must not resolve through the new
   // session. The replacement has its own provider thread and no child node.
   yield* insertProvider(
-    provider("pt-claude-replacement", "t-claude-parent", "claudeAgent", "parent-uuid-replacement", "2026-01-03T00:00:00.000Z"),
+    provider(
+      "pt-claude-replacement",
+      "t-claude-parent",
+      "claudeAgent",
+      "parent-uuid-replacement",
+      "2026-01-03T00:00:00.000Z",
+    ),
   );
 
   // Review r4 (app-owned children): an app-owned delegated child whose
   // completion records its provider thread. It is not a provider-native child.
-  yield* insertThread(thread("t-app-parent", "pt-app-parent", { parentThreadId: null, rootThreadId: "t-app-parent" }));
-  yield* insertProvider(provider("pt-app-parent", "t-app-parent", "codex", "codex-app-parent", "2026-01-01T00:00:00.000Z"));
-  yield* insertThread(thread("t-app-child", "pt-app-child", { parentThreadId: "t-app-parent", rootThreadId: "t-app-parent", relationshipToParent: "subagent" }, { instanceId: "codex", model: "gpt-6.1-sol" }));
-  yield* insertProvider(provider("pt-app-child", "t-app-child", "codex", "codex-app-child-uuid", "2026-01-01T00:00:00.000Z"));
+  yield* insertThread(
+    thread("t-app-parent", "pt-app-parent", { parentThreadId: null, rootThreadId: "t-app-parent" }),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-app-parent",
+      "t-app-parent",
+      "codex",
+      "codex-app-parent",
+      "2026-01-01T00:00:00.000Z",
+    ),
+  );
+  yield* insertThread(
+    thread(
+      "t-app-child",
+      "pt-app-child",
+      {
+        parentThreadId: "t-app-parent",
+        rootThreadId: "t-app-parent",
+        relationshipToParent: "subagent",
+      },
+      { instanceId: "codex", model: "gpt-6.1-sol" },
+    ),
+  );
+  yield* insertProvider(
+    provider(
+      "pt-app-child",
+      "t-app-child",
+      "codex",
+      "codex-app-child-uuid",
+      "2026-01-01T00:00:00.000Z",
+    ),
+  );
   yield* insertSubagent(
-    subagent("s-app-child", "t-app-parent", "t-app-child", "pt-app-child", "codex", null, { instanceId: "codex", model: "gpt-6.1-sol" }, { origin: "app_owned" }),
+    subagent(
+      "s-app-child",
+      "t-app-parent",
+      "t-app-child",
+      "pt-app-child",
+      "codex",
+      null,
+      { instanceId: "codex", model: "gpt-6.1-sol" },
+      { origin: "app_owned" },
+    ),
   );
 });
 
@@ -259,7 +436,15 @@ const seedStaleOnly = Effect.gen(function* () {
     thread("t-only-stale", "pt-only-stale", { parentThreadId: null, rootThreadId: "t-only-stale" }),
   )}`;
   yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
-    provider("pt-only-stale", "t-only-stale", "codex", null, now, "codex", "2026-01-01T00:00:00.000Z"),
+    provider(
+      "pt-only-stale",
+      "t-only-stale",
+      "codex",
+      null,
+      now,
+      "codex",
+      "2026-01-01T00:00:00.000Z",
+    ),
   )}`;
 });
 
@@ -472,7 +657,10 @@ describe("ExecutionIdentity", () => {
     run(
       Effect.gen(function* () {
         const identity = yield* ExecutionIdentity.ExecutionIdentity;
-        const result = yield* identity.resolve({ nativeId: "codex-app-child-uuid", driver: "codex" });
+        const result = yield* identity.resolve({
+          nativeId: "codex-app-child-uuid",
+          driver: "codex",
+        });
         assert.strictEqual(result.robobThreadId, "t-app-child");
         assert.notStrictEqual(result.executionKind, "provider-native-child");
         assert.strictEqual(result.executionKind, "app-managed-child");
