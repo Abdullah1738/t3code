@@ -75,6 +75,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type ControlThreadState,
 } from "./model.ts";
+import { messagePreview, runToolEvidence } from "./evidence.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
 const SSE_HEARTBEAT = Duration.seconds(15);
@@ -1010,6 +1011,51 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
+  // A run's own evidence: its status, its assistant messages with their phase, and
+  // whether any tool ran. Reads only this run's rows through the projection filter.
+  const getRunEvidence = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const threadId = yield* param("threadId");
+    const runId = yield* param("runId");
+    yield* getShell(threadId);
+    const records = yield* threads
+      .getThreadRecords(ThreadId.make(threadId), ["runs", "messages", "turnItems"], {
+        runIds: [RunId.make(runId)],
+        messageRunIds: [RunId.make(runId)],
+        turnItemRunIds: [RunId.make(runId)],
+      })
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const run = records.runs.find((candidate) => candidate.id === runId);
+    if (run === undefined) {
+      return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
+    }
+    const messages = records.messages
+      .filter((message) => message.runId === run.id && message.role === "assistant")
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+          left.id.localeCompare(right.id),
+      );
+    const evidence = runToolEvidence({
+      runStatus: run.status,
+      turnItems: records.turnItems.filter((item) => item.runId === run.id),
+      itemsComplete: true,
+    });
+    return json({
+      ok: true,
+      threadId,
+      runId: run.id,
+      status: run.status,
+      toolEvidence: evidence.toolEvidence,
+      complete: evidence.complete,
+      messages: messages.map((message) => ({
+        id: message.id,
+        phase: message.phase,
+        text: messagePreview(message),
+      })),
+    });
+  });
+
   const send = Effect.gen(function* () {
     const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
@@ -1555,6 +1601,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
     HttpRouter.route("GET", `${p}/threads/:threadId/messages`, handle(getMessages)),
+    HttpRouter.route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
     HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
     HttpRouter.route("POST", `${p}/threads/:threadId/send`, handle(send)),
     HttpRouter.route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
