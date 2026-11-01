@@ -1,12 +1,15 @@
 """Widen episodic_events.source to accept 'claude' (schema_version 2).
 
-SQLite cannot alter a CHECK constraint, so the table is rebuilt once inside one
-transaction: the new table keeps every row id, the indexes and triggers (both
-FTS feeds included) are re-created from their stored SQL, and sqlite_sequence
-keeps the higher of the old and new counters so a deleted top id is never
-reused. Idempotent: a table that already accepts 'claude' is left alone.
-An unknown CHECK shape is refused rather than guessed at.
+The source CHECK is widened IN PLACE by editing the stored table definition
+inside one short transaction (the sqlite_master route sync_muse already uses).
+Widening a CHECK cannot invalidate an existing row, so no table copy happens:
+on a 97 GB memory.db this is a sub-second catalog edit, where the 12-step
+table copy would run for about an hour in one non-resumable transaction and be
+killed by every tick. The transaction verifies the new CHECK, the row count and
+the FTS count before commit, and rolls back on any mismatch.
 
+Idempotent: a table that already accepts 'claude' is left alone. A CHECK of an
+unknown shape (a source missing from the known set) is refused, not guessed at.
 Only the native tailers call migrate(); sync_muse and sync_opencode_v2 keep
 their own widening paths.
 """
@@ -110,9 +113,9 @@ def _widen_in_place(con):
 def migrate(con):
     """Bring memory.db to TARGET_VERSION. Safe to call on every run; returns True when it changed the schema.
 
-    The common case is an in-place CHECK widening (milliseconds). The full table rebuild is
-    kept only for explicit maintenance (rebuild_episodic_events) because it copies every row
-    and is not resumable; it must never run inside a tailer's kill budget.
+    The only schema change is the in-place CHECK widening (see module docstring). There is
+    deliberately no table-copy path here: a copy of memory.db is not resumable and would not
+    finish inside any tailer's kill budget.
     """
     prev = con.isolation_level
     con.isolation_level = None  # explicit BEGIN/COMMIT
