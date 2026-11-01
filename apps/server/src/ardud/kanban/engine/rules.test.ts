@@ -1085,9 +1085,12 @@ describe("pool levels", () => {
       [opus, 1],
     ]);
     expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
-    expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
+    // A named level is exact: a low card has no low pool here, so it gets none.
+    expect(poolFor(all, at(haiku, "low"))).toBeUndefined();
     expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
-    expect(poolFor(all, at(opus, "high"))?.key).toBe(poolKey(opus));
+    // A named level on a model whose only pool has no level gets no pool: levels never mix.
+    expect(poolFor(all, at(opus, "high"))).toBeUndefined();
+    expect(poolFor(all, opus)?.key).toBe(poolKey(opus));
     expect(poolFor(all, sol)).toBeUndefined();
   });
 
@@ -1103,10 +1106,10 @@ describe("pool levels", () => {
       [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
       all,
     );
-    // The low card would run on max (the first Haiku pool), but max's one slot is taken.
+    // The low card has no pool of its own here, so it waits instead of taking max's slot.
     expect(plan.map((d) => d.pool)).toEqual([poolKey(xhigh), poolKey(max)]);
     const alone = planDispatch(board, [card({ model: at(haiku, "low") })], all);
-    expect(alone.map((d) => d.pool)).toEqual([poolKey(max)]);
+    expect(alone).toEqual([]);
   });
 
   it("lets a thread claim a card whose level runs on the thread's pool", () => {
@@ -1120,9 +1123,17 @@ describe("pool levels", () => {
       carrying: 0,
       slots: 1,
     };
-    expect(checkClaim(board, c, ctx).ok).toBe(false);
-    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(true);
-    expect(modelOnPool(c, poolKey(max), pools([[max, 1]]))).toEqual(c.model);
+    // A low card can't be claimed on the thread's max pool: its level has no pool here.
+    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(false);
+    const own = card({ model: max });
+    expect(
+      checkClaim(board, own, {
+        ...ctx,
+        byId: new Map([[own.id as string, own]]),
+        pools: pools([[max, 1]]),
+      }).ok,
+    ).toBe(true);
+    expect(modelOnPool(own, poolKey(max), pools([[max, 1]]))).toEqual(own.model);
   });
 });
 
@@ -1163,20 +1174,33 @@ describe("claude effort pools", () => {
     expect(aliasPool(all, claude(null))?.key).toBe(poolKey(maxPool));
   });
 
-  it("OpenCode variant pools keep the first-pool fallback for a level they lack", () => {
-    const opencodeMax: ModelSelection = {
+  it("a named level is exact on OpenCode too: an xhigh-only pool never runs a max card", () => {
+    const opencode = (level: string): ModelSelection => ({
       instanceId: ProviderInstanceId.make("opencode"),
-      model: "opus/cc/claude-haiku-5-5",
+      model: "opus/gpt-6-astra",
+      options: [{ id: "variant", value: level }],
+    });
+    const xhighOnly = pools([[opencode("xhigh"), 1]]);
+    expect(poolFor(xhighOnly, opencode("xhigh"))?.key).toBe(poolKey(opencode("xhigh")));
+    expect(poolFor(xhighOnly, opencode("max"))).toBeUndefined();
+    const maxAlias: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opus"),
+      model: "gpt-6-astra",
       options: [{ id: "variant", value: "max" }],
     };
-    const all = pools([[opencodeMax, 1]]);
-    const low: ModelSelection = { ...opencodeMax, options: [{ id: "variant", value: "low" }] };
-    expect(poolFor(all, low)?.key).toBe(poolKey(opencodeMax));
-    const alias: ModelSelection = {
-      instanceId: ProviderInstanceId.make("opus"),
-      model: "claude-haiku-5-5",
-      options: [{ id: "variant", value: "low" }],
+    expect(aliasPool(xhighOnly, maxAlias)).toBeUndefined();
+  });
+
+  it("OpenCode levels with no pool are refused, and a card with no level still takes the model's pool", () => {
+    const opencodeHigh: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/cc/claude-haiku-5-5",
+      options: [{ id: "variant", value: "high" }],
     };
-    expect(aliasPool(all, alias)?.key).toBe(poolKey(opencodeMax));
+    const all = pools([[opencodeHigh, 1]]);
+    const max: ModelSelection = { ...opencodeHigh, options: [{ id: "variant", value: "max" }] };
+    expect(poolFor(all, max)).toBeUndefined();
+    const bare: ModelSelection = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/cc/claude-haiku-5-5" };
+    expect(poolFor(all, bare)?.key).toBe(poolKey(opencodeHigh));
   });
 });

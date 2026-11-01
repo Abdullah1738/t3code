@@ -15,10 +15,7 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
-import {
-  effortOptionId,
-  selectionEffort,
-} from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -41,10 +38,9 @@ export const poolKey = (model: ModelSelection): string => {
 };
 
 /**
- * The pool a model runs on: the pool at its exact level. An effort pool (Claude, Codex)
- * never runs a named level on another level's pool, so max and xhigh stay apart. A model
- * with no level takes the first pool of its model. OpenCode variant pools keep the
- * first-pool fallback they had before levels were keyed.
+ * The pool a model runs on. A named level is exact, for every driver: its own pool, or none.
+ * Another level's pool never runs it (max on an xhigh-only pool would have its options
+ * replaced by xhigh). Only a model with no level takes the first pool of its model.
  */
 export function poolFor(
   pools: ReadonlyArray<KanbanPool>,
@@ -54,8 +50,7 @@ export function poolFor(
   // Compared by each pool's model, not its stored key, so a pool not yet rekeyed still matches.
   const exact = pools.find((pool) => poolKey(pool.model) === key);
   if (exact !== undefined) return exact;
-  if (modelLevel(model) !== null && effortOptionId(model.instanceId) !== "variant")
-    return undefined;
+  if (modelLevel(model) !== null) return undefined;
   const base = modelKey(model);
   return pools.find((pool) => modelKey(pool.model) === base);
 }
@@ -64,7 +59,7 @@ export function poolFor(
  * The pool an alias names. An alias is written without its instance, or with a short name,
  * so it is matched to the pool model it means: a short name is unambiguous when its pools all
  * belong to one model (one key per level is still one model). The level rule is poolFor's:
- * an effort pool never gives a named level to another level's pool.
+ * a named level is exact, for every driver.
  */
 export function aliasPool(
   pools: ReadonlyArray<KanbanPool>,
@@ -81,9 +76,7 @@ export function aliasPool(
   if (first === undefined) return undefined;
   const level = modelLevel(model);
   if (level === null) return first;
-  const exact = same.find((pool) => modelLevel(pool.model) === level);
-  if (exact !== undefined) return exact;
-  return effortOptionId(first.model.instanceId) === "variant" ? first : undefined;
+  return same.find((pool) => modelLevel(pool.model) === level);
 }
 
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);

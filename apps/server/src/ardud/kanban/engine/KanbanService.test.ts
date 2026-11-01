@@ -5838,21 +5838,21 @@ it.effect("refuses a model or variant the provider doesn't offer, and names what
       });
       const astraPool = yield* kanban.setPool(board.id, astraXhigh, 2);
       assert.isDefined(astraPool);
-      // The pool's variant wins: a card asking for high on an xhigh pool runs at xhigh.
-      const created = yield* kanban.createCard(
-        board.id,
-        { prompt: "x", title: "x", model: astraHigh },
-        owner,
-      );
-      assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+      // A card asking for high on an xhigh-only pool is refused, never run at xhigh instead.
+      const refusedCreate = yield* kanban
+        .createCard(board.id, { prompt: "x", title: "x", model: astraHigh }, owner)
+        .pipe(Effect.flip);
+      assert.include(refusedCreate.detail, 'has no "high" variant; it offers: xhigh');
 
       const accepted = yield* kanban.createCard(
         board.id,
         { prompt: "x", title: "x", model: astraXhigh },
         owner,
       );
-      const edited = yield* kanban.editCard(accepted.id, { model: astraHigh }, owner);
-      assert.strictEqual(edited.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+      const editRefused = yield* kanban
+        .editCard(accepted.id, { model: astraHigh }, owner)
+        .pipe(Effect.flip);
+      assert.include(editRefused.detail, 'has no "high" variant; it offers: xhigh');
       yield* kanban.editCard(accepted.id, { model: astraXhigh }, owner);
 
       const poolRefused = yield* kanban.setPool(board.id, astraHigh, 1).pipe(Effect.flip);
@@ -5874,14 +5874,14 @@ it.effect("pausing a pool at a variant the provider doesn't offer keeps the pool
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       yield* kanban.setPool(board.id, astraXhigh, 2);
-      const paused = yield* kanban.setPool(board.id, astraHigh, 0);
+      const paused = yield* kanban.setPool(board.id, astraXhigh, 0);
       const pool = paused.find((candidate) => candidate.key === Rules.poolKey(astraXhigh));
       assert.strictEqual(pool?.slots, 0);
       assert.strictEqual(pool?.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
 
       const created = yield* kanban.createCard(
         board.id,
-        { prompt: "x", title: "x", model: astraHigh },
+        { prompt: "x", title: "x", model: astraXhigh },
         owner,
       );
       assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
@@ -6418,16 +6418,14 @@ it.effect("the pool's variant wins on create and edit", () =>
       yield* kanban.setPool(board.id, astraXhigh, 1);
       const created = yield* kanban.createCard(
         board.id,
-        { prompt: "x", title: "x", model: astraHigh },
+        { prompt: "x", title: "x", model: astraXhigh },
         owner,
       );
       assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
-      const edited = yield* kanban.editCard(
-        created.id,
-        { models: [{ model: astraHigh, weight: 1 }] },
-        owner,
-      );
-      assert.strictEqual(edited.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
+      const refused = yield* kanban
+        .editCard(created.id, { models: [{ model: astraHigh, weight: 1 }] }, owner)
+        .pipe(Effect.flip);
+      assert.include(refused.detail, 'has no "high" variant; it offers: xhigh');
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -6437,11 +6435,10 @@ it.effect("the pool's variant wins for a create without an explicit model", () =
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      // Opus offers high, so a high board default is valid; the Opus xhigh pool wins anyway.
-      const opusHigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
+      // The default and the only pool share a level, so a card with no model gets that level.
       const opusXhigh = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
       yield* kanban.setPool(board.id, opusXhigh, 1);
-      yield* kanban.updateBoard(board.id, { defaultCardModel: opusHigh });
+      yield* kanban.updateBoard(board.id, { defaultCardModel: opusXhigh });
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       assert.strictEqual(created.model.options?.find((o) => o.id === "variant")?.value, "xhigh");
     }).pipe(Effect.provide(testLayer(fake.layer)));
