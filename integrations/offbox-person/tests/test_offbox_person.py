@@ -224,6 +224,21 @@ class OffboxPersonTest(unittest.TestCase):
                                  f"offbox-person: her box didn't start (offbox exit {second}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n")
                 self.assertEqual(len(self.ssh_calls()), 2)
 
+    def test_wa_read_discards_failed_attempt_output_before_retry(self):
+        self.ssh_responses({"exit": 90, "stdout": "offline (not linked)\n"},
+                           {"exit": 0, "stdout": "online pid 1\n"})
+        result = self.tool("wa", "moni", "status")
+        self.assertEqual(result.stdout, "online pid 1\n")
+        self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_wa_read_without_retry_preserves_stdout_and_trailing_newlines(self):
+        self.ssh_responses({"exit": 1, "stdout": "offline (linked)\n\n"})
+        result = self.tool("wa", "moni", "status", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "offline (linked)\n\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(self.ssh_calls()), 1)
+
     def test_wa_not_linked_and_other_exits_pass_through(self):
         for command, response in (
             (("status",), {"exit": 1, "stdout": "offline (not linked)\n"}),
@@ -257,7 +272,8 @@ class OffboxPersonTest(unittest.TestCase):
                     result = self.tool("wa", "moni", command, "arg", check=False)
                     self.assertEqual(result.returncode, 90)
                     self.assertEqual(result.stderr,
-                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n")
+                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n"
+                                     "offbox-person: the command may have run; check before repeating it.\n")
                     self.assertEqual(len(self.ssh_calls()), 1)
 
     def test_wa_setup_stops_on_box_failure_at_each_step_without_retry(self):
@@ -268,7 +284,8 @@ class OffboxPersonTest(unittest.TestCase):
                     result = self.tool("wa", "moni", "setup", check=False)
                     self.assertEqual(result.returncode, 90)
                     self.assertEqual(result.stderr,
-                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n")
+                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n"
+                                     "offbox-person: the command may have run; check before repeating it.\n")
                     self.assertEqual(len(self.ssh_calls()), step + 1)
 
     def test_wa_setup_other_failure_passes_through_without_retry(self):

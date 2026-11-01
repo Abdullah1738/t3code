@@ -304,15 +304,23 @@ cmd_backup() {
 
 # Only explicitly read-only WA commands can be repeated after an ambiguous box failure.
 wa_box_ssh() {
-  local p=$1 retry=$2 rc=0; shift 2
-  box_ssh "$p" "$@" || rc=$?
-  if [[ $rc == (90|92) && $retry == 1 ]]; then
+  local p=$1 retry=$2 rc=0 first_output; shift 2
+  if [[ $retry == 1 ]]; then
+    # Keep the first read's stdout only if it won't be retried. The sentinel preserves trailing newlines.
+    first_output=$(box_ssh "$p" "$@" || rc=$?; print -rn -- .; exit $rc) || rc=$?
+    if [[ $rc != (90|92) ]]; then
+      print -rn -- "${first_output%.}"
+      return $rc
+    fi
     print -u2 -- "offbox-person: her box didn't start in time (offbox exit $rc); retrying once"
     rc=0
+    box_ssh "$p" "$@" || rc=$?
+  else
     box_ssh "$p" "$@" || rc=$?
   fi
   if [[ $rc == (90|92) ]]; then
     print -u2 -- "offbox-person: her box didn't start (offbox exit $rc). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes."
+    [[ $retry == 1 ]] || print -u2 -- "offbox-person: the command may have run; check before repeating it."
     return 90
   fi
   return $rc
