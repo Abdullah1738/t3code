@@ -10,7 +10,10 @@ Stdlib only. Never reads or writes the personal homes (~/.claude, ~/.codex,
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -24,7 +27,7 @@ PERSONAL_HOMES = ("~/.claude", "~/.codex", "/Volumes/ExternalSSD/codex")
 INLINE_KEYS = {"http_headers", "env", "set"}
 CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
-HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "SessionStart")
+HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SessionStart")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 
 
@@ -52,6 +55,17 @@ def resolve_homes(manifest: dict, home_root: str | None) -> tuple[str, str]:
     for home in (claude, codex):
         guard_home(home)
     return os.path.abspath(claude), os.path.abspath(codex)
+
+
+def additional_codex_homes(manifest: dict, home_root: str | None) -> list[str]:
+    result = []
+    for name, harness in manifest.get("homeHarnesses", {}).items():
+        if harness != "codex" or name == "codex":
+            continue
+        path = os.path.join(expand(home_root), name) if home_root else expand(manifest["homes"][name])
+        guard_home(path)
+        result.append(os.path.abspath(path))
+    return result
 
 
 def guard_home(path: str) -> None:
@@ -220,15 +234,180 @@ def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) 
 
 # ---------- content builders ----------
 
-def claude_hooks(hooks: list[dict]) -> dict:
+def claude_hooks(hooks: list[dict], harness: str | None = None) -> dict:
     out: dict[str, list] = {}
     for hook in hooks:
+        if harness and hook.get("harness") not in (None, harness):
+            continue
         group: dict = {}
         if hook.get("matcher") is not None:
             group["matcher"] = hook["matcher"]
         group["hooks"] = [{"type": "command", "command": hook["command"], "timeout": hook["timeoutSec"]}]
         out.setdefault(hook["event"], []).append(group)
     return out
+
+
+def merge_hooks(existing, expected: dict, label: str) -> dict:
+    """Update only manifest commands, retaining foreign groups and their positions."""
+    if not isinstance(existing, dict):
+        raise HomeError(f"{label}: hooks must be an object")
+    result = {event: list(groups) if isinstance(groups, list) else groups
+              for event, groups in existing.items()}
+    for event, wanted_groups in expected.items():
+        groups = result.setdefault(event, [])
+        if not isinstance(groups, list):
+            raise HomeError(f"{label}: hooks.{event} must be a list")
+        for wanted in wanted_groups:
+            handler = wanted["hooks"][0]
+            target = hook_command_target(handler["command"])
+            matches = []
+            for group_index, group in enumerate(groups):
+                if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                    raise HomeError(f"{label}: invalid hooks.{event} group")
+                for handler_index, item in enumerate(group["hooks"]):
+                    if (isinstance(item, dict) and item.get("command") == handler["command"]):
+                        matches.append((group_index, handler_index))
+                    elif (isinstance(item, dict) and target != handler["command"]
+                          and hook_command_target(item.get("command")) == target):
+                        raise HomeError(f"{label}: {event} has a conflicting recall command; resolve it manually")
+            if len(matches) > 1:
+                raise HomeError(f"{label}: duplicate owned hook for {event}; resolve it without shifting foreign hooks")
+            if not matches:
+                groups.append(wanted)
+                continue
+            group_index, handler_index = matches[0]
+            group = dict(groups[group_index])
+            handlers = list(group["hooks"])
+            if group.get("matcher") != wanted.get("matcher"):
+                if len(handlers) != 1:
+                    raise HomeError(f"{label}: cannot change {event} matcher shared with another hook")
+                if "matcher" in wanted:
+                    group["matcher"] = wanted["matcher"]
+                else:
+                    group.pop("matcher", None)
+            handlers[handler_index] = handler
+            group["hooks"] = handlers
+            groups[group_index] = group
+    return result
+
+
+def hook_command_target(command) -> str | None:
+    if not isinstance(command, str):
+        return None
+    # Recognize manifest handlers across flag/interpreter changes without claiming
+    # unrelated commands. Paths may be quoted; the executable path is stable.
+    match = re.search(r"(?:^|\s)[\"']?(/[^\s\"']+/recall_hook\.py)(?=$|[\s\"'])", command)
+    return match.group(1) if match else command
+
+
+def owned_hook_positions(actual, expected: dict, label: str, fail) -> list[tuple]:
+    """Locate exact owned definitions without requiring foreign definitions to match."""
+    positions = []
+    if not isinstance(actual, dict):
+        fail(f"{label}: hooks must be an object")
+        return positions
+    if label.startswith("claude"):
+        for event, groups in actual.items():
+            if not isinstance(groups, list):
+                fail(f"{label}: hooks.{event} must be a list")
+                continue
+            for group in groups:
+                if (not isinstance(group, dict) or not isinstance(group.get("hooks"), list)
+                    or ("matcher" in group and not isinstance(group["matcher"], str))):
+                    fail(f"{label}: invalid hooks.{event} group")
+    for event, groups in expected.items():
+        actual_groups = actual.get(event)
+        if not isinstance(actual_groups, list):
+            fail(f"{label}: missing hooks.{event}")
+            continue
+        for wanted in groups:
+            wanted_handler = wanted["hooks"][0]
+            matches = []
+            for group_index, group in enumerate(actual_groups):
+                if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                    fail(f"{label}: invalid hooks.{event} group")
+                    continue
+                for handler_index, handler in enumerate(group["hooks"]):
+                    if (isinstance(handler, dict)
+                        and hook_command_target(handler.get("command")) == hook_command_target(wanted_handler["command"])):
+                        matches.append((group_index, handler_index, group, handler))
+            if len(matches) != 1:
+                fail(f"{label}: expected exactly one owned {event} hook, found {len(matches)}")
+                continue
+            group_index, handler_index, group, handler = matches[0]
+            if (set(group) - {"matcher", "hooks"} or group.get("matcher") != wanted.get("matcher")
+                    or handler != wanted_handler):
+                fail(f"{label}: owned {event} definition differs from manifest")
+                continue
+            positions.append((event, group_index, handler_index, wanted))
+    return positions
+
+
+def codex_hook_trust_failures(home: str, config: dict, positions: list[tuple], fail) -> None:
+    # Codex rust-v0.144.1/0.166.0 hook discovery: key = source:event:group:handler,
+    # hash = canonical JSON of the normalized event, matcher and single handler.
+    labels = {"UserPromptSubmit": "user_prompt_submit", "PostToolUse": "post_tool_use",
+              "SubagentStart": "subagent_start", "PreToolUse": "pre_tool_use",
+              "SessionStart": "session_start"}
+    hooks = config.get("hooks", {})
+    state = hooks.get("state", {}) if isinstance(hooks, dict) else {}
+    if not isinstance(state, dict):
+        state = {}
+    for event, group_index, handler_index, wanted in positions:
+        label = labels.get(event)
+        if label is None:
+            fail(f"{home}: cannot verify Codex trust for unsupported event {event}")
+            continue
+        command = wanted["hooks"][0]
+        identity = {"event_name": label, "hooks": [{**command, "async": False}]}
+        if event != "UserPromptSubmit" and "matcher" in wanted:
+            identity["matcher"] = wanted["matcher"]
+        canonical = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+        digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        key = f"{os.path.realpath(os.path.join(home, 'hooks.json'))}:{label}:{group_index}:{handler_index}"
+        entry = state.get(key)
+        if not isinstance(entry, dict) or entry.get("trusted_hash") != digest:
+            fail(f"{home}: {event} recall hook is not trusted or has changed; review it in Codex /hooks")
+        elif entry.get("enabled", True) is not True:
+            fail(f"{home}: {event} recall hook is disabled")
+
+
+def validate_codex_hook_file(hooks, label: str, fail) -> None:
+    # A malformed foreign event can prevent Codex from loading the entire file.
+    events = {"PreModelRequest", "PostModelRequest", "PreToolUse", "PermissionRequest", "PostToolUse",
+              "PreCompact", "PostCompact", "SessionStart", "SessionEnd", "UserPromptSubmit",
+              "SubagentStart", "SubagentStop", "Stop", "Interrupt"}
+    if not isinstance(hooks, dict):
+        fail(f"{label}: hooks must be an object")
+        return
+    for event, groups in hooks.items():
+        if event not in events:
+            continue
+        if not isinstance(groups, list):
+            fail(f"{label}: hooks.{event} must be a list")
+            continue
+        for group in groups:
+            if not isinstance(group, dict) or ("matcher" in group and group["matcher"] is not None
+                                              and not isinstance(group["matcher"], str)):
+                fail(f"{label}: invalid {event} matcher group")
+                continue
+            handlers = group.get("hooks", [])
+            if not isinstance(handlers, list):
+                fail(f"{label}: invalid {event} handlers")
+                continue
+            for handler in handlers:
+                if not isinstance(handler, dict) or handler.get("type") not in ("command", "prompt", "agent"):
+                    fail(f"{label}: cannot verify foreign {event} handler; Codex may reject the hook file")
+                    continue
+                if handler["type"] != "command":
+                    continue
+                timeout = handler.get("timeout")
+                if (not isinstance(handler.get("command"), str)
+                    or (timeout is not None and (type(timeout) is not int or not 0 <= timeout < 2**64))
+                    or ("async" in handler and not isinstance(handler["async"], bool))
+                    or any(handler.get(key) is not None and not isinstance(handler[key], str)
+                           for key in ("statusMessage", "commandWindows", "command_windows"))):
+                    fail(f"{label}: invalid {event} command handler")
 
 
 def claude_mcp(servers: list[dict]) -> dict:
@@ -272,7 +451,7 @@ def claude_settings_owned(manifest: dict) -> dict:
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "900000",
             "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": str(c["subagentDepth"]),
         },
-        "hooks": claude_hooks(manifest["hooks"]),
+        "hooks": claude_hooks(manifest["hooks"], "claude"),
     }
 
 
@@ -285,6 +464,12 @@ def toml_value(value) -> str:
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise HomeError("cannot safely rewrite TOML with non-finite floats")
+        return repr(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
@@ -339,7 +524,7 @@ def codex_mcp(servers: list[dict]) -> dict:
     return out
 
 
-def codex_config(manifest: dict, codex_home: str, existing_state: dict | None) -> dict:
+def codex_config(manifest: dict, codex_home: str) -> dict:
     path_value = ":".join(list(manifest["shellPathPrefix"]) + list(manifest["shellPath"]))
     config = {
         "model": "gpt-6-astra",
@@ -391,13 +576,24 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None) -
         "shell_environment_policy": {"inherit": "all", "set": {"PATH": path_value}},
         "mcp_servers": codex_mcp(manifest["mcpServers"]),
     }
-    if manifest["hooks"]:
-        config["hooks"] = {"state": existing_state or {}}
     return config
 
 
 def codex_hooks_json(hooks: list[dict]) -> dict:
-    return {"hooks": claude_hooks(hooks)}
+    return {"hooks": claude_hooks(hooks, "codex")}
+
+
+def validate_toml_shapes(prior: dict, defaults: dict, path: str) -> None:
+    for key, default in defaults.items():
+        if key not in prior:
+            continue
+        old = prior[key]
+        if isinstance(old, dict) != isinstance(default, dict):
+            raise HomeError(f"{path}.{key}: cannot merge table with non-table; nothing written")
+        if isinstance(old, list) != isinstance(default, list):
+            raise HomeError(f"{path}.{key}: cannot merge array with non-array; nothing written")
+        if isinstance(old, dict):
+            validate_toml_shapes(old, default, f"{path}.{key}")
 
 
 def models_json(vendor_path: Path, manifest: dict) -> bytes:
@@ -431,9 +627,26 @@ def validate_manifest(manifest: dict) -> None:
             raise HomeError(f"unknown hook event {h['event']!r}")
         if not os.path.isabs(h["command"]):
             raise HomeError(f"hook command must be an absolute path: {h['command']}")
+        if h.get("harness") not in (None, "claude", "codex"):
+            raise HomeError(f"unknown hook harness {h['harness']!r}")
+    home_harnesses = manifest.get("homeHarnesses", {})
+    if home_harnesses.get("claude") != "claude" or home_harnesses.get("codex") != "codex":
+        raise HomeError("homeHarnesses must identify the claude and codex homes")
+    if set(home_harnesses) != set(manifest["homes"]):
+        raise HomeError("every manifest home must have a harness")
+    for name, harness in home_harnesses.items():
+        if name not in manifest["homes"] or harness not in ("claude", "codex"):
+            raise HomeError(f"invalid home harness: {name}")
+        if name != "claude" and harness == "claude":
+            raise HomeError(f"additional Claude home not supported: {name}")
+    codex_paths = [manifest["homes"][name] for name, harness in manifest.get("homeHarnesses", {}).items()
+                   if harness == "codex"]
+    if len({os.path.realpath(expand(path)) for path in codex_paths}) != len(codex_paths):
+        raise HomeError("Codex homes must be distinct")
 
 
-def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]]) -> dict:
+def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]],
+          extra_codex: bool = False) -> dict:
     """Compute every generated file in memory. Reads only; writes nothing."""
     canonical_path = expand(manifest["instructions"]["canonical"])
     canonical = read_bytes(canonical_path)
@@ -443,34 +656,48 @@ def build(manifest: dict, claude: str, codex: str, skills: list[tuple[str, str]]
     overlay_codex = (PKG / manifest["instructions"]["overlays"]["codex"]).read_bytes()
 
     settings_path = os.path.join(claude, "settings.json")
-    settings = deep_merge(read_json_or_empty(settings_path), claude_settings_owned(manifest),
-                          replace=frozenset({"hooks"}))
+    settings = read_json_or_empty(settings_path)
+    owned_settings = claude_settings_owned(manifest)
+    owned_hooks = owned_settings.pop("hooks")
+    settings = deep_merge(settings, owned_settings)
+    settings["hooks"] = merge_hooks(settings.get("hooks", {}), owned_hooks, settings_path)
 
     claude_json_path = os.path.join(claude, ".claude.json")
     claude_json = read_json_or_empty(claude_json_path)
     claude_json["mcpServers"] = claude_mcp(manifest["mcpServers"])
     claude_json["hasCompletedOnboarding"] = True
 
-    existing_state = None
     config_path = os.path.join(codex, "config.toml")
+    prior = {}
     if os.path.exists(config_path):
         try:
             prior = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as exc:
             raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
-        existing_state = (prior.get("hooks") or {}).get("state")
+    defaults = codex_config(manifest, codex)
+    validate_toml_shapes(prior, defaults, config_path)
+    if extra_codex:
+        # Instance-specific settings (notably computer use) belong to that home.
+        config = deep_merge(defaults, prior)
+        config = deep_merge(config, {"features": {"hooks": True}})
+    else:
+        config = deep_merge(prior, defaults)
 
     files = {
         settings_path: json_bytes(settings),
         claude_json_path: json_bytes(claude_json),
         os.path.join(claude, "CLAUDE.md"): f"@{canonical_path}\n@{os.path.join(claude, 'overlay.md')}\n".encode(),
         os.path.join(claude, "overlay.md"): overlay_claude,
-        config_path: toml_dump(codex_config(manifest, codex, existing_state)).encode("utf-8"),
+        config_path: toml_dump(config).encode("utf-8"),
         os.path.join(codex, "AGENTS.md"): canonical + b"\n\n" + overlay_codex,
         os.path.join(codex, "models.json"): models_json(PKG / manifest["codexModels"]["catalogSource"], manifest),
     }
-    if manifest["hooks"]:
-        files[os.path.join(codex, "hooks.json")] = json_bytes(codex_hooks_json(manifest["hooks"]))
+    hooks_path = os.path.join(codex, "hooks.json")
+    expected_codex_hooks = codex_hooks_json(manifest["hooks"])["hooks"]
+    if expected_codex_hooks:
+        hooks_file = read_json_or_empty(hooks_path)
+        hooks_file["hooks"] = merge_hooks(hooks_file.get("hooks", {}), expected_codex_hooks, hooks_path)
+        files[hooks_path] = json_bytes(hooks_file)
     return files
 
 
@@ -480,6 +707,10 @@ def plan_all(home_root: str | None) -> tuple[dict, str, str, list[tuple[str, str
     claude, codex = resolve_homes(manifest, home_root)
     skills = discover_skills([expand(r) for r in manifest["skillRoots"]])
     files = build(manifest, claude, codex, skills)
+    for extra in additional_codex_homes(manifest, home_root):
+        extra_files = build(manifest, claude, extra, skills, extra_codex=True)
+        files.update({path: data for path, data in extra_files.items()
+                      if os.path.commonpath((extra, path)) == extra})
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
             raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
@@ -544,19 +775,19 @@ class Writer:
 
 def generate(home_root: str | None, dry_run: bool) -> int:
     manifest, claude, codex, skills, files = plan_all(home_root)
-    farms = [os.path.join(claude, "skills"), os.path.join(codex, "skills")]
-    guard_outputs([claude, codex, *farms, *files])
+    homes = [claude, codex, *additional_codex_homes(manifest, home_root)]
+    farms = [os.path.join(home, "skills") for home in homes]
+    guard_outputs([*homes, *farms, *files])
     roots = [expand(r) for r in manifest["skillRoots"]]
-    ops = skill_ops(farms[0], skills, roots)
-    ops_codex = skill_ops(farms[1], skills, roots)
-    guard_outputs([op[1] for op in ops + ops_codex])
+    plans = [skill_ops(farm, skills, roots) for farm in farms]
+    guard_outputs([op[1] for plan in plans for op in plan])
     writer = Writer(dry_run)
-    for home in (claude, codex):
+    for home in homes:
         writer.ensure_dir(home, dry_run)
     for path, data in files.items():
         mode = 0o644
         writer.file(path, data, mode)
-    for home, plan in ((claude, ops), (codex, ops_codex)):
+    for home, plan in zip(homes, plans):
         writer.ensure_dir(os.path.join(home, "skills"), dry_run)
         for op in plan:
             if op[0] == "unlink":
@@ -572,7 +803,8 @@ def check(home_root: str | None) -> int:
     manifest = load_manifest()
     validate_manifest(manifest)
     claude, codex = resolve_homes(manifest, home_root)
-    guard_outputs([claude, codex, os.path.join(claude, "skills"), os.path.join(codex, "skills")])
+    extras = additional_codex_homes(manifest, home_root)
+    guard_outputs([claude, codex, *extras, *(os.path.join(home, "skills") for home in [claude, codex, *extras])])
     failures: list[str] = []
 
     def fail(msg: str) -> None:
@@ -591,6 +823,10 @@ def check(home_root: str | None) -> int:
     for key in ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_ORG_MEMORY"):
         if env.get(key) != "1":
             fail(f"claude settings.json: env.{key} is not \"1\"")
+    if settings.get("disableAllHooks") is True:
+        fail("claude settings.json: disableAllHooks is true")
+    owned_hook_positions(settings.get("hooks", {}), claude_hooks(manifest["hooks"], "claude"),
+                         "claude settings.json", fail)
     claude_json = read_json_or_empty(os.path.join(claude, ".claude.json"))
     if set((claude_json.get("mcpServers") or {}).keys()) != want_ids:
         fail("claude .claude.json: mcpServers ids differ from manifest")
@@ -608,10 +844,16 @@ def check(home_root: str | None) -> int:
         config = {}
         fail(f"codex config.toml unreadable: {exc}")
     feats = config.get("features", {})
+    if not isinstance(feats, dict):
+        fail("codex config.toml: features is not a table")
+        feats = {}
     for key in ("memories", "chronicle"):
         if feats.get(key) is not False:
             fail(f"codex config.toml: features.{key} is not false")
     mem = config.get("memories", {})
+    if not isinstance(mem, dict):
+        fail("codex config.toml: memories is not a table")
+        mem = {}
     for key in ("generate_memories", "use_memories"):
         if mem.get(key) is not False:
             fail(f"codex config.toml: memories.{key} is not false")
@@ -619,8 +861,8 @@ def check(home_root: str | None) -> int:
         fail("codex config.toml: approval_policy is not \"never\"")
     if config.get("sandbox_mode") != "danger-full-access":
         fail("codex config.toml: sandbox_mode is not \"danger-full-access\"")
-    if set((config.get("mcp_servers") or {}).keys()) != want_ids:
-        fail("codex config.toml: mcp_servers ids differ from manifest")
+    if not want_ids.issubset((config.get("mcp_servers") or {}).keys()):
+        fail("codex config.toml: mcp_servers ids missing from manifest")
     agents_md = read_bytes(os.path.join(codex, "AGENTS.md"))
     canonical = read_bytes(canonical_path)
     if canonical is None:
@@ -645,6 +887,26 @@ def check(home_root: str | None) -> int:
     if config.get("model_catalog_json") != os.path.join(codex, "models.json"):
         fail("codex config.toml: model_catalog_json does not point at the generated models.json")
 
+    expected_hooks = codex_hooks_json(manifest["hooks"])["hooks"]
+    for home in [codex, *extras]:
+        hooks_path = os.path.join(home, "hooks.json")
+        try:
+            actual_file = read_json_or_empty(hooks_path)
+            if expected_hooks and (set(actual_file) - {"description", "hooks"}
+                                   or ("description" in actual_file and not isinstance(actual_file["description"], str))):
+                fail(f"{home} hooks.json: unsupported top-level fields or description")
+            if expected_hooks:
+                validate_codex_hook_file(actual_file.get("hooks", {}), f"{home} hooks.json", fail)
+            positions = owned_hook_positions(actual_file.get("hooks", {}), expected_hooks,
+                                             f"{home} hooks.json", fail)
+            extra_config = tomllib.loads(Path(home, "config.toml").read_text(encoding="utf-8"))
+            features = extra_config.get("features", {})
+            if not isinstance(features, dict) or features.get("hooks") is not True:
+                fail(f"{home} config.toml: features.hooks is not true")
+            codex_hook_trust_failures(home, extra_config, positions, fail)
+        except (OSError, tomllib.TOMLDecodeError, HomeError) as exc:
+            fail(f"{home}: {exc}")
+
     # Skills farms
     try:
         roots = [expand(r) for r in manifest["skillRoots"]]
@@ -653,7 +915,7 @@ def check(home_root: str | None) -> int:
         skills = []
         fail(str(exc))
     desired = {name: path for name, path in skills}
-    for home, label in ((claude, "claude"), (codex, "codex")):
+    for home, label in [(claude, "claude"), (codex, "codex"), *((path, path) for path in extras)]:
         farm = os.path.join(home, "skills")
         links = [e for e in (os.listdir(farm) if os.path.isdir(farm) else []) if os.path.islink(os.path.join(farm, e))]
         if len(links) != len(desired):
@@ -676,6 +938,8 @@ def check(home_root: str | None) -> int:
         str(PKG / manifest["instructions"]["overlays"]["claude"]),
         str(PKG / manifest["instructions"]["overlays"]["codex"]),
     ]
+    for home in extras:
+        scan.extend(os.path.join(home, name) for name in ("config.toml", "AGENTS.md", "hooks.json", "models.json"))
     for path in scan:
         data = read_bytes(path)
         if data is not None and SECRET_RE.search(data.decode("utf-8", errors="replace")):

@@ -1,7 +1,13 @@
 {
   "homes": {
     "claude": "~/.robob/harness-homes/claude",
-    "codex": "~/.robob/harness-homes/codex"
+    "codex": "~/.robob/harness-homes/codex",
+    "codex-cu": "~/.robob/harness-homes/codex-cu"
+  },
+  "homeHarnesses": {
+    "claude": "claude",
+    "codex": "codex",
+    "codex-cu": "codex"
   },
   "skillRoots": ["~/.config/opencode/skills"],
   "instructions": {
@@ -22,7 +28,15 @@
   ],
   "shellPathPrefix": [],
   "shellPath": ["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
-  "hooks": [],
+  "hooks": [
+    {"harness": "claude", "event": "UserPromptSubmit", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "PostToolUseFailure", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "SubagentStart", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "codex", "event": "UserPromptSubmit", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
+    {"harness": "codex", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
+    {"harness": "codex", "event": "SubagentStart", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
+  ],
   "codexModels": {
     "catalogSource": "vendor/codex-models-0.166.0.json",
     "extended": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
