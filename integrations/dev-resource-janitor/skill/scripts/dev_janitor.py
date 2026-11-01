@@ -23,7 +23,7 @@ Stdlib only. Opens opencode.db read-only.
 """
 import argparse, calendar, json, os, re, signal, sqlite3, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import active_session_ids  # noqa: E402
+from active_sessions import snapshot  # noqa: E402
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
 OC_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
@@ -85,11 +85,26 @@ def keep_list():
 
 
 def running_sessions():
-    return active_session_ids(timeout=20)
+    """(running OpenCode session ids, native thread dirs, error): complete snapshot, or (None, {}, why).
+
+    Only OpenCode ids come back as session ids, because session_evidence matches them against OpenCode's own
+    tables. Running Claude/Codex threads come back as {thread id: worktree path} so their checkouts are
+    treated as in use. An incomplete set (either source missing or truncated) returns None and scan() keeps
+    every resource.
+    """
+    snap = snapshot(timeout=20)
+    if not snap["complete"]:
+        return None, {}, "; ".join(snap["problems"]) or "active set incomplete"
+    native = {tid: t.get("worktreePath") for tid, t in snap["threads"].items() if t.get("worktreePath")}
+    return set(snap["opencode"]), native, None
 
 
-def session_evidence(tokens_by_res, running):
-    """tokens_by_res: {res_id: [token,...]} -> {res_id: [{session,title,at,token}]}"""
+def session_evidence(tokens_by_res, running, native_dirs=None):
+    """tokens_by_res: {res_id: [token,...]} -> ({res_id: [{session,title,at,token}]}, {session: directory}).
+
+    native_dirs: {thread id: worktree path} for running Claude/Codex threads. They count as running work in
+    their directory, so an Expo server inside one of their worktrees is kept.
+    """
     since = int((time.time() - IDLE_MIN * 60) * 1000)
     c = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True, timeout=30)
     titles = {}
@@ -117,6 +132,9 @@ def session_evidence(tokens_by_res, running):
             row = c.execute("SELECT directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
             if row:
                 dirs[sid] = row[0]
+    for tid, path in (native_dirs or {}).items():
+        if path:
+            dirs["thread:" + tid] = path
     out = {}
     for rid, d in hits.items():
         lst = sorted(d.values(), key=lambda x: -x["at_ms"])
@@ -128,7 +146,7 @@ def session_evidence(tokens_by_res, running):
 
 def scan():
     now = time.time()
-    running, run_err = running_sessions()
+    running, native_dirs, run_err = running_sessions()
     ps = procs()
     by_pid = {p["pid"]: p for p in ps}
     resources = []
@@ -210,12 +228,13 @@ def scan():
                           "age_s": vm["age_s"] if vm else None, "vm_rss_mb": vm["rss_mb"] if vm else None,
                           "tokens": ["docker ", "docker\\", "docker-compose", "docker compose"]})
 
-    evidence, run_dirs = session_evidence({r["id"]: r["tokens"] for r in resources}, running)
+    evidence, run_dirs = session_evidence({r["id"]: r["tokens"] for r in resources}, running, native_dirs)
     keep = keep_list()
     for r in resources:
         reasons = []
         r["sessions"] = evidence.get(r["id"], [])[:5]
         if running is None:
+            # Incomplete active set: a missing source means "unknown", so nothing is a candidate.
             reasons.append("cannot_read_running_sessions: " + (run_err or ""))
         if any(k and (k in r["id"] or k == r.get("name") or k == r.get("cwd")) for k in keep):
             reasons.append("keep_file")

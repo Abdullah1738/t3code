@@ -28,7 +28,7 @@ import tarfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import active_session_ids  # noqa: E402
+from active_sessions import snapshot  # noqa: E402
 
 HOME = os.path.expanduser("~")
 STALE_DAYS = int(os.environ.get("WORKTREE_STALE_DAYS", "60"))
@@ -112,14 +112,22 @@ def worktrees(common):
 
 
 def running_dirs(c):
-    ids, err = active_session_ids(timeout=30)
-    if ids is None:
-        raise RuntimeError("cannot read running sessions: " + err)
+    """Directories of every active OpenCode session and every active Robob thread (Claude and Codex included).
+
+    Raises when the active set is incomplete: the caller then keeps every worktree (see main()).
+    """
+    snap = snapshot(timeout=30)
+    if not snap["complete"]:
+        raise RuntimeError("cannot read the complete active set: " + "; ".join(snap["problems"]))
     dirs = set()
-    for sid in ids:
+    for sid in snap["opencode"]:
         row = c.execute("SELECT directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
         if row and row[0]:
             dirs.add(row[0].rstrip("/"))
+    for thread in snap["threads"].values():
+        path = thread.get("worktreePath")
+        if path:
+            dirs.add(path.rstrip("/"))
     return dirs
 
 
