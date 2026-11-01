@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+"""Build the gateway.tail landing page and the iPhone/iPad profile from the CA cert.
+
+    tail-gateway-site            writes ~/.local/share/tail-gateway/www/{index.html,ca.crt,tail-ca.mobileconfig}
+
+The profile holds only the public CA certificate (never the key). Its UUIDs are derived from the cert
+fingerprint, so rebuilding gives the same profile and iOS treats a reinstall as the same profile.
+"""
+import base64
+import hashlib
+import html
+import json
+import os
+import subprocess
+import uuid
+
+HOME = os.path.expanduser("~")
+LIVE = os.environ.get("TAIL_GATEWAY_HOME", os.path.join(HOME, ".local/share/tail-gateway"))
+ROUTES = os.path.join(os.environ.get("TAIL_GATEWAY_CONFIG", os.path.join(HOME, ".config/tail-gateway")), "routes.json")
+CA_PEM = os.path.join(LIVE, "ca/root.crt")
+WWW = os.path.join(LIVE, "www")
+
+
+def der_from_pem(pem_path):
+    out = subprocess.run(["/opt/homebrew/bin/openssl", "x509", "-in", pem_path, "-outform", "DER"],
+                         capture_output=True, check=True)
+    return out.stdout
+
+
+def mobileconfig(der):
+    fp = hashlib.sha256(der).hexdigest()
+    ns = uuid.UUID("6f1c2a6e-4b8e-4c55-9a51-7461696c6e65")
+    cert_uuid = str(uuid.uuid5(ns, "cert:" + fp)).upper()
+    prof_uuid = str(uuid.uuid5(ns, "profile:" + fp)).upper()
+    b64 = base64.encodebytes(der).decode().strip()
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadCertificateFileName</key>
+			<string>tail-ca.cer</string>
+			<key>PayloadContent</key>
+			<data>
+{b64}
+			</data>
+			<key>PayloadDescription</key>
+			<string>Trusts HTTPS for .tail names on Abdullah's tailnet.</string>
+			<key>PayloadDisplayName</key>
+			<string>Abdullah Tailnet .tail CA</string>
+			<key>PayloadIdentifier</key>
+			<string>fund.abdullah.tail.ca.cert</string>
+			<key>PayloadType</key>
+			<string>com.apple.security.root</string>
+			<key>PayloadUUID</key>
+			<string>{cert_uuid}</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Lets this device open https://*.tail sites on Abdullah's tailnet without warnings. The CA can only sign .tail names.</string>
+	<key>PayloadDisplayName</key>
+	<string>Tailnet .tail sites</string>
+	<key>PayloadIdentifier</key>
+	<string>fund.abdullah.tail.ca</string>
+	<key>PayloadOrganization</key>
+	<string>Abdullah</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>{prof_uuid}</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
+"""
+
+
+PROFILE_URL = "https://tail-gateway.tailcca332.ts.net:8443/tail-ca.mobileconfig"
+
+
+def page(routes, fingerprint):
+    rows = []
+    for r in routes:
+        url = f"https://{r['name']}.tail{r.get('path', '')}" + ("/" if r.get("path") else "")
+        rows.append(f'<li><a href="{html.escape(url)}">{html.escape(url.removeprefix("https://"))}</a>'
+                    f'<span>{html.escape(r.get("note", ""))}</span></li>')
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>.tail</title>
+<style>
+:root{{--bg:#f6f6f4;--fg:#18181b;--mute:#6b6b70;--line:#e3e3df;--acc:#2f5bd3}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#111113;--fg:#ececee;--mute:#9a9aa2;--line:#26262b;--acc:#8aa6ff}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,system-ui,sans-serif}}
+main{{max-width:640px;margin:0 auto;padding:40px 20px 64px}}
+h1{{font-size:28px;letter-spacing:-.02em;margin:0 0 4px}}p{{color:var(--mute);margin:0 0 24px}}
+.ca{{display:inline-block;padding:10px 14px;border:1px solid var(--line);border-radius:10px;color:var(--acc);text-decoration:none;margin:0 0 32px}}
+ul{{list-style:none;padding:0;margin:0;border-top:1px solid var(--line)}}
+li{{display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--line)}}
+li a{{color:var(--fg);font-weight:600;text-decoration:none}}.fp{{font:12px ui-monospace,monospace;word-break:break-all;margin:-20px 0 32px}}li span{{color:var(--mute);font-size:14px}}
+</style></head><body><main>
+<h1>.tail</h1>
+<p>Sites on the tailnet.</p>
+<a class="ca" href="{PROFILE_URL}">Install the .tail profile (iPhone, iPad, Mac)</a>
+<p class="fp">CA SHA-256 {fingerprint}</p>
+<ul>
+{chr(10).join(rows)}
+</ul>
+</main></body></html>
+"""
+
+
+def main():
+    os.makedirs(WWW, exist_ok=True)
+    der = der_from_pem(CA_PEM)
+    with open(os.path.join(WWW, "ca.crt"), "wb") as f:
+        f.write(der)
+    with open(os.path.join(WWW, "tail-ca.mobileconfig"), "w") as f:
+        f.write(mobileconfig(der))
+    try:
+        with open(ROUTES) as f:
+            routes = json.load(f).get("routes", [])
+    except FileNotFoundError:
+        routes = []
+    with open(os.path.join(WWW, "index.html"), "w") as f:
+        fp = ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
+        f.write(page(routes, fp))
+    print(WWW)
+
+
+if __name__ == "__main__":
+    main()
