@@ -210,21 +210,29 @@ const make = Effect.gen(function* () {
   // the link, and it must belong to the parent app thread AND to the driver +
   // instance the caller resolved. The agent id alone is not unique across
   // sessions, so the match is only trusted when exactly one row qualifies.
+  // Ownership is proven by the child's node: the adapter writes it with the
+  // parent's provider thread id (ClaudeAdapterV2.ts ~5482) and the task id as
+  // its native item ref. A replacement session in the same instance has a
+  // different provider thread, so it can never match an old child's node.
   const subagentsByAgent = (
     threadId: string,
     agentId: string,
     driver: string,
     providerInstanceId: string,
+    parentProviderThreadId: string,
   ) =>
     sql<SubagentRow>`
-      SELECT thread_id, child_thread_id, json_extract(payload_json, '$.modelSelection') AS model_json
-      FROM orchestration_v2_projection_subagents
-      WHERE thread_id = ${threadId}
-        AND COALESCE(driver, json_extract(payload_json, '$.driver')) = ${driver}
-        AND COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) = ${providerInstanceId}
-        AND json_extract(payload_json, '$.nativeTaskRef.nativeId') = ${agentId}
-        AND origin = 'provider_native'
-        AND child_thread_id IS NOT NULL
+      SELECT s.thread_id, s.child_thread_id, json_extract(s.payload_json, '$.modelSelection') AS model_json
+      FROM orchestration_v2_projection_subagents AS s
+      JOIN orchestration_v2_projection_nodes AS n ON n.node_id = s.subagent_id
+      WHERE s.thread_id = ${threadId}
+        AND COALESCE(s.driver, json_extract(s.payload_json, '$.driver')) = ${driver}
+        AND COALESCE(s.provider_instance_id, json_extract(s.payload_json, '$.providerInstanceId')) = ${providerInstanceId}
+        AND json_extract(s.payload_json, '$.nativeTaskRef.nativeId') = ${agentId}
+        AND s.origin = 'provider_native'
+        AND s.child_thread_id IS NOT NULL
+        AND n.kind = 'subagent'
+        AND n.provider_thread_id = ${parentProviderThreadId}
     `.pipe(Effect.mapError(fail("read-subagent-by-agent")));
 
   // Codex children: the subagent row points at the child's own provider thread.
@@ -321,7 +329,14 @@ const make = Effect.gen(function* () {
       const providerInstanceId = row?.provider_instance_id ?? "opencode";
 
       if (input.agentId !== undefined) {
-        const matches = yield* subagentsByAgent(threadId, input.agentId, driver, providerInstanceId);
+        if (row === undefined) return unresolved("unavailable");
+        const matches = yield* subagentsByAgent(
+          threadId,
+          input.agentId,
+          driver,
+          providerInstanceId,
+          row.provider_thread_id,
+        );
         const childIds = [...new Set(matches.map((row) => row.child_thread_id!))];
         if (childIds.length > 1) return unresolved("ambiguous", childIds);
         const subagent = matches[0];

@@ -106,6 +106,25 @@ const seed = Effect.gen(function* () {
     sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(row)}`;
   const insertSubagent = (row: ReturnType<typeof subagent>) =>
     sql`INSERT INTO orchestration_v2_projection_subagents ${sql.insert(row)}`;
+  // The child's node carries the parent provider thread the adapter wrote
+  // (ClaudeAdapterV2.ts ~5482). The subagent row and its node share one id.
+  const insertNode = (subagentId: string, threadId: string, providerThreadId: string | null) =>
+    sql`INSERT INTO orchestration_v2_projection_nodes ${sql.insert({
+      node_id: subagentId,
+      thread_id: threadId,
+      run_id: null,
+      parent_node_id: null,
+      root_node_id: subagentId,
+      kind: "subagent",
+      status: "running",
+      provider_thread_id: providerThreadId,
+      provider_turn_id: null,
+      runtime_request_id: null,
+      checkpoint_scope_id: null,
+      started_at: "2026-01-01T00:00:00.000Z",
+      completed_at: null,
+      payload_json: JSON.stringify({ id: subagentId, kind: "subagent", providerThreadId }),
+    })}`;
   const insertImport = (nativeId: string, threadId: string) =>
     sql`INSERT INTO ardud_opencode_import ${sql.insert({
       native_session_id: nativeId,
@@ -135,6 +154,7 @@ const seed = Effect.gen(function* () {
   yield* insertSubagent(
     subagent("s-claude", "t-claude-parent", "t-claude-child", null, "claudeAgent", "agent-abc"),
   );
+  yield* insertNode("s-claude", "t-claude-parent", "pt-claude-parent");
 
   // Codex child owns its own provider thread.
   yield* insertThread(thread("t-codex-parent", "pt-codex-parent", { parentThreadId: null, rootThreadId: "t-codex-parent" }));
@@ -196,6 +216,15 @@ const seed = Effect.gen(function* () {
   yield* insertThread(thread("t-claude-child-2", null, { parentThreadId: "t-claude-parent", rootThreadId: "t-claude-parent", relationshipToParent: "subagent" }));
   yield* insertSubagent(
     subagent("s-claude-2", "t-claude-parent", "t-claude-child-2", null, "claudeAgent", "agent-abc", undefined, { instance: "claudeAgent-2" }),
+  );
+  yield* insertNode("s-claude-2", "t-claude-parent", "pt-claude-parent-2");
+
+  // Review r5 (same-instance replacement): the parent app thread's Claude
+  // session is replaced by a new session in the SAME instance. The old child
+  // (agent-abc, node under pt-claude-parent) must not resolve through the new
+  // session. The replacement has its own provider thread and no child node.
+  yield* insertProvider(
+    provider("pt-claude-replacement", "t-claude-parent", "claudeAgent", "parent-uuid-replacement", "2026-01-03T00:00:00.000Z"),
   );
 
   // Review r4 (app-owned children): an app-owned delegated child whose
@@ -393,6 +422,32 @@ describe("ExecutionIdentity", () => {
         });
         assert.strictEqual(first.robobThreadId, "t-claude-child");
         assert.strictEqual(first.providerInstanceId, "claudeAgent");
+      }),
+    ),
+  );
+
+  it.effect("does not resolve an old child through a same-instance replacement session", () =>
+    run(
+      Effect.gen(function* () {
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        // The replacement is in the same instance as the old child, but its
+        // provider thread never created agent-abc's node.
+        const replacement = yield* identity.resolve({
+          nativeId: "parent-uuid-replacement",
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          agentId: "agent-abc",
+        });
+        assert.notStrictEqual(replacement.robobThreadId, "t-claude-child");
+        assert.notStrictEqual(replacement.resolution, "resolved");
+        // The old session still resolves its own child: the node proves ownership.
+        const original = yield* identity.resolve({
+          nativeId: "parent-uuid",
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          agentId: "agent-abc",
+        });
+        assert.strictEqual(original.robobThreadId, "t-claude-child");
       }),
     ),
   );
