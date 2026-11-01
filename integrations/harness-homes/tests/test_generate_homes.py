@@ -107,6 +107,9 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(settings["env"]["CLAUDE_CODE_DISABLE_ORG_MEMORY"], "1")
         self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:20128")
         self.assertEqual(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "500000")
+        self.assertEqual(settings["env"]["ENABLE_PROMPT_CACHING_1H"], "1")
+        self.assertEqual(settings["env"]["CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"], "450000")
+        self.assertNotIn("idleCompaction", settings)
         self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"], "1000000")
         self.assertEqual(settings["pluginConfigs"]["cc-plugin-agents-md@builtin"]["options"]["instructionFiles"],
                          "claude-md-and-agents-md")
@@ -164,6 +167,55 @@ class GenerateTests(HarnessTestCase):
         self.assertTrue(os.path.islink(self.claude / "skills/beta"))
         self.assertEqual(os.path.realpath(self.claude / "skills/gamma"),
                          os.path.realpath(self.skill_root / "cat/deep/gamma"))
+
+    def test_openai_named_provider_and_compaction_flags_apply_to_both_codex_homes(self) -> None:
+        self.run_gen()
+        for home in (self.codex, self.codex_cu):
+            with self.subTest(home=home.name):
+                cfg = tomllib.loads((home / "config.toml").read_text())
+                self.assertEqual(cfg["model_provider"], "ninerouter")
+                provider = cfg["model_providers"]["ninerouter"]
+                self.assertEqual(provider["name"], "OpenAI")
+                self.assertEqual(provider["base_url"], "http://127.0.0.1:20128/v1")
+                self.assertNotIn("capabilities", provider)
+                self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
+                self.assertEqual(cfg["model_auto_compact_token_limit_scope"], "total")
+                self.assertIs(cfg["features"]["output_token_replay"], True)
+                self.assertIs(cfg["features"]["concurrent_reasoning_summaries"], True)
+                self.assertNotIn("async_compaction", cfg["features"])
+                self.assertNotIn("image_generation", cfg["features"])
+
+    def test_check_detects_compaction_setting_drift(self) -> None:
+        self.run_gen()
+        p = self.claude / "settings.json"
+        settings = json.loads(p.read_text())
+        settings["env"]["CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"] = "200000"
+        p.write_text(json.dumps(settings))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("settings.json", out)
+        self.run_gen()
+        p = self.codex_cu / "config.toml"
+        p.write_text(p.read_text().replace('name = "OpenAI"', 'name = "9router"'))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("codex-cu/config.toml", out)
+
+    def test_existing_idle_compaction_override_is_detected_and_removed(self) -> None:
+        self.run_gen()
+        p = self.claude / "settings.json"
+        settings = json.loads(p.read_text())
+        settings["idleCompaction"] = False
+        settings["theme"] = "dark"
+        p.write_text(json.dumps(settings))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1, out)
+        self.run_gen()
+        settings = json.loads(p.read_text())
+        self.assertNotIn("idleCompaction", settings)
+        self.assertEqual(settings["theme"], "dark")
+        rc, out = self.run_check()
+        self.assertEqual(rc, 0, out)
 
     def test_modes_are_restrictive(self) -> None:
         self.run_gen()
