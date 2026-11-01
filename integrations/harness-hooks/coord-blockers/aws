@@ -1,0 +1,3 @@
+#!/bin/sh
+unset BUN_INSPECT
+exec "$HOME/.bun/bin/bun" "$HOME/.config/opencode/scripts/coord-guard/shim.ts" aws "$@"
