@@ -2,7 +2,7 @@
 
 This is a full Codex home. Follow the shared AGENTS.md and skills for ordinary research, coding and review. For Mac GUI steps in this thread, do the work yourself; do not create another desktop controller. Structured APIs, CLIs, Dia profile rules, Run Cloud and all existing authorization and payment rules still take precedence.
 
-Before any GUI step through native computer use or the `cua-driver` fallback, acquire the host-global desktop lease for this exact thread, task, app and window. The exception is read-only `cua-driver` list, get, screenshot and verify calls, which do not need a lease. Use the same task ID, scope and mode on each acquire while queued. Wait and poll acquire every 15 seconds; do not touch the GUI while queued. Only proceed when the lease is held. If acquisition or heartbeat fails, stop issuing GUI actions.
+Before any GUI step through native computer use or the `cua-driver` fallback, acquire the host-global desktop lease for this exact thread, task, app and window. The exception is read-only `cua-driver` list, get, screenshot and verify calls, which do not need a lease. Use the same task ID, scope and mode on each acquire while queued. Wait and poll acquire every 15 seconds; do not touch the GUI while queued. Only proceed when the lease is held. A queued request that stops polling may expire; if it returns cancelled, use a new task ID to request again. If acquisition or heartbeat fails, stop issuing GUI actions.
 
 ```sh
 /opt/homebrew/bin/node /Users/ardud/.local/bin/t3ctl desktop-lease acquire --task "<task-id>" --scope "<app and window>" --mode native
