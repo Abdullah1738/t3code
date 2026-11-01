@@ -13,7 +13,7 @@ for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin; do
   fi
 done
 
-if [[ -n "${OPENCODE_SESSION_ID:-}" ]]; then
+if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}" ]]; then
   /opt/homebrew/bin/python3 - "$blockers:h" "$@" <<'PY'
 import os
 import shlex
@@ -45,7 +45,21 @@ if mode() == "enforce" and offbox_usable():
                or verbs == ["compose", "up"] or verbs == ["buildx", "build"])
     command = shlex.join(["docker", *args])
     verdict = classify(command, os.getcwd())
-    if guarded and verdict.get("heavy") and not live_exemption(os.environ["OPENCODE_SESSION_ID"]):
+    native = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("ROBOB_HARNESS")
+    if native:
+        # Native identities are not OpenCode session IDs. Resolve ancestry through
+        # the same per-call hook policy rather than borrowing an inherited OC ID.
+        try:
+            sys.path.insert(0, os.environ.get("HARNESS_HOOKS_SRC", os.path.expanduser("~/.local/share/harness-hooks/src")))
+            from engine import decide
+            harness = "codex" if os.environ.get("CODEX_THREAD_ID") or os.environ.get("ROBOB_HARNESS") == "codex" else "claude"
+            event = {"hook_event_name": "PreToolUse", "session_id": os.environ.get("CODEX_THREAD_ID") if harness == "codex" else os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "tool_name": "Bash", "tool_input": {"command": command}}
+            allowed = decide(event, harness).get("decision") != "deny"
+        except Exception:
+            allowed = True  # The native hook, like the OpenCode gate, fails open.
+    else:
+        allowed = live_exemption(os.environ.get("OPENCODE_SESSION_ID", ""))
+    if guarded and verdict.get("heavy") and not allowed:
         print("offbox gate: this command was NOT run on the Mac (owner rule 2026-10-13, remote-compute skill).", file=sys.stderr)
         print(f"Why: {verdict['why']} [rule {verdict['rule']}].", file=sys.stderr)
         print("Run it on a boat.dev box instead (same repo dir, output streams back, same exit code):", file=sys.stderr)
