@@ -209,6 +209,8 @@ interface ActiveTurn {
   };
   steps: number;
   lastStep: Tokens | undefined;
+  /** The native finish of the turn's last step (session.step.ended); null until one ends. */
+  lastFinish: string | null;
   before: string | null | undefined;
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -1205,6 +1207,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       usage: { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0 },
       steps: 0,
       lastStep: undefined,
+      lastFinish: null,
       before: undefined,
       compaction: undefined,
       compactions: 0,
@@ -1671,6 +1674,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         ...turn.providerTurn,
         status: terminal.status,
         completedAt,
+        finish: turn.lastFinish,
         turnTokenUsage: turnTokenUsage(turn, terminal.status),
         ...(lastStep === undefined
           ? {}
@@ -2208,6 +2212,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           return yield* emitCompaction(state, turn, "failed");
         case "session.step.ended":
         case "session.step.failed": {
+          if (event.type === "session.step.ended") turn.lastFinish = event.data.finish;
           const tokens = event.data.tokens;
           if (tokens === undefined) return;
           turn.steps += 1;

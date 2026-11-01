@@ -665,6 +665,44 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("records the native finish of the last step on the provider turn", () =>
+    Effect.gen(function* () {
+      const message = "msg_0eb735d5b001oAFVeY5jz3WD4Z";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.text.started", { sessionID: SESSION, assistantMessageID: message, ordinal: 0 }),
+        event("session.text.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          ordinal: 0,
+          text: "DONE",
+        }),
+        event("session.step.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const collected = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      const seen = yield* Fiber.join(collected);
+      const finishes = seen.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status === "completed"
+          ? [event.providerTurn.finish]
+          : [],
+      );
+      assert.deepEqual(finishes, ["stop"]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("emits a streaming block's node only when it changes, and every text update", () =>
     Effect.gen(function* () {
       const block = {
