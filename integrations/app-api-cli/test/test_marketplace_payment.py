@@ -138,10 +138,42 @@ class PaymentTests(unittest.TestCase):
                                            (flow.flow_id, 'payment')).fetchone()
                 self.assertEqual(operation['request_hash'], expected.digest)
 
+    def test_null_session_provider_is_bound_into_one_exact_payment_on_both_lanes(self):
+        for fixture in (main, rocket):
+            with self.subTest(lane=fixture.__name__):
+                self.fresh_journal()
+                pending = {'status': 'pending', 'clientSecret': 'synthetic-intent'}
+                flow, wire = self.placed(fixture, order_status=[pending, pending, fixture.FIXTURE['status_success']],
+                    payment_complete={'status': 'payment_pending'}, payment_status={'status': 'payment_pending'})
+                flow.session_response.data['paymentProviderCode'] = None
+                self.setup_cvv(flow, wire)
+                flow.place()
+                with patch.object(flow, '_expect', wraps=flow._expect) as expect:
+                    self.assertTrue(flow.await_success(notify=None, sleep=lambda _: None)['paid'])
+                calls = [x for x in wire.calls if x[0] == 'payment_complete']
+                self.assertEqual(len(calls), 1)
+                body = calls[0][2]
+                self.assertEqual(set(body), {'clientSecret', 'orderNumber', 'paymentMethodCode',
+                                             'idCustomerToken', 'cvvEncryption', 'paymentProviderCode'})
+                self.assertEqual(body['paymentProviderCode'], 'NOON_PAY')
+                self.assertTrue(all(value is not None for value in body.values()))
+                self.assertEqual(body, {'clientSecret': 'synthetic-intent', 'orderNumber': fixture.ORDER,
+                                        'paymentMethodCode': 'cc_noonpay', 'idCustomerToken': 'synthetic-card-token',
+                                        'cvvEncryption': {'encCvv': 'encrypted-fixture', 'publicKeyName': 'fixture'},
+                                        'paymentProviderCode': 'NOON_PAY'})
+                args = expect.call_args.kwargs
+                self.assertEqual(expect.call_args.args, ('payment_complete',))
+                self.assertEqual(args['payment_provider_code'], 'NOON_PAY')
+                expected = market.operation('main', 'payment_complete', **args)
+                with j._db() as db:
+                    operation = db.execute('SELECT request_hash FROM operations WHERE flow_id=? AND kind=?',
+                                           (flow.flow_id, 'payment')).fetchone()
+                self.assertEqual(operation['request_hash'], expected.digest)
+
     def test_unverified_session_provider_fails_before_place_on_both_lanes(self):
         missing = object()
         for fixture in (main, rocket):
-            for provider in (missing, 'PAYPAL', '', 5, None):
+            for provider in (missing, 'PAYPAL', '', 5, True, []):
                 with self.subTest(lane=fixture.__name__, provider=provider):
                     self.fresh_journal()
                     flow, wire = self.placed(fixture)
@@ -153,6 +185,25 @@ class PaymentTests(unittest.TestCase):
                         with self.assertRaisesRegex(j.JournalError, 'MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED'):
                             flow.prepare_payment(cvv=b'123')
                     encrypt.assert_not_called()
+                    self.assertNotIn('payment_config', [call[0] for call in wire.calls])
+                    self.assertNotIn('place', [call[0] for call in wire.calls])
+                    self.assertEqual(j.inspect(flow.flow_id)['reserved_minor'], 0)
+
+    def test_invalid_session_provider_never_loads_cvv_on_both_lanes(self):
+        missing = object()
+        for fixture in (main, rocket):
+            for provider in (missing, 'PAYPAL', '', 'noon_pay', 5, True, [], {}):
+                with self.subTest(lane=fixture.__name__, provider=provider):
+                    self.fresh_journal()
+                    flow, wire = self.placed(fixture)
+                    if provider is missing:
+                        flow.session_response.data.pop('paymentProviderCode')
+                    else:
+                        flow.session_response.data['paymentProviderCode'] = provider
+                    loader = Mock(side_effect=AssertionError('CVV loader called'))
+                    with self.assertRaisesRegex(j.JournalError, 'MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED'):
+                        flow.prepare_payment(cvv_loader=loader)
+                    loader.assert_not_called()
                     self.assertNotIn('payment_config', [call[0] for call in wire.calls])
                     self.assertNotIn('place', [call[0] for call in wire.calls])
                     self.assertEqual(j.inspect(flow.flow_id)['reserved_minor'], 0)

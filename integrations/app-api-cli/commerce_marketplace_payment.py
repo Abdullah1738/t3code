@@ -70,8 +70,8 @@ class MarketplacePayment:
                     and str(card.get('mask', '')).endswith(order_card.LAST4)]
         if len(selected) != 1:
             journal.fail('MARKETPLACE_SAVED_CARD_MISMATCH')
-        provider = session.get('paymentProviderCode')
-        if type(provider) is not str or provider not in market.PAYMENT_PROVIDERS:
+        provider = market.session_payment_provider(session)
+        if provider is None:
             journal.fail('MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED')
         self.payment_provider_code = provider
         if cvv_loader is not None:

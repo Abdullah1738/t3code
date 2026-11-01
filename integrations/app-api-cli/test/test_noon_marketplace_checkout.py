@@ -185,6 +185,18 @@ class MarketplaceTests(unittest.TestCase):
         body = json.loads(m.operation('main', 'payment_complete', **args, payment_provider_code=None).body)
         self.assertNotIn('paymentProviderCode', body)
 
+    def test_session_payment_provider_defaults_only_explicit_null(self):
+        self.assertEqual(m.session_payment_provider({'paymentProviderCode': None}), 'NOON_PAY')
+        for provider in ('NOON_PAY', 'ADYEN', 'CHECKOUT'):
+            with self.subTest(provider=provider):
+                self.assertEqual(m.session_payment_provider({'paymentProviderCode': provider}), provider)
+        for provider in ('', 'PAYPAL', 'noon_pay', 5, True, [], {}):
+            with self.subTest(provider=provider):
+                self.assertIsNone(m.session_payment_provider({'paymentProviderCode': provider}))
+        for session in ({}, None, [], 'session'):
+            with self.subTest(session=session):
+                self.assertIsNone(m.session_payment_provider(session))
+
     def test_outcome_only_exposes_safe_transaction_status_and_boolean_failure(self):
         for value in ('CREATED', '3DS_ENROLL_INITIATED', 'X' * 64):
             with self.subTest(value=value):

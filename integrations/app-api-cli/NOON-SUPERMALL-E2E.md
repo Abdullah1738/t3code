@@ -218,6 +218,10 @@ The CLI now sends the session's `paymentProviderCode`, failing closed unless it
 is `NOON_PAY`, `ADYEN` or `CHECKOUT`, and prints `payment_status_poll` lines.
 Redirect handling is not built.
 
+Live checkout-v2 sessions send `paymentProviderCode` as null (1 Nov). The CLI
+maps an explicit null to `NOON_PAY`, as the app's `getMerchantIDCode` does; a
+missing key or any other value still fails closed.
+
 ## Live proof
 
 Lane's own live run, 2026-10-11 00:16-00:23 +04 (flow

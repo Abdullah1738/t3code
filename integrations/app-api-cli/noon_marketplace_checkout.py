@@ -47,6 +47,17 @@ CONTRACT = {
 }
 
 
+def session_payment_provider(session):
+    # The app maps null to NOON_PAY (getMerchantIDCode f62407, #239); live
+    # checkout-v2 sends null. Missing or other values are still refused.
+    if not isinstance(session, dict) or 'paymentProviderCode' not in session:
+        return None
+    provider = session['paymentProviderCode']
+    if provider is None:
+        return 'NOON_PAY'
+    return provider if type(provider) is str and provider in PAYMENT_PROVIDERS else None
+
+
 class MarketplaceError(Exception):
     def __init__(self, code, *, http_status=None, may_have_sent=False,
                  receipt=None, outcome_journaled=False):

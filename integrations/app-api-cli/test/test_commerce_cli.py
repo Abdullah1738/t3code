@@ -66,7 +66,7 @@ class MarketplacePaymentCLITests(unittest.TestCase):
         import test_commerce_supermall_order as rocket
         for lane, target, fixture in (('main', 'commerce_main_order.MainOrderFlow', main),
                                       ('supermall', 'commerce_supermall_order.SupermallOrderFlow', rocket)):
-            for provider in (None, 'PAYPAL'):
+            for provider in ('', 'PAYPAL'):
                 with self.subTest(lane=lane, provider=provider):
                     flow = Mock()
                     flow.flow_id, flow.order = 'fixture-flow', None
