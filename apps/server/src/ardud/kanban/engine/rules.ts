@@ -415,6 +415,7 @@ export function planDispatch(
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
+  const kept = board.pause ? new Set<string>(board.pause.keep) : null;
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
@@ -428,6 +429,7 @@ export function planDispatch(
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const waiting = cards.filter(
     (card) =>
+      (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
       card.stalled === null &&
@@ -460,6 +462,9 @@ export function planDispatch(
       const key = poolFor(pools, model)?.key;
       if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
       let thread = role === "work" ? card.workThreadId : null;
+      if (thread !== null && kept !== null && cards.some(
+        (other) => other.activeThreadId === thread && !kept.has(other.id),
+      )) continue;
       const fresh = thread !== null && busyElsewhere(thread, key);
       // A new thread can't take a card its old thread's own work still holds up.
       if (fresh && isBlocked(card, byId, null)) continue;
@@ -505,6 +510,9 @@ export interface ClaimContext {
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
   if (board.setup?.status === "running") return no("Setup is running");
+  if (board.pause && !board.pause.keep.includes(card.id)) {
+    return no(`the board is paused: ${board.pause.reason}`);
+  }
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

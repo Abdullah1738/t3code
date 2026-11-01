@@ -532,8 +532,23 @@ const SetupDone = tool(
   { readonly: false },
 );
 
+const BoardPause = tool(
+  "board_pause",
+  "Pause or resume a board",
+  "Evaluators: pause the whole board or lift it. While paused, the dispatcher starts no card work or review except the kept cards (keep: #numbers). Threads already running keep running; stop them with card_thread stop if they must stop now. clear:true lifts it. Use this instead of per-card stalled flags.",
+  {
+    boardId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    keep: Schema.optional(Schema.NullOr(Schema.Array(TrimmedNonEmptyString))),
+    reason: Schema.optional(Schema.NullOr(Schema.String)),
+    clear: Schema.optional(Schema.NullOr(Schema.Boolean)),
+  },
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
   SetupDone,
+  BoardPause,
   BoardGet,
   CardSearch,
   CardGet,

@@ -91,6 +91,7 @@ export type KanbanReviewChain = typeof KanbanReviewChain.Type;
 export const KanbanThreadPause = Schema.Struct({
   at: IsoDateTime,
   message: Schema.String,
+  runId: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type KanbanThreadPause = typeof KanbanThreadPause.Type;
 
@@ -527,6 +528,14 @@ export const KanbanBoardSetup = Schema.Struct({
 });
 export type KanbanBoardSetup = typeof KanbanBoardSetup.Type;
 
+export const KanbanBoardPause = Schema.Struct({
+  reason: TrimmedNonEmptyString,
+  keep: Schema.Array(KanbanCardId),
+  at: IsoDateTime,
+  by: Schema.String,
+});
+export type KanbanBoardPause = typeof KanbanBoardPause.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -544,6 +553,7 @@ export const KanbanBoard = Schema.Struct({
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });

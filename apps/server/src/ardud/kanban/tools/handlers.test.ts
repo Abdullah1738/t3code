@@ -12,7 +12,8 @@ import { McpSchema, McpServer } from "effect/ai";
 
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
-import { liveThreadsLayer } from "../../../mcp/McpToolAccess.testkit.ts";
+import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -28,7 +29,7 @@ import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
 import { KanbanToolkit } from "./tools.ts";
 
-// Writes check the caller is the thread's live provider; liveThreadsLayer runs on codex.
+// Writes check the caller is the thread's live provider; the fake runs on codex.
 const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
   environmentId: EnvironmentId.make("environment"),
   requestNamespace: `provider:${threadId}`,
@@ -70,6 +71,7 @@ const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =
 // Threads launch idle; `running` keeps a work thread's slot between cards.
 const fakeThreads = () => {
   const running = new Set<string>();
+  const parents = new Map<ThreadId, ThreadId>();
   let launched = 0;
   const launches: Array<string> = [];
   const threads = Layer.succeed(
@@ -106,7 +108,22 @@ const fakeThreads = () => {
   }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
   const layer = McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
-    Layer.provideMerge(liveThreadsLayer),
+    Layer.provideMerge(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (threadId) => {
+          const parentThreadId = parents.get(threadId) ?? null;
+          const shell = liveThreadShell(threadId);
+          return Effect.succeed({
+            ...shell,
+            lineage: {
+              ...shell.lineage,
+              parentThreadId,
+              relationshipToParent: parentThreadId === null ? null : "subagent",
+            },
+          });
+        },
+      }),
+    ),
     Layer.provideMerge(KanbanService.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
@@ -117,7 +134,7 @@ const fakeThreads = () => {
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
-  return { running, launches, layer };
+  return { running, launches, parents, layer };
 };
 
 const owner: KanbanActor = { _tag: "owner" };
@@ -231,6 +248,87 @@ it.effect("board_open gives a board its icon only while it has none", () => {
       icon: "nope",
     }).pipe(Effect.flip);
     assert.include(String(unknown), "Invalid parameters");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("board_pause is evaluator-only and resolves kept numbers on the selected board", () => {
+  const { layer, parents } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const workerCard = yield* kanban.createCard(board.id, { prompt: "Worker" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(workerCard.id)).card.activeThreadId!;
+    const denied = yield* call(worker, "board_pause", { reason: "No" });
+    assert.isTrue(denied.isError);
+    assert.include(denied.text, "Only evaluators");
+    const child = ThreadId.make("worker-child");
+    const grandchild = ThreadId.make("worker-grandchild");
+    parents.set(child, worker);
+    parents.set(grandchild, child);
+    for (const descendant of [child, grandchild]) {
+      const deniedChild = yield* call(descendant, "board_pause", { boardId: "toy", clear: true });
+      assert.isTrue(deniedChild.isError);
+      assert.include(deniedChild.text, "Only evaluators");
+    }
+    yield* kanban.updateBoard(board.id, {
+      reviewChains: [{ name: "Standard", steps: [board.evaluatorModel] }],
+      defaultReviewChain: "Standard",
+    });
+    yield* kanban.setPool(board.id, board.evaluatorModel, 2);
+    yield* kanban.moveCard(workerCard.id, "needs_review", "cardThread", {
+      _tag: "thread",
+      threadId: worker,
+    });
+    yield* kanban.dispatchNow;
+    const reviewing = (yield* kanban.card(workerCard.id)).card;
+    assert.strictEqual(reviewing.activeRole, "review");
+    assert.isNotNull(reviewing.activeThreadId);
+    const reviewer = reviewing.activeThreadId!;
+    const deniedReview = yield* call(reviewer, "board_pause", { reason: "No" });
+    assert.isTrue(deniedReview.isError);
+    assert.include(deniedReview.text, "Only evaluators");
+
+    const other = yield* kanban.ensureBoard({
+      slug: "other",
+      name: "Other",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const keep = yield* kanban.createCard(other.id, { prompt: "Keep" }, owner);
+    const evaluator = ThreadId.make("thread-evaluator");
+    const paused = yield* call(evaluator, "board_pause", {
+      boardId: "other",
+      keep: [`#${keep.number}`],
+      reason: "Ship first",
+    });
+    assert.isFalse(paused.isError, paused.text);
+    const result = paused.structured.board as {
+      pause: { keep: string[]; reason: string; by: string };
+    };
+    assert.deepStrictEqual(result.pause.keep, [keep.id]);
+    assert.strictEqual(result.pause.reason, "Ship first");
+    assert.strictEqual(result.pause.by, `evaluator ${evaluator}`);
+    assert.isNull((yield* kanban.snapshot(board.id)).board.pause);
+
+    const wrongBoard = yield* call(evaluator, "board_pause", {
+      boardId: "toy",
+      keep: [keep.id],
+      reason: "Wrong board",
+    });
+    assert.isTrue(wrongBoard.isError);
+    assert.include(wrongBoard.text, keep.id);
+    const missingReason = yield* call(evaluator, "board_pause", { boardId: "other" });
+    assert.isTrue(missingReason.isError);
+    const deniedClear = yield* call(worker, "board_pause", { clear: true });
+    assert.isTrue(deniedClear.isError);
+    const lifted = yield* call(evaluator, "board_pause", { boardId: "other", clear: true });
+    assert.isFalse(lifted.isError, lifted.text);
+    assert.isNull((lifted.structured.board as { pause: unknown }).pause);
   }).pipe(Effect.provide(layer));
 });
 

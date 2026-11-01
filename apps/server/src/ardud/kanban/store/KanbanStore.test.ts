@@ -39,6 +39,7 @@ const board: KanbanBoard = {
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
   setup: null,
+  pause: null,
   archivedAt: null,
 };
 

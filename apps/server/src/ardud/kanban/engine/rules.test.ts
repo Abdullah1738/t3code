@@ -65,6 +65,7 @@ const board: KanbanBoard = {
   defaultReviewChain: "Default",
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
+  pause: null,
   createdAt: "2026-10-25T00:00:00Z",
   archivedAt: null,
 };
@@ -260,6 +261,45 @@ describe("planDispatch", () => {
     expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
   });
 
+  it("holds work, reviews and claims except for the kept cards until the pause is lifted", () => {
+    const kept = card();
+    const held = card();
+    const review = card({ stage: "needs_review" });
+    const cards = [kept, held, review];
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Ship the fix", keep: [kept.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    const available = pools([[opus, 3]]);
+    expect(planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role])).toEqual(
+      [[kept.id, "work"]],
+    );
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(opus),
+      projectId: null,
+      byId: new Map(cards.map((entry) => [entry.id as string, entry])),
+      carrying: 1,
+      slots: 3,
+    };
+    expect(checkClaim(paused, kept, ctx).ok).toBe(true);
+    expect(checkClaim(paused, held, ctx)).toEqual({
+      ok: false,
+      reason: "the board is paused: Ship the fix",
+    });
+    const reviewKept = { ...paused, pause: { ...paused.pause!, keep: [review.id] } };
+    expect(
+      planDispatch(reviewKept, cards, available).map((entry) => [entry.cardId, entry.role]),
+    ).toEqual([[review.id, "review"]]);
+    const lifted = { ...paused, pause: null };
+    expect(planDispatch(lifted, cards, available).map((entry) => entry.cardId)).toEqual([
+      review.id,
+      kept.id,
+      held.id,
+    ]);
+    expect(checkClaim(lifted, held, ctx).ok).toBe(true);
+  });
+
   it("leaves a todo card alone while its step is a board script's", () => {
     const scriptStep = card({
       subtasks: [
@@ -425,6 +465,19 @@ describe("thread batching", () => {
     expect(plan).toMatchObject([{ cardId: back.id, role: "work", joins: true }]);
     const full = Array.from({ length: MAX_BATCH }, () => working());
     expect(planDispatch(board, [...full, back], pools([[opus, 1]]))).toEqual([]);
+  });
+
+  it("does not wake a mixed batch for a kept card", () => {
+    const held = working();
+    const back = card({ workThreadId: t1 });
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    expect(planDispatch(paused, [held, back], pools([[opus, 1]]))).toEqual([]);
+    expect(planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]]))).toMatchObject([
+      { cardId: back.id, joins: true },
+    ]);
   });
 
   it("keeps a held slot for a thread between cards", () => {

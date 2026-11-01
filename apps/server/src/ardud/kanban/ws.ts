@@ -1,6 +1,7 @@
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBoardUpdateInput,
+  type KanbanCardId,
   type KanbanCardPatchInput,
   type KanbanDiscussionUpdateInput,
 } from "@t3tools/contracts";
@@ -75,6 +76,17 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     }) => service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
     [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
       service.endSetup(input.boardId, OWNER),
+    [M.boardPause]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["pauseBoard"]>[0];
+      readonly keep?: ReadonlyArray<KanbanCardId> | undefined;
+      readonly reason?: string | undefined;
+      readonly clear?: boolean | undefined;
+    }) =>
+      service.pauseBoard(
+        input.boardId,
+        input.clear ? null : { reason: input.reason ?? "", keep: input.keep ?? [] },
+        OWNER,
+      ),
     [M.cardPatch]: patchCard,
     [M.cardSettle]: (input: { readonly cardId: Parameters<KanbanServiceShape["settleCard"]>[0] }) =>
       service.settleCard(input.cardId),

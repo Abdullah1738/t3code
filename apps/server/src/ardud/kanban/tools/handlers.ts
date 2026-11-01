@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionOf } from "../engine/defaults.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
@@ -80,6 +81,31 @@ const asEvaluator = <A, R>(
       : run(service, caller),
   );
 
+// An unlinked subagent isn't an outside orchestrator if a card thread started it.
+const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (caller: Caller) {
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const seen = new Set<string>();
+  let id = caller.threadId;
+  while (true) {
+    if (seen.has(id)) return yield* refuse("Cannot verify the calling thread's ancestry.");
+    seen.add(id);
+    const shell = yield* threads.getThreadShell(id).pipe(
+      Effect.mapError(
+        () =>
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "Cannot verify the calling thread's ancestry.",
+          }),
+      ),
+    );
+    if (shell === null || shell.deletedAt !== null) {
+      return yield* refuse("Cannot verify the calling thread's ancestry.");
+    }
+    if (shell.lineage.parentThreadId === null) return [...seen];
+    id = shell.lineage.parentThreadId;
+  }
+});
+
 const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
@@ -135,12 +161,13 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
   ref: string | undefined,
+  boardId?: string,
 ) {
   const trimmed = ref?.trim();
   if (!trimmed) return yield* defaultCard(service, caller);
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
-    const board = yield* boardFor(service, caller);
+    const board = yield* boardFor(service, caller, boardId);
     const snapshot = yield* service.snapshot(board.id);
     const card = snapshot.cards.find((candidate) => candidate.number === number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
@@ -754,6 +781,29 @@ const handlers = {
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
         return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
+  board_pause: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const ancestors = yield* pauseCallerAncestry(caller);
+        const board = yield* boardFor(service, caller, input.boardId ?? undefined);
+        if (input.clear) {
+          return { board: yield* service.pauseBoard(board.id, null, caller.actor, ancestors) };
+        }
+        const keep = yield* Effect.forEach(input.keep ?? [], (ref) =>
+          cardFor(service, caller, ref, board.id).pipe(Effect.map((card) => card.id)),
+        );
+        return {
+          board: yield* service.pauseBoard(
+            board.id,
+            { reason: input.reason ?? "", keep },
+            caller.actor,
+            ancestors,
+          ),
+        };
       }),
     ),
   ),
