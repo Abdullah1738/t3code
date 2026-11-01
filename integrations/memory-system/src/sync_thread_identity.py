@@ -101,6 +101,23 @@ def gather(state):
         out.append(dict(canonical=tid, native=native, agent=None, driver=driver or _str(ref.get("driver")),
                         instance=instance or _str(p.get("providerInstanceId")),
                         model=threads.get(tid, {}).get("model")))
+    # Owning incarnation of each child. One app thread can have several provider rows (one per
+    # harness incarnation: OpenCode, then Claude, then Codex, ...). A subagent belongs to the
+    # provider thread that ran its parent node: subagent.parentNodeId -> provider_turns.node_id
+    # -> provider_thread_id -> that row's native session. Read-only, verified against live state.
+    # Only when no turn links the node does the app-thread fallback apply.
+    by_provider = {pt_id: (native, driver, instance) for pt_id, native, driver, instance in state.execute(
+        "SELECT provider_thread_id, json_extract(payload_json,'$.nativeThreadRef.nativeId'), driver, provider_instance_id"
+        " FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id IS NOT NULL")}
+    owner_of_node = {}
+    has_turns = state.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orchestration_v2_projection_provider_turns'"
+    ).fetchone()
+    if has_turns:  # an older or partial state DB has no turn table: every child uses the fallback
+        for node_id, provider_thread_id in state.execute(
+            "SELECT node_id, provider_thread_id FROM orchestration_v2_projection_provider_turns"
+        ):
+            owner_of_node.setdefault(node_id, provider_thread_id)
     for child_tid, parent_tid, payload, driver, instance in state.execute(
         "SELECT child_thread_id, thread_id, payload_json, driver, provider_instance_id"
         " FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"
@@ -108,9 +125,16 @@ def gather(state):
         p = _j(payload)
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
         task = _str(ref.get("nativeId"))
-        parent = native_of.get(parent_tid)
-        if not task or not parent:
-            continue  # no native task id, or the parent has no native session yet: nothing to key by
+        if not task:
+            continue  # no native task id: nothing native to key this child by
+        parent = None
+        owning_pt = owner_of_node.get(_str(p.get("parentNodeId")))
+        if owning_pt and owning_pt in by_provider and by_provider[owning_pt][0]:
+            parent = by_provider[owning_pt]
+        else:
+            parent = native_of.get(parent_tid)  # fallback: the app thread's first native session
+        if not parent or not parent[0]:
+            continue
         parent_native, parent_driver, parent_instance = parent
         out.append(dict(canonical=child_tid, native=parent_native, agent=task,
                         driver=driver or parent_driver or _str(ref.get("driver")),

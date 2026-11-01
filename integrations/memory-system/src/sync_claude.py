@@ -227,22 +227,52 @@ class ClaudeSync:
             agent = os.path.basename(path)[len("agent-"):-len(".jsonl")]
         return session_key(rec["sessionId"], agent)
 
+    def key_of(self, path):
+        """Qualified identity: the home's configured instance plus the path below its root.
+
+        Both sides are compared as realpaths, because the roots are resolved (a symlinked
+        or /tmp -> /private/tmp home would otherwise match nothing).
+        """
+        root = self._root_of(path)
+        return f"{root['instance']}:{tc.logical_name(os.path.realpath(path), os.path.realpath(root['path']))}"
+
+    def _root_of(self, path):
+        """The captured home a file lives under (the home the walk started from).
+
+        Both sides are realpaths: a root may be given as a symlink, /tmp, or ~.
+        """
+        real = os.path.realpath(path)
+        for r in self.roots:
+            base = os.path.realpath(r["path"])
+            if real.startswith(base + os.sep):
+                return r
+        raise ValueError(f"{path} is outside every captured Claude home")
+
+    @staticmethod
+    def _unchanged(path, st, rep):
+        """Nothing to read: the file is exactly the size of the last clean pass and its consumed bytes match."""
+        if rep["error"] or rep["offset"] != st.st_size:
+            return False
+        if not rep.get("tail_sha1"):
+            return False  # no checksum from a previous clean pass yet: read once to establish it
+        return tc.tail_sha1(path, rep["offset"]) == rep["tail_sha1"]
+
     def sync_file(self, path, st):
-        logical = tc.logical_name(path)
-        if tc.quarantined(self.mem, logical):
+        key = self.key_of(path)
+        if tc.quarantined(self.mem, key):
             self.stats["quarantined"] += 1
             return
-        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st))
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
-        if rep["offset"] == st.st_size and not rep["error"]:
+        if self._unchanged(path, st, rep):
             self.stats["unchanged"] += 1
-            return  # nothing new since the last clean pass
+            return  # nothing new since the last clean pass, and the consumed bytes still match
         events, raw = [], []
         pos = rep["offset"]
         line_no = rep["lines"]  # lines already journaled for this representation
-        for line, end in tc.read_complete_lines(path, pos):
+        for line, end in tc.read_complete_lines(path, pos, max_bytes=tc.BATCH_BYTES):
             line_no += 1
             pos = end
             try:
@@ -252,8 +282,8 @@ class ClaudeSync:
             raw.append((line, line_no))
             if rec is None:
                 continue
-            key = self._key_of_line(path, rec)
-            if is_seeded(self.seeded, path, line_no, key):
+            key_line = self._key_of_line(path, rec)
+            if is_seeded(self.seeded, path, line_no, key_line):
                 self.stats["skipped_seeded"] += 1
                 continue
             events.extend(project(rec, path, line_no))
@@ -274,19 +304,38 @@ class ClaudeSync:
                     [(SOURCE, key, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
                      for tid, ts, spk, ctype, content, model, m, key in events],
                 )
-            tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total)
+            tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
+                         tail=tc.tail_sha1(path, pos) if pos else None)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)
         self.stats["raw"] += len(raw)
 
-    def _fail(self, path, msg):
+    def _fail(self, path, msg, key=None):
+        """Durable per-file failure: counted, logged and quarantined, even on the first pass.
+
+        The row is created from stat data alone (no head read), so an unreadable file
+        cannot abort the run or escape the handler.
+        """
         self.stats["errors"] += 1
         self.errors.append(f"{os.path.basename(path)}: {msg}")
         print(f"error in {path}: {msg}", flush=True)
+        key = key or self.key_of(path)
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
         row = self.mem.execute(
             "SELECT rep_id FROM native_capture_files WHERE logical=? AND retired=0 ORDER BY rep_id DESC LIMIT 1",
-            (tc.logical_name(path),)).fetchone()
+            (key,)).fetchone()
+        if row is None and st is not None:
+            def ins():
+                cur = self.mem.execute(
+                    "INSERT INTO native_capture_files(path, logical, inode, head_len, head_sha1, offset, phys_size,"
+                    " mtime, error, error_count, quarantined_until) VALUES(?,?,?,0,NULL,0,?,?,?,1,?)",
+                    (path, key, st.st_ino, st.st_size, st.st_mtime, msg[:500], int(time.time()) + tc.QUARANTINE_SECS))
+                return cur.lastrowid
+            row = (with_retry(self.mem, ins),)
         if row:
             with_retry(self.mem, lambda: tc.record_error(self.mem, row[0], msg))
 

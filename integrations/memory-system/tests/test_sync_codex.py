@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -210,6 +211,34 @@ class CodexSyncTest(unittest.TestCase):
         self.assertEqual(len(chunked), len(single))
         self.assertEqual(chunked, single)
 
+    def test_capture_commits_in_bounded_batches(self):
+        """A large pre-existing rollout advances its checkpoint after each batch, not once at EOF.
+
+        Otherwise a kill mid-file (the 240 s hard limit) loses all progress and the next tick repeats it.
+        """
+        import transcript_capture as tc
+        real = tc.BATCH_BYTES
+        tc.BATCH_BYTES = 40000  # several batches over ~1 MB of records
+        seen_offsets = []
+        real_record_ok = tc.record_ok
+
+        def spy(con, rep_id, offset, *a, **k):
+            seen_offsets.append(offset)
+            return real_record_ok(con, rep_id, offset, *a, **k)
+
+        tc.record_ok = spy
+        try:
+            pad = "z" * 3000
+            lines = [meta(CHILD_ID, ROOT_ID)] + [msg("user", f"row {i} {pad}") for i in range(400)]
+            write_rollout(self.rollout, lines)
+            self.sync()
+        finally:
+            tc.BATCH_BYTES = real
+            tc.record_ok = real_record_ok
+        self.assertGreater(len(seen_offsets), 3, f"expected several commits, got {seen_offsets}")
+        self.assertEqual(seen_offsets, sorted(seen_offsets))
+        self.assertEqual(len(self.rows()), 400)
+
     def test_replay_past_eight_mib_keeps_numbering(self):
         """Resume must replay the whole consumed prefix; a single 8 MiB batch restarted line numbers."""
         pad = "x" * 60000
@@ -279,6 +308,70 @@ class CodexSyncTest(unittest.TestCase):
         subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
         self.sync()
         self.assertIn("appended later", [r[4] for r in self.rows()])
+
+    def test_same_inode_same_size_rewrite_is_not_skipped(self):
+        """An in-place rewrite that keeps inode and size is detected (the review's P1 case)."""
+        old = msg("user", "AAAAAAAA")
+        new = msg("user", "BBBBBBBB")
+        self.assertEqual(len(json.dumps(old)), len(json.dumps(new)))
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), old])
+        ino = os.stat(self.rollout).st_ino
+        size = os.stat(self.rollout).st_size
+        self.sync()
+        with open(self.rollout, "r+b") as f:
+            f.seek(len(json.dumps(meta(CHILD_ID, ROOT_ID))) + 1)
+            f.write((json.dumps(new) + "\n").encode())
+        self.assertEqual((os.stat(self.rollout).st_ino, os.stat(self.rollout).st_size), (ino, size))
+        s2 = self.sync()
+        self.assertEqual(s2["unchanged"], 0, "a same-size rewrite was skipped as unchanged")
+        self.assertIn("BBBBBBBB", [r[4] for r in self.rows()])
+
+    def test_same_position_rewrite_keeps_old_event_and_adds_new(self):
+        """A rewrite that changes a record in place keeps the earlier event and adds the new text.
+
+        The earlier version stays (never deleted on rewrite); the new bytes get their own event.
+        """
+        import subprocess  # noqa: F401
+        head = meta(CHILD_ID, ROOT_ID)
+        old = msg("user", "AAAAAAAA")
+        new = msg("user", "BBBBBBBB")
+        self.assertEqual(len(json.dumps(old)), len(json.dumps(new)))
+        write_rollout(self.rollout, [head, old])
+        self.sync()
+        with open(self.rollout, "r+b") as f:
+            f.seek(len(json.dumps(head)) + 1)
+            f.write((json.dumps(new) + "\n").encode())
+        self.sync()
+        texts = [r[4] for r in self.rows()]
+        self.assertIn("AAAAAAAA", texts)
+        self.assertIn("BBBBBBBB", texts)
+
+    def test_first_encounter_permission_error_is_quarantined_and_others_continue(self):
+        """A rollout that cannot be read on its first pass is quarantined; the next file is still captured."""
+        unreadable = os.path.join(self.home, "sessions/2026/10/31/rollout-denied-DENIED.jsonl")
+        write_rollout(unreadable, [meta("DENIED", ROOT_ID), msg("user", "never read")])
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "captured meanwhile")])
+        real_open = open
+
+        def deny(path, *a, **k):
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *a, **k)
+
+        import builtins
+        builtins.open = deny
+        try:
+            s = self.sync()
+        finally:
+            builtins.open = real_open
+        self.assertEqual(s["errors"], 1)
+        self.assertIn("captured meanwhile", [r[4] for r in self.rows()])
+        con = sqlite3.connect(self.db)
+        row = con.execute("SELECT error, quarantined_until FROM native_capture_files WHERE path=?", (unreadable,)).fetchone()
+        con.close()
+        self.assertIsNotNone(row, "no durable failure row for a file that failed on its first pass")
+        self.assertIn("PermissionError", row[0])
+        self.assertGreater(row[1], time.time())
 
     def test_seeded_record_still_advances_identity_state(self):
         """A seeded record's effect on the projector must match the replay path (no events, but state)."""

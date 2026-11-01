@@ -226,6 +226,51 @@ class ClaudeSyncTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertGreater(until, time.time())
 
+    def test_equal_agent_filenames_under_two_parents_do_not_collide(self):
+        """agent-X.jsonl under two parents is two transcripts: neither retires or re-journals the other."""
+        a = os.path.join(self.home, "projects/-repo/PARENT-A/subagents/agent-same.jsonl")
+        b = os.path.join(self.home, "projects/-repo/PARENT-B/subagents/agent-same.jsonl")
+        write_lines(a, [rec("ua1", "user", "from parent A", agent="same")])
+        write_lines(b, [rec("ub1", "user", "from parent B", agent="same")])
+        self.sync()
+        self.sync()
+        con = sqlite3.connect(self.db)
+        live = con.execute("SELECT count(*) FROM native_capture_files WHERE retired=0").fetchone()[0]
+        retired = con.execute("SELECT count(*) FROM native_capture_files WHERE retired=1").fetchone()[0]
+        raw = con.execute("SELECT count(*) FROM native_capture_raw").fetchone()[0]
+        con.close()
+        self.assertEqual(live, 2)
+        self.assertEqual(retired, 0)
+        self.assertEqual(raw, 2)  # each line journaled once, not once per tick
+        self.assertEqual(sorted(r[4] for r in self.rows()), ["from parent A", "from parent B"])
+
+    def test_first_encounter_read_failure_is_quarantined_and_others_continue(self):
+        """A file that cannot be read on its first pass still gets a durable failure row."""
+        bad = os.path.join(self.home, "projects/-repo/unreadable.jsonl")
+        write_lines(bad, [rec("x1", "user", "never read")])
+        write_lines(self.top, [rec("u1", "user", "captured meanwhile")])
+        real_open = open
+
+        def deny(path, *a, **k):
+            if path == bad:
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *a, **k)
+
+        import builtins
+        builtins.open = deny
+        try:
+            s = self.sync()
+        finally:
+            builtins.open = real_open
+        self.assertEqual(s["errors"], 1)
+        self.assertIn("captured meanwhile", [r[4] for r in self.rows()])
+        con = sqlite3.connect(self.db)
+        row = con.execute("SELECT error, quarantined_until FROM native_capture_files WHERE path=?", (bad,)).fetchone()
+        con.close()
+        self.assertIsNotNone(row, "no ledger row for a file that failed on its first pass")
+        self.assertIn("PermissionError", row[0])
+        self.assertGreater(row[1], time.time())
+
 
 if __name__ == "__main__":
     unittest.main()

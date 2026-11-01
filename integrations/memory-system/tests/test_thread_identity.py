@@ -133,6 +133,39 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual((native, agent), ("SESS-PARENT", "AGT-7"))
         self.assertNotEqual(native, "CP")
 
+    def test_mixed_provider_thread_child_binds_to_its_owning_incarnation(self):
+        """One app thread: OpenCode -> Claude (CLAUDE-1) -> Codex -> Claude (CLAUDE-2). A child of the
+        second Claude incarnation must alias under CLAUDE-2, never under the first provider row (ses_OC).
+        """
+        s = sqlite3.connect(self.state)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("MX", "Mixed"))
+        s.execute("INSERT INTO ardud_opencode_import VALUES('ses_MX_OC','MX','2026-10-01')")
+
+        def pt(pid, drv, native):
+            s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?,?,?,?)",
+                      (pid, "MX", drv, drv, drv, json.dumps({"nativeThreadRef": {"driver": drv, "nativeId": native}})))
+
+        pt("mx-oc", "opencode", "ses_MX_OC")
+        pt("mx-cl1", "claudeAgent", "CLAUDE-1")
+        pt("mx-cx", "codex", "CODEX-MX")
+        pt("mx-cl2", "claudeAgent", "CLAUDE-2")
+        # the run that spawned the child belongs to the second Claude incarnation
+        s.execute("CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_turns(provider_turn_id TEXT PRIMARY KEY,"
+                  " thread_id TEXT, provider_thread_id TEXT, node_id TEXT, run_attempt_id TEXT, ordinal INTEGER, status TEXT,"
+                  " started_at TEXT, completed_at TEXT, payload_json TEXT)")
+        s.execute("INSERT INTO orchestration_v2_projection_provider_turns VALUES('turn-cl2','MX','mx-cl2','node-parent-cl2',NULL,1,'completed',NULL,NULL,'{}')")
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("MXCH", "Claude child", parent="MX"))
+        s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES('mxsub','MX','MXCH','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeTaskRef": {"driver": "claudeAgent", "nativeId": "AGT-MX"},
+                               "parentNodeId": "node-parent-cl2", "providerThreadId": None}),))
+        s.commit()
+        s.close()
+        ti.sync(self.mem, self.state)
+        rows = [r for r in self.aliases() if r[0] == "MXCH"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0][2], rows[0][3]), ("CLAUDE-2", "AGT-MX"))
+        self.assertNotEqual(rows[0][2], "ses_MX_OC")
+
     def test_refresh_updates_title_and_bumps_revision_without_new_rows(self):
         ti.sync(self.mem, self.state)
         n = len(self.aliases())
