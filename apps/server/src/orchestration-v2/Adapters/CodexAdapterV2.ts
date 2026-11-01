@@ -1333,6 +1333,7 @@ const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 
 function codexThreadRuntimeParams(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+  readonly recall?: { readonly url: string; readonly threadId: ThreadId } | undefined;
   readonly modelSelection?: { readonly model: string };
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
@@ -1355,6 +1356,17 @@ function codexThreadRuntimeParams(input: {
               tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
               http_headers: {
                 Authorization: mcpSession.authorizationHeader,
+              },
+            },
+          }),
+      ...(input.recall === undefined
+        ? {}
+        : {
+            "mcp_servers.recall": {
+              url: input.recall.url,
+              http_headers: {
+                "X-Robob-Thread": input.recall.threadId,
+                "X-Robob-Driver": CODEX_PROVIDER,
               },
             },
           }),
@@ -1710,8 +1722,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
-  const readMcpSession = (threadId: ThreadId | null) =>
-    threadId === null ? Effect.succeed(undefined) : mcpSessions.read(threadId);
   const { clientFactory, crypto, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
 
@@ -1736,13 +1746,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
+        const environment = resolvedRuntime?.environment ?? adapterOptions.environment;
+        const recallUrl = environment.ROBOB_RECALL_MCP_URL?.trim();
+        const readMcpSession = (threadId: ThreadId | null) =>
+          threadId === null
+            ? recallUrl
+              ? Effect.fail(new Error("Cannot attach recall without an app thread ID."))
+              : Effect.succeed(undefined)
+            : mcpSessions.read(threadId);
+        const recallForThread = (threadId: ThreadId | null) =>
+          recallUrl && threadId !== null ? { url: recallUrl, threadId } : undefined;
         const client = yield* clientFactory.open({
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
-          environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+          environment,
         });
         const additionalContextByThread = yield* Ref.make(
           new Map<
@@ -6660,6 +6680,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   "thread/start",
                   codexThreadRuntimeParams({
                     mcpSession,
+                    recall: recallForThread(threadInput.threadId),
                     modelSelection: threadInput.modelSelection,
                     runtimePolicy: threadInput.runtimePolicy,
                   }),
@@ -6693,6 +6714,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
                   mcpSession: yield* readMcpSession(
+                    threadInput.threadId ?? threadInput.providerThread.appThreadId,
+                  ),
+                  recall: recallForThread(
                     threadInput.threadId ?? threadInput.providerThread.appThreadId,
                   ),
                   ...(threadInput.modelSelection === undefined
@@ -7433,6 +7457,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
                     mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
+                    recall: recallForThread(threadInput.providerThread.appThreadId),
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
                   }),
@@ -7485,6 +7510,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : { lastTurnId: boundary.lastTurnId }),
                     ...codexThreadRuntimeParams({
                       mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                      recall: recallForThread(threadInput.targetThreadId),
                       ...(threadInput.modelSelection === undefined
                         ? {}
                         : { modelSelection: threadInput.modelSelection }),
