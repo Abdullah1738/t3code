@@ -239,6 +239,17 @@ class CodexSync:
             return
         if path.endswith(tc.ZST) and not tc.zstd_bin():
             raise ZstdMissing(path)  # recorded against the file's ledger row by run()
+        # Cheap pass first: a file whose physical size and inode are unchanged since its last clean
+        # pass cannot have new content, so it is skipped without decoding (a .zst decode costs a
+        # zstd process per tick; the head check below would repeat it on every tick).
+        known = self.mem.execute(
+            "SELECT rep_id, offset, phys_size, inode, error, quarantined_until FROM native_capture_files"
+            " WHERE logical=? AND retired=0 ORDER BY rep_id DESC LIMIT 1",
+            (logical,)).fetchone()
+        if known and known[4] is None and known[5] <= time.time() and known[3] == st.st_ino \
+                and known[2] == st.st_size and known[1]:
+            self.stats["unchanged"] += 1
+            return  # physical file unchanged since the last clean pass
         rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
@@ -246,9 +257,6 @@ class CodexSync:
         if not path.endswith(tc.ZST) and rep["offset"] == st.st_size and not rep["error"]:
             self.stats["unchanged"] += 1
             return  # nothing new since the last clean pass
-        if path.endswith(tc.ZST) and rep["phys_size"] == st.st_size and rep["offset"] and not rep["error"]:
-            self.stats["unchanged"] += 1
-            return  # compressed file unchanged since the last clean pass (no re-journal)
         file_hash = _first_line_hash(path)
         proj = CodexProjector(file_hash)
         events, raw, pos = [], [], 0

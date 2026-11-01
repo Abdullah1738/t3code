@@ -248,6 +248,38 @@ class CodexSyncTest(unittest.TestCase):
         self.assertEqual(raw2, raw1)
         self.assertEqual(reps, 1)
 
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_unchanged_zst_costs_no_decode_and_changed_zst_is_read(self):
+        """An unchanged archive is not decoded on later ticks; a re-compressed larger one is read."""
+        import subprocess
+        plain = os.path.join(self.tmp.name, "plain.jsonl")
+        write_rollout(plain, [meta(CHILD_ID, ROOT_ID), msg("user", "first")])
+        zst = self.rollout + ".zst"
+        os.makedirs(os.path.dirname(zst), exist_ok=True)
+        subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
+        self.sync()
+        import transcript_capture as tc
+        real = tc.zstd_bin
+        decodes = {"n": 0}
+        real_head = tc.decompressed_head
+
+        def counting(path, length):
+            decodes["n"] += 1
+            return real_head(path, length)
+
+        tc.decompressed_head = counting
+        try:
+            self.sync()
+            self.sync()
+        finally:
+            tc.decompressed_head = real_head
+        self.assertEqual(decodes["n"], 0)
+        write_rollout(plain, [msg("assistant", "appended later")] * 30)
+        os.remove(zst)
+        subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
+        self.sync()
+        self.assertIn("appended later", [r[4] for r in self.rows()])
+
     def test_seeded_record_still_advances_identity_state(self):
         """A seeded record's effect on the projector must match the replay path (no events, but state)."""
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "transplanted"),
