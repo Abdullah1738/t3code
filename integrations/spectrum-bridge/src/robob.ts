@@ -75,9 +75,11 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
         continue;
       }
       const done = settled || !message.streaming;
+      // Robob's own phase says whether this text was the reply. It is never a made-up OpenCode finish:
+      // `unknown` stays unmarked, so the router treats it as neither an answer nor proof of a tool.
       last = {
-        id: message.messageId, type: "assistant", content: [{ type: "text", text: message.text }],
-        ...(done ? { finish: "stop" } : {}),
+        id: message.messageId, type: "assistant", content: [{ type: "text", text: message.text }], runId,
+        ...(message.phase === "answer" ? { answer: true } : message.phase === "narration" ? { answer: false } : {}),
         time: { created, ...(done ? { completed: epoch(message.updatedAt, created) } : {}) },
       };
       records.push(last);
@@ -88,7 +90,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       // Carries the provider's error text, which is how a refusal is recognised.
       const error = { type: "provider", message: thread.lastError };
       if (last) last.error = error;
-      else records.push({ id: `${runId}:error`, type: "assistant", content: [], finish: "error", error, time: { created: epoch(group.at(-1)?.updatedAt ?? null), completed: epoch(group.at(-1)?.updatedAt ?? null) } });
+      else records.push({ id: `${runId}:error`, type: "assistant", content: [], runId, finish: "error", error, time: { created: epoch(group.at(-1)?.updatedAt ?? null), completed: epoch(group.at(-1)?.updatedAt ?? null) } });
     }
     records.push({ id: `idle:${runId}`, type: "idle", outcome: result, time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
   }
@@ -158,12 +160,22 @@ export class RobobBackend implements ChatBackend {
     return thread.threadId;
   }
 
-  /** Whether the run started at `sinceMs` called tools, from OpenCode's step rows (see markRunEvidence). Unproven is `unknown`. */
+  /**
+   * Whether the run that started at `sinceMs` called tools. Robob's run-evidence route answers; only an
+   * OpenCode thread the route can't prove falls back to OpenCode's step rows. Unproven is `unknown`.
+   */
   async runToolEvidence(id: string, _directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown"> {
     if (!Number.isFinite(sinceMs)) return "unknown";
     try {
-      const { thread } = await this.client.thread(await this.resolve(id));
-      return thread.nativeSessionId ? this.runEvidence(thread.nativeSessionId, sinceMs) : "unknown";
+      const threadId = await this.resolve(id);
+      const { thread } = await this.client.thread(threadId);
+      const started = (run: RunSummary) => Date.parse(run.requestedAt ?? run.startedAt ?? "");
+      const runs = [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])];
+      const run = runs.filter(candidate => started(candidate) >= sinceMs).sort((a, b) => started(a) - started(b))[0];
+      if (!run) return "unknown";
+      const fromRobob = (await this.client.runEvidence(threadId, run.runId)).toolEvidence;
+      if (fromRobob !== "unknown" || !this.isOpenCodeThread(thread) || !thread.nativeSessionId) return fromRobob;
+      return this.runEvidence(thread.nativeSessionId, sinceMs);
     } catch {
       return "unknown";
     }
@@ -275,11 +287,22 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
     const records = recordsFromThread(thread, messages);
-    this.markRunEvidence(thread, records);
+    await this.markRunEvidence(thread, records);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
     const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
-    return this.markAnswers(records.slice(start));
+    const page = records.slice(start);
+    // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
+    return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
+  }
+
+  /**
+   * Whether the thread runs on OpenCode, the only driver whose step rows the bridge can read as a
+   * fallback: its native session, its model's instance, or a message id OpenCode wrote.
+   */
+  private isOpenCodeThread(thread: ThreadDetail): boolean {
+    return thread.model?.instanceId === "opencode" || thread.nativeSessionId?.startsWith("ses_") === true
+      || thread.threadId.startsWith("ses_");
   }
 
   /**
@@ -287,13 +310,30 @@ export class RobobBackend implements ChatBackend {
    * OpenCode's own step rows for the thread's native session. The run's last record carries the
    * answer, since a tool-only run has no text record at all. Only that run is looked up.
    */
-  private markRunEvidence(thread: ThreadDetail, records: MessageRecord[]): void {
-    const run = thread.run ?? thread.recentRuns.at(-1);
-    if (!run || !thread.nativeSessionId) return;
-    const sinceMs = Date.parse(run.requestedAt ?? run.startedAt ?? "");
-    if (!Number.isFinite(sinceMs)) return;
-    const evidence = this.runEvidence(thread.nativeSessionId, sinceMs);
-    for (const record of records) if (record.type === "assistant") record.toolEvidence = evidence;
+  private async markRunEvidence(thread: ThreadDetail, records: MessageRecord[]): Promise<void> {
+    // One route read per run on this page, so each run's steps get only that run's evidence.
+    const runIds = [...new Set(records.flatMap(record => record.type === "assistant" && record.runId ? [record.runId] : []))];
+    const byRun = new Map<string, "ran" | "none" | "unknown">();
+    for (const runId of runIds) {
+      try {
+        byRun.set(runId, (await this.client.runEvidence(thread.threadId, runId)).toolEvidence);
+      } catch {
+        byRun.set(runId, "unknown");
+      }
+    }
+    // An OpenCode run the route can't prove is read from OpenCode's own step rows (the fallback).
+    const openCode = this.isOpenCodeThread(thread) && thread.nativeSessionId ? thread.nativeSessionId : undefined;
+    for (const [runId, evidence] of byRun) {
+      if (evidence !== "unknown" || openCode === undefined) continue;
+      const run = thread.recentRuns.find(candidate => candidate.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined);
+      const sinceMs = Date.parse(run?.requestedAt ?? run?.startedAt ?? "");
+      if (Number.isFinite(sinceMs)) byRun.set(runId, this.runEvidence(openCode, sinceMs));
+    }
+    for (const record of records) {
+      if (record.type !== "assistant") continue;
+      const evidence = record.runId ? byRun.get(record.runId) : undefined;
+      if (evidence !== undefined) record.toolEvidence = evidence;
+    }
   }
 
   /**
@@ -322,7 +362,8 @@ export class RobobBackend implements ChatBackend {
       // `ran` is merged here. The run-level answer from markRunEvidence stays authoritative otherwise.
       if (finish === "tool-calls") step.toolEvidence = "ran";
       else if (step.toolEvidence === undefined) step.toolEvidence = "unknown";
-      if (step.finish === "stop" && finish !== undefined) step.answer = finish === "stop";
+      // OpenCode's own finish fills in only what Robob's phase left unknown, and only for a completed step.
+      if (step.answer === undefined && step.time.completed !== undefined && finish !== undefined) step.answer = finish === "stop";
     }
     return records;
   }

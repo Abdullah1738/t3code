@@ -2853,7 +2853,9 @@ export class Router {
       // An active session is still working even after an idle marker.
       if (turn.phase !== "running" || live.size || statuses[turn.id] !== undefined) return;
       if (runningTools || !idle) return;
-      if (final && (final.time.completed === undefined || !final.finish || final.finish === "tool-calls")) return;
+      // A final step is settled when it has completed. OpenCode also says why it stopped (`finish`); Robob
+      // reports a phase instead, and narration (text before a tool call) is the only one that keeps the turn open.
+      if (final && (final.time.completed === undefined || final.answer === false || (final.finish !== undefined && final.finish === "tool-calls"))) return;
       const text = final ? replyText(assistantText(final)) : "";
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)

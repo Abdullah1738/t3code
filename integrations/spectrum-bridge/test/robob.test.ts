@@ -19,6 +19,8 @@ type Thread = {
   worktreePath: string | null; parentThreadId: string | null; nativeSessionId: string | null;
   runs: Array<{ runId: string; ordinal: number; status: string; requestedAt?: string }>;
   messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
+  /** What the run-evidence route reports per run; absent means `unknown`. */
+  evidence?: Record<string, "ran" | "none" | "unknown">;
 };
 type Call = { method: string; path: string; body?: any; auth: string | null };
 
@@ -91,6 +93,15 @@ function fakeControl() {
       }
       if (thread && parts.length === 2) return ok({ thread: detail(thread) });
       if (thread && parts[2] === "messages") return ok({ threadId: thread.threadId, state: state(thread), messages: thread.messages });
+      if (thread && parts[2] === "runs" && parts[4] === "evidence") {
+        const runId = parts[3]!;
+        const run = thread.runs.find(candidate => candidate.runId === runId);
+        if (!run) return notFound();
+        const forced = thread.evidence?.[runId];
+        const messages = thread.messages.filter(message => message.runId === runId && message.role === "assistant")
+          .map(message => ({ id: message.messageId, phase: message.phase ?? "unknown", text: message.text.slice(0, 200) }));
+        return ok({ runId, status: run.status, toolEvidence: forced ?? "unknown", complete: forced === "none", messages });
+      }
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
@@ -272,6 +283,44 @@ test("records: settled runs end with an idle marker; agent-sent wakes are not ow
   expect(records[2]).toMatchObject({ outcome: "succeeded" });
   expect(records[3]).not.toHaveProperty("finish");
   expect(withoutGuidance("plain")).toBe("plain");
+});
+
+test("records: a Robob phase decides answer vs narration; no finish is invented for a settled message", () => {
+  const at = "2026-01-01T00:00:00Z";
+  const messages: ControlMessage[] = [
+    { messageId: "narrate", runId: "run:thread:t:ordinal:1", role: "assistant", phase: "narration", text: "Checking the calendar.", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "reply", runId: "run:thread:t:ordinal:1", role: "assistant", phase: "answer", text: "You're booked.", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "unsure", runId: "run:thread:t:ordinal:1", role: "assistant", text: "Maybe.", streaming: false, createdAt: at, updatedAt: at },
+  ];
+  const records = recordsFromThread({ threadId: "t", lastError: null, run: null, recentRuns: [
+    { runId: "run:thread:t:ordinal:1", ordinal: 1, status: "completed" },
+  ] }, messages);
+  const steps = records.filter((record): record is Extract<typeof record, { type: "assistant" }> => record.type === "assistant");
+  expect(steps.map(step => [step.id, step.answer])).toEqual([["narrate", false], ["reply", true], ["unsure", undefined]]);
+  for (const step of steps) expect(step).not.toHaveProperty("finish");
+});
+
+test("a run's tool evidence from Robob reaches its steps; unknown never becomes none", async () => {
+  const control = fakeControl();
+  const { id, directory } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  const run = (runId: string) => ({ runId, ordinal: thread.runs.length + 1, status: "completed", requestedAt: "2026-01-01T00:00:00Z" });
+  const at = "2026-01-01T00:00:01Z";
+  thread.runs.push(run("run:a"), run("run:b"), run("run:c"));
+  thread.messages.push(
+    { messageId: "a-1", runId: "run:a", role: "assistant", phase: "answer", text: "done", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "b-1", runId: "run:b", role: "assistant", phase: "narration", text: "checking", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "c-1", runId: "run:c", role: "assistant", text: "unsure", streaming: false, createdAt: at, updatedAt: at },
+  );
+  thread.evidence = { "run:a": "none", "run:b": "ran", "run:c": "unknown" };
+  const records = await control.backend().messages(id, directory);
+  const step = (messageId: string) => records.find(record => record.id === messageId && record.type === "assistant") as Extract<(typeof records)[number], { type: "assistant" }> | undefined;
+  expect(step("a-1")?.toolEvidence).toBe("none");
+  expect(step("b-1")?.toolEvidence).toBe("ran");
+  expect(step("c-1")?.toolEvidence).toBe("unknown");
+  expect(step("a-1")?.answer).toBe(true);
+  expect(step("b-1")?.answer).toBe(false);
 });
 
 test("records: the bridge's own prompt stays even when Robob attributed it to the bridge, other system sends do not", () => {
@@ -497,6 +546,8 @@ test("a failed run that ran a tool reports tool evidence through messages(), so 
   control.finishes.set(toolStep, "tool-calls");
   control.finishes.set(errorStep, "error");
   control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  // An OpenCode thread: its native session is what OpenCode's step rows are read from.
+  control.threads.get(id)!.nativeSessionId = "ses_tool_run";
   const records = await backend.messages(id, directory);
   const replies = records.filter(record => record.type === "assistant");
   expect(replies.map(record => record.type === "assistant" && record.toolEvidence)).toEqual(["ran", "unknown"]);
@@ -804,6 +855,8 @@ test("a background run's answer before two steered texts reaches the chat along 
   await router.tick();
   expect(store.get("activeTurn")).toBeNull();
   const thread = control.threads.get(route.id)!;
+  // This thread's steps are OpenCode's own messages, so it is an OpenCode thread for the fallback.
+  thread.nativeSessionId = "ses_background_answer";
   const runId = `run:thread:${thread.threadId}:ordinal:2`;
   const at = (s: number) => new Date(Date.now() + s * 1000).toISOString();
   const native = (id: string) => `message:provider:opencode:native-item:${encodeURIComponent(`${id}:text:0`)}`;
