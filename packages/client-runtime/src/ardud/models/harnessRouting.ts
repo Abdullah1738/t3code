@@ -2,11 +2,15 @@
  * One driver-aware map from OpenCode model ids to Claude Code / Codex selections.
  *
  * Pure functions only, shared by the server (kanban rules, control API) and the
- * clients (board view model). A selection's effort lives in the option its
- * instance names: "effort" for Claude, "reasoningEffort" for Codex, and "variant"
- * for OpenCode and everything else.
+ * clients (board view model). A selection's effort lives in the option its instance
+ * names: "effort" for Claude, "reasoningEffort" for Codex and codex-cu, and "variant"
+ * for OpenCode and every other instance.
  */
-import type { ModelSelection, ProviderInstanceId, ProviderOptionSelection } from "@t3tools/contracts";
+import type {
+  ModelSelection,
+  ProviderInstanceId,
+  ProviderOptionSelection,
+} from "@t3tools/contracts";
 
 /** Version of HARNESS_MAP. Bump it when a row changes, so stored mappings can be traced. */
 export const HARNESS_MAP_VERSION = 1;
@@ -24,45 +28,45 @@ export interface HarnessMapRow {
   readonly to: HarnessRoute;
 }
 
+const OPENCODE = "opencode";
 const CLAUDE = "claudeAgent";
 const CODEX = "codex";
 const CODEX_CU = "codex-cu";
 
-/** The exact legacy OpenCode ids and the route each one moves to. Anything else is unchanged. */
+/** The legacy OpenCode ids and the route each one moves to. Any other selection stays as it is. */
 export const HARNESS_MAP: ReadonlyArray<HarnessMapRow> = [
   {
-    from: { instanceId: "opencode", model: "opus/claude-opus-5-5" },
+    from: { instanceId: OPENCODE, model: "opus/claude-opus-5-5" },
     to: { instanceId: CLAUDE, model: "claude-opus-5-5", effortOptionId: "effort" },
   },
   {
-    from: { instanceId: "opencode", model: "opus/claude-sonnet-5-5" },
+    from: { instanceId: OPENCODE, model: "opus/claude-sonnet-5-5" },
     to: { instanceId: CLAUDE, model: "claude-sonnet-5-5", effortOptionId: "effort" },
   },
   {
     // Old alias for the same Sonnet route.
-    from: { instanceId: "opencode", model: "opus/claude-sonnet-5" },
+    from: { instanceId: OPENCODE, model: "opus/claude-sonnet-5" },
     to: { instanceId: CLAUDE, model: "claude-sonnet-5-5", effortOptionId: "effort" },
   },
   {
-    from: { instanceId: "opencode", model: "opus/cc/claude-haiku-5-5" },
+    from: { instanceId: OPENCODE, model: "opus/cc/claude-haiku-5-5" },
     to: { instanceId: CLAUDE, model: "claude-haiku-5-5", effortOptionId: "effort" },
   },
   {
-    from: { instanceId: "opencode", model: "opus/cx/gpt-6.1-sol" },
+    from: { instanceId: OPENCODE, model: "opus/cx/gpt-6.1-sol" },
     to: { instanceId: CODEX, model: "gpt-6.1-sol", effortOptionId: "reasoningEffort" },
   },
   {
-    from: { instanceId: "opencode", model: "opus/gpt-6-astra" },
+    from: { instanceId: OPENCODE, model: "opus/gpt-6-astra" },
     to: { instanceId: CODEX, model: "gpt-6-astra", effortOptionId: "reasoningEffort" },
   },
   {
-    // Computer use only.
-    from: { instanceId: "opencode", model: "opus/cx/gpt-6.1-terra" },
+    from: { instanceId: OPENCODE, model: "opus/cx/gpt-6.1-terra" },
     to: { instanceId: CODEX_CU, model: "gpt-6.1-terra", effortOptionId: "reasoningEffort" },
   },
   {
     // The old provider-block fallback.
-    from: { instanceId: "layso", model: "gpt-6-astra" },
+    from: { instanceId: OPENCODE, model: "layso/gpt-6-astra" },
     to: { instanceId: CODEX, model: "gpt-6-astra", effortOptionId: "reasoningEffort" },
   },
 ];
@@ -79,12 +83,30 @@ const ROWS_BY_SOURCE = new Map(
   HARNESS_MAP.map((row) => [rowKey(row.from.instanceId, row.from.model), row] as const),
 );
 
-/** Which option holds a selection's effort. Claude uses "effort", Codex "reasoningEffort", the rest "variant". */
+/** Which option holds a selection's effort: "effort" for Claude, "reasoningEffort" for Codex, "variant" otherwise. */
 export function effortOptionId(instanceId: string): EffortOptionId {
   if (instanceId === CLAUDE) return "effort";
   if (instanceId === CODEX || instanceId === CODEX_CU) return "reasoningEffort";
   return "variant";
 }
+
+/** Option ids that can carry an effort on an instance. "variant" is always one, as the compatibility name. */
+function effortIds(instanceId: string): ReadonlyArray<string> {
+  const native = effortOptionId(instanceId);
+  return native === "variant" ? ["variant"] : [native, "variant"];
+}
+
+/** The string values of the options named by `ids`, in order. Booleans are never efforts. */
+function valuesOf(
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  ids: ReadonlyArray<string>,
+): Array<string> {
+  return (options ?? []).flatMap((option) =>
+    ids.includes(option.id) && typeof option.value === "string" ? [option.value] : [],
+  );
+}
+
+const unique = (values: ReadonlyArray<string>): Array<string> => [...new Set(values)];
 
 /** The effort a selection carries in its own instance's option, or null. */
 export function selectionEffort(
@@ -94,9 +116,8 @@ export function selectionEffort(
   } | null,
 ): string | null {
   if (selection === null) return null;
-  const id = effortOptionId(selection.instanceId);
-  const value = selection.options?.find((option) => option.id === id)?.value;
-  return typeof value === "string" ? value : null;
+  const [value] = valuesOf(selection.options, [effortOptionId(selection.instanceId)]);
+  return value ?? null;
 }
 
 const LEGACY_SUFFIX = /^(.+)#([A-Za-z0-9][A-Za-z0-9_-]*)$/;
@@ -106,6 +127,21 @@ export function splitLegacySuffix(model: string): { model: string; effort: strin
   const match = LEGACY_SUFFIX.exec(model);
   if (!match) return { model, effort: null };
   return { model: match[1] ?? model, effort: match[2] ?? null };
+}
+
+/**
+ * splitLegacySuffix, but only for an id that names a mapped route. Any other id keeps its
+ * `#`, so the rest of the OpenCode catalog stays exactly as it is.
+ */
+function splitRouteSuffix(
+  instanceId: string,
+  model: string,
+): { model: string; effort: string | null } {
+  const split = splitLegacySuffix(model);
+  if (split.effort === null || !ROWS_BY_SOURCE.has(rowKey(instanceId, split.model))) {
+    return { model, effort: null };
+  }
+  return split;
 }
 
 export type SelectionResolution =
@@ -118,32 +154,28 @@ export type SelectionResolution =
   | { readonly kind: "unchanged"; readonly selection: ModelSelection }
   | { readonly kind: "conflict"; readonly reason: string };
 
-function optionString(
-  options: ReadonlyArray<ProviderOptionSelection> | undefined,
-  id: string,
-): string | null {
-  const value = options?.find((option) => option.id === id)?.value;
-  return typeof value === "string" ? value : null;
-}
-
 /**
  * Routes one selection through HARNESS_MAP. A legacy `#effort` suffix and the variant
- * option must agree, or the selection is a conflict and nothing is guessed. Resolving
- * a selection that is already mapped returns it unchanged.
+ * option are the same effort: if they name different ones (or the variant is listed
+ * twice with different values), the selection is a conflict and nothing is guessed.
+ * A selection that is already mapped comes back unchanged.
  */
 export function resolveSelection(selection: ModelSelection): SelectionResolution {
-  const split = splitLegacySuffix(selection.model);
+  const split = splitRouteSuffix(selection.instanceId, selection.model);
   const row = ROWS_BY_SOURCE.get(rowKey(selection.instanceId, split.model));
   if (row === undefined) return { kind: "unchanged", selection };
 
-  const variant = optionString(selection.options, "variant");
-  if (split.effort !== null && variant !== null && variant !== split.effort) {
+  const efforts = unique([
+    ...(split.effort === null ? [] : [split.effort]),
+    ...valuesOf(selection.options, ["variant"]),
+  ]);
+  if (efforts.length > 1) {
     return {
       kind: "conflict",
-      reason: `${selection.model} says effort ${split.effort} but its variant option is ${variant}`,
+      reason: `${selection.model} names conflicting efforts: ${efforts.join(", ")}`,
     };
   }
-  const effort = split.effort ?? variant;
+  const effort = efforts[0] ?? null;
   const carried = (selection.options ?? []).filter((option) =>
     (CARRIED_OPTIONS[row.to.instanceId] ?? []).includes(option.id),
   );
@@ -151,23 +183,25 @@ export function resolveSelection(selection: ModelSelection): SelectionResolution
     ...(effort === null ? [] : [{ id: row.to.effortOptionId, value: effort }]),
     ...carried,
   ];
-  const mapped: ModelSelection = {
-    instanceId: row.to.instanceId as ProviderInstanceId,
-    model: row.to.model,
-    ...(options.length > 0 ? { options } : {}),
-  } as ModelSelection;
   return {
     kind: "mapped",
-    selection: mapped,
+    selection: {
+      instanceId: row.to.instanceId as ProviderInstanceId,
+      model: row.to.model,
+      ...(options.length > 0 ? { options } : {}),
+    } as ModelSelection,
     from: { instanceId: row.from.instanceId, model: row.from.model },
     effort,
   };
 }
 
+export type MergeResult =
+  | { readonly kind: "selection"; readonly selection: ModelSelection }
+  | { readonly kind: "conflict"; readonly reason: string };
+
 /**
- * A partial selection update. Omitted `options` inherit only when the instance and
- * model stay the same. An explicit `options` list replaces them, and `[]` clears them.
- * `variant` is the compatibility field: a string sets the target's effort, null clears it.
+ * A partial selection update. `variant` is the compatibility name for the effort: a string
+ * sets it, and null clears it.
  */
 export interface SelectionPatch {
   readonly instanceId?: string | undefined;
@@ -176,37 +210,81 @@ export interface SelectionPatch {
   readonly variant?: string | null | undefined;
 }
 
-/**
- * Applies a patch to a selection. For a Claude or Codex target a compatibility variant
- * becomes that target's effort option and replaces any existing effort, so the result
- * never holds both a variant and an effort.
- */
-export function mergeSelection(base: ModelSelection, patch: SelectionPatch): ModelSelection {
-  const instanceId = patch.instanceId ?? base.instanceId;
-  const model = patch.model ?? base.model;
-  const sameTarget = instanceId === base.instanceId && model === base.model;
-  const start: ReadonlyArray<ProviderOptionSelection> =
-    patch.options !== undefined ? patch.options : sameTarget ? (base.options ?? []) : [];
+const conflict = (reason: string): MergeResult => ({ kind: "conflict", reason });
 
-  const effortId = effortOptionId(instanceId);
-  const native = effortId === "variant";
-  // A variant on a Claude or Codex target is a compatibility effort, and beats an effort in the same list.
-  const compat =
-    patch.variant !== undefined
-      ? patch.variant
-      : native
-        ? undefined
-        : optionString(start, "variant") ?? undefined;
-  const rest = start.filter(
-    (option) => option.id !== effortId && (native || option.id !== "variant"),
-  );
-  const effortEntry = start.findLast((option) => option.id === effortId);
-  const value = compat !== undefined ? compat : (effortEntry?.value ?? null);
-  const options: ReadonlyArray<ProviderOptionSelection> =
-    value === null ? rest : [...rest, { id: effortId, value }];
+/**
+ * A stored selection with its legacy `#effort` suffix folded into its effort option, so the
+ * merge rules see one effort. A suffix that disagrees with the option is a conflict.
+ */
+function foldSuffix(selection: ModelSelection): MergeResult {
+  const split = splitRouteSuffix(selection.instanceId, selection.model);
+  if (split.effort === null) return { kind: "selection", selection };
+  const ids = effortIds(selection.instanceId);
+  const efforts = unique([split.effort, ...valuesOf(selection.options, ids)]);
+  if (efforts.length > 1) {
+    return conflict(`${selection.model} conflicts with its effort option: ${efforts.join(", ")}`);
+  }
+  const options: Array<ProviderOptionSelection> = [
+    ...(selection.options ?? []).filter((option) => !ids.includes(option.id)),
+    { id: effortOptionId(selection.instanceId), value: split.effort },
+  ];
   return {
-    instanceId,
-    model,
-    ...(options.length > 0 ? { options } : {}),
-  } as ModelSelection;
+    kind: "selection",
+    selection: {
+      instanceId: selection.instanceId,
+      model: split.model,
+      options,
+    } as ModelSelection,
+  };
+}
+
+/**
+ * Applies a patch to a selection (validation-core 3.1). Omitted options inherit only for the
+ * same instance and model; an explicit list replaces them, and [] clears them. Every effort
+ * the patch supplies must agree: its options, its compatibility variant and a legacy suffix on
+ * its model. Two different values are a conflict, never a pick. A supplied effort replaces the
+ * inherited one, and variant null clears it.
+ */
+export function mergeSelection(base: ModelSelection, patch: SelectionPatch): MergeResult {
+  const folded = foldSuffix(base);
+  if (folded.kind === "conflict") return folded;
+  const start = folded.selection;
+
+  const instanceId = patch.instanceId ?? start.instanceId;
+  const named = splitRouteSuffix(instanceId, patch.model ?? start.model);
+  const model = named.model;
+  const sameTarget = instanceId === start.instanceId && model === start.model;
+  const ids = effortIds(instanceId);
+
+  const supplied = unique([
+    ...(named.effort === null ? [] : [named.effort]),
+    ...valuesOf(patch.options, ids),
+    ...(typeof patch.variant === "string" ? [patch.variant] : []),
+  ]);
+  if (supplied.length > 1) {
+    return conflict(`${model} is given conflicting efforts: ${supplied.join(", ")}`);
+  }
+  if (patch.variant === null && supplied.length > 0) {
+    return conflict(`${model} clears its effort and sets it in one patch`);
+  }
+
+  const inherited =
+    patch.options === undefined && sameTarget ? unique(valuesOf(start.options, ids)) : [];
+  if (inherited.length > 1) {
+    return conflict(`${model} already holds conflicting efforts: ${inherited.join(", ")}`);
+  }
+  const effort = supplied[0] ?? (patch.variant === null ? null : (inherited[0] ?? null));
+
+  const source = patch.options ?? (sameTarget ? (start.options ?? []) : []);
+  const carried = source.filter((option) => !ids.includes(option.id));
+  const options: Array<ProviderOptionSelection> =
+    effort === null ? carried : [...carried, { id: effortOptionId(instanceId), value: effort }];
+  return {
+    kind: "selection",
+    selection: {
+      instanceId: instanceId as ProviderInstanceId,
+      model,
+      ...(options.length > 0 ? { options } : {}),
+    } as ModelSelection,
+  };
 }
