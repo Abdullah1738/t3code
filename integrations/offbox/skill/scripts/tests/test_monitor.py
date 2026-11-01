@@ -7,9 +7,17 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import monitor
 import monitor_sample as sample
 import monitor_support as support
+
+
+def _real_ctl(cfg_file, method, path, body=None):
+    """support.ctl against a credential file the test wrote (the real HTTP path, no mocked responses)."""
+    cfg = json.loads(Path(cfg_file).read_text())
+    return support.request(method, cfg["url"].rstrip("/") + "/api/ardud/control" + path,
+                           "Bearer " + cfg["token"], body)
 
 
 class MonitorTests(unittest.TestCase):
@@ -159,6 +167,71 @@ class MonitorTests(unittest.TestCase):
             send.return_value = False
             self.assertTrue(support.steer("ses_top", support.PREFIX, "request2"))
             oc.assert_called_once()
+
+    def test_native_child_warning_goes_to_writable_ancestor_and_never_to_opencode(self):
+        # A Claude child (no messages) under an app-managed parent: the warning lands on the parent over
+        # the control API, and the OpenCode /prompt route is never called with the UUID.
+        import test_identity as ti
+        stub = ti.StubControl()
+        self.addCleanup(stub.close)
+        stub.threads["mid"] = {"threadId": "mid", "parentThreadId": ti.PARENT,
+                               "relationshipToParent": "subagent"}
+        stub.threads["leaf"] = {"threadId": "leaf", "parentThreadId": "mid", "relationshipToParent": "subagent"}
+        stub.identities[(ti.CLAUDE_UUID, "claudeAgent")] = ti.resolved("leaf", "mid", kind="provider-native-child",
+                                                                       accepts=False)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "offbox.json"
+        cfg.write_text(json.dumps({"url": stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        with patch.object(support, "HOME", Path(tmp.name)), \
+                patch.object(support, "_CACHE", {}), \
+                patch.object(support, "oc") as oc, \
+                patch.object(support, "ctl", side_effect=lambda m, p, b=None: _real_ctl(cfg, m, p, b)):
+            sent = []
+            with patch.object(support, "thread_send", side_effect=lambda t, text, rid: sent.append(t) or True):
+                delivered = support.steer(ti.CLAUDE_UUID, support.PREFIX + " warn", "rid-1", driver="claudeAgent")
+        self.assertTrue(delivered)
+        self.assertEqual(sent, [ti.PARENT])
+        oc.assert_not_called()
+
+    def test_native_child_without_a_writable_ancestor_is_not_delivered_to_opencode(self):
+        import test_identity as ti
+        stub = ti.StubControl()
+        self.addCleanup(stub.close)
+        stub.identities[(ti.CLAUDE_UUID, "claudeAgent")] = ti.resolved(
+            "orphan", None, kind="provider-native-child", accepts=False)
+        stub.threads["orphan"] = {"threadId": "orphan", "parentThreadId": None,
+                                  "relationshipToParent": "subagent"}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "offbox.json"
+        cfg.write_text(json.dumps({"url": stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        with patch.object(support, "HOME", Path(tmp.name)), \
+                patch.object(support, "_CACHE", {}), \
+                patch.object(support, "oc") as oc, \
+                patch.object(support, "ctl", side_effect=lambda m, p, b=None: _real_ctl(cfg, m, p, b)), \
+                patch.object(support, "thread_send", return_value=True) as send:
+            delivered = support.steer(ti.CLAUDE_UUID, support.PREFIX + " warn", "rid-2", driver="claudeAgent")
+        self.assertFalse(delivered)
+        send.assert_not_called()
+        oc.assert_not_called()
+
+    def test_uuid_without_a_native_driver_is_never_sent_to_opencode(self):
+        with patch.object(support, "oc") as oc, patch.object(support, "thread_send") as send:
+            self.assertFalse(support.steer("11111111-2222-3333-4444-555555555555", support.PREFIX, "rid-3"))
+        oc.assert_not_called()
+        send.assert_not_called()
+
+    def test_opencode_session_still_uses_the_prompt_route(self):
+        with patch.object(support, "thread_for", return_value={"threadId": "t"}), \
+                patch.object(support, "parent_session", return_value=None), \
+                patch.object(support, "thread_send", return_value=False), \
+                patch.object(support, "oc", return_value=(200, {})) as oc:
+            self.assertTrue(support.steer("ses_top", support.PREFIX, "rid-4"))
+        oc.assert_called_once()
+        self.assertEqual(oc.call_args.args[1], "ses_top")
 
     def test_ladder_timing_dedupe_and_exemption(self):
         con = monitor.connect(":memory:")

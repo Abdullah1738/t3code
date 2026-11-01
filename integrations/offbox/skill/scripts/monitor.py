@@ -114,7 +114,7 @@ def ladder(con, groups, sample, now, dry_run=False):
                 count = throttle(group)
                 log(f"throttle session={session} pids_attempted={count}")
             success = steer(session, message(session, group, sample, target == 2), rid,
-                            include_parent=target == 2)
+                            include_parent=target == 2, driver=group.get("driver"))
         else:
             success = record.get("telegram_sent", False) or telegram(session)
             if success:

@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.error
@@ -16,6 +17,8 @@ HOME = Path.home()
 STATE = Path(os.environ.get("OFFBOX_STATE_DIR", HOME / ".local/share/offbox"))
 PREFIX = "[Automated message from the offbox monitor (remote-compute skill), not typed by Abdullah.]"
 _CACHE = {}
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+MAX_ANCESTOR_HOPS = 100
 
 
 def read_json(path, default):
@@ -132,7 +135,95 @@ def thread_send(thread, text, request_id):
     return 200 <= status < 300
 
 
-def steer(session, text, request_id, include_parent=False):
+def is_uuid(value):
+    return bool(UUID_RE.fullmatch(value or ""))
+
+
+def resolve(native, driver):
+    """C1 resolution for a native id; "unavailable" on any failure.
+
+    A resolved answer is held for five minutes. Anything else (pending, ambiguous, unavailable)
+    is asked again after a minute, so a fresh mapping or a recovered control API is picked up.
+    """
+    key = ("identity", driver, native)
+    now = time.time()
+    item = _CACHE.get(key)
+    if item and item[0] > now:
+        return item[1]
+    status, data = ctl("GET", "/identity/resolve?nativeId=" + urllib.parse.quote(native, safe="")
+                       + "&driver=" + urllib.parse.quote(driver, safe=""))
+    if status == 200 and isinstance(data, dict) and isinstance(data.get("identity"), dict):
+        ident = data["identity"]
+    else:
+        ident = {"resolution": "unavailable", "acceptsMessages": False, "robobThreadId": None,
+                 "parentThreadId": None}
+    ttl = 300 if ident.get("resolution") == "resolved" else 60
+    _CACHE[key] = (now + ttl, ident)
+    return ident
+
+
+def thread_detail(thread_id):
+    status, data = ctl("GET", "/threads/" + urllib.parse.quote(thread_id, safe=""))
+    if status == 200 and isinstance(data, dict):
+        return data.get("thread") or {}
+    return None
+
+
+def writable_ancestor(thread_id):
+    """Nearest ancestor of `thread_id` that accepts messages (a top-level or app-managed thread).
+
+    Native children are never writable here: the walk starts above them. A broken or
+    cyclic lineage ends the walk without a target instead of guessing one.
+    """
+    visited = {thread_id}
+    current = thread_detail(thread_id)
+    for _ in range(MAX_ANCESTOR_HOPS):
+        parent = (current or {}).get("parentThreadId")
+        if not parent or parent in visited:
+            return None
+        visited.add(parent)
+        current = thread_detail(parent)
+        if current is None:
+            return None
+        if current.get("relationshipToParent") != "subagent":
+            return parent
+    return None
+
+
+def steer(session, text, request_id, include_parent=False, driver=None):
+    """Deliver a monitor warning to the caller, or to its nearest writable ancestor.
+
+    A native (Claude/Codex) id never goes to the OpenCode /prompt route: that answered 404
+    for native children. Without a known native driver it isn't delivered at all.
+    OpenCode ses_ ids keep the old path.
+    """
+    if driver in ("claudeAgent", "codex"):
+        return steer_native(session, text, request_id, include_parent, driver)
+    if is_uuid(session):
+        return False
+    return _steer_opencode(session, text, request_id, include_parent)
+
+
+def steer_native(session, text, request_id, include_parent=False, driver="claudeAgent"):
+    ident = resolve(session, driver)
+    tid = ident.get("robobThreadId")
+    delivered = False
+    if tid and ident.get("resolution") == "resolved" and ident.get("acceptsMessages"):
+        delivered = thread_send(tid, text, request_id)
+    if not delivered and tid and ident.get("resolution") == "resolved" and not ident.get("acceptsMessages"):
+        # A native child takes no messages: the warning goes to its nearest writable ancestor.
+        target = writable_ancestor(tid)
+        if target is not None:
+            delivered = thread_send(target, text, request_id + ":ancestor")
+    if include_parent and tid:
+        manager = ident.get("parentThreadId")
+        parent_text = text.replace(PREFIX, PREFIX + "\nFYI for the parent/manager of this session.", 1)
+        if manager and manager != tid:
+            thread_send(manager, parent_text, request_id + ":parent")
+    return delivered
+
+
+def _steer_opencode(session, text, request_id, include_parent=False):
     thread = thread_for(session) or {}
     tid = thread.get("threadId")
     parent = parent_session(session)
@@ -145,7 +236,7 @@ def steer(session, text, request_id, include_parent=False):
         manager = thread.get("parentThreadId")
         parent_text = text.replace(PREFIX, PREFIX + "\nFYI for the parent/manager of this session.", 1)
         if parent:
-            steer(parent, parent_text, request_id + ":parent", include_parent=False)
+            _steer_opencode(parent, parent_text, request_id + ":parent", include_parent=False)
         elif manager and manager != tid:
             thread_send(manager, parent_text, request_id + ":parent")
     return delivered
