@@ -171,6 +171,33 @@ class MarketplaceTests(unittest.TestCase):
         self.assertTrue(result[0]['isSelected'])
         self.assertFalse(rows[0]['isSelected'])
 
+    def test_payment_provider_is_optional_but_when_present_must_be_verified(self):
+        args = {'order': 'NTEST1', 'client_secret': 'secret', 'card_token': 'token'}
+        for provider in ('PAYPAL', '', 5, True, []):
+            with self.subTest(provider=provider):
+                self.assert_code('MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED', lambda:
+                    m.operation('main', 'payment_complete', **args, payment_provider_code=provider))
+        for provider in ('NOON_PAY', 'ADYEN', 'CHECKOUT'):
+            with self.subTest(provider=provider):
+                body = json.loads(m.operation('main', 'payment_complete', **args,
+                                              payment_provider_code=provider).body)
+                self.assertEqual(body['paymentProviderCode'], provider)
+        body = json.loads(m.operation('main', 'payment_complete', **args, payment_provider_code=None).body)
+        self.assertNotIn('paymentProviderCode', body)
+
+    def test_outcome_only_exposes_safe_transaction_status_and_boolean_failure(self):
+        for value in ('CREATED', '3DS_ENROLL_INITIATED', 'X' * 64):
+            with self.subTest(value=value):
+                result = m.outcome('payment_status', {'transaction_status': value, 'is_3ds_failure': False})
+                self.assertEqual(result['transaction_status'], value)
+                self.assertIs(result['is_3ds_failure'], False)
+        for value in ('', 'X' * 65, 'payment_pending', 'CREATED\n', 'https://bank.invalid', 1, None):
+            with self.subTest(value=value):
+                result = m.outcome('payment_status', {'transaction_status': value, 'is_3ds_failure': 1})
+                self.assertIsNone(result['transaction_status'])
+                self.assertIsNone(result['is_3ds_failure'])
+        self.assertIs(m.outcome('payment_complete', {'is_3ds_failure': True})['is_3ds_failure'], True)
+
     def test_fresh_headers_every_operation_and_experience_binding(self):
         for service, experience in [('main', 'ecom'), ('supermall', 'rocket')]:
             h = Harness(service=service)

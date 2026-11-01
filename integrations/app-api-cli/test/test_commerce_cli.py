@@ -40,6 +40,7 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                 flow.review = {'payable_minor': 1980}
                 flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
                     'review': {}, 'readback': {'verified': True}}
+                flow.prepare_payment.side_effect = lambda *, cvv_loader: cvv_loader()
                 flow.place.return_value = {'order': flow.order}
                 flow.await_success.return_value = {'paid': True}
                 flow.verify_tracking.return_value = {'status': 'placed'}
@@ -50,13 +51,38 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                      contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(c.main(['order',lane,'--sku-config','Z1','--cvv-from-keychain']),0)
                 cvv.assert_called_once()
-                flow.prepare_payment.assert_called_once_with(cvv=b'123')
+                flow.prepare_payment.assert_called_once_with(cvv_loader=cvv)
                 flow.place.assert_called_once()
                 flow.await_success.assert_called_once()
                 names = [call[0] for call in flow.mock_calls]
                 self.assertLess(names.index('prepare_payment'), names.index('place'))
                 self.assertLess(names.index('await_success'), names.index('register_tracker'))
                 complete.assert_called_once_with(flow.flow_id)
+
+    def test_invalid_provider_stops_both_lanes_before_keychain_or_place(self):
+        from unittest.mock import Mock
+        from commerce_marketplace_payment import MarketplacePayment
+        import test_commerce_main_order as main
+        import test_commerce_supermall_order as rocket
+        for lane, target, fixture in (('main', 'commerce_main_order.MainOrderFlow', main),
+                                      ('supermall', 'commerce_supermall_order.SupermallOrderFlow', rocket)):
+            for provider in (None, 'PAYPAL'):
+                with self.subTest(lane=lane, provider=provider):
+                    flow = Mock()
+                    flow.flow_id, flow.order = 'fixture-flow', None
+                    flow.review = {'payable_minor': 1980}
+                    flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
+                        'review': {}, 'readback': {'verified': True}}
+                    flow.session_response.data = fixture.session_state()
+                    flow.session_response.data['paymentProviderCode'] = provider
+                    flow.prepare_payment.side_effect = lambda **kw: MarketplacePayment.prepare_payment(flow, **kw)
+                    with patch(target, return_value=flow), patch.object(c, 'CommerceAuth'), \
+                         patch.object(c, 'cvv_from_keychain') as cvv, contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(c.main(['order', lane, '--sku-config', 'Z1', '--cvv-from-keychain']), 1)
+                    self.assertEqual(json.loads(output.getvalue().strip().splitlines()[-1])['error'],
+                                     'MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED')
+                    cvv.assert_not_called()
+                    flow.place.assert_not_called()
 
     def test_marketplace_await_routes_readonly_resume_then_tracker(self):
         from unittest.mock import Mock

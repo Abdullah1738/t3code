@@ -27,6 +27,7 @@ import noon_vertical_reads as tracking
 EXPERIENCES = {'main': 'ecom', 'supermall': 'rocket'}
 HOST = 'api-app.noon.com'
 PAYMENT_HOST = 'api-app-st.noon.com'
+PAYMENT_PROVIDERS = frozenset({'NOON_PAY', 'ADYEN', 'CHECKOUT'})
 CART = '/_svc/cart-v1/cart'
 CHECKOUT = '/_svc/checkout-v2/session/'
 ORDER = '/_svc/checkout-v2/order/'
@@ -295,7 +296,9 @@ def operation(service, name, **args):
                 payload['cvvEncryption'] = dict(encrypted)
             provider = args.pop('payment_provider_code', None)
             if provider is not None:
-                payload['paymentProviderCode'] = _id(provider)
+                if type(provider) is not str or provider not in PAYMENT_PROVIDERS:
+                    raise MarketplaceError('MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED')
+                payload['paymentProviderCode'] = provider
     else:
         raise MarketplaceError('UNMAPPED_OPERATION')
     if args:
@@ -355,7 +358,11 @@ def outcome(name, data):
         state = {'payment_pending': 'pending', 'payment_ready_to_redirect': 'challenge_required',
                   'payment_confirmed': 'payment_confirmed', 'payment_failed': 'failed',
                   'payment_cancelled': 'cancelled'}.get(raw, 'unknown') if isinstance(raw, str) else 'unknown'
+    transaction = data.get('transaction_status')
+    failure = data.get('is_3ds_failure')
     return {'state': state, 'raw_status': raw if isinstance(raw, str) and re.fullmatch(r'[a-z_]{1,64}', raw) else None,
+            'transaction_status': transaction if isinstance(transaction, str) and re.fullmatch(r'[A-Z0-9_]{1,64}', transaction) else None,
+            'is_3ds_failure': failure if isinstance(failure, bool) else None,
             'has_client_secret': bool(data.get('clientSecret')),
             'has_redirect': bool(data.get('redirect_url')), 'resend_allowed': False}
 

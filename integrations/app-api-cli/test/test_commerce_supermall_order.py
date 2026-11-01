@@ -84,7 +84,7 @@ def session_state(*, total=25.49, subtotal=17.0, quantity=1, address=HEADERS['x-
         promises = [dict(promises[0], analytics={'tag': 'ndd'}, delivery_date=None)]
     return {'version': 3, 'addressKey': address, 'addressCode': HEADERS['x-addresscode'],
             'useCredits': credits, 'walletAmount': 0.0, 'total': total, 'subtotal': subtotal,
-            'orderPaymentAmount': total, 'paymentAmount': total,
+            'orderPaymentAmount': total, 'paymentAmount': total, 'paymentProviderCode': 'NOON_PAY',
             'paymentMethods': [{'code': 'google_pay', 'status': 'available', 'cards': []},
                                {'code': 'cc_noonpay', 'status': 'active', 'cards': cards}],
             'deliveryOptions': {

@@ -214,6 +214,10 @@ generated. Missing provider is a proven request difference; the config-route
 hypothesis is disproved for this bundle, and the mandatory redirect branch
 requires a separately scoped decision before implementation or a live retry.
 
+The CLI now sends the session's `paymentProviderCode`, failing closed unless it
+is `NOON_PAY`, `ADYEN` or `CHECKOUT`, and prints `payment_status_poll` lines.
+Redirect handling is not built.
+
 ## Live proof
 
 Lane's own live run, 2026-10-11 00:16-00:23 +04 (flow
