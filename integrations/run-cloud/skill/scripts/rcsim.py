@@ -270,39 +270,102 @@ def telegram(text: str, key: str, severity: str = "info") -> bool:
 
 # ---------------------------------------------------------------- identity
 
-def whoami(thread: str | None = None, manager: str | None = None) -> dict:
-    """Owner thread, its title, and the manager (parent) thread for subagents."""
-    ses = os.environ.get("OPENCODE_SESSION_ID") or None
-    me = {"ses": ses, "thread": thread or os.environ.get("RCSIM_THREAD") or None,
-          "title": None, "manager": None, "relationship": None}
-    t = None
-    if me["thread"]:
-        state, t = thread_get(me["thread"])
-        if state == "gone":
-            die(f"thread {me['thread']} not found or archived")
-    elif ses:
-        st, d = ctl("GET", "/threads/by-native/" + q(ses))
+# The harness env names the caller's native id; the driver says which home it belongs to. Order matters:
+# CODEX_THREAD_ID is the concrete thread, CODEX_SESSION_ID is shared by a session's children.
+ENV_DRIVERS = (
+    ("CLAUDE_CODE_SESSION_ID", "claudeAgent"),
+    ("CODEX_THREAD_ID", "codex"),
+    ("OPENCODE_SESSION_ID", "opencode"),
+)
+# Pending/ambiguous/unavailable answers are held for a short burst only, so the next call asks again.
+UNRESOLVED_TTL = 5
+
+
+def caller_native() -> tuple[str | None, str | None]:
+    for var, driver in ENV_DRIVERS:
+        value = os.environ.get(var) or None
+        if value:
+            return value, driver
+    return None, None
+
+
+def identity_for(native: str, driver: str) -> dict:
+    """C1's resolution for one native id: {resolution, robobThreadId, parentThreadId, executionKind, ...}.
+
+    Every failure (control API down, bad token, unreadable config) comes back as "unavailable", never as
+    an unowned caller. Rcsim refuses to create or claim on anything but "resolved".
+    """
+    st, d = ctl("GET", f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}")
+    if st == 200 and isinstance(d, dict) and isinstance(d.get("identity"), dict):
+        ident = dict(d["identity"])
+    else:
+        ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                 "executionKind": None, "acceptsMessages": False, "candidates": []}
+    ident.update(driver=driver, nativeId=native)
+    return ident
+
+
+def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env: bool = False) -> dict:
+    """The execution rcsim acts for: owner thread, its title, and its manager (parent) thread.
+
+    The owner is the resolved execution (a Claude or Codex thread, a Claude child with its parent), not the
+    shared native session. `resolution` says whether that is known. Anything but "resolved" has no owner.
+    """
+    native, driver = caller_native()
+    me = {"ses": native, "driver": driver, "resolution": None, "executionKind": None,
+          "thread": None, "title": None, "manager": None, "relationship": None}
+    env_thread = None if ignore_env else (os.environ.get("RCSIM_THREAD") or None)
+    explicit = thread or env_thread
+    if native is not None and driver == "opencode" and explicit is None:
+        # OpenCode path, unchanged: the session names the thread through the control API.
+        st, d = ctl("GET", "/threads/by-native/" + q(native))
         if st == 200:
-            t = d.get("thread")
-            me["thread"] = t["threadId"]
-    if t:
-        me["title"] = t.get("title")
-        me["relationship"] = t.get("relationshipToParent")
-        if t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
-            me["manager"] = t["parentThreadId"]
-    if not me["manager"] and ses:
-        # OpenCode child session whose thread mapping is missing: use the parent session's thread.
-        info = opencode_session(ses) or {}
-        pid = info.get("parentID")
-        if pid:
-            st, d = ctl("GET", "/threads/by-native/" + q(pid))
-            if st == 200:
-                me["manager"] = d["thread"]["threadId"]
-            if not me["relationship"]:
-                me["relationship"] = "subagent"
+            t = d.get("thread") or {}
+            me.update(thread=t.get("threadId"), title=t.get("title"), resolution="resolved")
+            if t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
+                me.update(manager=t["parentThreadId"], relationship="subagent")
+    elif native is not None and explicit is None:
+        ident = identity_for(native, driver)
+        me["resolution"] = ident.get("resolution")
+        me["executionKind"] = ident.get("executionKind")
+        if ident.get("resolution") == "resolved":
+            me["thread"] = ident.get("robobThreadId")
+            me["manager"] = ident.get("parentThreadId")
+            if me["thread"]:
+                state, t = thread_get(me["thread"])
+                me["title"] = (t or {}).get("title")
+            me["relationship"] = "subagent" if me["manager"] else None
+    elif explicit is not None:
+        # An explicit --thread (or RCSIM_THREAD) names an owner. It counts only when it is this execution or
+        # one of its ancestors, so an inherited value from an unrelated parent can't take the work.
+        state, t = thread_get(explicit)
+        if state == "gone":
+            die(f"thread {explicit} not found or archived")
+        ident = identity_for(native, driver) if native is not None else None
+        if ident is not None and ident.get("resolution") == "resolved":
+            allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
+            if explicit not in allowed:
+                if thread is None:
+                    # Inherited from an unrelated parent: ignore it and use the resolved execution instead.
+                    log(f"RCSIM_THREAD ignored: {explicit} is not this execution or an ancestor")
+                    return whoami(None, manager, ignore_env=True)
+                die(f"--thread {explicit} is not this session's thread or its parent")
+        me.update(thread=explicit, title=(t or {}).get("title"),
+                  resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
+                  ident.get("resolution"))
+        if t and t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
+            me.update(manager=t["parentThreadId"], relationship="subagent")
     if manager:
         me["manager"] = None if manager == "none" else manager
     return me
+
+
+def refuse_unresolved(me: dict, action: str) -> None:
+    """Rcsim only acts for a resolved execution. Pending, ambiguous and unavailable never fall back to an
+    unowned or shared-session owner."""
+    if me.get("resolution") != "resolved" or not me.get("thread"):
+        die(f"{action} refused: this caller is not resolved to a Robob thread yet "
+            f"(resolution={me.get('resolution') or 'none'}). Retry in a few seconds; nothing was created.")
 
 
 # ---------------------------------------------------------------- create / launch
@@ -382,6 +445,7 @@ def print_created(sess: dict, platform: str, me: dict, notified: bool, as_json: 
 
 def cmd_create(a) -> None:
     me = whoami(a.thread, a.manager)
+    refuse_unresolved(me, "create")
     con = db()
     hard = check_hard(a.hard_timeout)
     args = [a.platform, "create", "--json", "--display-name", a.name or default_name(me, a.platform),
@@ -407,6 +471,7 @@ def cmd_launch(a) -> None:
     if bool(a.build) == bool(a.asset):
         die("pass exactly one of --build BUILD_ID or --asset ASSET_ID")
     me = whoami(a.thread, a.manager)
+    refuse_unresolved(me, "launch")
     con = db()
     hard = check_hard(a.hard_timeout)
     key = a.idempotency_key or f"rcsim-{a.platform}-{a.build or a.asset}-{int(now())}"
@@ -431,9 +496,18 @@ def cmd_launch(a) -> None:
 # ---------------------------------------------------------------- lifecycle commands
 
 def my_active(con, me: dict):
+    """Simulators this execution owns. Matched on the exact owner thread: a Claude or Codex session id is
+    shared by a session's children, so it never names one execution. Legacy rows that carry only an
+    OpenCode session id still match that session, and only when this caller is that OpenCode session."""
     rows = con.execute("SELECT * FROM sims WHERE state='active'").fetchall()
-    return [r for r in rows if (me.get("thread") and r["owner_thread"] == me["thread"])
-            or (me.get("ses") and r["owner_ses"] == me["ses"])]
+    out = []
+    for r in rows:
+        if me.get("thread") and r["owner_thread"] == me["thread"]:
+            out.append(r)
+        elif (not r["owner_thread"] and me.get("driver") == "opencode" and me.get("ses")
+              and r["owner_ses"] == me["ses"]):
+            out.append(r)
+    return out
 
 
 def cmd_heartbeat(a) -> None:
@@ -473,6 +547,8 @@ def cmd_release(a) -> None:
     con = db()
     me = whoami(a.thread)
     if a.mine:
+        # "Nothing to release" from an unresolved caller would hide its simulators behind a pending mapping.
+        refuse_unresolved(me, "release --mine")
         rows = my_active(con, me)
     elif a.ids:
         rows = [get_row(con, resolve_id(con, i)) for i in a.ids]
@@ -749,8 +825,7 @@ def monitor(dry: bool = False) -> None:
         if row["owner_thread"]:
             owner_state, owner_thread = thread_get(row["owner_thread"])
         elif row["owner_ses"]:
-            info = opencode_session(row["owner_ses"])
-            owner_state = "gone" if (info or {}).get("__missing__") else ("ok" if info else "unknown")
+            owner_state = legacy_owner_state(row["owner_ses"])
 
         if owner_state == "gone":
             # a pending handoff target inherits it; otherwise delete right away
@@ -793,6 +868,27 @@ def monitor(dry: bool = False) -> None:
             log(f"{sid} missed heartbeat ({mins(age)}): {'; '.join(notes) or 'telegram only'}")
     con.execute("INSERT OR REPLACE INTO kv VALUES ('last_monitor', ?)", (str(t),))
     con.commit()
+
+
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def legacy_owner_state(owner_ses: str) -> str:
+    """Liveness for a row that names only a session (no owner thread).
+
+    OpenCode session ids keep the OpenCode check. A Claude or Codex id is a UUID that OpenCode never knows:
+    asking OpenCode would 404 and read as dead. Those are resolved through the identity map, and a UUID is
+    only ever "ok" (resolved to a thread) or "unknown". It is never "gone" from a failed or pending lookup,
+    so an unresolved UUID keeps its simulator.
+    """
+    if not UUID_RE.fullmatch(owner_ses):
+        info = opencode_session(owner_ses)
+        return "gone" if (info or {}).get("__missing__") else ("ok" if info else "unknown")
+    for driver in ("claudeAgent", "codex"):
+        ident = identity_for(owner_ses, driver)
+        if ident.get("resolution") == "resolved" and ident.get("robobThreadId"):
+            return "ok"
+    return "unknown"
 
 
 def act_delete(con, row, reason: str, owner_thread: dict | None, owner_state: str, dry: bool) -> None:
