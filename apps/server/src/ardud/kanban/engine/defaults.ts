@@ -84,8 +84,8 @@ export const modelSelectionOf = (input: ModelInput, apply = false): ModelSelecti
 
 /** Titles, descriptions, goal stories and similar-card groups. */
 export const DEFAULT_MANAGER_MODEL = model("opus/cc/claude-haiku-5-5", "xhigh");
-export const DEFAULT_EVALUATOR_MODEL = model("opus/claude-opus-5-5", "xhigh");
-export const DEFAULT_CARD_MODEL = model("opus/claude-opus-5-5", "xhigh");
+export const DEFAULT_EVALUATOR_MODEL = model("opus/claude-opus-5-5", "high");
+export const DEFAULT_CARD_MODEL = model("opus/claude-opus-5-5", "high");
 
 /**
  * What the setup evaluator is told when the owner leaves notes empty. It proposes
