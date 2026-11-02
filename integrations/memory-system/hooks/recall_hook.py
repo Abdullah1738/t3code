@@ -171,6 +171,13 @@ def pending_seed_key(harness: str, event: dict) -> str:
     return "pending:" + seed_key(harness, event, os.environ.get("ROBOB_PROVIDER_INSTANCE_ID") or "")
 
 
+def transcript_offset(path: str | None) -> int | None:
+    try:
+        return os.stat(path).st_size if isinstance(path, str) else None
+    except OSError:
+        return None
+
+
 def native_key(harness: str, event: dict) -> str | None:
     session, agent = event.get("session_id"), event.get("agent_id")
     if not isinstance(session, str) or not session or len(session) > 200:
@@ -278,13 +285,13 @@ def turn_id(harness: str, event: dict) -> str | None:
 
 def transcript_task(harness: str, path: str | None, agent_id: str,
                     session_id: str | None = None, child_path: str | None = None,
-                    parent_path: str | None = None) -> str | None:
+                    parent_path: str | None = None, after_offset: int | None = None) -> str | None:
     """Only use an unambiguous authored task; the on-disk transcript can lag."""
     try:
         with open(path, "rb") as file:
             file.seek(0, os.SEEK_END)
             size = file.tell()
-            file.seek(max(0, size - 1_000_000))
+            file.seek(min(size, after_offset) if after_offset is not None else max(0, size - 1_000_000))
             records = file.read().decode("utf-8", "replace").splitlines()
     except (OSError, TypeError):
         records = []
@@ -322,7 +329,7 @@ def transcript_task(harness: str, path: str | None, agent_id: str,
     # Choosing the latest of multiple candidates could silently assign another task.
     if clean:
         return clean[0][:6000] if len(set(clean)) == 1 else None
-    if (harness != "claude" or not isinstance(session_id, str) or
+    if (after_offset is not None or harness != "claude" or not isinstance(session_id, str) or
         not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", session_id) or
         not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", agent_id)):
         return None
@@ -382,6 +389,8 @@ def next_turn(state: dict | None, tid: str, task: str, now: float, provisional: 
     retired = list(state.get("retired_turns", [])) if state else []
     if state and not state.get("provisional"):
         retired.append(state["turn"])
+    if state and state.get("ended_turn"):
+        retired.append(state["ended_turn"])
     # An unseen ID from an unresolved preceding turn is indistinguishable from
     # this turn's first ID, so do not guess until a later explicit prompt ID.
     blocked = bool(provisional and state and state.get("provisional"))
@@ -524,26 +533,42 @@ def handle(harness: str, event: dict):
         db = Store(state_path(), cfg["note_ttl_days"])
         try:
             with db.transaction():
+                if name == "SubagentStop":
+                    db.take_seed(pending_seed_key(harness, event))
+                    db.drop_seeds_for_native(harness, event.get("session_id"), event.get("agent_id"))
                 now = time.time()
                 db.prune(now)
                 db.end_turn(native, turn_id(harness, event), now)
         finally:
             db.close()
         return
-    if cfg["mode"] not in ("on", "observe"):
-        return
     if name == "PostToolUseFailure" and harness != "claude":
         return
     cwd = event.get("cwd") or ""
     dirs = cfg.get("only_dirs")
-    if isinstance(dirs, list) and dirs and not any(isinstance(d, str) and d and cwd.startswith(d) for d in dirs):
+    enabled = (cfg["mode"] in ("on", "observe") and not (
+        isinstance(dirs, list) and dirs and not any(isinstance(d, str) and d and cwd.startswith(d) for d in dirs)))
+    if not enabled:
+        if name == "UserPromptSubmit" and native and os.path.exists(state_path()):
+            # Even a suppressed prompt is a turn boundary. Quarantine its old
+            # state and supersede any earlier identity lookup without network I/O.
+            db = Store(state_path(), cfg["note_ttl_days"])
+            try:
+                with db.transaction():
+                    generation = uuid.uuid4().hex
+                    db.guard_prompt(native, generation)
+                    db.prune(time.time())
+                    db.invalidate_prompt(native, generation, time.time())
+            finally:
+                db.close()
         return
     child_id = event.get("agent_id")
     seed = None
     if (name == "SubagentStart" and cfg["work"] and cfg["work_subagents"] and
         isinstance(child_id, str) and child_id and isinstance(event.get("session_id"), str) and event["session_id"]):
         seed = {"path": event.get("transcript_path"), "child_path": event.get("agent_transcript_path"),
-                "started": time.time(), "turn": turn_id(harness, event)}
+                "started": time.time(), "turn": turn_id(harness, event),
+                "resume_offset": transcript_offset(event.get("transcript_path")) or 0}
         db = Store(state_path(), cfg["note_ttl_days"])
         try:
             with db.transaction():
@@ -620,17 +645,36 @@ def handle(harness: str, event: dict):
                     return
                 db.discard_turn(key, state)
                 state = None
-            if state and state.get("invalidated") and name != "UserPromptSubmit":
-                return
             if is_child:
                 skey = seed_key(harness, event, identity["providerInstanceId"])
+                pending_seed = db.take_seed(pending_seed_key(harness, event))
                 seed = db.get_seed(skey)
-                if not seed:
-                    seed = db.take_seed(pending_seed_key(harness, event))
-                    if seed:
-                        db.seed(skey, seed, now)
+                if pending_seed and (not seed or pending_seed["started"] > seed["started"]):
+                    seed = pending_seed
+                    db.seed(skey, seed, now)
+                tid = turn_id(harness, event)
+                if state and state.get("invalidated") and name != "UserPromptSubmit":
+                    # A start and a tool must agree on a genuinely new native
+                    # turn; a delayed event or duplicate start cannot revive it.
+                    if (not seed or not tid or seed.get("turn") != tid or
+                        tid in (state["turn"], state.get("ended_turn")) or
+                        tid in state.get("retired_turns", [])):
+                        return
+                    # Do not attribute the child's first historical prompt to a
+                    # resume; wait for an authored task matching the new start.
+                    path = event.get("transcript_path") or seed.get("path")
+                    task = transcript_task(harness, path, str(child_id or ""), event.get("session_id"),
+                                           event.get("agent_transcript_path") or seed.get("child_path"),
+                                           seed.get("path"), seed.get("resume_offset"))
+                    if not task:
+                        return
+                    db.discard_turn(key, state)
+                    state = next_turn(state, tid, task, seed.get("started", now), False)
+                    state["_native_key"] = native
+                    db.take_seed(skey)
                 if seed and not state:
-                    tid = turn_id(harness, event)
+                    if seed.get("turn") and tid and seed["turn"] != tid:
+                        return
                     state = new_turn(tid or ("seed:" + str(child_id)), "", seed.get("started", now),
                                      provisional=not bool(tid))
                     state["_native_key"] = native
@@ -643,6 +687,8 @@ def handle(harness: str, event: dict):
                     if task:
                         state["task"] = task
                         db.take_seed(skey)
+            if state and state.get("invalidated") and name != "UserPromptSubmit":
+                return
             tid = turn_id(harness, event)
             if name == "UserPromptSubmit":
                 prompt = event.get("prompt")

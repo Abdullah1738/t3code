@@ -131,7 +131,10 @@ class Store:
             if not turn and self.prompt_guarded(native_key):
                 continue
             if turn and state.get("turn") != turn:
-                continue
+                if (not state.get("provisional") or state.get("adoption_blocked") or
+                    turn in state.get("retired_turns", []) or self.prompt_guarded(native_key)):
+                    continue
+                state["ended_turn"] = turn
             self.discard_turn(key, state)
             state["invalidated"] = True
             self.save(key, state, now)
@@ -178,6 +181,13 @@ class Store:
     def get_seed(self, key: str) -> dict | None:
         row = self.db.execute("SELECT task FROM seeds WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def drop_seeds_for_native(self, harness: str, session: str | None, agent: str | None):
+        if not session or not agent:
+            return
+        self.db.execute("DELETE FROM seeds WHERE json_valid(key) AND json_extract(key, '$[0]')=? "
+                        "AND json_extract(key, '$[2]')=? AND json_extract(key, '$[3]')=?",
+                        (harness, session, agent))
 
     def adopt_turn(self, key: str, state: dict, turn: str) -> bool:
         if not state.get("provisional") or state.get("adoption_blocked") or turn in state.get("retired_turns", []):

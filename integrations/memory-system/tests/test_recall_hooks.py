@@ -443,6 +443,20 @@ class RecallHookTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_native_end_clears_unidentified_provisional_turn(self):
+        prompt = self.event()
+        prompt.pop("prompt_id")
+        self.call(prompt)
+        tool = self.event("PostToolUseFailure", tool_use_id="error", error="old failure")
+        tool.pop("prompt_id")
+        self.call(tool, now=1100)
+        self.assertTrue(self.state()["errors"])
+        self.call(self.event("Stop", prompt_id="real-ended"), now=1110)
+        state = self.state()
+        self.assertTrue(state["invalidated"])
+        self.assertEqual(state["ended_turn"], "real-ended")
+        self.assertEqual((state["activity"], state["errors"]), ([], []))
+
     def test_end_during_prompt_resolution_does_not_invalidate_new_turn(self):
         self.call(self.event())
         self.call(self.event("PostToolUseFailure", tool_use_id="old", error="remove old error"), now=1003)
@@ -537,6 +551,116 @@ class RecallHookTests(unittest.TestCase):
             env=os.environ, timeout=5)
         self.assertEqual((process.returncode, process.stdout, process.stderr), (0, "", ""))
         self.assertIn("hook:", (self.tmp / "hook.log").read_text())
+
+    def test_disabled_or_filtered_prompt_quarantines_previous_turn(self):
+        cases = ({"mode": "off"}, {"mode": "on", "only_dirs": ["/other"]})
+        for harness in ("claude", "codex"):
+            for i, restricted in enumerate(cases):
+                with self.subTest(harness=harness, restricted=restricted):
+                    session = f"native-{harness}-{i}"
+                    turn_field = "prompt_id" if harness == "claude" else "turn_id"
+                    self.config_file.write_text(json.dumps({"wait_ms": 0}))
+                    self.call(self.event(harness=harness, session_id=session, **{turn_field: "old"}), harness,
+                              now=1000 + i * 1000)
+                    self.work(8, harness=harness, start=1100 + i * 1000, session_id=session,
+                              **{turn_field: "old"})
+                    job = self.jobs.pop()
+                    hook.worker(job)
+                    self.config_file.write_text(json.dumps(restricted))
+                    request_count = len(self.server.requests)
+                    query_count = len(self.server.queries)
+                    boundary = self.event(harness=harness, session_id=session,
+                                          prompt="Investigate another task", **{turn_field: "new"})
+                    boundary.pop(turn_field)
+                    self.assertIsNone(self.call(boundary, harness, now=1130 + i * 1000))
+                    self.assertEqual((len(self.server.requests), len(self.server.queries)), (request_count, query_count))
+                    self.config_file.write_text(json.dumps({"mode": "on"}))
+                    tool = self.event("PostToolUse", harness, session_id=session, tool_use_id="without-id")
+                    tool.pop(turn_field)
+                    self.assertIsNone(self.call(tool, harness, now=1140 + i * 1000))
+                    self.assertTrue(self.state({"driver": "claudeAgent" if harness == "claude" else "codex",
+                                                "providerInstanceId": "claude-instance" if harness == "claude" else "cu",
+                                                "robobThreadId": "root", "_agent": None})["invalidated"])
+                    fresh = self.event(harness=harness, session_id=session, prompt="Investigate the next task",
+                                       **{turn_field: "fresh"})
+                self.call(fresh, harness, now=1150 + i * 1000)
+                self.assertEqual(len(self.server.requests), request_count + 1)
+
+    def test_resumed_child_requires_new_turn_and_fresh_task(self):
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                self.config_file.write_text("{}")
+                field = "prompt_id" if harness == "claude" else "turn_id"
+                agent = "agent-resume" if harness == "claude" else "codex-child"
+                transcript = self.tmp / f"{harness}-resume.jsonl"
+                transcript.write_text("")
+                common = {"agent_id": agent, "transcript_path": str(transcript)}
+                ident = {"driver": "claudeAgent" if harness == "claude" else "codex",
+                         "providerInstanceId": "claude-instance" if harness == "claude" else "cu",
+                         "robobThreadId": "child", "_agent": agent if harness == "claude" else None}
+                def task(prompt):
+                    if harness == "claude":
+                        row = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent",
+                               "input": {"resume": agent, "prompt": prompt}}]}}
+                    else:
+                        row = {"type": "event_msg", "payload": {"type": "user_message", "message": prompt}}
+                    with transcript.open("a") as f:
+                        f.write(json.dumps(row) + "\n")
+
+                self.call(self.event("SubagentStart", harness, **common, **{field: "old"}), harness, now=1000)
+                task("Investigate old child task")
+                self.work(8, start=1100, harness=harness, **common, **{field: "old"})
+                old_job = self.jobs.pop()
+                hook.worker(old_job)
+                self.call(self.event("SubagentStop", harness, **common, **{field: "old"}), harness, now=1130)
+                self.assertTrue(self.state(ident)["invalidated"])
+                self.call(self.event("SubagentStart", harness, **common, **{field: "new"}), harness, now=1140)
+                stale = self.event("PostToolUse", harness, **common, **{field: "old"}, tool_use_id="stale")
+                self.assertIsNone(self.call(stale, harness, now=1141))
+                fresh = self.event("PostToolUse", harness, **common, **{field: "new"}, tool_use_id="fresh-0")
+                self.assertIsNone(self.call(fresh, harness, now=1240))  # no fresh task yet
+                self.assertTrue(self.state(ident)["invalidated"])
+                task("Investigate resumed child task")
+                self.assertIsNone(self.call(fresh, harness, now=1243))
+                state = self.state(ident)
+                self.assertEqual((state["turn"], state["task"], state["calls"]),
+                                 ("new", "Investigate resumed child task", 1))
+                self.assertNotIn("stale", state["seen_tools"])
+                for n in range(1, 8):
+                    self.call({**fresh, "tool_use_id": f"fresh-{n}"}, harness, now=1243 + n * 3)
+                self.assertEqual(len(self.jobs), 1)
+                hook.worker(self.jobs.pop())
+                self.assertEqual(self.server.requests[-1]["prompt"], "Investigate resumed child task")
+                self.assertEqual(self.server.requests[-1]["mode"], "work")
+
+    def test_child_stop_removes_unconsumed_start_seed(self):
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                field = "prompt_id" if harness == "claude" else "turn_id"
+                agent = "agent-one" if harness == "claude" else "codex-child"
+                common = {"agent_id": agent, field: "turn-1"}
+                self.call(self.event("SubagentStart", harness, **common), harness)
+                self.call(self.event("SubagentStop", harness, **common), harness, now=1010)
+                db = Store(str(self.state_file))
+                try:
+                    self.assertEqual(db.db.execute("SELECT COUNT(*) FROM seeds").fetchone()[0], 0)
+                finally:
+                    db.close()
+
+    def test_new_pending_seed_replaces_old_seed_after_resolution_lag(self):
+        harness, field, agent = "claude", "prompt_id", "agent-abc"
+        transcript = self.tmp / "pending-resume.jsonl"
+        transcript.write_text("")
+        common = {"agent_id": agent, "transcript_path": str(transcript)}
+        self.call(self.event("SubagentStart", harness, **common, **{field: "first"}), harness, now=1000)
+        self.server.resolution = "pending"
+        self.call(self.event("SubagentStart", harness, **common, **{field: "second"}), harness, now=1010)
+        self.server.resolution = "resolved"
+        child = self.event("PostToolUse", harness, **common, **{field: "second"}, tool_use_id="new")
+        self.assertIsNone(self.call(child, harness, now=1020))
+        ident = {"driver": "claudeAgent", "providerInstanceId": "claude-instance",
+                 "robobThreadId": "child", "_agent": agent}
+        self.assertEqual(self.state(ident)["turn"], "second")
 
     def test_codex_identity_uses_agent_concrete_id_and_child_seed(self):
         # Codex emits SubagentStart from the child without a task field.
