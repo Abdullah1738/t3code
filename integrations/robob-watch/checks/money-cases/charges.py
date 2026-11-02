@@ -169,7 +169,9 @@ def search(query, since, until=None, source=None, n=20, deadline=None):
         raise Lookup(f'msgs: {e}') from e
     if done.returncode:
         raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
-    return [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+    # split on '\n' only: msgs prints ensure_ascii=False JSON, so a snippet can hold
+    # U+2028, \x85 or \x1c-\x1e, which str.splitlines() would treat as line breaks.
+    return [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
 
 
 def iso(t):
