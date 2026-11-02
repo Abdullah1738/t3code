@@ -83,6 +83,34 @@ const kanbanLayer = KanbanService.layer.pipe(
 
 const testLayer = SelectionMigration.layer.pipe(Layer.provideMerge(kanbanLayer));
 
+it.effect("apply moves a board's pools to Claude Code and a second apply writes nothing", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const board = yield* kanban.ensureBoard({
+      slug: "pools",
+      name: "Pools",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+
+    const applied = yield* migration.apply;
+    assert.isTrue(applied.applied > 0);
+
+    // The store itself must now hold the migrated pools, not just a report claiming so.
+    const pools = yield* store.pools(board.id);
+    assert.isTrue(pools.length > 0);
+    assert.isTrue(pools.every((pool) => pool.model.instanceId === "claudeAgent"));
+
+    // Running it again finds every value already migrated and writes nothing.
+    const again = yield* migration.apply;
+    assert.strictEqual(again.applied, 0);
+    const poolsAfterSecond = yield* store.pools(board.id);
+    assert.deepStrictEqual(poolsAfterSecond, pools);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("dry-run reports a board's selections and writes nothing", () =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
