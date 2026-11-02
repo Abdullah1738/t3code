@@ -2,6 +2,7 @@ import { assert, it, vi } from "@effect/vitest";
 import {
   MessageId,
   NodeId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -14,6 +15,7 @@ import {
   TurnItemId,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -61,6 +63,123 @@ it.effect("leaves durable effects for the worker after runtime reconciliation", 
       requeuedEffects: 0,
     });
     assert.equal(yield* Ref.get(runs), 0);
+  }),
+);
+
+// ardud: an already-failed shared provider session must not block every thread.
+it.effect("queues continuations for two running threads with an errored shared session", () =>
+  Effect.gen(function* () {
+    const driver = ProviderDriverKind.make("opencode");
+    const providerInstanceId = ProviderInstanceId.make("opencode");
+    const sessionId = ProviderSessionId.make("provider-session:opencode:shared");
+    const startedAt = DateTime.makeUnsafe("2026-10-30T00:00:00.000Z");
+    const threadIds = [ThreadId.make("thread:shared-a"), ThreadId.make("thread:shared-b")];
+    const projections = threadIds.map((threadId, index) => {
+      const runId = RunId.make(`run:shared-${index}`);
+      const providerThreadId = ProviderThreadId.make(`provider-thread:shared-${index}`);
+      const attemptId = RunAttemptId.make(`attempt:shared-${index}`);
+      return {
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("project:shared"),
+          providerInstanceId,
+          archivedAt: null,
+          deletedAt: null,
+        },
+        runs: [
+          {
+            id: runId,
+            ordinal: 1,
+            status: "running",
+            providerInstanceId,
+            providerThreadId,
+            activeAttemptId: attemptId,
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: null,
+          },
+        ],
+        providerThreads: [
+          {
+            id: providerThreadId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            driver,
+            providerInstanceId,
+            providerSessionId: sessionId,
+            nativeThreadRef: { driver, nativeId: `native-${index}`, strength: "strong" },
+            status: "active",
+          },
+        ],
+        providerSessions: [
+          {
+            id: sessionId,
+            driver,
+            providerInstanceId,
+            status: "error",
+            capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+          },
+        ],
+        providerTurns: [
+          {
+            id: ProviderTurnId.make(`turn:shared-${index}`),
+            providerThreadId,
+            runAttemptId: attemptId,
+            status: "running",
+          },
+        ],
+        runtimeRequests: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        messages: [],
+        turnItems: [],
+      } as unknown as OrchestrationV2ThreadProjection;
+    });
+    const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+    const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed(threadIds),
+            getRuntimeRecoveryProjection: (id) =>
+              Effect.succeed(projections[threadIds.indexOf(id)]!),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            commitCommand: (input) =>
+              Effect.sync(() => {
+                commits.push(input);
+                return { committed: true, cancelledEffectCount: 0 } as never;
+              }),
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
+      ),
+    );
+    yield* recovery.reconcile("startup");
+    assert.deepEqual(
+      commits.flatMap((commit) =>
+        commit.effects.map((effect) => ({
+          id: effect.id,
+          request: effect.request,
+        })),
+      ),
+      [
+        {
+          id: "effect:restart-continuation:run:shared-0",
+          request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-0") },
+        },
+        {
+          id: "effect:restart-continuation:run:shared-1",
+          request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-1") },
+        },
+      ],
+    );
   }),
 );
 

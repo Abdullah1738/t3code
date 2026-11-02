@@ -143,6 +143,25 @@ it("continues a live turn whose session the adapter never marked running", () =>
     assert.isUndefined(restartContinuationRun(withSessionStatus(status), now), status);
 });
 
+// ardud: a shared session's status describes the instance, not this running turn.
+it.each(["error", "stopped"] as const)(
+  "continues a live turn when its shared session is %s",
+  (status) => {
+    const projection = makeProjection();
+    const shared = {
+      ...projection,
+      providerSessions: [
+        {
+          ...projection.providerSessions[0]!,
+          status,
+          capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.equal(restartContinuationRun(shared, now)?.id, runId);
+  },
+);
+
 it("recovers an admitted continuation after another crash before provider start", () => {
   const projection = makeProjection();
   const starting = {
