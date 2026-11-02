@@ -707,6 +707,7 @@ const make = Effect.gen(function* () {
   // Invalidates a probe when another failed run arrives while it is in flight.
   const outageGeneration = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
   const deferredNudges = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  const deferredDiscussionNudges = yield* Ref.make<ReadonlyMap<ThreadId, ReadonlySet<KanbanDiscussionId>>>(new Map());
   const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
@@ -1727,6 +1728,7 @@ const make = Effect.gen(function* () {
     yield* store.putBoard(next);
     yield* publish(board.id, { _tag: "board", board: next });
     yield* wakeRecovered(next);
+    yield* wakeDiscussionNudges(next);
     yield* wakeBoardNudges(next);
     yield* kick;
     return next;
@@ -2226,6 +2228,7 @@ const make = Effect.gen(function* () {
   const settleParticipant = Effect.fn("KanbanService.settleParticipant")(function* (
     discussion: KanbanDiscussion,
     threadId: ThreadId,
+    retry = false,
   ) {
     const participant = discussion.participants.find(
       (candidate) =>
@@ -2234,9 +2237,31 @@ const make = Effect.gen(function* () {
     );
     if (!participant) return;
     if (participant.owes === "asked") {
-      yield* threads
+      const link = yield* store.threadLink(threadId);
+      const board = yield* boardOf(discussion.boardId);
+      if (board.pause && link && link.role !== "evaluator") {
+        const carried = yield* store.cardsByThread(threadId);
+        if (
+          (discussion.cardId !== null && !board.pause.keep.includes(discussion.cardId)) ||
+          carried.some((card) => !board.pause!.keep.includes(card.id)) ||
+          (carried.length === 0 && link.cardId !== null && !board.pause.keep.includes(link.cardId))
+        ) {
+          yield* Ref.update(deferredDiscussionNudges, (all) => {
+            const next = new Map(all);
+            next.set(threadId, new Set([...(all.get(threadId) ?? []), discussion.id]));
+            return next;
+          });
+          yield* saveDiscussion(withParticipant(discussion, participant.actor, participant.name, {
+            typingUntil: null,
+          }));
+          return;
+        }
+      }
+      const sent = yield* threads
         .send({ threadId, text: Briefs.nudgeDiscussionText(discussion.id) })
-        .pipe(Effect.ignore);
+        .pipe(Effect.as(true), Effect.catchCause(() => Effect.succeed(false)));
+      const deferred = (yield* Ref.get(deferredDiscussionNudges)).get(threadId)?.has(discussion.id);
+      if ((retry || deferred) && !sent) return;
       yield* saveDiscussion(
         withParticipant(discussion, participant.actor, participant.name, {
           owes: "nudged",
@@ -2782,11 +2807,62 @@ const make = Effect.gen(function* () {
       }
       if (carried.some((card) => board.pause && !board.pause.keep.includes(card.id))) continue;
       if ((yield* store.threadLink(threadId))?.paused) continue;
+      if ((yield* Ref.get(deferredDiscussionNudges)).has(threadId)) continue;
       const view = yield* threads.view(threadId);
       if (!view || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis)) continue;
       const review = carried.find((card) => card.activeRole === "review");
       if (review) yield* reviewerStopped(review, threadId);
       else yield* nudgeWorker(threadId, carried);
+    }
+  });
+
+  // Dropped or completed cards still own their discussion even when no card is active.
+  const wakeDiscussionNudges = Effect.fn("KanbanService.wakeDiscussionNudges")(function* (board: KanbanBoard) {
+    const deferred = yield* Ref.get(deferredDiscussionNudges);
+    if (deferred.size === 0) return;
+    for (const [threadId, ids] of deferred) {
+      const link = yield* store.threadLink(threadId);
+      if (!link || link.boardId !== board.id || link.paused) continue;
+      const carried = yield* store.cardsByThread(threadId);
+      const view = yield* threads.view(threadId);
+      if (!view || view.archived || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis)) continue;
+      for (const id of ids) {
+        const discussion = yield* store.discussion(id);
+        const participant = discussion?.participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === threadId,
+        );
+        if (discussion && discussion.settledAt === null && discussion.archivedAt === null && participant?.owes === "asked" && board.pause && (
+          (discussion.cardId !== null && !board.pause.keep.includes(discussion.cardId)) ||
+          (carried.length === 0 && link.cardId !== null && !board.pause.keep.includes(link.cardId)) ||
+          carried.some((card) => !board.pause!.keep.includes(card.id))
+        )) continue;
+        const isReady = yield* threads.view(threadId);
+        if (!isReady || isReady.archived || isReady.state !== "idle") break;
+        if (discussion && discussion.settledAt === null && discussion.archivedAt === null && participant?.owes === "asked" && (yield* isHome(discussion, threadId))) {
+          yield* settleParticipant(discussion, threadId, true);
+          const updated = yield* store.discussion(id);
+          const stillAsked = updated?.participants.some(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === threadId && entry.owes === "asked",
+          );
+          if (stillAsked) continue;
+          // The discussion reminder already restarted the thread. Its next turn end
+          // takes over the deferred work/review nudge.
+          yield* Ref.update(deferredNudges, (set) => {
+            const next = new Set(set);
+            next.delete(threadId);
+            return next;
+          });
+        }
+        yield* Ref.update(deferredDiscussionNudges, (all) => {
+          const next = new Map(all);
+          const remaining = new Set(next.get(threadId));
+          remaining.delete(id);
+          if (remaining.size === 0) next.delete(threadId);
+          else next.set(threadId, remaining);
+          return next;
+        });
+        if (discussion && participant?.owes === "asked" && discussion.settledAt === null && discussion.archivedAt === null) break;
+      }
     }
   });
 
@@ -3201,6 +3277,7 @@ const make = Effect.gen(function* () {
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
       yield* wakeRecovered(board);
+      yield* wakeDiscussionNudges(board);
       yield* wakeBoardNudges(board);
       // The scribe regroups at most every SCRIBE_EVERY_MS, and only when open cards changed.
       const fingerprint = Scribe.groupsFingerprint(yield* store.cards(board.id));
@@ -3277,6 +3354,7 @@ const make = Effect.gen(function* () {
         const threadId = card.activeThreadId;
         if (threadId === null || card.activeRole !== "work") continue;
         if (board.pause && !board.pause.keep.includes(card.id)) continue;
+        if ((yield* Ref.get(deferredDiscussionNudges)).has(threadId)) continue;
         // A paused worker waits for probeOutages, not a nudge.
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
@@ -3304,6 +3382,7 @@ const make = Effect.gen(function* () {
         const threadId = card.activeThreadId;
         if (threadId === null || card.activeRole !== "review") continue;
         if (board.pause && !board.pause.keep.includes(card.id)) continue;
+        if ((yield* Ref.get(deferredDiscussionNudges)).has(threadId)) continue;
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
         if (

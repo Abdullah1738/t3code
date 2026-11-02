@@ -462,13 +462,13 @@ export function planDispatch(
       const key = poolFor(pools, model)?.key;
       if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
       let thread = role === "work" ? card.workThreadId : null;
-      if (thread !== null && kept !== null && cards.some(
-        (other) => other.activeThreadId === thread && !kept.has(other.id),
-      )) continue;
       const fresh = thread !== null && busyElsewhere(thread, key);
       // A new thread can't take a card its old thread's own work still holds up.
       if (fresh && isBlocked(card, byId, null)) continue;
       if (fresh) thread = null;
+      if (thread !== null && kept !== null && cards.some(
+        (other) => other.activeThreadId === thread && !kept.has(other.id),
+      )) continue;
       const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
       if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
       if (!joins) {

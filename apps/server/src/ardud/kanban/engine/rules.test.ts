@@ -546,6 +546,18 @@ describe("thread batching", () => {
     ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
   });
 
+  it("starts a kept card fresh when its old thread carries a held card on another pool", () => {
+    const held = working({ model: haiku, activePool: poolKey(haiku) });
+    const back = card({ workThreadId: t1 });
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    expect(planDispatch(paused, [held, back], pools([[opus, 1], [haiku, 1]]))).toMatchObject([
+      { cardId: back.id, joins: false, fresh: true },
+    ]);
+  });
+
   it("never picks up a backlog card, not even back to its own thread", () => {
     const parked = card({ priority: KANBAN_BACKLOG });
     const paused = card({ priority: KANBAN_BACKLOG, workThreadId: t1 });
