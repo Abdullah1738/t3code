@@ -23,7 +23,7 @@ Stdlib only. Opens opencode.db read-only.
 """
 import argparse, calendar, json, os, re, signal, sqlite3, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import snapshot  # noqa: E402
+from active_sessions import in_use, project_roots, snapshot, workspace_of  # noqa: E402
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
 OC_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
@@ -95,7 +95,13 @@ def running_sessions():
     snap = snapshot(timeout=20)
     if not snap["complete"]:
         return None, {}, "; ".join(snap["problems"]) or "active set incomplete"
-    native = {tid: t.get("worktreePath") for tid, t in snap["threads"].items() if t.get("worktreePath")}
+    roots = {}
+    if any(not t.get("worktreePath") for t in snap["threads"].values() if in_use(t)):
+        roots, roots_err = project_roots(timeout=20)
+        if roots_err:
+            return None, {}, roots_err
+    native = {tid: workspace_of(t, roots) for tid, t in snap["threads"].items()
+              if in_use(t) and workspace_of(t, roots)}
     return set(snap["opencode"]), native, None
 
 

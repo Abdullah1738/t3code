@@ -23,7 +23,8 @@ import active_sessions as active  # noqa: E402
 class Stub:
     """Serves the control API (`threads`, `total`) and the OpenCode active list on one loopback port."""
 
-    def __init__(self, threads, total=None, control_ok=True, opencode=None, opencode_ok=True):
+    def __init__(self, threads, total=None, control_ok=True, opencode=None, opencode_ok=True, projects=None):
+        self.projects = projects or []
         self.threads = threads
         self.total = len(threads) if total is None else total
         self.control_ok = control_ok
@@ -56,6 +57,10 @@ class Stub:
                     limit = int(q.get("limit", ["50"])[0])
                     return self._send(200, {"ok": True, "total": stub.total,
                                             "threads": stub.threads[:limit]})
+                if url.path == "/api/ardud/control/projects":
+                    if not stub.control_ok:
+                        return self._send(503, {"ok": False})
+                    return self._send(200, {"ok": True, "projects": stub.projects})
                 if url.path == "/api/session/active":
                     if not stub.opencode_ok:
                         return self._send(500, {"error": "down"})
@@ -122,6 +127,25 @@ class ActiveSetTests(unittest.TestCase):
         active.snapshot()
         self.assertTrue(any("includeSubagents=true" in r for r in stub.requests), stub.requests)
 
+    def test_active_query_reads_the_full_list_so_runless_native_threads_are_covered(self):
+        # `active=true` is built from runs and pending requests, so a native child with neither is missing from it.
+        # The janitor reads the full thread list instead and decides activity itself.
+        stub = self.serve(threads=[thread(1)], opencode={"ses_a": True})
+        active.snapshot()
+        queries = [r for r in stub.requests if "/threads" in r]
+        self.assertTrue(queries, stub.requests)
+        self.assertFalse(any("active=true" in r for r in queries), queries)
+
+    def test_runless_native_child_is_kept_as_in_use(self):
+        # A native child that is idle (no run, no pending request) can still own a worktree: it counts as in use.
+        native = {"threadId": "thread-native-runless", "state": "idle", "worktreePath": "/work/native",
+                  "relationshipToParent": "subagent", "creationSource": "provider"}
+        self.serve(threads=[native], opencode={})
+        snap = active.snapshot()
+        self.assertTrue(snap["complete"], snap["problems"])
+        self.assertIn("thread-native-runless", snap["threads"])
+        self.assertTrue(active.in_use(snap["threads"]["thread-native-runless"]))
+
     def test_exactly_one_full_page_with_matching_total_is_complete(self):
         self.serve(threads=[thread(i) for i in range(500)], total=500)
         snap = active.snapshot()
@@ -160,6 +184,46 @@ class ActiveSetTests(unittest.TestCase):
         self.assertEqual(ids, {"ses_x"})
 
 
+class RootWorkspaceTests(unittest.TestCase):
+    """A thread on a project's root workspace has worktreePath null. Its checkout is still in use."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "rcsim.json"
+        self.cfg.write_text(json.dumps({"url": "", "token": "test-token"}))
+        self.cfg.chmod(0o600)
+        self.patches = [patch.object(active, "CONTROL_CFGS", (str(self.cfg),)),
+                        patch.object(active, "PASSWORD_FILE", os.path.join(self.tmp.name, "no-password"))]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def serve(self, **kwargs):
+        stub = Stub(**kwargs)
+        self.addCleanup(stub.close)
+        self.cfg.write_text(json.dumps({"url": stub.base, "token": "test-token"}))
+        self.cfg.chmod(0o600)
+        patch.object(active, "OC_SERVICE_URL", stub.base).start()
+        self.addCleanup(patch.stopall)
+        return stub
+
+    def test_root_workspace_thread_protects_its_project_root(self):
+        root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-1"}
+        self.serve(threads=[root], opencode={}, projects=[{"projectId": "proj-1", "workspaceRoot": "/Users/x/repo"}])
+        workspaces = active.active_workspaces()
+        self.assertIsNotNone(workspaces, "a readable project must resolve")
+        self.assertIn("/Users/x/repo", workspaces)
+
+    def test_unresolvable_project_fails_closed(self):
+        # The thread's project is missing from /projects: its workspace is unknown, so the set is not complete.
+        root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-gone"}
+        self.serve(threads=[root], opencode={}, projects=[])
+        snap = active.snapshot()
+        self.assertFalse(snap["complete"], "an in-use thread whose workspace is unknown must not be reaped against")
+        self.assertTrue(any("workspace" in p for p in snap["problems"]), snap["problems"])
+
+
 class JanitorKeepsEverythingTests(unittest.TestCase):
     """An incomplete active set must keep every resource and every worktree, never reap."""
 
@@ -190,9 +254,11 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
         import sqlite3
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
-        with patch.object(worktree_reaper, "snapshot", return_value={
-                "complete": True, "opencode": set(),
-                "threads": {"t1": {"threadId": "t1", "worktreePath": "/work/claude-task"}}, "problems": []}):
+        # running_dirs first gates on a complete snapshot, then reads the resolved workspaces. Both are patched so
+        # the test stays off the live control API and checks only that the claude workspace is protected.
+        complete = {"complete": True, "opencode": set(), "threads": {}, "problems": []}
+        with patch.object(worktree_reaper, "snapshot", return_value=complete), \
+                patch.object(worktree_reaper, "active_workspaces", return_value={"/work/claude-task"}):
             dirs = worktree_reaper.running_dirs(con)
         self.assertIn("/work/claude-task", dirs)
 
