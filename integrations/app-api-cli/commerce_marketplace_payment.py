@@ -58,13 +58,11 @@ def telegram_stall_notify(order, total_minor):
 class MarketplacePayment:
     vertical = None
 
-    def prepare_payment(self, cvv=None):
+    def prepare_payment(self, cvv=None, *, cvv_loader=None):
         """Check/load secrets before place; keep the encrypted envelope in RAM."""
         if self.review is None or self.session_response is None:
             journal.fail('MARKETPLACE_REVIEW_REQUIRED')
         session = self.session_response.data
-        if session.get('isCvvRequired') is not False and cvv is None:
-            journal.fail('MARKETPLACE_CVV_REQUIRED_USE_KEYCHAIN')
         methods = session.get('paymentMethods', [])
         selected = [card for method in methods if method.get('code') == 'cc_noonpay'
                     and method.get('status') == 'active' for card in method.get('cards', [])
@@ -72,6 +70,14 @@ class MarketplacePayment:
                     and str(card.get('mask', '')).endswith(order_card.LAST4)]
         if len(selected) != 1:
             journal.fail('MARKETPLACE_SAVED_CARD_MISMATCH')
+        provider = market.session_payment_provider(session)
+        if provider is None:
+            journal.fail('MARKETPLACE_PAYMENT_PROVIDER_UNVERIFIED')
+        self.payment_provider_code = provider
+        if cvv_loader is not None:
+            cvv = cvv_loader()
+        if session.get('isCvvRequired') is not False and cvv is None:
+            journal.fail('MARKETPLACE_CVV_REQUIRED_USE_KEYCHAIN')
         self.payment_card_token = market.card_token(selected[0].get('id'))
         self.cvv_encryption = None
         if cvv is not None:
@@ -115,6 +121,7 @@ class MarketplacePayment:
             print(json.dumps({'phase': phase, 'notify': result}), flush=True)
 
         last = None
+        last_payment = None
         # The payment itself reported failed (the order can lag behind it). A resumed wait
         # (await-payment) keeps what the run before the restart already saw.
         declined = getattr(self, '_recovery_only', False) and journal.payment_declined(self.flow_id)
@@ -167,10 +174,12 @@ class MarketplacePayment:
                     journal.fail('MARKETPLACE_PENDING_AMOUNT_MISMATCH')
                 consumed = self._financial_operation() != 'place'
                 if not consumed and not getattr(self, '_recovery_only', False):
-                    if not getattr(self, 'payment_card_token', None):
+                    provider = getattr(self, 'payment_provider_code', None)
+                    if (not getattr(self, 'payment_card_token', None) or type(provider) is not str
+                            or provider not in market.PAYMENT_PROVIDERS):
                         journal.fail('MARKETPLACE_PAYMENT_SETUP_REQUIRED')
                     args = {'order': self.order, 'client_secret': secret,
-                            'card_token': self.payment_card_token}
+                            'card_token': self.payment_card_token, 'payment_provider_code': provider}
                     if self.cvv_encryption is not None:
                         args['cvv_encryption'] = self.cvv_encryption
                     self._expect('payment_complete', **args)
@@ -188,6 +197,16 @@ class MarketplacePayment:
                         client_secret=secret, timeout=min(timeout, end - clock()))
             if payment is not None:
                 summary = payment.summary()
+                current_payment = (summary['raw_status'], summary['transaction_status'],
+                                   summary['is_3ds_failure'], summary['has_redirect'])
+                if current_payment != last_payment:
+                    last_payment = current_payment
+                    print(json.dumps({'phase': 'payment_status_poll', 'order': self.order,
+                                      'source': payment.operation.name,
+                                      'raw_status': current_payment[0],
+                                      'transaction_status': current_payment[1],
+                                      'is_3ds_failure': current_payment[2],
+                                      'has_redirect': current_payment[3]}), flush=True)
                 state = summary['state']
                 if state in ('failed', 'cancelled'):
                     self._payment_observation('PAYMENT_FAILED', payment)

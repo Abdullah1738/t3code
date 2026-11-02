@@ -431,7 +431,7 @@ def order_main(args):
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
     if args.prepare_only:
         return verified
-    flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
+    flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
     try:
         with marketplace_after_send(flow,sending=True):
             placed=flow.place()
@@ -486,7 +486,7 @@ def order_supermall(args):
     print(json.dumps({'flow_id': flow.flow_id, 'phase': 'review', 'review': review}), flush=True)
     if args.prepare_only:
         return verified
-    flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
+    flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
     try:
         with marketplace_after_send(flow, sending=True):
             placed = flow.place()

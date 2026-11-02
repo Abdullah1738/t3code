@@ -29,22 +29,22 @@ describe("poolAddLevel", () => {
   ];
 
   it("adds a new model at the provider's default level, or none", () => {
-    expect(poolAddLevel(models, "a", [])).toEqual({ variant: "high" });
-    expect(poolAddLevel(models, "b", [])).toEqual({ variant: "max" });
-    expect(poolAddLevel(models, "c", [])).toEqual({ variant: null });
-    expect(poolAddLevel(models, "d", [])).toEqual({ variant: null });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", [])).toEqual({ variant: "high" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "b", [])).toEqual({ variant: "max" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", [])).toEqual({ variant: null });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "d", [])).toEqual({ variant: null });
   });
 
   it("adds a pooled model at a level none of its pools has, never with no level", () => {
-    expect(poolAddLevel(models, "a", ["low"])).toEqual({ variant: "high" });
-    expect(poolAddLevel(models, "a", ["high"])).toEqual({ variant: "low" });
-    expect(poolAddLevel(models, "c", ["max"])).toEqual({ variant: "low" });
-    expect(poolAddLevel(models, "c", [null])).toEqual({ variant: "low" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["low"])).toEqual({ variant: "high" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["high"])).toEqual({ variant: "low" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", ["max"])).toEqual({ variant: "low" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", [null])).toEqual({ variant: "low" });
   });
 
   it("has nothing to add once every level is pooled, or for a pooled model with no levels", () => {
-    expect(poolAddLevel(models, "a", ["low", "high", "max"])).toBeNull();
-    expect(poolAddLevel(models, "d", [null])).toBeNull();
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["low", "high", "max"])).toBeNull();
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "d", [null])).toBeNull();
   });
 });
 

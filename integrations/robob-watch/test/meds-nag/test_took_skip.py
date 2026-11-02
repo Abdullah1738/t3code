@@ -8,12 +8,13 @@ import sys
 import tempfile
 import unittest
 
-STAGED_TOOK = os.environ.get(
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOOK = os.environ.get(
     "TOOK_PY",
-    "/Volumes/ExternalSSD/t3code-fork/tmp/robob-board/meds-skip/watchers/meds-nag/took.py",
+    os.path.join(HERE, "..", "..", "watchers", "meds-nag", "took.py"),
 )
-LIVE_CHECK = os.environ.get(
-    "CHECK_PY", os.path.expanduser("~/.local/share/robob-watch/watchers/meds-nag/check.py")
+CHECK = os.environ.get(
+    "CHECK_PY", os.path.join(HERE, "..", "..", "watchers", "meds-nag", "check.py")
 )
 DAY = "2026-10-29"
 
@@ -21,8 +22,8 @@ DAY = "2026-10-29"
 class TookSkipTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="meds-skip-")
-        shutil.copy(os.path.abspath(STAGED_TOOK), os.path.join(self.dir, "took.py"))
-        shutil.copy(LIVE_CHECK, os.path.join(self.dir, "check.py"))
+        shutil.copy(os.path.abspath(TOOK), os.path.join(self.dir, "took.py"))
+        shutil.copy(CHECK, os.path.join(self.dir, "check.py"))
         for name in ("taken.json", "moved.json"):
             with open(os.path.join(self.dir, name), "w") as f:
                 json.dump({}, f)

@@ -42,7 +42,7 @@ import {
   type ModelSelection,
   type ProviderOptionSelection,
   type ProjectId,
-  ThreadId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -173,7 +173,6 @@ export type BoardPatch = Partial<
     | "managerModel"
     | "evaluatorModel"
     | "defaultCardModel"
-    | "evaluatorSlots"
     | "reviewChains"
     | "defaultReviewChain"
     | "instructions"
@@ -453,20 +452,15 @@ export interface KanbanServiceShape {
   /** Runs dispatch for every board now. */
   readonly dispatchNow: Effect.Effect<void, KanbanError>;
   /** Handles a finished turn of a board thread now. */
-  /** A turn end; `runId` is the run that ended (tests may omit it). */
-  readonly turnEnded: (threadId: ThreadId, runId?: string) => Effect.Effect<void, KanbanError>;
+  readonly turnEnded: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Periodic upkeep: typing heartbeat, PR states, dispatch. */
   readonly tick: Effect.Effect<void, KanbanError>;
   /** Probes the models paused threads wait on and wakes them when one answers. */
   readonly probeOutages: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
-  readonly notifyTurnEnded: (threadId: ThreadId, runId: string) => Effect.Effect<void>;
+  readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
   /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
-  /** A run update also names its run, so an admission waiting for one can take it. */
-  readonly notifyThreadChanged: (
-    threadId: ThreadId,
-    runId: string | null,
-  ) => Effect.Effect<void, KanbanError>;
+  readonly notifyThreadChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Background worker: runs queued dispatch kicks and turn ends; never returns. */
   readonly worker: Effect.Effect<never>;
 }
@@ -475,9 +469,7 @@ export class KanbanService extends Context.Service<KanbanService, KanbanServiceS
   "t3/ardud/kanban/engine/KanbanService",
 ) {}
 
-type Job =
-  | { readonly _tag: "kick" }
-  | { readonly _tag: "turnEnd"; readonly threadId: ThreadId; readonly runId: string };
+type Job = { readonly _tag: "kick" } | { readonly _tag: "turnEnd"; readonly threadId: ThreadId };
 
 /** A slot a work thread keeps between cards (see `holds`). */
 interface Hold {
@@ -489,8 +481,6 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
-/** A launched evaluator can take a moment to show as running; until then it still holds its slot. */
-const ADMIT_GRACE_MS = 2 * 60_000;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
@@ -644,15 +634,6 @@ const make = Effect.gen(function* () {
    * or that outlived HOLD_MAX_MS.
    */
   const holds = yield* Ref.make<ReadonlyMap<ThreadId, Hold>>(new Map());
-  // Evaluator turns this board started or woke and that haven't ended, limit or not: the pool's busy
-  // count. `turn` is unique per admission, so a stale turn end can't release a newer admission.
-  // Keyed by the run id the send started; a turn not yet reported by its run stays `pending:`.
-  const admitted = yield* Ref.make<
-    ReadonlyMap<
-      ThreadId,
-      { readonly boardId: KanbanBoard["id"]; readonly at: number; readonly turn: string }
-    >
-  >(new Map());
   // Evaluators whose last run failed for a non-outage reason: retried once, then given up.
   // In memory on purpose: a restart starts the streaks over.
   const evaluatorFailures = yield* Ref.make<
@@ -797,24 +778,8 @@ const make = Effect.gen(function* () {
   ) {
     const pools = yield* store.pools(boardId);
     const joined = `${model.instanceId}/${model.model}`;
-    // An alias names the model without its instance; resolve it to the pool model it means,
-    // then pick the level among that model's pools (never the first row when a level is named).
-    const aliased = (): KanbanPool | undefined => {
-      const byName = pools.filter(
-        (pool) => pool.model.model === joined || pool.model.model === model.model,
-      );
-      const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
-      // A short name is unambiguous when its pools all belong to one model (one key per
-      // level is still one model); two different models or instances stay refused.
-      const suffixModels = new Set(bySuffix.map((pool) => Rules.modelKey(pool.model)));
-      const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
-      if (same.length === 0) return undefined;
-      const level = Rules.modelLevel(model);
-      if (level === null) return same[0];
-      // The requested level's pool when the model has one; else the first, as Rules.poolFor does.
-      return same.find((pool) => Rules.modelLevel(pool.model) === level) ?? same[0];
-    };
-    const match = Rules.poolFor(pools, model) ?? aliased();
+    // An alias names the model without its instance; Rules.aliasPool matches it to its pool.
+    const match = Rules.poolFor(pools, model) ?? Rules.aliasPool(pools, model);
     if (!match) {
       // A model the provider refuses is named as such, even when no pool exists for it.
       yield* checkModel(model);
@@ -953,11 +918,6 @@ const make = Effect.gen(function* () {
       groups: yield* store.groups(boardId),
       threads: states.flat(),
       unread,
-      evaluators: {
-        slots: board.evaluatorSlots,
-        busy: yield* admittedCount(boardId),
-        queued: new Set((yield* store.evaluatorQueue(boardId)).map((item) => item.threadId)).size,
-      },
     } satisfies KanbanBoardSnapshot;
   });
 
@@ -1571,209 +1531,20 @@ const make = Effect.gen(function* () {
     text: string,
     note = false,
   ) {
-    let queued = false;
-    if (actor._tag === "evaluator") {
-      const board = yield* boardOf(discussion.boardId);
-      queued = (yield* sendEvaluator(board, threadId, text)) === "queued";
-    } else {
-      yield* threads.send({ threadId, text });
-    }
-    // A queued send owes its reply, but nobody is typing until the turn starts.
+    yield* threads.send({ threadId, text });
     const next = withParticipant(
       discussion,
       actor,
       name,
       note
         ? {}
-        : {
-            lastReadSeq: discussion.lastSeq,
-            typingUntil: queued ? null : yield* typingUntil,
-            owes: "asked",
-          },
+        : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
     );
     yield* saveDiscussion(next);
     return next;
   });
 
-  /**
-   * Records an evaluator turn the board started. `runId` is the run the send started, so the
-   * admission is keyed to that run from the start and only its own end can release it. A send
-   * that steered a running run names no run; its admission stays pending until rekeyAdmission.
-   */
-  const admit = Effect.fn("KanbanService.admit")(function* (
-    threadId: ThreadId,
-    boardId: KanbanBoard["id"],
-    runId: string | null = null,
-  ) {
-    const at = yield* nowMillis;
-    // A placeholder no run id can equal until rekeyAdmission sets it.
-    const turn = runId ?? `pending:${at}:${NodeCrypto.randomUUID()}`;
-    yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { boardId, at, turn }));
-    yield* store.putAdmission({ threadId, boardId, turn, at });
-  });
-
-  /**
-   * Rebuilds admissions from the board's open evaluator links and their live threads, so a restart
-   * (a service over the same store, with no in-memory admissions) counts the turns still running.
-   * A running turn keeps its run id as the key; one the view can't name stays pending, like a fresh
-   * admission. Idempotent: a thread already admitted is left as it is.
-   */
-  const restoreAdmissions = Effect.fn("KanbanService.restoreAdmissions")(function* () {
-    for (const row of yield* store.admissions()) {
-      if (!(yield* Ref.get(admitted)).has(ThreadId.make(row.threadId))) {
-        yield* Ref.update(admitted, (all) =>
-          new Map(all).set(ThreadId.make(row.threadId), {
-            boardId: row.boardId,
-            at: row.at,
-            turn: row.turn,
-          }),
-        );
-      }
-    }
-    for (const board of yield* store.boards) {
-      if (board.archivedAt !== null) continue;
-      yield* reconcileAdmitted(board.id);
-    }
-  });
-
-  /** A running run reported its id: an admission still waiting for one takes that id. */
-  const rekeyAdmission = Effect.fn("KanbanService.rekeyAdmission")(function* (
-    threadId: ThreadId,
-    runId: string,
-  ) {
-    const entry = (yield* Ref.get(admitted)).get(threadId);
-    if (!entry || !entry.turn.startsWith("pending:")) return;
-    yield* Ref.update(admitted, (all) => new Map(all).set(threadId, { ...entry, turn: runId }));
-    yield* store.putAdmission({ threadId, boardId: entry.boardId, turn: runId, at: entry.at });
-  });
-
-  /**
-   * Releases a thread's admission when `turn` (the run that ended) is the one it
-   * was admitted in. A newer admission on the same thread is left alone, so a
-   * stale or repeated turn end can't free a slot a newer turn holds.
-   */
-  const releaseTurn = Effect.fn("KanbanService.releaseTurn")(function* (
-    threadId: ThreadId,
-    turn: string,
-  ) {
-    const entry = (yield* Ref.get(admitted)).get(threadId);
-    if (!entry || entry.turn !== turn) return;
-    yield* Ref.update(admitted, (all) => {
-      const next = new Map(all);
-      next.delete(threadId);
-      return next;
-    });
-    yield* store.dropAdmission(threadId, turn);
-  });
-
-  /**
-   * Drops admitted turns the board can no longer see as running: idle or gone, and
-   * past the launch grace. Runs before any slot decision, so a restart or a limit
-   * change starts from the live count instead of stale entries.
-   */
-  const reconcileAdmitted = Effect.fn("KanbanService.reconcileAdmitted")(function* (
-    boardId: KanbanBoard["id"],
-  ) {
-    const now = yield* nowMillis;
-    for (const [threadId, entry] of yield* Ref.get(admitted)) {
-      if (entry.boardId !== boardId || now - entry.at < ADMIT_GRACE_MS) continue;
-      const view = yield* threads.view(threadId);
-      if (!view || view.state === "idle") yield* releaseTurn(threadId, entry.turn);
-    }
-  });
-
-  const admittedCount = (boardId: string) =>
-    Effect.map(
-      Ref.get(admitted),
-      (all) => [...all.values()].filter((entry) => entry.boardId === boardId).length,
-    );
-
-  /** Whether the board's pool has no free slot. Reconciles first. */
-  const poolFull = Effect.fn("KanbanService.poolFull")(function* (board: KanbanBoard) {
-    if (board.evaluatorSlots === null) return false;
-    yield* reconcileAdmitted(board.id);
-    return (yield* admittedCount(board.id)) >= board.evaluatorSlots;
-  });
-
-  /**
-   * An evaluator send through the board's evaluator pool. A steer (a running
-   * turn) goes straight through, with no slot. Otherwise it takes a free slot,
-   * or waits in the queue for one. Every board-started turn is admitted, even
-   * with no limit, so a later limit counts it.
-   */
-  const sendEvaluator = Effect.fn("KanbanService.sendEvaluator")(function* (
-    board: KanbanBoard,
-    threadId: ThreadId,
-    text: string,
-    model?: ModelSelection,
-  ) {
-    const view = yield* threads.view(threadId);
-    if (view && view.state !== "idle") {
-      yield* threads.send({ threadId, ...(model ? { model } : {}), text });
-      return "sent" as const;
-    }
-    // A new request never overtakes the queue: it sends only when the pool has room and nothing is
-    // queued ahead of it. Otherwise it waits behind the queue, and the drain starts it when there's room.
-    if (!(yield* poolFull(board)) && (yield* store.evaluatorQueue(board.id)).length === 0) {
-      const sent = yield* threads.send({ threadId, ...(model ? { model } : {}), text });
-      yield* admit(threadId, board.id, sent.runId);
-      return "sent" as const;
-    }
-    yield* store.enqueueEvaluator(board.id, threadId, {
-      text,
-      model: model ?? null,
-      queuedAt: yield* nowIso,
-    });
-    yield* drainEvaluators(board.id);
-    return "queued" as const;
-  });
-
-  /**
-   * Starts queued evaluator sends while the pool has room, oldest first. A
-   * thread's queued texts go as one send. The rows are deleted only after the
-   * send is accepted, so an interruption leaves them queued. A failed send
-   * keeps its rows and ends this pass, so a dead thread can't spin the drain.
-   */
-  const drainEvaluators = Effect.fn("KanbanService.drainEvaluators")(function* (
-    boardId: KanbanBoard["id"],
-  ) {
-    const board = yield* boardOf(boardId);
-    for (;;) {
-      const queue = yield* store.evaluatorQueue(boardId);
-      const first = queue[0];
-      if (first === undefined) return;
-      if (yield* poolFull(board)) return;
-      const threadId = ThreadId.make(first.threadId);
-      const mine = queue.filter((item) => item.threadId === threadId);
-      const text = mine.map((item) => item.entry.text).join("\n\n");
-      const model = mine.at(-1)?.entry.model ?? undefined;
-      // A refused or archived thread is logged and its rows dropped, so it can't hold back the
-      // healthy requests queued behind it. The rows stay until the send has been attempted.
-      const sent = yield* threads.send({ threadId, text, ...(model ? { model } : {}) }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban evaluator queue send failed", {
-            boardId,
-            threadId,
-            cause,
-          }).pipe(Effect.as(null)),
-        ),
-      );
-      if (sent) yield* admit(threadId, boardId, sent.runId);
-      yield* store.dropEvaluatorQueue(threadId);
-    }
-  });
-
   const startEvaluatorUnlocked = Effect.fn("KanbanService.startEvaluatorUnlocked")(function* (
-    board: KanbanBoard,
-    purpose: Briefs.EvaluatorPurpose,
-    extra: { readonly text?: string | undefined; readonly cardId?: KanbanCard["id"] | null } = {},
-  ) {
-    const started = yield* startEvaluatorThread(board, purpose, extra);
-    return started.threadId;
-  });
-
-  /** Starts an evaluator; `queued` says its brief waits for a pool slot (the thread is idle). */
-  const startEvaluatorThread = Effect.fn("KanbanService.startEvaluatorThread")(function* (
     board: KanbanBoard,
     purpose: Briefs.EvaluatorPurpose,
     extra: { readonly text?: string | undefined; readonly cardId?: KanbanCard["id"] | null } = {},
@@ -1804,27 +1575,13 @@ const make = Effect.gen(function* () {
     }
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
-    const fullText = extra.text ? `${brief}\n\n${extra.text}` : brief;
-    // A full pool launches the thread idle and queues its brief; drain sends it when a slot frees.
-    const queued = (yield* poolFull(board)) || (yield* store.evaluatorQueue(board.id)).length > 0;
-    const launched = yield* threads.launch({
+    const threadId = yield* threads.launch({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${at}`,
       projectId: board.defaultProjectId,
       title,
       model: board.evaluatorModel,
-      ...(queued ? {} : { text: fullText }),
+      text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
-    const threadId = launched.threadId;
-    if (queued) {
-      yield* store.enqueueEvaluator(board.id, threadId, {
-        text: fullText,
-        model: board.evaluatorModel,
-        queuedAt: at,
-      });
-      yield* drainEvaluators(board.id);
-    } else {
-      yield* admit(threadId, board.id, launched.runId);
-    }
     yield* linkThread(
       {
         threadId,
@@ -1867,7 +1624,7 @@ const make = Effect.gen(function* () {
       yield* store.putBoard(running);
       yield* publish(board.id, { _tag: "board", board: running });
     }
-    return { threadId, queued };
+    return threadId;
   });
 
   /**
@@ -1920,9 +1677,6 @@ const make = Effect.gen(function* () {
       if (link.role !== "evaluator" || link.purpose !== kind || link.discussionId !== null) continue;
       const view = yield* threads.view(link.threadId);
       if (view && view.state !== "idle") return link.threadId;
-      // A thread still waiting in the evaluator pool counts as running, so no second sweep starts.
-      const queued = yield* store.evaluatorQueue(boardId);
-      if (queued.some((item) => item.threadId === link.threadId)) return link.threadId;
     }
     return null;
   });
@@ -1984,7 +1738,7 @@ const make = Effect.gen(function* () {
     // One evaluator per card discussion: the evaluators that asked on the card
     // hear it is handed over, and stop typing there.
     const priors = card ? yield* liveEvaluatorAskers(card) : [];
-    const { threadId, queued } = yield* startEvaluatorThread(
+    const threadId = yield* startEvaluatorUnlocked(
       board,
       {
         kind: "discussion",
@@ -1997,23 +1751,18 @@ const make = Effect.gen(function* () {
         cardId: discussion.cardId,
       },
     );
-    // A queued start is idle until its slot frees, so nobody shows as typing.
     let next = withParticipant(
       { ...discussion, evaluatorThreadId: threadId },
       actorOf(threadId),
       "Evaluator",
       note
         ? { lastReadSeq: discussion.lastSeq }
-        : {
-            lastReadSeq: discussion.lastSeq,
-            typingUntil: queued ? null : yield* typingUntil,
-            owes: "asked",
-          },
+        : { lastReadSeq: discussion.lastSeq, typingUntil: yield* typingUntil, owes: "asked" },
     );
     if (card) {
       for (const priorId of priors) {
         const handoff = Briefs.cardHandoffText(card.number, discussion.id, threadId);
-        yield* sendEvaluator(board, priorId, handoff).pipe(Effect.ignore);
+        yield* threads.send({ threadId: priorId, text: handoff }).pipe(Effect.ignore);
         const prior = actorOf(priorId);
         if (next.participants.some((p) => actorKey(p.actor) === actorKey(prior))) {
           next = withParticipant(next, prior, "Evaluator", { typingUntil: null, owes: null });
@@ -2103,7 +1852,7 @@ const make = Effect.gen(function* () {
         for (const link of open.toReversed()) {
           if (link.role !== "evaluator" || link.purpose !== "packets") continue;
           if (!(yield* liveEvaluator(link.threadId))) continue;
-          yield* sendEvaluator(yield* boardOf(after.boardId), link.threadId, text);
+          yield* threads.send({ threadId: link.threadId, text });
           return;
         }
         yield* startEvaluatorUnlocked(yield* boardOf(after.boardId), { kind: "packets" }, { text });
@@ -2417,20 +2166,13 @@ const make = Effect.gen(function* () {
     );
     if (!participant) return;
     if (participant.owes === "asked") {
-      const nudge = Briefs.nudgeDiscussionText(discussion.id);
-      const link = yield* store.threadLink(threadId);
-      const send =
-        link?.role === "evaluator"
-          ? boardOf(discussion.boardId).pipe(
-              Effect.flatMap((board) => sendEvaluator(board, threadId, nudge)),
-            )
-          : threads.send({ threadId, text: nudge }).pipe(Effect.as("sent" as const));
-      const outcome = yield* send.pipe(Effect.catch(() => Effect.succeed("failed" as const)));
-      // A queued nudge isn't being typed yet: it waits behind the queue, and stays owed.
+      yield* threads
+        .send({ threadId, text: Briefs.nudgeDiscussionText(discussion.id) })
+        .pipe(Effect.ignore);
       yield* saveDiscussion(
         withParticipant(discussion, participant.actor, participant.name, {
           owes: "nudged",
-          typingUntil: outcome === "queued" ? null : yield* typingUntil,
+          typingUntil: yield* typingUntil,
         }),
       );
       return;
@@ -2545,13 +2287,13 @@ const make = Effect.gen(function* () {
         dispatch.role === "work"
           ? `#${card.number} ${card.title}`
           : `#${card.number} review: ${card.title}`;
-      threadId = (yield* threads.launch({
+      threadId = yield* threads.launch({
         key: `${card.id}:${dispatch.role}:${at}`,
         projectId,
         title,
         model: dispatch.model,
         text,
-      })).threadId;
+      });
       yield* linkThread(
         {
           threadId,
@@ -2800,15 +2542,12 @@ const make = Effect.gen(function* () {
         yield* store.putThreadLink({ ...link, paused: null });
         continue;
       }
-      const wake = Briefs.providerBackText(link.paused.message);
-      const sent = yield* (
-        link.role === "evaluator"
-          ? boardOf(link.boardId).pipe(
-              Effect.flatMap((board) => sendEvaluator(board, link.threadId, wake)),
-              Effect.as(true),
-            )
-          : threads.send({ threadId: link.threadId, text: wake }).pipe(Effect.as(true))
-      ).pipe(Effect.catchCause(() => Effect.succeed(false)));
+      const sent = yield* threads
+        .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
+        .pipe(
+          Effect.as(true),
+          Effect.catchCause(() => Effect.succeed(false)),
+        );
       if (!sent) {
         failed = true;
         continue;
@@ -2942,19 +2681,9 @@ const make = Effect.gen(function* () {
 
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
-    runId: string,
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
-    // The run that just ended is released before anything else can admit a turn here (the nudge
-    // below is a new turn with its own admission). A stale end names an older run, so it matches
-    // nothing and can't free a newer run's slot. An end that names no run releases the pending
-    // admission the turn started with; a nudge admitted during this end is not released.
-    const startedPending = (yield* Ref.get(admitted)).get(threadId)?.turn;
-    yield* releaseTurn(threadId, runId);
-    if (runId === "" && startedPending !== undefined && startedPending.startsWith("pending:")) {
-      yield* releaseTurn(threadId, startedPending);
-    }
     const at = yield* nowIso;
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
@@ -3039,76 +2768,71 @@ const make = Effect.gen(function* () {
     }
 
     if (link.role === "evaluator") {
-      // Whatever the run left behind, its slot is free by now: queued evaluator sends go next.
-      const evaluatorEnd = Effect.gen(function* () {
-        const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
-        // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
-        if (failure === null) {
-          // lastFailure is also null while the latest run is still going or waiting on
-          // input/approval, and a delayed terminal event for an older run must not clear
-          // a live retry's streak. Only a thread that is idle has finished its run. A gone
-          // thread (null view) counts as finished, so its one-shot link still ends.
-          const state = (yield* threads.view(threadId))?.state;
-          if (state !== undefined && state !== "idle") return;
-          yield* Ref.update(evaluatorFailures, (all) => {
-            const next = new Map(all);
-            next.delete(threadId);
+      const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
+      // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
+      if (failure === null) {
+        // lastFailure is also null while the latest run is still going or waiting on
+        // input/approval, and a delayed terminal event for an older run must not clear
+        // a live retry's streak. Only a thread that is idle has finished its run. A gone
+        // thread (null view) counts as finished, so its one-shot link still ends.
+        const state = (yield* threads.view(threadId))?.state;
+        if (state !== undefined && state !== "idle") return;
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        for (const discussion of yield* store.discussions(link.boardId)) {
+          if (discussion.evaluatorThreadId !== threadId) continue;
+          yield* Ref.update(replaced, (all) => {
+            const next = new Set(all);
+            next.delete(discussion.id);
             return next;
           });
-          for (const discussion of yield* store.discussions(link.boardId)) {
-            if (discussion.evaluatorThreadId !== threadId) continue;
-            yield* Ref.update(replaced, (all) => {
-              const next = new Set(all);
-              next.delete(discussion.id);
-              return next;
-            });
-          }
         }
-        // A paused evaluator stays open so it can be woken, and a retry keeps the link
-        // open so the run after it can end it. `link` is stale once its pause was set
-        // or cleared above, so the current row is ended.
-        const endLink = Effect.gen(function* () {
-          if (link.discussionId !== null || link.endedAt !== null) return;
-          const current = (yield* store.threadLink(threadId)) ?? link;
-          yield* store.putThreadLink({ ...current, endedAt: at });
-        });
-        if (failure === null) {
-          yield* endLink;
-          return;
-        }
-        if (outage !== null) {
-          // An outage pauses the thread for probeOutages; a retry scheduled before it must not fire.
-          // Parked, not deleted: the streak survives until a clean run, and the next
-          // non-outage failure after the probe still hands off instead of retrying.
-          if (entry !== undefined && entry.state === "retry") {
-            yield* Ref.update(evaluatorFailures, (all) =>
-              new Map(all).set(threadId, { ...entry, state: "paused" }),
-            );
-          }
-          return;
-        }
-        if (entry?.state === "gone") {
-          yield* endLink;
-          return;
-        }
-        // The same executed run can be reported twice (a repeated turn-end or a metadata update).
-        if (entry !== undefined && failure.runId != null && entry.runId === failure.runId) return;
-        if (entry !== undefined || Rules.isContextFull(failure)) {
-          yield* evaluatorGiveUp(link, failure.message);
-          return;
-        }
-        const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
-        yield* Ref.update(evaluatorFailures, (all) =>
-          new Map(all).set(threadId, {
-            dueAt,
-            message: failure.message,
-            state: "retry",
-            runId: failure.runId ?? null,
-          }),
-        );
+      }
+      // A paused evaluator stays open so it can be woken, and a retry keeps the link
+      // open so the run after it can end it. `link` is stale once its pause was set
+      // or cleared above, so the current row is ended.
+      const endLink = Effect.gen(function* () {
+        if (link.discussionId !== null || link.endedAt !== null) return;
+        const current = (yield* store.threadLink(threadId)) ?? link;
+        yield* store.putThreadLink({ ...current, endedAt: at });
       });
-      yield* evaluatorEnd;
-      yield* drainEvaluators(link.boardId);
+      if (failure === null) {
+        yield* endLink;
+        return;
+      }
+      if (outage !== null) {
+        // An outage pauses the thread for probeOutages; a retry scheduled before it must not fire.
+        // Parked, not deleted: the streak survives until a clean run, and the next
+        // non-outage failure after the probe still hands off instead of retrying.
+        if (entry !== undefined && entry.state === "retry") {
+          yield* Ref.update(evaluatorFailures, (all) =>
+            new Map(all).set(threadId, { ...entry, state: "paused" }),
+          );
+        }
+        return;
+      }
+      if (entry?.state === "gone") {
+        yield* endLink;
+        return;
+      }
+      // The same executed run can be reported twice (a repeated turn-end or a metadata update).
+      if (entry !== undefined && failure.runId != null && entry.runId === failure.runId) return;
+      if (entry !== undefined || Rules.isContextFull(failure)) {
+        yield* evaluatorGiveUp(link, failure.message);
+        return;
+      }
+      const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
+      yield* Ref.update(evaluatorFailures, (all) =>
+        new Map(all).set(threadId, {
+          dueAt,
+          message: failure.message,
+          state: "retry",
+          runId: failure.runId ?? null,
+        }),
+      );
       return;
     }
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
@@ -3268,37 +2992,21 @@ const make = Effect.gen(function* () {
         yield* setState("sent");
         continue;
       }
-      // The retry is a new evaluator turn, so it takes a pool slot or waits behind the queue.
-      const retryLink = yield* store.threadLink(threadId);
-      const retryText = Briefs.evaluatorRetryText(entry.message);
-      const retry =
-        retryLink === null
-          ? Effect.asVoid(threads.send({ threadId, text: retryText }))
-          : Effect.asVoid(
-              Effect.flatMap(boardOf(retryLink.boardId), (board) =>
-                sendEvaluator(board, threadId, retryText),
-              ),
-            );
-      const sent = yield* retry.pipe(
-        Effect.as(true),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban evaluator retry failed", { threadId, cause }).pipe(
-            Effect.as(false),
+      const sent = yield* threads
+        .send({ threadId, text: Briefs.evaluatorRetryText(entry.message) })
+        .pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban evaluator retry failed", { threadId, cause }).pipe(
+              Effect.as(false),
+            ),
           ),
-        ),
-      );
+        );
       yield* setState("sent");
       if (!sent) {
         const link = yield* store.threadLink(threadId);
         if (link) yield* evaluatorGiveUp(link, entry.message);
       }
-    }
-    // A turn end the board missed (a restart, a turn the provider ended oddly) must not hold a slot.
-    // Launches are given two minutes to show as running before they count as idle.
-    for (const board of yield* store.boards) {
-      if (board.archivedAt !== null) continue;
-      yield* reconcileAdmitted(board.id);
-      yield* drainEvaluators(board.id);
     }
     const missed = new Set<ThreadId>();
     const before = yield* Ref.get(missing);
@@ -3443,7 +3151,7 @@ const make = Effect.gen(function* () {
         const sent = yield* threads
           .send({
             threadId: link.threadId,
-            text: `Board check: this turn has been running for ${minutes} minutes. Post a one-line status where Abdullah reads it (your discussion, with discussion_post): what you're doing and when you expect to finish. Then carry on; don't stop for this.`,
+            text: `Board check: this turn has been running for ${minutes} minutes. If your last ETA in the discussion still holds, carry on without posting. Otherwise post one line there with discussion_post: what's done and the new ETA. After a second missed ETA, stop researching: file what's left as cards with what you know, post the summary, and end the turn.`,
           })
           .pipe(
             Effect.as(true),
@@ -3869,7 +3577,6 @@ const make = Effect.gen(function* () {
       managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
       evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
       defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
-      evaluatorSlots: null,
       reviewChains: [],
       defaultReviewChain: null,
       instructions: Defaults.DEFAULT_INSTRUCTIONS,
@@ -3914,35 +3621,12 @@ const make = Effect.gen(function* () {
             if (!unchanged) yield* checkModel(step);
           }
         }
-        if (
-          patch.evaluatorSlots !== undefined &&
-          patch.evaluatorSlots !== null &&
-          !Number.isInteger(patch.evaluatorSlots)
-        ) {
-          return yield* failWith("invalid", "the evaluator pool takes a whole number of slots");
-        }
-        if (patch.evaluatorSlots === 0) {
-          return yield* failWith(
-            "invalid",
-            "the evaluator pool needs at least 1 slot; use no limit instead",
-          );
-        }
-        if (
-          patch.evaluatorSlots !== undefined &&
-          patch.evaluatorSlots !== null &&
-          patch.evaluatorSlots > 50
-        ) {
-          return yield* failWith("invalid", "the evaluator pool takes at most 50 slots");
-        }
         const pools = missingPools(yield* store.pools(board.id), boardModels(next));
         yield* store.putBoardWithPools(next, pools);
         if (pools.length > 0) {
           yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
         }
         yield* publish(board.id, { _tag: "board", board: next });
-        if (patch.evaluatorSlots !== undefined && patch.evaluatorSlots !== board.evaluatorSlots) {
-          yield* drainEvaluators(board.id);
-        }
         yield* kick;
         return next;
       }),
@@ -5655,18 +5339,13 @@ const make = Effect.gen(function* () {
 
   const runJob = (job: Job) =>
     lock
-      .withPermits(1)(
-        job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId, job.runId),
-      )
+      .withPermits(1)(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId))
       .pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("kanban job failed", { job: job._tag, cause }),
         ),
       );
 
-  // Admissions are counted from the store before the service is handed out, so nothing can admit or
-  // drain against an empty pool after a restart.
-  yield* restoreAdmissions();
   return KanbanService.of({
     boards: readDb(store.boards),
     ensureBoard,
@@ -5774,20 +5453,18 @@ const make = Effect.gen(function* () {
     createForThread,
     nextCards,
     dispatchNow: guard(dispatchUnlocked()),
-    turnEnded: (threadId, runId) => guard(turnEndedUnlocked(threadId, runId ?? "")),
+    turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
     tick: guard(tickUnlocked()),
     probeOutages: read(probeOutagesNow()),
-    notifyTurnEnded: (threadId, runId) =>
-      Queue.offer(jobs, { _tag: "turnEnd", threadId, runId }).pipe(Effect.asVoid),
-    notifyThreadChanged: (threadId, runId) =>
+    notifyTurnEnded: (threadId) =>
+      Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
+    notifyThreadChanged: (threadId) =>
       read(
         Effect.gen(function* () {
           const link = yield* store.threadLink(threadId);
           if (!link) return;
           const view = yield* threads.view(threadId);
           if (!view) return;
-          // A running run names itself: an admission made before its id was known takes it.
-          if (runId !== null && view.state !== "idle") yield* rekeyAdmission(threadId, runId);
           yield* publish(link.boardId, {
             _tag: "thread",
             thread: {

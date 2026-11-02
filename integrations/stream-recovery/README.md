@@ -57,9 +57,13 @@ also looks for those:
 - Not a restart: a user Stop (its turn has a `run_interrupt_request` item), a
   burst inside one thread tree, delegated `task_cancel` (app-owned rows), and
   sessions the stall watch interrupted itself.
-- Waits 3 min after the last cancel, and while `install-robob-resume.zsh` still
-  has `restart-snapshots/pending.json` (up to 30 min), so threads that resume on
-  their own go first.
+- Fast (owner, 1 Nov): scans run every 15s and act 20s after the last cancel
+  (`RESTART_SETTLE_MS`), so a cut thread gets its note within about 35s of
+  Robob being back. Threads Robob already continued are busy and skipped. The
+  installer's `pending.json` no longer holds notes back. The incident stays
+  open until the restart window has closed, so a run cut late still joins it.
+  The stall watch inside the same scan keeps a once-a-minute pace
+  (`lastStallScan`).
 - Per lost subagent: re-dispatched (same session resumed, or same title with a
   `(resume)`-style suffix), still running, finished (result never delivered,
   or delivered: in Robob or in the parent's OpenCode history after a later
@@ -147,7 +151,7 @@ cp integrations/stream-recovery/scripts/com.ardud.stream-recovery.plist ~/Librar
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.stream-recovery.plist
 ```
 
-Runs every 60s, log `~/Library/Logs/stream-recovery.log`. Disable with
+Runs every 15s (stall watch once a minute), log `~/Library/Logs/stream-recovery.log`. Disable with
 `launchctl bootout gui/$(id -u)/com.ardud.stream-recovery`.
 
 Tests: `node --test test/*.test.mjs`.

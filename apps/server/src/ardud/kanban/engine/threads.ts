@@ -51,8 +51,6 @@ export interface KanbanThreadView {
   readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
-  /** The run the thread is in, when one is active (for an admission that has no run id yet). */
-  readonly activeRunId: string | null;
   /** Its own subagents and background tasks still running after its turn ended. Pull-request watches don't count: they never end. */
   readonly backgroundWork: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
@@ -65,13 +63,7 @@ export interface KanbanLaunchInput {
   readonly projectId: ProjectId;
   readonly title: string;
   readonly model: ModelSelection;
-  /** Omitted: the thread is created idle, with no first message. */
-  readonly text?: string | undefined;
-}
-
-export interface KanbanSendResult {
-  /** The run this send started, or null when it steered a run already running. */
-  readonly runId: string | null;
+  readonly text: string;
 }
 
 export interface KanbanSendInput {
@@ -96,18 +88,8 @@ export interface KanbanThreadsShape {
   readonly lastFailure: (
     threadId: ThreadId,
   ) => Effect.Effect<(OrchestrationV2ProviderFailure & { readonly runId?: string | null }) | null>;
-  /** The thread, and the run its initial message started (null when it started no run). */
-  readonly launch: (
-    input: KanbanLaunchInput,
-  ) => Effect.Effect<
-    { readonly threadId: ThreadId; readonly runId: string | null },
-    KanbanThreadError
-  >;
-  /**
-   * Sends a message. The result names the run it started, when it started one (a steer into a running
-   * run names none), so the board can key that run's admission to its id from the start.
-   */
-  readonly send: (input: KanbanSendInput) => Effect.Effect<KanbanSendResult, KanbanThreadError>;
+  readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
+  readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
   readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
   readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
@@ -171,7 +153,6 @@ const make = Effect.gen(function* () {
               runStartedAt: shell.activityRunStartedAt
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
-              activeRunId: shell.activeRunId ?? null,
               backgroundWork: backgroundWorkOf(shell),
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
@@ -222,9 +203,8 @@ const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
-  const launch: KanbanThreadsShape["launch"] = (input) => {
-    const messageId = MessageId.make(`kanban:launch:${input.key}`);
-    return launcher
+  const launch: KanbanThreadsShape["launch"] = (input) =>
+    launcher
       .launch({
         commandId: CommandId.make(`kanban:launch:${input.key}`),
         projectId: input.projectId,
@@ -233,27 +213,16 @@ const make = Effect.gen(function* () {
         runtimeMode: DEFAULT_RUNTIME_MODE,
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         workspaceStrategy: { type: "root" },
-        ...(input.text === undefined
-          ? {}
-          : { initialMessage: { messageId, text: input.text, attachments: [] } }),
+        initialMessage: { text: input.text, attachments: [] },
         createdBy: "system",
         creationSource: "server",
       })
       .pipe(
-        Effect.map((launched) => ({
-          threadId: launched.threadId,
-          // The run the initial message started: the one run in the projection that carries it.
-          runId:
-            input.text === undefined
-              ? null
-              : (launched.projection.runs.find((run) => run.userMessageId === messageId)?.id ??
-                null),
-        })),
+        Effect.map((launched) => launched.threadId),
         Effect.mapError(
           (error) => new KanbanThreadError({ operation: "launch", detail: detailOf(error) }),
         ),
       );
-  };
 
   const send: KanbanThreadsShape["send"] = Effect.fn("KanbanThreads.send")(
     function* (input) {
@@ -262,7 +231,7 @@ const make = Effect.gen(function* () {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
       const id = NodeCrypto.randomUUID();
-      const result = yield* threads.sendToThread({
+      yield* threads.sendToThread({
         projectId: shell.projectId,
         commandId: CommandId.make(`kanban:send:${id}`),
         messageId: MessageId.make(`kanban:${id}`),
@@ -274,8 +243,6 @@ const make = Effect.gen(function* () {
         createdBy: "system",
         creationSource: "server",
       });
-      // A send that starts a run names it; a steer into the running run starts none.
-      return { runId: result.delivery === "steered" ? null : result.run.id };
     },
     Effect.mapError((error) =>
       isKanbanThreadError(error)

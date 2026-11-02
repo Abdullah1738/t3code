@@ -267,6 +267,8 @@ def status(me: dict) -> None:
     s = capacity.snapshot(con)
     print('starts: ' + ', '.join(f"{w['used']}/{w['cap']} in {w['window']}s" for w in s['counts']) +
           (f"; next local allowance {iso(s['retry_at'])}" if s['blocked'] else '; allowance available'))
+    for size, e in sorted(capacity.supply_status().items()):
+        print(f"boat supply: {size} out until {iso(e['until'])} (since {iso(e['since'])})")
     try:
         with api.budget(STATUS_CALL_S):
             boxes = api.list_boxes()

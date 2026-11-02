@@ -4,6 +4,8 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   type ChatAttachment,
+  ContextHandoffId,
+  ContextTransferId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -64,6 +66,7 @@ import {
   CODEX_MODEL_SELECTION,
   CURSOR_MODEL_SELECTION,
   GROK_MODEL_SELECTION,
+  OPENCODE2_MODEL_SELECTION,
 } from "./fixtures/shared.ts";
 import * as ProviderReplayHarness from "./ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -80,6 +83,7 @@ const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 const GROK_DRIVER = ProviderDriverKind.make("acp");
+const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
 
 interface CapturedTurn {
   readonly driver: ProviderDriverKind;
@@ -120,6 +124,8 @@ function makeTestAdapter(input: {
   readonly failedRunOrdinals?: ReadonlySet<number>;
   readonly interruptedRunOrdinals?: ReadonlySet<number>;
   readonly holdRunOrdinal?: number;
+  readonly pendingBackgroundWork?: Ref.Ref<boolean>;
+  readonly subagentOnlyBackgroundWork?: boolean;
   readonly holdFirstTurn?: Deferred.Deferred<void>;
   readonly releaseFirstTurn?: Deferred.Deferred<void>;
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
@@ -151,6 +157,14 @@ function makeTestAdapter(input: {
           providerSessionId: sessionInput.providerSessionId,
           providerSession,
           events: Stream.fromPubSub(events),
+          ...(input.pendingBackgroundWork === undefined
+            ? {}
+            : {
+                hasPendingBackgroundWorkForThread: (_thread, options) =>
+                  input.subagentOnlyBackgroundWork && options?.includeSubagents !== true
+                    ? Effect.succeed(false)
+                    : Ref.get(input.pendingBackgroundWork!),
+              }),
           ...(input.getModelContextWindow === undefined
             ? {}
             : { getModelContextWindow: input.getModelContextWindow }),
@@ -414,6 +428,13 @@ describe("orchestration v2 provider switching", () => {
     "screenshot-model-change-retry-native",
     "screenshot-option-change-retry-native",
     "prior-images-reasoning-change-replacement-native",
+    "screenshot-exhausted-target-native",
+    "screenshot-exhausted-target-fallback",
+    "screenshot-exhausted-target-estimate-native",
+    "screenshot-exhausted-target-oversized-native",
+    "screenshot-exhausted-target-tight-native",
+    "screenshot-exhausted-target-background-native",
+    "screenshot-exhausted-target-subagent-native",
     "prior-images-reasoning-change-replacement-small-native",
     "prior-images-reasoning-change-native",
     "prior-images-turn-usage-native",
@@ -443,11 +464,16 @@ describe("orchestration v2 provider switching", () => {
         const failStartOnce = yield* Ref.make(false);
         const failResumeOnce = yield* Ref.make(false);
         const generation = yield* Ref.make(0);
+        const pendingBackgroundWork = yield* Ref.make(false);
         const priorImages = scenario.includes("prior-images");
+        const exhaustedTarget = scenario.includes("exhausted-target");
         const replaceNative = scenario.includes("replacement");
         const capacityScenario = modelScenario || scenario.includes("reported-capacity");
         const returning =
-          scenario === "large-current-input" || scenario.includes("-change-") || priorImages;
+          scenario === "large-current-input" ||
+          scenario.includes("-change-") ||
+          priorImages ||
+          exhaustedTarget;
         const targetSelection: ModelSelection = !modelScenario
           ? CLAUDE_MODEL_SELECTION
           : {
@@ -472,10 +498,19 @@ describe("orchestration v2 provider switching", () => {
             driver: CLAUDE_DRIVER,
             capabilities: ClaudeProviderCapabilitiesV2,
             modelSelection: CLAUDE_MODEL_SELECTION,
-            responseByRunOrdinal: {},
+            responseByRunOrdinal: scenario.includes("target-estimate")
+              ? { 2: "x".repeat(10_000) }
+              : {},
             capturedTurns,
             ...(scenario.includes("retry") || scenario.includes("unsent") ? { failStartOnce } : {}),
             ...(replaceNative ? { failResumeOnce, nativeThreadGeneration: generation } : {}),
+            ...(exhaustedTarget ? { nativeThreadGeneration: generation } : {}),
+            ...(scenario.includes("target-background") || scenario.includes("target-subagent")
+              ? {
+                  pendingBackgroundWork,
+                  subagentOnlyBackgroundWork: scenario.includes("target-subagent"),
+                }
+              : {}),
             ...(scenario.includes("reported-capacity")
               ? { initialContextUsage: { usedTokens: 999_999, maxTokens: 1_000_000 } }
               : {}),
@@ -503,8 +538,11 @@ describe("orchestration v2 provider switching", () => {
                         ? 1_000_000
                         : 32_000,
                   }
-                : scenario === "large-current-input" || priorImages
-                  ? { getModelContextWindow: () => 32_000 }
+                : scenario === "large-current-input" || priorImages || exhaustedTarget
+                  ? {
+                      getModelContextWindow: () =>
+                        scenario.includes("target-tight") ? 25_121 : 32_000,
+                    }
                   : {}),
             ...(scenario.endsWith("-native") || scenario === "large-current-input"
               ? { injectedHistory }
@@ -551,7 +589,9 @@ describe("orchestration v2 provider switching", () => {
                     }))
                   : turnUsageScenario && ordinal >= targetOrdinal
                     ? [screenshot, { ...screenshot, id: "current-2" }]
-                    : scenario.startsWith("screenshot") && ordinal >= targetOrdinal
+                    : scenario.startsWith("screenshot") &&
+                        ordinal >= targetOrdinal &&
+                        (!exhaustedTarget || ordinal === targetOrdinal)
                       ? screenshots
                       : priorImages && ordinal === (scenario.startsWith("imported") ? 1 : 2)
                         ? [screenshot]
@@ -607,19 +647,49 @@ describe("orchestration v2 provider switching", () => {
           yield* Effect.addFinalizer(() => Effect.sync(() => spy?.mockRestore()));
           const current = scenario.startsWith("compact")
             ? "/compact"
-            : capacityScenario && !turnUsageScenario
-              ? "x".repeat(70_000)
-              : scenario === "large-current-input"
-                ? "x".repeat(9_000)
-                : "Continue work";
+            : scenario.includes("target-oversized")
+              ? "x".repeat(40_000)
+              : capacityScenario && !turnUsageScenario
+                ? "x".repeat(70_000)
+                : scenario === "large-current-input"
+                  ? "x".repeat(9_000)
+                  : "Continue work";
           if (returning) {
             if (scenario.includes("unsent")) yield* Ref.set(failStartOnce, true);
             yield* dispatch(
               2,
-              turnUsageScenario ? "x".repeat(27_460) : "Establish target",
+              turnUsageScenario
+                ? "x".repeat(27_460)
+                : scenario.includes("target-estimate")
+                  ? "x".repeat(12_000)
+                  : "Establish target",
               CLAUDE_MODEL_SELECTION,
             );
             yield* wait(2);
+            if (exhaustedTarget) {
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+                "completed",
+              );
+            }
+            if (exhaustedTarget && !scenario.includes("target-estimate")) {
+              const target = (yield* orchestrator.getThreadProjection(
+                threadId,
+              )).providerThreads.find(
+                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+              )!;
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: EventId.make("exhausted-target-usage"),
+                    type: "provider-thread.updated",
+                    threadId,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...target, contextUsage: { usedTokens: 30_000, maxTokens: 32_000 } },
+                  },
+                ],
+              });
+            }
             if (modelScenario && !turnUsageScenario) {
               const target = (yield* orchestrator.getThreadProjection(
                 threadId,
@@ -700,6 +770,8 @@ describe("orchestration v2 provider switching", () => {
             yield* Ref.set(failResumeOnce, true);
           }
           if (scenario.includes("retry")) yield* Ref.set(failStartOnce, true);
+          if (scenario.includes("target-background") || scenario.includes("target-subagent"))
+            yield* Ref.set(pendingBackgroundWork, true);
           yield* dispatch(targetOrdinal, current, targetSelection);
           yield* wait(targetOrdinal);
           if (scenario.includes("retry")) {
@@ -785,7 +857,73 @@ describe("orchestration v2 provider switching", () => {
             yield* wait(targetOrdinal + 3);
           }
           const projection = yield* orchestrator.getThreadProjection(threadId);
+          if (
+            scenario.includes("target-oversized") ||
+            scenario.includes("target-tight") ||
+            scenario.includes("target-background") ||
+            scenario.includes("target-subagent")
+          ) {
+            assert.equal(projection.runs.at(-1)?.status, "failed");
+            assert.equal(yield* Ref.get(generation), 1);
+            assert.equal(projection.messages.at(-1)!.text, current);
+            assert.deepEqual(projection.messages.at(-1)!.attachments, screenshots);
+            if (scenario.includes("target-background") || scenario.includes("target-subagent")) {
+              assert.isTrue(yield* Ref.get(pendingBackgroundWork));
+              const failure = projection.turnItems.findLast((item) => item.type === "error");
+              assert.equal(
+                failure?.type === "error" ? failure.failure.message : null,
+                "The target provider still has background work running. Wait for it to finish or stop it before retrying the handoff.",
+              );
+            }
+            return;
+          }
           assert.equal(projection.runs.at(-1)?.status, "completed");
+          if (exhaustedTarget) {
+            assert.equal(yield* Ref.get(generation), 2);
+            const turns = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.driver === CLAUDE_DRIVER,
+            );
+            assert.notEqual(turns[0]!.nativeThreadId, turns[1]!.nativeThreadId);
+            const latestRun = projection.runs.at(-1)!;
+            assert.equal(
+              projection.attempts.find((attempt) => attempt.id === latestRun.activeAttemptId)!
+                .nativeThreadId,
+              turns[1]!.nativeThreadId,
+            );
+            const context = scenario.endsWith("-native")
+              ? yield* encodeJson(yield* Ref.get(injectedHistory))
+              : turns[1]!.text;
+            assert.include(context, "Original request with constraints");
+            assert.include(context, "Original partial work");
+            assert.include(context, "New source constraint");
+            assert.include(turns[1]!.text, current);
+            assert.deepEqual(turns[1]!.attachments, screenshots);
+            const historyBeforeFollowup = yield* Ref.get(injectedHistory);
+            yield* dispatch(5, "Continue after automatic recovery", CLAUDE_MODEL_SELECTION);
+            yield* wait(5);
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+              "completed",
+            );
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.equal(
+              (yield* Ref.get(capturedTurns)).at(-1)!.text,
+              "Continue after automatic recovery",
+            );
+            assert.deepEqual(yield* Ref.get(injectedHistory), historyBeforeFollowup);
+            if (scenario.includes("target-estimate")) {
+              yield* dispatch(6, "Another source turn", CODEX_MODEL_SELECTION);
+              yield* wait(6);
+              yield* dispatch(7, "Return after recovery", CLAUDE_MODEL_SELECTION);
+              yield* wait(7);
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+                "completed",
+              );
+              assert.equal(yield* Ref.get(generation), 2);
+            }
+            return;
+          }
           if (priorImages) {
             const handoff = projection.contextHandoffs.at(-1)!;
             const context = scenario.endsWith("-native")
@@ -908,7 +1046,12 @@ describe("orchestration v2 provider switching", () => {
       }),
     ),
   );
-  it.live.each(["turn-start", "injection", "large-missed-request"] as const)(
+  it.live.each([
+    "turn-start",
+    "injection",
+    "large-missed-request",
+    "exhausted-target-retry",
+  ] as const)(
     "recovers %s failure without duplicating history in the same native thread",
     (failure) =>
       Effect.scoped(
@@ -1006,6 +1149,22 @@ describe("orchestration v2 provider switching", () => {
               failure !== "injection" ? "injected" : "pending",
             );
             const historyBeforeRetry = (yield* Ref.get(injectedHistory)).length;
+            if (failure === "exhausted-target-retry") {
+              const target = failed.providerThreads.find(
+                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+              )!;
+              yield* (yield* EventSink.EventSinkV2).write({
+                events: [
+                  {
+                    id: EventId.make("exhausted-retry-usage"),
+                    type: "provider-thread.updated",
+                    threadId,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...target, contextUsage: { usedTokens: 30_000, maxTokens: 32_000 } },
+                  },
+                ],
+              });
+            }
             const retryText =
               failure === "large-missed-request" ? "y".repeat(10_000) : "Retry target request";
             yield* dispatch(3, retryText, CLAUDE_MODEL_SELECTION);
@@ -1013,7 +1172,7 @@ describe("orchestration v2 provider switching", () => {
             const retried = yield* orchestrator.getThreadProjection(threadId);
             const lastTurn = (yield* Ref.get(capturedTurns)).at(-1)!;
             assert.equal(lastTurn.text, retryText);
-            if (failure !== "injection") {
+            if (failure !== "injection" && failure !== "exhausted-target-retry") {
               const delta = yield* encodeJson(
                 (yield* Ref.get(injectedHistory)).slice(historyBeforeRetry),
               );
@@ -1057,6 +1216,348 @@ describe("orchestration v2 provider switching", () => {
               ProviderReplayHarness.layerWithRegistry(
                 {
                   name: `handoff-retry-${failure}`,
+                  runtimePolicyOverride: {
+                    cwd,
+                    approvalPolicy: "never",
+                    sandboxPolicy: { type: "readOnly" },
+                  },
+                },
+                layerRegistry,
+              ),
+            ),
+          );
+        }),
+      ),
+  );
+
+  it.live.each(["an older handoff", "a missed request"] as const)(
+    "keeps the latest turn when a resume fallback also delivers %s",
+    (older) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // A run that fails before its provider turn starts is retried as a missed request.
+          const missed = older === "a missed request";
+          const name = `resume-fallback-handoff-order${missed ? "-missed" : ""}`;
+          const cwd = yield* checkpointWorkspace(name);
+          const failStartOnce = yield* Ref.make(false);
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const injectedHistory = yield* Ref.make<ReadonlyArray<unknown>>([]);
+          const oldResult = `old result ${"o".repeat(2_500)}`;
+          const latestResult = `latest result ${"l".repeat(2_500)}`;
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            makeTestAdapter({
+              instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+              driver: CLAUDE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              responseByRunOrdinal: { 1: oldResult, 3: latestResult },
+              capturedTurns,
+              injectedHistory,
+              failResume: true,
+              ...(missed ? { failStartOnce } : { failedRunOrdinals: new Set([2]) }),
+              nativeThreadGeneration: yield* Ref.make(0),
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const runAfterDetach = Effect.fn("runAfterDetach")(function* (
+              ordinal: number,
+              text: string,
+            ) {
+              const providerSessionId = (yield* orchestrator.getThreadProjection(threadId))
+                .providerThreads[0]?.providerSessionId;
+              if (providerSessionId != null) {
+                yield* orchestrator.dispatch({
+                  type: "provider-session.detach",
+                  commandId: CommandId.make(`handoff-order:detach:${ordinal}`),
+                  threadId,
+                  providerSessionId,
+                });
+                yield* worker.drain();
+              }
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`handoff-order:${ordinal}`),
+                threadId,
+                messageId: MessageId.make(`handoff-order:${ordinal}`),
+                createdBy: "user",
+                creationSource: "web",
+                text,
+                attachments: [],
+                modelSelection: CLAUDE_MODEL_SELECTION,
+                dispatchMode: { type: "start_immediately" },
+              });
+              yield* orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.ordinal === ordinal &&
+                    (event.payload.status === "completed" || event.payload.status === "failed"),
+                ),
+                Stream.runHead,
+              );
+              yield* worker.drain();
+            });
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("handoff-order:create"),
+              threadId,
+              projectId,
+              createdBy: "user",
+              creationSource: "web",
+              title: "Resume fallback handoff order",
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            yield* runAfterDetach(1, `Original brief ${"b".repeat(9_000)}`);
+            yield* Ref.set(failStartOnce, missed);
+            yield* runAfterDetach(2, missed ? `Request 2 ${"r".repeat(6_000)}` : "Request 2");
+            yield* runAfterDetach(3, "Request 3");
+            const historyBeforeRun4 = (yield* Ref.get(injectedHistory)).length;
+            yield* runAfterDetach(4, "Request 4");
+
+            const projection = yield* orchestrator.getThreadProjection(threadId);
+            assert.deepEqual(
+              projection.runs.map((run) => run.status),
+              ["completed", "failed", "completed", "completed"],
+            );
+            const run4NativeThreadId = (yield* Ref.get(capturedTurns)).at(-1)?.nativeThreadId;
+            assert.equal(
+              projection.contextHandoffs.find(
+                (handoff) => handoff.targetRunId === projection.runs[1]?.id,
+              )?.delivery?.nativeThreadId,
+              run4NativeThreadId,
+            );
+            const run4History = yield* encodeJson(
+              (yield* Ref.get(injectedHistory)).slice(historyBeforeRun4),
+            );
+            assert.include(run4History, "Original brief");
+            assert.include(run4History, latestResult);
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                {
+                  name,
+                  runtimePolicyOverride: {
+                    cwd,
+                    approvalPolicy: "never",
+                    sandboxPolicy: { type: "readOnly" },
+                  },
+                },
+                layerRegistry,
+              ),
+            ),
+          );
+        }),
+      ),
+  );
+
+  it.live(
+    "an interrupted run on a nearly full thread restarts in a fresh native session (Crpko #16)",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace("handoff-crpko-16");
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const failStartOnce = yield* Ref.make(false);
+          const generation = yield* Ref.make(0);
+          const usage = { usedTokens: 428_388, maxTokens: 500_000 };
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            // OpenCode delivers history inline (no injectHistory). Its capability
+            // table isn't exported; the fake runtime only needs handoff support.
+            makeTestAdapter({
+              instanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+              driver: OPENCODE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: OPENCODE2_MODEL_SELECTION,
+              responseByRunOrdinal: { 1: "Original partial work" },
+              capturedTurns,
+              failStartOnce,
+              nativeThreadGeneration: generation,
+              getModelContextWindow: () => usage.maxTokens,
+              interruptedRunOrdinals: new Set([2]),
+              tokenUsageByRunOrdinal: { 2: usage },
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const eventSink = yield* EventSink.EventSinkV2;
+            const dispatch = (ordinal: number, text: string) =>
+              orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`crpko-16:${ordinal}`),
+                threadId,
+                messageId: MessageId.make(`crpko-16:${ordinal}`),
+                createdBy: "user",
+                creationSource: "web",
+                text,
+                attachments: [],
+                modelSelection: OPENCODE2_MODEL_SELECTION,
+                dispatchMode: { type: "start_immediately" },
+              });
+            const settle = (ordinal: number, status: "completed" | "failed" | "interrupted") =>
+              orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.ordinal === ordinal &&
+                    ["completed", "failed", "interrupted"].includes(event.payload.status),
+                ),
+                Stream.runHead,
+                Effect.andThen(worker.drain()),
+                Effect.andThen(orchestrator.getThreadProjection(threadId)),
+                Effect.tap((projection) =>
+                  Effect.sync(() => assert.equal(projection.runs.at(-1)?.status, status)),
+                ),
+              );
+            const targetOf = (projection: {
+              providerThreads: ReadonlyArray<OrchestrationV2ProviderThread>;
+            }) =>
+              projection.providerThreads.find(
+                (thread) => thread.providerInstanceId === OPENCODE2_MODEL_SELECTION.instanceId,
+              )!;
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("crpko-16:create"),
+              threadId,
+              projectId,
+              createdBy: "user",
+              creationSource: "web",
+              title: "Nearly full OpenCode thread",
+              modelSelection: OPENCODE2_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            yield* dispatch(1, "Original request with constraints");
+            yield* settle(1, "completed");
+
+            // Run 49: cut by the OpenCode crash after reporting 428,388 of 500,000.
+            yield* dispatch(2, "Work that the crash cut off");
+            const interrupted = yield* settle(2, "interrupted");
+            const interruptedRun = interrupted.runs.at(-1)!;
+            const target = targetOf(interrupted);
+            const now = yield* DateTime.now;
+            const transferId = ContextTransferId.make("transfer:crpko-16-subagent-result");
+            // Older builds also stored each delegated result as a ready history
+            // handoff aimed at the parent's run. These pointed at run 49.
+            yield* eventSink.write({
+              events: [
+                {
+                  id: EventId.make("crpko-16-usage"),
+                  type: "provider-thread.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: { ...target, contextUsage: usage },
+                },
+                {
+                  id: EventId.make("crpko-16-subagent-transfer"),
+                  type: "context-transfer.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: transferId,
+                    type: "subagent_result",
+                    sourceThreadId: ThreadId.make("thread:crpko-16-child"),
+                    targetThreadId: threadId,
+                    sourcePoint: { threadId: ThreadId.make("thread:crpko-16-child") },
+                    basePoint: null,
+                    sourceProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    targetProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    targetRunId: interruptedRun.id,
+                    status: "consumed",
+                    resolution: null,
+                    createdBy: "system",
+                    error: null,
+                    createdAt: now,
+                    updatedAt: now,
+                    consumedAt: null,
+                  },
+                },
+                {
+                  id: EventId.make("crpko-16-subagent-handoff"),
+                  type: "context-handoff.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: ContextHandoffId.make("handoff:crpko-16-subagent-result"),
+                    transferId,
+                    threadId,
+                    targetRunId: interruptedRun.id,
+                    fromProviderThreadIds: [
+                      ProviderThreadId.make("provider-thread:crpko-16-child"),
+                    ],
+                    toProviderThreadId: target.id,
+                    coveredRunOrdinals: { from: 1, to: 1 },
+                    strategy: "manual_context",
+                    status: "ready",
+                    summaryMessageId: null,
+                    summaryText: "Legacy delegated result for the cut run",
+                    createdByProviderInstanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                },
+              ],
+            });
+
+            // Runs 50-52 never reached the provider. One refused start leaves the
+            // same missed run for the next turn to replay.
+            yield* Ref.set(failStartOnce, true);
+            yield* dispatch(3, "Pick up after the restart");
+            yield* settle(3, "failed");
+
+            // Run 53: OpenCode's /compact reports no token usage, so the stored
+            // reading stays at 428,388 and still leaves no handoff budget.
+            yield* dispatch(4, "/compact");
+            const compacted = yield* settle(4, "completed");
+            assert.deepEqual(targetOf(compacted).contextUsage, usage);
+            assert.equal(yield* Ref.get(generation), 1);
+
+            yield* dispatch(5, "Carry on with the plan");
+            const recovered = yield* settle(5, "completed");
+            const turns = yield* Ref.get(capturedTurns);
+            const recoveredTurn = turns.at(-1)!;
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.notEqual(recoveredTurn.nativeThreadId, turns[0]!.nativeThreadId);
+            const handoff = recovered.contextHandoffs.at(-1)!;
+            assert.equal(handoff.strategy, "full_thread_summary");
+            assert.equal(handoff.delivery?.status, "inline");
+            assert.equal(handoff.delivery?.nativeThreadId, recoveredTurn.nativeThreadId);
+            assert.include(recoveredTurn.text, "Original request with constraints");
+            assert.include(recoveredTurn.text, "Original partial work");
+            assert.include(recoveredTurn.text, "Pick up after the restart");
+            assert.isTrue(recoveredTurn.text.endsWith("User message:\nCarry on with the plan"));
+            assert.notInclude(recoveredTurn.text, "Legacy delegated result");
+            assert.isUndefined(
+              recovered.contextHandoffs.find(
+                (candidate) => candidate.id === "handoff:crpko-16-subagent-result",
+              )?.delivery,
+            );
+            assert.isNull(targetOf(recovered).contextUsage);
+            assert.notExists(
+              recovered.turnItems.find(
+                (item) =>
+                  item.type === "error" &&
+                  /too little context|Insufficient context allowance/.test(item.failure.message),
+              ),
+            );
+
+            yield* dispatch(6, "Next step");
+            yield* settle(6, "completed");
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.equal((yield* Ref.get(capturedTurns)).at(-1)!.text, "Next step");
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                {
+                  name: "handoff-crpko-16",
                   runtimePolicyOverride: {
                     cwd,
                     approvalPolicy: "never",

@@ -189,8 +189,23 @@ export class ControlClient {
   }
 
   /** Looks up the thread for an OpenCode session id (ses_...). @param {string} sessionId */
-  threadByNativeSession(sessionId) {
-    return this.request("GET", `/threads/by-native/${encodeURIComponent(sessionId)}`);
+  threadByNativeSession(sessionId, options = {}) {
+    const query = options.driver ? `?driver=${encodeURIComponent(options.driver)}` : "";
+    return this.request("GET", `/threads/by-native/${encodeURIComponent(sessionId)}${query}`);
+  }
+
+  /**
+   * Resolves any native id to its Robob execution. `agentId` is the Claude
+   * child's agent id; without it the session id alone names the owner.
+   * @param {string} nativeId
+   * @param {{ driver?: string, instance?: string, agentId?: string }} [options]
+   */
+  identity(nativeId, options = {}) {
+    const params = new URLSearchParams({ nativeId });
+    if (options.driver) params.set("driver", options.driver);
+    if (options.instance) params.set("instance", options.instance);
+    if (options.agentId) params.set("agentId", options.agentId);
+    return this.request("GET", `/identity/resolve?${params}`);
   }
 
   /**

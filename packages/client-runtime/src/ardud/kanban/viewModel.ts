@@ -23,6 +23,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ageView } from "../common/time.ts";
+import { effortOptionId, selectionEffort } from "../models/harnessRouting.ts";
 import type { KanbanBoardState } from "./boardState.ts";
 import { linkLabels } from "./links.ts";
 
@@ -59,9 +60,7 @@ export function modelName(model: ModelSelection | null): string {
 }
 
 export function modelVariant(model: ModelSelection | null): string | null {
-  const options = Array.isArray(model?.options) ? model.options : [];
-  const variant = options.find((option) => option.id === "variant")?.value;
-  return typeof variant === "string" ? variant : null;
+  return selectionEffort(model);
 }
 
 export const modelLetter = (model: ModelSelection | null) =>
@@ -78,7 +77,7 @@ export function boardModelSelection(input: {
 }): ModelSelection {
   const { instanceId, model, variant } = input;
   return variant
-    ? { instanceId, model, options: [{ id: "variant", value: variant }] }
+    ? { instanceId, model, options: [{ id: effortOptionId(instanceId), value: variant }] }
     : { instanceId, model };
 }
 
@@ -90,6 +89,7 @@ export function boardModelSelection(input: {
  * reads that as "resize its only pool".
  */
 export function poolAddLevel(
+  instanceId: ProviderInstanceId,
   models: ReadonlyArray<{
     readonly slug: string;
     readonly capabilities?:
@@ -117,7 +117,7 @@ export function poolAddLevel(
 ): { readonly variant: string | null } | null {
   const descriptor = models
     .find((entry) => entry.slug === model)
-    ?.capabilities?.optionDescriptors?.find((entry) => entry.id === "variant");
+    ?.capabilities?.optionDescriptors?.find((entry) => entry.id === effortOptionId(instanceId));
   const levels = descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
   const preferred =
     descriptor?.type === "select"

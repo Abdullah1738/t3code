@@ -265,5 +265,46 @@ class PoolLockTests(Isolated):
         self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
 
 
+class PrePoolLockDatabase(Isolated):
+    """1 Nov: #217 added pool_pending.source only inside CREATE TABLE IF NOT EXISTS, so the live offbox.db kept its
+    4-column table and every pooled create failed with exit 90 "table pool_pending has 4 columns but 5 values"."""
+
+    def old_table(self):
+        self.con.executescript("""DROP TABLE pool_pending;
+            CREATE TABLE pool_pending (
+              token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL
+            );""")
+
+    def cols(self):
+        return [r[1] for r in self.con.execute("PRAGMA table_info(pool_pending)")]
+
+    def test_schema_adds_source_to_an_old_pool_pending(self):
+        self.old_table()
+        self.con.execute("INSERT INTO pool_pending VALUES ('create-old','repo',1,1)")
+        self.con.commit()
+        capacity.schema(self.con)
+        capacity.schema(self.con)  # a second run (every offbox call runs it) changes nothing
+        self.assertEqual(self.cols(), ['token', 'pool_key', 'pid', 'created_at', 'source'])
+        self.assertEqual([tuple(r) for r in self.con.execute("SELECT * FROM pool_pending")],
+                         [('create-old', 'repo', 1, 1.0, None)])
+
+    def test_fresh_pool_box_is_created_on_an_old_database(self):
+        self.old_table()
+        self.box('one', member=True)
+        self.busy('one')
+        seen = []
+        make = PoolLockTests.new_box(self)
+
+        def create(me, size, template, base, fresh):
+            seen.append([tuple(r)[1:2] + tuple(r)[4:] for r in self.con.execute("SELECT * FROM pool_pending")])
+            return make(me, size, template, base, fresh)
+        with patch.object(lease, 'acquire_private', side_effect=create), contextlib.redirect_stderr(io.StringIO()):
+            row = pool.acquire(self.me, fresh=True)
+            pool.release_guard(row)
+        self.assertEqual(row['box_id'], 'bx_new')
+        self.assertEqual(seen, [[('repo', 'fresh')]])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM pool_pending").fetchone()[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()

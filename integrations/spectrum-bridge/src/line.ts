@@ -35,6 +35,8 @@ export type LineInbound = {
   mediaUrl?: string;
   /** message_handle this message replies to. */
   replyTo?: string;
+  /** message_handle of the first message of the inline-reply thread this joined (Sendblue thread_originator). */
+  threadOrigin?: string;
   kind: "message" | "location" | "other";
   location?: LineLocation;
   service: string;

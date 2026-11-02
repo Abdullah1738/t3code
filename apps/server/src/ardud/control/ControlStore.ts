@@ -32,16 +32,32 @@ export interface ControlStoreShape {
     origin: string | null,
   ) => Effect.Effect<void, ControlStoreError>;
   /**
-   * The thread an OpenCode session id belongs to: the importer's mapping
-   * first, then any provider thread whose native ref names the session.
+   * The thread a native session id belongs to: the importer's mapping first,
+   * then provider threads whose native ref names it. Null when the id is
+   * unknown or when two threads claim it (never the newest one).
    */
   readonly threadIdForNativeSession: (
     nativeSessionId: string,
+    driver?: string,
   ) => Effect.Effect<string | null, ControlStoreError>;
-  /** Native OpenCode session ids per thread, for listings. */
+  /**
+   * Current native id per thread (its active provider thread), for listings.
+   * A migrated thread reports its new id. Threads with no active binding fall
+   * back to their newest OpenCode session id.
+   */
   readonly nativeSessionIds: (
     threadIds: ReadonlyArray<string>,
   ) => Effect.Effect<ReadonlyMap<string, string>, ControlStoreError>;
+  /** Current qualified native binding per thread. */
+  readonly nativeBindings: (
+    threadIds: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    ReadonlyMap<
+      string,
+      { readonly driver: string; readonly providerInstanceId: string; readonly nativeId: string }
+    >,
+    ControlStoreError
+  >;
   /**
    * Threads that may be non-idle: a run that has not ended, or a pending
    * runtime request. A superset of what the shell calls active, read from
@@ -116,42 +132,87 @@ export const make = Effect.gen(function* () {
       `;
     }).pipe(Effect.mapError(fail("write-origin")));
 
-  const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = (nativeId) =>
-    Effect.gen(function* () {
-      const imported = yield* sql<{ readonly thread_id: string }>`
-        SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
+  const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = Effect.fn(
+    "ControlStore.threadIdForNativeSession",
+  )(
+    function* (nativeId, driver) {
+      const imported =
+        driver === undefined || driver === "opencode"
+          ? yield* sql<{ readonly thread_id: string }>`
+              SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
+            `
+          : [];
+      const live = yield* sql<{ readonly thread_id: string }>`
+        SELECT DISTINCT pt.thread_id
+        FROM orchestration_v2_projection_provider_threads pt
+        WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
+          AND pt.thread_id IS NOT NULL
+          AND (${driver ?? null} IS NULL
+            OR COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) = ${driver ?? null})
       `;
-      if (imported[0] !== undefined) return imported[0].thread_id;
-      const live = yield* sql<{ readonly thread_id: string | null }>`
-        SELECT thread_id FROM orchestration_v2_projection_provider_threads
-        WHERE json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
-          AND thread_id IS NOT NULL
-        ORDER BY updated_at DESC
-        LIMIT 1
-      `;
-      return live[0]?.thread_id ?? null;
-    }).pipe(Effect.mapError(fail("read-native-session")));
+      const threadIds = new Set([
+        ...imported.map((row) => row.thread_id),
+        ...live.map((row) => row.thread_id),
+      ]);
+      // Two app threads claim this id: refuse rather than pick one.
+      return threadIds.size === 1 ? [...threadIds][0]! : null;
+    },
+    Effect.mapError(fail("read-native-session")),
+  );
 
-  const nativeSessionIds: ControlStoreShape["nativeSessionIds"] = (threadIds) =>
+  const nativeBindings: ControlStoreShape["nativeBindings"] = (threadIds) =>
     Effect.forEach(
       chunks([...new Set(threadIds)]),
       (ids) =>
-        sql<{ readonly thread_id: string; readonly native_id: string | null }>`
-          SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
-          FROM orchestration_v2_projection_provider_threads
-          WHERE thread_id IN ${sql.in(ids)}
-            AND json_extract(payload_json, '$.ownerNodeId') IS NULL
-          ORDER BY updated_at ASC
+        sql<{
+          readonly thread_id: string;
+          readonly driver: string | null;
+          readonly provider_instance_id: string | null;
+          readonly native_id: string | null;
+        }>`
+          SELECT t.thread_id,
+            COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+            COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id
+          FROM orchestration_v2_projection_threads t
+          JOIN orchestration_v2_projection_provider_threads pt
+            ON pt.provider_thread_id = t.active_provider_thread_id
+          WHERE t.thread_id IN ${sql.in(ids)}
         `,
       { concurrency: 1 },
     ).pipe(
       Effect.map((pages) => {
-        const out = new Map<string, string>();
+        const out = new Map<
+          string,
+          {
+            readonly driver: string;
+            readonly providerInstanceId: string;
+            readonly nativeId: string;
+          }
+        >();
         for (const row of pages.flat()) {
-          if (row.native_id !== null && row.native_id.startsWith("ses")) {
-            out.set(row.thread_id, row.native_id);
+          if (row.driver !== null && row.provider_instance_id !== null && row.native_id !== null) {
+            out.set(row.thread_id, {
+              driver: row.driver,
+              providerInstanceId: row.provider_instance_id,
+              nativeId: row.native_id,
+            });
           }
         }
+        return out;
+      }),
+      Effect.mapError(fail("read-native-bindings")),
+    );
+
+  // Current OpenCode-style session id per thread, read from the active binding
+  // only. A thread with no active native id (detached, or not yet created)
+  // reports nothing: its old ses_ stays reachable through aliases and by-native,
+  // never as the current id.
+  const nativeSessionIds: ControlStoreShape["nativeSessionIds"] = (threadIds) =>
+    nativeBindings(threadIds).pipe(
+      Effect.map((bindings) => {
+        const out = new Map<string, string>();
+        for (const [threadId, binding] of bindings) out.set(threadId, binding.nativeId);
         return out;
       }),
       Effect.mapError(fail("read-native-sessions")),
@@ -184,6 +245,7 @@ export const make = Effect.gen(function* () {
     setOrigin,
     threadIdForNativeSession,
     nativeSessionIds,
+    nativeBindings,
     liveThreadIds,
     pendingRequestThreadIds,
   });

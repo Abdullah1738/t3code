@@ -60,13 +60,10 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) => {
         const route = boardEventRoute(event);
-        // Both routes name the run when the event is a run update; the id is what admissions key on.
-        const runId = event.type === "run.updated" ? event.payload.id : null;
-        if (route === "turnEnd" && runId !== null)
-          return service.notifyTurnEnded(event.threadId, runId);
+        if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
         if (route === "threadChanged")
           return service
-            .notifyThreadChanged(event.threadId, runId)
+            .notifyThreadChanged(event.threadId)
             .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change")));
         return Effect.void;
       }).pipe(

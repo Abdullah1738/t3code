@@ -20,7 +20,9 @@ const HELP = `t3ctl <command> [options]
          [--variant V] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
-  native SES_ID                        thread for an OpenCode session id
+  native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
+  identity NATIVE_ID [--driver D] [--instance I] [--agent A]
+                                       resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
   send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
@@ -30,6 +32,10 @@ const HELP = `t3ctl <command> [options]
   set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
+  desktop-lease status
+  desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
+  desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
+  desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
@@ -40,6 +46,9 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
   options: {
     url: { type: "string" },
     token: { type: "string" },
+    driver: { type: "string" },
+    instance: { type: "string" },
+    agent: { type: "string" },
     prompt: { type: "string" },
     title: { type: "string" },
     dir: { type: "string" },
@@ -70,6 +79,12 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     unsettle: { type: "boolean" },
     thread: { type: "string" },
     session: { type: "string" },
+    "native-id": { type: "string" },
+    "agent-id": { type: "string" },
+    task: { type: "string" },
+    scope: { type: "string" },
+    ticket: { type: "string" },
+    evidence: { type: "string" },
     types: { type: "string" },
     after: { type: "string" },
     text: { type: "boolean" },
@@ -114,6 +129,49 @@ async function main() {
       return print(await client.projects());
     case "models":
       return print(await client.models());
+    case "desktop-lease": {
+      const action = need(args[0], "desktop-lease action");
+      const path = "/desktop-lease";
+      if (action === "status") return print(await client.request("GET", path));
+      if (action === "reconcile")
+        return print(
+          await client.request("POST", `${path}/reconcile`, {
+            ticket: need(flags.ticket, "--ticket"),
+            evidence: need(flags.evidence, "--evidence"),
+          }),
+        );
+      if (!["acquire", "heartbeat", "release"].includes(action)) {
+        console.error(`unknown desktop-lease action ${action}`);
+        process.exit(2);
+      }
+      const envCaller = process.env.CODEX_THREAD_ID
+        ? { driver: "codex", nativeId: process.env.CODEX_THREAD_ID }
+        : process.env.OPENCODE_SESSION_ID
+          ? { driver: "opencode", nativeId: process.env.OPENCODE_SESSION_ID }
+          : null;
+      const explicit = flags.driver !== undefined || flags["native-id"] !== undefined;
+      const caller = explicit ? { driver: flags.driver, nativeId: flags["native-id"] } : envCaller;
+      if (!caller?.driver || !caller.nativeId) {
+        console.error("no caller identity");
+        process.exit(2);
+      }
+      const identity = { ...caller, ...(flags["agent-id"] ? { agentId: flags["agent-id"] } : {}) };
+      if (action === "acquire")
+        return print(
+          await client.request("POST", `${path}/acquire`, {
+            ...identity,
+            taskId: need(flags.task, "--task"),
+            scope: need(flags.scope, "--scope"),
+            mode: need(flags.mode, "--mode"),
+          }),
+        );
+      return print(
+        await client.request("POST", `${path}/${action}`, {
+          ...identity,
+          ticket: need(flags.ticket, "--ticket"),
+        }),
+      );
+    }
     case "threads": {
       const result = await client.listThreads({
         origin: flags.origin,
@@ -153,7 +211,17 @@ async function main() {
     case "status":
       return print(await client.thread(need(args[0], "THREAD")));
     case "native":
-      return print(await client.threadByNativeSession(need(args[0], "SES_ID")));
+      return print(
+        await client.threadByNativeSession(need(args[0], "SES_ID"), { driver: flags.driver }),
+      );
+    case "identity":
+      return print(
+        await client.identity(need(args[0], "NATIVE_ID"), {
+          driver: flags.driver,
+          instance: flags.instance,
+          agentId: flags.agent,
+        }),
+      );
     case "messages": {
       const threadId = need(args[0], "THREAD");
       const result = await client.messages(threadId, {

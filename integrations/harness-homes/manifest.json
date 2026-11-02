@@ -1,14 +1,16 @@
 {
   "homes": {
     "claude": "~/.robob/harness-homes/claude",
-    "codex": "~/.robob/harness-homes/codex"
+    "codex": "~/.robob/harness-homes/codex",
+    "codex-cu": "~/.robob/harness-homes/codex-cu"
   },
   "skillRoots": ["~/.config/opencode/skills"],
   "instructions": {
     "canonical": "~/.config/opencode/AGENTS.md",
     "overlays": {
       "claude": "overlays/claude.md",
-      "codex": "overlays/codex.md"
+      "codex": "overlays/codex.md",
+      "codex-cu": "overlays/codex-cu.md"
     }
   },
   "mcpServers": [
@@ -27,6 +29,12 @@
     "catalogSource": "vendor/codex-models-0.166.0.json",
     "extended": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
     "contextWindow": 872000,
+    "autoCompactTokenLimit": 450000
+  },
+  "codexCu": {
+    "model": "gpt-6.1-terra",
+    "prefixedModel": "cx/gpt-6.1-terra",
+    "contextWindow": 1050000,
     "autoCompactTokenLimit": 450000
   },
   "claude": {

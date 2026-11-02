@@ -14,6 +14,7 @@ const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
 const MAX_ATTEMPTS = 3;
 const RESTART_LOOKBACK_MS = 3 * 3600_000;
+const STALL_EVERY_MS = 55_000;
 
 function parseArgs(argv) {
   const [cmd = 'scan', ...rest] = argv;
@@ -258,8 +259,12 @@ async function scan(opts) {
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
     let stalls = [];
-    if (!opts.seed) {
+    // Scans run every 15s so restarts are picked up fast; the stall watch reads
+    // every active OpenCode session, so it keeps its once-a-minute pace.
+    const stallDue = !state.lastStallScan || now - Date.parse(state.lastStallScan) >= STALL_EVERY_MS;
+    if (!opts.seed && (stallDue || opts.dryRun)) {
       try {
+        if (!opts.dryRun) state.lastStallScan = new Date(now).toISOString();
         stalls = await stallScan({ state, now, dryRun: opts.dryRun, verbose: opts.verbose, log });
       } catch (err) {
         log(`stall watch failed: ${err?.message || err}`);

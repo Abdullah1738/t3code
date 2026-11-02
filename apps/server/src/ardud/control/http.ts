@@ -46,6 +46,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
 import {
   GUIDANCE_MAX_CHARS,
@@ -106,6 +107,16 @@ const STATUS: Record<ControlErrorCode, number> = {
 };
 
 const fail = (code: ControlErrorCode, message: string) => new ControlError({ code, message });
+
+/** A merged selection, or the conflict as a 400: a stale effort is never silently picked. */
+const selectionOrFail = (
+  result:
+    | { readonly kind: "selection"; readonly selection: ModelSelection }
+    | { readonly kind: "conflict"; readonly reason: string },
+) =>
+  result.kind === "selection"
+    ? Effect.succeed(result.selection)
+    : Effect.fail(fail("invalid_request", result.reason));
 
 const errorDetail = (cause: unknown): string =>
   userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
@@ -423,6 +434,7 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -516,9 +528,10 @@ const makeRoutes = Effect.gen(function* () {
   const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
     Effect.gen(function* () {
       const ids = shells.map((shell) => shell.id);
-      const [origins, natives] = yield* Effect.all([
+      const [origins, natives, bindings] = yield* Effect.all([
         store.getOrigins(ids),
         store.nativeSessionIds(ids),
+        store.nativeBindings(ids),
       ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       // Children inherit the root's origin.
       const rootIds = shells
@@ -530,8 +543,8 @@ const makeRoutes = Effect.gen(function* () {
           : yield* store
               .getOrigins(rootIds)
               .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      return shells.map((shell) =>
-        shellSummary(shell, {
+      return shells.map((shell) => ({
+        ...shellSummary(shell, {
           origin:
             origins.get(shell.id) ??
             origins.get(shell.lineage.rootThreadId) ??
@@ -539,7 +552,8 @@ const makeRoutes = Effect.gen(function* () {
             null,
           nativeSessionId: natives.get(shell.id) ?? null,
         }),
-      );
+        native: bindings.get(shell.id) ?? null,
+      }));
     });
 
   const threadDetail = (threadId: string) =>
@@ -704,12 +718,14 @@ const makeRoutes = Effect.gen(function* () {
     if (base === null && body.model === undefined) {
       return yield* fail("invalid_request", "No default model is configured; pass model.");
     }
-    const modelSelection = modelSelectionFrom({
-      model: body.model,
-      variant: body.variant,
-      instanceId: body.providerInstanceId,
-      base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
-    });
+    const modelSelection = yield* selectionOrFail(
+      modelSelectionFrom({
+        model: body.model,
+        variant: body.variant,
+        instanceId: body.providerInstanceId,
+        base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
+      }),
+    );
     const commandId = yield* commandIdFor("thread", body.clientRequestId);
     const threadId = ThreadId.make(commandId);
     const prompt = body.prompt?.trim() ?? "";
@@ -856,13 +872,38 @@ const makeRoutes = Effect.gen(function* () {
   const byNative = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const nativeId = yield* param("sessionId");
+    const driver = (yield* searchParams).get("driver") ?? undefined;
     const threadId = yield* store
-      .threadIdForNativeSession(nativeId)
+      .threadIdForNativeSession(nativeId, driver)
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     if (threadId === null) {
       return yield* fail("not_found", `No thread maps to session ${nativeId}.`);
     }
     return json({ ok: true, nativeSessionId: nativeId, thread: yield* threadDetail(threadId) });
+  });
+
+  // Any native id a hook or tool sees, resolved to its Robob execution.
+  // Ambiguous and unknown ids come back as a resolution, not an error, so
+  // callers can tell "not yet" from "never".
+  const identityResolve = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const nativeId = params.get("nativeId");
+    if (nativeId === null || nativeId.length === 0) {
+      return yield* fail("invalid_request", "nativeId is required.");
+    }
+    const driver = params.get("driver");
+    const providerInstanceId = params.get("instance");
+    const agentId = params.get("agentId");
+    const identity = yield* identities
+      .resolve({
+        nativeId,
+        ...(driver === null ? {} : { driver }),
+        ...(providerInstanceId === null ? {} : { providerInstanceId }),
+        ...(agentId === null ? {} : { agentId }),
+      })
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return json({ ok: true, identity });
   });
 
   const getMessages = Effect.gen(function* () {
@@ -928,11 +969,13 @@ const makeRoutes = Effect.gen(function* () {
     const modelSelection =
       body.model === undefined && body.variant === undefined
         ? undefined
-        : modelSelectionFrom({
-            model: body.model,
-            variant: body.variant,
-            base: shell.modelSelection,
-          });
+        : yield* selectionOrFail(
+            modelSelectionFrom({
+              model: body.model,
+              variant: body.variant,
+              base: shell.modelSelection,
+            }),
+          );
     const result = yield* startup
       .enqueueCommand(
         ThreadMessageIntake.sendToThread({
@@ -1100,11 +1143,13 @@ const makeRoutes = Effect.gen(function* () {
       });
     }
     if (body.model !== undefined || body.variant !== undefined) {
-      const modelSelection = modelSelectionFrom({
-        model: body.model,
-        variant: body.variant,
-        base: shell.modelSelection,
-      });
+      const modelSelection = yield* selectionOrFail(
+        modelSelectionFrom({
+          model: body.model,
+          variant: body.variant,
+          base: shell.modelSelection,
+        }),
+      );
       yield* dispatch({
         type:
           modelSelection.instanceId === shell.providerInstanceId
@@ -1399,6 +1444,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
+    HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
     HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
@@ -1414,5 +1460,5 @@ const makeRoutes = Effect.gen(function* () {
 });
 
 export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
-  Layer.provide(ControlStore.layer),
+  Layer.provide(Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer)),
 );

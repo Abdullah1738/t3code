@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .common import OffboxError, EXIT_INFRA, log
+from .common import OffboxError, EXIT_INFRA, iso_ts, log
 from . import capacity
 
 API = os.environ.get("OFFBOX_BOAT_API", "https://boat.dev/api/v1")
@@ -59,6 +59,31 @@ class ApiError(OffboxError):
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
         self.status, self.api_code, self.retryable = status, code, retryable
+
+
+SUPPLY_OUT = re.compile(r"supply for size (\w+) is over", re.I)
+# A box whose stale error already names the outage may still carry it after boat accepts a resume: only trust its
+# state after this long stopped.
+SUPPLY_STALE_GRACE_S = 120
+
+
+class SupplyOut(capacity.CapacityError):
+    """boat has no machines of this size right now. Nothing ran; the size is on cooldown (capacity.supply_out)."""
+
+    def __init__(self, size: str, box_id: str | None, msg: str, tried: bool = True):
+        super().__init__(f"boat has no {size} machines right now ({msg}); nothing ran")
+        self.size, self.box_id, self.tried = size, box_id, tried
+
+
+def _refused(e: "ApiError", box_id: str | None):
+    """SupplyOut for boat's synchronous 'supply for size X is over' answer (records the cooldown), else None."""
+    msg = str(e)
+    m = SUPPLY_OUT.search(msg)
+    if not m:
+        return None
+    size = m.group(1).lower()
+    capacity.supply_out(size, box_id, msg)
+    return SupplyOut(size, box_id, msg)
 
 
 CONNECT_RETRIES = 5
@@ -321,7 +346,10 @@ def create(size: str, ttl: int, name: str, idem: str, saved: str | None = None) 
     body = {"type": size, "ttlSeconds": ttl, "noEnv": True, "name": name[:120]}
     if saved:
         body["from"] = saved
-    d = call("POST", "/sandboxes", body, {"Idempotency-Key": idem}, retries=4)
+    try:
+        d = call("POST", "/sandboxes", body, {"Idempotency-Key": idem}, retries=4)
+    except ApiError as e:
+        raise _refused(e, None) or e from e
     return d["sandbox"]
 
 
@@ -358,7 +386,10 @@ def fork(src: str, ttl: int, idem: str, size: str | None = None) -> dict:
     body = {"ttlSeconds": ttl, "noEnv": True}
     if size:
         body["type"] = size
-    d = call("POST", f"/sandboxes/{src}/fork", body, {"Idempotency-Key": idem}, retries=4)
+    try:
+        d = call("POST", f"/sandboxes/{src}/fork", body, {"Idempotency-Key": idem}, retries=4)
+    except ApiError as e:
+        raise _refused(e, None) or e from e
     return d.get("sandbox") or {"id": d.get("id")}
 
 
@@ -371,7 +402,7 @@ def resume(box_id: str, ttl: int, size: str | None = None) -> dict:
     except ApiError as e:
         if e.api_code in ("sandbox_resuming",):
             return {}
-        raise
+        raise _refused(e, box_id) or e from e
 
 
 def stop(box_id: str) -> dict:
@@ -408,7 +439,25 @@ def latest_snapshot(box_id: str) -> dict | None:
     return d.get("snapshot")
 
 
-def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7) -> dict:
+def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: str | None) -> bool:
+    """True when the box's supply error is this attempt's, not an old one left on the box."""
+    if st in ("error", "cancelled"):
+        return True
+    if since is None or st not in STOPPED_STATES:
+        return False
+    # (a) updatedAt before the attempt (30 s for clock skew): an error boat wrote earlier.
+    if (iso_ts(s.get("updatedAt")) or 0) < since - 30:
+        return False
+    # (b) the same message already on the box before the attempt: boat may bump updatedAt on accepting the resume
+    # without clearing the old error, so trust it only after the grace period, still stopped.
+    if SUPPLY_OUT.search(stale_error or "") and time.time() - since < SUPPLY_STALE_GRACE_S:
+        return False
+    return True
+
+
+def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
+               stale_error: str | None = None) -> dict:
+    """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
@@ -419,6 +468,10 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         st = s.get("state")
         if st in want:
             return s
+        m = SUPPLY_OUT.search(s.get("error") or "")
+        if m and _supply_refusal(s, st, since, stale_error):
+            capacity.supply_out(m.group(1).lower(), box_id, s["error"])
+            raise SupplyOut(m.group(1).lower(), box_id, s["error"])
         if st in ("error", "cancelled"):
             raise OffboxError(f"box {box_id} went to {st}: {s.get('error')}")
         if time.time() > deadline:

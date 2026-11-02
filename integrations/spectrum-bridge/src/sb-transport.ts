@@ -179,7 +179,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
 }
 
 /** Maps a Line message to the router's inbound row. Attachments keep the media URL as their guid. */
-export function inboundFromLine(message: { handle: string; text: string; from: string; mediaUrl?: string; replyTo?: string;
+export function inboundFromLine(message: { handle: string; text: string; from: string; mediaUrl?: string; replyTo?: string; threadOrigin?: string;
   kind: string; location?: { latitude: number; longitude: number; accuracy?: number; at?: number }; service: string;
   sentAt: number }): NormalizedInbound {
   const mediaUrl = message.mediaUrl;
@@ -195,6 +195,7 @@ export function inboundFromLine(message: { handle: string; text: string; from: s
     id: message.handle,
     text,
     ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+    ...(message.threadOrigin ? { threadOrigin: message.threadOrigin } : {}),
     isAudioMessage: isAudio,
     attachments: attachments as NormalizedInbound["attachments"],
     receivedAt: message.sentAt,

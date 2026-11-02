@@ -124,7 +124,10 @@ class ExpiryTests(Isolated):
                 patch.object(lease, "_bring_up") as up, patch.object(lease, "pick_template", return_value="crpko-node"):
             row = lease.acquire_private(dict(self.me, owner="pool:repo"))
         self.assertEqual(row["source"], "recipe:crpko-node")
-        self.assertEqual(up.call_args.kwargs, {"fresh": False, "recipe": "crpko-node", "box_held": True})
+        self.assertEqual(up.call_args.kwargs["recipe"], "crpko-node")
+        self.assertEqual(up.call_args.kwargs["box_held"], True)
+        self.assertFalse(up.call_args.kwargs["fresh"])
+        self.assertIsNotNone(up.call_args.kwargs["since"])  # supply-out trip rule (test_supply_out)
         self.assertEqual(lease.natural_size(self.con, row), "large")
         self.con.execute("INSERT INTO pool_members VALUES ('bx_r','repo')")
         self.con.commit()

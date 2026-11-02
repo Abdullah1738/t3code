@@ -261,6 +261,69 @@ def archive_robob_thread(ses_id, quiet_before):
     return tid, res["archived"], res["reason"]
 
 
+# A deleted root session is gone for good, so a failed thread archive is kept in
+# a pending file and retried at the start of later runs. Only a persistent
+# failure (PENDING_ARCHIVE_TRIES failed retries) alerts.
+PENDING_ARCHIVE_TRIES = 5
+
+
+def pending_path():
+    return os.path.join(LOGS, "state", "reaper_pending_archive.json")
+
+
+def load_pending():
+    try:
+        with open(pending_path()) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+
+
+def save_pending(pending):
+    p = pending_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(pending, fh, indent=1)
+    os.replace(tmp, p)
+
+
+def queue_archive_retry(ses_id, err):
+    pending = load_pending()
+    e = pending.get(ses_id)
+    if e is None:
+        e = pending[ses_id] = {"attempts": 0, "first_ts": int(time.time())}
+    else:
+        e["attempts"] = e.get("attempts", 0) + 1
+    e["last_error"] = str(err)[:200]
+    save_pending(pending)
+
+
+def retry_pending_archives(quiet_before, st):
+    pending = load_pending()
+    if not pending:
+        return
+    for ses_id in list(pending):
+        e = pending[ses_id]
+        try:
+            thread_id, archived, reason = archive_robob_thread(ses_id, quiet_before)
+        except Exception as err:
+            e["attempts"] = e.get("attempts", 0) + 1
+            e["last_error"] = str(err)[:200]
+            if e["attempts"] >= PENDING_ARCHIVE_TRIES:
+                del pending[ses_id]
+                st["errors"].append(f"{ses_id}: archiving its Robob thread failed "
+                                    f"{PENDING_ARCHIVE_TRIES} times: {str(err)[:120]}")
+            continue
+        del pending[ses_id]
+        st["archive_retried"] = st.get("archive_retried", 0) + 1
+        st.setdefault("archive_retry_audit", []).append(
+            {"id": ses_id, "thread": thread_id, "archived": archived, "reason": reason})
+        if thread_id and not archived:
+            st["kept_threads"] = st.get("kept_threads", 0) + 1
+    save_pending(pending)
+
+
 # ------------------------------------------------------------------ candidates
 SESS_SQL = """
 SELECT s.id, s.parent_id, s.title, s.directory, s.time_updated, s.time_suspended,
@@ -424,6 +487,8 @@ def main():
         log(f"gate ok (snapshot {ev['snapshot'][:8]}); {len(sessions)} sessions, "
             f"{st['stale_trees']} stale trees ({st['stale_sessions']} sessions)")
         quiet_before = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t0 - STALE_DAYS * 86400))
+        if backend.is_robob() and not args.dry_run:
+            retry_pending_archives(quiet_before, st)
         ver = Verifier(oc)
         n_sess = n_msgs = 0
         for root, tree in work:
@@ -500,7 +565,8 @@ def main():
                         st["kept_threads"] = st.get("kept_threads", 0) + 1
                 except Exception as e:
                     rec["robob_thread_error"] = str(e)[:200]
-                    st["errors"].append(f"{root['id']}: deleted, but archiving its Robob thread failed: {str(e)[:120]}")
+                    queue_archive_retry(root["id"], str(e))
+                    st["archive_retry_queued"] = st.get("archive_retry_queued", 0) + 1
             audit.write(json.dumps(rec, ensure_ascii=False) + "\n")
             audit.flush()
             st["deleted_roots"] += 1
@@ -518,7 +584,9 @@ def main():
             st["deleted_roots"] = 0
         st["state"] = "error" if st["errors"] else "done"
     except Gate as e:
-        st["state"] = "gated"
+        # A Gate after an error was recorded (e.g. an exhausted archive retry)
+        # must not hide it: health_check treats "gated" as healthy.
+        st["state"] = "error" if st["errors"] else "gated"
         st["message"] = str(e)
     except Exception as e:
         st["state"] = "error"

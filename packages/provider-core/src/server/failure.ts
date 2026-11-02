@@ -22,7 +22,16 @@ export class ContextHandoffBudgetError extends Schema.TaggedError<ContextHandoff
   {},
 ) {
   override get message() {
-    return "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.";
+    return "The request leaves too little context for a provider handoff. Shorten the request or use a larger-context model; the current request has not been truncated.";
+  }
+}
+
+export class ContextHandoffBackgroundWorkError extends Schema.TaggedError<ContextHandoffBackgroundWorkError>()(
+  "ContextHandoffBackgroundWorkError",
+  {},
+) {
+  override get message() {
+    return "The target provider still has background work running. Wait for it to finish or stop it before retrying the handoff.";
   }
 }
 
@@ -73,6 +82,8 @@ function causeMessage(cause: unknown): string | undefined {
       switch (tag) {
         case "ContextHandoffBudgetError":
           return new ContextHandoffBudgetError().message;
+        case "ContextHandoffBackgroundWorkError":
+          return new ContextHandoffBackgroundWorkError().message;
         case "ClaudeBackgroundWorkBlocksQueryReplacementError":
         case "CursorModelUnavailableError":
           return stringField(cause, "message");

@@ -91,6 +91,19 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                         (now(), "client ended before it got a box", rid))
     if nobox and not dry:
         con.commit()
+    # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
+    from .misc import _client_alive
+    orphan = [tuple(r) for r in con.execute(
+        "SELECT run_id, client_pid, start_at FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
+        "AND status IN ('starting','running') AND client_pid IS NOT NULL").fetchall()]
+    for rid, pid, start_at in orphan:
+        if _client_alive(pid, start_at):
+            continue
+        actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
+        if not dry:
+            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
+                        "AND status IN ('starting','running')", (now(), "client ended before it got a box", rid))
+            con.commit()
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
     protected = _protected(con)

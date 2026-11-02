@@ -77,7 +77,7 @@ def session_state(*, total=19.8, quantity=2, address=HEADERS['x-addresskey'],
               'isSelected': False, 'isDefault': False}]
     return {'version': 3, 'addressKey': address, 'addressCode': HEADERS['x-addresscode'],
             'useCredits': credits, 'walletAmount': 0.0, 'total': total, 'subtotal': total,
-            'orderPaymentAmount': total, 'paymentAmount': total,
+            'orderPaymentAmount': total, 'paymentAmount': total, 'paymentProviderCode': 'NOON_PAY',
             'paymentMethods': [{'code': 'google_pay', 'status': 'available', 'cards': []},
                                {'code': 'cc_noonpay', 'status': 'active', 'cards': cards}],
             'deliveryOptions': {

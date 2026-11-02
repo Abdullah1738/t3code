@@ -9,10 +9,11 @@ import {
   trackServer, truncate, RESTART_BUSY_REASON,
 } from "./detect.mjs";
 
-// Long enough for a thread that resumes on its own (or gets the installer's
-// resume message) to re-dispatch first, so the note can say so.
-export const RESTART_SETTLE_MS = 180_000;
-export const INSTALLER_WAIT_MS = 30 * 60_000;
+// Owner, 1 Nov: resumes after a restart must be fast and automatic. Wait only
+// until the shutdown/startup cancels stop landing; Robob's own continuation
+// starts within seconds and those threads are skipped as busy. The installer is
+// no longer waited for: this watch is the resume path.
+export const RESTART_SETTLE_MS = 20_000;
 export const STALE_PULSE_MS = 2 * 3_600_000;
 // How long a busy thread is held back. Past this, a thread that is still busy
 // or has run again since its cut counts as resumed and gets no note.
@@ -246,15 +247,6 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       log(`${incident.id}: seeded (no action)`);
       continue;
     }
-    // install-robob-resume.zsh sends its own "resume, including sub-agents"
-    // message once Abdullah confirms the client loaded. Let that go first so
-    // the note can list what the threads already relaunched.
-    const installerMs = dryRun ? null : io.installerResumePendingMs();
-    const installing = installerMs != null && installerMs > incident.startMs - 2 * 3_600_000 && installerMs < incident.endMs + 5 * 60_000;
-    if (installing && now - incident.endMs < INSTALLER_WAIT_MS) {
-      log(`${incident.id}: waiting for install-robob-resume to send its resume message`);
-      continue;
-    }
     robobUp ??= await io.robobHealthy();
     if (!robobUp) {
       log(`${incident.id}: Robob is not reachable, retrying next scan`);
@@ -329,6 +321,10 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
     // One summary per restart, sent once every thread is settled (held-back
     // threads settle within RESTART_RESUME_WINDOW_MS), so it names them all.
     const pending = dryRun ? [] : [...byThread.keys()].filter((id) => !entry.threads[id]?.done);
+    // Acting 20s after the last cancel can come before the restart window
+    // closes. Keep the incident open until then so a late cut joins it.
+    const windowOpen = !dryRun && Number.isFinite(incident.windowTo) && now < incident.windowTo + RESTART_SETTLE_MS;
+    if (windowOpen && !pending.length) pending.push("(restart window still open)");
     if (dryRun) {
       log(`summary (${quiet ? "not sent, all archived" : summary.severity}):\n${summary.text}`);
     } else if (quiet && !pending.length) {

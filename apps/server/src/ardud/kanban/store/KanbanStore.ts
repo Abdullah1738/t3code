@@ -24,7 +24,6 @@ import {
   type KanbanDiscussionId,
   type KanbanScriptId,
   type KanbanStage,
-  type ModelSelection,
 } from "@t3tools/contracts";
 
 import { SummaryCard } from "./summaryCard.ts";
@@ -124,15 +123,6 @@ const DDL = [
     PRIMARY KEY (thread_id, card_id)
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_thread_cards_card ON ardud_kanban_thread_cards (card_id)`,
-  // Evaluator sends waiting for a free slot in the board's evaluator pool, oldest first.
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    board_id TEXT NOT NULL,
-    thread_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_evaluator_queue_board ON ardud_kanban_evaluator_queue (board_id, id)`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_admissions (thread_id TEXT PRIMARY KEY, board_id TEXT NOT NULL, turn TEXT NOT NULL, at INTEGER NOT NULL)`,
 ];
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
@@ -179,12 +169,6 @@ interface IdJsonRow extends JsonRow {
 }
 
 export type NewCardEvent = Omit<KanbanCardEvent, "id">;
-/** One evaluator send held back: the text and the model it was asked with. */
-export interface EvaluatorQueueEntry {
-  readonly text: string;
-  readonly model: ModelSelection | null;
-  readonly queuedAt: string;
-}
 export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
 export interface KanbanStoreShape {
@@ -243,39 +227,6 @@ export interface KanbanStoreShape {
     pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
     cards: ReadonlyArray<KanbanCard>,
   ) => Effect.Effect<void, KanbanStoreError>;
-
-  /** Evaluator sends waiting for a slot in the board's pool, oldest first. */
-  readonly enqueueEvaluator: (
-    boardId: KanbanBoardId,
-    threadId: string,
-    entry: EvaluatorQueueEntry,
-  ) => Effect.Effect<void, KanbanStoreError>;
-  readonly evaluatorQueue: (
-    boardId: KanbanBoardId,
-  ) => Effect.Effect<
-    ReadonlyArray<{ readonly threadId: string; readonly entry: EvaluatorQueueEntry }>,
-    KanbanStoreError
-  >;
-  readonly dropEvaluatorQueue: (threadId: string) => Effect.Effect<void, KanbanStoreError>;
-
-  /** Evaluator turns the board admitted and not yet released, whatever their link state. */
-  readonly putAdmission: (input: {
-    readonly threadId: string;
-    readonly boardId: KanbanBoardId;
-    readonly turn: string;
-    readonly at: number;
-  }) => Effect.Effect<void, KanbanStoreError>;
-  readonly admissions: () => Effect.Effect<
-    ReadonlyArray<{
-      readonly threadId: string;
-      readonly boardId: KanbanBoardId;
-      readonly turn: string;
-      readonly at: number;
-    }>,
-    KanbanStoreError
-  >;
-  /** Removes an admission only when it is still keyed to `turn`. */
-  readonly dropAdmission: (threadId: string, turn: string) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
     boardId: KanbanBoardId,
@@ -604,71 +555,6 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const enqueueEvaluator = (boardId: KanbanBoardId, threadId: string, entry: EvaluatorQueueEntry) =>
-    run(
-      "enqueue evaluator",
-      Effect.asVoid(
-        sql`INSERT INTO ardud_kanban_evaluator_queue (board_id, thread_id, json)
-          VALUES (${boardId}, ${threadId}, ${JSON.stringify(entry)})`,
-      ),
-    );
-  const evaluatorQueue = (boardId: KanbanBoardId) =>
-    run(
-      "read evaluator queue",
-      Effect.map(
-        sql<{ readonly thread_id: string; readonly json: string }>`
-          SELECT thread_id, json FROM ardud_kanban_evaluator_queue WHERE board_id = ${boardId} ORDER BY id
-        `,
-        (rows) =>
-          rows.map((row) => ({
-            threadId: row.thread_id,
-            entry: JSON.parse(row.json) as EvaluatorQueueEntry,
-          })),
-      ),
-    );
-  const dropEvaluatorQueue = (threadId: string) =>
-    run(
-      "drop evaluator queue",
-      Effect.asVoid(sql`DELETE FROM ardud_kanban_evaluator_queue WHERE thread_id = ${threadId}`),
-    );
-
-  const putAdmission: KanbanStoreShape["putAdmission"] = (input) =>
-    run(
-      "put evaluator admission",
-      Effect.asVoid(
-        sql`INSERT OR REPLACE INTO ardud_kanban_evaluator_admissions (thread_id, board_id, turn, at)
-          VALUES (${input.threadId}, ${input.boardId}, ${input.turn}, ${input.at})`,
-      ),
-    );
-
-  const admissions: KanbanStoreShape["admissions"] = () =>
-    run(
-      "read evaluator admissions",
-      Effect.map(
-        sql<{
-          readonly thread_id: string;
-          readonly board_id: string;
-          readonly turn: string;
-          readonly at: number;
-        }>`SELECT thread_id, board_id, turn, at FROM ardud_kanban_evaluator_admissions ORDER BY at`,
-        (rows) =>
-          rows.map((row) => ({
-            threadId: row.thread_id,
-            boardId: row.board_id as KanbanBoardId,
-            turn: row.turn,
-            at: row.at,
-          })),
-      ),
-    );
-
-  const dropAdmission: KanbanStoreShape["dropAdmission"] = (threadId, turn) =>
-    run(
-      "drop evaluator admission",
-      Effect.asVoid(
-        sql`DELETE FROM ardud_kanban_evaluator_admissions WHERE thread_id = ${threadId} AND turn = ${turn}`,
-      ),
-    );
-
   const groups = (boardId: KanbanBoardId) =>
     run(
       "read groups",
@@ -967,12 +853,6 @@ const make = Effect.gen(function* () {
     pools,
     putPool,
     removePool,
-    enqueueEvaluator,
-    evaluatorQueue,
-    dropEvaluatorQueue,
-    putAdmission,
-    admissions,
-    dropAdmission,
     rekeyBoard,
     groups,
     putGroups,
