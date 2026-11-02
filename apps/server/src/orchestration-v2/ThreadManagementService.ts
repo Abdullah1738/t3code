@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - the migration command needs a unique id for each attempt.
+import { randomUUID } from "node:crypto";
+import { resolveSelection } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -10,6 +13,7 @@ import type {
 import {
   type ChatAttachment,
   CommandId,
+  isProviderNativeSubagentThread,
   MessageId,
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
@@ -36,6 +40,8 @@ import {
   ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -522,6 +528,9 @@ const make = Effect.gen(function* () {
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+  // Orchestrator's lock is not reentrant. This separate lock covers the
+  // preflight + selection update + send across callers of this service.
+  const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -677,11 +686,134 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
+  const dispatchUnchanged = (command: OrchestrationV2ServerCommand) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
       Effect.andThen(orchestrator.dispatch(command)),
     );
+
+  const dispatchWithSelectionMigration = Effect.fn(
+    "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
+  )(function* (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
+  ) {
+    yield* ensureCommandTranscripts(command);
+
+    // Neither an accepted nor a rejected command may acquire new side effects
+    // on replay, including when its id belongs to a different aggregate.
+    const readReceipt = <A>(effect: Effect.Effect<A, CommandReceiptStore.CommandReceiptStoreV2Error>) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new Orchestrator.OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        ),
+      );
+    const receipt = yield* readReceipt(receipts.getByCommandId(command.commandId));
+    if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
+    const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
+    if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+    const stored = projection.thread.modelSelection;
+    const requested = command.modelSelection ?? stored;
+    const resolved = resolveSelection(requested);
+    if (resolved.kind === "conflict") {
+      return yield* new Orchestrator.OrchestratorCommandRejectedError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Model selection migration: ${resolved.reason}`,
+      });
+    }
+
+    // A caller may have already resolved an inherited selection. Treat it as
+    // inherited too, but never overwrite a genuinely different explicit pick.
+    const resolvedStored = resolveSelection(stored);
+    const inherited =
+      command.modelSelection === undefined ||
+      modelSelectionsEqual(command.modelSelection, stored) ||
+      (resolvedStored.kind === "mapped" &&
+        modelSelectionsEqual(resolved.selection, resolvedStored.selection));
+
+    yield* assertProviderInstanceEnabled({
+      projectId: projection.thread.projectId,
+      commandId: command.commandId,
+      instanceId: resolved.selection.instanceId,
+    });
+
+    if (inherited && resolvedStored.kind === "mapped") {
+      const { thread, runs } = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
+      if (isProviderNativeSubagentThread(thread)) {
+        return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+        });
+      }
+      if (!modelSelectionsEqual(thread.modelSelection, stored)) {
+        return yield* new Orchestrator.OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "The thread's model selection changed during migration. Retry the send.",
+        });
+      }
+      // A provider switch detaches the old session. Never interrupt active or
+      // queued work merely because a legacy selection was encountered.
+      if (
+        thread.deletedAt !== null ||
+        thread.archivedAt !== null ||
+        runs.some((run) => isActiveRun(run) || run.status === "queued")
+      ) {
+        return yield* new Orchestrator.OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Cannot migrate an archived or deleted thread, or one with active or queued runs.",
+        });
+      }
+      yield* orchestrator.dispatch({
+        type: "thread.model-selection.set",
+        commandId: CommandId.make(`command:ardud:harness-migration:${randomUUID()}`),
+        threadId: command.threadId,
+        modelSelection: resolvedStored.selection,
+      });
+    }
+
+    const nextCommand =
+      command.modelSelection === undefined || resolved.kind === "unchanged"
+        ? command
+        : { ...command, modelSelection: resolved.selection };
+    // Re-read the target after a selection update and check the actual send,
+    // rather than allowing a disabled destination on an inherited command.
+    yield* assertDispatchTargetEnabled(nextCommand);
+    return yield* orchestrator.dispatch(nextCommand);
+  });
+
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+    if (
+      command.type !== "message.dispatch" &&
+      command.type !== "thread.model-selection.set" &&
+      command.type !== "provider.switch"
+    ) {
+      return dispatchUnchanged(command);
+    }
+    return serverSettings.getSettings.pipe(
+      Effect.orDie,
+      Effect.flatMap((settings) => {
+        if (settings.ardudHarnessMigration?.selections !== "apply") {
+          return dispatchUnchanged(command);
+        }
+        return selectionDispatchLock.withLock(
+          command.threadId,
+          command.type === "message.dispatch"
+            ? dispatchWithSelectionMigration(command)
+            : dispatchUnchanged(command),
+        );
+      }),
+    );
+  };
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
     getThreadProjection(input.threadId).pipe(

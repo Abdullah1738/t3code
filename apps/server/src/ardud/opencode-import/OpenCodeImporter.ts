@@ -33,6 +33,9 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
@@ -67,6 +70,17 @@ const RUN_ORDINAL_FLOOR = 1_000_000;
 const MIN_SESSION_AGE_MS = 2 * 60 * 1000;
 const SETTLE_AFTER_MS = 24 * 60 * 60 * 1000;
 const OPENCODE_INSTANCE = ProviderInstanceId.make("opencode");
+const historicalModel = Schema.Struct({
+  providerID: Schema.String,
+  id: Schema.String,
+  variant: Schema.optional(Schema.String),
+});
+const historicalSession = Schema.decodeUnknownEffect(
+  Schema.Struct({ data: Schema.Struct({ model: Schema.optional(Schema.NullOr(historicalModel)) }) }),
+);
+const historicalMessages = Schema.decodeUnknownEffect(
+  Schema.Struct({ data: Schema.Array(Schema.Struct({ model: Schema.optional(historicalModel) })) }),
+);
 
 export class OpenCodeImportError extends Schema.TaggedError<OpenCodeImportError>()(
   "OpenCodeImportError",
@@ -199,6 +213,54 @@ export const make = Effect.gen(function* () {
     const selection = Option.isSome(current) ? current.value.defaultModelSelection : undefined;
     return selection?.instanceId === OPENCODE_INSTANCE ? selection : fallback;
   });
+
+  // Preserve historical models even if OpenCode no longer lists them as runnable.
+  const childSelection = (conn: OpenCodeHttp.OpenCodeConnection, sessionId: string) =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient;
+      const request = (path: string) =>
+        client.execute(
+          HttpClientRequest.get(`${conn.baseUrl}${path}`).pipe(
+            HttpClientRequest.setHeader("authorization", conn.authorization),
+            HttpClientRequest.acceptJson,
+          ),
+        );
+      const sessionPath = `/api/session/${encodeURIComponent(sessionId)}`;
+      const response = yield* request(sessionPath);
+      const fallback = yield* fallbackSelection;
+      if (response.status === 404) return fallback;
+      if (response.status < 200 || response.status >= 300) {
+        return yield* new OpenCodeHttp.OpenCodeHttpError({
+          operation: "get child session",
+          status: response.status,
+        });
+      }
+      const session = yield* historicalSession(yield* response.json);
+      let model = session.data.model;
+      if (!model?.providerID || !model.id) {
+        const messages = yield* request(`${sessionPath}/message?limit=1&type=assistant&order=desc`);
+        if (messages.status < 200 || messages.status >= 300) {
+          return yield* new OpenCodeHttp.OpenCodeHttpError({
+            operation: "get child session model",
+            status: messages.status,
+          });
+        }
+        model = (yield* historicalMessages(yield* messages.json)).data[0]?.model;
+      }
+      return sessionModelSelection(
+        {
+          id: sessionId,
+          time: { created: 0, updated: 0 },
+          location: { directory: "" },
+          ...(model == null ? {} : { model }),
+        },
+        OPENCODE_INSTANCE,
+        fallback,
+      );
+    }).pipe(
+      Effect.timeout("60 seconds"),
+      Effect.provide(FetchHttpClient.layer),
+    );
 
   const readImportRows = sql<ImportRow>`
     SELECT
@@ -664,6 +726,7 @@ export const make = Effect.gen(function* () {
   const childThreadEvents = (
     parent: OrchestrationV2AppThread,
     calls: ReturnType<typeof subagentCalls>,
+    conn: OpenCodeHttp.OpenCodeConnection,
   ) =>
     Effect.gen(function* () {
       const events: Array<OrchestrationV2DomainEvent> = [];
@@ -688,7 +751,7 @@ export const make = Effect.gen(function* () {
             parentNodeId: NodeId.make(`${IMPORT_PREFIX}:subagent:${call.sessionId}`),
             activeProviderThreadId: providerThread.id,
             providerInstanceId: OPENCODE_INSTANCE,
-            modelSelection: parent.modelSelection,
+            modelSelection: yield* childSelection(conn, call.sessionId),
             title: call.title,
             now: call.at,
             createdBy: "agent",
@@ -781,7 +844,7 @@ export const make = Effect.gen(function* () {
         const children =
           parent.lineage.relationshipToParent === "subagent"
             ? { events: [], mappings: [] }
-            : yield* childThreadEvents(parent, subagentCalls({ ...context, messages }));
+            : yield* childThreadEvents(parent, subagentCalls({ ...context, messages }), conn);
 
         // Positions first: the sink keeps a supplied position for a known item.
         yield* sql.withTransaction(
