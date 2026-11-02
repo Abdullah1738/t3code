@@ -16,7 +16,7 @@ for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
   fi
 done
 
-if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}" ]]; then
+if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}${HARNESS_HOOKS_COMMAND_IDENTITY:-}" ]]; then
   typeset -a words value_flags=(--account --lock-wait --store --timeout)
   typeset -i i=1 for_me=0
   while (( i <= $# )); do

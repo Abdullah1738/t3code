@@ -229,6 +229,36 @@ def _command_needs_eval(command):
     return "<<" in command
 
 
+def _exit_trap_update(path, before, identity, pin):
+    """Bind a changed EXIT trap to its registration context."""
+    trap_file = Path(path)
+    try:
+        current = trap_file.read_text(encoding="utf-8")
+        previous = Path(before).read_text(encoding="utf-8")
+        match = re.search(r"^trap -- (.*?) EXIT(?:\n|$)", current, re.MULTILINE | re.DOTALL)
+        old_match = re.search(r"^trap -- (.*?) EXIT(?:\n|$)", previous, re.MULTILINE | re.DOTALL)
+        if not match or (old_match and match.group(0) == old_match.group(0)):
+            return
+        # The quoted value comes from the shell's own `trap` builtin; leaving
+        # it quoted lets bash and zsh round-trip their different formats.
+        argument = match.group(1)
+        variable = "__harness_exit_" + secrets.token_hex(8)
+        values = {COMMAND_IDENTITY_ENV: identity or "", "HARNESS_COORD_APPROVED": pin or "",
+                  "AGENT_GUARD_APPROVED": pin or ""}
+        exports = "; ".join("export " + k + "=" + shlex.quote(v) for k, v in values.items())
+        action = (variable + "=$?; " + exports + "; (exit \"$" + variable + "\") && :; eval " + argument)
+        sys.stdout.write("trap -- " + shlex.quote(action) + " EXIT\n")
+    finally:
+        try:
+            trap_file.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            Path(before).unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _command_with_context(command, identity, pin):
     """Scope exports to this execution without losing shell cwd changes."""
     name = "__harness_hook_" + secrets.token_hex(8)
@@ -242,11 +272,25 @@ def _command_with_context(command, identity, pin):
                       "export " + key + "=" + shlex.quote(value)])
         cleanup.append('if [ "${' + present + '-}" = x ]; then export ' + key + '="${' + previous + '-}"; else unset ' + key + "; fi")
     status = name + "_status"
+    trap_file, before, install = (name + "_trapfile", name + "_before", name + "_install")
+    scratch.extend([trap_file, before, install])
     # A group runs the original in the current shell (including positional
     # parameters, functions and cwd). eval preserves a heredoc's EOF boundary.
     # Restore inherited context before this shell can run another command.
     body = "eval " + shlex.quote(command) if _command_needs_eval(command) else command
-    return ("{\n" + "\n".join(setup) + "\n" + body + "\n" + status + "=$?\n" + "\n".join(cleanup) +
+    snapshot = (
+        trap_file + "=$(mktemp \"${TMPDIR:-/tmp}/harness-exit.XXXXXXXX\")\n" +
+        before + "=\"$" + trap_file + ".before\"\n" +
+        "if [ -n \"$" + trap_file + "\" ]; then\ntrap > \"$" + before + "\"\nfi\n"
+    )
+    bind_exit = (
+        "if [ -n \"$" + trap_file + "\" ]; then\ntrap > \"$" + trap_file + "\"\n" +
+        install + "=$(" + shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__)) +
+        " --bind-exit \"$" + trap_file + "\" \"$" + before + "\" " +
+        shlex.quote(identity or "") + " " + shlex.quote(pin or "") + ")\n" +
+        "if [ -n \"$" + install + "\" ]; then eval \"$" + install + "\"; fi\nfi\n"
+    )
+    return ("{\n" + snapshot + "\n".join(setup) + "\n" + body + "\n" + status + "=$?\n" + bind_exit + "\n" + "\n".join(cleanup) +
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
@@ -885,3 +929,7 @@ def decide(event, harness):
          cmd_sha1=hashlib.sha1(command.encode("utf-8")).hexdigest() if command else None,
          cmd=command[:200] if command else None, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
+
+
+if __name__ == "__main__" and len(sys.argv) == 6 and sys.argv[1] == "--bind-exit":
+    _exit_trap_update(*sys.argv[2:])

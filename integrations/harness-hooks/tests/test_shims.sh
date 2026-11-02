@@ -41,6 +41,7 @@ run_shim() {
     claude) ident=(CLAUDE_CODE_SESSION_ID=claude-test) ;;
     codex) ident=(CODEX_THREAD_ID=codex-test) ;;
     marker) ident=(ROBOB_HARNESS=claude) ;;
+    identity) ident=(HARNESS_HOOKS_COMMAND_IDENTITY=synthetic-marker) ;;
     human) ident=() ;;
   esac
   env -i HOME="$tmp/home" PATH="$blockers:$tmp/bin:/usr/bin:/bin" \
@@ -66,6 +67,17 @@ for kind in claude codex marker; do
     rc=$?
     [[ $rc == 3 ]] || { cat "$tmp/err" >&2; exit 1; }
     grep -q 'offbox gate:' "$tmp/err"
+    [[ ! -s "$tmp/out" ]]
+  fi
+done
+for name in wacli himalaya himalaya-heal; do
+  if [[ $name == wacli ]]; then args=(send text); else args=(message send); fi
+  if run_shim identity "$name" "${args[@]}"; then
+    print -u2 -- "FAIL: command identity $name passed a raw send"; exit 1
+  else
+    rc=$?
+    [[ $rc == 2 ]] || { cat "$tmp/err" >&2; exit 1; }
+    grep -q 'Blocked:' "$tmp/err"
     [[ ! -s "$tmp/out" ]]
   fi
 done

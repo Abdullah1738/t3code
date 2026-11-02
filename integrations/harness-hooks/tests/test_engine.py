@@ -355,6 +355,29 @@ class EngineTests(unittest.TestCase):
                            tool_input={"command": "./probe.sh", "cmd": "./other.sh"})
         self.assertNotIn("updatedInput", engine.decide(event, "claude")["context"])
 
+    def test_mcp_rewrite_activates_raw_send_shims_without_native_env(self):
+        offbox = SRC.parents[1] / "offbox/skill/scripts/blockers"
+        self.add_identity("agent-child", "child", parent="parent", model="gpt-6-astra")
+        real = self.root / "mcp-bin"
+        real.mkdir()
+        for name, arguments in (("wacli", "send text"), ("himalaya", "message send"),
+                                ("himalaya-heal", "message send")):
+            binary = real / name
+            binary.write_text("#!/bin/sh\nprintf 'SHOULD_NOT_SEND\\n'\n")
+            binary.chmod(0o755)
+            for harness in ("claude", "codex"):
+                for tool in ("exec_command", "shell_command"):
+                    with self.subTest(name=name, harness=harness, tool=tool):
+                        command = f"{name} {arguments}"
+                        event = self.event(command, tool_name=f"mcp__test__{tool}", tool_input={"cmd": command})
+                        response = self.run_adapter(harness, event)["hookSpecificOutput"]
+                        env = self.shell_environment()
+                        env["PATH"] = os.pathsep.join([str(offbox), str(real), "/usr/bin", "/bin"])
+                        result = self.run_shell(response["updatedInput"]["cmd"], env)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn("Blocked:", result.stderr)
+
     def test_mcp_approved_script_is_not_trusted_as_same_host(self):
         self.actor()
         script, sql = self.root / "scripts/deploy-health.sh", self.root / "replica-health.sql"
@@ -678,6 +701,116 @@ printf done | cat"""
                 self.assertEqual(calls.read_text(), "called\n")
                 self.assertEqual((result.returncode, result.stdout, result.stderr),
                                  (0, "status=1 context=unset\nreal-psql\n", engine.COORD_REASON + "\n"))
+
+    def test_exit_trap_uses_executing_child_after_context_cleanup(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\nprintf 'called\\n' >> calls\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        command = "trap './probe.sh' EXIT"
+        for shell in ("/bin/bash", "/bin/zsh"):
+            for agent, expected in (("agent-child", engine.COORD_REASON + "\n"), ("agent-sibling", "")):
+                with self.subTest(shell=shell, agent=agent):
+                    (self.root / "calls").unlink(missing_ok=True)
+                    response = self.run_adapter("claude", self.event(command, agent=agent))["hookSpecificOutput"]
+                    suffix = "\nprintf 'context=%s\\n' \"${HARNESS_HOOKS_COMMAND_IDENTITY-unset}\""
+                    result = self.run_shell(response["updatedInput"]["command"] + suffix, env, shell=shell)
+                    self.assertEqual((self.root / "calls").read_text(), "called\n")
+                    self.assertEqual(result.stderr, expected)
+                    self.assertEqual(result.stdout, "context=unset\n" + ("real-psql\n" if not expected else ""))
+
+    def test_exit_trap_reset_and_replacement_use_latest_child(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\nprintf 'called\\n' >> calls\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        for shell in ("/bin/bash", "/bin/zsh"):
+            for second, expected in (("trap - EXIT", ""), ("trap './probe.sh' EXIT", "real-psql\n")):
+                with self.subTest(shell=shell, second=second):
+                    (self.root / "calls").unlink(missing_ok=True)
+                    first = self.run_adapter("claude", self.event("trap './probe.sh' EXIT"))["hookSpecificOutput"]["updatedInput"]["command"]
+                    last = self.run_adapter("claude", self.event(second, agent="agent-sibling"))["hookSpecificOutput"]["updatedInput"]["command"]
+                    result = self.run_shell(first + "\n" + last, env, shell=shell)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(result.stdout, expected)
+                    self.assertEqual((self.root / "calls").exists(), bool(expected))
+
+    def test_exit_trap_sees_original_exit_status(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        command = "trap 'printf \"exit-status=%s\\n\" \"$?\"' EXIT"
+        rewritten = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]["updatedInput"]["command"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell(rewritten + "\nexit 19", env, shell=shell)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (19, "exit-status=19\n", ""))
+
+    def test_exit_trap_remains_attributed_to_codex_child(self):
+        self.actor()
+        self.add_identity("codex-parent", "parent", model="claude-opus-5-5")
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        event = self.event("trap './probe.sh' EXIT", session="codex-parent", agent="codex-child")
+        rewritten = self.run_adapter("codex", event)["hookSpecificOutput"]["updatedInput"]["command"]
+        env = self.shell_environment(CODEX_THREAD_ID="codex-parent", ROBOB_HARNESS="codex")
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell(rewritten, env, shell=shell)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, engine.COORD_REASON + "\n")
+
+    def test_multiline_exit_trap_retains_child_attribution(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        command = "trap 'echo deferred\n./probe.sh' EXIT"
+        rewritten = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]["updatedInput"]["command"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell(rewritten, env, shell=shell)
+                self.assertEqual(result.stdout, "deferred\n")
+                self.assertEqual(result.stderr, engine.COORD_REASON + "\n")
+
+    def test_preexisting_exit_trap_runs_with_original_context(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        rewritten = self.run_adapter("claude", self.event("printf child"))["hookSpecificOutput"]["updatedInput"]["command"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell("trap './probe.sh' EXIT\n" + rewritten, env, shell=shell)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "childreal-psql\n", ""))
+
+    def test_unchanged_exit_trap_keeps_its_own_context(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        script = self.root / "probe.sh"
+        script.write_text("#!/bin/sh\npsql\n")
+        script.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        first = self.run_adapter("claude", self.event("trap './probe.sh' EXIT"))["hookSpecificOutput"]["updatedInput"]["command"]
+        second = self.run_adapter("claude", self.event("printf sibling", agent="agent-sibling"))["hookSpecificOutput"]["updatedInput"]["command"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                result = self.run_shell(first + "\n" + second, env, shell=shell)
+                self.assertEqual(result.stdout, "sibling")
+                self.assertEqual(result.stderr, engine.COORD_REASON + "\n")
 
     def test_heredocs_at_eof_preserve_behavior_and_cleanup(self):
         self.add_identity("session", "parent", model="claude-opus-5-5")

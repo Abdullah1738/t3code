@@ -20,7 +20,7 @@ done
 # so any prefix counts here: an ambiguous one is refused by himalaya anyway.
 picks() { local w=$1 n; shift; [[ -n $w ]] || return 1; for n; do [[ $n == $w* ]] && return 0; done; return 1; }
 
-if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}" ]]; then
+if [[ -n "${OPENCODE_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${ROBOB_HARNESS:-}${HARNESS_HOOKS_COMMAND_IDENTITY:-}" ]]; then
   # Options that take a value (with their aliases), so a value is never read as a command word.
   typeset -a words value_flags=(-c --config -a --account -b --backend --log-level --log --log-file
     -m --mailbox -f --folder -t --to --cc --bcc -s --subject --body --body-file --attach
