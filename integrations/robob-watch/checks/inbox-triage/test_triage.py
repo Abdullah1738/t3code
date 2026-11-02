@@ -1012,5 +1012,20 @@ class SourceHealthTests(unittest.TestCase):
         self.assertIn('Security:', t.SYSTEM)
 
 
+class ActivityLogBytes(unittest.TestCase):
+    def test_a_bad_byte_in_the_activity_log_does_not_break_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / 'Documents/assistant/inbox-triage').mkdir(parents=True)
+            (home / 'Documents/assistant/inbox-triage/prefs.md').write_text('rules')
+            day = time.strftime('%Y-%m-%d', time.gmtime())
+            (home / 'Documents/assistant/activity-log.md').write_bytes(
+                f'- {day} 10:00 \u00b7 hookah bowl \u00b7 split on '.encode() + b'\x85' + b' only\n')
+            with patch.object(t, 'HOME', home), patch.object(t, 'DATA', home / 'Documents/assistant/inbox-triage'), \
+                    patch.object(t, 'live_work', return_value={}):
+                ctx = t.build_context([{'sender': 'hookah', 'subject': 'bowl', 'preview': 'hookah bowl'}], [], time.time())
+        self.assertIn('hookah bowl', ctx['recent_activity_newest_first'])
+
+
 if __name__ == '__main__':
     unittest.main()
