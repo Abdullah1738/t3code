@@ -131,6 +131,28 @@ echo $(( $(date +%s) - 9999 )) > "$T/logs/state/capture.last_ok"
 bash "$T/scripts/memory_stall_watch.sh" >/dev/null
 [ ! -f "$T/logs/state/capture.stall_alerted" ] && pass "failed send is retried later" || fail "failed send marked as alerted"
 
+# 8. capture tick: a failing Claude stage makes the aggregate capture status failed,
+#    and the other stages still run (driven through the real tick script with stub python)
+TICK="$T/tick"
+mkdir -p "$TICK/scripts" "$TICK/src" "$TICK/logs/state"
+cp "$HERE/scripts/stage_lib.sh" "$HERE/scripts/memory_stall_watch.sh" "$HERE/scripts/memory_capture_tick.sh" "$TICK/scripts/"
+printf '#!/bin/bash\nexit 0\n' > "$TICK/scripts/memory_stall_watch.sh"
+cat > "$TICK/fakepy" <<'PYEOF'
+#!/bin/bash
+case "$2" in
+  *sync_claude.py) echo claude >> "$MEMORY_ROOT/ran.log"; exit 3 ;;
+  *) echo "$2" >> "$MEMORY_ROOT/ran.log"; exit 0 ;;
+esac
+PYEOF
+chmod +x "$TICK/fakepy"
+sed "s#PY=/opt/homebrew/bin/python3#PY=$TICK/fakepy#; s#ROOT=\"\$HOME/.local/share/memory-system\"#ROOT=\"$TICK\"#" "$TICK/scripts/memory_capture_tick.sh" > "$TICK/scripts/tick.sh"
+mkdir -p "$T/logs/state"
+MEMORY_ROOT="$TICK" bash "$TICK/scripts/tick.sh" >/dev/null 2>&1
+grep -q "claude capture failed rc=3" "$TICK/logs/capture-$(date +%Y%m%d).log" && pass "failing claude stage is logged" || fail "claude failure not logged"
+grep -q "sync_codex.py" "$MEMORY_ROOT/ran.log" 2>/dev/null || grep -q "sync_codex.py" "$TICK/ran.log" && pass "codex stage still runs after claude fails" || fail "codex skipped after claude failed"
+grep -q "sync_thread_identity.py" "$TICK/ran.log" && pass "identity stage runs" || fail "identity stage did not run"
+[ "$(sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' "$TICK/logs/capture_last.json")" = failed ] && pass "aggregate capture status is failed" || fail "aggregate status not failed: $(cat "$TICK/logs/capture_last.json" 2>/dev/null)"
+
 rm -rf "$T"
 [ "$FAIL" = 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $FAIL
