@@ -85,7 +85,11 @@ def ladder(con, groups, sample, now, dry_run=False):
             record["resource_since"] = now
         if now - record["resource_since"] < 60:
             continue
-        if live_exemption(session, now):
+        # The record key is driver-qualified (one UUID under two drivers is two executions), but C1, the exemption
+        # file and the native steer all name the bare native id. Pass that, with its driver, everywhere they're used.
+        native = group.get("session") or session
+        driver = group.get("driver")
+        if live_exemption(native, now, driver):
             record.update(start=None, stage=0, resource_since=None)
             actions.append({"session": session, "action": "exempt"})
             continue
@@ -113,8 +117,8 @@ def ladder(con, groups, sample, now, dry_run=False):
             if target == 2:
                 count = throttle(group)
                 log(f"throttle session={session} pids_attempted={count}")
-            success = steer(session, message(session, group, sample, target == 2), rid,
-                            include_parent=target == 2, driver=group.get("driver"))
+            success = steer(native, message(native, group, sample, target == 2), rid,
+                            include_parent=target == 2, driver=driver)
         else:
             success = record.get("telegram_sent", False) or telegram(session)
             if success:

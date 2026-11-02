@@ -97,7 +97,11 @@ def parent_session(session):
     return cached(("parent", session), lookup)
 
 
-def live_exemption(session, now=None):
+def live_exemption(session, now=None, driver=None):
+    """Whether a live exemption covers this session. A native exemption (a bare UUID) matches only the driver it was
+    written under, so one UUID under Claude and Codex is two separate answers. An entry without a driver predates
+    native drivers and only ever meant OpenCode. OpenCode's parent lookup is skipped for native callers, which have
+    no OpenCode parent."""
     now = time.time() if now is None else now
     entries = read_json(STATE / "exemptions.json", [])
     if not isinstance(entries, list):
@@ -114,10 +118,16 @@ def live_exemption(session, now=None):
                 expires = dt.datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).timestamp()
             except ValueError:
                 continue
-        if expires > now and entry.get("session_id"):
-            live.add(entry["session_id"])
+        if expires <= now or not entry.get("session_id"):
+            continue
+        entry_driver = entry.get("driver") or "opencode"
+        if (driver or "opencode") != entry_driver:
+            continue
+        live.add(entry["session_id"])
     if session in live:
         return True
+    if driver not in (None, "opencode"):
+        return False
     return bool(live and parent_session(session) in live)
 
 

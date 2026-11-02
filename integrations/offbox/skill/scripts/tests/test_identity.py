@@ -36,6 +36,8 @@ class StubControl:
             OTHER: {"threadId": OTHER, "parentThreadId": None, "relationshipToParent": None},
         }
         self.calls = []
+        # Every POST /threads/<id>/send, as (thread id, body): the monitor's warning, recorded for assertions.
+        self.sends = []
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -49,6 +51,19 @@ class StubControl:
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
+
+            def do_POST(self):
+                url = urlparse(self.path)
+                if self.headers.get("Authorization") != "Bearer test-token":
+                    return self._send(401, {"ok": False})
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                # /api/ardud/control/threads/<id>/send -> ['', 'api', 'ardud', 'control', 'threads', '<id>', 'send']
+                parts = url.path.split("/")
+                if len(parts) == 7 and parts[4] == "threads" and parts[6] == "send":
+                    stub.sends.append((parts[5], body))
+                    return self._send(200, {"ok": True})
+                return self._send(404, {"ok": False})
 
             def do_GET(self):
                 url = urlparse(self.path)

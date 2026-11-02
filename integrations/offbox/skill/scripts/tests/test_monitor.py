@@ -424,5 +424,153 @@ class MonitorTests(unittest.TestCase):
                 self.assertEqual(request.call_args.args[2], "Bearer shared")
 
 
+class SamplerToLadderTests(unittest.TestCase):
+    """The real sampler feeds the real ladder, and the real steer and resolve talk to a control stub over HTTP.
+
+    The earlier ladder tests mock steer and live_exemption, so they could not see a native group sent to C1 under its
+    driver-qualified key. These tests only pass when the bare native id and its driver reach the wire.
+    """
+
+    CLAUDE = "11111111-2222-3333-4444-555555555555"
+    CODEX = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+    def setUp(self):
+        import test_identity as ti
+        self.ti = ti
+        self.stub = ti.StubControl()
+        self.addCleanup(self.stub.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        cfg = root / "offbox.json"
+        cfg.write_text(json.dumps({"url": self.stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        # Both native drivers resolve to their own top-level thread, and each thread accepts messages.
+        self.stub.threads["thread-claude"] = {"threadId": "thread-claude", "parentThreadId": None,
+                                              "relationshipToParent": None}
+        self.stub.threads["thread-codex"] = {"threadId": "thread-codex", "parentThreadId": None,
+                                             "relationshipToParent": None}
+        self.stub.identities[(self.CLAUDE, "claudeAgent")] = ti.resolved("thread-claude", None, driver="claudeAgent")
+        self.stub.identities[(self.CODEX, "codex")] = ti.resolved("thread-codex", None, driver="codex")
+        patches = [patch.object(support, "HOME", root), patch.object(support, "STATE", root),
+                   patch.object(monitor, "STATE", root), patch.object(support, "_CACHE", {}),
+                   patch.object(monitor, "throttle", return_value=1),
+                   patch.object(monitor, "log"),
+                   # The OpenCode parent lookup must never run for a native caller: it would fail the test.
+                   patch.object(support, "oc", side_effect=AssertionError("OpenCode called for a native id"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.cfg_home = root
+        # support.ctl reads ~/.robob/components/offbox.json, so give it that path under the temp HOME.
+        (root / ".robob/components").mkdir(parents=True)
+        (root / ".robob/components/offbox.json").write_text(cfg.read_text())
+        (root / ".robob/components/offbox.json").chmod(0o600)
+
+    def _tick_pair(self, con, *, start, drivers_and_pids, seconds=130):
+        """Run the real sampler and ladder every ten seconds for `seconds`, the way tick() does.
+
+        The sampler earns "sustained" over its first minute, and the ladder waits one more minute of resource floor
+        before its first warning. So the window has to be longer than two minutes for the first steer to fire.
+        Returns the groups from the last tick and every action the ladder produced, in order.
+        """
+        lines_plain, lines_env = [], []
+        for pid, driver, uuid in drivers_and_pids:
+            command = "claude -p work" if driver == "claudeAgent" else "codex exec work"
+            lines_plain.append(f"{pid} 1 60.0 2048 {command}")
+            env = (f"PWD=/repo CLAUDE_CODE_SESSION_ID={uuid}" if driver == "claudeAgent"
+                   else f"PWD=/repo CODEX_THREAD_ID={uuid}")
+            lines_env.append(f"{pid} 1 60.0 2048 {command} {env}")
+        plain = "\n".join(lines_plain) + "\n"
+        raw = "\n".join(lines_env) + "\n"
+        prev = {}
+        all_actions = []
+        groups = {}
+        for now in range(start, start + seconds, 10):
+            # The sampler is handed the previous tick's CPU progress, as tick() does, so sustained is earned per tick.
+            groups, progress, _ = sample.sample_processes(prev, now, raw, plain)
+            prev = progress
+            pressure = {"active": True, "load1": 25, "swap_gb": 7, "free_pct": 20}
+            all_actions.extend(monitor.ladder(con, groups, pressure, now))
+        return groups, all_actions
+
+    def test_claude_and_codex_each_reach_their_own_thread_under_the_bare_uuid(self):
+        con = monitor.connect(":memory:")
+        groups, actions = self._tick_pair(con, start=1000, drivers_and_pids=[
+            (10001, "claudeAgent", self.CLAUDE), (10002, "codex", self.CODEX)])
+        self.assertEqual(set(groups), {"claudeAgent:" + self.CLAUDE, "codex:" + self.CODEX})
+        # C1 is asked for the bare native id under its own driver, never the composite key.
+        identity_queries = [q for _, p, q in self.stub.calls if p == "/api/ardud/control/identity/resolve"]
+        self.assertTrue(identity_queries, self.stub.calls)
+        for query in identity_queries:
+            self.assertNotIn("claudeAgent%3A", query)
+            self.assertNotIn("codex%3A", query)
+        self.assertIn(("thread-claude", ), [(t,) for t, _ in self.stub.sends])
+        self.assertIn(("thread-codex", ), [(t,) for t, _ in self.stub.sends])
+        claude_send = next(body for t, body in self.stub.sends if t == "thread-claude")
+        self.assertIn("Local heavy work", claude_send["text"])
+        self.assertIn("Session " + self.CLAUDE, claude_send["text"])
+        con.close()
+
+    def test_a_native_exemption_for_one_driver_does_not_silence_the_other_driver(self):
+        # A Codex exemption on the shared UUID covers the Codex group only. The Claude group still gets its warning.
+        con = monitor.connect(":memory:")
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        exemptions.write_text(json.dumps([{"session_id": self.CODEX, "driver": "codex",
+                                           "expires_at": 9999999999}]))
+        with patch.object(support, "STATE", self.cfg_home), patch.object(monitor, "STATE", self.cfg_home):
+            _, actions = self._tick_pair(con, start=1000, drivers_and_pids=[
+                (10001, "claudeAgent", self.CODEX), (10002, "codex", self.CODEX)])
+        by_session = {a["session"]: a["action"] for a in actions}
+        self.assertEqual(by_session.get("codex:" + self.CODEX), "exempt")
+        self.assertEqual(by_session.get("claudeAgent:" + self.CODEX), "steer")
+        con.close()
+
+    def test_a_valid_native_exemption_short_circuits_steering_with_no_send(self):
+        con = monitor.connect(":memory:")
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        exemptions.write_text(json.dumps([{"session_id": self.CLAUDE, "driver": "claudeAgent",
+                                           "expires_at": 9999999999}]))
+        with patch.object(support, "STATE", self.cfg_home), patch.object(monitor, "STATE", self.cfg_home):
+            _, actions = self._tick_pair(con, start=1000, drivers_and_pids=[(10001, "claudeAgent", self.CLAUDE)])
+        self.assertEqual([a["action"] for a in actions], ["exempt"])
+        self.assertEqual(self.stub.sends, [], "an exempt native session must not receive a warning")
+        con.close()
+
+    def test_the_exemption_writer_records_the_driver_the_monitor_matches_on(self):
+        # The real `offbox local` writer: it must store the caller's driver with the bare session id, so the monitor
+        # can match that exemption under the same driver and no other.
+        import offbox_lib.common as common
+        from offbox_lib import misc
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        me = {"session": self.CODEX, "thread": None, "driver": "codex", "repo_root": str(self.cfg_home)}
+        patches = [patch.object(common, "EXEMPTIONS", exemptions), patch.object(common, "STATE", self.cfg_home),
+                   patch.object(common, "LOCKS_DIR", self.cfg_home / "locks"),
+                   patch.object(common, "DB_PATH", self.cfg_home / "offbox.db"),
+                   patch.object(misc, "EXEMPTIONS", exemptions)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        (self.cfg_home / "locks").mkdir(exist_ok=True)
+        misc.local_exempt(me, "a reason long enough to pass", "2h", False, False)
+        written = json.loads(exemptions.read_text())
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["session_id"], self.CODEX)
+        self.assertEqual(written[0]["driver"], "codex")
+        with patch.object(support, "STATE", self.cfg_home):
+            self.assertTrue(support.live_exemption(self.CODEX, driver="codex"))
+            self.assertFalse(support.live_exemption(self.CODEX, driver="claudeAgent"))
+
+    def test_an_exemption_recorded_without_a_driver_is_read_as_opencode_only(self):
+        # Entries written before native drivers have no driver field. They must not silence a native process.
+        con = monitor.connect(":memory:")
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        exemptions.write_text(json.dumps([{"session_id": self.CLAUDE, "expires_at": 9999999999}]))
+        with patch.object(support, "STATE", self.cfg_home), patch.object(monitor, "STATE", self.cfg_home):
+            _, actions = self._tick_pair(con, start=1000, drivers_and_pids=[(10001, "claudeAgent", self.CLAUDE)])
+        self.assertEqual([a["action"] for a in actions], ["steer"])
+        con.close()
+
+
 if __name__ == "__main__":
     unittest.main()

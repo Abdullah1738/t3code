@@ -50,8 +50,11 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
         if not ses and not me.get("thread"):
             say("note: no OPENCODE_SESSION_ID; the exemption is recorded but the gate can't match it to a session")
         secs = parse_ttl(ttl)
-        e = {"session_id": ses, "thread_id": me.get("thread"), "reason": reason.strip()[:500],
-             "created_at": now(), "expires_at": now() + secs, "repo_root": me.get("repo_root"), "pid": os.getppid()}
+        # The driver goes with the session id: the monitor matches a native UUID only under the driver it was written
+        # for, and an entry without one is read as OpenCode.
+        e = {"session_id": ses, "driver": me.get("driver") or "opencode", "thread_id": me.get("thread"),
+             "reason": reason.strip()[:500], "created_at": now(), "expires_at": now() + secs,
+             "repo_root": me.get("repo_root"), "pid": os.getppid()}
         cur.append(e)
         atomic_write_json(EXEMPTIONS, cur)
     event(db(), None, "exemption_add", f"session={ses} thread={me.get('thread')} ttl={secs}s reason={reason[:200]}")
