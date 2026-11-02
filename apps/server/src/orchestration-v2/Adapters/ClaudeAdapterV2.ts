@@ -4587,6 +4587,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly status: OrchestrationV2ProviderTurn["status"];
           readonly completedAt: DateTime.Utc | null;
+          /** The CLI's terminal stop reason (`end_turn`, `max_tokens`, ...); absent until the turn ends. */
+          readonly finish?: string | null;
         }): OrchestrationV2ProviderTurn => ({
           id: input.context.providerTurnId,
           providerThreadId: input.context.input.providerThread.id,
@@ -4601,6 +4603,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           status: input.status,
           startedAt: input.context.startedAt,
           completedAt: input.completedAt,
+          ...(input.finish === undefined ? {} : { finish: input.finish }),
         });
 
         const buildToolCallArtifacts = (input: {
@@ -6576,6 +6579,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context: input.context,
                     status: input.status,
                     completedAt: input.completedAt,
+                    // The terminal result reports the stop reason; a turn that ended with no result has none.
+                    finish: input.result?.stop_reason ?? null,
                   }),
                   turnTokenUsage: normalizeClaudeTurnTokenUsage(
                     input.result,

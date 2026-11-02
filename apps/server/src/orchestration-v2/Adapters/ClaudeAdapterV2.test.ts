@@ -2504,6 +2504,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly apiErrorStatus?: number | null;
     // null omits the field, as the CLI does on a zero-turn result.
     readonly terminalReason?: SDKResultMessage["terminal_reason"] | null;
+    readonly stopReason?: string | null;
     readonly usage?: {
       readonly input_tokens: number;
       readonly output_tokens: number;
@@ -2519,7 +2520,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       is_error: input.isError ?? false,
       num_turns: input.numTurns ?? 1,
       result: input.result,
-      stop_reason: "end_turn",
+      stop_reason: input.stopReason === undefined ? "end_turn" : input.stopReason,
       total_cost_usd: 0,
       usage: input.usage ?? {
         input_tokens: 1,
@@ -3229,6 +3230,43 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         ),
       ),
+  );
+
+  it.effect("records the terminal result's stop reason on the turn's provider turn", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("finish-attempt"),
+          text: "Keep going",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "finish-terminal",
+          result: "Cut off",
+          stopReason: "max_tokens",
+        }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+      const finishes = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status !== "running"
+          ? [event.providerTurn.finish]
+          : [],
+      );
+      // The CLI's own reason, not a value the adapter invented.
+      assert.equal(finishes.at(-1), "max_tokens");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 
   it.effect.each(["completed", "interrupted"] as const)(

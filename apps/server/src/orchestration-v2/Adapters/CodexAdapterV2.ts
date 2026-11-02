@@ -5213,9 +5213,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             const finalAnswer = payload.item.phase !== "commentary";
-            const completedPhase: OrchestrationV2AssistantPhase = finalAnswer
-              ? "answer"
-              : "narration";
+            // Only an explicit phase is proven. A missing or null phase is not an
+            // answer: Codex has not said it is the reply, so it stays unknown.
+            const completedPhase: OrchestrationV2AssistantPhase =
+              payload.item.phase === "final_answer"
+                ? "answer"
+                : payload.item.phase === "commentary"
+                  ? "narration"
+                  : "unknown";
             yield* Ref.update(assistantPhaseByItemId, (current) =>
               new Map(current).set(payload.item.id, completedPhase),
             );

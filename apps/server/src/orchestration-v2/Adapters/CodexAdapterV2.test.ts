@@ -4738,6 +4738,36 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("keeps a text with no explicit Codex phase unknown, never an answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const transcript = finalAnswerTranscript("codex-null-phase-is-unknown", [
+          { id: "answer-null", text: "CODEX_RECOVERY_OK", phase: null },
+        ]);
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-null-phase-is-unknown"),
+            text: "Reply with the requested recovery marker.",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+
+        const phases = assistantMessages(harness.events).map((event) => event.message.phase);
+        assert.deepStrictEqual(phases, ["unknown"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("preserves an empty final answer when only commentary preceded it", () =>
     Effect.scoped(
       Effect.gen(function* () {
