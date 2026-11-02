@@ -240,7 +240,7 @@ export class ControlClient {
     });
   }
 
-  /** @param {string} threadId @param {{ reason?: string }} [options] */
+  /** @param {string} threadId @param {{ reason?: string, clientRequestId?: string, expectedRunId?: string, expectedAttemptId?: string }} [options] */
   interrupt(threadId, options = {}) {
     return this.request("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, options);
   }

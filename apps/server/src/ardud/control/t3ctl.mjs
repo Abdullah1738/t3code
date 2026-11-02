@@ -26,7 +26,7 @@ const HELP = `t3ctl <command> [options]
   messages THREAD [--limit N] [--last] [--role user|assistant]
   send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
-  interrupt THREAD
+  interrupt THREAD [--expect-run RUN] [--expect-attempt ATTEMPT] [--reason TEXT]
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
   origin THREAD ORIGIN|none
   set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
@@ -79,6 +79,9 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     unsettle: { type: "boolean" },
     thread: { type: "string" },
     session: { type: "string" },
+    "expect-run": { type: "string" },
+    "expect-attempt": { type: "string" },
+    reason: { type: "string" },
     "native-id": { type: "string" },
     "agent-id": { type: "string" },
     task: { type: "string" },
@@ -256,7 +259,13 @@ async function main() {
       return print(waited);
     }
     case "interrupt":
-      return print(await client.interrupt(need(args[0], "THREAD")));
+      return print(
+        await client.interrupt(need(args[0], "THREAD"), {
+          expectedRunId: flags["expect-run"],
+          expectedAttemptId: flags["expect-attempt"],
+          reason: flags.reason,
+        }),
+      );
     case "respond": {
       const threadId = need(args[0], "THREAD");
       const requestId = need(args[1], "REQUEST");

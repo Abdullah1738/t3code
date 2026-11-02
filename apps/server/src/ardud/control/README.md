@@ -72,27 +72,31 @@ t3ctl's.
 
 All paths are under `/api/ardud/control`.
 
-| Method | Path                                       | What it does                                                                                |
-| ------ | ------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| GET    | `/health`                                  | Token check plus the latest event sequence.                                                 |
-| GET    | `/projects`                                | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                     |
-| GET    | `/models`                                  | Default model and runtime mode, plus each provider's models and variants.                   |
-| GET    | `/threads`                                 | List threads (see filters below).                                                           |
-| POST   | `/threads`                                 | Create a thread, optionally with a first prompt.                                            |
-| GET    | `/threads/by-native/:sesId?driver=`        | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.      |
+| Method | Path                                                     | What it does                                                                                                     |
+| ------ | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| GET    | `/health`                                                | Token check plus the latest event sequence.                                                                      |
+| GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                          |
+| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models and variants.                                        |
+| GET    | `/threads`                                               | List threads (see filters below).                                                                                |
+| POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                 |
+| GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.                           |
 | GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`. |
-| GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                                  |
-| PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`. |
-| POST   | `/threads/:id/archive-if-idle`             | Archive only if the thread is still idle; otherwise refuse and leave it alone.              |
-| GET    | `/threads/:id/messages`                    | Messages plus `lastAssistant`.                                                              |
-| GET    | `/threads/:id/wait`                        | Long-poll until not running (or needs input).                                               |
-| POST   | `/threads/:id/send`                        | Send a message.                                                                             |
-| POST   | `/threads/:id/interrupt`                   | Stop the active turn.                                                                       |
-| POST   | `/threads/:id/requests/:requestId/respond` | Answer an approval or a question.                                                           |
-| PUT    | `/threads/:id/origin`                      | Set or clear the origin.                                                                    |
-| GET    | `/requests`                                | Every pending approval and question across active threads.                                  |
-| POST   | `/attachments`                             | Get a signed upload URL for a file to attach.                                               |
-| GET    | `/events`                                  | Server-sent events (SSE).                                                                   |
+| GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                       |
+| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`.                      |
+| POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                   |
+| GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                   |
+| GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                    |
+| POST   | `/threads/:id/send`                                      | Send a message.                                                                                                  |
+| POST   | `/threads/:id/interrupt`                                 | Stop the active turn; optional `expectedRunId` and `expectedAttemptId` reject a mismatch with 409.               |
+| POST   | `/threads/:id/requests/:requestId/respond`               | Answer an approval or a question.                                                                                |
+| PUT    | `/threads/:id/origin`                                    | Set or clear the origin.                                                                                         |
+| GET    | `/requests`                                              | Every pending approval and question across active threads.                                                       |
+| POST   | `/attachments`                                           | Get a signed upload URL for a file to attach.                                                                    |
+| GET    | `/events`                                                | Server-sent events (SSE).                                                                                        |
+
+`expectedAttemptId` requires `expectedRunId`. An expected run that is already terminal
+returns `already_terminal` without interrupting. The attempt check is a preflight read,
+not an atomic check at dispatch; an attempt that changes after the read can still be interrupted.
 
 ### GET /threads
 
@@ -268,6 +272,7 @@ alias t3ctl="node <fork>/apps/server/src/ardud/control/t3ctl.mjs"
 t3ctl create --prompt "reply PONG" --origin crw --wait --text
 t3ctl threads --active --text
 t3ctl send <thread> "follow up" --wait --text
+t3ctl interrupt <thread> --expect-run <run> --expect-attempt <attempt> --reason "stalled"
 t3ctl respond <thread> <request> --approve
 t3ctl events --origin imessage
 t3ctl native ses_...
@@ -298,17 +303,17 @@ t3ctl native ses_...
 
 ### telegram-bridge (`src/openchamber.ts`, `attention.ts`, `notification-events.ts`)
 
-| OpenChamber                                                                                        | t3 control API                                                                                                                                  |
-| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention. |
-| `GET /api/permission/request`, `GET /api/form` (directory-wide)                                    | `GET /requests` (all threads; `?origin=none` excludes iMessage)                                                                                 |
-| reply/cancel permission and form                                                                   | `respond` as above                                                                                                                              |
-| `GET /api/session/active`                                                                          | `GET /threads?active=true`                                                                                                                      |
-| `GET /api/permission-auto-accept` (+ `.updated` event)                                             | `runtimeMode` on each thread; `thread.updated` with `change: thread.runtime-mode-updated`                                                       |
-| Events `form.created`, `permission.asked` / `form.replied`, `form.cancelled`, `permission.replied` | `request.opened` / `request.resolved`                                                                                                           |
-| `session.execution.started` / `succeeded`, `failed`, `interrupted`                                 | `thread.status` (`state` running, or waiting/idle; `status` failed, interrupted, ...)                                                           |
-| `session.inbox.enqueued` (user), `session.renamed`                                                 | `message.completed` with `role: "user"`; `thread.updated`                                                                                       |
-| `sessionOrigin` / `IMESSAGE_ORIGIN` filtering                                                      | `origin` on every summary and event                                                                                                             |
+| OpenChamber                                                                                        | t3 control API                                                                            |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention.   |
+| `GET /api/permission/request`, `GET /api/form` (directory-wide)                                    | `GET /requests` (all threads; `?origin=none` excludes iMessage)                           |
+| reply/cancel permission and form                                                                   | `respond` as above                                                                        |
+| `GET /api/session/active`                                                                          | `GET /threads?active=true`                                                                |
+| `GET /api/permission-auto-accept` (+ `.updated` event)                                             | `runtimeMode` on each thread; `thread.updated` with `change: thread.runtime-mode-updated` |
+| Events `form.created`, `permission.asked` / `form.replied`, `form.cancelled`, `permission.replied` | `request.opened` / `request.resolved`                                                     |
+| `session.execution.started` / `succeeded`, `failed`, `interrupted`                                 | `thread.status` (`state` running, or waiting/idle; `status` failed, interrupted, ...)     |
+| `session.inbox.enqueued` (user), `session.renamed`                                                 | `message.completed` with `role: "user"`; `thread.updated`                                 |
+| `sessionOrigin` / `IMESSAGE_ORIGIN` filtering                                                      | `origin` on every summary and event                                                       |
 
 ### crw (`lib/sessions.mjs`, `lib/util.mjs`)
 

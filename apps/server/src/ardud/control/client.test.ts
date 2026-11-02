@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeUtil from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 
@@ -23,6 +25,8 @@ const listen = (handler: Parameters<typeof NodeHttp.createServer>[1]) =>
       resolve(`http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`);
     });
   });
+
+const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 
 describe("discoverConfig", () => {
   const saved = {
@@ -82,6 +86,45 @@ describe("discoverConfig", () => {
 });
 
 describe("ControlClient", () => {
+  it("forwards guarded interrupt options from the client and CLI", async () => {
+    const seen: Array<{ url: string | undefined; body: unknown }> = [];
+    const url = await listen((request, response) => {
+      let text = "";
+      request.on("data", (chunk) => (text += chunk));
+      request.on("end", () => {
+        seen.push({ url: request.url, body: JSON.parse(text) });
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ ok: true, interrupted: true }));
+      });
+    });
+    const options = { expectedRunId: "run-new", expectedAttemptId: "att-2", reason: "stalled" };
+    const client = new ControlClient({ url, token: "t0k" });
+    await client.interrupt("thread/one", { ...options, clientRequestId: "request-1" });
+    const result = await execFile(
+      process.execPath,
+      [
+        NodePath.join(process.cwd(), "src/ardud/control/t3ctl.mjs"),
+        "interrupt",
+        "thread/one",
+        "--expect-run",
+        "run-new",
+        "--expect-attempt",
+        "att-2",
+        "--reason",
+        "stalled",
+      ],
+      { env: { ...process.env, T3_CONTROL_URL: url, T3_CONTROL_TOKEN: "t0k" } },
+    );
+    expect(JSON.parse(result.stdout)).toEqual({ ok: true, interrupted: true });
+    expect(seen).toEqual([
+      {
+        url: "/api/ardud/control/threads/thread%2Fone/interrupt",
+        body: { ...options, clientRequestId: "request-1" },
+      },
+      { url: "/api/ardud/control/threads/thread%2Fone/interrupt", body: options },
+    ]);
+  });
+
   it("sends the bearer token and surfaces API errors", async () => {
     const url = await listen((request, response) => {
       response.setHeader("content-type", "application/json");

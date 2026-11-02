@@ -17,6 +17,7 @@ import {
   ProjectId,
   ProviderApprovalDecision,
   ProviderInteractionMode,
+  RunId,
   RuntimeMode,
   RuntimeRequestId,
   ThreadId,
@@ -256,6 +257,8 @@ const SendBody = Schema.Struct({
 const InterruptBody = Schema.Struct({
   reason: OptionalString,
   clientRequestId: OptionalString,
+  expectedRunId: OptionalString,
+  expectedAttemptId: OptionalString,
 });
 
 const RespondBody = Schema.Struct({
@@ -1014,7 +1017,31 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeInterruptBody);
+    if (body.expectedAttemptId !== undefined && body.expectedRunId === undefined) {
+      return yield* fail("invalid_request", "expectedAttemptId needs expectedRunId");
+    }
+    const expectedRunId = body.expectedRunId?.trim();
+    if (expectedRunId === "") {
+      return yield* fail("invalid_request", "expectedRunId must not be empty.");
+    }
     const shell = yield* getShell(threadId);
+    if (expectedRunId !== undefined) {
+      const records = yield* threads
+        .getThreadRecords(shell.id, ["runs"])
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      const run = records.runs.find((candidate) => candidate.id === expectedRunId);
+      if (
+        run !== undefined &&
+        !TERMINAL_RUN_STATUSES.has(run.status) &&
+        body.expectedAttemptId !== undefined &&
+        run.activeAttemptId !== body.expectedAttemptId
+      ) {
+        return yield* fail(
+          "conflict",
+          `Run ${expectedRunId} is on attempt ${run.activeAttemptId}, not ${body.expectedAttemptId}.`,
+        );
+      }
+    }
     const result = yield* startup
       .enqueueCommand(
         threads.interruptThread({
@@ -1022,6 +1049,7 @@ const makeRoutes = Effect.gen(function* () {
           commandId: yield* commandIdFor(`interrupt:${threadId}`, body.clientRequestId),
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
+          ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
         }),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
