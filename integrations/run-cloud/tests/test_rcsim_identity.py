@@ -101,6 +101,7 @@ class RcsimIdentityTests(unittest.TestCase):
             patch.object(rcsim, "CTL_CFGS", (cfg, root / "none.json")),
             patch.object(rcsim, "RUNCLOUD", str(fake)),
             patch.object(rcsim, "OC_PW", root / "no-password"),
+            patch.object(rcsim, "LOG_PATH", root / "state" / "monitor.log"),
         ]
         for p in self.patches:
             p.start()
@@ -226,6 +227,124 @@ class RcsimIdentityTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 rcsim.cmd_release(args)
         self.assertEqual(self.api_calls(), [])
+
+    # --- shared Claude session: a parent and two native children present the same session id
+
+    def _seed_shared_session_sims(self):
+        con = rcsim.db()
+        for sid, owner in (("sim-parent", PARENT), ("sim-child-a", CHILD), ("sim-child-b", "thread-child-b")):
+            con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                        "VALUES (?,'ios',?,?,'active',1,1,'rcsim')", (sid, owner, CLAUDE_UUID))
+        con.commit()
+        return con
+
+    def _snapshot_db(self, con):
+        return [tuple(r) for r in con.execute("SELECT id, owner_thread, owner_ses, state, handoff_to, last_hb, hb_by "
+                                              "FROM sims ORDER BY id")]
+
+    def _shared_session_callers(self):
+        # Three callers that all present CLAUDE_UUID: the parent shell and two children. Each one names the parent
+        # through --thread or RCSIM_THREAD, which is the path that used to pass the owner check.
+        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(PARENT, None, "top-level")
+        # A real, reachable handoff target: the only thing that can stop a handoff is the guard under test.
+        self.stub.threads["thread-elsewhere"] = {"threadId": "thread-elsewhere", "title": "Elsewhere",
+                                                 "parentThreadId": None, "relationshipToParent": None}
+        for label, thread_env in (("parent", PARENT), ("child-a", PARENT), ("child-b", PARENT)):
+            yield label, thread_env
+
+    def test_shared_session_callers_cannot_release_mine_with_a_named_parent(self):
+        con = self._seed_shared_session_sims()
+        before = self._snapshot_db(con)
+        for label, thread in self._shared_session_callers():
+            with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=thread), \
+                    patch.object(rcsim, "rc") as run_cloud:
+                args = type("A", (), {"mine": True, "ids": [], "thread": thread})()
+                with self.assertRaises(SystemExit, msg=label):
+                    rcsim.cmd_release(args)
+                run_cloud.assert_not_called()
+        self.assertEqual(self._snapshot_db(con), before, "a shared session must not release any simulator")
+        self.assertEqual(self.api_calls(), [])
+
+    def test_shared_session_callers_cannot_release_or_hand_off_by_id(self):
+        con = self._seed_shared_session_sims()
+        before = self._snapshot_db(con)
+        for label, thread in self._shared_session_callers():
+            with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=thread), \
+                    patch.object(rcsim, "rc") as run_cloud:
+                release_args = type("A", (), {"mine": False, "ids": ["sim-child-a"], "thread": thread})()
+                with self.assertRaises(SystemExit, msg=f"{label} release"):
+                    rcsim.cmd_release(release_args)
+                handoff_args = type("A", (), {"id": "sim-child-b", "to": "thread-elsewhere", "note": None,
+                                              "thread": thread})()
+                with self.assertRaises(SystemExit, msg=f"{label} handoff"):
+                    rcsim.cmd_handoff(handoff_args)
+                run_cloud.assert_not_called()
+        self.assertEqual(self._snapshot_db(con), before, "a shared session must not change any owner or handoff")
+        self.assertEqual(self.api_calls(), [])
+
+    def test_shared_session_callers_cannot_claim_create_or_launch(self):
+        con = self._seed_shared_session_sims()
+        con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                    "VALUES ('sim-orphan','ios',NULL,NULL,'active',1,1,'orphan')")
+        con.commit()
+        before = self._snapshot_db(con)
+        for label, thread in self._shared_session_callers():
+            with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=thread), \
+                    patch.object(rcsim, "find_live", return_value=({"id": "sim-new"}, "ios")) as live, \
+                    patch.object(rcsim, "check_hard", return_value="45m"):
+                claim_args = type("A", (), {"thread": thread, "manager": None, "ids": ["sim-orphan", "sim-new"],
+                                            "purpose": None})()
+                with self.assertRaises(SystemExit, msg=f"{label} claim"):
+                    rcsim.cmd_claim(claim_args)
+                live.assert_not_called()
+                create_args = type("A", (), {"thread": thread, "manager": None, "platform": "ios", "name": None,
+                                             "purpose": None, "model": None, "region": None,
+                                             "hard_timeout": "45m", "inactivity_timeout": "none", "install": None,
+                                             "install_asset": None, "no_notify": True, "json": False})()
+                with self.assertRaises(SystemExit, msg=f"{label} create"):
+                    rcsim.cmd_create(create_args)
+                launch_args = type("A", (), {"thread": thread, "manager": None, "platform": "android",
+                                             "name": None, "purpose": None, "model": None, "region": None,
+                                             "hard_timeout": "45m", "inactivity_timeout": "none", "build": "b1",
+                                             "asset": None, "idempotency_key": None, "no_notify": True,
+                                             "json": False})()
+                with self.assertRaises(SystemExit, msg=f"{label} launch"):
+                    rcsim.cmd_launch(launch_args)
+        self.assertEqual(self._snapshot_db(con), before, "a shared session must not claim or register anything")
+        self.assertEqual(self.api_calls(), [], "a shared session must not reach Run Cloud")
+
+    def test_shared_session_callers_cannot_heartbeat_another_execution_by_id(self):
+        con = self._seed_shared_session_sims()
+        before = self._snapshot_db(con)
+        for label, thread in self._shared_session_callers():
+            with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=thread):
+                args = type("A", (), {"ids": ["sim-child-b"], "thread": thread})()
+                with self.assertRaises(SystemExit, msg=label):
+                    rcsim.cmd_heartbeat(args)
+        self.assertEqual(self._snapshot_db(con), before, "a shared session must not refresh another's simulator")
+
+    def test_claude_shell_is_refused_even_when_the_explicit_thread_is_the_parent(self):
+        # whoami(--thread parent) must not come back resolved: the shared session can't name the owner.
+        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(PARENT, None, "top-level")
+        with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID):
+            me = rcsim.whoami(PARENT)
+        self.assertEqual(me["resolution"], "unresolved")
+        self.assertIsNone(me["thread"])
+        self.assertEqual(me["reason"], "claude-shared-session")
+
+    def test_provable_codex_child_can_still_release_its_own_simulator(self):
+        # The gate must not block a provable owner: a resolved Codex child releases its own simulator.
+        con = self._seed_shared_session_sims()
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(CHILD, PARENT, "app-managed-child")
+        with self.shell(CODEX_THREAD_ID=CODEX_UUID), \
+                patch.object(rcsim, "rc", return_value=(0, {"status": "deleted"}, "", "")) as run_cloud:
+            args = type("A", (), {"mine": True, "ids": [], "thread": None})()
+            with self.assertRaises(SystemExit) as done:
+                rcsim.cmd_release(args)
+        self.assertEqual(done.exception.code, 0)
+        mine_released = [r["id"] for r in con.execute("SELECT id FROM sims WHERE state='released'")]
+        self.assertEqual(mine_released, ["sim-child-a"], "only the child's own simulator is released")
+        self.assertEqual(run_cloud.call_count, 1)
 
     # --- liveness
 

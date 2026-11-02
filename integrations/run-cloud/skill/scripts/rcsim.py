@@ -314,6 +314,17 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
     native, driver = caller_native()
     me = {"ses": native, "driver": driver, "resolution": None, "executionKind": None,
           "thread": None, "title": None, "manager": None, "relationship": None}
+    if driver == "claudeAgent":
+        # A Claude shell carries only its session id, which its native children share. No --thread, RCSIM_THREAD
+        # or C1 answer can name this one execution, so the check comes before every explicit and env branch. An
+        # explicit --thread naming the parent would otherwise be trusted as this caller's owner.
+        me["resolution"] = "unresolved"
+        me["reason"] = "claude-shared-session"
+        if thread or (os.environ.get("RCSIM_THREAD") or None):
+            log("claude caller: an explicit or inherited thread is ignored, no owner is taken from a shared session")
+        if manager:
+            me["manager"] = None if manager == "none" else manager
+        return me
     env_thread = None if ignore_env else (os.environ.get("RCSIM_THREAD") or None)
     explicit = thread or env_thread
     if native is not None and driver == "opencode" and explicit is None:
@@ -328,12 +339,7 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
         ident = identity_for(native, driver)
         me["resolution"] = ident.get("resolution")
         me["executionKind"] = ident.get("executionKind")
-        # A Claude shell carries only its session id, shared with its native children. C1's answer for that id is
-        # the parent's identity, so it can't name the owner. Claude callers never get a resolved owner here, and
-        # create/claim/release refuse them through refuse_unresolved.
-        if driver == "claudeAgent":
-            me["resolution"] = "unresolved"
-        elif ident.get("resolution") == "resolved":
+        if ident.get("resolution") == "resolved":
             me["thread"] = ident.get("robobThreadId")
             me["manager"] = ident.get("parentThreadId")
             if me["thread"]:
@@ -371,9 +377,21 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
 def refuse_unresolved(me: dict, action: str) -> None:
     """Rcsim only acts for a resolved execution. Pending, ambiguous and unavailable never fall back to an
     unowned or shared-session owner."""
+    if me.get("reason") == "claude-shared-session":
+        die(f"{action} refused: a Claude shell shares its session id with its native children, so it can't be "
+            f"told apart from them. Claude callers can't own simulators; use a Codex or OpenCode thread, or an "
+            f"iMessage-driven one. Nothing was changed.")
     if me.get("resolution") != "resolved" or not me.get("thread"):
         die(f"{action} refused: this caller is not resolved to a Robob thread yet "
             f"(resolution={me.get('resolution') or 'none'}). Retry in a few seconds; nothing was created.")
+
+
+def refuse_native_unproven(me: dict, action: str) -> None:
+    """Explicit-id mutations (release by id, handoff, heartbeat by id) act on a named simulator. A plain operator
+    shell has no native driver and keeps working. A native caller that isn't resolved to an execution must not
+    change another execution's simulator, so it is refused the same way as --mine."""
+    if me.get("driver") in ("claudeAgent", "codex") and (me.get("resolution") != "resolved" or not me.get("thread")):
+        refuse_unresolved(me, action)
 
 
 # ---------------------------------------------------------------- create / launch
@@ -521,6 +539,8 @@ def my_active(con, me: dict):
 def cmd_heartbeat(a) -> None:
     con = db()
     me = whoami(a.thread)
+    if a.ids:
+        refuse_native_unproven(me, "heartbeat")
     ids = [resolve_id(con, i) for i in a.ids] if a.ids else [r["id"] for r in my_active(con, me)]
     if not ids:
         die("no active simulators registered to this thread (pass ids explicitly)", 1)
@@ -559,6 +579,7 @@ def cmd_release(a) -> None:
         refuse_unresolved(me, "release --mine")
         rows = my_active(con, me)
     elif a.ids:
+        refuse_native_unproven(me, "release")
         rows = [get_row(con, resolve_id(con, i)) for i in a.ids]
     else:
         die("pass ids or --mine")
@@ -623,6 +644,7 @@ def cmd_claim(a) -> None:
 def cmd_handoff(a) -> None:
     con = db()
     me = whoami(a.thread)
+    refuse_native_unproven(me, "handoff")
     sid = resolve_id(con, a.id)
     row = get_row(con, sid)
     if not row or row["state"] != "active":
