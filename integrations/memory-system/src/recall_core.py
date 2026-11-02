@@ -19,6 +19,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+from collections import deque
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -980,53 +981,53 @@ def _state_tree(ids: set[str]) -> set[str]:
         seeds.update(r[0] for r in con.execute(
             "SELECT thread_id FROM ardud_opencode_import WHERE native_session_id IN (SELECT value FROM json_each(?))", (_members(natives),)
         ))
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT child_thread_id FROM {subagent_table} "
+            "WHERE child_thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
+        ) if r[0])
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT thread_id FROM {subagent_table} "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
+        ) if r[0])
         if not seeds:
             return set()
-        # A child may have no trustworthy root field yet. Walk both persisted
-        # lineage and subagent ownership upward before collecting siblings.
-        ancestors = set(seeds)
-        frontier = set(seeds)
-        while frontier:
-            parents = {r[0] for r in con.execute(
-                f"SELECT json_extract(payload_json,'$.lineage.parentThreadId') FROM {thread_table} "
-                "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
-            ) if r[0]}
-            parents.update(r[0] for r in con.execute(
-                f"SELECT thread_id FROM {subagent_table} "
-                "WHERE child_thread_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
-            ) if r[0])
-            frontier = parents - ancestors
-            ancestors.update(frontier)
-        root_rows = con.execute(
-            f"SELECT json_extract(payload_json,'$.lineage.rootThreadId') FROM {thread_table} "
-            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ancestors),)
-        ).fetchall()
-        roots = {r[0] for r in root_rows if r[0]} | ancestors
-        threads = set(roots)
-        threads.update(r[0] for r in con.execute(
-            f"SELECT thread_id FROM {thread_table} WHERE "
-            "json_extract(payload_json,'$.lineage.rootThreadId') IN (SELECT value FROM json_each(?))", (_members(roots),)
-        ))
-        # Include child edges even when a projection's root field is missing or
-        # stale. Read lineage once; its JSON parent field has no index.
-        children: dict[str, set[str]] = {}
-        for child, parent in con.execute(
-            f"SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId') FROM {thread_table}"
+        # Root hints and explicit edges all establish possible membership, even
+        # when projections disagree. Only direct parent edges prove ownership.
+        neighbors: dict[str, set[str]] = {}
+        ownership_children: dict[str, set[str]] = {}
+
+        def link(parent: str, child: str, *, owns: bool) -> None:
+            if not parent or not child or parent == child:
+                return
+            neighbors.setdefault(parent, set()).add(child)
+            neighbors.setdefault(child, set()).add(parent)
+            if owns:
+                ownership_children.setdefault(parent, set()).add(child)
+
+        # The JSON lineage fields have no index, so read them once.
+        for child, parent, root in con.execute(
+            f"SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
+            f"json_extract(payload_json,'$.lineage.rootThreadId') FROM {thread_table}"
         ):
             if parent:
-                children.setdefault(parent, set()).add(child)
-        frontier = set(threads)
-        subagents = []
+                link(parent, child, owns=True)
+            if root:
+                link(root, child, owns=False)
+        threads = set(seeds)
+        frontier = set(seeds)
+        subagents = set()
         while frontier:
             rows = con.execute(
                 f"SELECT thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId') "
-                f"FROM {subagent_table} WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
+                f"FROM {subagent_table} WHERE thread_id IN (SELECT value FROM json_each(?)) "
+                "OR child_thread_id IN (SELECT value FROM json_each(?))", (_members(frontier), _members(frontier))
             ).fetchall()
-            subagents.extend(rows)
-            next_children = {r[1] for r in rows if r[1]}
-            for parent in frontier:
-                next_children.update(children.get(parent, ()))
-            frontier = next_children - threads
+            subagents.update(rows)
+            for parent, child, _agent in rows:
+                if child:
+                    link(parent, child, owns=True)
+            found = set().union(*(neighbors.get(thread, set()) for thread in frontier))
+            frontier = found - threads
             threads.update(frontier)
         out = set(threads)
         natives_by_thread: dict[str, set[str]] = {}
@@ -1041,12 +1042,37 @@ def _state_tree(ids: set[str]) -> set[str]:
             "SELECT thread_id,native_session_id FROM ardud_opencode_import "
             "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(threads),)
         ):
-            out.add(native_id)
-            natives_by_thread.setdefault(thread, set()).add(native_id)
+            if native_id:
+                out.add(native_id)
+                natives_by_thread.setdefault(thread, set()).add(native_id)
+        # Native subagents may have no provider row. Carry every possible
+        # ancestor incarnation through the ownership graph; a nearer provider
+        # does not prove that older/root incarnations did not capture the task.
+        owners = {thread: set(natives) for thread, natives in natives_by_thread.items()}
+        pending = deque((thread, native) for thread, natives in owners.items() for native in natives)
+        while pending:
+            parent, native = pending.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and native not in owners.get(child, ()):
+                    owners.setdefault(child, set()).add(native)
+                    pending.append((child, native))
+        # A second possible ownership path can have no provider even when
+        # another path has one. Propagate that uncertainty rather than using
+        # a root hint to guess the missing incarnation.
+        dangling = threads - owners.keys()
+        pending_dangling = deque(dangling)
+        while pending_dangling:
+            parent = pending_dangling.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and child not in dangling:
+                    dangling.add(child)
+                    pending_dangling.append(child)
+        if dangling:
+            raise UnknownCaller("subagent provider ownership could not be resolved")
         for parent, _child, agent in subagents:
             if agent:
                 out.add(agent)
-                out.update(f"{n}:agent:{agent}" for n in natives_by_thread.get(parent, ()))
+                out.update(f"{n}:agent:{agent}" for n in owners[parent])
         return out
 
 

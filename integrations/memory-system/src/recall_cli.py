@@ -75,9 +75,10 @@ def format_search(res: dict, *, show_queries: bool = True) -> str:
     return "\n".join(l for l in lines if l is not None)
 
 
-def format_view(ref: str, *, include_tools: bool = False, include_reasoning: bool = False, total_chars: int = 60000) -> str:
+def format_view(ref: str, *, include_tools: bool = False, include_reasoning: bool = False, total_chars: int = 60000,
+                resolved_session: str | None = None) -> str:
     ident, start, end, at = parse_ref(ref)
-    sid = rc.resolve_session(ident)
+    sid = resolved_session if resolved_session is not None else rc.resolve_session(ident)
     if not sid:
         return f"No session matches '{ident}'."
     head = rc.session_header(sid)

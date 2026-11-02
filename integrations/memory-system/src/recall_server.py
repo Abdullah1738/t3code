@@ -155,12 +155,10 @@ def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool =
             sid = rc.resolve_session(ref)
             if not sid or sid in excluded:
                 raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
-            # Pin prefix resolution so the view cannot switch sessions between
-            # the guard and the read if the catalog changes.
-            ident, _, _, _ = cli.parse_ref(ref)
-            ref = sid + ref.strip()[len(ident):]
         result = cli.format_view(
-            ref, include_tools=include_tools, include_reasoning=include_reasoning, total_chars=max(2000, min(int(max_chars or 40000), 120000))
+            ref, include_tools=include_tools, include_reasoning=include_reasoning,
+            total_chars=max(2000, min(int(max_chars or 40000), 120000)),
+            resolved_session=sid if excluded else None,
         )
         if excluded and sid in (excluded | recheck()):
             raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
@@ -229,7 +227,7 @@ def _log_inject(entry: dict) -> None:
             except FileNotFoundError:
                 pass
             with INJECT_LOG.open("a") as f:
-                f.write(json.dumps({k: _redact(v) for k, v in entry.items()}, ensure_ascii=False) + "\n")
+                f.write(json.dumps({k: _redact(v) for k, v in entry.items()}) + "\n")
     except OSError:
         pass
 
