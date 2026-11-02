@@ -145,7 +145,8 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
         self.assertEqual(cfg["notify"], [])
-        self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"],
+                         ":".join(m["shellPathPrefix"] + m["shellPath"]))
         self.assertEqual(cfg["agents"]["max_depth"], 1000000)
         self.assertEqual(cfg["history"], {"persistence": "none"})
 
@@ -412,7 +413,9 @@ class GenerateTests(HarnessTestCase):
         self.assertTrue((self.codex / "hooks.json").exists())
 
     def test_no_hooks_leaves_empty_blocks_in_both_codex_homes(self) -> None:
-        self.run_gen()
+        m = self.manifest()
+        m["hooks"] = []
+        self.run_gen(m)
         settings = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(settings["hooks"], {})
         self.assertEqual(json.loads((self.codex / "hooks.json").read_text()), {"hooks": {}})
@@ -553,7 +556,7 @@ class GenerateTests(HarnessTestCase):
             ("plain feature", self.codex, "config.toml", "computer_use = false", "computer_use = true"),
             ("plain injection", self.codex, "config.toml", "[mcp_servers.dia]", "[mcp_servers.node_repl]\ncommand = \"bad\"\n[mcp_servers.dia]"),
             ("CU catalog", self.codex_cu, "models.json", '"tool_mode": "code_mode_only"', '"tool_mode": "bad"'),
-            ("CU hooks", self.codex_cu, "hooks.json", '"hooks": {}', '"hooks": {"PreToolUse": []}'),
+            ("CU hooks", self.codex_cu, "hooks.json", '"PreToolUse"', '"PostToolUse"'),
             ("Claude deny", self.claude, "settings.json", '"Computer"', '"Other"'),
             ("Claude MCP", self.claude, ".claude.json", '"https://mcp.betterstack.com"', '"http://example.invalid"'),
             ("CU shared instructions", self.codex_cu, "AGENTS.md", "Shared instructions.", "Lost instructions."),
@@ -676,10 +679,11 @@ class GenerateTests(HarnessTestCase):
         m = self.manifest()
         m["hooks"] = [{"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 3}]
         self.run_gen(m)
-        self.run_gen()
+        m["hooks"] = []
+        self.run_gen(m)
         for home in (self.codex, self.codex_cu):
             self.assertEqual(json.loads((home / "hooks.json").read_text()), {"hooks": {}})
-        self.assertEqual(self.run_check()[0], 0)
+        self.assertEqual(self.run_check(m)[0], 0)
 
     def test_rescoping_hook_removes_it_from_both_codex_homes(self) -> None:
         m = self.manifest()
