@@ -75,7 +75,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type ControlThreadState,
 } from "./model.ts";
-import { messagePreview, runToolEvidence } from "./evidence.ts";
+import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
 const SSE_HEARTBEAT = Duration.seconds(15);
@@ -1019,7 +1019,7 @@ const makeRoutes = Effect.gen(function* () {
     const runId = yield* param("runId");
     yield* getShell(threadId);
     const records = yield* threads
-      .getThreadRecords(ThreadId.make(threadId), ["runs", "messages", "turnItems"], {
+      .getThreadRecords(ThreadId.make(threadId), ["runs", "messages", "turnItems", "attempts", "providerTurns"], {
         runIds: [RunId.make(runId)],
         messageRunIds: [RunId.make(runId)],
         turnItemRunIds: [RunId.make(runId)],
@@ -1029,6 +1029,10 @@ const makeRoutes = Effect.gen(function* () {
     if (run === undefined) {
       return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
     }
+    // A provider turn is this run's only when its attempt belongs to the run. Each native
+    // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
+    const attemptIds = new Set(records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id));
+    const runTurns = records.providerTurns.filter((turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId));
     const messages = records.messages
       .filter((message) => message.runId === run.id && message.role === "assistant")
       .toSorted(
@@ -1039,7 +1043,7 @@ const makeRoutes = Effect.gen(function* () {
     const evidence = runToolEvidence({
       runStatus: run.status,
       turnItems: records.turnItems.filter((item) => item.runId === run.id),
-      itemsComplete: true,
+      itemsComplete: providerTurnsSettled(runTurns),
     });
     return json({
       ok: true,

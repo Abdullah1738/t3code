@@ -1,4 +1,8 @@
-import type { OrchestrationV2ConversationMessage, OrchestrationV2TurnItem } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ConversationMessage,
+  OrchestrationV2ProviderTurn,
+  OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
 
 import { TERMINAL_RUN_STATUSES } from "./model.ts";
 
@@ -26,6 +30,18 @@ export interface RunEvidence {
   readonly toolEvidence: ToolEvidence;
   /** Every turn item of the run was read, and the run has settled. */
   readonly complete: boolean;
+}
+
+/**
+ * Whether the run's native streams all reached their own terminal state. A lost or
+ * abandoned stream leaves a provider turn running, interrupted or failed, and then tools
+ * may have run unseen, so the route must not claim `none`. A run with no provider turn
+ * is not proven either.
+ */
+export function providerTurnsSettled(
+  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "status">>,
+): boolean {
+  return turns.length > 0 && turns.every((turn) => turn.status === "completed");
 }
 
 const PREVIEW_CHARS = 200;

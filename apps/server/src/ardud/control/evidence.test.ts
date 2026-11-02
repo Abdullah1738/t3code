@@ -1,9 +1,27 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { messagePreview, runToolEvidence } from "./evidence.ts";
+import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
 
 const assistant = { type: "assistant_message" } as const;
 const command = { type: "command_execution" } as const;
+const turn = (status: string) => ({ status }) as never;
+
+describe("providerTurnsSettled", () => {
+  it("is true only when every native stream of the run completed", () => {
+    expect(providerTurnsSettled([turn("completed"), turn("completed")])).toBe(true);
+  });
+
+  it("is false for a lost or abandoned stream, since tools may have run unseen", () => {
+    expect(providerTurnsSettled([turn("completed"), turn("running")])).toBe(false);
+    expect(providerTurnsSettled([turn("interrupted")])).toBe(false);
+    expect(providerTurnsSettled([turn("failed")])).toBe(false);
+    expect(providerTurnsSettled([turn("cancelled")])).toBe(false);
+  });
+
+  it("is false for a run with no provider turn, since nothing proves its streams settled", () => {
+    expect(providerTurnsSettled([])).toBe(false);
+  });
+});
 
 describe("runToolEvidence", () => {
   it("is none only when the run is terminal and every item is loaded with no tool item", () => {
@@ -61,6 +79,26 @@ describe("runToolEvidence", () => {
       itemsComplete: true,
     });
     expect(evidence).toStrictEqual({ toolEvidence: "ran", complete: true });
+  });
+
+  it("is unknown for a completed run whose stream was lost, so a retry is never allowed on silence", () => {
+    // The route computes itemsComplete from the run's provider turns; a lost stream fails that.
+    const evidence = runToolEvidence({
+      runStatus: "completed",
+      turnItems: [assistant],
+      itemsComplete: providerTurnsSettled([turn("completed"), turn("interrupted")]),
+    });
+    expect(evidence.toolEvidence).toBe("unknown");
+    expect(evidence.complete).toBe(false);
+  });
+
+  it("is none only when the run completed, every native stream settled and no tool item exists", () => {
+    const evidence = runToolEvidence({
+      runStatus: "completed",
+      turnItems: [assistant],
+      itemsComplete: providerTurnsSettled([turn("completed")]),
+    });
+    expect(evidence).toStrictEqual({ toolEvidence: "none", complete: true });
   });
 });
 
