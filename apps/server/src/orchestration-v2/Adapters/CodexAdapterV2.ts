@@ -52,6 +52,7 @@ import type {
   OrchestrationV2PlanArtifact,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderFailure,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderRetry,
   OrchestrationV2ProviderSession,
   OrchestrationV2ProviderThread,
@@ -1123,6 +1124,44 @@ function codexExhaustionHttpStatus(errorInfo: CodexErrorInfo | null | undefined)
     "responseTooManyFailedAttempts" in errorInfo
     ? (errorInfo.responseTooManyFailedAttempts.httpStatusCode ?? null)
     : null;
+}
+
+/**
+ * What a Codex failure means for the next attempt, from the app-server's own error
+ * code. The literals are the generated CodexErrorInfo union; anything else is unknown.
+ */
+export function codexFailureCategory(
+  code: string | null,
+  errorInfo: CodexErrorInfo | null | undefined,
+): OrchestrationV2ProviderFailureCategory {
+  if (code === "usageLimitExceeded" || code === "rateLimitExceeded") return "quota";
+  if (codexExhaustionHttpStatus(errorInfo) === 429) return "quota";
+  if (codexExhaustionHttpStatus(errorInfo) === 503) return "transient";
+  // Only codes whose meaning the generated schema states are mapped. badRequest and
+  // internalServerError have no description there, so they stay unknown (flag path).
+  switch (code) {
+    case "serverOverloaded":
+    case "flexUnavailable":
+      return "transient";
+    case "unauthorized":
+      return "auth_expired";
+    case "contextWindowExceeded":
+      return "context_exhausted";
+    case "cyberPolicy":
+    case "misalignmentPolicyViolation":
+      return "content_filter";
+    default:
+      break;
+  }
+  // An HTTP or stream connection failure never got an answer: a timeout or a reset.
+  if (
+    code === "httpConnectionFailed" ||
+    code === "responseStreamConnectionFailed" ||
+    code === "responseStreamDisconnected"
+  ) {
+    return "transient";
+  }
+  return "unknown";
 }
 
 function codexUsageLimitError(
@@ -4605,6 +4644,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   class: codexUsageLimitError(notificationCode, payload.error.codexErrorInfo)
                     ? "usage_limit"
                     : "provider_error",
+                  category: codexFailureCategory(notificationCode, payload.error.codexErrorInfo),
                 }),
               };
               return;
@@ -4630,6 +4670,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : code?.startsWith("http") === true || code?.startsWith("responseStream") === true
                   ? "transport_error"
                   : "provider_error",
+              category: codexFailureCategory(code, payload.error.codexErrorInfo),
               retryable: true,
             });
             const itemOrdinal =
@@ -5704,6 +5745,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       message: input.failureMessage,
                       code: failureCode,
                       class: failureClass,
+                      category: codexFailureCategory(failureCode ?? null, input.failureErrorInfo),
                     });
               return {
                 type: "turn.terminal",

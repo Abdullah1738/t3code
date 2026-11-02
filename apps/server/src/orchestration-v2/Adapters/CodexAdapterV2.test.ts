@@ -7186,6 +7186,64 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it("maps each Codex app-server failure code to one normalized category", () => {
+    const cases: ReadonlyArray<readonly [string, string | null, unknown, string]> = [
+      ["usageLimitExceeded is quota", "usageLimitExceeded", undefined, "quota"],
+      ["rateLimitExceeded is quota", "rateLimitExceeded", undefined, "quota"],
+      [
+        "exhausted 429 is quota",
+        "responseTooManyFailedAttempts",
+        { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+        "quota",
+      ],
+      [
+        "exhausted 503 is transient",
+        "responseTooManyFailedAttempts",
+        { responseTooManyFailedAttempts: { httpStatusCode: 503 } },
+        "transient",
+      ],
+      ["serverOverloaded is transient", "serverOverloaded", undefined, "transient"],
+      ["flexUnavailable is transient", "flexUnavailable", undefined, "transient"],
+      ["httpConnectionFailed is transient", "httpConnectionFailed", undefined, "transient"],
+      [
+        "responseStreamConnectionFailed is transient",
+        "responseStreamConnectionFailed",
+        undefined,
+        "transient",
+      ],
+      [
+        "responseStreamDisconnected is transient",
+        "responseStreamDisconnected",
+        undefined,
+        "transient",
+      ],
+      ["unauthorized is expired auth", "unauthorized", undefined, "auth_expired"],
+      [
+        "contextWindowExceeded is context exhaustion",
+        "contextWindowExceeded",
+        undefined,
+        "context_exhausted",
+      ],
+      ["cyberPolicy is a content filter", "cyberPolicy", undefined, "content_filter"],
+      [
+        "misalignmentPolicyViolation is a content filter",
+        "misalignmentPolicyViolation",
+        undefined,
+        "content_filter",
+      ],
+      ["badRequest stays unknown (no stated meaning)", "badRequest", undefined, "unknown"],
+      ["internalServerError stays unknown", "internalServerError", undefined, "unknown"],
+      ["a missing code is unknown", null, undefined, "unknown"],
+    ];
+    for (const [name, code, errorInfo, expected] of cases) {
+      assert.strictEqual(
+        CodexAdapterV2.codexFailureCategory(code, errorInfo as never),
+        expected,
+        name,
+      );
+    }
+  });
+
   it.effect.each([
     {
       name: "usage",
