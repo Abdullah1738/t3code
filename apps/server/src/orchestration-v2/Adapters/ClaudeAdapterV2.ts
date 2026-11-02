@@ -67,6 +67,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
+  type OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderGoal,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2PlanStep,
@@ -2944,6 +2945,64 @@ function claudeUsageLimitResetAt(resetsAt: unknown): string | null {
     : null;
 }
 
+/**
+ * What a Claude failure means for the next attempt. Decided from the SDK's own
+ * status and reason fields first; the message text is only the fallback for
+ * failures that carry neither.
+ */
+// A 400 whose text names a model or effort the request can't use: a config fault, not a bad prompt.
+const CLAUDE_MODEL_CONFIG_TEXT =
+  /\b(?:invalid|unknown|unsupported)\s+(?:model|effort)\b|\bmodel\s+(?:not found|does not exist|is not available)\b|\beffort\s+(?:level\s+)?(?:is\s+)?(?:invalid|not supported)\b/i;
+
+export function claudeFailureCategory(input: {
+  readonly apiErrorStatus?: number | null | undefined;
+  readonly terminalReason?: string | null | undefined;
+  readonly retryError?: string | null | undefined;
+  readonly retryStatus?: number | null | undefined;
+  readonly noResponse?: boolean | undefined;
+  /** Rate-limit evidence on the turn: a usage limit even when the CLI ends it as blocking_limit. */
+  readonly usageLimited?: boolean | undefined;
+  readonly text?: string | undefined;
+}): OrchestrationV2ProviderFailureCategory {
+  if (input.usageLimited === true) return "quota";
+  const status = input.apiErrorStatus ?? input.retryStatus ?? null;
+  if (status === 429) return "quota";
+  if (status === 529 || status === 503) return "transient";
+  if (status === 401) return "auth_expired";
+  switch (input.retryError) {
+    case "rate_limit":
+      return "quota";
+    case "overloaded":
+    case "server_error":
+      return "transient";
+    case "authentication_failed":
+      return "auth_expired";
+    // Account state a retry can't change: pausing would loop, so these fail the card.
+    case "billing_error":
+    case "account_on_hold":
+    case "oauth_org_not_allowed":
+    case "verification_required":
+      return "config";
+    // A bare invalid_request is also how the API refuses an over-long prompt, so it
+    // is not called a config error here; the text check below decides it.
+    case "model_not_found":
+      return "model_invalid";
+    default:
+      break;
+  }
+  // No HTTP response at all, or the first byte never came: a timeout or a reset.
+  if (input.noResponse === true || (input.retryStatus === null && input.retryError === "unknown")) {
+    return "transient";
+  }
+  if (input.terminalReason === "prompt_too_long" || input.terminalReason === "blocking_limit") {
+    return "context_exhausted";
+  }
+  if (status === 400 && input.text !== undefined && CLAUDE_MODEL_CONFIG_TEXT.test(input.text)) {
+    return "model_invalid";
+  }
+  return "unknown";
+}
+
 function providerFailureFromResult(
   message: SDKResultMessage,
   completedAt: DateTime.Utc,
@@ -2969,6 +3028,7 @@ function providerFailureFromResult(
     if (seconds > 0 && resetMs < 8.64e15) {
       return makeProviderFailure({
         class: "usage_limit",
+        category: "quota",
         message: "Claude API rate limit reached. Try again later.",
         code: "api_error_429",
         retryable: true,
@@ -2997,6 +3057,11 @@ function providerFailureFromResult(
       message: listedError ?? structuredError ?? message.errors.join("\n"),
       code: message.subtype,
       class: failureClass,
+      category: claudeFailureCategory({
+        terminalReason: message.terminal_reason,
+        usageLimited,
+        text: listedError ?? structuredError ?? message.errors.join("\n"),
+      }),
     });
   }
   if (!message.is_error && structuredError === undefined) {
@@ -3010,6 +3075,12 @@ function providerFailureFromResult(
         ? (message.terminal_reason ?? "sdk_result_error")
         : `api_error_${apiErrorStatus}`,
     class: failureClass,
+    category: claudeFailureCategory({
+      apiErrorStatus,
+      terminalReason: message.terminal_reason,
+      usageLimited,
+      text: listedError ?? structuredError ?? failureHint ?? message.result,
+    }),
     retryable: apiErrorStatus === 429 || apiErrorStatus === 529 ? true : null,
   });
 }
@@ -3018,6 +3089,11 @@ function providerFailureFromApiRetry(message: SDKAPIRetryMessage): Orchestration
   const errorName = message.error.replaceAll("_", " ");
   return makeProviderFailure({
     message: `Claude API ${errorName}.`,
+    category: claudeFailureCategory({
+      retryError: message.error,
+      retryStatus: message.error_status,
+      noResponse: message.no_response !== undefined,
+    }),
     code:
       message.error_status === null
         ? message.error

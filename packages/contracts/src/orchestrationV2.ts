@@ -1271,6 +1271,25 @@ const OrchestrationV2ProviderFailureMessage = TrimmedNonEmptyString.check(
 const OrchestrationV2ProviderFailureCode = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 
 /**
+ * What a failure means for the next attempt, normalized across drivers. The
+ * board and schedules decide from this, not from driver codes or message text.
+ * `unknown` is the decoding default, so records written before this field existed
+ * still decode.
+ */
+export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
+  "quota",
+  "transient",
+  "auth_expired",
+  "config",
+  "model_invalid",
+  "context_exhausted",
+  "content_filter",
+  "unknown",
+]);
+export type OrchestrationV2ProviderFailureCategory =
+  typeof OrchestrationV2ProviderFailureCategory.Type;
+
+/**
  * Producers must redact credentials before constructing this value.
  */
 export const OrchestrationV2ProviderFailure = Schema.Struct({
@@ -1279,6 +1298,9 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  category: Schema.optional(OrchestrationV2ProviderFailureCategory).pipe(
+    Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
+  ),
 });
 export type OrchestrationV2ProviderFailure = typeof OrchestrationV2ProviderFailure.Type;
 

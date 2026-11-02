@@ -4393,6 +4393,63 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it("maps every Claude failure signal to one normalized category", () => {
+    const cases: ReadonlyArray<
+      readonly [
+        string,
+        Parameters<typeof ClaudeAdapterV2.claudeFailureCategory>[0],
+        ReturnType<typeof ClaudeAdapterV2.claudeFailureCategory>,
+      ]
+    > = [
+      ["429 is quota", { apiErrorStatus: 429 }, "quota"],
+      ["529 is transient", { apiErrorStatus: 529 }, "transient"],
+      ["503 is transient", { apiErrorStatus: 503 }, "transient"],
+      ["401 is expired auth", { apiErrorStatus: 401 }, "auth_expired"],
+      ["a retried rate_limit is quota", { retryError: "rate_limit", retryStatus: 429 }, "quota"],
+      ["overloaded is transient", { retryError: "overloaded", retryStatus: 529 }, "transient"],
+      ["server_error is transient", { retryError: "server_error", retryStatus: 500 }, "transient"],
+      [
+        "no HTTP response is a transient timeout",
+        { retryError: "unknown", retryStatus: null, noResponse: true },
+        "transient",
+      ],
+      [
+        "authentication_failed is expired auth",
+        { retryError: "authentication_failed", retryStatus: null },
+        "auth_expired",
+      ],
+      [
+        "billing_error is a config fault",
+        { retryError: "billing_error", retryStatus: 402 },
+        "config",
+      ],
+      [
+        "model_not_found is an invalid model",
+        { retryError: "model_not_found", retryStatus: 404 },
+        "model_invalid",
+      ],
+      [
+        "an invalid effort in a 400 is an invalid model",
+        { apiErrorStatus: 400, text: "API Error: 400 invalid effort level for this model" },
+        "model_invalid",
+      ],
+      [
+        "prompt too long ends the turn as context exhaustion",
+        { terminalReason: "prompt_too_long" },
+        "context_exhausted",
+      ],
+      [
+        "blocking_limit with rate-limit evidence stays a usage limit",
+        { terminalReason: "blocking_limit", usageLimited: true },
+        "quota",
+      ],
+      ["an unrecognized failure stays unknown", { apiErrorStatus: 418 }, "unknown"],
+    ];
+    for (const [name, input, expected] of cases) {
+      assert.strictEqual(ClaudeAdapterV2.claudeFailureCategory(input), expected, name);
+    }
+  });
+
   it.effect.each([429, 401, 503, 529])(
     "classifies the current Claude API status %s after rate-limit evidence",
     (apiErrorStatus) =>

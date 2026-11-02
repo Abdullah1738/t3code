@@ -1,6 +1,7 @@
 import type {
   NodeId,
   OrchestrationV2ProviderFailure,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderFailureClass,
   OrchestrationV2ProviderRetry,
   OrchestrationV2TurnItem,
@@ -189,6 +190,7 @@ export function makeProviderFailure(input: {
   readonly message?: string | undefined;
   readonly code?: string | null | undefined;
   readonly class?: OrchestrationV2ProviderFailureClass;
+  readonly category?: OrchestrationV2ProviderFailureCategory;
   readonly retryable?: boolean | null;
   readonly resetAt?: string | null;
 }): OrchestrationV2ProviderFailure {
@@ -203,6 +205,7 @@ export function makeProviderFailure(input: {
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
+    category: input.category ?? "unknown",
     ...(input.class === "usage_limit" &&
     input.resetAt != null &&
     Number.isFinite(Date.parse(input.resetAt))
