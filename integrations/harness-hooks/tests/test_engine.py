@@ -753,6 +753,29 @@ printf done | cat"""
                 result = self.run_shell(rewritten + "\nexit 19", env, shell=shell)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (19, "exit-status=19\n", ""))
 
+    def test_failing_exit_action_runs_err_handler_once_per_failure(self):
+        self.actor()
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        for harness in ("claude", "codex"):
+            for shell in ("/bin/bash", "/bin/zsh"):
+                for action in ("false", "false; false", "false; true", "false || :"):
+                    for exit_status in (0, 19):
+                        with self.subTest(harness=harness, shell=shell, action=action, status=exit_status):
+                            command = "trap 'echo cleanup >> calls' ERR; trap " + shlex.quote(action) + " EXIT"
+                            event = self.event(command, session="codex-child", agent=None) if harness == "codex" else self.event(command)
+                            env = self.shell_environment(**({"CODEX_THREAD_ID": "codex-child", "ROBOB_HARNESS": "codex"} if harness == "codex" else {"CLAUDE_CODE_SESSION_ID": "session", "ROBOB_HARNESS": "claude"}))
+                            rewritten = self.run_adapter(harness, event)["hookSpecificOutput"]["updatedInput"]["command"]
+                            suffix = f"\nexit {exit_status}"
+                            calls = self.root / "calls"
+                            calls.unlink(missing_ok=True)
+                            raw = self.run_shell(command + suffix, env, shell=shell)
+                            expected_calls = calls.read_text() if calls.exists() else ""
+                            calls.unlink(missing_ok=True)
+                            actual = self.run_shell(rewritten + suffix, env, shell=shell)
+                            actual_calls = calls.read_text() if calls.exists() else ""
+                            self.assertEqual((actual.returncode, actual.stdout, actual.stderr, actual_calls),
+                                             (raw.returncode, raw.stdout, raw.stderr, expected_calls))
+
     def test_exit_trap_remains_attributed_to_codex_child(self):
         self.actor()
         self.add_identity("codex-parent", "parent", model="claude-opus-5-5")

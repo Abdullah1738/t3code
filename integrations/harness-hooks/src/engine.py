@@ -288,10 +288,12 @@ def _exit_trap_update(path, before, identity, pin):
         argument = _exit_trap_argument(current)
         if argument is None or argument == _exit_trap_argument(previous):
             return
-        # The argument is from the shell's `trap` builtin, with its quoting
-        # intact for both bash and zsh, including embedded newlines.
-        action = (variable + "=$?; " + exports + "; (exit \"$" + variable + "\") && :; eval " + argument)
-        sys.stdout.write("trap -- " + shlex.quote(action) + " EXIT\n")
+        # Let the shell decode its own trap representation, then splice the
+        # action into the trap itself: an eval adds an extra ERR boundary.
+        action_var = variable + "_action"
+        prefix = variable + "=$?; " + exports + "; (exit \"$" + variable + "\") && :\n"
+        sys.stdout.write(action_var + "=" + argument + "\ntrap -- " + shlex.quote(prefix) +
+                         '"$' + action_var + '" EXIT\nunset ' + action_var + "\n")
     finally:
         for filename in (path, before, path + ".function", before + ".function"):
             try:
