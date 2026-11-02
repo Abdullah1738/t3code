@@ -99,6 +99,7 @@ interface SubagentRow {
   readonly thread_id: string;
   readonly child_thread_id: string | null;
   readonly model_json: string | null;
+  readonly parent_node_id?: string | null;
 }
 
 const parseModel = (json: string | null): ModelSelection | null => {
@@ -222,7 +223,8 @@ const make = Effect.gen(function* () {
     parentProviderThreadId: string,
   ) =>
     sql<SubagentRow>`
-      SELECT s.thread_id, s.child_thread_id, json_extract(s.payload_json, '$.modelSelection') AS model_json
+      SELECT s.thread_id, s.child_thread_id, s.parent_node_id,
+        json_extract(s.payload_json, '$.modelSelection') AS model_json
       FROM orchestration_v2_projection_subagents AS s
       JOIN orchestration_v2_projection_nodes AS n ON n.node_id = s.subagent_id
       WHERE s.thread_id = ${threadId}
@@ -234,6 +236,23 @@ const make = Effect.gen(function* () {
         AND n.kind = 'subagent'
         AND n.provider_thread_id = ${parentProviderThreadId}
     `.pipe(Effect.mapError(fail("read-subagent-by-agent")));
+
+  // Claude's in-process tasks share the root provider thread. Resolve just the
+  // immediate owner here; hook policy handles any further ancestry separately.
+  const ownerChildThread = (threadId: string, parentNodeId: string) =>
+    sql<{ readonly child_thread_id: string; readonly provider_thread_id: string | null }>`
+      SELECT s.child_thread_id, n.provider_thread_id
+      FROM orchestration_v2_projection_subagents AS s
+      JOIN orchestration_v2_projection_nodes AS n ON n.node_id = s.subagent_id
+      WHERE s.subagent_id = ${parentNodeId}
+        AND s.thread_id = ${threadId}
+        AND s.origin = 'provider_native'
+        AND s.child_thread_id IS NOT NULL
+        AND n.kind = 'subagent'
+    `.pipe(
+      Effect.map((rows) => rows[0] ?? null),
+      Effect.mapError(fail("read-owner-child-thread")),
+    );
 
   // Codex children: the subagent row points at the child's own provider thread.
   // Only provider-native children qualify; app-owned delegation also records a
@@ -346,10 +365,16 @@ const make = Effect.gen(function* () {
             ? unresolved("pending")
             : unresolved("unavailable");
         }
+        const owner = subagent.parent_node_id
+          ? yield* ownerChildThread(threadId, subagent.parent_node_id)
+          : null;
+        if (owner !== null && owner.provider_thread_id !== row.provider_thread_id) {
+          return unresolved("unavailable");
+        }
         return {
           resolution: "resolved",
           robobThreadId: subagent.child_thread_id,
-          parentThreadId: subagent.thread_id,
+          parentThreadId: owner?.child_thread_id ?? subagent.thread_id,
           rootThreadId: yield* rootOf(subagent.thread_id),
           executionKind: "provider-native-child",
           driver,

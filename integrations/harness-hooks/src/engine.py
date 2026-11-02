@@ -373,6 +373,8 @@ def _exit_trap_update(path, before, identity, pin):
                 pass
 
 
+# The wrapper assumes a fresh top-level shell for each tool call. An existing
+# ERR trap can fire twice; a top-level return skips cleanup only by ending the shell.
 def _command_with_context(command, identity, pin):
     """Scope exports to this execution without losing shell cwd changes."""
     name = "__harness_hook_" + secrets.token_hex(8)

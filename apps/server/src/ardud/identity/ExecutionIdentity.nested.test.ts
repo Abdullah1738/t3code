@@ -6,9 +6,6 @@ import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ExecutionIdentity from "./ExecutionIdentity.ts";
 
 describe("Claude nested execution identity", () => {
-  it.fails("documents the unresolved ownership flattening until the source fix is verified", () => {
-    assert.fail("Pending #296: nested Claude ownership is flattened by the adapter and resolver.");
-  });
   it.effect("uses the owning node, including old flattened children, and isolates siblings", () =>
     Effect.scoped(
       Effect.gen(function* () {
