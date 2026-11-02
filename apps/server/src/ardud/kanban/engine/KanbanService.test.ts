@@ -73,7 +73,10 @@ const makeFake = Effect.gen(function* () {
   const threads = yield* Ref.make(new Map<string, FakeThread>());
   const interrupted: Array<string> = [];
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
-  const failures = new Map<string, OrchestrationV2ProviderFailure>();
+  const failures = new Map<
+    string,
+    OrchestrationV2ProviderFailure & { readonly model?: ModelSelection | null }
+  >();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
   let nextRun = 0;
@@ -83,7 +86,11 @@ const makeFake = Effect.gen(function* () {
     if (!runIds.has(failure)) runIds.set(failure, `run-${(nextRun += 1)}`);
     return { ...failure, runId: runIds.get(failure)! };
   };
-  const sends: Array<{ threadId: string; model: ModelSelection | undefined }> = [];
+  const sends: Array<{
+    threadId: string;
+    model: ModelSelection | undefined;
+    key: string | undefined;
+  }> = [];
   const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
   // Threads whose sends are refused, to test a wake that doesn't land.
   const rejectSends = new Set<string>();
@@ -158,7 +165,7 @@ const makeFake = Effect.gen(function* () {
               return Effect.fail(new KanbanThreadError({ operation: "send", detail: "refused" }));
             }
             if (thread) thread.messages.push(input.text);
-            sends.push({ threadId: input.threadId, model: input.model });
+            sends.push({ threadId: input.threadId, model: input.model, key: input.key });
             return Effect.void;
           }),
         ),
@@ -4168,11 +4175,12 @@ it.effect("an owner's pick on an archived evaluator's choice reaches its replace
 );
 
 // Provider outage tests: the probe answers when probe.ok is true, dies otherwise.
-const outage = {
+const outage: OrchestrationV2ProviderFailure = {
   class: "provider_error",
   code: "provider.invalid-request",
   message: "Third-party apps now draw from your extra usage, not your plan limits.",
-} as never;
+  retryable: null,
+};
 const probe = { ok: false, calls: 0 };
 /** Everything but the service, so a test can start a second service on the same store. */
 const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
@@ -4273,6 +4281,25 @@ it.effect("an outage after a card_edit model switch holds the thread's live mode
       yield* kanban.dispatchNow;
       assert.isNull((yield* kanban.card(onSol.id)).card.activeThreadId);
       assert.isNotNull((yield* kanban.card(plain.id)).card.activeThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("an outage is filed under the failed run's model", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.modelSwitches.push({ threadId, model: board.defaultCardModel });
+      fake.failures.set(threadId, { ...outage, model: sol });
+      yield* kanban.turnEnded(threadId);
+      const link = yield* kanban.caller(threadId);
+      assert.isNotNull(link?.paused);
+      assert.deepStrictEqual(link?.model, sol);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -4820,6 +4847,52 @@ it.effect("a paused link gets exactly one wake when its probe passes", () =>
       const after = (yield* Ref.get(fake.threads)).get(threadId)!.messages.length;
       assert.strictEqual(after - before, 1);
     }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a wake reuses one command key per outage", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const saved = yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const { board } = yield* toyBoard;
+        const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+        fake.failures.set(threadId, outage);
+        yield* kanban.turnEnded(threadId);
+        const link = (yield* kanban.caller(threadId))!;
+        assert.isNotNull(link.paused);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+        return link;
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+
+      // Restore the persisted pause to simulate a crash after the send but before its clear.
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putThreadLink(saved);
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.probeOutages;
+        const wakes = fake.sends.filter((send) => send.threadId === saved.threadId);
+        assert.strictEqual(wakes.length, 2);
+        assert.match(wakes[0]?.key ?? "", /^wake:[a-f0-9]{32}$/);
+        assert.strictEqual(wakes[1]?.key, wakes[0]?.key);
+        assert.isNull((yield* kanban.caller(saved.threadId))?.paused ?? null);
+
+        // A later failure is a distinct outage epoch on that same link.
+        fake.failures.set(saved.threadId, { ...outage });
+        yield* kanban.turnEnded(saved.threadId);
+        assert.notStrictEqual((yield* kanban.caller(saved.threadId))?.paused?.at, saved.paused?.at);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        const later = fake.sends.filter((send) => send.threadId === saved.threadId);
+        assert.strictEqual(later.length, 3);
+        assert.notStrictEqual(later[2]?.key, later[0]?.key);
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+    }).pipe(Effect.provide(probeDeps(fake.layer)));
   }),
 );
 
@@ -7538,7 +7611,7 @@ it.effect("a failed outage post is retried by the next probe, and recovery waits
   }),
 );
 
-it.effect("a rejected wake after an announced recovery does not post recovery twice", () =>
+it.effect("a refused wake is not announced as woken", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     probe.ok = false;
@@ -7557,38 +7630,46 @@ it.effect("a rejected wake after an announced recovery does not post recovery tw
         (discussion) => discussion.title === "Provider outages",
       )!.id;
 
-      // Recovery posts, but the wake is refused: the link stays paused.
+      // The wake is refused: the link stays paused and no recovery is announced.
       probe.ok = true;
       fake.rejectSends.add(threadId);
       yield* TestClock.adjust("20 minutes");
       yield* kanban.probeOutages;
       assert.isNotNull((yield* kanban.caller(threadId))?.paused);
+      assert.strictEqual(
+        outageTitled(yield* kanban.messages(discussionId)).filter((text) =>
+          text.includes("answers again"),
+        ).length,
+        0,
+      );
 
-      // The wake lands on the next passing probe; recovery must not be posted again.
+      // The wake lands on the next passing probe and is counted once.
       fake.rejectSends.delete(threadId);
       yield* TestClock.adjust("20 minutes");
       yield* kanban.probeOutages;
       assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
       const texts = outageTitled(yield* kanban.messages(discussionId));
-      assert.strictEqual(texts.filter((text) => text.includes("answers again")).length, 1);
+      const recoveries = texts.filter((text) => text.includes("answers again"));
+      assert.strictEqual(recoveries.length, 1);
+      assert.include(recoveries[0] ?? "", "1 paused thread woken");
     }).pipe(Effect.provide(probeLayer(fake.layer)));
   }),
 );
 
-const failingLinkProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
+const failingRecoveryPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(
       fake.pipe(
         Layer.provideMerge(KanbanModels.layerTest(null)),
-        Layer.provideMerge(failingLinkStore.pipe(Layer.provide(KanbanStore.layer))),
+        Layer.provideMerge(failingPostStore.pipe(Layer.provide(KanbanStore.layer))),
         Layer.provideMerge(Sqlite.layerMemory),
         Layer.provideMerge(
           Layer.mock(TextGeneration.TextGeneration)({
             generateJson: (() => {
               probe.calls += 1;
               if (probe.ok) {
-                linkFailures.remaining = linkFailures.afterPass;
-                linkFailures.afterPass = 0;
+                postFailures.remaining = postFailures.afterPass;
+                postFailures.afterPass = 0;
               }
               return probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
             }) as never,
@@ -7604,8 +7685,8 @@ const failingLinkProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
 const failingPostProbeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake, true)));
 
-// Fails the next `linkFailures.remaining` threadLinks reads (the recovery scan reads them first).
-const linkFailures = { skip: 0, remaining: 0, afterPass: 0 };
+// Fail a paused-link count or the subsequent discussion read during an outage alert.
+const linkFailures = { remaining: 0, alertReads: 0 };
 const failingLinkStore = Layer.effect(
   KanbanStore.KanbanStore,
   Effect.gen(function* () {
@@ -7613,10 +7694,6 @@ const failingLinkStore = Layer.effect(
     return {
       ...real,
       threadLinks: (filter) => {
-        if (linkFailures.skip > 0) {
-          linkFailures.skip -= 1;
-          return real.threadLinks(filter);
-        }
         return linkFailures.remaining > 0
           ? ((linkFailures.remaining -= 1),
             Effect.fail(
@@ -7627,6 +7704,13 @@ const failingLinkStore = Layer.effect(
             ))
           : real.threadLinks(filter);
       },
+      discussions: (boardId) =>
+        linkFailures.alertReads > 0
+          ? ((linkFailures.alertReads -= 1),
+            Effect.fail(
+              new KanbanStore.KanbanStoreError({ operation: "read discussions", cause: "injected" }),
+            ))
+          : real.discussions(boardId),
     };
   }),
 );
@@ -7651,7 +7735,7 @@ const failingRekeyStore = Layer.effect(
 );
 
 // Fails the next `postFailures.remaining` writes of a "provider-watch" outage post.
-const postFailures = { remaining: 0 };
+const postFailures = { remaining: 0, afterPass: 0 };
 const failingPostStore = Layer.effect(
   KanbanStore.KanbanStore,
   Effect.gen(function* () {
@@ -7669,7 +7753,7 @@ const failingPostStore = Layer.effect(
   }),
 );
 
-it.effect("a failed recovery-alert read still wakes the paused thread on a passing probe", () =>
+it.effect("a failed recovery-alert post still wakes the paused thread on a passing probe", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     probe.ok = false;
@@ -7684,14 +7768,14 @@ it.effect("a failed recovery-alert read still wakes the paused thread on a passi
       yield* kanban.probeOutages;
       assert.isNotNull((yield* kanban.caller(threadId))?.paused);
 
-      // The probe passes, but the recovery-alert scan's threadLinks read fails once.
+      // The probe passes, the wake lands, and the optional recovery post fails.
       probe.ok = true;
-      linkFailures.afterPass = 1;
+      postFailures.afterPass = 1;
       yield* TestClock.adjust("20 minutes");
       yield* kanban.probeOutages;
-      assert.strictEqual(linkFailures.remaining, 0);
+      assert.strictEqual(postFailures.remaining, 0);
       assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
-    }).pipe(Effect.provide(failingLinkProbeLayer(fake.layer)));
+    }).pipe(Effect.provide(failingRecoveryPostProbeLayer(fake.layer)));
   }),
 );
 
@@ -7725,11 +7809,11 @@ const twoModelProbeLayer = (fake: Layer.Layer<KanbanThreads>, armAfterA: () => v
     ),
   );
 
-const twoModelScenario = (skip: number) =>
+const twoModelScenario = (failure: "count" | "discussion") =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
-    linkFailures.skip = 0;
     linkFailures.remaining = 0;
+    linkFailures.alertReads = 0;
     probe.calls = 0;
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
@@ -7750,9 +7834,8 @@ const twoModelScenario = (skip: number) =>
       yield* kanban.turnEnded(threadB);
       assert.isNotNull((yield* kanban.caller(threadA))?.paused);
       assert.isNotNull((yield* kanban.caller(threadB))?.paused);
-      // Scenario: after A's probe fails, the next threadLinks reads skip `skip` and fail once.
+      // A's failed probe arms one failure in its optional alert.
       probe.ok = false;
-      linkFailures.remaining = 0;
       yield* TestClock.adjust("5 minutes");
       yield* kanban.probeOutages;
       assert.isNotNull((yield* kanban.caller(threadA))?.paused);
@@ -7766,18 +7849,18 @@ const twoModelScenario = (skip: number) =>
     }).pipe(
       Effect.provide(
         twoModelProbeLayer(fake.layer, () => {
-          linkFailures.skip = skip;
-          linkFailures.remaining = 1;
+          if (failure === "count") linkFailures.remaining = 1;
+          else linkFailures.alertReads = 1;
         }),
       ),
     );
   });
 
-it.effect("a failed outage-alert scan does not skip the next model's probe", () =>
-  twoModelScenario(0),
-);
 it.effect("a failed outage-alert count scan does not skip the next model's probe", () =>
-  twoModelScenario(1),
+  twoModelScenario("count"),
+);
+it.effect("a failed outage-alert discussion read does not skip the next model's probe", () =>
+  twoModelScenario("discussion"),
 );
 
 // Counts the reviewer's "record your verdict" nudges sent to a thread.

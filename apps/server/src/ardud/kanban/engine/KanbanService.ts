@@ -83,6 +83,9 @@ import { selectionRoutingEnabled } from "./selectionSettings.ts";
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
 
+const wakeKey = (threadId: string, at: string) =>
+  `wake:${NodeCrypto.createHash("sha256").update(`${threadId}|${at}`).digest("hex").slice(0, 32)}`;
+
 /**
  * Same option list in the same order. A value that isn't a primitive compares by reference,
  * so it reads as changed and gets checked: the safe direction for a validation skip.
@@ -2486,21 +2489,14 @@ const make = Effect.gen(function* () {
   const outageActor: KanbanActor = { _tag: "system", component: "provider-watch" };
 
   /**
-   * Posts to the "Provider outages" discussion of each board in `only` that has threads
-   * waiting on `key`, with how many. Returns the boards whose post landed. A failed post
+   * Posts to the "Provider outages" discussion of each board with its supplied count.
+   * Returns the boards whose post landed. A failed post
    * is logged and left out, so the caller retries it next time; it never fails the probe.
    */
   const alertBoards = Effect.fn("KanbanService.alertBoards")(function* (
-    key: string,
-    only: ReadonlySet<KanbanBoard["id"]>,
+    counts: ReadonlyMap<KanbanBoard["id"], number>,
     text: (count: number) => string,
   ) {
-    const counts = new Map<KanbanBoard["id"], number>();
-    for (const { link, board } of yield* pausedLinks) {
-      if (linkKey(link, board) === key && only.has(board.id)) {
-        counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
-      }
-    }
     const delivered = new Set<KanbanBoard["id"]>();
     for (const [boardId, count] of counts) {
       const posted = yield* Effect.gen(function* () {
@@ -2532,37 +2528,8 @@ const make = Effect.gen(function* () {
    * Callers hold the lock.
    */
   const resumeKey = Effect.fn("KanbanService.resumeKey")(function* (key: string) {
-    // Only boards that were announced get a "back" message, once per outage: a board
-    // is recorded as recovered as soon as its post lands, so a rejected wake below
-    // doesn't repeat it on the next probe.
-    // The whole step is optional: a failed read here (boards or links) must not abort
-    // the wakes below, or the other probe keys in this run.
-    yield* Effect.gen(function* () {
-      const state = (yield* Ref.get(down)).get(key);
-      if (state === undefined) return;
-      const pending = new Set<KanbanBoard["id"]>();
-      for (const id of state.announced) if (!state.recovered.has(id)) pending.add(id);
-      if (pending.size === 0) return;
-      const backed = yield* alertBoards(
-        key,
-        pending,
-        (count) =>
-          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
-      );
-      yield* Ref.update(down, (map) => {
-        const entry = map.get(key);
-        if (!entry) return map;
-        return new Map(map).set(key, {
-          ...entry,
-          recovered: new Set([...entry.recovered, ...backed]),
-        });
-      });
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("kanban outage recovery alert failed", { key, cause }),
-      ),
-    );
     let failed = false;
+    const woken = new Map<KanbanBoard["id"], number>();
     for (const { link, board } of yield* pausedLinks) {
       if (link.paused === null || linkKey(link, board) !== key) continue;
       // Only a thread that still owns its work and isn't already running again.
@@ -2589,7 +2556,11 @@ const make = Effect.gen(function* () {
         continue;
       }
       const sent = yield* threads
-        .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
+        .send({
+          threadId: link.threadId,
+          text: Briefs.providerBackText(link.paused.message),
+          key: wakeKey(link.threadId, link.paused.at),
+        })
         .pipe(
           Effect.as(true),
           Effect.catchCause(() => Effect.succeed(false)),
@@ -2599,7 +2570,34 @@ const make = Effect.gen(function* () {
         continue;
       }
       yield* store.putThreadLink({ ...link, paused: null });
+      woken.set(board.id, (woken.get(board.id) ?? 0) + 1);
     }
+    // Report accepted wakes only, once on each board that saw the outage.
+    yield* Effect.gen(function* () {
+      const state = (yield* Ref.get(down)).get(key);
+      if (state === undefined) return;
+      const counts = new Map(
+        [...woken].filter(([id]) => state.announced.has(id) && !state.recovered.has(id)),
+      );
+      if (counts.size === 0) return;
+      const backed = yield* alertBoards(
+        counts,
+        (count) =>
+          `${key} answers again. ${count} paused thread${count === 1 ? "" : "s"} woken where they stopped.`,
+      );
+      yield* Ref.update(down, (map) => {
+        const entry = map.get(key);
+        if (!entry) return map;
+        return new Map(map).set(key, {
+          ...entry,
+          recovered: new Set([...entry.recovered, ...backed]),
+        });
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban outage recovery alert failed", { key, cause }),
+      ),
+    );
     if (failed) return;
     yield* Ref.update(down, (map) => {
       const next = new Map(map);
@@ -2764,7 +2762,9 @@ const make = Effect.gen(function* () {
     const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
     if (outage !== null) {
       // A card_edit switches the open thread's model without touching its link.
+      // The failed run's own selection wins because that is the model that is down.
       const model =
+        outage.model ??
         (yield* threads.model(threadId)) ??
         link.model ??
         (yield* boardOf(link.boardId)).evaluatorModel;
@@ -3518,36 +3518,31 @@ const make = Effect.gen(function* () {
       yield* Effect.gen(function* () {
         // One alert per board per outage, after the first failed probe, so threads that die in the same minutes are counted.
         // A board whose post failed is not marked announced and is retried by the next failed probe.
-        const unannounced = yield* lock.withPermits(1)(
+        yield* lock.withPermits(1)(
           Effect.gen(function* () {
-            const boards = new Set<KanbanBoard["id"]>();
-            for (const { link, board } of yield* pausedLinks) {
-              if (linkKey(link, board) === key) boards.add(board.id);
-            }
+            const counts = new Map<KanbanBoard["id"], number>();
             const announced = (yield* Ref.get(down)).get(key)?.announced ?? new Set();
-            const unannounced = new Set<KanbanBoard["id"]>();
-            for (const id of boards) if (!announced.has(id)) unannounced.add(id);
-            return unannounced;
-          }),
-        );
-        if (unannounced.size > 0) {
-          const posted = yield* lock.withPermits(1)(
-            alertBoards(
-              key,
-              unannounced,
+            for (const { link, board } of yield* pausedLinks) {
+              if (linkKey(link, board) === key && !announced.has(board.id)) {
+                counts.set(board.id, (counts.get(board.id) ?? 0) + 1);
+              }
+            }
+            if (counts.size === 0) return;
+            const posted = yield* alertBoards(
+              counts,
               (count) =>
                 `${key} is out of usage or down: ${count} thread${count === 1 ? "" : "s"} paused. They wake by themselves when a probe passes (every 5 to 30 minutes). Cards that list another model start there meanwhile.`,
-            ),
-          );
-          yield* Ref.update(down, (map) => {
-            const entry = map.get(key);
-            if (!entry) return map;
-            return new Map(map).set(key, {
-              ...entry,
-              announced: new Set([...entry.announced, ...posted]),
+            );
+            yield* Ref.update(down, (map) => {
+              const entry = map.get(key);
+              if (!entry) return map;
+              return new Map(map).set(key, {
+                ...entry,
+                announced: new Set([...entry.announced, ...posted]),
+              });
             });
-          });
-        }
+          }),
+        );
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("kanban outage alert failed", { key, cause }),

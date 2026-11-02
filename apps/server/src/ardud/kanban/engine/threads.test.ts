@@ -1,8 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
-import { RuntimeRequestId } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
 
-import { backgroundWorkOf, viewStateOf } from "./threads.ts";
+import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import { backgroundWorkOf, KanbanThreads, layer, viewStateOf } from "./threads.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -94,3 +98,38 @@ describe("backgroundWorkOf", () => {
     expect(backgroundWorkOf({})).toBe(0);
   });
 });
+
+it.effect("a keyed send passes stable command and message ids to thread management", () =>
+  Effect.gen(function* () {
+    const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];
+    const threadId = ThreadId.make("thread-wake");
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+      sendToThread: (input) =>
+        Effect.sync(() => {
+          sent.push(input);
+          return {} as never;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
+      yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
+      yield* threads.send({ threadId, text: "Unkeyed" });
+      yield* threads.send({ threadId, text: "Unkeyed" });
+      expect(sent[0]?.commandId).toBe("kanban:send:wake:abc");
+      expect(sent[0]?.messageId).toBe("kanban:wake:abc");
+      expect(sent[1]?.commandId).toBe(sent[0]?.commandId);
+      expect(sent[1]?.messageId).toBe(sent[0]?.messageId);
+      expect(sent[2]?.commandId).not.toBe(sent[3]?.commandId);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  }),
+);

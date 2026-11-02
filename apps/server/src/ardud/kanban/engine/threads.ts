@@ -69,6 +69,8 @@ export interface KanbanLaunchInput {
 export interface KanbanSendInput {
   readonly threadId: ThreadId;
   readonly text: string;
+  /** Stable per logical send when a retry must not deliver a second message. */
+  readonly key?: string;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
 }
@@ -87,7 +89,13 @@ export interface KanbanThreadsShape {
   // runId names the executed run, so a repeated notification of the same run is recognised.
   readonly lastFailure: (
     threadId: ThreadId,
-  ) => Effect.Effect<(OrchestrationV2ProviderFailure & { readonly runId?: string | null }) | null>;
+  ) => Effect.Effect<
+    | (OrchestrationV2ProviderFailure & {
+        readonly runId?: string | null;
+        readonly model?: ModelSelection | null;
+      })
+    | null
+  >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
@@ -196,9 +204,15 @@ const make = Effect.gen(function* () {
             code: null,
             retryable: null,
             runId: run.id,
-          } as OrchestrationV2ProviderFailure & { readonly runId?: string | null };
+            model: run.modelSelection,
+          } as OrchestrationV2ProviderFailure & {
+            readonly runId?: string | null;
+            readonly model?: ModelSelection | null;
+          };
         }
-        return failure === null ? null : { ...failure, runId: run?.id ?? null };
+        return failure === null
+          ? null
+          : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
       }),
       Effect.catchCause(() => Effect.succeed(null)),
     );
@@ -230,7 +244,7 @@ const make = Effect.gen(function* () {
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
-      const id = NodeCrypto.randomUUID();
+      const id = input.key ?? NodeCrypto.randomUUID();
       yield* threads.sendToThread({
         projectId: shell.projectId,
         commandId: CommandId.make(`kanban:send:${id}`),
