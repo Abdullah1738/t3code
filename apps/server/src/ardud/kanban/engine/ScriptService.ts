@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - script files live on disk and runs get random ids.
 // @effect-diagnostics globalDate:off - runs are stamped like every other board record.
+// @effect-diagnostics preferSchemaOverJson:off - child environment values are JSON strings.
 /**
  * Board scripts: owner-approved programs the board runs on a schedule, on a
  * board event, or by hand. They run as plain child processes, with no model.
@@ -10,8 +11,10 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   KanbanDiscussionId,
   KanbanError,
@@ -39,6 +42,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService } from "./KanbanService.ts";
 import { modelSelectionResult } from "./defaults.ts";
@@ -156,8 +160,19 @@ interface Slot {
 type Slots = ReadonlyMap<KanbanScript["id"], Slot>;
 
 const make = Effect.gen(function* () {
-  const context = yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
+  const context = yield* Effect.context<ServerSettings.ServerSettingsService>();
   const routingEnabled = selectionRoutingEnabled.pipe(Effect.provideContext(context));
+  const settings = yield* ServerSettings.ServerSettingsService;
+  const executable = yield* HostProcess.ExecutablePath;
+  const isExecutable = yield* HostProcess.IsExecutable;
+  const bridgeEntry = import.meta.url.endsWith(".ts")
+    ? NodeURL.fileURLToPath(new URL("../../../bin.ts", import.meta.url))
+    : NodeURL.fileURLToPath(new URL("./bin.mjs", import.meta.url));
+  const bridgeCommand = [
+    executable,
+    ...(isExecutable ? [] : [bridgeEntry]),
+    "__kanban-resolve-selection",
+  ];
   const store = yield* KanbanStore;
   const service = yield* KanbanService;
   const scope = yield* Effect.scope;
@@ -328,15 +343,28 @@ const make = Effect.gen(function* () {
         notes.push(yield* resizePool(script, command));
         continue;
       }
-      if (command.kanban === "subtask" || command.kanban === "handback" || command.kanban === "move") {
+      if (
+        command.kanban === "subtask" ||
+        command.kanban === "handback" ||
+        command.kanban === "move"
+      ) {
         const card = cards.find((entry) => entry.number === command.card);
         if (!card) {
-          notes.push(`Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`);
+          notes.push(
+            `Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`,
+          );
           continue;
         }
         if (command.kanban === "subtask") {
           const marked = yield* Effect.result(
-            service.markSubtask(card.id, command.subtask, command.state, command.note ?? null, actor, "script"),
+            service.markSubtask(
+              card.id,
+              command.subtask,
+              command.state,
+              command.note ?? null,
+              actor,
+              "script",
+            ),
           );
           notes.push(
             Result.isSuccess(marked)
@@ -448,6 +476,7 @@ const make = Effect.gen(function* () {
     if (interpreter === null || !(yield* isFile(script.path))) {
       return yield* close(script, run, null, `There is no script at ${script.path}.`);
     }
+    const current = yield* settings.getSettings.pipe(Effect.mapError(asKanbanError));
     const result = yield* runProcess({
       argv: [interpreter, script.path],
       cwd: NodePath.dirname(script.path),
@@ -456,6 +485,8 @@ const make = Effect.gen(function* () {
         KANBAN_BOARD_ID: script.boardId,
         KANBAN_SCRIPT_ID: script.id,
         KANBAN_TRIGGER: run.trigger,
+        KANBAN_HARNESS_MIGRATION: JSON.stringify(current.ardudHarnessMigration ?? {}),
+        KANBAN_HARNESS_ROUTING_COMMAND: JSON.stringify(bridgeCommand),
         ...(event === null ? {} : { KANBAN_EVENT: event }),
       },
       timeoutMs: RUN_TIMEOUT_MS,

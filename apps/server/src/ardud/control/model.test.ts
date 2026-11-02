@@ -414,4 +414,53 @@ describe("effort compatibility", () => {
     const unknownOption = selection([{ id: "someSetting", value: "keep" }]);
     expect(modelSelectionFrom({ base: unknownOption, settings }).kind).toBe("conflict");
   });
+
+  it("distinguishes legacy OpenCode slugs from native slugs on either base", () => {
+    for (const base of [selection(), claude]) {
+      expect(selectionOf(modelSelectionFrom({ base, model: "surplus/glm", settings }))).toEqual({
+        instanceId: "opencode",
+        model: "surplus/glm",
+      });
+      expect(
+        selectionOf(modelSelectionFrom({ base, model: "claude-sonnet-5-5", settings })),
+      ).toEqual({
+        instanceId: "claudeAgent",
+        model: "claude-sonnet-5-5",
+      });
+    }
+  });
+
+  it("lets a replacement or model switch discard obsolete stored options", () => {
+    const base = selection([{ id: "agent", value: "build" }]);
+    expect(selectionOf(modelSelectionFrom({ base, options: [], settings }))).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+    });
+    expect(
+      selectionOf(
+        modelSelectionFrom({
+          base,
+          instanceId: "codex",
+          model: "gpt-6.1-sol",
+          options: [],
+          settings,
+        }),
+      ),
+    ).toEqual({
+      instanceId: "codex",
+      model: "gpt-6.1-sol",
+    });
+    expect(modelSelectionFrom({ base, settings }).kind).toBe("conflict");
+  });
+
+  it("lets a new effort replace conflicting stored native efforts", () => {
+    const base = {
+      ...claude,
+      options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, { id: "fastMode", value: true }],
+    } as ModelSelection;
+    expect(selectionOf(modelSelectionFrom({ base, variant: "low", settings }))).toEqual({
+      instanceId: "claudeAgent", model: "claude-opus-5-5",
+      options: [{ id: "fastMode", value: true }, { id: "effort", value: "low" }],
+    });
+  });
 });

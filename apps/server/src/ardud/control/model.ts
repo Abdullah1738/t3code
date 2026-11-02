@@ -172,15 +172,49 @@ export function modelSelectionFrom(input: {
     };
   }
 
-  const duplicateBase = duplicate(input.base.options);
-  if (duplicateBase) {
+  // Resolve the identity before the options: an explicit replacement or a
+  // different target must be able to repair obsolete stored options.
+  const identityBase = resolveSelection({ ...input.base, options: [] });
+  if (identityBase.kind === "conflict") return identityBase;
+  const inferredInstance =
+    input.instanceId ??
+    (input.model?.includes("/") ? "opencode" : identityBase.selection.instanceId);
+  const target =
+    input.model === undefined && input.instanceId === undefined
+      ? identityBase
+      : resolveSelection({
+          instanceId: inferredInstance,
+          model:
+            input.model ??
+            (input.instanceId === input.base.instanceId
+              ? input.base.model
+              : identityBase.selection.model),
+        } as ModelSelection);
+  if (target.kind === "conflict") return target;
+  const sameTarget =
+    target.selection.instanceId === identityBase.selection.instanceId &&
+    target.selection.model === identityBase.selection.model;
+  const inherit = input.options === undefined && sameTarget;
+  const retainEffort = inherit && input.variant === undefined;
+  const duplicateBase = inherit ? duplicate(input.base.options) : undefined;
+  if (duplicateBase)
     return { kind: "conflict", reason: `Stored option ${duplicateBase.id} occurs more than once.` };
-  }
-  const foldedBase = mergeSelection(input.base, {});
+  const baseToMerge = inherit
+    ? retainEffort
+      ? input.base
+      : {
+          ...input.base,
+          // A new effort supersedes both stored compatibility and native effort.
+          options: (input.base.options ?? []).filter(
+            (option) => !["variant", "effort", "reasoningEffort"].includes(option.id),
+          ),
+        }
+    : { ...input.base, options: [] };
+  const foldedBase = mergeSelection(baseToMerge, {});
   if (foldedBase.kind === "conflict") return foldedBase;
   const routedBase = resolveSelection(foldedBase.selection);
   if (routedBase.kind === "conflict") return routedBase;
-  if (routedBase.kind === "mapped") {
+  if (inherit && routedBase.kind === "mapped") {
     const dropped = foldedBase.selection.options?.find(
       (option) =>
         option.id !== "variant" &&
@@ -195,26 +229,7 @@ export function modelSelectionFrom(input: {
   }
   const base = routedBase.selection;
 
-  // Old callers may send an OpenCode slug after the thread has moved to a
-  // native provider. Only infer OpenCode for an exact route in the shared map.
-  const legacyTarget =
-    input.model !== undefined && input.instanceId === undefined
-      ? resolveSelection({ instanceId: "opencode", model: input.model } as ModelSelection)
-      : undefined;
-  if (legacyTarget?.kind === "conflict") return legacyTarget;
-  const target =
-    legacyTarget?.kind === "mapped"
-      ? legacyTarget
-      : input.model === undefined && input.instanceId === undefined
-        ? { kind: "unchanged" as const, selection: base }
-        : resolveSelection({
-            instanceId: input.instanceId ?? base.instanceId,
-            model:
-              input.model ??
-              (input.instanceId === input.base.instanceId ? input.base.model : base.model),
-          } as ModelSelection);
-  if (target.kind === "conflict") return target;
-  const suffix = target.kind === "mapped" ? target.effort : null;
+  const suffix = input.model !== undefined && target.kind === "mapped" ? target.effort : null;
   if (
     suffix !== null &&
     (input.variant === null || (input.variant !== undefined && input.variant !== suffix))

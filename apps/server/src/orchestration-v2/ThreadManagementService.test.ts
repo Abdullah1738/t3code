@@ -599,8 +599,14 @@ const migrationHarness = (input: {
               },
             }),
         providerInstances: {
-          [ProviderInstanceId.make("opencode")]: { driver: "opencode", enabled: input.sourceEnabled ?? true },
-          [ProviderInstanceId.make("claudeAgent")]: { driver: "claudeAgent", enabled: input.targetEnabled ?? true },
+          [ProviderInstanceId.make("opencode")]: {
+            driver: "opencode",
+            enabled: input.sourceEnabled ?? true,
+          },
+          [ProviderInstanceId.make("claudeAgent")]: {
+            driver: "claudeAgent",
+            enabled: input.targetEnabled ?? true,
+          },
         },
       }),
     ),
@@ -625,6 +631,81 @@ it.effect("migrates a dormant stored selection once before multiple inherited se
     expect(harness.getStored()).toEqual(mappedSelection);
   }).pipe(Effect.provide(harness.layerTest));
 });
+
+it.effect.each([
+  { instance: "claudeAgent", model: "claude-opus-5-5", option: "effort" },
+  { instance: "codex", model: "gpt-6.1-sol", option: "reasoningEffort" },
+] as const)(
+  "normalizes stored and explicitly requested variant on $instance",
+  ({ instance, model, option }) => {
+    const legacyNative: ModelSelection = {
+      instanceId: ProviderInstanceId.make(instance),
+      model,
+      options: [{ id: "variant", value: "high" }],
+    };
+    const expected = { instanceId: instance, model, options: [{ id: option, value: "high" }] };
+    const harness = migrationHarness({ mode: "apply", stored: legacyNative });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("native-first"));
+      yield* threads.dispatch(migrationMessage("native-explicit", legacyNative));
+      expect(harness.calls[0]).toMatchObject({
+        type: "thread.model-selection.set",
+        modelSelection: expected,
+      });
+      expect(harness.calls[1]).not.toHaveProperty("modelSelection");
+      expect(harness.calls[2]).toMatchObject({
+        type: "message.dispatch",
+        modelSelection: expected,
+      });
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("rejects conflicting native effort names before dispatch", () => {
+  const harness = migrationHarness({
+    mode: "apply",
+    stored: {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-5-5",
+      options: [
+        { id: "variant", value: "high" },
+        { id: "effort", value: "max" },
+      ],
+    },
+  });
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    yield* Effect.flip(service.dispatch(migrationMessage("native-conflict")));
+    expect(harness.calls).toEqual([]);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("rejects duplicate and wrong-driver reasoning options before dispatch", () =>
+  Effect.gen(function* () {
+    for (const options of [
+      [
+        { id: "effort", value: "high" },
+        { id: "effort", value: "high" },
+      ],
+      [{ id: "reasoningEffort", value: "high" }],
+    ]) {
+      const harness = migrationHarness({
+        mode: "apply",
+        stored: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-5-5",
+          options,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        yield* Effect.flip(service.dispatch(migrationMessage("invalid-native")));
+        expect(harness.calls).toEqual([]);
+      }).pipe(Effect.provide(harness.layerTest));
+    }
+  }),
+);
 
 it.effect.each([undefined, "off", "dryrun"] as const)(
   "leaves legacy selections untouched when the flag is %s",
@@ -690,7 +771,7 @@ it.effect("refuses a conflicting selection even when allowConflicts is true", ()
     const error = yield* Effect.flip(threads.dispatch(migrationMessage("conflict")));
     expect(error).toMatchObject({
       _tag: "OrchestratorCommandRejectedError",
-      cause: expect.stringContaining("conflicting efforts"),
+      cause: expect.stringContaining("conflicts with its effort"),
     });
     expect(harness.calls).toEqual([]);
   }).pipe(Effect.provide(harness.layerTest));
@@ -766,8 +847,7 @@ it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
         ...(kind === "project"
           ? { projectId: migrationProjectId }
           : {
-              threadId:
-                kind === "other-thread" ? ThreadId.make("thread:other") : migrationThreadId,
+              threadId: kind === "other-thread" ? ThreadId.make("thread:other") : migrationThreadId,
             }),
         commandType: kind === "project" ? "project.create" : "message.dispatch",
         acceptedAt: yield* DateTime.now,

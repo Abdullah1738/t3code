@@ -1,6 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - the migration command needs a unique id for each attempt.
 import { randomUUID } from "node:crypto";
-import { resolveSelection } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import {
+  mergeSelection,
+  resolveSelection,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -701,7 +704,9 @@ const make = Effect.gen(function* () {
 
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
-    const readReceipt = <A>(effect: Effect.Effect<A, CommandReceiptStore.CommandReceiptStoreV2Error>) =>
+    const readReceipt = <A>(
+      effect: Effect.Effect<A, CommandReceiptStore.CommandReceiptStoreV2Error>,
+    ) =>
       effect.pipe(
         Effect.mapError(
           (cause) =>
@@ -720,7 +725,36 @@ const make = Effect.gen(function* () {
     const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
     const stored = projection.thread.modelSelection;
     const requested = command.modelSelection ?? stored;
-    const resolved = resolveSelection(requested);
+    const canonicalize = (selection: ModelSelection) => {
+      const ids = new Set<string>();
+      for (const option of selection.options ?? []) {
+        if (ids.has(option.id))
+          return {
+            kind: "conflict" as const,
+            reason: `Option ${option.id} occurs more than once.`,
+          };
+        ids.add(option.id);
+      }
+      const merged = mergeSelection(selection, {});
+      if (merged.kind === "conflict") return merged;
+      if (
+        (selection.instanceId === "claudeAgent" ||
+          selection.instanceId === "codex" ||
+          selection.instanceId === "codex-cu") &&
+        (merged.selection.options ?? []).some(
+          (option) =>
+            ["variant", "effort", "reasoningEffort"].includes(option.id) &&
+            option.id !== (selection.instanceId === "claudeAgent" ? "effort" : "reasoningEffort"),
+        )
+      ) {
+        return {
+          kind: "conflict" as const,
+          reason: `Model ${selection.model} has an incompatible reasoning option.`,
+        };
+      }
+      return resolveSelection(merged.selection);
+    };
+    const resolved = canonicalize(requested);
     if (resolved.kind === "conflict") {
       return yield* new Orchestrator.OrchestratorCommandRejectedError({
         commandId: command.commandId,
@@ -731,11 +765,11 @@ const make = Effect.gen(function* () {
 
     // A caller may have already resolved an inherited selection. Treat it as
     // inherited too, but never overwrite a genuinely different explicit pick.
-    const resolvedStored = resolveSelection(stored);
+    const resolvedStored = canonicalize(stored);
     const inherited =
       command.modelSelection === undefined ||
       modelSelectionsEqual(command.modelSelection, stored) ||
-      (resolvedStored.kind === "mapped" &&
+      (resolvedStored.kind !== "conflict" &&
         modelSelectionsEqual(resolved.selection, resolvedStored.selection));
 
     yield* assertProviderInstanceEnabled({
@@ -744,7 +778,11 @@ const make = Effect.gen(function* () {
       instanceId: resolved.selection.instanceId,
     });
 
-    if (inherited && resolvedStored.kind === "mapped") {
+    if (
+      inherited &&
+      resolvedStored.kind !== "conflict" &&
+      !modelSelectionsEqual(stored, resolvedStored.selection)
+    ) {
       const { thread, runs } = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
       if (isProviderNativeSubagentThread(thread)) {
         return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
@@ -769,8 +807,7 @@ const make = Effect.gen(function* () {
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
-          cause:
-            "Cannot migrate an archived or deleted thread, or one with active or queued runs.",
+          cause: "Cannot migrate an archived or deleted thread, or one with active or queued runs.",
         });
       }
       yield* orchestrator.dispatch({
@@ -782,7 +819,7 @@ const make = Effect.gen(function* () {
     }
 
     const nextCommand =
-      command.modelSelection === undefined || resolved.kind === "unchanged"
+      command.modelSelection === undefined || modelSelectionsEqual(requested, resolved.selection)
         ? command
         : { ...command, modelSelection: resolved.selection };
     // Re-read the target after a selection update and check the actual send,
