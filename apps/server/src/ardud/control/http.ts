@@ -24,6 +24,7 @@ import {
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
@@ -870,6 +871,7 @@ const makeRoutes = Effect.gen(function* () {
     if (active === undefined) {
       return yield* fail("invalid_request", "active=true or active=false is required.");
     }
+    // Pure reads: keep them off the single writer, as the board reads do.
     const page = yield* recovery
       .page({
         active,
@@ -877,7 +879,10 @@ const makeRoutes = Effect.gen(function* () {
         // The service applies the default and the 500 cap.
         limit: Number(params.get("limit") ?? Number.NaN),
       })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      .pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      );
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
