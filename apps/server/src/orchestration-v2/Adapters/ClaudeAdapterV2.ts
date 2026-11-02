@@ -3281,6 +3281,8 @@ interface ActiveClaudeTurnContext {
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
+  /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
+  refusalMessage: string | undefined;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimit: {
@@ -7590,6 +7592,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
 
+          if (message.type === "system" && message.subtype === "model_refusal_no_fallback") {
+            // The turn ends refused. The result frame then fails it; the refusal text
+            // is kept so that failure can name it.
+            context.refusalMessage = message.content;
+            return;
+          }
+
           if (
             message.type === "system" &&
             (message.subtype === "model_refusal_fallback" ||
@@ -8298,6 +8307,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               resetTimes.length > 0 && resetTimes.every((time) => time !== null)
                 ? resetTimes.reduce((latest, time) => (time! > latest ? time! : latest), "")
                 : null;
+            const refusal = context.refusalMessage;
+            const turnFailure = interrupted
+              ? null
+              : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
             const resultFailure = interrupted
               ? null
               : limitedCompaction !== null
@@ -8306,7 +8319,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     message: limitedCompaction.message ?? failureHint,
                     code: "compaction_failed",
                   })
-                : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
+                : refusal !== undefined && turnFailure !== null
+                  ? makeProviderFailure({
+                      class: "provider_error",
+                      message: refusal,
+                      code: "model_refusal",
+                      category: "content_filter",
+                    })
+                  : turnFailure;
             const terminalFailure =
               resultFailure?.class === "usage_limit"
                 ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
@@ -9175,6 +9195,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ignoredTaskIds: new Set(),
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,
+              refusalMessage: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimit: null,

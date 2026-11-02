@@ -4852,6 +4852,60 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect("fails a refused Claude turn as a content filter, not a usage limit", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("claude-refusal-no-fallback-attempt"),
+          text: "Continue the audit",
+          attachments: [],
+        }),
+      );
+      const refusal = "Claude declined to continue this request.";
+      yield* Queue.offer(
+        harness.sdkMessages,
+        claudeSdkFrame({
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          original_model: "claude-fable-5",
+          request_id: "request-refusal-no-fallback",
+          api_refusal_category: "cyber",
+          api_refusal_explanation: null,
+          refused_user_message_uuid: null,
+          content: refusal,
+          session_id: WAKE_NATIVE_SESSION,
+          uuid: "00000000-0000-4000-8000-000000000401",
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000402",
+          result: "API Error: 400 Request refused.",
+          terminalReason: "api_error",
+          apiErrorStatus: 400,
+          isError: true,
+        }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.category, "content_filter");
+      assert.equal(terminal.failure.code, "model_refusal");
+      assert.equal(terminal.failure.message, refusal);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
+  );
+
   it.effect("surfaces a Claude safety model fallback without failing the turn", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
