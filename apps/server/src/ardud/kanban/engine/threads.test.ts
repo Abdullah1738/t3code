@@ -2,8 +2,25 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import * as Result from "effect/Result";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
+import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { backgroundWorkOf, KanbanThreads, layer, viewStateOf } from "./threads.ts";
@@ -128,8 +145,151 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
         layer.pipe(
           Layer.provide(management),
           Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
         ),
       ),
     );
   }),
 );
+
+it.effect("a rejected keyed wake can retry with real orchestrator receipts", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:outage-receipt");
+  const threadId = ThreadId.make("thread:outage-receipt");
+  const modelSelection = { instanceId, model: "gpt-5.1-codex" };
+  let available = false;
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: (id) =>
+        available
+          ? Effect.succeed(adapter)
+          : Effect.fail(
+              new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId: id }),
+            ),
+      list: () => Effect.succeed(available ? [instanceId] : []),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
+  let failBeforeDispatch = false;
+  let failAfterDispatch = false;
+  const runtime = ProviderReplayHarness.layerWithRegistry(
+    { name: "kanban-wake-receipts" },
+    registry,
+    { databaseLayer: db, runEffectWorker: false },
+  );
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  const dependencies = Layer.mergeAll(
+    management,
+    receipts,
+    Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+  );
+  const instrumentedManagement = Layer.effect(
+    ThreadManagementService.ThreadManagementService,
+    Effect.gen(function* () {
+      const real = yield* ThreadManagementService.ThreadManagementService;
+      return ThreadManagementService.ThreadManagementService.of({
+        ...real,
+        sendToThread: (input) =>
+          Effect.gen(function* () {
+            recorded.push(input);
+            if (failBeforeDispatch) {
+              failBeforeDispatch = false;
+              return yield* new ThreadManagementService.ThreadManagementProjectionLoadError({
+                projectId: input.projectId,
+                threadId: input.threadId,
+                cause: "injected before dispatch",
+              });
+            }
+            const result = yield* real.sendToThread(input);
+            if (failAfterDispatch) {
+              failAfterDispatch = false;
+              return yield* new ThreadManagementService.ThreadManagementProjectionLoadError({
+                projectId: input.projectId,
+                threadId: input.threadId,
+                cause: "injected after accepted dispatch",
+              });
+            }
+            return result;
+          }),
+      });
+    }),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const receiptStore = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("kanban-wake-receipt:create"),
+      threadId,
+      projectId,
+      title: "Outage wake",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const wake = { threadId, text: "Model answers again", key: "wake:real-receipt" };
+      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      const rejected = yield* receiptStore.getByCommandId(
+        CommandId.make("kanban:send:wake:real-receipt"),
+      );
+      expect(Option.isSome(rejected) && rejected.value.status).toBe("rejected");
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        0,
+      );
+      // Multiple proven rejections advance only to the next deterministic attempt.
+      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      const rejectedRetry = yield* receiptStore.getByCommandId(
+        CommandId.make("kanban:send:wake:real-receipt:retry:1"),
+      );
+      expect(Option.isSome(rejectedRetry) && rejectedRetry.value.status).toBe("rejected");
+    }).pipe(Effect.provide(layer.pipe(Layer.provide(instrumentedManagement))));
+
+    // Rebuild the board adapter as on restart, but retain the orchestrator's DB.
+    available = true;
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const wake = { threadId, text: "Model answers again", key: "wake:real-receipt" };
+      failBeforeDispatch = true;
+      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
+      expect(Option.isNone(yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId))).toBe(
+        true,
+      );
+      failAfterDispatch = true;
+      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
+      const accepted = yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId);
+      expect(Option.isSome(accepted) && accepted.value.status).toBe("accepted");
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        1,
+      );
+    }).pipe(Effect.provide(Layer.fresh(layer).pipe(Layer.provide(instrumentedManagement))));
+
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Model answers again", key: "wake:real-receipt" });
+      expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        1,
+      );
+    }).pipe(Effect.provide(Layer.fresh(layer).pipe(Layer.provide(instrumentedManagement))));
+  }).pipe(Effect.provide(dependencies));
+});

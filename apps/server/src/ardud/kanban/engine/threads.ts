@@ -14,6 +14,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type {
@@ -26,6 +27,7 @@ import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/or
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as OrchestrationCommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import { type ControlThreadState, stateFromRunStatus } from "../../control/model.ts";
 
 export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
@@ -145,6 +147,7 @@ export const backgroundWorkOf = (
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
+  const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
 
   const find: KanbanThreadsShape["find"] = (threadId) =>
     threads.getThreadShell(threadId).pipe(
@@ -244,7 +247,29 @@ const make = Effect.gen(function* () {
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
-      const id = input.key ?? NodeCrypto.randomUUID();
+      let id: string = input.key ?? NodeCrypto.randomUUID();
+      if (input.key !== undefined) {
+        // A rejected receipt is final, but proves that attempt did not send. Walk
+        // only those receipts: an accepted or unknown attempt must retain its id.
+        for (let attempt = 0; ; attempt += 1) {
+          id = attempt === 0 ? input.key : `${input.key}:retry:${attempt}`;
+          const receipt = yield* receipts.getByCommandId({
+            commandId: CommandId.make(`kanban:send:${id}`),
+          });
+          if (Option.isNone(receipt)) break;
+          if (
+            receipt.value.aggregateKind !== "thread" ||
+            receipt.value.aggregateId !== input.threadId ||
+            receipt.value.commandType !== "message.dispatch"
+          ) {
+            return yield* new KanbanThreadError({
+              operation: "send",
+              detail: "keyed send receipt belongs to another command",
+            });
+          }
+          if (receipt.value.status !== "rejected") break;
+        }
+      }
       yield* threads.sendToThread({
         projectId: shell.projectId,
         commandId: CommandId.make(`kanban:send:${id}`),
@@ -303,4 +328,6 @@ const make = Effect.gen(function* () {
   return KanbanThreads.of({ view, find, model, lastFailure, launch, send, setModel, interrupt });
 });
 
-export const layer = Layer.effect(KanbanThreads, make);
+export const layer = Layer.effect(KanbanThreads, make).pipe(
+  Layer.provide(OrchestrationCommandReceipts.layer),
+);
