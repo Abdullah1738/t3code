@@ -18,7 +18,6 @@ STATE = Path(os.environ.get("OFFBOX_STATE_DIR", HOME / ".local/share/offbox"))
 PREFIX = "[Automated message from the offbox monitor (remote-compute skill), not typed by Abdullah.]"
 _CACHE = {}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-MAX_ANCESTOR_HOPS = 100
 
 
 def read_json(path, default):
@@ -169,15 +168,25 @@ def thread_detail(thread_id):
     return None
 
 
-def writable_ancestor(thread_id):
-    """Nearest ancestor of `thread_id` that accepts messages (a top-level or app-managed thread).
+def accepts_messages(thread):
+    """Whether a thread can take a message. A provider-native child (its own conversation, created by the
+    provider) cannot. Top-level threads and app-managed children (created through T3 delegation) can, even
+    though both are lineage subagents, so relationshipToParent alone doesn't decide it.
+    """
+    provider_native = thread.get("relationshipToParent") == "subagent" and thread.get("creationSource") == "provider"
+    return not provider_native
 
-    Native children are never writable here: the walk starts above them. A broken or
-    cyclic lineage ends the walk without a target instead of guessing one.
+
+def writable_ancestor(thread_id):
+    """Nearest ancestor of `thread_id` that accepts messages, or None.
+
+    The walk starts above the caller, so the caller itself is never a target. A missing thread, a missing
+    parent or a lineage cycle ends the walk without a target rather than guessing one. There is no hop cap:
+    the visited set already bounds the walk to the lineage's real length.
     """
     visited = {thread_id}
     current = thread_detail(thread_id)
-    for _ in range(MAX_ANCESTOR_HOPS):
+    while True:
         parent = (current or {}).get("parentThreadId")
         if not parent or parent in visited:
             return None
@@ -185,9 +194,8 @@ def writable_ancestor(thread_id):
         current = thread_detail(parent)
         if current is None:
             return None
-        if current.get("relationshipToParent") != "subagent":
+        if accepts_messages(current):
             return parent
-    return None
 
 
 def steer(session, text, request_id, include_parent=False, driver=None):

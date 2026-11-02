@@ -20,6 +20,13 @@ def _real_ctl(cfg_file, method, path, body=None):
                            "Bearer " + cfg["token"], body)
 
 
+def _sustained(*cmds):
+    """Previous-sample state that makes each command a sustained (60 s over 50% CPU) process."""
+    import hashlib
+    return {str(pid) + ":" + hashlib.sha256(cmd.encode()).hexdigest()[:16]: {"since": 900, "last": 990}
+            for pid, cmd in cmds}
+
+
 class MonitorTests(unittest.TestCase):
     def test_pressure_boundaries_and_sample_gap(self):
         prev = {}
@@ -55,6 +62,30 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(groups["ses_real"]["pids"], [10001, 10002])
         self.assertEqual(groups["ses_real"]["rss"], 3072)
         self.assertEqual(groups["ses_real"]["cpu"], 41)
+
+    def test_stale_opencode_id_never_beats_a_concrete_native_id(self):
+        # An inherited OPENCODE_SESSION_ID must not name a Claude process that carries its own UUID.
+        uuid = "11111111-2222-3333-4444-555555555555"
+        plain = f"10001 1 60.0 2048 claude -p work\n"
+        raw = (f"10001 1 60.0 2048 claude -p work PWD=/repo OPENCODE_SESSION_ID=ses_stale "
+               f"CLAUDE_CODE_SESSION_ID={uuid}\n")
+        prev = _sustained((10001, "claude -p work"))
+        groups, _, _ = sample.sample_processes(prev, 1000, raw, plain)
+        self.assertEqual(set(groups), {"claudeAgent:" + uuid})
+        self.assertEqual(groups["claudeAgent:" + uuid]["driver"], "claudeAgent")
+        self.assertEqual(groups["claudeAgent:" + uuid]["session"], uuid)
+
+    def test_same_uuid_under_two_drivers_is_two_groups_with_their_own_driver(self):
+        # The same UUID in a Claude shell and a Codex shell is two executions: no merged group, no first-driver owner.
+        uuid = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+        plain = "10001 1 60.0 2048 claude -p a\n10002 1 60.0 2048 codex exec b\n"
+        raw = (f"10001 1 60.0 2048 claude -p a PWD=/repo CLAUDE_CODE_SESSION_ID={uuid}\n"
+               f"10002 1 60.0 2048 codex exec b PWD=/repo CODEX_THREAD_ID={uuid}\n")
+        prev = _sustained((10001, "claude -p a"), (10002, "codex exec b"))
+        groups, _, _ = sample.sample_processes(prev, 1000, raw, plain)
+        self.assertEqual(set(groups), {"claudeAgent:" + uuid, "codex:" + uuid})
+        self.assertEqual(groups["claudeAgent:" + uuid]["pids"], [10001])
+        self.assertEqual(groups["codex:" + uuid]["pids"], [10002])
 
     def test_app_launched_from_agent_shell_is_not_that_agents_work(self):
         # Robob reopened by an installer run from an agent thread: the app, its server and a
@@ -175,8 +206,9 @@ class MonitorTests(unittest.TestCase):
         stub = ti.StubControl()
         self.addCleanup(stub.close)
         stub.threads["mid"] = {"threadId": "mid", "parentThreadId": ti.PARENT,
-                               "relationshipToParent": "subagent"}
-        stub.threads["leaf"] = {"threadId": "leaf", "parentThreadId": "mid", "relationshipToParent": "subagent"}
+                               "relationshipToParent": "subagent", "creationSource": "mcp"}
+        stub.threads["leaf"] = {"threadId": "leaf", "parentThreadId": "mid",
+                                "relationshipToParent": "subagent", "creationSource": "provider"}
         stub.identities[(ti.CLAUDE_UUID, "claudeAgent")] = ti.resolved("leaf", "mid", kind="provider-native-child",
                                                                        accepts=False)
         tmp = tempfile.TemporaryDirectory()
@@ -192,7 +224,62 @@ class MonitorTests(unittest.TestCase):
             with patch.object(support, "thread_send", side_effect=lambda t, text, rid: sent.append(t) or True):
                 delivered = support.steer(ti.CLAUDE_UUID, support.PREFIX + " warn", "rid-1", driver="claudeAgent")
         self.assertTrue(delivered)
-        self.assertEqual(sent, [ti.PARENT])
+        # The nearest writable ancestor is the app-managed "mid", not the root above it.
+        self.assertEqual(sent, ["mid"])
+        oc.assert_not_called()
+
+    def test_writable_app_managed_manager_is_chosen_over_a_skipped_provider_child(self):
+        # Leaf: a Claude provider-native child (no messages). Its manager is an app-managed child (creationSource
+        # mcp, so it accepts messages). The walk must pick that manager, not skip it for a root.
+        import test_identity as ti
+        stub = ti.StubControl()
+        self.addCleanup(stub.close)
+        stub.threads["managed"] = {"threadId": "managed", "parentThreadId": ti.PARENT,
+                                   "relationshipToParent": "subagent", "creationSource": "mcp"}
+        stub.threads["leaf"] = {"threadId": "leaf", "parentThreadId": "managed",
+                                "relationshipToParent": "subagent", "creationSource": "provider"}
+        stub.identities[(ti.CLAUDE_UUID, "claudeAgent")] = ti.resolved("leaf", "managed",
+                                                                       kind="provider-native-child", accepts=False)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "offbox.json"
+        cfg.write_text(json.dumps({"url": stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        with patch.object(support, "HOME", Path(tmp.name)), \
+                patch.object(support, "_CACHE", {}), \
+                patch.object(support, "oc") as oc, \
+                patch.object(support, "ctl", side_effect=lambda m, p, b=None: _real_ctl(cfg, m, p, b)):
+            sent = []
+            with patch.object(support, "thread_send", side_effect=lambda t, text, rid: sent.append(t) or True):
+                delivered = support.steer(ti.CLAUDE_UUID, support.PREFIX + " warn", "rid-m", driver="claudeAgent")
+        self.assertTrue(delivered)
+        self.assertEqual(sent, ["managed"])
+        oc.assert_not_called()
+
+    def test_lineage_cycle_ends_the_walk_without_a_hop_cap(self):
+        # A cycle in the lineage must end the walk (no infinite loop) and deliver nowhere.
+        import test_identity as ti
+        stub = ti.StubControl()
+        self.addCleanup(stub.close)
+        stub.threads["a"] = {"threadId": "a", "parentThreadId": "b", "relationshipToParent": "subagent",
+                             "creationSource": "provider"}
+        stub.threads["b"] = {"threadId": "b", "parentThreadId": "a", "relationshipToParent": "subagent",
+                             "creationSource": "provider"}
+        stub.identities[(ti.CLAUDE_UUID, "claudeAgent")] = ti.resolved("a", "b", kind="provider-native-child",
+                                                                       accepts=False)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "offbox.json"
+        cfg.write_text(json.dumps({"url": stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        with patch.object(support, "HOME", Path(tmp.name)), \
+                patch.object(support, "_CACHE", {}), \
+                patch.object(support, "oc") as oc, \
+                patch.object(support, "ctl", side_effect=lambda m, p, b=None: _real_ctl(cfg, m, p, b)), \
+                patch.object(support, "thread_send", return_value=True) as send:
+            delivered = support.steer(ti.CLAUDE_UUID, support.PREFIX + " warn", "rid-c", driver="claudeAgent")
+        self.assertFalse(delivered)
+        send.assert_not_called()
         oc.assert_not_called()
 
     def test_native_child_without_a_writable_ancestor_is_not_delivered_to_opencode(self):

@@ -21,8 +21,10 @@ NATIVE_DRIVER = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "co
 
 
 def session_in(env):
-    """The native id this process env names: an OpenCode ses_ id or a Claude/Codex UUID, else None."""
-    found = SESSION.search(env) or NATIVE_SESSION.search(env)
+    """The native id this process env names: a Claude/Codex UUID when the env carries one, else the OpenCode
+    ses_ id, else None. A concrete native id wins over OPENCODE_SESSION_ID, which an inherited shell can leave
+    behind as a stale parent value."""
+    found = NATIVE_SESSION.search(env) or SESSION.search(env)
     return found[1] if found else None
 
 
@@ -150,8 +152,12 @@ def sample_processes(previous, now, raw=None, plain=None):
                 row["session"], row["driver"] = next(iter(candidates))
         if not row["session"]:
             continue
-        group = groups.setdefault(row["session"], {"cpu": 0.0, "rss": 0, "pids": [], "keys": [],
-                                                   "driver": row.get("driver")})
+        # A native UUID is keyed by its driver as well: the same UUID under two drivers is two executions.
+        # OpenCode ids keep their bare key (one driver, and the ladder's stored records use it).
+        group_key = row["session"] if row["session"].startswith("ses_") or not row.get("driver") \
+            else f"{row['driver']}:{row['session']}"
+        group = groups.setdefault(group_key, {"cpu": 0.0, "rss": 0, "pids": [], "keys": [],
+                                              "driver": row.get("driver"), "session": row["session"]})
         group["cpu"] += row["cpu"]
         group["rss"] += row["rss"]
         group["pids"].append(pid)
