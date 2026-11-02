@@ -44,7 +44,7 @@ import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
-import { editedSlots } from "./slotCount";
+import { editedSlots, shownSlots } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../../components/chat/TraitsPicker";
 import {
@@ -369,7 +369,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 disabled={blocked}
                 disabledReason={blockedReason}
                 onChange={(slots) =>
-                  void runAction("Couldn't change the pool", () =>
+                  runAction("Couldn't change the pool", () =>
                     kanban.setPool(board.id, pool.model, slots, { replaces: pool.key }),
                   )
                 }
@@ -731,15 +731,25 @@ function Stepper(props: {
   max?: number | undefined;
   disabled?: boolean;
   disabledReason?: string | undefined;
-  onChange: (value: number) => void;
+  onChange: (value: number) => Promise<boolean> | void;
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
+  const [sent, setSent] = useState<{ value: number; from: number } | null>(null);
+  if (sent !== null && sent.from !== props.value) setSent(null);
   const edited = useRef(false);
   const cancelled = useRef(false);
-  const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : props.value;
-  const base = Number.isSafeInteger(typed) ? typed : props.value;
+  const current = shownSlots(sent, props.value);
+  const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : current;
+  const base = Number.isSafeInteger(typed) ? typed : current;
   const atMax = base >= (props.max ?? Number.MAX_SAFE_INTEGER);
+  const send = (next: number) => {
+    const mark = { value: next, from: props.value };
+    setSent(mark);
+    void Promise.resolve(props.onChange(next)).then((ok) => {
+      if (ok === false) setSent((s) => (s === mark ? null : s));
+    });
+  };
   // While typing, the buttons step the draft, so a click never races the typed number.
   const step = (by: number) => {
     const next = Math.max(
@@ -747,7 +757,7 @@ function Stepper(props: {
       props.max === undefined ? base + by : Math.min(props.max, base + by),
     );
     if (!Number.isSafeInteger(next)) return;
-    if (draft === null) props.onChange(next);
+    if (draft === null) send(next);
     else {
       edited.current = true;
       setDraft(String(next));
@@ -775,11 +785,11 @@ function Stepper(props: {
         inputMode="numeric"
         pattern="[0-9]*"
         aria-label={`${props.label} count`}
-        value={draft ?? String(props.value)}
+        value={draft ?? String(current)}
         disabled={props.disabled}
         onFocus={(event) => {
           edited.current = false;
-          setDraft(String(props.value));
+          setDraft(String(current));
           event.currentTarget.select();
         }}
         onChange={(event) => {
@@ -797,11 +807,11 @@ function Stepper(props: {
           const next =
             cancelled.current || draft === null
               ? null
-              : editedSlots(draft, edited.current, props.value, props.min, props.max);
+              : editedSlots(draft, edited.current, current, props.min, props.max);
           cancelled.current = false;
           edited.current = false;
           setDraft(null);
-          if (next !== null) props.onChange(next);
+          if (next !== null) send(next);
         }}
         className="w-9 rounded-md bg-transparent text-center text-sm font-medium tabular-nums text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
       />

@@ -23,3 +23,11 @@ export function editedSlots(
 ): number | null {
   return edited ? committedSlots(text, current, min, max) : null;
 }
+
+/** The count the stepper shows and steps from: the last one it sent, until the feed's value moves off the one it was sent against. */
+export function shownSlots(
+  sent: { readonly value: number; readonly from: number } | null,
+  feed: number,
+): number {
+  return sent !== null && sent.from === feed ? sent.value : feed;
+}

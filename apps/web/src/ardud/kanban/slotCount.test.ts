@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { committedSlots, editedSlots } from "./slotCount";
+import { committedSlots, editedSlots, shownSlots } from "./slotCount";
 
 describe("committedSlots", () => {
   it("accepts whole counts without an upper cap", () => {
@@ -29,5 +29,12 @@ describe("committedSlots", () => {
     expect(editedSlots("12", true, 0, 0)).toBe(12);
     expect(editedSlots("12", true, 12, 0)).toBeNull();
     expect(editedSlots("abc", true, 0, 0)).toBeNull();
+  });
+
+  it("steps from the last sent count until the feed moves", () => {
+    expect(shownSlots(null, 5)).toBe(5);
+    expect(shownSlots({ value: 12, from: 5 }, 5)).toBe(12);
+    expect(shownSlots({ value: 12, from: 5 }, 12)).toBe(12);
+    expect(shownSlots({ value: 12, from: 5 }, 7)).toBe(7);
   });
 });
