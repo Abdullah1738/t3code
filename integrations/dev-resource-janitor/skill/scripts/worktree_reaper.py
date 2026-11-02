@@ -28,7 +28,7 @@ import tarfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import active_workspaces, snapshot  # noqa: E402
+from active_sessions import snapshot  # noqa: E402
 
 HOME = os.path.expanduser("~")
 STALE_DAYS = int(os.environ.get("WORKTREE_STALE_DAYS", "60"))
@@ -124,10 +124,9 @@ def running_dirs(c):
         row = c.execute("SELECT directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
         if row and row[0]:
             dirs.add(row[0].rstrip("/"))
-    # A root-workspace thread has no worktreePath; its project root is the directory it works in. The snapshot
-    # already failed closed if any in-use thread's workspace is unknown, so every one resolves here.
-    workspaces = active_workspaces(timeout=30) or set()
-    dirs.update(d.rstrip("/") for d in workspaces)
+    # Each in-use thread's directory comes from this same snapshot: a root-workspace thread resolves to its
+    # project root. The snapshot is complete here, so every in-use thread has one.
+    dirs.update(d.rstrip("/") for d in snap["workspaces"].values())
     return dirs
 
 

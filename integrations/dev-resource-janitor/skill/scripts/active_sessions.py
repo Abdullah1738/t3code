@@ -38,7 +38,7 @@ CONTROL_PAGE = 500
 
 
 class Snapshot(dict):
-    """{complete, threads: {threadId: {...}}, opencode: set(ids), problems: [str]}."""
+    """{complete, threads: {threadId: {...}}, opencode: set(ids), workspaces: {threadId: dir}, problems: [str]}."""
 
 
 def _password():
@@ -157,8 +157,9 @@ def workspace_of(thread, roots):
 
 
 def snapshot(timeout=20):
-    """The union of both sources, with `complete` true only when every source answered in full and every in-use
-    thread has a known workspace."""
+    """The union of both sources, read once. `complete` is true only when every source answered in full and every
+    in-use thread has a known workspace. `workspaces` maps each in-use thread to its directory, so a caller that
+    needs the directories reads them from this same answer instead of reading the sources again."""
     problems = []
     threads, err = robob_active(timeout)
     if err:
@@ -166,28 +167,25 @@ def snapshot(timeout=20):
     opencode, oc_err = opencode_active(timeout)
     if oc_err:
         problems.append(oc_err)
-    roots = {}
     in_use_threads = [t for t in (threads or {}).values() if in_use(t)]
+    roots = {}
     if any(not t.get("worktreePath") for t in in_use_threads):
-        roots, roots_err = project_roots(timeout)
+        found, roots_err = project_roots(timeout)
         if roots_err:
+            # A root-workspace thread's directory is unknown without the roots. The snapshot is then incomplete,
+            # and the reapers keep everything rather than protect only the worktree paths they could read.
             problems.append(roots_err)
         else:
-            for t in in_use_threads:
-                if not workspace_of(t, roots):
-                    problems.append(f"workspace unknown for thread {t.get('threadId')}")
+            roots = found
+    workspaces = {}
+    for t in in_use_threads:
+        path = workspace_of(t, roots)
+        if path:
+            workspaces[t["threadId"]] = path
+        else:
+            problems.append(f"workspace unknown for thread {t.get('threadId')}")
     return Snapshot(complete=not problems, threads=threads or {}, opencode=opencode or set(),
-                    problems=problems)
-
-
-def active_workspaces(timeout=20):
-    """Every directory an in-use Robob thread works in, or None when the set is incomplete."""
-    snap = snapshot(timeout)
-    if not snap["complete"]:
-        return None
-    roots, _ = project_roots(timeout) if any(not t.get("worktreePath") for t in snap["threads"].values()) \
-        else ({}, None)
-    return {workspace_of(t, roots or {}) for t in snap["threads"].values() if in_use(t)} - {None}
+                    workspaces=workspaces, problems=problems)
 
 
 def active_session_ids(timeout=20):

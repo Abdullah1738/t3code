@@ -23,8 +23,10 @@ import active_sessions as active  # noqa: E402
 class Stub:
     """Serves the control API (`threads`, `total`) and the OpenCode active list on one loopback port."""
 
-    def __init__(self, threads, total=None, control_ok=True, opencode=None, opencode_ok=True, projects=None):
+    def __init__(self, threads, total=None, control_ok=True, opencode=None, opencode_ok=True, projects=None,
+                 projects_ok=True):
         self.projects = projects or []
+        self.projects_ok = projects_ok
         self.threads = threads
         self.total = len(threads) if total is None else total
         self.control_ok = control_ok
@@ -58,7 +60,7 @@ class Stub:
                     return self._send(200, {"ok": True, "total": stub.total,
                                             "threads": stub.threads[:limit]})
                 if url.path == "/api/ardud/control/projects":
-                    if not stub.control_ok:
+                    if not stub.control_ok or not stub.projects_ok:
                         return self._send(503, {"ok": False})
                     return self._send(200, {"ok": True, "projects": stub.projects})
                 if url.path == "/api/session/active":
@@ -211,9 +213,9 @@ class RootWorkspaceTests(unittest.TestCase):
     def test_root_workspace_thread_protects_its_project_root(self):
         root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-1"}
         self.serve(threads=[root], opencode={}, projects=[{"projectId": "proj-1", "workspaceRoot": "/Users/x/repo"}])
-        workspaces = active.active_workspaces()
-        self.assertIsNotNone(workspaces, "a readable project must resolve")
-        self.assertIn("/Users/x/repo", workspaces)
+        snap = active.snapshot()
+        self.assertTrue(snap["complete"], snap["problems"])
+        self.assertEqual(snap["workspaces"], {"thread-root": "/Users/x/repo"})
 
     def test_unresolvable_project_fails_closed(self):
         # The thread's project is missing from /projects: its workspace is unknown, so the set is not complete.
@@ -222,6 +224,35 @@ class RootWorkspaceTests(unittest.TestCase):
         snap = active.snapshot()
         self.assertFalse(snap["complete"], "an in-use thread whose workspace is unknown must not be reaped against")
         self.assertTrue(any("workspace" in p for p in snap["problems"]), snap["problems"])
+
+    def test_failed_projects_read_makes_the_whole_snapshot_incomplete(self):
+        # Threads answer in full, but /projects fails. Protecting only the worktree paths would leave a root
+        # workspace unprotected, so the whole snapshot is incomplete, not just that one thread.
+        root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-1"}
+        worktree = {"threadId": "thread-wt", "state": "running", "worktreePath": "/work/wt"}
+        self.serve(threads=[root, worktree], opencode={}, projects_ok=False)
+        snap = active.snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("projects" in p for p in snap["problems"]), snap["problems"])
+
+    def test_janitor_running_sessions_reads_workspaces_from_the_same_snapshot(self):
+        import dev_janitor
+        root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-1"}
+        stub = self.serve(threads=[root], opencode={"ses_a": True},
+                          projects=[{"projectId": "proj-1", "workspaceRoot": "/Users/x/repo"}])
+        ids, native, err = dev_janitor.running_sessions()
+        self.assertIsNone(err)
+        self.assertEqual(ids, {"ses_a"})
+        self.assertEqual(native, {"thread-root": "/Users/x/repo"})
+        self.assertEqual(len([r for r in stub.requests if "/projects" in r]), 1, stub.requests)
+
+    def test_snapshot_reads_each_source_once(self):
+        # The workspaces come from the same read as the threads, so /projects is asked for once per snapshot.
+        root = {"threadId": "thread-root", "state": "running", "worktreePath": None, "projectId": "proj-1"}
+        stub = self.serve(threads=[root], opencode={}, projects=[{"projectId": "proj-1", "workspaceRoot": "/r"}])
+        active.snapshot()
+        projects_reads = [r for r in stub.requests if "/projects" in r]
+        self.assertEqual(len(projects_reads), 1, stub.requests)
 
 
 class JanitorKeepsEverythingTests(unittest.TestCase):
@@ -254,13 +285,83 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
         import sqlite3
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
-        # running_dirs first gates on a complete snapshot, then reads the resolved workspaces. Both are patched so
-        # the test stays off the live control API and checks only that the claude workspace is protected.
-        complete = {"complete": True, "opencode": set(), "threads": {}, "problems": []}
-        with patch.object(worktree_reaper, "snapshot", return_value=complete), \
-                patch.object(worktree_reaper, "active_workspaces", return_value={"/work/claude-task"}):
+        # running_dirs reads the workspaces from the one complete snapshot. The snapshot is patched so the test
+        # stays off the live control API and checks only that the claude workspace is protected.
+        complete = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
+                    "workspaces": {"thread-claude": "/work/claude-task"}}
+        with patch.object(worktree_reaper, "snapshot", return_value=complete):
             dirs = worktree_reaper.running_dirs(con)
         self.assertIn("/work/claude-task", dirs)
+
+    def test_running_dirs_takes_one_snapshot_and_keeps_its_workspaces(self):
+        # The reaper must not read the sources a second time for the workspaces. One snapshot gives both the
+        # opencode directories and the workspaces, and a later failure can't empty the protected set.
+        import worktree_reaper
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
+        complete = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
+                    "workspaces": {"thread-root": "/Users/x/repo"}}
+        with patch.object(worktree_reaper, "snapshot", return_value=complete) as snap:
+            dirs = worktree_reaper.running_dirs(con)
+        self.assertEqual(snap.call_count, 1)
+        self.assertIn("/Users/x/repo", dirs)
+
+    def test_incomplete_snapshot_makes_running_dirs_raise_not_protect_nothing(self):
+        import worktree_reaper
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
+        incomplete = {"complete": False, "opencode": set(), "threads": {}, "workspaces": {},
+                      "problems": ["control api projects: status 503"]}
+        with patch.object(worktree_reaper, "snapshot", return_value=incomplete):
+            with self.assertRaises(RuntimeError):
+                worktree_reaper.running_dirs(con)
+
+    def test_reaper_removes_nothing_when_the_recheck_snapshot_fails(self):
+        # The first read is healthy and the worktree is stale, so it reaches the re-check right before removal. The
+        # re-check's read fails: main() must remove nothing and report an error.
+        import contextlib
+        import io
+        import sqlite3
+        import worktree_reaper as wr
+        healthy = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
+                   "workspaces": {"thread-root": "/Users/x/repo"}}
+        failing = {"complete": False, "opencode": set(), "threads": {}, "workspaces": {},
+                   "problems": ["control api projects: status 503"]}
+        candidate = {"path": "/work/stale", "common": "/work/common.git", "head": "abc123",
+                     "branch": "refs/heads/old", "reasons": [], "last_commit": 0, "last_commit_days": 90,
+                     "last_session_days": None, "created_days": 90, "ignored_keep": []}
+        worktree = {"main": False, "common": "/work/common.git", "worktree": "/work/stale", "HEAD": "abc123",
+                    "branch": "refs/heads/old"}
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack, \
+                contextlib.redirect_stdout(io.StringIO()):
+            stack.enter_context(patch.object(wr, "LOG_DIR", tmp))
+            stack.enter_context(patch.object(wr, "STATUS", os.path.join(tmp, "status.json")))
+            stack.enter_context(patch.object(wr, "AUDIT", os.path.join(tmp, "audit.jsonl")))
+            stack.enter_context(patch.object(wr.sqlite3, "connect", return_value=db))
+            stack.enter_context(patch.object(wr, "snapshot", side_effect=[healthy, failing]))
+            stack.enter_context(patch.object(wr, "session_activity", return_value={}))
+            stack.enter_context(patch.object(wr, "process_cwds", return_value=[]))
+            stack.enter_context(patch.object(wr, "keep_list", return_value=[]))
+            stack.enter_context(patch.object(wr, "discover", return_value=["/work/common.git"]))
+            stack.enter_context(patch.object(wr, "worktrees", return_value=([worktree], None)))
+            stack.enter_context(patch.object(wr, "evaluate", return_value=candidate))
+            git = stack.enter_context(patch.object(wr, "git", return_value=(0, "", "")))
+            archive = stack.enter_context(patch.object(wr, "archive_ignored", return_value={}))
+            stack.enter_context(patch.object(sys, "argv", ["worktree_reaper.py"]))
+            code = wr.main()
+            with open(os.path.join(tmp, "status.json")) as f:
+                status = json.load(f)
+        self.assertEqual(code, 1)
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["removed"], [])
+        self.assertFalse(any("remove" in call.args[0] for call in git.call_args_list), git.call_args_list)
+        archive.assert_not_called()
+
+
 
 
 if __name__ == "__main__":
