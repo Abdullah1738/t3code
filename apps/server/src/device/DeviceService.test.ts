@@ -175,6 +175,7 @@ const fixture = Effect.fn("fixture")(function* (
         start: Effect.void,
         ready: Effect.void,
         getSettings: Ref.get(settings),
+        getSettingsWithTrust: Ref.get(settings).pipe(Effect.map((settings) => ({ settings, trusted: true }))),
         updateSettings: (patch) =>
           Ref.updateAndGet(settings, (current) => ({
             ...current,

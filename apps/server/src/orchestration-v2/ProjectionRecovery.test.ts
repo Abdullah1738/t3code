@@ -12,6 +12,8 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -132,6 +134,154 @@ const createRun = Effect.fn(function* (
   });
   return runId;
 });
+
+// ardud: exercise the real projection query and event outbox for a failed shared session.
+it.effect.each(["crash", "prepared"] as const)(
+  "recovers two threads sharing an errored session after %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const sessionId = ProviderSessionId.make(`session:shared:${mode}`);
+      const runIds: RunId[] = [];
+      const threadIds: ThreadId[] = [];
+      for (const name of ["a", "b"]) {
+        const threadId = yield* createThread(`shared:${mode}:${name}`);
+        const providerThreadId = ProviderThreadId.make(`provider-thread:${threadId}`);
+        const attemptId = RunAttemptId.make(`attempt:${threadId}`);
+        const providerTurnId = ProviderTurnId.make(`turn:${threadId}`);
+        const rootNodeId = NodeId.make(`node:${threadId}`);
+        threadIds.push(threadId);
+        yield* projections.apply({
+          id: EventId.make(`event:${threadId}:session`),
+          type: "provider-session.attached",
+          threadId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: sessionId,
+            driver,
+            providerInstanceId,
+            status: "error",
+            cwd: "/workspace",
+            model: modelSelection.model,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: now,
+            updatedAt: now,
+            lastError: null,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make(`event:${threadId}:provider-thread`),
+          type: "provider-thread.updated",
+          threadId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: providerThreadId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            driver,
+            providerInstanceId,
+            providerSessionId: sessionId,
+            nativeThreadRef: { driver, nativeId: `native:${threadId}`, strength: "strong" },
+            nativeConversationHeadRef: null,
+            status: "active",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        const runId = yield* createRun(threadId, "running", {
+          providerThreadId,
+          activeAttemptId: attemptId,
+          rootNodeId,
+        });
+        runIds.push(runId);
+        yield* projections.apply({
+          id: EventId.make(`event:${threadId}:attempt`),
+          type: "run-attempt.created",
+          threadId,
+          runId,
+          nodeId: rootNodeId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: attemptId,
+            runId,
+            attemptOrdinal: 1,
+            rootNodeId,
+            providerInstanceId,
+            providerThreadId,
+            providerTurnId,
+            reason: "initial",
+            status: "running",
+            startedAt: now,
+            completedAt: null,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make(`event:${threadId}:turn`),
+          type: "provider-turn.updated",
+          threadId,
+          runId,
+          nodeId: rootNodeId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: providerTurnId,
+            providerThreadId,
+            nodeId: rootNodeId,
+            runAttemptId: attemptId,
+            nativeTurnRef: null,
+            ordinal: 1,
+            status: "running",
+            startedAt: now,
+            completedAt: null,
+          },
+        });
+        const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
+        assert.equal(projection.providerSessions[0]?.status, "error");
+        assert.equal(projection.providerTurns[0]?.status, "running");
+      }
+      if (mode === "prepared") {
+        yield* recovery.prepareForShutdown;
+        yield* recovery.prepareForShutdown;
+        for (const [index, threadId] of threadIds.entries()) {
+          const beforeRestart = yield* sql<{ readonly effect_id: string }>`
+          SELECT effect_id FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+        `;
+          assert.deepEqual(beforeRestart, [
+            { effect_id: `effect:restart-continuation:${runIds[index]}` },
+          ]);
+        }
+      }
+      yield* recovery.reconcile("startup");
+      for (const [index, threadId] of threadIds.entries()) {
+        const effects = yield* sql<{ readonly effect_id: string; readonly effect_type: string }>`
+        SELECT effect_id, effect_type FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+      `;
+        assert.deepEqual(effects, [
+          {
+            effect_id: `effect:restart-continuation:${runIds[index]}`,
+            effect_type: "provider-runtime.continue",
+          },
+        ]);
+        const projection = yield* projections.getThreadProjection(threadId);
+        assert.equal(projection.runs[0]?.status, "cancelled");
+        assert.equal(projection.providerTurns[0]?.status, "cancelled");
+      }
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
 
 it.effect.each(["startup", "shutdown"] as const)(
   "%s cancels queued buffered wakes and holds durable messages",

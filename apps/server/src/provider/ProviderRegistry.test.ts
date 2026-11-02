@@ -368,6 +368,7 @@ function makeMutableServerSettingsService(
       start: Effect.void,
       ready: Effect.void,
       getSettings: Ref.get(settingsRef),
+      getSettingsWithTrust: Ref.get(settingsRef).pipe(Effect.map((settings) => ({ settings, trusted: true }))),
       updateSettings: (patch) =>
         Effect.gen(function* () {
           const current = yield* Ref.get(settingsRef);

@@ -1250,6 +1250,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       });
 
       assert.isFalse(settings.continueThreadsAfterServerUpdate);
+      assert.isFalse((yield* serverSettings.getSettingsWithTrust).trusted);
       assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), raw);
     }).pipe(Effect.provide(layerServerSettings())),
   );

@@ -18,6 +18,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Ref from "effect/Ref";
 
 import * as EffectWorker from "./EffectWorker.ts";
@@ -137,6 +138,11 @@ it.effect("queues continuations for two running threads with an errored shared s
       } as unknown as OrchestrationV2ThreadProjection;
     });
     const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+    const summaries: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      const [text, fields] = Array.isArray(message) ? message : [message];
+      if (text === "orchestration-v2.restart-continuation.summary") summaries.push(fields);
+    });
     const recovery = yield* ProviderRuntimeRecovery.make.pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -161,7 +167,7 @@ it.effect("queues continuations for two running threads with an errored shared s
         ),
       ),
     );
-    yield* recovery.reconcile("startup");
+    yield* recovery.reconcile("startup").pipe(Effect.provide(Logger.layer([logger])));
     assert.deepEqual(
       commits.flatMap((commit) =>
         commit.effects.map((effect) => ({
@@ -180,6 +186,24 @@ it.effect("queues continuations for two running threads with an errored shared s
         },
       ],
     );
+    assert.deepEqual(summaries, [
+      {
+        threadsRead: 2,
+        runsCancelled: 2,
+        continuationsQueued: 2,
+        skipped: {
+          settings_disabled: 0,
+          settings_unreadable: 0,
+          blocked: 0,
+          no_provider_thread: 0,
+          provider_thread_not_active: 0,
+          no_session: 0,
+          session_stopped_or_error: 0,
+          no_running_turn: 0,
+          other: 0,
+        },
+      },
+    ]);
   }),
 );
 
