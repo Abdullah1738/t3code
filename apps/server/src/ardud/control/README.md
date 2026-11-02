@@ -95,8 +95,8 @@ All paths are under `/api/ardud/control`.
 | GET    | `/events`                                                | Server-sent events (SSE).                                                                                        |
 
 `expectedAttemptId` requires `expectedRunId`. An expected run that is already terminal
-returns `already_terminal` without interrupting. The attempt check is a preflight read,
-not an atomic check at dispatch; an attempt that changes after the read can still be interrupted.
+returns `already_terminal` without interrupting. Run and attempt checks happen before
+dispatch, not atomically with it; changes after the checks can still race with interruption.
 
 ### GET /threads
 

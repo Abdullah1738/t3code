@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeUtil from "node:util";
+import * as NodeUrl from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 
@@ -103,7 +104,7 @@ describe("ControlClient", () => {
     const result = await execFile(
       process.execPath,
       [
-        NodePath.join(process.cwd(), "src/ardud/control/t3ctl.mjs"),
+        NodeUrl.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
         "interrupt",
         "thread/one",
         "--expect-run",
