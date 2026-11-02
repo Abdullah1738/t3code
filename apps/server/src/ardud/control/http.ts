@@ -50,6 +50,7 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
+import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
 import {
   GUIDANCE_MAX_CHARS,
@@ -449,6 +450,7 @@ const makeRoutes = Effect.gen(function* () {
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
+  const recovery = yield* RecoverySnapshot.RecoverySnapshot;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -858,6 +860,25 @@ const makeRoutes = Effect.gen(function* () {
       },
       launched.resumed ? 200 : 201,
     );
+  });
+
+  // Read-only recovery view for stream-recovery; see ardud/recovery/RecoverySnapshot.ts.
+  const recoverySnapshot = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const active = boolParam(params.get("active"));
+    if (active === undefined) {
+      return yield* fail("invalid_request", "active=true or active=false is required.");
+    }
+    const page = yield* recovery
+      .page({
+        active,
+        cursor: params.get("cursor") || null,
+        // The service applies the default and the 500 cap.
+        limit: Number(params.get("limit") ?? Number.NaN),
+      })
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
   const listThreads = Effect.gen(function* () {
@@ -1609,6 +1630,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
+    HttpRouter.route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
     HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
@@ -1624,6 +1646,11 @@ const makeRoutes = Effect.gen(function* () {
   ] as const;
 });
 
+// RecoverySnapshot takes ThreadManagementService and ProviderSessionManagerV2
+// from the server runtime, like the other routes here.
+const controlServices = Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer);
 export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
-  Layer.provide(Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer)),
+  Layer.provide(
+    Layer.mergeAll(controlServices, RecoverySnapshot.layer.pipe(Layer.provide(controlServices))),
+  ),
 );
