@@ -144,7 +144,8 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
   const poolsNext = mappedPools.map((pool, index) => {
     const before = pools[index];
     if (before !== undefined && !sameJson(before, pool)) {
-      changes.push({ ref: `pool:${before.key}`, before, after: pool });
+      // Pool keys repeat across boards, so the ref carries the board: it is the rollback's key.
+      changes.push({ ref: `pool:${board.id}:${before.key}`, before, after: pool });
     }
     return pool;
   });

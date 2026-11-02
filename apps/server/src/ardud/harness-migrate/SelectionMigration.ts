@@ -8,7 +8,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 import type {
   CommandId,
   KanbanBoard,
+  KanbanCard,
   KanbanPool,
+  KanbanThreadLink,
   ModelSelection,
   ProjectId,
   ScheduledTaskId,
@@ -18,6 +20,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   CommandId as CommandIdSchema,
+  KanbanBoardId as KanbanBoardIdSchema,
   ProjectId as ProjectIdSchema,
   ScheduledTaskId as ScheduledTaskIdSchema,
 } from "@t3tools/contracts";
@@ -621,7 +624,7 @@ export const make = Effect.gen(function* () {
 
   /**
    * Puts one ledger row back through its owner. Returns null when written, or the reason it was not.
-   * A board, queued-run or thread row is never restored alone: see `restoreBoardRows` and the skips.
+   * A board, queued-run or thread row is never restored alone: see `restoreBoard` and the skips.
    */
   const writeValue = (
     scope: MigrationScope,
@@ -662,9 +665,124 @@ export const make = Effect.gen(function* () {
         case "board":
         case "queued-run":
         case "thread":
-          return `${scope} rollback is not implemented yet`;
+          // Board rows are restored together by restoreBoards; a lone row is never written.
+          return `${scope} rows restore with their board, not alone`;
       }
     });
+
+  /** Board ids this migration wrote, read from the ledger's board rows for one version. */
+  const boardIdOf = (ref: string): string | null => {
+    const match = /^(board|card|thread|pool):(.+)$/.exec(ref);
+    if (match === null) return null;
+    const kind = match[1];
+    const rest = match[2] ?? "";
+    if (kind === "board") return rest;
+    if (kind === "pool") return rest.split(":")[0] ?? null;
+    return null;
+  };
+
+  /**
+   * Restores one board from its ledger rows, all or nothing. Every row must still hold the value
+   * apply wrote; if any has changed, the board is left as it is and the reason is returned.
+   */
+  const restoreBoard = Effect.fn("SelectionMigration.restoreBoard")(function* (
+    boardId: string,
+    rows: ReadonlyArray<LedgerRow>,
+  ) {
+    const boardRows = rows.filter((row) => row.scope === "board");
+    const boardRecord = boardRows.find((row) => row.ref === `board:${boardId}`);
+    if (boardRecord === undefined) return "board row is missing from the ledger";
+
+    // Read the board's current state and check every row against what apply wrote.
+    const current = {
+      board: (yield* kanban.boards.pipe(
+        Effect.mapError((cause) => migrationError("read board", cause)),
+      )).find((board) => board.id === boardId),
+      pools: yield* store
+        .pools(KanbanBoardIdSchema.make(boardId))
+        .pipe(Effect.mapError((cause) => migrationError("read pools", cause))),
+      cards: yield* store
+        .cards(KanbanBoardIdSchema.make(boardId))
+        .pipe(Effect.mapError((cause) => migrationError("read cards", cause))),
+      links: yield* store
+        .threadLinks({ boardId: KanbanBoardIdSchema.make(boardId), open: true })
+        .pipe(Effect.mapError((cause) => migrationError("read thread links", cause))),
+    };
+    if (current.board === undefined) return "board is gone";
+
+    const restored = {
+      board: undefined as KanbanBoard | undefined,
+      pools: new Map<string, KanbanPool>(),
+      cards: new Map<string, KanbanCard>(),
+      links: new Map<string, KanbanThreadLink>(),
+      oldPoolKeys: [] as Array<string>,
+    };
+    for (const row of boardRows) {
+      const before = yield* decodeLedgerValue(row.before_json).pipe(
+        Effect.mapError((cause) => migrationError("decode board ledger", cause)),
+      );
+      const after = yield* decodeLedgerValue(row.after_json).pipe(
+        Effect.mapError((cause) => migrationError("decode board ledger", cause)),
+      );
+      if (row.ref === `board:${boardId}`) {
+        if (!sameJson(current.board, after)) return "board changed after apply";
+        restored.board = before as KanbanBoard;
+      }
+    }
+    for (const row of rows) {
+      if (row.scope !== "board" || row.ref === `board:${boardId}`) continue;
+      const before = yield* decodeLedgerValue(row.before_json).pipe(
+        Effect.mapError((cause) => migrationError("decode board ledger", cause)),
+      );
+      const after = yield* decodeLedgerValue(row.after_json).pipe(
+        Effect.mapError((cause) => migrationError("decode board ledger", cause)),
+      );
+      if (row.ref.startsWith("card:")) {
+        const id = row.ref.slice("card:".length);
+        const live = current.cards.find((card) => card.id === id);
+        if (live === undefined || !sameJson(live, after)) return `card ${id} changed after apply`;
+        restored.cards.set(id, before as KanbanCard);
+      } else if (row.ref.startsWith("thread:")) {
+        const id = row.ref.slice("thread:".length);
+        const live = current.links.find((link) => link.threadId === id);
+        if (live === undefined || !sameJson(live, after)) return `thread link ${id} changed after apply`;
+        restored.links.set(id, before as KanbanThreadLink);
+      } else if (row.ref.startsWith("pool:")) {
+        const key = row.ref.slice(`pool:${boardId}:`.length);
+        const afterPool = after as KanbanPool;
+        const live = current.pools.find((pool) => pool.key === afterPool.key);
+        if (live === undefined || !sameJson(live, afterPool)) return `pool ${key} changed after apply`;
+        restored.pools.set(key, before as KanbanPool);
+        restored.oldPoolKeys.push(afterPool.key);
+      }
+    }
+    if (restored.board === undefined) return "board row is missing from the ledger";
+
+    // The rows restored in full. Old keys are the after keys, so the store removes them first.
+    yield* store
+      .migrateBoardSelections({
+        board: restored.board,
+        pools: [...restored.pools.values()],
+        oldPoolKeys: restored.oldPoolKeys,
+        cards: [...restored.cards.values()],
+        threadLinks: [...restored.links.values()],
+      })
+      .pipe(Effect.mapError((cause) => migrationError(`restore board ${boardId}`, cause)));
+    return null;
+  });
+
+  /** Stamps the ledger rows of one restored unit as rolled back. */
+  const markRolledBack = Effect.fn("SelectionMigration.markRolledBack")(function* (
+    ids: ReadonlyArray<number>,
+  ) {
+    if (ids.length === 0) return;
+    const now = DateTime.formatIso(yield* DateTime.now);
+    for (const id of ids) {
+      yield* sql`
+        UPDATE ardud_harness_selection_migration SET rolled_back_at = ${now} WHERE id = ${id}
+      `.pipe(Effect.mapError((cause) => migrationError("mark rollback", cause)));
+    }
+  });
 
   const rollback: SelectionMigrationShape["rollback"] = Effect.fn("SelectionMigration.rollback")(
     function* (version) {
@@ -674,15 +792,38 @@ export const make = Effect.gen(function* () {
         WHERE version = ${version} AND applied_at IS NOT NULL AND rolled_back_at IS NULL
         ORDER BY id DESC
       `.pipe(Effect.mapError((cause) => migrationError("read ledger", cause)));
+
       const skipped: Array<{ readonly ref: string; readonly reason: string }> = [];
       let reverted = 0;
+
+      // Boards first, one unit each: a board's rows are restored together or not at all.
+      const boardIds = [
+        ...new Set(
+          rows
+            .filter((row) => row.scope === "board")
+            .map((row) => boardIdOf(row.ref))
+            .filter((id): id is string => id !== null),
+        ),
+      ];
+      for (const boardId of boardIds) {
+        const boardRows = rows.filter(
+          (row) => row.scope === "board" && boardIdOf(row.ref) === boardId,
+        );
+        const reason = yield* restoreBoard(boardId, boardRows);
+        if (reason === null) {
+          yield* markRolledBack(boardRows.map((row) => row.id));
+          reverted += boardRows.length;
+        } else {
+          skipped.push({ ref: `board:${boardId}`, reason });
+        }
+      }
+
+      // Every other row is restored alone, through its owner, and stamped only when it was written.
       for (const row of rows) {
+        if (row.scope === "board") continue;
         const reason = yield* restoreRow(row);
         if (reason === null) {
-          const now = DateTime.formatIso(yield* DateTime.now);
-          yield* sql`
-            UPDATE ardud_harness_selection_migration SET rolled_back_at = ${now} WHERE id = ${row.id}
-          `.pipe(Effect.mapError((cause) => migrationError("mark rollback", cause)));
+          yield* markRolledBack([row.id]);
           reverted += 1;
         } else {
           skipped.push({ ref: row.ref, reason });
