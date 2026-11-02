@@ -205,7 +205,9 @@ export function makeProviderFailure(input: {
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
-    category: input.category ?? "unknown",
+    // Only producers that classify a category set it. Others keep the record shape they
+    // always had, so OpenCode and Pi failures serialize exactly as before.
+    ...(input.category === undefined ? {} : { category: input.category }),
     ...(input.class === "usage_limit" &&
     input.resetAt != null &&
     Number.isFinite(Date.parse(input.resetAt))
