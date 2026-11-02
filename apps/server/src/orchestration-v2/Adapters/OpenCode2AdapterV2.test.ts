@@ -569,10 +569,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
   );
 
   it.effect.each([
-    ["provider.quota", "usage_limit"],
-    ["provider.rate-limit", "usage_limit"],
-    ["provider", "provider_error"],
-  ] as const)("classifies a %s execution failure as %s", ([code, failureClass]) =>
+    ["provider.quota", "usage_limit", "quota"],
+    ["provider.rate-limit", "usage_limit", "quota"],
+    ["provider", "provider_error", null],
+  ] as const)("classifies a %s execution failure as %s", ([code, failureClass, category]) =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
@@ -586,11 +586,14 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(turnInput(thread));
       const ended = yield* Fiber.join(terminal);
       assert.equal(ended?.status, "failed");
+      // Only quota/rate-limit carries a category; other OpenCode failures keep their
+      // original record shape.
       assert.deepEqual(ended?.failure, {
         class: failureClass,
         code,
         message: "Provider rejected the request",
         retryable: null,
+        ...(category === null ? {} : { category }),
       });
     }).pipe(Effect.scoped),
   );

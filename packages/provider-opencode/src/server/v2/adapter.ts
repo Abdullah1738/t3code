@@ -2239,6 +2239,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 event.data.error.type === "provider.rate-limit"
                   ? "usage_limit"
                   : "provider_error",
+              ...(event.data.error.type === "provider.quota" ||
+              event.data.error.type === "provider.rate-limit"
+                ? { category: "quota" as const }
+                : {}),
             }),
           });
         default:
