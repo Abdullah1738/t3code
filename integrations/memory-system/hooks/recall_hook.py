@@ -387,7 +387,7 @@ def fallback_prompt_id(event: dict, prompt: str) -> str:
 
 def next_turn(state: dict | None, tid: str, task: str, now: float, provisional: bool) -> dict:
     retired = list(state.get("retired_turns", [])) if state else []
-    if state and not state.get("provisional"):
+    if state and state.get("turn"):
         retired.append(state["turn"])
     if state and state.get("ended_turn"):
         retired.append(state["ended_turn"])
@@ -653,7 +653,8 @@ def handle(harness: str, event: dict):
                     seed = pending_seed
                     db.seed(skey, seed, now)
                 tid = turn_id(harness, event)
-                if state and state.get("invalidated") and name != "UserPromptSubmit":
+                if state and name != "UserPromptSubmit" and (
+                    state.get("invalidated") or (seed and seed.get("turn") and seed["turn"] != state["turn"])):
                     # A start and a tool must agree on a genuinely new native
                     # turn; a delayed event or duplicate start cannot revive it.
                     if (not seed or not tid or seed.get("turn") != tid or

@@ -633,6 +633,39 @@ class RecallHookTests(unittest.TestCase):
                 self.assertEqual(self.server.requests[-1]["prompt"], "Investigate resumed child task")
                 self.assertEqual(self.server.requests[-1]["mode"], "work")
 
+    def test_child_new_start_without_stop_retires_previous_turn(self):
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                field = "prompt_id" if harness == "claude" else "turn_id"
+                agent = "agent-reused" if harness == "claude" else "codex-child"
+                transcript = self.tmp / f"active-{harness}.jsonl"
+                transcript.write_text("")
+                common = {"agent_id": agent, "transcript_path": str(transcript)}
+                def task(message):
+                    row = ({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent",
+                             "input": {"resume": agent, "prompt": message}}]}} if harness == "claude" else
+                           {"type": "event_msg", "payload": {"type": "user_message", "message": message}})
+                    with transcript.open("a") as f:
+                        f.write(json.dumps(row) + "\n")
+                self.call(self.event("SubagentStart", harness, **common, **{field: "old"}), harness, now=1000)
+                task("Old child task")
+                self.work(8, start=1100, harness=harness, **common, **{field: "old"})
+                hook.worker(self.jobs.pop())
+                self.call(self.event("SubagentStart", harness, **common, **{field: "new"}), harness, now=1130)
+                old_tool = self.event("PostToolUse", harness, **common, **{field: "old"}, tool_use_id="late")
+                self.assertIsNone(self.call(old_tool, harness, now=1140))
+                new_tool = self.event("PostToolUse", harness, **common, **{field: "new"}, tool_use_id="fresh")
+                self.assertIsNone(self.call(new_tool, harness, now=1200))
+                task("New child task")
+                self.assertIsNone(self.call(new_tool, harness, now=1203))
+                ident = {"driver": "claudeAgent" if harness == "claude" else "codex",
+                         "providerInstanceId": "claude-instance" if harness == "claude" else "cu",
+                         "robobThreadId": "child", "_agent": agent if harness == "claude" else None}
+                state = self.state(ident)
+                self.assertEqual((state["turn"], state["task"]), ("new", "New child task"))
+                self.assertNotIn("late", state["seen_tools"])
+                self.assertIsNone(self.call(old_tool, harness, now=1210))
+
     def test_child_stop_removes_unconsumed_start_seed(self):
         for harness in ("claude", "codex"):
             with self.subTest(harness=harness):
