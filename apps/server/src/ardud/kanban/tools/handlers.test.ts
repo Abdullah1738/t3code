@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  KanbanCardId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -8,6 +9,8 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
@@ -27,6 +30,7 @@ import { layer as providerRegistryLayer } from "../../../provider/testUtils/prov
 import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
 import { KanbanToolkit } from "./tools.ts";
+import { ModelBody } from "../http.ts";
 
 // Writes check the caller is the thread's live provider; liveThreadsLayer runs on codex.
 const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
@@ -233,6 +237,138 @@ it.effect("board_open gives a board its icon only while it has none", () => {
     assert.include(String(unknown), "Invalid parameters");
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("board model inputs preserve native options and reject conflicting levels", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({ slug: "toy", name: "Toy", defaultProjectId: ProjectId.make("project-1") });
+    const evaluator = ThreadId.make("thread-evaluator");
+    const model = {
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      effort: "max",
+      options: [{ id: "fastMode", value: true }],
+    };
+    const set = yield* call(evaluator, "pool_set", { model, slots: 2 });
+    assert.isFalse(set.isError, set.text);
+    const pool = (yield* kanban.snapshot(board.id)).pools.find((entry) => entry.model.instanceId === "claudeAgent");
+    assert.deepStrictEqual(pool?.model.options, [{ id: "fastMode", value: true }, { id: "effort", value: "max" }]);
+
+    const rejected = yield* call(evaluator, "pool_set", {
+      model: { ...model, variant: "high" }, slots: 3,
+    });
+    assert.isTrue(rejected.isError, rejected.text);
+    assert.include(rejected.text, "effort and variant");
+    assert.strictEqual((yield* kanban.snapshot(board.id)).pools.find((entry) => entry.key === pool?.key)?.slots, 2);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("MCP model writes resolve legacy selections only under the apply flag", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const board = yield* kanban.ensureBoard({ slug: "toy", name: "Toy", defaultProjectId: ProjectId.make("project-1") });
+    const evaluator = ThreadId.make("thread-evaluator");
+    const opus = { instanceId: "opencode", model: "opus/claude-opus-5-5#high" };
+    const haiku = { instanceId: "opencode", model: "opus/cc/claude-haiku-5-5#max" };
+
+    // A separate level is accepted before migration without changing its identity.
+    const legacy = { model: "opus/claude-opus-5-5", variant: "high" };
+    const off = yield* call(evaluator, "pool_set", { model: legacy, slots: 0 });
+    assert.isFalse(off.isError, off.text);
+    assert.isTrue((yield* kanban.snapshot(board.id)).pools.some((pool) => pool.key === "opencode/opus/claude-opus-5-5#high"));
+
+    yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
+    const set = yield* call(evaluator, "pool_set", { model: opus, slots: 0 });
+    assert.isFalse(set.isError, set.text);
+    const setHaiku = yield* call(evaluator, "pool_set", { model: haiku, slots: 0 });
+    assert.isFalse(setHaiku.isError, setHaiku.text);
+    const pools = (yield* kanban.snapshot(board.id)).pools;
+    assert.isTrue(pools.some((pool) => pool.key === "claudeAgent/claude-opus-5-5#high"));
+    assert.isTrue(pools.some((pool) => pool.key === "claudeAgent/claude-haiku-5-5#max"));
+
+    const created = yield* call(evaluator, "card_create", {
+      prompt: "Mapped card", title: "Mapped card", description: "Explicit model",
+      model: opus,
+    });
+    assert.isFalse(created.isError, created.text);
+    const card = created.structured.card as { id: string; model: { instanceId: string; model: string } };
+    assert.strictEqual(card.model.instanceId, "claudeAgent");
+    assert.strictEqual(card.model.model, "claude-opus-5-5");
+
+    const weightedCreated = yield* call(evaluator, "card_create", {
+      prompt: "Weighted mapped card", title: "Weighted mapped card", description: "Weighted models",
+      models: [{ ...opus, weight: 2 }, { ...haiku, weight: 1 }],
+    });
+    assert.isFalse(weightedCreated.isError, weightedCreated.text);
+    const weightedCreatedCard = weightedCreated.structured.card as {
+      models: ReadonlyArray<{ model: { instanceId: string } }>;
+    };
+    assert.deepStrictEqual(weightedCreatedCard.models.map((entry) => entry.model.instanceId), ["claudeAgent", "claudeAgent"]);
+
+    const edited = yield* call(evaluator, "card_edit", { card: card.id, model: haiku });
+    assert.isFalse(edited.isError, edited.text);
+    assert.strictEqual((yield* kanban.card(KanbanCardId.make(card.id))).card.model.model, "claude-haiku-5-5");
+
+    const weighted = yield* call(evaluator, "card_edit", {
+      card: card.id, models: [{ ...opus, weight: 2 }, { ...haiku, weight: 1 }],
+    });
+    assert.isFalse(weighted.isError, weighted.text);
+    const weightedCard = (yield* kanban.card(KanbanCardId.make(card.id))).card;
+    assert.deepStrictEqual(weightedCard.models.map((entry) => entry.model.instanceId), ["claudeAgent", "claudeAgent"]);
+
+    const conflict = yield* call(evaluator, "card_edit", {
+      card: card.id, model: { ...opus, variant: "xhigh" },
+    });
+    assert.isTrue(conflict.isError, conflict.text);
+    assert.include(conflict.text, "conflicting");
+    assert.deepStrictEqual((yield* kanban.card(KanbanCardId.make(card.id))).card.models, weightedCard.models);
+
+    const conflictCreate = yield* call(evaluator, "card_create", {
+      prompt: "Refused card", title: "Refused card", description: "Should not be written",
+      models: [{ ...opus, variant: "xhigh", weight: 1 }],
+    });
+    assert.isTrue(conflictCreate.isError, conflictCreate.text);
+    assert.isFalse((yield* kanban.snapshot(board.id)).cards.some((candidate) => candidate.title === "Refused card"));
+
+    const rejectedSet = yield* call(evaluator, "pool_set", {
+      model: { ...opus, variant: "xhigh" }, slots: 8,
+    });
+    assert.isTrue(rejectedSet.isError, rejectedSet.text);
+    assert.strictEqual((yield* kanban.snapshot(board.id)).pools.find((pool) => pool.key === "claudeAgent/claude-opus-5-5#high")?.slots, 0);
+
+    // Use an unused native pool to exercise removal independently of card references.
+    const astra = { instanceId: "opencode", model: "opus/gpt-6-astra#xhigh" };
+    const setAstra = yield* call(evaluator, "pool_set", { model: astra, slots: 0 });
+    assert.isFalse(setAstra.isError, setAstra.text);
+    const rejectedRemove = yield* call(evaluator, "pool_remove", { model: { ...astra, effort: "high" } });
+    assert.isTrue(rejectedRemove.isError, rejectedRemove.text);
+    assert.isTrue((yield* kanban.snapshot(board.id)).pools.some((pool) => pool.key === "codex/gpt-6-astra#xhigh"));
+    const removed = yield* call(evaluator, "pool_remove", { model: astra });
+    assert.isFalse(removed.isError, removed.text);
+    assert.isFalse((yield* kanban.snapshot(board.id)).pools.some((pool) => pool.key === "codex/gpt-6-astra#xhigh"));
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("HTTP model input decodes full native options and legacy variants", () =>
+  Effect.sync(() => {
+    const decode = Schema.decodeUnknownResult(ModelBody);
+    const native = decode({
+      instanceId: "codex", model: "gpt-6.1-sol", effort: "high",
+      options: [{ id: "serviceTier", value: "priority" }],
+    });
+    assert.isTrue(Result.isSuccess(native));
+    if (Result.isSuccess(native)) {
+      assert.deepStrictEqual(native.success.options, [{ id: "serviceTier", value: "priority" }]);
+      assert.strictEqual(native.success.effort, "high");
+    }
+    const legacy = decode({ model: "opus/gpt-6-astra", variant: "xhigh" });
+    assert.isTrue(Result.isSuccess(legacy));
+    if (Result.isSuccess(legacy)) assert.strictEqual(legacy.success.variant, "xhigh");
+  }),
+);
 
 it.effect("evaluator_start gives a sweep its text and refuses a second running sweep of the kind", () => {
   const { running, launches, layer } = fakeThreads();

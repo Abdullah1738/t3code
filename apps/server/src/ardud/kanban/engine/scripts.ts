@@ -5,13 +5,14 @@
  * hand one back to the evaluator (`handback`) or move a card to completed,
  * deployed or verified (`move`); every other line is plain output.
  */
-import type {
-  KanbanActor,
-  KanbanCard,
-  KanbanChange,
-  KanbanDiscussion,
-  KanbanScript,
-  KanbanScriptTrigger,
+import {
+  ProviderOptionSelections,
+  type KanbanActor,
+  type KanbanCard,
+  type KanbanChange,
+  type KanbanDiscussion,
+  type KanbanScript,
+  type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 import * as Cron from "effect/Cron";
 import * as Result from "effect/Result";
@@ -100,6 +101,8 @@ const PoolCommand = Schema.Struct({
   instanceId: Schema.optional(Schema.String),
   /** The pool's level, e.g. "max"; needed when the board runs the model at several levels. */
   variant: Schema.optional(Schema.String),
+  effort: Schema.optional(Schema.String),
+  options: Schema.optional(ProviderOptionSelections),
   slots: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 50 })),
 });
 

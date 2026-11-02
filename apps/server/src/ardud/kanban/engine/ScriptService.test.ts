@@ -10,6 +10,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   type KanbanActor,
   type KanbanBoard,
@@ -28,6 +29,9 @@ import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
 import * as Rules from "./rules.ts";
 import * as ScriptService from "./ScriptService.ts";
+import * as Scripts from "./scripts.ts";
+import { modelSelectionOf, modelSelectionResult } from "./defaults.ts";
+import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads } from "./threads.ts";
@@ -47,11 +51,14 @@ const threads = Layer.succeed(
   }),
 );
 
-const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
+const boardFilesLayer = (apply = false) => ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-kanban-scripts-test-",
-}).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
+}).pipe(
+  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(ServerSettings.layerTest(apply ? { ardudHarnessMigration: { selections: "apply" } } : {})),
+);
 
-const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>) =>
+const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>, apply = false) =>
   ScriptService.layer.pipe(
     Layer.provideMerge(KanbanService.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
@@ -61,7 +68,7 @@ const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
-    Layer.provideMerge(boardFilesLayer),
+    Layer.provideMerge(boardFilesLayer(apply)),
   );
 
 const testLayer = makeTestLayer(threads);
@@ -275,6 +282,106 @@ it.effect("a pool command names the level when the model runs at several", () =>
       ["high", 4],
     ]);
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("a legacy script resolves only when enabled and exact pool keys stay usable", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    const native = modelSelectionOf({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      effort: "high",
+      options: [{ id: "fastMode", value: true }],
+    });
+    // The mapped default is another level of this model; add an explicit pool so
+    // this test also checks the script keeps the selected pool's secondary options.
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putPool(board.id, { key: Rules.poolKey(native), model: native, slots: 1 });
+    const script = yield* register(board, scriptFile([
+      `echo '{"kanban":"pool","instanceId":"opencode","model":"opus/claude-opus-5-5#high","slots":2}'`,
+      `echo '{"kanban":"pool","instanceId":"opencode","model":"opus/claude-opus-5-5#high","variant":"xhigh","slots":3}'`,
+      `echo '{"kanban":"pool","model":"claudeAgent/claude-opus-5-5#high","slots":4}'`,
+      "",
+    ].join("\n")));
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+    const [done] = yield* scripts.runs(script.id, 1);
+    assert.include(done?.output, "pool to 2 slots");
+    assert.include(done?.output, "conflicting efforts");
+    assert.include(done?.output, "pool to 4 slots");
+    const pool = (yield* kanban.snapshot(board.id)).pools.find((entry) => entry.key === Rules.poolKey(native));
+    assert.strictEqual(pool?.slots, 4);
+    assert.deepStrictEqual(pool?.model, native);
+  }).pipe(Effect.provide(makeTestLayer(threads, true))),
+);
+
+it.effect("legacy pool commands do not map while routing is off", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    const native = modelSelectionOf({ instanceId: "claudeAgent", model: "claude-opus-5-5", effort: "high" });
+    yield* kanban.setPool(board.id, native, 1);
+    const script = yield* register(board, scriptFile(
+      `echo '{"kanban":"pool","instanceId":"opencode","model":"opus/claude-opus-5-5#high","slots":2}'\n`,
+    ));
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+    const [done] = yield* scripts.runs(script.id, 1);
+    assert.include(done?.output, "There's no opus/claude-opus-5-5#high pool");
+    assert.strictEqual((yield* kanban.snapshot(board.id)).pools.find((pool) => pool.key === Rules.poolKey(native))?.slots, 1);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("selection input preserves native options and fails closed on conflicting efforts", () =>
+  Effect.sync(() => {
+    const parsed = Scripts.parseOutput(JSON.stringify({
+      kanban: "pool", model: "gpt-6.1-sol", instanceId: "codex", effort: "xhigh",
+      options: [{ id: "serviceTier", value: "priority" }], slots: 2,
+    }));
+    assert.lengthOf(parsed.errors, 0);
+    assert.deepStrictEqual(parsed.commands[0], {
+      kanban: "pool", model: "gpt-6.1-sol", instanceId: "codex", effort: "xhigh",
+      options: [{ id: "serviceTier", value: "priority" }], slots: 2,
+    });
+    assert.deepStrictEqual(modelSelectionOf({
+      instanceId: "codex", model: "gpt-6.1-sol", effort: "xhigh",
+      options: [{ id: "serviceTier", value: "priority" }],
+    }), {
+      instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol",
+      options: [{ id: "serviceTier", value: "priority" }, { id: "reasoningEffort", value: "xhigh" }],
+    });
+    assert.strictEqual(modelSelectionResult({
+      instanceId: "claudeAgent", model: "claude-opus-5-5", effort: "high",
+      options: [{ id: "effort", value: "max" }],
+    }).kind, "conflict");
+    assert.strictEqual(modelSelectionResult({
+      model: "opus/gpt-6-astra#high", variant: "xhigh",
+    }, true).kind, "conflict");
+    assert.strictEqual(modelSelectionResult({
+      model: "opus/gpt-6-astra", effort: "high", options: [{ id: "reasoningEffort", value: "xhigh" }],
+    }, true).kind, "conflict");
+    assert.strictEqual(modelSelectionOf({ model: "opus/gpt-6-astra#high" }).model, "opus/gpt-6-astra#high");
+    assert.deepStrictEqual(modelSelectionOf({ model: "opus/cx/gpt-6.1-terra", variant: "xhigh" }, true), {
+      instanceId: ProviderInstanceId.make("codex-cu"), model: "gpt-6.1-terra",
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
+    });
+  }),
+);
+
+it.effect("selection routing follows the live migration setting", () =>
+  Effect.gen(function* () {
+    const settings = yield* ServerSettings.ServerSettingsService;
+    assert.isFalse(yield* selectionRoutingEnabled);
+    yield* settings.updateSettings({ ardudHarnessMigration: { selections: "dryrun" } });
+    assert.isFalse(yield* selectionRoutingEnabled);
+    yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
+    assert.isTrue(yield* selectionRoutingEnabled);
+    yield* settings.updateSettings({ ardudHarnessMigration: { selections: "off" } });
+    assert.isFalse(yield* selectionRoutingEnabled);
+  }).pipe(Effect.provide(ServerSettings.layerTest())),
 );
 
 it.effect("runs one at a time and says why a run went wrong", () =>

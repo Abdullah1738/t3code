@@ -38,7 +38,12 @@ import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanModels from "./models.ts";
-import { modelSelectionOf } from "./defaults.ts";
+import {
+  DEFAULT_CARD_MODEL,
+  DEFAULT_EVALUATOR_MODEL,
+  DEFAULT_MANAGER_MODEL,
+  modelSelectionOf,
+} from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as KanbanService from "./KanbanService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -208,6 +213,42 @@ const fileTestLayer = (fake: Layer.Layer<KanbanThreads>, dbPath: string) =>
   );
 
 const owner: KanbanActor = { _tag: "owner" };
+
+it.effect("new board defaults follow the migration setting without rewriting existing boards", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const original = yield* kanban.ensureBoard({ slug: "original", name: "Original", defaultProjectId: null });
+      assert.deepStrictEqual(original.managerModel, DEFAULT_MANAGER_MODEL);
+      assert.deepStrictEqual(original.evaluatorModel, DEFAULT_EVALUATOR_MODEL);
+      assert.deepStrictEqual(original.defaultCardModel, DEFAULT_CARD_MODEL);
+
+      yield* settings.updateSettings({ ardudHarnessMigration: { selections: "dryrun" } });
+      const dryrun = yield* kanban.ensureBoard({ slug: "dryrun", name: "Dry run", defaultProjectId: null });
+      assert.deepStrictEqual(dryrun.managerModel, DEFAULT_MANAGER_MODEL);
+      assert.deepStrictEqual(dryrun.defaultCardModel, DEFAULT_CARD_MODEL);
+
+      yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
+      const mapped = yield* kanban.ensureBoard({ slug: "mapped", name: "Mapped", defaultProjectId: null });
+      assert.deepStrictEqual(mapped.managerModel, {
+        instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude-haiku-5-5",
+        options: [{ id: "effort", value: "xhigh" }],
+      });
+      assert.deepStrictEqual(mapped.defaultCardModel, {
+        instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude-opus-5-5",
+        options: [{ id: "effort", value: "xhigh" }],
+      });
+      assert.deepStrictEqual(mapped.evaluatorModel, mapped.defaultCardModel);
+      const pools = (yield* kanban.snapshot(mapped.id)).pools;
+      assert.deepStrictEqual(pools.map((pool) => pool.key), [
+        "claudeAgent/claude-haiku-5-5#xhigh", "claudeAgent/claude-opus-5-5#xhigh",
+      ]);
+      assert.deepStrictEqual((yield* kanban.ensureBoard({ slug: "original", name: "Again", defaultProjectId: null })).managerModel, DEFAULT_MANAGER_MODEL);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
 
 it.effect("runs a card from To-Do through work, review findings, fix and a clear review", () =>
   Effect.gen(function* () {

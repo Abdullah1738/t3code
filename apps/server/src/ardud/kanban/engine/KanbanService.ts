@@ -78,6 +78,7 @@ import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import { KanbanThreads } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
+import { selectionRoutingEnabled } from "./selectionSettings.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
@@ -610,6 +611,8 @@ const roleName = (role: KanbanThreadLink["role"]) =>
   role === "work" ? "Worker" : role === "review" ? "Reviewer" : "Evaluator";
 
 const make = Effect.gen(function* () {
+  const context = yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
+  const routingEnabled = selectionRoutingEnabled.pipe(Effect.provideContext(context));
   const store = yield* KanbanStore;
   const threads = yield* KanbanThreads;
   const models = yield* KanbanModels;
@@ -3563,6 +3566,19 @@ const make = Effect.gen(function* () {
     readonly evaluatorModel?: ModelSelection | undefined;
     readonly defaultCardModel?: ModelSelection | undefined;
   }) {
+    const apply = yield* routingEnabled;
+    const defaultModel = (selection: ModelSelection) => {
+      if (!apply) return Effect.succeed(selection);
+      const result = Defaults.modelSelectionResult(selection, apply);
+      return result.kind === "conflict"
+        ? failWith("invalid", result.reason)
+        : Effect.succeed(result.selection);
+    };
+    const managerModel = input.managerModel ?? (yield* defaultModel(Defaults.DEFAULT_MANAGER_MODEL));
+    const evaluatorModel =
+      input.evaluatorModel ?? (yield* defaultModel(Defaults.DEFAULT_EVALUATOR_MODEL));
+    const defaultCardModel =
+      input.defaultCardModel ?? (yield* defaultModel(Defaults.DEFAULT_CARD_MODEL));
     if (input.managerModel) yield* checkModel(input.managerModel);
     if (input.evaluatorModel) yield* checkModel(input.evaluatorModel);
     if (input.defaultCardModel) yield* checkModel(input.defaultCardModel);
@@ -3574,9 +3590,9 @@ const make = Effect.gen(function* () {
       icon: null,
       iconImage: null,
       defaultProjectId: input.defaultProjectId,
-      managerModel: input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
-      evaluatorModel: input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
-      defaultCardModel: input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
+      managerModel,
+      evaluatorModel,
+      defaultCardModel,
       reviewChains: [],
       defaultReviewChain: null,
       instructions: Defaults.DEFAULT_INSTRUCTIONS,

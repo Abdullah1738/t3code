@@ -11,6 +11,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import {
   KanbanDiscussionId,
   KanbanError,
@@ -40,6 +41,8 @@ import * as Stream from "effect/Stream";
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService } from "./KanbanService.ts";
+import { modelSelectionResult } from "./defaults.ts";
+import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
 
@@ -153,6 +156,8 @@ interface Slot {
 type Slots = ReadonlyMap<KanbanScript["id"], Slot>;
 
 const make = Effect.gen(function* () {
+  const context = yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
+  const routingEnabled = selectionRoutingEnabled.pipe(Effect.provideContext(context));
   const store = yield* KanbanStore;
   const service = yield* KanbanService;
   const scope = yield* Effect.scope;
@@ -226,27 +231,53 @@ const make = Effect.gen(function* () {
     return yield* ownDiscussion(script);
   });
 
-  // Only resizes a pool the board already has, keeping its variant.
+  // Only resizes a pool the board already has, keeping its full selection.
   const resizePool = Effect.fn("KanbanScripts.resizePool")(function* (
     script: KanbanScript,
     command: Scripts.PoolCommand,
   ) {
     const pools = yield* io(store.pools(script.boardId));
+    const apply = yield* routingEnabled;
+    const selected = modelSelectionResult(command, apply);
+    if (selected.kind === "conflict") {
+      return `Couldn't resize the ${command.model} pool: ${selected.reason}`;
+    }
+    const exact = pools.filter((entry) => entry.key === command.model);
+    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
+    const namedLevel = selectionEffort(selected.selection);
+    const keyedPool = exact[0];
+    if (
+      keyedPool &&
+      ((command.instanceId !== undefined && command.instanceId !== keyedPool.model.instanceId) ||
+        (namedLevel !== null && namedLevel !== Rules.modelLevel(keyedPool.model)))
+    ) {
+      return `The pool key ${command.model} conflicts with its instance or effort.`;
+    }
+    const mapped =
+      apply &&
+      (selected.selection.instanceId !== (command.instanceId ?? "opencode") ||
+        selected.selection.model !== command.model);
     const same = pools.filter(
       (entry) =>
-        entry.model.model === command.model &&
-        (command.instanceId === undefined || entry.model.instanceId === command.instanceId),
+        entry.model.model === selected.selection.model &&
+        (mapped
+          ? entry.model.instanceId === selected.selection.instanceId
+          : command.instanceId === undefined || entry.model.instanceId === command.instanceId),
     );
-    if (command.variant === undefined && same.length > 1) {
+    if (!keyedPool && namedLevel === null && same.length > 1) {
       const levels = same.map((entry) => Rules.modelLevel(entry.model) ?? "no level").join(", ");
       return `The ${command.model} pools run at ${levels}; name the variant.`;
     }
-    const pool =
-      command.variant === undefined
-        ? same[0]
-        : same.find((entry) => Rules.modelLevel(entry.model) === command.variant);
+    const matching =
+      namedLevel === null
+        ? same
+        : same.filter((entry) => Rules.modelLevel(entry.model) === namedLevel);
+    if (!keyedPool && matching.length > 1) {
+      return `More than one pool matches ${command.model} ${namedLevel ?? ""}.`;
+    }
+    const pool = keyedPool ?? matching[0];
     if (!pool) {
-      return `There's no ${command.model}${command.variant ? ` ${command.variant}` : ""} pool on this board.`;
+      return `There's no ${command.model}${namedLevel ? ` ${namedLevel}` : ""} pool on this board.`;
     }
     const resized = yield* Effect.result(
       service.setPool(script.boardId, pool.model, command.slots),

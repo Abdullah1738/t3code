@@ -19,7 +19,7 @@ import {
   KanbanScriptId,
   KanbanScriptTrigger,
   KanbanStage,
-  ModelSelection,
+  ProviderOptionSelections,
   ProjectId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -30,8 +30,9 @@ import * as Struct from "effect/Struct";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
-import { modelSelectionOf } from "./engine/defaults.ts";
+import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
+import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
 
 export const KANBAN_ROUTE_PREFIX = "/api/ardud/kanban";
@@ -83,19 +84,22 @@ const query = Effect.fn("KanbanHttp.query")(function* (name: string) {
 
 const Text = Schema.optional(Schema.String);
 
-const ModelBody = Schema.Struct({
+export const ModelBody = Schema.Struct({
   model: Schema.String,
   instanceId: Text,
+  provider: Text,
+  effort: Text,
   variant: Text,
+  options: Schema.optional(ProviderOptionSelections),
 });
 
 const CreateBoardBody = Schema.Struct({
   slug: Schema.String,
   name: Schema.String,
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
-  managerModel: Schema.optional(ModelSelection),
-  evaluatorModel: Schema.optional(ModelSelection),
-  defaultCardModel: Schema.optional(ModelSelection),
+  managerModel: Schema.optional(ModelBody),
+  evaluatorModel: Schema.optional(ModelBody),
+  defaultCardModel: Schema.optional(ModelBody),
 });
 
 const CreateCardBody = Schema.Struct({
@@ -168,6 +172,13 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
     const service = yield* KanbanService;
     const scripts = yield* KanbanScripts;
+
+    const modelOf = (input: ModelInput, apply: boolean) => {
+      const result = modelSelectionResult(input, apply);
+      return result.kind === "conflict"
+        ? Effect.fail(fail("invalid", result.reason))
+        : Effect.succeed(result.selection);
+    };
 
     const authenticate = Effect.fn("KanbanHttp.authenticate")(function* (
       scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
@@ -244,13 +255,23 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const input = yield* body(CreateBoardBody);
         const projectId = input.projectId ? ProjectId.make(input.projectId) : null;
+        const apply = yield* selectionRoutingEnabled;
+        const managerModel = input.managerModel
+          ? yield* modelOf(input.managerModel, apply)
+          : undefined;
+        const evaluatorModel = input.evaluatorModel
+          ? yield* modelOf(input.evaluatorModel, apply)
+          : undefined;
+        const defaultCardModel = input.defaultCardModel
+          ? yield* modelOf(input.defaultCardModel, apply)
+          : undefined;
         const board = yield* service.ensureBoard({
           slug: input.slug,
           name: input.name,
           defaultProjectId: projectId,
-          ...(input.managerModel ? { managerModel: input.managerModel } : {}),
-          ...(input.evaluatorModel ? { evaluatorModel: input.evaluatorModel } : {}),
-          ...(input.defaultCardModel ? { defaultCardModel: input.defaultCardModel } : {}),
+          ...(managerModel ? { managerModel } : {}),
+          ...(evaluatorModel ? { evaluatorModel } : {}),
+          ...(defaultCardModel ? { defaultCardModel } : {}),
         });
         if (projectId && board.defaultProjectId !== projectId) {
           return yield* service.updateBoard(board.id, { defaultProjectId: projectId });
@@ -270,9 +291,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const board: KanbanBoard = yield* boardOf(yield* param("board"));
         const { model, ...input } = yield* body(CreateCardBody);
+        const apply = model ? yield* selectionRoutingEnabled : false;
+        const selected = model ? yield* modelOf(model, apply) : undefined;
         return yield* service.createCard(
           board.id,
-          { ...input, ...(model ? { model: modelSelectionOf(model) } : {}) },
+          { ...input, ...(selected ? { model: selected } : {}) },
           OWNER,
         );
       }),
@@ -282,6 +305,23 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(BoardBody);
+        const apply = yield* selectionRoutingEnabled;
+        const managerModel = input.managerModel
+          ? yield* modelOf(input.managerModel, apply)
+          : undefined;
+        const evaluatorModel = input.evaluatorModel
+          ? yield* modelOf(input.evaluatorModel, apply)
+          : undefined;
+        const defaultCardModel = input.defaultCardModel
+          ? yield* modelOf(input.defaultCardModel, apply)
+          : undefined;
+        const reviewChains = input.reviewChains
+          ? yield* Effect.forEach(input.reviewChains, (chain) =>
+              Effect.forEach(chain.steps, (step) => modelOf(step, apply)).pipe(
+                Effect.map((steps) => ({ name: chain.name, steps })),
+              ),
+            )
+          : undefined;
         return yield* service.updateBoard(board.id, {
           ...(input.name ? { name: input.name } : {}),
           ...(input.icon !== undefined ? { icon: input.icon } : {}),
@@ -289,21 +329,10 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(input.projectId !== undefined
             ? { defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null }
             : {}),
-          ...(input.managerModel ? { managerModel: modelSelectionOf(input.managerModel) } : {}),
-          ...(input.evaluatorModel
-            ? { evaluatorModel: modelSelectionOf(input.evaluatorModel) }
-            : {}),
-          ...(input.defaultCardModel
-            ? { defaultCardModel: modelSelectionOf(input.defaultCardModel) }
-            : {}),
-          ...(input.reviewChains
-            ? {
-                reviewChains: input.reviewChains.map((chain) => ({
-                  name: chain.name,
-                  steps: chain.steps.map(modelSelectionOf),
-                })),
-              }
-            : {}),
+          ...(managerModel ? { managerModel } : {}),
+          ...(evaluatorModel ? { evaluatorModel } : {}),
+          ...(defaultCardModel ? { defaultCardModel } : {}),
+          ...(reviewChains ? { reviewChains } : {}),
           ...(input.defaultReviewChain !== undefined
             ? { defaultReviewChain: input.defaultReviewChain }
             : {}),
@@ -323,7 +352,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         if (!slotsOk) {
           return yield* fail("invalid", "slots must be a whole number, 0 or more.");
         }
-        return yield* service.setPool(board.id, modelSelectionOf(input.model), input.slots, {
+        const apply = yield* selectionRoutingEnabled;
+        const model = yield* modelOf(input.model, apply);
+        return yield* service.setPool(board.id, model, input.slots, {
           replaces: input.replaces,
         });
       }),
