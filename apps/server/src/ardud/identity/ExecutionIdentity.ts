@@ -49,6 +49,10 @@ export interface ExecutionIdentityResult {
   /** The native session that owns the execution (the parent's, for Claude children). */
   readonly nativeSessionId: string | null;
   readonly nativeAgentId: string | null;
+  /** Native Claude owner for the next proven in-session ancestry hop. */
+  readonly parentNativeAgentId: string | null;
+  /** Claude provider session's app thread; not necessarily the global root. */
+  readonly nativeOwnerThreadId: string | null;
   readonly model: ModelSelection | null;
   readonly acceptsMessages: boolean;
   /** Thread ids that matched when resolution is ambiguous; empty otherwise. */
@@ -132,6 +136,8 @@ const unresolved = (
   providerInstanceId: null,
   nativeSessionId: null,
   nativeAgentId: null,
+  parentNativeAgentId: null,
+  nativeOwnerThreadId: null,
   model: null,
   acceptsMessages: false,
   candidates,
@@ -240,8 +246,9 @@ const make = Effect.gen(function* () {
   // Claude's in-process tasks share the root provider thread. Resolve just the
   // immediate owner here; hook policy handles any further ancestry separately.
   const ownerChildThread = (threadId: string, parentNodeId: string) =>
-    sql<{ readonly child_thread_id: string; readonly provider_thread_id: string | null }>`
-      SELECT s.child_thread_id, n.provider_thread_id
+    sql<{ readonly child_thread_id: string; readonly provider_thread_id: string | null; readonly native_agent_id: string | null }>`
+      SELECT s.child_thread_id, n.provider_thread_id,
+        json_extract(s.payload_json, '$.nativeTaskRef.nativeId') AS native_agent_id
       FROM orchestration_v2_projection_subagents AS s
       JOIN orchestration_v2_projection_nodes AS n ON n.node_id = s.subagent_id
       WHERE s.subagent_id = ${parentNodeId}
@@ -368,7 +375,7 @@ const make = Effect.gen(function* () {
         const owner = subagent.parent_node_id
           ? yield* ownerChildThread(threadId, subagent.parent_node_id)
           : null;
-        if (owner !== null && owner.provider_thread_id !== row.provider_thread_id) {
+        if (owner !== null && (owner.provider_thread_id !== row.provider_thread_id || !owner.native_agent_id)) {
           return unresolved("unavailable");
         }
         return {
@@ -381,6 +388,8 @@ const make = Effect.gen(function* () {
           providerInstanceId,
           nativeSessionId: input.nativeId,
           nativeAgentId: input.agentId,
+          parentNativeAgentId: owner?.native_agent_id ?? null,
+          nativeOwnerThreadId: threadId,
           model: parseModel(subagent.model_json),
           acceptsMessages: false,
           candidates: [],
@@ -400,6 +409,8 @@ const make = Effect.gen(function* () {
             providerInstanceId,
             nativeSessionId: input.nativeId,
             nativeAgentId: null,
+            parentNativeAgentId: null,
+            nativeOwnerThreadId: null,
             model: parseModel(child.model_json),
             acceptsMessages: true,
             candidates: [],
@@ -419,6 +430,8 @@ const make = Effect.gen(function* () {
         providerInstanceId,
         nativeSessionId: input.nativeId,
         nativeAgentId: null,
+        parentNativeAgentId: null,
+        nativeOwnerThreadId: null,
         model: parseModel(thread?.model_json ?? null),
         acceptsMessages: true,
         candidates: [],

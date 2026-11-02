@@ -21,7 +21,7 @@ describe("Claude nested execution identity", () => {
             payload_json: JSON.stringify({ lineage: { parentThreadId: parent, rootThreadId: "root" } }),
           })}`;
         yield* insertThread("root", null, "pt");
-        for (const id of ["a", "b", "leaf", "leaf-b"]) {
+        for (const id of ["a", "b", "leaf", "leaf-b", "deep"]) {
           // Old nested child threads have the root as their stored parent.
           yield* insertThread(id, "root", null);
         }
@@ -53,6 +53,7 @@ describe("Claude nested execution identity", () => {
         yield* insertAgent("node-b", "b", "root-node", "agent-b");
         yield* insertAgent("node-leaf", "leaf", "node-a", "agent-leaf");
         yield* insertAgent("node-leaf-b", "leaf-b", "node-b", "agent-leaf-b");
+        yield* insertAgent("node-deep", "deep", "node-leaf", "agent-deep");
 
         const resolve = (agentId: string) => identity.resolve({
           nativeId: "session", driver: "claudeAgent", agentId,
@@ -66,6 +67,12 @@ describe("Claude nested execution identity", () => {
         assert.strictEqual(sibling.parentThreadId, "b");
         assert.strictEqual(leaf.robobThreadId, "leaf");
         assert.strictEqual(sibling.robobThreadId, "leaf-b");
+        const deep = yield* resolve("agent-deep");
+        assert.strictEqual(deep.parentThreadId, "leaf");
+        assert.strictEqual(deep.parentNativeAgentId, "agent-leaf");
+        assert.strictEqual(deep.nativeOwnerThreadId, "root");
+        assert.strictEqual(leaf.parentNativeAgentId, "agent-a");
+        assert.strictEqual(a.parentNativeAgentId, null);
 
         // A placeholder task can be upserted before the parent Agent frame.
         yield* sql`UPDATE orchestration_v2_projection_subagents SET parent_node_id = 'root-node' WHERE subagent_id = 'node-leaf'`;
@@ -84,6 +91,9 @@ describe("Claude nested execution identity", () => {
         yield* sql`UPDATE orchestration_v2_projection_nodes SET provider_thread_id = 'other' WHERE node_id = 'node-a'`;
         assert.strictEqual((yield* resolve("agent-leaf")).resolution, "unavailable");
         assert.strictEqual((yield* resolve("agent-leaf-b")).parentThreadId, "b");
+        yield* sql`UPDATE orchestration_v2_projection_nodes SET provider_thread_id = 'pt' WHERE node_id = 'node-a'`;
+        yield* sql`UPDATE orchestration_v2_projection_subagents SET payload_json = '{}' WHERE subagent_id = 'node-leaf'`;
+        assert.strictEqual((yield* resolve("agent-deep")).resolution, "unavailable");
       }).pipe(Effect.provide(ExecutionIdentity.layer)),
     ).pipe(Effect.provide(Sqlite.layerMemory)),
   );

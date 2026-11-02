@@ -120,7 +120,9 @@ class EngineTests(unittest.TestCase):
     def add_identity(self, native, thread, parent=None, agent=None, model="claude-haiku-5-5"):
         self.state.identities[(native, agent)] = {"resolution": "resolved", "robobThreadId": thread,
             "parentThreadId": parent, "rootThreadId": parent or thread,
-            "nativeSessionId": native, "nativeAgentId": agent, "model": {"model": model}}
+            "nativeSessionId": native, "nativeAgentId": agent, "model": {"model": model},
+            **({"driver": "claudeAgent", "providerInstanceId": "claudeAgent", "parentNativeAgentId": None,
+                "nativeOwnerThreadId": parent} if agent else {})}
 
     def event(self, command, session="session", agent="agent-child", **extra):
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": session,
@@ -313,6 +315,69 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.decide(self.event("psql", session="deep", agent=None), "claude")["decision"], "deny")
         self.assertTrue(any("/threads/middle" in path for path in self.state.calls))
         self.assertTrue(any("/threads/parent" in path for path in self.state.calls))
+
+    def test_claude_three_native_levels_follow_proven_owners_for_coord_and_exemptions(self):
+        self.state.threads["parent"].update(parentThreadId=None, nativeSessionId="session")
+        for thread in ("a", "b"):
+            # Old Claude child shells all report the root as parent.
+            self.state.threads[thread] = {"threadId": thread, "parentThreadId": "parent", "nativeSessionId": None}
+        self.add_identity("session", "a", parent="parent", agent="agent-a")
+        self.add_identity("session", "b", parent="a", agent="agent-b")
+        self.add_identity("session", "leaf", parent="b", agent="agent-leaf")
+        for agent, owner in (("agent-leaf", "agent-b"), ("agent-b", "agent-a"), ("agent-a", None)):
+            self.state.identities[("session", agent)].update(
+                driver="claudeAgent", providerInstanceId="claudeAgent", parentNativeAgentId=owner,
+                nativeOwnerThreadId="parent")
+        self.actor("a")
+        event = self.event("psql", agent="agent-leaf")
+        self.assertEqual(engine.decide(event, "claude")["decision"], "deny")
+        entry = {"thread_id": "a", "expires_at": time.time() + 60}
+        (self.offbox_state / "exemptions.json").write_text(json.dumps([entry]))
+        self.assertEqual(engine.decide(self.event("npm ci", agent="agent-leaf"), "claude")["decision"], "allow")
+        entry["thread_id"] = "sibling"
+        (self.offbox_state / "exemptions.json").write_text(json.dumps([entry]))
+        self.assertEqual(engine.decide(self.event("npm ci", agent="agent-leaf"), "claude")["decision"], "deny")
+        self.assertTrue(any("agentId=agent-b" in path for path in self.state.calls))
+        self.assertTrue(any("agentId=agent-a" in path for path in self.state.calls))
+
+    def test_native_chain_requires_the_proven_provider_owner_endpoint(self):
+        self.add_identity("session", "leaf", parent=None, agent="agent-leaf")
+        leaf = self.state.identities[("session", "agent-leaf")]
+        leaf.update(parentNativeAgentId="agent-b", nativeOwnerThreadId="parent")
+        with self.assertRaisesRegex(ValueError, "lineage-native-unresolved"):
+            engine._lineage(leaf)
+
+    def test_claude_parent_lookup_rejects_wrong_sibling_cycles_and_unresolved(self):
+        self.add_identity("session", "leaf", parent="b", agent="agent-leaf")
+        leaf = self.state.identities[("session", "agent-leaf")]
+        leaf.update(parentNativeAgentId="agent-b", nativeOwnerThreadId="parent")
+        self.add_identity("session", "b", parent="parent", agent="agent-b")
+        owner = self.state.identities[("session", "agent-b")]
+        for changed in ({"robobThreadId": "sibling"}, {"providerInstanceId": "other"},
+                        {"resolution": "unavailable"}, {"nativeOwnerThreadId": "other"},
+                        {"parentNativeAgentId": "agent-leaf"}):
+            with self.subTest(changed=changed):
+                old = dict(owner)
+                owner.update(changed)
+                if changed.get("parentNativeAgentId") == "agent-leaf":
+                    owner["parentThreadId"] = "a"
+                with self.assertRaises(ValueError):
+                    engine._lineage(leaf)
+                owner.clear()
+                owner.update(old)
+
+    def test_claude_native_owner_can_be_an_app_managed_child(self):
+        self.add_identity("session", "leaf", parent="app-child", agent="agent-leaf")
+        leaf = self.state.identities[("session", "agent-leaf")]
+        leaf.update(parentNativeAgentId=None, nativeOwnerThreadId="app-child", rootThreadId="parent")
+        self.state.threads["app-child"] = {"threadId": "app-child", "parentThreadId": "parent", "nativeSessionId": "session"}
+        self.assertEqual([n["threadId"] for n in engine._lineage(leaf)], ["leaf", "app-child", "parent"])
+
+    def test_missing_native_owner_metadata_is_not_replaced_by_flat_shell_parent(self):
+        event = self.event("psql")
+        del self.state.identities[("session", "agent-child")]["parentNativeAgentId"]
+        self.actor()
+        self.assertEqual(engine.decide(event, "claude")["context"]["rule"], "coord-unresolved")
 
     def test_lineage_depth_limit_never_trusts_partial_ancestry(self):
         self.add_identity("deep", "leaf", parent="n0", agent=None)

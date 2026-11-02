@@ -78,6 +78,16 @@ def _log(**record):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
         command = record.get("command")
+        command_hmac = None
+        audit_error = None
+        if isinstance(command, str) and command:
+            try:
+                command_hmac = hmac.new(_command_identity_key(create=True), command.encode("utf-8"), hashlib.sha256).hexdigest()
+            except UnicodeError:
+                audit_error = "command-encoding-error"
+            except (OSError, ValueError):
+                # A damaged or inaccessible key must not change a policy decision.
+                audit_error = "command-key-unavailable"
         row = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": _log_enum(record.get("event"), _LOG_EVENTS),
@@ -86,10 +96,11 @@ def _log(**record):
             "robobThreadId_sha256": hashlib.sha256(thread_id.encode("utf-8")).hexdigest() if isinstance(thread_id, str) and thread_id else None,
             "rule": _log_enum(record.get("rule"), _LOG_RULES),
             "decision": _log_enum(record.get("decision", "allow"), {"allow", "deny"}),
-            "cmd_hmac_sha256": hmac.new(_command_identity_key(create=True), command.encode("utf-8"), hashlib.sha256).hexdigest() if isinstance(command, str) and command else None,
+            "cmd_hmac_sha256": command_hmac,
             "cmd": None,
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
+            "audit_error": audit_error,
         }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
@@ -479,6 +490,19 @@ def _lineage(identity, *, deadline=None):
               "nativeSessionId": identity.get("nativeSessionId") if not identity.get("nativeAgentId") else None}]
     seen = {identity["robobThreadId"]}
     parent = identity.get("parentThreadId")
+    native = identity.get("nativeSessionId")
+    agent = identity.get("nativeAgentId")
+    instance = identity.get("providerInstanceId")
+    driver = identity.get("driver")
+    native_chain = driver == "claudeAgent" and bool(agent)
+    owner_agent = identity.get("parentNativeAgentId")
+    native_owner_thread = identity.get("nativeOwnerThreadId")
+    if native_chain and (not isinstance(native, str) or not native or
+                         not isinstance(instance, str) or not instance or
+                         not isinstance(native_owner_thread, str) or not native_owner_thread or
+                         "parentNativeAgentId" not in identity):
+        raise ValueError("lineage-native-unresolved")
+    seen_agents = {agent} if native_chain else set()
     deadline = deadline if deadline is not None else time.monotonic() + _LINEAGE_TIMEOUT
     while parent:
         if len(seen) > _LINEAGE_MAX_PARENTS or time.monotonic() >= deadline:
@@ -486,11 +510,32 @@ def _lineage(identity, *, deadline=None):
         if not isinstance(parent, str) or parent in seen:
             raise ValueError("lineage-cycle")
         seen.add(parent)
-        data = _get("/threads/" + urllib.parse.quote(parent, safe=""), deadline=deadline).get("thread")
+        if native_chain and owner_agent is not None:
+            if not isinstance(owner_agent, str) or not owner_agent or owner_agent in seen_agents:
+                raise ValueError("lineage-native-cycle")
+            seen_agents.add(owner_agent)
+            params = {"nativeId": native, "driver": driver, "instance": instance, "agentId": owner_agent}
+            owner = _get("/identity/resolve?" + urllib.parse.urlencode(params), deadline=deadline).get("identity")
+            if (not isinstance(owner, dict) or owner.get("resolution") != "resolved" or
+                owner.get("robobThreadId") != parent or owner.get("driver") != driver or
+                owner.get("providerInstanceId") != instance or owner.get("nativeSessionId") != native or
+                owner.get("nativeAgentId") != owner_agent or owner.get("nativeOwnerThreadId") != native_owner_thread or
+                "parentNativeAgentId" not in owner):
+                raise ValueError("lineage-native-unresolved")
+            data = {"threadId": parent, "nativeSessionId": None,
+                    "parentThreadId": owner.get("parentThreadId")}
+            owner_agent = owner.get("parentNativeAgentId")
+        else:
+            if native_chain and parent != native_owner_thread:
+                raise ValueError("lineage-native-unresolved")
+            native_chain = False
+            data = _get("/threads/" + urllib.parse.quote(parent, safe=""), deadline=deadline).get("thread")
         if not isinstance(data, dict) or data.get("threadId") != parent:
             raise ValueError("lineage-unresolved")
         nodes.append(data)
         parent = data.get("parentThreadId")
+    if native_chain:
+        raise ValueError("lineage-native-unresolved")
     return nodes
 
 
