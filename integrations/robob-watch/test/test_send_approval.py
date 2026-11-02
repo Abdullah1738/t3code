@@ -1026,5 +1026,118 @@ class SendApprovalTest(unittest.TestCase):
         self.assertEqual(code, 2, err)
 
 
+# ---- live request path: shared Claude session id, parent and two children, no identity seam
+
+class SharedSessionControlStub:
+    """A Robob control API on a real socket that answers the way C1 does for a shared Claude session.
+
+    Claude children share the parent's session id, and a bare Claude id has no agent id, so C1 answers the parent's
+    top-level identity for every caller that presents that id. The stub records each request it receives.
+    """
+
+    SHARED = "11111111-2222-3333-4444-555555555555"
+    PARENT = "t-parent"
+
+    def __init__(self):
+        import http.server
+        import threading
+        self.requests = []
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                from urllib.parse import urlparse, parse_qs
+                url = urlparse(self.path)
+                stub.requests.append((url.path, parse_qs(url.query)))
+                if self.headers.get("Authorization") != "Bearer stub-token":
+                    body = {"ok": False}
+                    code = 401
+                elif url.path == "/api/ardud/control/identity/resolve":
+                    q = parse_qs(url.query)
+                    if q.get("driver", [""])[0] == "claudeAgent" and q.get("nativeId", [""])[0] == stub.SHARED:
+                        body = {"ok": True, "identity": {
+                            "resolution": "resolved", "robobThreadId": stub.PARENT, "parentThreadId": None,
+                            "executionKind": "top-level", "acceptsMessages": True, "candidates": []}}
+                    else:
+                        body = {"ok": True, "identity": {
+                            "resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                            "executionKind": None, "acceptsMessages": False, "candidates": []}}
+                    code = 200
+                else:
+                    body, code = {"ok": False}, 404
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class SharedSessionRequestPathTest(unittest.TestCase):
+    """Parent and two children all present the shared Claude session id through the real request path.
+
+    No identity seam is set, so the helper calls the control API exactly as it does in production. Every caller
+    must be refused, and none may approve on the parent's stream.
+    """
+
+    def setUp(self):
+        self.stub = SharedSessionControlStub()
+        self.addCleanup(self.stub.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        creds = os.path.join(self.tmp.name, ".robob", "components")
+        os.makedirs(creds)
+        cred = os.path.join(creds, "watchers.json")
+        with open(cred, "w") as fh:
+            json.dump({"url": self.stub.url, "token": "stub-token"}, fh)
+        os.chmod(cred, 0o600)
+        self.draft = os.path.join(self.tmp.name, "draft.txt")
+        with open(self.draft, "w") as fh:
+            fh.write(PREVIEW)
+
+    def check_as(self, env_extra):
+        env = {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "ROBOB_TEST": "1",
+               "SEND_APPROVAL_LOG": os.path.join(self.tmp.name, "decisions.jsonl"),
+               "SEND_APPROVAL_STATE_DB": os.path.join(self.tmp.name, "missing.sqlite"),
+               "SEND_APPROVAL_BRIDGE_DIR": self.tmp.name, "SEND_APPROVAL_FORMATTER": FORMATTER,
+               "SEND_APPROVAL_BUN": BUN, **env_extra}
+        r = subprocess.run(["/usr/bin/python3", HELPER, "check", "--app", "--preview", PREVIEW,
+                            "--drafted-at", str(DRAFTED)],
+                           capture_output=True, text=True, env=env)
+        return r.returncode, r.stderr.strip()
+
+    def test_parent_and_two_children_on_a_shared_session_are_all_refused(self):
+        shared = self.stub.SHARED
+        # The parent, and two in-process children, all present the same CLAUDE_CODE_SESSION_ID.
+        for who in ("parent", "child-a", "child-b"):
+            code, err = self.check_as({"CLAUDE_CODE_SESSION_ID": shared})
+            self.assertEqual(code, 2, f"{who} must be refused, got: {err}")
+            self.assertIn("can't prove", err, f"{who} refused for the wrong reason: {err}")
+        # The request path really ran: every call asked C1 with driver=claudeAgent and the shared id.
+        resolves = [q for path, q in self.stub.requests if path.endswith("/identity/resolve")]
+        self.assertEqual(len(resolves), 3)
+        for q in resolves:
+            self.assertEqual(q["driver"], ["claudeAgent"])
+            self.assertEqual(q["nativeId"], [shared])
+
+    def test_codex_child_of_a_shared_session_is_refused_as_a_child_not_as_the_parent(self):
+        # A Codex child with a concrete thread id is provably a child: refused on its execution kind.
+        self.stub.requests.clear()
+        code, err = self.check_as({"CODEX_THREAD_ID": self.stub.SHARED})
+        self.assertEqual(code, 2, err)
+        self.assertNotIn("can't prove", err)
+
+
 if __name__ == "__main__":
     unittest.main()
