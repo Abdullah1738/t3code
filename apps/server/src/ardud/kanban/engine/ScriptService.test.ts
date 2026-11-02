@@ -247,7 +247,7 @@ it.effect("a pool command names the level when the model runs at several", () =>
     const opus = board.defaultCardModel.model;
     yield* kanban.setPool(
       board.id,
-      { ...board.defaultCardModel, options: [{ id: "variant", value: "high" }] },
+      { ...board.defaultCardModel, options: [{ id: "variant", value: "xhigh" }] },
       1,
     );
     const script = yield* register(
@@ -255,7 +255,7 @@ it.effect("a pool command names the level when the model runs at several", () =>
       scriptFile(
         [
           `echo '{"kanban":"pool","model":"${opus}","slots":2}'`,
-          `echo '{"kanban":"pool","model":"${opus}","variant":"high","slots":4}'`,
+          `echo '{"kanban":"pool","model":"${opus}","variant":"xhigh","slots":4}'`,
           `echo '{"kanban":"pool","model":"${opus}","variant":"low","slots":4}'`,
           "",
         ].join("\n"),
@@ -264,15 +264,15 @@ it.effect("a pool command names the level when the model runs at several", () =>
     yield* scripts.run(script.id, "manual");
     yield* scripts.idle;
     const [done] = yield* scripts.runs(script.id, 1);
-    assert.include(done?.output, `The ${opus} pools run at xhigh, high; name the variant.`);
+    assert.include(done?.output, `The ${opus} pools run at high, xhigh; name the variant.`);
     assert.include(done?.output, `Set the ${opus} pool to 4 slots.`);
     assert.include(done?.output, `There's no ${opus} low pool on this board.`);
     const levels = (yield* kanban.snapshot(board.id)).pools
       .filter((pool) => pool.model.model === opus)
       .map((pool) => [Rules.modelLevel(pool.model), pool.slots]);
     assert.deepStrictEqual(levels, [
-      ["xhigh", 0],
-      ["high", 4],
+      ["high", 0],
+      ["xhigh", 4],
     ]);
   }).pipe(Effect.provide(testLayer)),
 );
