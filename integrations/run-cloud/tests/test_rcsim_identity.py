@@ -117,21 +117,23 @@ class RcsimIdentityTests(unittest.TestCase):
 
     # --- identity
 
-    def test_claude_shell_resolves_to_its_robob_execution(self):
+    def test_claude_shell_has_no_resolved_owner_even_when_c1_answers(self):
+        # C1 answers a bare Claude id with the parent's identity, which a native child shares. So a Claude shell
+        # never becomes a resolved owner: create, claim and release --mine refuse it.
         self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, "app-managed-child")
         with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID):
             me = rcsim.whoami()
-        self.assertEqual(me["resolution"], "resolved")
-        self.assertEqual(me["thread"], CHILD)
-        self.assertEqual(me["manager"], PARENT)
+        self.assertEqual(me["resolution"], "unresolved")
+        self.assertIsNone(me["thread"])
         self.assertEqual(me["driver"], "claudeAgent")
 
     def test_inherited_rcsim_thread_of_an_unrelated_thread_is_ignored(self):
+        # The unrelated-value rule, on a provable Codex caller (a Claude shell has no resolved owner at all).
         other = "thread-unrelated"
         self.stub.threads[other] = {"threadId": other, "title": "Other", "parentThreadId": None,
                                     "relationshipToParent": None}
-        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, "app-managed-child")
-        with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=other):
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(CHILD, PARENT, "app-managed-child")
+        with self.shell(CODEX_THREAD_ID=CODEX_UUID, RCSIM_THREAD=other):
             me = rcsim.whoami()
         self.assertEqual(me["thread"], CHILD)
 
@@ -181,8 +183,9 @@ class RcsimIdentityTests(unittest.TestCase):
         con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
                     "VALUES ('sim-parent','ios',?,?,'active',1,1,'rcsim')", (PARENT, CLAUDE_UUID))
         con.commit()
-        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, "app-managed-child")
-        with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=PARENT):
+        # A provable Codex caller: the inherited-parent rule, not the Claude rule, is under test here.
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(CHILD, PARENT, "app-managed-child")
+        with self.shell(CODEX_THREAD_ID=CODEX_UUID, RCSIM_THREAD=PARENT):
             me = rcsim.whoami()
             self.assertEqual(me["thread"], CHILD, "the owner is the resolved child, not the inherited parent")
             self.assertEqual(me["manager"], PARENT, "the parent is kept as the manager, not the owner")

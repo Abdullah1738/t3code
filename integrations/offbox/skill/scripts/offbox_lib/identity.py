@@ -268,7 +268,13 @@ def whoami(cwd: str | None = None) -> dict:
         me["resolution"] = ident.get("resolution")
         me["executionKind"] = ident.get("executionKind")
         me["acceptsMessages"] = ident.get("acceptsMessages")
-        if ident.get("resolution") == "resolved":
+        # A Claude shell carries only its session id, which a native child shares with its parent. C1 answers a
+        # bare Claude id with the parent's identity, so taking that answer would let a child own the parent's
+        # leases. Claude callers therefore never take a resolved owner; they keep their own unresolved owner.
+        if driver == "claudeAgent":
+            log(f"claude caller {native[:8]}: no per-agent id in the shell, so no resolved owner is taken")
+            me["resolution"] = "unresolved"
+        elif ident.get("resolution") == "resolved":
             me["thread"] = ident.get("robobThreadId")
             me["manager"] = ident.get("parentThreadId")
             me["parent"] = ident.get("parentThreadId")

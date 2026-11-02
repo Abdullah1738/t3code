@@ -328,7 +328,12 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
         ident = identity_for(native, driver)
         me["resolution"] = ident.get("resolution")
         me["executionKind"] = ident.get("executionKind")
-        if ident.get("resolution") == "resolved":
+        # A Claude shell carries only its session id, shared with its native children. C1's answer for that id is
+        # the parent's identity, so it can't name the owner. Claude callers never get a resolved owner here, and
+        # create/claim/release refuse them through refuse_unresolved.
+        if driver == "claudeAgent":
+            me["resolution"] = "unresolved"
+        elif ident.get("resolution") == "resolved":
             me["thread"] = ident.get("robobThreadId")
             me["manager"] = ident.get("parentThreadId")
             if me["thread"]:

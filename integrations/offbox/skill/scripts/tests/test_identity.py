@@ -121,13 +121,15 @@ class IdentityTests(unittest.TestCase):
         with patch.dict(os.environ, shell):
             return identity.whoami(str(Path(self.tmp.name)))
 
-    def test_claude_shell_resolves_to_its_robob_thread_by_driver(self):
+    def test_claude_shell_asks_c1_by_driver_but_takes_no_resolved_owner(self):
+        # C1 is queried with driver=claudeAgent, but a bare Claude id can't prove top-level, so the caller keeps
+        # its own unresolved owner. No parent lease is taken.
         self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(OTHER)
         me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
-        self.assertEqual(me["thread"], OTHER)
-        self.assertEqual(me["owner"], OTHER)
+        self.assertIsNone(me["thread"])
+        self.assertEqual(me["owner"], f"unresolved:claudeAgent:{CLAUDE_UUID}")
         self.assertEqual(me["driver"], "claudeAgent")
-        self.assertEqual(me["resolution"], "resolved")
+        self.assertEqual(me["resolution"], "unresolved")
         self.assertTrue(any(c[2].endswith("driver=claudeAgent") for c in self.stub.calls
                             if c[1].endswith("/identity/resolve")))
 
@@ -141,14 +143,23 @@ class IdentityTests(unittest.TestCase):
 
     def test_stale_inherited_offbox_thread_of_an_unrelated_thread_is_ignored(self):
         # A child shell inherits OFFBOX_THREAD from an unrelated parent: that value must not claim the work.
-        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, kind="app-managed-child")
-        me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, OFFBOX_THREAD=OTHER)
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(CHILD, PARENT, kind="app-managed-child", driver="codex")
+        me = self.who(CODEX_THREAD_ID=CODEX_UUID, OFFBOX_THREAD=OTHER)
         self.assertEqual(me["thread"], CHILD)
         self.assertEqual(me["owner"], CHILD)
 
+    def test_claude_shell_never_takes_the_parent_lease_on_a_shared_session_id(self):
+        # C1 answers a bare Claude id with the parent's top-level identity, but a child shell shares that id.
+        # The shell must not inherit the parent's owner: it gets its own unresolved owner, never the parent's.
+        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(OTHER)
+        me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
+        self.assertNotEqual(me["owner"], OTHER, "a Claude shell must not own the resolved thread's leases")
+        self.assertEqual(me["owner"], f"unresolved:claudeAgent:{CLAUDE_UUID}")
+        self.assertIsNone(me["thread"])
+
     def test_explicit_offbox_thread_matching_an_ancestor_is_honoured(self):
-        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, kind="app-managed-child")
-        me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, OFFBOX_THREAD=PARENT)
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(CHILD, PARENT, kind="app-managed-child", driver="codex")
+        me = self.who(CODEX_THREAD_ID=CODEX_UUID, OFFBOX_THREAD=PARENT)
         self.assertEqual(me["thread"], PARENT)
 
     def age_identity_row(self, native, seconds):
@@ -199,12 +210,13 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(me["owner"], f"unresolved:claudeAgent:{CLAUDE_UUID}")
 
     def test_same_uuid_under_two_drivers_never_crosses(self):
-        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(OTHER)
-        claude = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
+        # The UUID is a Codex thread in one home. Under Claude it must not resolve through that answer.
+        self.stub.identities[(CLAUDE_UUID, "codex")] = resolved(OTHER, driver="codex")
         codex = self.who(CODEX_THREAD_ID=CLAUDE_UUID)
-        self.assertEqual(claude["thread"], OTHER)
-        self.assertIsNone(codex["thread"])
-        self.assertEqual(codex["resolution"], "unavailable")
+        claude = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
+        self.assertEqual(codex["thread"], OTHER)
+        self.assertIsNone(claude["thread"], "a Claude shell never takes a resolved owner")
+        self.assertEqual(claude["resolution"], "unresolved")
 
     def test_opencode_shell_keeps_the_session_lookup(self):
         with patch.object(identity, "_lookup_thread", return_value={"thread": "thread-oc", "title": "t",
