@@ -306,12 +306,12 @@ def transcript_task(harness: str, path: str | None, agent_id: str,
             for block in message.get("content", []) if isinstance(message, dict) else []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
-                if block.get("name") not in ("Agent", "Task"):
-                    continue
                 args = block.get("input") or {}
-                # A resume can be matched by ID. A fresh spawn usually cannot.
-                if isinstance(args, dict) and args.get("resume") == agent_id and isinstance(args.get("prompt"), str):
-                    matches.append(args["prompt"])
+                if isinstance(args, dict):
+                    if block.get("name") in ("Agent", "Task") and args.get("resume") == agent_id and isinstance(args.get("prompt"), str):
+                        matches.append(args["prompt"])
+                    elif block.get("name") == "SendMessage" and args.get("to") == agent_id and isinstance(args.get("message"), str):
+                        matches.append(args["message"])
         elif harness == "codex":
             payload = entry.get("payload") or {}
             if not isinstance(payload, dict):
@@ -534,8 +534,8 @@ def handle(harness: str, event: dict):
         try:
             with db.transaction():
                 if name == "SubagentStop":
-                    db.take_seed(pending_seed_key(harness, event))
-                    db.drop_seeds_for_native(harness, event.get("session_id"), event.get("agent_id"))
+                    db.drop_seeds_for_native(harness, event.get("session_id"), event.get("agent_id"),
+                                             turn_id(harness, event))
                 now = time.time()
                 db.prune(now)
                 db.end_turn(native, turn_id(harness, event), now)
@@ -568,7 +568,7 @@ def handle(harness: str, event: dict):
         isinstance(child_id, str) and child_id and isinstance(event.get("session_id"), str) and event["session_id"]):
         seed = {"path": event.get("transcript_path"), "child_path": event.get("agent_transcript_path"),
                 "started": time.time(), "turn": turn_id(harness, event),
-                "resume_offset": transcript_offset(event.get("transcript_path")) or 0}
+                "resume_offset": transcript_offset(event.get("transcript_path"))}
         db = Store(state_path(), cfg["note_ttl_days"])
         try:
             with db.transaction():
@@ -663,6 +663,8 @@ def handle(harness: str, event: dict):
                         return
                     # Do not attribute the child's first historical prompt to a
                     # resume; wait for an authored task matching the new start.
+                    if seed.get("resume_offset") is None:
+                        return
                     path = event.get("transcript_path") or seed.get("path")
                     task = transcript_task(harness, path, str(child_id or ""), event.get("session_id"),
                                            event.get("agent_transcript_path") or seed.get("child_path"),

@@ -886,6 +886,23 @@ class RecallTest(unittest.TestCase):
         with self.assertRaises(rc.UnknownCaller):
             ra.lineage_of(None, None, caller_thread="thread-0", caller_native="native-0", caller_driver="bad-driver")
 
+    def test_stale_alias_without_state_anchor_fails_closed(self):
+        import recall_server as server
+        con = sqlite3.connect(rc.MEM_DB)
+        con.execute("CREATE TABLE IF NOT EXISTS thread_aliases(canonical_thread_id,root_thread_id,native_id,agent_id)")
+        con.execute("INSERT INTO thread_aliases VALUES ('ghost-thread','ghost-root','ghost-native',NULL)")
+        con.commit()
+        con.close()
+        try:
+            with self.assertRaises(rc.UnknownCaller):
+                rc.lineage_exclusions("ghost-thread")
+            self.assertIn("error:", server.recall_search("negative balance", caller_thread="ghost-thread"))
+        finally:
+            con = sqlite3.connect(rc.MEM_DB)
+            con.execute("DELETE FROM thread_aliases WHERE canonical_thread_id='ghost-thread'")
+            con.commit()
+            con.close()
+
     def test_anonymous_cli_preview_does_not_open_automatic_injection(self):
         with patch.object(ra, "_recall_note", return_value={"note": "preview"}) as note:
             self.assertEqual(ra.inject("Investigate the pangolin regression", anonymous_preview=True)["note"], "preview")

@@ -615,6 +615,8 @@ class RecallHookTests(unittest.TestCase):
                 self.call(self.event("SubagentStop", harness, **common, **{field: "old"}), harness, now=1130)
                 self.assertTrue(self.state(ident)["invalidated"])
                 self.call(self.event("SubagentStart", harness, **common, **{field: "new"}), harness, now=1140)
+                # A delayed stop for the old execution must not remove the new seed.
+                self.call(self.event("SubagentStop", harness, **common, **{field: "old"}), harness, now=1140.5)
                 stale = self.event("PostToolUse", harness, **common, **{field: "old"}, tool_use_id="stale")
                 self.assertIsNone(self.call(stale, harness, now=1141))
                 fresh = self.event("PostToolUse", harness, **common, **{field: "new"}, tool_use_id="fresh-0")
@@ -632,6 +634,29 @@ class RecallHookTests(unittest.TestCase):
                 hook.worker(self.jobs.pop())
                 self.assertEqual(self.server.requests[-1]["prompt"], "Investigate resumed child task")
                 self.assertEqual(self.server.requests[-1]["mode"], "work")
+
+    def test_missing_resume_transcript_does_not_reuse_historical_task(self):
+        transcript = self.tmp / "appears-later.jsonl"
+        ident = {"driver": "claudeAgent", "providerInstanceId": "claude-instance",
+                 "robobThreadId": "child", "_agent": "agent-abc"}
+        common = {"agent_id": "agent-abc", "transcript_path": str(transcript)}
+        self.call(self.event("SubagentStart", **common), now=1000)
+        self.call(self.event("PostToolUse", **common, tool_use_id="old"), now=1010)
+        self.call(self.event("SubagentStop", **common), now=1020)
+        self.call(self.event("SubagentStart", **common, prompt_id="new"), now=1030)
+        historical = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent",
+                      "input": {"resume": "agent-abc", "prompt": "Historical task"}}]}}
+        transcript.write_text(json.dumps(historical) + "\n")
+        self.call(self.event("PostToolUse", **common, prompt_id="new", tool_use_id="new"), now=1130)
+        self.assertTrue(self.state(ident)["invalidated"])
+
+    def test_claude_transcript_reads_send_message_resume(self):
+        transcript = self.tmp / "send-message.jsonl"
+        entry = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                 "input": {"to": "agent-abc", "message": "Investigate the new issue"}}]}}
+        transcript.write_text(json.dumps(entry) + "\n")
+        self.assertEqual(hook.transcript_task("claude", str(transcript), "agent-abc", after_offset=0),
+                         "Investigate the new issue")
 
     def test_child_new_start_without_stop_retires_previous_turn(self):
         for harness in ("claude", "codex"):

@@ -182,12 +182,20 @@ class Store:
         row = self.db.execute("SELECT task FROM seeds WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def drop_seeds_for_native(self, harness: str, session: str | None, agent: str | None):
+    def drop_seeds_for_native(self, harness: str, session: str | None, agent: str | None, turn: str | None):
         if not session or not agent:
             return
-        self.db.execute("DELETE FROM seeds WHERE json_valid(key) AND json_extract(key, '$[0]')=? "
-                        "AND json_extract(key, '$[2]')=? AND json_extract(key, '$[3]')=?",
-                        (harness, session, agent))
+        rows = self.db.execute("SELECT key,task FROM seeds").fetchall()
+        for key, payload in rows:
+            try:
+                identity = json.loads(key.removeprefix("pending:"))
+                seed = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(identity, list) and len(identity) == 4 and
+                identity[0] == harness and identity[2] == session and identity[3] == agent and
+                (not turn or seed.get("turn") == turn)):
+                self.db.execute("DELETE FROM seeds WHERE key=?", (key,))
 
     def adopt_turn(self, key: str, state: dict, turn: str) -> bool:
         if not state.get("provisional") or state.get("adoption_blocked") or turn in state.get("retired_turns", []):

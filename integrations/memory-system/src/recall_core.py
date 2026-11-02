@@ -1154,6 +1154,9 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
         aliases = _alias_table_tree({ident})
         try:
             aliases.update(_state_tree({ident}))
+            # An alias row can predate its state's descendants. Expand from
+            # every historical binding, but require a current state anchor.
+            state_anchor = bool(_state_tree(set(aliases) | {ident}))
             state_available = True
         except sqlite3.Error:
             raise UnknownCaller("caller identity store unavailable") from None
@@ -1167,6 +1170,10 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
             explicit = {ident} | _opencode_tree({ident}, edges) | _catalog_tree({ident})
             aliases.update(_alias_table_tree(explicit) | _state_tree(explicit))
             aliases.update(explicit if aliases else _legacy_lineage(ident, fresh=fresh_legacy))
+            state_anchor = bool(_state_tree(aliases))
+        if not state_anchor and not (ident.startswith("ses_") and oc is not None and oc.execute(
+                "SELECT 1 FROM session_v2 WHERE id=?", (ident,)).fetchone()):
+            raise UnknownCaller("caller has no current identity anchor")
         aliases.add(ident)
         # A migration edge can reveal a later Robob binding, and that binding
         # can reveal more OpenCode aliases. Close both maps until stable.
