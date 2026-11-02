@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -778,6 +779,33 @@ class RotationGateTests(FakeCliTestCase):
             report = hc.auto()
         rot.assert_called_once()
         self.assertEqual(report["codexRotation"], "Codex app-server refreshed onto the current binary")
+
+
+class ManifestLocationTests(FakeCliTestCase):
+    """The installed job must find its minimums without the fork tree."""
+
+    def test_bundled_manifest_loads_when_fork_tree_is_absent(self) -> None:
+        # Simulate the installed layout: this module plus its bundled manifest, nothing else.
+        installed = self.tmp / "installed"
+        installed.mkdir()
+        shutil.copy(PKG / "harness_cli.py", installed / "harness_cli.py")
+        shutil.copy(PKG / "model-manifest.json", installed / "model-manifest.json")
+        env = {k: v for k, v in os.environ.items() if k != "HARNESS_CLI_MODEL_MANIFEST"}
+        code = (
+            "import sys, json; sys.path.insert(0, %r); import harness_cli as hc; "
+            "print(json.dumps(hc.load_manifest_minimums()))" % str(installed)
+        )
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        minimums = json.loads(out.stdout)
+        self.assertEqual(minimums["driver"]["claude"], "2.1.280")
+        self.assertEqual(minimums["models"]["claude"]["claude-haiku-5-5"], "2.1.293")
+
+    def test_missing_manifest_fails_with_a_clear_error(self) -> None:
+        with mock.patch.dict(os.environ, {"HARNESS_CLI_MODEL_MANIFEST": str(self.tmp / "nope.json")}):
+            with self.assertRaises(hc.HarnessError) as ctx:
+                hc.load_manifest_minimums()
+        self.assertIn("model manifest not found", str(ctx.exception))
 
 
 class BeforeReleaseTests(FakeCliTestCase):

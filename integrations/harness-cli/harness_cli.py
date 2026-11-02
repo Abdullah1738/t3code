@@ -214,11 +214,23 @@ def parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in m.groups())
 
 
+def model_manifest_path() -> Path:
+    """Where the minimums come from. The installed job reads the copy install.zsh bundles next to
+    this script, so it never depends on the fork tree. HARNESS_CLI_MODEL_MANIFEST overrides it."""
+    override = os.environ.get("HARNESS_CLI_MODEL_MANIFEST")
+    if override:
+        return Path(override)
+    bundled = Path(__file__).resolve().parent / "model-manifest.json"
+    if bundled.is_file():
+        return bundled
+    return Path(__file__).resolve().parents[2] / "apps" / "server" / "src" / "provider" / "model-manifest.json"
+
+
 def load_manifest_minimums() -> dict:
-    """Minimum CLI versions from the fork's model-manifest.json (driver + per-model)."""
-    manifest_path = Path(os.environ.get(
-        "HARNESS_CLI_MODEL_MANIFEST",
-        str(Path(__file__).resolve().parents[2] / "apps" / "server" / "src" / "provider" / "model-manifest.json")))
+    """Minimum CLI versions from the model manifest (driver + per-model)."""
+    manifest_path = model_manifest_path()
+    if not manifest_path.is_file():
+        raise HarnessError(f"model manifest not found at {manifest_path}; cannot check minimums")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     minimums = {"claude": None, "codex": None}
     for entry in data["compatibility"]:
