@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.error
@@ -44,16 +45,56 @@ def _state():
     return Path(os.environ.get("HARNESS_HOOKS_STATE_DIR", str(HOME / ".local/state/harness-hooks")))
 
 
+# The JSONL file is an audit trail, not a transcript. Untrusted event, tool,
+# identity and classifier fields can themselves contain an entire command.
+_LOG_EVENTS = {"PreToolUse", "SessionStart", "shim"}
+_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker"}
+_LOG_RULES = {
+    "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
+    "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
+    "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
+    "gradle", "cargo", "make-test", "forge-test", "anvil", "no-policy", "non-pre-tool", "betterstack-scope",
+    "offbox-observe", "offbox-exempt", "offbox-unavailable", "offbox-unresolved", "coord-unresolved", "hook-error",
+    "approved-sha256", "non-member", "excluded", "coord-haiku", "non-haiku", "database-direct", "secret-read",
+    "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
+    "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
+    "native-check-unavailable",
+}
+_LOG_ERRORS = {
+    "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
+    "identity-unavailable", "identity-pending", "identity-ambiguous", "coord-unresolved", "TimeoutExpired",
+    "ValueError", "TypeError", "OSError", "RuntimeError", "PermissionError", "FileNotFoundError",
+    "TimeoutError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
+}
+
+
+def _log_enum(value, allowed):
+    return value if isinstance(value, str) and value in allowed else None if value is None else "other"
+
+
 def _log(**record):
     try:
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        defaults = {"event": None, "harness": None, "robobThreadId": None, "rule": None,
-                    "decision": "allow", "cmd_sha1": None, "cmd": None, "ms": 0, "error": None}
+        thread_id = record.get("robobThreadId")
+        command = record.get("command")
+        row = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": _log_enum(record.get("event"), _LOG_EVENTS),
+            "harness": _log_enum(record.get("harness"), {"claude", "codex"}),
+            "tool": _log_enum(record.get("tool"), _LOG_TOOLS),
+            "robobThreadId_sha256": hashlib.sha256(thread_id.encode("utf-8")).hexdigest() if isinstance(thread_id, str) and thread_id else None,
+            "rule": _log_enum(record.get("rule"), _LOG_RULES),
+            "decision": _log_enum(record.get("decision", "allow"), {"allow", "deny"}),
+            "cmd_hmac_sha256": hmac.new(_command_identity_key(create=True), command.encode("utf-8"), hashlib.sha256).hexdigest() if isinstance(command, str) and command else None,
+            "cmd": None,
+            "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
+            "error": _log_enum(record.get("error"), _LOG_ERRORS),
+        }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), **defaults, **record}, separators=(",", ":")) + "\n")
-    except OSError:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except (OSError, UnicodeError):
         pass
 
 
@@ -102,14 +143,44 @@ def _control():
     return base, credentials.get("token")
 
 
-def _get(path):
+def _get(path, *, deadline=None):
+    # urlopen's timeout bounds each socket read, not the total response; a
+    # slow streaming control response could otherwise exhaust the hook's 10s.
+    deadline = deadline if deadline is not None else time.monotonic() + 1.2
+    done = threading.Event()
+    result = []
+
+    def request():
+        try:
+            result.append((True, _get_unbounded(path, deadline)))
+        except Exception as error:
+            result.append((False, error))
+        finally:
+            done.set()
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("control-deadline")
+    threading.Thread(target=request, daemon=True).start()
+    if not done.wait(remaining):
+        raise TimeoutError("control-deadline")
+    success, value = result[0]
+    if not success:
+        raise value
+    return value
+
+
+def _get_unbounded(path, deadline):
     base, token = _control()
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(base + path, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=1.2) as response:
+        timeout = 1.2 if deadline is None else min(1.2, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("control-deadline")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.load(response)
     except urllib.error.HTTPError as error:
         error.close()
@@ -394,7 +465,11 @@ def resolve_identity(event, harness, *, fresh=False):
         return {"resolution": "unavailable"}
 
 
-def _lineage(identity):
+_LINEAGE_MAX_PARENTS = 64
+_LINEAGE_TIMEOUT = 1.5
+
+
+def _lineage(identity, *, deadline=None):
     """Return self and proven parents, never root or sibling guesses."""
     if identity.get("resolution") != "resolved" or not identity.get("robobThreadId"):
         raise ValueError("identity-unresolved")
@@ -402,11 +477,14 @@ def _lineage(identity):
               "nativeSessionId": identity.get("nativeSessionId") if not identity.get("nativeAgentId") else None}]
     seen = {identity["robobThreadId"]}
     parent = identity.get("parentThreadId")
+    deadline = deadline if deadline is not None else time.monotonic() + _LINEAGE_TIMEOUT
     while parent:
+        if len(seen) > _LINEAGE_MAX_PARENTS or time.monotonic() >= deadline:
+            raise ValueError("lineage-limit")
         if not isinstance(parent, str) or parent in seen:
             raise ValueError("lineage-cycle")
         seen.add(parent)
-        data = _get("/threads/" + urllib.parse.quote(parent, safe="")).get("thread")
+        data = _get("/threads/" + urllib.parse.quote(parent, safe=""), deadline=deadline).get("thread")
         if not isinstance(data, dict) or data.get("threadId") != parent:
             raise ValueError("lineage-unresolved")
         nodes.append(data)
@@ -439,7 +517,7 @@ def _expires(value):
             return 0
 
 
-def _exempt(identity):
+def _exempt(identity, *, lineage=None):
     entries = _read_json(_offbox_state() / "exemptions.json", [])
     if not isinstance(entries, list):
         return False
@@ -448,7 +526,7 @@ def _exempt(identity):
                _expires(entry.get("expires_at")) > time.time()]
     if not entries:
         return False
-    nodes = _lineage(identity)
+    nodes = lineage() if lineage else _lineage(identity)
     for entry in entries:
         # If a record carries a thread, its native session can be shared by
         # siblings and is not independent authority.
@@ -784,7 +862,7 @@ def _thread_key(value):
     return re.sub(r"^(?:ardud-control:thread:|mcp:)", "", value or "")
 
 
-def _coord_state(identity):
+def _coord_state(identity, *, lineage=None):
     if identity.get("resolution") != "resolved" or not identity.get("robobThreadId"):
         raise ValueError("identity-unresolved")
     config = _read_json(os.environ.get("HARNESS_HOOKS_COORD_CONFIG", str(HOME / ".config/opencode/agent-guard.json")))
@@ -794,7 +872,7 @@ def _coord_state(identity):
     model = model.get("model") or model.get("id") if isinstance(model, dict) else model
     if not isinstance(model, str) or not model:
         raise ValueError("model-unresolved")
-    nodes = _lineage(identity)
+    nodes = lineage() if lineage else _lineage(identity)
     db_path = os.environ.get("HARNESS_HOOKS_COORD_DB", str(HOME / ".local/share/coord/data/coord.db"))
     db_file = Path(db_path).absolute()
     uri = db_file.as_uri() + "?mode=ro"
@@ -832,14 +910,14 @@ def _coord_state(identity):
     return config, "claude-haiku" in model, "coord-haiku" if "claude-haiku" in model else "non-haiku"
 
 
-def decide_coord(command, identity, cwd, *, approved=False, approval_allowed=True):
+def decide_coord(command, identity, cwd, *, approved=False, approval_allowed=True, lineage=None):
     """Shim-facing decision. `approved` must come from approval_valid per invocation.
 
     A direct executable MCP tool does not accept the shell-input rewrite needed
     to pass its pin to the shim, so callers can disable hook-side approval.
     """
     try:
-        config, guarded, membership = _coord_state(identity)
+        config, guarded, membership = _coord_state(identity, lineage=lineage)
         hit = classify_coord(command)
         allowed_pin = approved or (approval_allowed and bool(approval(command, cwd)))
         deny = bool(hit and guarded and not allowed_pin and config["mode"] == "enforce")
@@ -896,6 +974,17 @@ def decide(event, harness):
     identity = {}
     error_type = None
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
+    lineage_nodes = None
+    lineage_deadline = None
+
+    def lineage():
+        nonlocal lineage_nodes, lineage_deadline
+        if lineage_nodes is None:
+            if lineage_deadline is None:
+                lineage_deadline = time.monotonic() + _LINEAGE_TIMEOUT
+            lineage_nodes = _lineage(identity, deadline=lineage_deadline)
+        return lineage_nodes
+
     try:
         if not isinstance(event, dict) or harness not in {"claude", "codex"}:
             raise ValueError("invalid-event")
@@ -929,7 +1018,7 @@ def decide(event, harness):
                             available = _offbox_available() and not (isinstance(cap, dict) and cap.get("capped") is True)
                             if mode == "enforce" and available and identity.get("resolution") != "resolved":
                                 raise ValueError("identity-unresolved")
-                            exempt = _exempt(identity) if mode == "enforce" and available else False
+                            exempt = _exempt(identity, lineage=lineage) if mode == "enforce" and available else False
                             if mode == "enforce" and available and not exempt:
                                 result = {"decision": "deny", "reason": _offbox_denial(verdict), "context": {"rule": verdict["rule"]}}
                             else:
@@ -940,7 +1029,7 @@ def decide(event, harness):
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
-                    coord = decide_coord(command, identity, cwd, approval_allowed=approval_allowed)
+                    coord = decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
                     if coord["context"].get("rule") == "coord-unresolved" and not error_type:
                         error_type = "coord-unresolved"
                     if coord["decision"] == "deny":
@@ -973,8 +1062,7 @@ def decide(event, harness):
     _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
          tool=event.get("tool_name") if isinstance(event, dict) else None,
          robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-         cmd_sha1=hashlib.sha1(command.encode("utf-8")).hexdigest() if command else None,
-         cmd=command[:200] if command else None, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
+         command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 
 

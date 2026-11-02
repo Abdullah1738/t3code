@@ -1,6 +1,7 @@
 import datetime
 from contextlib import closing
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -313,13 +314,96 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("/threads/middle" in path for path in self.state.calls))
         self.assertTrue(any("/threads/parent" in path for path in self.state.calls))
 
-    def test_lineage_has_no_100_parent_cap(self):
+    def test_lineage_depth_limit_never_trusts_partial_ancestry(self):
         self.add_identity("deep", "leaf", parent="n0", agent=None)
         for number in range(105):
             self.state.threads[f"n{number}"] = {"threadId": f"n{number}", "parentThreadId": f"n{number + 1}" if number < 104 else None}
-        self.actor("n104")
-        self.assertEqual(engine.decide(self.event("psql", session="deep", agent=None), "claude")["decision"], "deny")
-        self.assertTrue(any("/threads/n104" in path for path in self.state.calls))
+        identity = self.state.identities[("deep", None)]
+        with self.assertRaisesRegex(ValueError, "lineage-limit"):
+            engine._lineage(identity)
+        self.assertLessEqual(len(self.state.calls), 64)
+        self.assertFalse(any("/threads/n104" in path for path in self.state.calls))
+
+    def test_slow_lineage_has_a_total_budget_not_a_timeout_per_ancestor(self):
+        identity = {"resolution": "resolved", "robobThreadId": "leaf", "parentThreadId": "n0"}
+        clock = [100.0]
+        timeouts = []
+
+        def slow_get(path, *, deadline=None):
+            timeout = min(1.2, deadline - clock[0]) if deadline is not None else 1.2
+            timeouts.append(timeout)
+            clock[0] += min(timeout, 0.4)
+            if timeout < 0.4:
+                raise TimeoutError("deadline")
+            n = int(path.rsplit("n", 1)[1])
+            if n >= 20:
+                raise TimeoutError("test safety limit")
+            return {"thread": {"threadId": f"n{n}", "parentThreadId": f"n{n+1}"}}
+
+        with patch.object(engine.time, "monotonic", side_effect=lambda: clock[0]), patch.object(engine, "_get", side_effect=slow_get):
+            with self.assertRaises((TimeoutError, ValueError)):
+                engine._lineage(identity)
+        self.assertLessEqual(clock[0] - 100.0, 1.6)
+        self.assertLessEqual(len(timeouts), 5)
+
+    def test_control_deadline_applies_to_a_slow_streaming_response(self):
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for byte in b'{"ok":true,"thread":null}':
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with patch.dict(os.environ, {"HARNESS_HOOKS_CONTROL_URL": f"http://127.0.0.1:{server.server_port}"}):
+                start = time.monotonic()
+                with self.assertRaises((TimeoutError, OSError, ValueError)):
+                    engine._get("/threads/slow", deadline=start + 0.2)
+                self.assertLess(time.monotonic() - start, 0.6)
+        finally:
+            server.shutdown()
+            worker.join()
+            server.server_close()
+
+    def test_exemption_and_coord_share_a_complete_ancestry_walk(self):
+        self.add_identity("deep", "leaf", parent="middle", agent=None)
+        self.state.threads["middle"] = {"threadId": "middle", "parentThreadId": "parent"}
+        (self.offbox_state / "exemptions.json").write_text(json.dumps([{"thread_id": "middle", "expires_at": time.time() + 60}]))
+        self.actor("middle")
+        event = self.event("npm ci; psql", session="deep", agent=None)
+        self.assertEqual(engine.decide(event, "claude")["decision"], "deny")
+        paths = [p for p in self.state.calls if "/threads/" in p]
+        self.assertEqual(len(paths), 2)
+
+    def test_transient_first_lineage_error_does_not_disable_independent_coord_guard(self):
+        self.actor()
+        (self.offbox_state / "exemptions.json").write_text(json.dumps([{"thread_id": "other", "expires_at": time.time() + 60}]))
+        original = engine._get
+        failures = []
+
+        def fail_first_parent(path, **kwargs):
+            if "/threads/" in path and not failures:
+                failures.append(path)
+                raise ValueError("transient")
+            return original(path, **kwargs)
+
+        with patch.object(engine, "_get", side_effect=fail_first_parent):
+            result = engine.decide(self.event("npm ci; psql"), "claude")
+        self.assertEqual(result["decision"], "deny")
+        self.assertEqual(result["reason"], engine.COORD_REASON)
+        self.assertEqual(len(failures), 1)
 
     def test_explicit_mcp_shell_schema_and_apply_patch_exclusion(self):
         event = self.event("ignored", tool_name="mcp__test_server__exec_command", tool_input={"cmd": "npm ci"})
@@ -411,7 +495,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(engine.resolve_identity(self.event("echo", session="cred", agent=None), "claude")["robobThreadId"], "cred-thread")
             self.assertTrue(self.state.calls[-1].startswith("/api/ardud/control/identity/resolve?"))
 
-    def test_outages_fail_open_and_log_each_event_with_hash_and_truncated_command(self):
+    def test_outages_fail_open_and_log_each_event_with_hash_and_no_command(self):
         self.state.fail = True
         (self.offbox_state / "exemptions.json").write_text(json.dumps([{"thread_id": "some-thread", "expires_at": time.time() + 60}]))
         result = engine.decide(self.event("npm ci private-argument"), "claude")
@@ -422,8 +506,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         for line in records:
             record = json.loads(line)
-            self.assertEqual(record["cmd"], "npm ci private-argument")
-            self.assertEqual(record["cmd_sha1"], hashlib.sha1(record["cmd"].encode()).hexdigest())
+            self.assertIsNone(record["cmd"])
+            self.assertEqual(record["cmd_hmac_sha256"], hmac.new(engine._command_identity_key(), b"npm ci private-argument", hashlib.sha256).hexdigest())
             self.assertEqual(record["decision"], "allow")
             self.assertIsNotNone(record["error"])
             self.assertGreaterEqual(record["ms"], 0)
@@ -448,15 +532,30 @@ class EngineTests(unittest.TestCase):
         self.state.fail = True
         self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
 
-    def test_log_includes_identity_and_limits_command_to_200_characters(self):
-        command = "printf " + "x" * 240
+    def test_log_never_includes_secret_even_as_first_word_or_metadata(self):
+        secret = "sk-test-0123456789abcdef0123456789abcdef"
+        command = secret + " --credential " + secret
         engine.decide(self.event(command), "claude")
-        line = json.loads((self.root / "hook-state/decisions.jsonl").read_text())
-        self.assertEqual(line["cmd"], command[:200])
-        self.assertEqual(line["cmd_sha1"], hashlib.sha1(command.encode()).hexdigest())
-        self.assertEqual(line["robobThreadId"], "child")
+        path = self.root / "hook-state/decisions.jsonl"
+        self.assertNotIn(secret, path.read_text())
+        line = json.loads(path.read_text())
+        self.assertIsNone(line["cmd"])
+        self.assertEqual(line["cmd_hmac_sha256"], hmac.new(engine._command_identity_key(), command.encode(), hashlib.sha256).hexdigest())
+        self.assertEqual(line["robobThreadId_sha256"], hashlib.sha256(b"child").hexdigest())
         self.assertEqual(line["event"], "PreToolUse")
         self.assertEqual(line["harness"], "claude")
+        self.state.identities[("session", "agent-child")]["robobThreadId"] = secret
+        event = self.event(command, tool_name=secret, hook_event_name=secret)
+        engine.decide(event, "claude")
+        self.assertNotIn(secret, path.read_text())
+
+    def test_log_keeps_native_docker_failure_metadata_without_arguments(self):
+        engine._log(harness="claude", event="shim", tool="docker", decision="allow",
+                    rule="native-check-unavailable", error="ValueError")
+        line = json.loads((self.root / "hook-state/decisions.jsonl").read_text())
+        self.assertEqual(line["tool"], "docker")
+        self.assertEqual(line["rule"], "native-check-unavailable")
+        self.assertEqual(line["error"], "ValueError")
 
     def test_heavy_identity_outage_allows_even_with_cached_identity_and_no_exemption(self):
         event = self.event("npm ci")
