@@ -436,6 +436,22 @@ class ReaperProtection(unittest.TestCase):
         self.assertIn("ses_mig", ids)
         self.assertNotIn("ses_old", ids)
 
+    def test_unknown_migration_time_or_driver_is_protected(self):
+        import datetime
+        make_state_db(self.db)
+        now = datetime.datetime(2026, 11, 1, tzinfo=datetime.timezone.utc)
+        con = sqlite3.connect(self.db)
+        for suffix, driver, updated in (("missing", "codex", None), ("bad", "claude", "bad"),
+                                        ("driver", None, "2000-01-01T00:00:00Z")):
+            provider_thread(con, "th-" + suffix, "ses_" + suffix)
+            con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("pt-other-" + suffix, "th-" + suffix, None, driver, None, "idle", 2, 2,
+                         updated, "{}", driver, driver))
+        con.commit()
+        self.assertEqual(backend.migrated_rollback_session_ids(con, now=now),
+                         {"ses_missing", "ses_bad", "ses_driver"})
+        con.close()
+
     def test_migrated_thread_protected_end_to_end(self):
         import datetime
         make_state_db(self.db)
@@ -452,6 +468,75 @@ class ReaperProtection(unittest.TestCase):
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db):
             self.assertIn("ses_mig", session_reaper.rollback_ids())
             self.assertIn("ses_mig", session_reaper.protected_ids())
+
+    def test_migration_after_selection_prevents_real_delete(self):
+        """A new rollback pin on a child must stop its already-selected whole tree."""
+        import datetime
+        make_state_db(self.db)
+        add_kanban(self.db)
+        con = sqlite3.connect(self.db)
+        provider_thread(con, "th-late", "ses_child")
+        con.commit()
+        con.close()
+
+        ocdb = os.path.join(self.tmp.name, "opencode.sqlite")
+        con = sqlite3.connect(ocdb)
+        con.executescript("""
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT,
+              time_updated INTEGER, time_suspended INTEGER, metadata TEXT);
+            CREATE TABLE session_message (session_id TEXT, time_created INTEGER);
+            CREATE TABLE session_inbox (session_id TEXT);
+            CREATE TABLE session_pending (session_id TEXT);
+            INSERT INTO session_v2 VALUES ('ses_root', NULL, 'root', '/test', 1, NULL, '{}');
+            INSERT INTO session_v2 VALUES ('ses_child', 'ses_root', 'child', '/test', 1, NULL, '{}');
+        """)
+        con.close()
+        logs = os.path.join(self.tmp.name, "logs")
+        replica = os.path.join(self.tmp.name, "replica")
+        os.makedirs(logs)
+        os.makedirs(replica)
+        with open(os.path.join(replica, "memory.db"), "wb"):
+            pass
+        status = os.path.join(logs, "status.json")
+        actual_plan = session_reaper.plan
+        selected = []
+
+        def migrate_after_plan(*args):
+            work, reasons, blocked = actual_plan(*args)
+            selected.extend((root["id"], tree) for root, tree in work)
+            with sqlite3.connect(self.db) as state:
+                state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                              ("pt-claude-late", "th-late", None, "claude", None, "idle", 2, 2,
+                               datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                               "{}", "claude", "claude"))
+            return work, reasons, blocked
+
+        verifier = mock.Mock()
+        verifier.check.return_value = None
+        with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db), \
+                mock.patch.object(session_reaper, "OC_DB", ocdb), \
+                mock.patch.object(session_reaper, "LOGS", logs), \
+                mock.patch.object(session_reaper, "REPLICA", replica), \
+                mock.patch.object(session_reaper, "STATUS", status), \
+                mock.patch.object(session_reaper, "backup_gate", return_value={"backup_ts": 9_999_999_999, "snapshot": "fake"}), \
+                mock.patch.object(session_reaper, "control_gate"), \
+                mock.patch.object(session_reaper, "running_ids", return_value=set()), \
+                mock.patch.object(session_reaper, "Verifier", return_value=verifier), \
+                mock.patch.object(session_reaper, "plan", side_effect=migrate_after_plan), \
+                mock.patch.object(session_reaper, "http", side_effect=AssertionError("DELETE must not be called")) as http, \
+                mock.patch.object(sys, "argv", ["session_reaper.py"]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(session_reaper.main(), 0)
+            http.assert_not_called()
+        self.assertEqual(selected, [("ses_root", ["ses_root", "ses_child"])])
+        self.assertEqual(verifier.check.call_count, 2)
+        with open(status) as f:
+            report = json.load(f)
+        self.assertEqual(report["state"], "done")
+        self.assertEqual(report["deleted_roots"], 0)
+        self.assertEqual(report["skipped"]["protected_before_delete"], 1)
+        with sqlite3.connect(ocdb) as con:
+            self.assertEqual(con.execute("SELECT count(*) FROM session_v2").fetchone()[0], 2)
 
     def test_unreadable_rollback_pins_fail_closed(self):
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=os.path.join(self.tmp.name, "nope.sqlite")):

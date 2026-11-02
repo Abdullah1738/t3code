@@ -331,12 +331,16 @@ def migrated_rollback_session_ids(con, now=None):
     """OpenCode sessions of Robob threads whose provider thread moved to another
     driver (Claude/Codex/Muse) within ROLLBACK_DAYS. Those OpenCode sessions are the
     rollback source for the migration, so they are never reaped in that window.
-    The move time is approximated by the non-OpenCode provider row's updated_at."""
+    The move time is approximated by the non-OpenCode provider row's updated_at.
+    A missing or invalid driver/timestamp cannot prove the rollback window ended."""
     import datetime
     now = now or datetime.datetime.now(datetime.timezone.utc)
     cutoff = (now - datetime.timedelta(days=ROLLBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     moved = [r[0] for r in con.execute(
         "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
-        "WHERE driver IS NOT NULL AND driver != 'opencode' AND thread_id IS NOT NULL AND updated_at >= ?",
+        "WHERE (driver IS NULL OR driver != 'opencode') "
+        "AND (driver IS NULL OR julianday(updated_at) IS NULL OR julianday(updated_at) >= julianday(?))",
         (cutoff,))]
+    if any(not isinstance(tid, str) or not tid for tid in moved):
+        raise RuntimeError("migrated provider thread has no thread id")
     return native_ids_for_threads(con, moved)

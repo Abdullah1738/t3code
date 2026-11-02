@@ -7,13 +7,25 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SQLITE=/opt/homebrew/opt/sqlite/bin/sqlite3
-REAL_RSYNC="$HOME/.local/share/memory-system/bin/sqlite3_rsync"
+PYTHON=/opt/homebrew/bin/python3
+RESTIC=/opt/homebrew/bin/restic
+TOP=$(mktemp -d "${TMPDIR:-/tmp}/backuptest.XXXXXX") || exit 1
+trap 'rm -rf "$TOP"' EXIT
+# Stand-in uses SQLite's backup API. No executable or database from the live
+# install is read. The original no-op and high-water-mark regressions remain.
+REAL_RSYNC="$TOP/sqlite3_rsync"
+cat > "$REAL_RSYNC" <<'SH'
+#!/bin/bash
+src="${@: -2:1}"; dst="${@: -1}"
+/opt/homebrew/opt/sqlite/bin/sqlite3 "$src" ".backup '$dst'"
+SH
+chmod +x "$REAL_RSYNC"
 FAIL=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; FAIL=1; }
 
 setup() { # fake-or-real sqlite3_rsync
-  T=$(mktemp -d "${TMPDIR:-/tmp}/backuptest.XXXXXX")
+  T=$(mktemp -d "$TOP/case.XXXXXX")
   R="$T/.local/share/memory-system"
   mkdir -p "$R/data" "$R/bin" "$R/logs" "$R/scripts" "$R/src" "$R/schema" "$R/sql" "$T/stage" "$T/repo/live"
   touch "$R/HANDOFF.md"
@@ -21,6 +33,8 @@ setup() { # fake-or-real sqlite3_rsync
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
   # the live install ships src/ (incl. the transcript manifest tool) next to the script
   cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$R/src/"
+  # Never invoke the Dropbox API in this test, even when restic succeeds.
+  printf 'print("{\\"test\\": true}")\n' > "$R/src/dropbox_mirror.py"
   old=$(( $(date +%s) - 3 * 86400 ))
   "$SQLITE" "$R/data/memory.db" "PRAGMA journal_mode=wal;
     CREATE TABLE episodic_events(id INTEGER PRIMARY KEY, timestamp INTEGER);
@@ -34,7 +48,11 @@ setup() { # fake-or-real sqlite3_rsync
   fi
 }
 run() {
-  HOME="$T" MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
+  env -u RESTIC_PASSWORD -u RESTIC_PASSWORD_FILE HOME="$T" XDG_DATA_HOME="$T/.local/share" \
+    ROBOB_STATE_DB="${ROBOB_STATE_DB:-$T/no-robob.sqlite}" \
+    ROBOB_HARNESS_HOMES="$T/.robob/harness-homes" \
+    MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
+    MEMORY_BACKUP_PASSWORD_COMMAND='printf fixture-password' MEMORY_BACKUP_CACHE_DIR="$T/cache" \
     MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
 }
 st() { /opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["stage"], d["ok"])' "$R/logs/backup_last.json"; }
@@ -50,13 +68,13 @@ grep -q "replica not updated by sqlite3_rsync: replica=2 live>=3" "$R/logs/backu
 [ "$(grep -c 'behind after sync' "$R"/logs/backup-*.log)" = 1 ] && pass "retried once before failing" || fail "retry count"
 rm -rf "$T"
 
-# 2. real sqlite3_rsync -> replica stage passes (run then stops at fake restic repo)
+# 2. SQLite backup stand-in -> replica stage passes (then fake repo fails).
 if [ -x "$REAL_RSYNC" ]; then
   setup real
   run
   "$SQLITE" "$R/data/memory.db" "INSERT INTO episodic_events VALUES (3,$(date +%s));"
   run
-  [ "$(st)" = "restic False" ] && pass "real sync passes replica+verify" || fail "real sync gave: $(st) $(cat "$R/logs/backup_last.json")"
+  [ "$(st)" = "restic False" ] && pass "SQLite sync passes replica+verify" || fail "SQLite sync gave: $(st) $(cat "$R/logs/backup_last.json")"
   [ "$("$SQLITE" -readonly "$T/stage/memory.db" 'SELECT max(id) FROM episodic_events')" = 3 ] \
     && pass "replica caught up" || fail "replica not caught up"
   rm -rf "$T"
@@ -125,5 +143,160 @@ grep -q "skip: backup $live still running" "$R"/logs/backup-*.log \
 kill -0 $live 2>/dev/null && [ -d "$R/logs/backup.lock" ] \
   && pass "live holder not killed, lock kept" || fail "live holder disturbed"
 kill $live; wait $live 2>/dev/null
+rm -rf "$T"
+
+# 6. Exercise the real restic snapshot, not merely the manifest helper. All
+# sources, credentials, repos, cache, mirror and restored output are fixtures.
+setup fake
+rm "$T/repo/live/config"
+RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" init >/dev/null || exit 1
+H="$T/.robob/harness-homes"
+# Historical runs placed a manifest outside the current snapshot-manifest dir.
+# It must not be copied back as a stale second manifest.
+mkdir -p "$R/data/backup-manifests" "$T/stage/files/data/backup-manifests"
+echo old > "$R/data/backup-manifests/older.json"
+echo old > "$T/stage/files/data/backup-manifests/older.json"
+mkdir -p "$H/claude/projects/proj/session/subagents" "$H/codex/sessions/2026" \
+  "$H/codex/archived_sessions/old" "$H/codex-cu/sessions/2026" \
+  "$H/claude/projects/proj/auth.json" "$T/outside" \
+  "$T/stage/files/transcripts/codex-cu/archived_sessions/missing/auth.json" \
+  "$T/stage/files/transcripts/unrecognized"
+printf 'claude main\n' > "$H/claude/projects/proj/session.jsonl"
+printf 'claude child\n' > "$H/claude/projects/proj/session/subagents/agent.jsonl"
+printf 'codex\n' > "$H/codex/sessions/2026/session.jsonl"
+printf 'archive\n' > "$H/codex/archived_sessions/old/old.jsonl"
+printf 'codex-cu\n' > "$H/codex-cu/sessions/2026/session.jsonl"
+printf 'source secret\n' > "$H/claude/projects/proj/.credentials.json"
+printf 'source database\n' > "$H/codex/sessions/2026/state.sqlite3"
+printf 'source secret\n' > "$H/claude/projects/proj/auth.json/nested-secret"
+printf 'old secret\n' > "$T/stage/files/transcripts/codex-cu/archived_sessions/missing/.credentials.json"
+printf 'old db\n' > "$T/stage/files/transcripts/codex-cu/archived_sessions/missing/state.sqlite-wal"
+printf 'nested secret\n' > "$T/stage/files/transcripts/codex-cu/archived_sessions/missing/auth.json/secret"
+printf 'old but safe transcript\n' > "$T/stage/files/transcripts/codex-cu/archived_sessions/missing/keep.jsonl"
+printf 'other stale secret\n' > "$T/stage/files/transcripts/unrecognized/private.key"
+printf 'outside untouched\n' > "$T/outside/auth.json"
+ln -s "$T/outside" "$T/stage/files/transcripts/unrecognized/outside-link"
+ln -s "$T/outside/auth.json" "$H/claude/projects/proj/credential-link"
+ln -s "$T/outside" "$H/codex/sessions/2026/outside-dir"
+mkfifo "$H/codex/sessions/2026/source-pipe"
+run
+[ "$(st)" = "done True" ] && pass "first transcript backup completes" \
+  || fail "first transcript backup: $(st) $(cat "$R/logs/backup_last.json")"
+[ "$(cat "$T/outside/auth.json")" = 'outside untouched' ] \
+  && pass "symlink target not touched" || fail "symlink target was modified"
+RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" \
+  restore latest --target "$T/restore" >/dev/null || fail "cannot restore test snapshot"
+SNAPROOT="$T/restore$T/stage"
+if "$PYTHON" - "$HERE/src" "$SNAPROOT" "$R/data/backup-manifests" <<'PY'
+import glob, hashlib, json, os, sys
+sys.path.insert(0, sys.argv[1])
+import transcript_backup_manifest as tbm
+root, published = sys.argv[2:]
+tree = os.path.join(root, 'files', 'transcripts')
+snapshots = glob.glob(os.path.join(root, 'files', 'transcript-manifest', '*.json'))
+local = glob.glob(os.path.join(published, '*.json'))
+assert len(snapshots) == 1, snapshots
+assert not os.path.exists(os.path.join(root, 'files', 'data', 'backup-manifests'))
+current = [p for p in local if os.path.basename(p) == os.path.basename(snapshots[0])]
+assert len(current) == 1, local
+with open(snapshots[0], 'rb') as f: contents = f.read()
+with open(current[0], 'rb') as f: assert contents == f.read()
+manifest = json.loads(contents)
+assert not tbm.verify(manifest, tree), tbm.verify(manifest, tree)
+expected = {
+    'claude/projects/proj/session.jsonl': b'claude main\n',
+    'claude/projects/proj/session/subagents/agent.jsonl': b'claude child\n',
+    'codex/sessions/2026/session.jsonl': b'codex\n',
+    'codex/archived_sessions/old/old.jsonl': b'archive\n',
+    'codex-cu/sessions/2026/session.jsonl': b'codex-cu\n',
+    'codex-cu/archived_sessions/missing/keep.jsonl': b'old but safe transcript\n',
+}
+listed = {item['path']: item for item in manifest['files']}
+assert set(listed) == set(expected), (set(listed), set(expected))
+for path, content in expected.items():
+    with open(os.path.join(tree, path), 'rb') as f: assert f.read() == content
+    assert listed[path]['size'] == len(content)
+    assert listed[path]['sha256'] == hashlib.sha256(content).hexdigest()
+for directory, dirs, files in os.walk(tree):
+    for name in dirs + files:
+        assert not tbm.excluded(name), (directory, name)
+        assert not os.path.islink(os.path.join(directory, name)), (directory, name)
+PY
+then pass "restored snapshot contains exact verified manifest and no forbidden transcripts"
+else fail "restored snapshot or manifest mismatch"; fi
+
+# A vanished source root retains safe historical transcripts but cannot retain
+# excluded entries, even if they were injected into the persistent replica.
+rm -rf "$H/codex/archived_sessions"
+mkdir -p "$T/stage/files/transcripts/codex/archived_sessions/old/settings.local.json"
+printf 'old nested secret\n' > "$T/stage/files/transcripts/codex/archived_sessions/old/settings.local.json/x"
+printf 'old secret\n' > "$T/stage/files/transcripts/codex/archived_sessions/old/auth.json"
+run
+[ "$(st)" = "done True" ] && pass "backup completes after a transcript source vanishes" || fail "vanished source gave: $(st)"
+mkdir "$T/restore-second"
+RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" \
+  restore latest --target "$T/restore-second" >/dev/null || fail "cannot restore second snapshot"
+SECOND="$T/restore-second$T/stage"
+if "$PYTHON" - "$HERE/src" "$SECOND" "$R/data/backup-manifests" <<'PY'
+import glob, json, os, sys
+sys.path.insert(0, sys.argv[1])
+import transcript_backup_manifest as tbm
+root, published = sys.argv[2:]
+tree = os.path.join(root, 'files', 'transcripts')
+snapshots = glob.glob(os.path.join(root, 'files', 'transcript-manifest', '*.json'))
+assert len(snapshots) == 1, snapshots
+with open(snapshots[0], 'rb') as f: contents = f.read()
+with open(os.path.join(published, os.path.basename(snapshots[0])), 'rb') as f: assert f.read() == contents
+manifest = json.loads(contents)
+assert not tbm.verify(manifest, tree), tbm.verify(manifest, tree)
+assert 'codex/archived_sessions/old/old.jsonl' in {f['path'] for f in manifest['files']}
+for directory, dirs, files in os.walk(tree):
+    for name in dirs + files:
+        assert not tbm.excluded(name), (directory, name)
+        assert not os.path.islink(os.path.join(directory, name)), (directory, name)
+PY
+then pass "vanished-root snapshot keeps safe transcripts but excludes injected secrets"
+else fail "vanished-root snapshot or manifest mismatch"; fi
+# A special file in an unsynced root must fail before restic or local manifest
+# publication. Compare snapshot and manifest counts around this failed run.
+before=$(RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" snapshots --json | "$PYTHON" -c 'import json,sys; print(len(json.load(sys.stdin)))')
+manifests_before=$(ls "$R/data/backup-manifests/"*.json | wc -l | tr -d ' ')
+mkfifo "$T/stage/files/transcripts/unrecognized/pipe"
+run
+[ "$(st)" = "files False" ] && pass "unsafe stage fails closed before snapshot" || fail "unsafe stage gave: $(st)"
+after=$(RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" snapshots --json | "$PYTHON" -c 'import json,sys; print(len(json.load(sys.stdin)))')
+[ "$before" = "$after" ] && [ "$(ls "$R/data/backup-manifests/"*.json | wc -l | tr -d ' ')" = "$manifests_before" ] \
+  && pass "failed run created no snapshot or manifest" || fail "failed run published backup or manifest"
+rm -rf "$T"
+
+# Failed restic snapshots must not become local reaper manifests either.
+setup fake
+mkdir -p "$T/.robob/harness-homes/codex/sessions"
+echo session > "$T/.robob/harness-homes/codex/sessions/first.jsonl"
+run
+[ "$(st)" = "restic False" ] && [ -z "$(ls -A "$R/data/backup-manifests" 2>/dev/null)" ] \
+  && pass "failed restic backup publishes no manifest" || fail "failed restic backup published a manifest"
+rm -rf "$T"
+
+# A local restic snapshot alone is not enough for the reaper: mirroring must
+# have completed before the manifest is visible under data/backup-manifests.
+setup fake
+rm "$T/repo/live/config"
+RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" init >/dev/null || exit 1
+echo 'raise SystemExit(1)' > "$R/src/dropbox_mirror.py"
+run
+[ "$(st)" = "dropbox False" ] && [ -z "$(ls -A "$R/data/backup-manifests" 2>/dev/null)" ] \
+  && pass "failed mirror publishes no manifest" || fail "failed mirror published a manifest"
+rm -rf "$T"
+
+# If the local manifest destination is not writable as a directory, the run
+# must fail even after snapshot and mirror; it must not silently claim success.
+setup fake
+rm "$T/repo/live/config"
+RESTIC_PASSWORD=fixture-password RESTIC_CACHE_DIR="$T/cache" "$RESTIC" -r "$T/repo/live" init >/dev/null || exit 1
+echo blocked > "$R/data/backup-manifests"
+run
+[ "$(st)" = "files False" ] && grep -q 'transcript manifest publish' "$R/logs/backup_last.json" \
+  && pass "manifest publication failure is reported" || fail "manifest publication failure was ignored: $(st)"
 rm -rf "$T"
 exit $FAIL

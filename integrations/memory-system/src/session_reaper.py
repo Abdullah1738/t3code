@@ -538,11 +538,14 @@ def main():
                 st["stopped"] = "memory backup started; replica evidence no longer final"
                 break
             live_now = running_ids() | backlog_ids()
+            if any(s["id"] in live_now for s in nodes):
+                st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
+                continue
             changed = False
             for s in nodes:
                 r = oc.execute("SELECT time_updated, (SELECT count(*) FROM session_message WHERE session_id=?) FROM session_v2 WHERE id=?",
                                (s["id"], s["id"])).fetchone()
-                if not r or r[0] != s["tu"] or r[1] != s["n"] or s["id"] in live_now:
+                if not r or r[0] != s["tu"] or r[1] != s["n"]:
                     changed = True
                     break
             kids_now = oc.execute("SELECT count(*) FROM session_v2 WHERE parent_id IN (%s)" % ",".join("?" * len(tree)), tree).fetchone()[0]
@@ -550,8 +553,14 @@ def main():
             if changed or kids_now != len(tree) - 1:
                 st["skipped"]["changed_before_delete"] = st["skipped"].get("changed_before_delete", 0) + 1
                 continue
-            t1 = time.time()
+            # A migration can pin any node after planning, without changing the
+            # OpenCode tree. Read Robob again immediately before the DELETE.
+            rollback_now = rollback_ids()
+            if any(s["id"] in rollback_now for s in nodes):
+                st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
+                continue
             try:
+                t1 = time.time()
                 code, body = http("DELETE", "/api/session/" + urllib.parse.quote(root["id"]))
             except (TimeoutError, OSError) as e:
                 code, body = None, repr(e)

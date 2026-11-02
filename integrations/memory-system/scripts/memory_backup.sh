@@ -18,8 +18,8 @@ REPO_ROOT="${MEMORY_BACKUP_REPO_ROOT:-/Volumes/ExternalSSD/memory-system-backup/
 export RESTIC_REPOSITORY="$REPO_ROOT/live"
 DROPBOX_DEST="/Backups/memory-system/live"
 MIRROR="$ROOT/src/dropbox_mirror.py"
-export RESTIC_PASSWORD_COMMAND="security find-generic-password -s restic-memory-backup -w"
-export RESTIC_CACHE_DIR="/Volumes/ExternalSSD/.restic-cache"
+export RESTIC_PASSWORD_COMMAND="${MEMORY_BACKUP_PASSWORD_COMMAND:-security find-generic-password -s restic-memory-backup -w}"
+export RESTIC_CACHE_DIR="${MEMORY_BACKUP_CACHE_DIR:-/Volumes/ExternalSSD/.restic-cache}"
 RESTIC=/opt/homebrew/bin/restic
 SQRSYNC="$ROOT/bin/sqlite3_rsync"
 SQLITE=/opt/homebrew/opt/sqlite/bin/sqlite3
@@ -198,30 +198,36 @@ fi
 # below must match the staged copy, or the run fails.
 HARNESS="${ROBOB_HARNESS_HOMES:-$HOME/.robob/harness-homes}"
 TSTAGE="$STAGE/files/transcripts"
-mkdir -p "$TSTAGE"
-for pair in "claude/projects" "codex/sessions" "codex/archived_sessions" "codex-cu/sessions" "codex-cu/archived_sessions"; do
+TMANIFEST="$STAGE/files/transcript-manifest"
+TRANSCRIPT_PAIRS=("claude/projects" "codex/sessions" "codex/archived_sessions" "codex-cu/sessions" "codex-cu/archived_sessions")
+# Clean the entire persistent stage, even roots missing from the source. Python
+# is allowed to write on the SSD under launchd, unlike system rm, cp and find.
+out=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" prepare "$STAGE" "${TRANSCRIPT_PAIRS[@]}" 2>&1) \
+  || fail files "transcript stage preparation: $(printf '%s' "$out" | tail -1)"
+for pair in "${TRANSCRIPT_PAIRS[@]}"; do
   src="$HARNESS/$pair"
   [ -d "$src" ] || continue
   dst="$TSTAGE/$pair"
-  # --delete keeps the staged copy equal to the live dir (no stale transcripts
-  # in the backup); rm is avoided on the SSD under launchd (see above).
-  /opt/homebrew/bin/rsync -a --delete \
+  /opt/homebrew/bin/rsync -a --no-links --no-specials --no-devices --delete --delete-excluded \
     --exclude='.credentials.json' --exclude='auth.json' --exclude='settings.local.json' \
     --exclude='*.key' --exclude='*.sqlite*' --exclude='*.db' --exclude='*.db-*' --exclude='*-wal' --exclude='*-shm' \
     "$src/" "$dst/" >>"$LOG" 2>&1 || fail files "rsync harness transcripts $pair"
 done
-MANIFEST_DIR="$DATA/backup-manifests"
-mkdir -p "$MANIFEST_DIR"
-mout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" build "$TSTAGE" "$MANIFEST_DIR" 2>&1) \
+# Build and verify inside the actual snapshot tree, not just in live data.
+mout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" build "$TSTAGE" "$TMANIFEST" 2>&1) \
   || fail files "transcript manifest build: $(printf '%s' "$mout" | tail -1)"
 MPATH="$mout"
 vout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" verify "$MPATH" "$TSTAGE" 2>&1) \
   || fail files "transcript manifest mismatch: $(printf '%s' "$vout" | tail -1)"
-log "transcript manifest $(basename "$MPATH") verified ($(printf '%s' "$vout" | wc -l | tr -d ' ') problems)"
+log "transcript manifest $(basename "$MPATH") verified"
 
 # 2. snapshot
-excl=(--exclude "$STAGE/robob-state.sql.tmp")
+excl=(--exclude "$STAGE/robob-state.sql.tmp" --exclude "$STAGE/files/data/backup-manifests")
 for p in "${RETIRED[@]}"; do excl+=(--exclude "$STAGE/$p"); done
+# Scope the second fence to transcripts so database replicas elsewhere remain.
+for p in '.credentials.json' 'auth.json' 'settings.local.json' '*.key' '*.sqlite*' '*.db' '*.db-*' '*-wal' '*-shm'; do
+  excl+=(--exclude "$TSTAGE/$p" --exclude "$TSTAGE/**/$p")
+done
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
   --pack-size 64 "${excl[@]}" "$STAGE" 2>&1)
 rc=$?
@@ -248,5 +254,10 @@ log "dropbox mirror rc=$mrc $(printf '%s' "$mout" | tail -1)"
 [ $mrc -eq 0 ] || fail dropbox "mirror rc=$mrc $(printf '%s' "$mout" | tail -c 600)"
 printf '%s' "$mout" | tail -1 > "$LOGDIR/dropbox_mirror_live.json"
 
+# The reaper must never see a manifest for a failed snapshot or mirror. Publish
+# the bytes from that snapshot, failing if the staged tree changed meanwhile.
+pout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" publish "$MPATH" "$TSTAGE" "$DATA/backup-manifests" 2>&1) \
+  || fail files "transcript manifest publish: $(printf '%s' "$pout" | tail -1)"
+log "transcript manifest published: $pout"
 write_status 1 done "ok" "$snap" "$added"
 log "backup done ($(( $(date +%s) - START ))s)"
