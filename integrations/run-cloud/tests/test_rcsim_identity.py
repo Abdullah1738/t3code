@@ -172,6 +172,48 @@ class RcsimIdentityTests(unittest.TestCase):
         mine = [r["id"] for r in rcsim.my_active(con, child)]
         self.assertEqual(mine, ["sim-child"], "a child must not release its parent's or sibling's simulator")
 
+    def test_inherited_parent_rcsim_thread_never_releases_the_parents_simulators(self):
+        # A resolved child inherits RCSIM_THREAD naming its parent. The owner must stay the exact child, so
+        # `release --mine` releases only the child's simulator, never the parent's or a sibling's.
+        con = rcsim.db()
+        con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                    "VALUES ('sim-child','ios',?,?,'active',1,1,'rcsim')", (CHILD, CLAUDE_UUID))
+        con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                    "VALUES ('sim-parent','ios',?,?,'active',1,1,'rcsim')", (PARENT, CLAUDE_UUID))
+        con.commit()
+        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(CHILD, PARENT, "app-managed-child")
+        with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, RCSIM_THREAD=PARENT):
+            me = rcsim.whoami()
+            self.assertEqual(me["thread"], CHILD, "the owner is the resolved child, not the inherited parent")
+            self.assertEqual(me["manager"], PARENT, "the parent is kept as the manager, not the owner")
+            mine = [r["id"] for r in rcsim.my_active(con, me)]
+        self.assertEqual(mine, ["sim-child"])
+
+    def _claim_args(self, ids):
+        return type("A", (), {"thread": None, "manager": None, "ids": ids, "purpose": None})()
+
+    def test_claim_refuses_unresolved_callers_without_touching_rows_or_run_cloud(self):
+        # Pending, ambiguous and unavailable callers must not overwrite an owner, nor call Run Cloud to discover one.
+        con = rcsim.db()
+        con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                    "VALUES ('sim-owned','ios',?,?,'active',1,1,'rcsim')", (PARENT, CLAUDE_UUID))
+        con.execute("INSERT INTO sims (id, platform, owner_thread, owner_ses, state, created_at, last_hb, source) "
+                    "VALUES ('sim-orphan','ios',NULL,NULL,'active',1,1,'orphan')")
+        con.commit()
+        before = [tuple(r) for r in con.execute("SELECT id, owner_thread, owner_ses, state FROM sims ORDER BY id")]
+        for resolution in ("pending", "ambiguous", "unavailable"):
+            self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = {
+                "resolution": resolution, "robobThreadId": None, "parentThreadId": None,
+                "executionKind": None, "acceptsMessages": False, "candidates": []}
+            with self.shell(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID), \
+                    patch.object(rcsim, "find_live", return_value=({"id": "sim-new"}, "ios")) as live:
+                with self.assertRaises(SystemExit):
+                    rcsim.cmd_claim(self._claim_args(["sim-owned", "sim-orphan", "sim-new"]))
+            live.assert_not_called()
+        after = [tuple(r) for r in con.execute("SELECT id, owner_thread, owner_ses, state FROM sims ORDER BY id")]
+        self.assertEqual(after, before, "an unresolved claim must not change any owner")
+        self.assertEqual(self.api_calls(), [], "an unresolved claim must not call Run Cloud")
+
     def test_mine_refuses_an_unresolved_caller(self):
         self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = {
             "resolution": "ambiguous", "robobThreadId": None, "parentThreadId": None, "executionKind": None,

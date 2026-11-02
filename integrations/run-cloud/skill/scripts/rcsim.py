@@ -336,19 +336,22 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
                 me["title"] = (t or {}).get("title")
             me["relationship"] = "subagent" if me["manager"] else None
     elif explicit is not None:
-        # An explicit --thread (or RCSIM_THREAD) names an owner. It counts only when it is this execution or
-        # one of its ancestors, so an inherited value from an unrelated parent can't take the work.
+        # An explicit --thread names the owner the operator chose. It counts only when it is this execution or
+        # one of its ancestors. RCSIM_THREAD is inherited shell state: it can never replace a resolved owner,
+        # because an inherited parent id would hand the child's work (and its siblings') to the parent.
         state, t = thread_get(explicit)
         if state == "gone":
             die(f"thread {explicit} not found or archived")
         ident = identity_for(native, driver) if native is not None else None
+        if thread is None and ident is not None and ident.get("resolution") == "resolved":
+            # Inherited RCSIM_THREAD: keep the resolved execution as the owner and drop the env value.
+            # An ancestor value is only informational here, so it is logged and ignored.
+            if explicit != ident.get("robobThreadId"):
+                log(f"RCSIM_THREAD ignored: the resolved execution owns this call, not the inherited {explicit}")
+            return whoami(None, manager, ignore_env=True)
         if ident is not None and ident.get("resolution") == "resolved":
             allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
             if explicit not in allowed:
-                if thread is None:
-                    # Inherited from an unrelated parent: ignore it and use the resolved execution instead.
-                    log(f"RCSIM_THREAD ignored: {explicit} is not this execution or an ancestor")
-                    return whoami(None, manager, ignore_env=True)
                 die(f"--thread {explicit} is not this session's thread or its parent")
         me.update(thread=explicit, title=(t or {}).get("title"),
                   resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
@@ -583,8 +586,9 @@ def cmd_release(a) -> None:
 def cmd_claim(a) -> None:
     con = db()
     me = whoami(a.thread, a.manager)
-    if not me.get("thread") and not me.get("ses"):
-        die("claim needs to run inside an agent thread (or pass --thread)")
+    # Before any discovery or write: a pending, ambiguous or unavailable caller must not overwrite an owner or
+    # register a simulator under a shared or missing identity.
+    refuse_unresolved(me, "claim")
     for raw in a.ids:
         sid = resolve_id(con, raw)
         row = get_row(con, sid)
