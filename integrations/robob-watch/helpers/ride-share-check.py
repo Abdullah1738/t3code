@@ -31,7 +31,7 @@ Env overrides (all optional):
   UBER_AUDIT_DIR     booking audit logs (default ~/Library/Application Support/uber/audit)
   RIDE_SHARE_NOW     epoch seconds to use as "now" (tests only)
 """
-import json, os, re, shutil, subprocess, sys, time
+import hashlib, json, os, re, shutil, subprocess, sys, time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -238,6 +238,70 @@ def mark_fare_checked(uuid, now):
     save(checkpoint)
 
 
+def queue_fare_alert(uuid, t, line):
+    # The receipt cannot be read twice, so persist the result before anything else can fail.
+    alert = {"line": line}
+    checkpoint = load()
+    checkpoint["trips"].setdefault(uuid, {})["fare_alert"] = alert
+    save(checkpoint)
+    t["fare_alert"] = alert
+
+
+def runner_state():
+    try:
+        with open(os.path.join(WD, "state.json")) as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def event_hash(event):
+    return hashlib.sha256(event.encode("utf-8")).hexdigest()
+
+
+def clear_acked_fares(trips):
+    try:
+        with open(os.path.join(WD, ".run-ok")) as f:
+            ack = f.read().strip()
+    except OSError:
+        ack = ""
+    state = runner_state()
+    pending = state.get("pending") or {}
+    pending_event = pending.get("event") if isinstance(pending, dict) else None
+    pending_hash = event_hash(pending_event.strip()) if isinstance(pending_event, str) and pending_event.strip() else None
+    fires = state.get("fires")
+    for t in trips.values():
+        alert = t.get("fare_alert")
+        if not alert or not alert.get("run"):
+            continue
+        baseline = alert.get("fires")
+        if (alert["run"] == ack or (pending_hash and alert.get("batch") == pending_hash)
+                or (isinstance(fires, int) and isinstance(baseline, int) and fires > baseline)):
+            t.pop("fare_alert")
+
+
+def finish_run(s, out):
+    trips = s["trips"]
+    alerts = [t["fare_alert"] for t in trips.values() if t.get("fare_alert")]
+    out.extend(alert["line"] for alert in alerts)
+    run = os.environ.get("WATCH_RUN", "")
+    if run and alerts:
+        batch = event_hash("\n".join(out).strip())
+        fires = runner_state().get("fires", 0)
+        for alert in alerts:
+            # Rebind on every replay: .run-ok acknowledges the run that printed it, not the first run.
+            alert.update(run=run, fires=fires, batch=batch)
+    save(s)
+    if out:
+        print("\n".join(out), flush=True)
+    if not run and alerts:
+        # A direct invocation has no runner to acknowledge its output.
+        for t in trips.values():
+            t.pop("fare_alert", None)
+        save(s)
+
+
 def recently_requested(trips, rider, now, exclude):
     return any(u != exclude and t.get("rider") == rider and t.get("card_requested")
                and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
@@ -283,6 +347,7 @@ def unshare_ended(now, live=None):
 def main():
     s = load()
     now = now_ts()
+    clear_acked_fares(s["trips"])
     try:
         d = uber("rides", "status")
         if not d.get("ok"):
@@ -290,10 +355,11 @@ def main():
         s["fail_since"] = None
     except Exception as e:
         s["fail_since"] = s.get("fail_since") or now
-        save(s)
         if now - s["fail_since"] > FAIL_ALERT_S:
+            save(s)
             print(f"uber rides status failing for {int((now - s['fail_since'])/60)} min: {e}", file=sys.stderr)
             sys.exit(1)
+        finish_run(s, [])
         return
 
     out = []
@@ -305,7 +371,7 @@ def main():
             cur = rc.check_uuid(trip["uuid"])
         except SystemExit:
             print(f"ride-share: ignoring malformed trip uuid {str(trip.get('uuid'))[:60]!r}", file=sys.stderr)
-            save(s)
+            finish_run(s, [])
             return  # can't bind a card to it; leave every other trip untouched this run
     if cur:
         t = trips.setdefault(cur, {"first_seen": now})
@@ -386,10 +452,10 @@ def main():
                     t["fare_checked"] = now
                     # A timeout or killed check must not issue a second receipt read.
                     mark_fare_checked(uuid, now)
+                    _, _, label = who(uuid)
                     detail = fare_over(uuid, quote)
                     if detail:
-                        _, _, label = who(uuid)
-                        out.append(f"FARE_OVER trip={uuid} rider={label} {detail}")
+                        queue_fare_alert(uuid, t, f"FARE_OVER trip={uuid} rider={label} {detail}")
             if not card_shared(uuid, t):
                 continue  # nothing was shared: nothing to correct
             rider, _, label = who(uuid)
@@ -446,12 +512,10 @@ def main():
         t = trips[uuid]
         if "fare_checked" in t:
             # Keep a small tombstone so a reappearing trip never reads its receipt twice.
-            trips[uuid] = {k: t[k] for k in ("fare_checked", "ended_fired", "result") if k in t}
+            trips[uuid] = {k: t[k] for k in ("fare_checked", "ended_fired", "result", "fare_alert") if k in t}
         else:
             trips.pop(uuid, None)
-    save(s)
-    if out:
-        print("\n".join(out))
+    finish_run(s, out)
 
 
 if __name__ == "__main__":

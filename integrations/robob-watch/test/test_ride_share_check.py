@@ -177,7 +177,7 @@ class Base(unittest.TestCase):
             RIDE_SHARE_HINTS=self.hints, RIDE_CARD_ROOT=self.cards, RIDE_CARD_JOURNAL=self.journal,
             RIDE_CARD_NO_IMAGE="1", RIDE_CARD_BRIDGE=self.bridge, FAKE_BRIDGE_LOG=self.blog,
             RIDE_CARD_ENROLL=self.enroll, WATCH_DIR=self.dir, RIDE_CARD_BRIDGE_STATE=self.bstate,
-            UBER_AUDIT_DIR=self.audit,
+            UBER_AUDIT_DIR=self.audit, WATCH_RUN="",
         )
 
     def route(self, chat, rid, generation):
@@ -267,9 +267,17 @@ class Base(unittest.TestCase):
         with open(self.fixture + ".calls") as f:
             return f.read().splitlines().count(f"trips receipt {uuid}")
 
-    def start_completed(self, uuid, receipt):
+    def ack(self, run):
+        with open(os.path.join(self.dir, ".run-ok"), "w") as f:
+            f.write(run + "\n")
+
+    def runner_state(self, **fields):
+        with open(os.path.join(self.dir, "state.json"), "w") as f:
+            json.dump(fields, f)
+
+    def start_completed(self, uuid, receipt, now=FARE_NOW):
         self.set_state(trip(uuid, "OnTrip"), {})
-        self.assertEqual(self.run_check(FARE_NOW), [])
+        self.assertEqual(self.run_check(now), [])
         self.set_state(None, {uuid: {"status": "COMPLETED"}}, {uuid: receipt} if receipt is not None else None)
 
     def card_cli(self, *args, ok=True, **extra):
@@ -488,6 +496,165 @@ class WatcherTest(Base):
         self.assertEqual(self.run_check(FARE_NOW + 15 * 86400 + 30), [])
         self.set_state(None, {A: {"status": "COMPLETED"}}, {A: REAL_RECEIPT})
         self.assertEqual(self.run_check(FARE_NOW + 15 * 86400 + 60), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_unacked_alert_survives_age_cleanup_until_acknowledged(self):
+        now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc).timestamp()
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT, now=now)
+        out = self.run_check(now + 30, WATCH_RUN="r1")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(self.run_check(now + 15 * 86400, WATCH_RUN="r2"), out)
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["trips"][A]["fare_alert"]["line"], out[0])
+        self.ack("r2")
+        self.assertEqual(self.run_check(now + 15 * 86400 + 30, WATCH_RUN="r3"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_fare_alert_replayed_after_exception_and_acked_replay(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        wrapper = self._exe("raise-after-receipt", """#!/usr/bin/python3
+import importlib.util, os
+spec = importlib.util.spec_from_file_location('ride_share_check', os.environ['TEST_HELPER'])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def fail(*args, **kwargs):
+    raise RuntimeError('unshare failed after receipt')
+m.unshare_ended = fail
+m.main()
+""")
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(FARE_NOW + 30), WATCH_RUN="r1", TEST_HELPER=HELPER))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("unshare failed after receipt", p.stderr)
+        self.assertEqual(p.stdout, "")
+        expected = (f"FARE_OVER trip={A} rider=abdullah(assumed) quoted=AED 84.70 "
+                    "charged=AED 98.25 extra=Wait Time AED 13.55")
+        self.assertEqual(self.run_check(FARE_NOW + 60, WATCH_RUN="r2"), [expected])
+        self.ack("r2")
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+        # A fresh trip is still detected after the replay was acknowledged.
+        self.audit_quote(B)
+        self.set_state(trip(B, "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW + 120, WATCH_RUN="r4"), [])
+        self.set_state(None, {B: {"status": "COMPLETED"}}, {B: REAL_RECEIPT})
+        self.assertEqual(self.run_check(FARE_NOW + 150, WATCH_RUN="r5"), [expected.replace(A, B)])
+        self.assertEqual(self.receipt_calls(B), 1)
+
+    def test_fare_alert_rebinds_unacked_runs_until_acknowledged(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        first = self.run_check(FARE_NOW + 30, WATCH_RUN="r1")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(self.run_check(FARE_NOW + 60, WATCH_RUN="r2"), first)
+        self.ack("r2")
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_status_failure_does_not_silently_ack_a_replayed_alert(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        first = self.run_check(FARE_NOW + 30, WATCH_RUN="r1")
+        self.assertEqual(len(first), 1)
+        p = self.run_check_result(FARE_NOW + 60, WATCH_RUN="r2", UBER_BIN=os.path.join(self.dir, "missing-uber"))
+        self.assertEqual(p.stdout.splitlines(), first)
+        self.ack("r2")
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_malformed_live_trip_does_not_silently_ack_a_replayed_alert(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        first = self.run_check(FARE_NOW + 30, WATCH_RUN="r1")
+        self.assertEqual(len(first), 1)
+        self.set_state(trip("invalid-uuid", "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW + 60, WATCH_RUN="r2"), first)
+        self.ack("r2")
+        self.set_state(None, {A: {"status": "COMPLETED"}})
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_runner_pending_or_delivery_before_ack_prevents_duplicate_fare(self):
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                uuid = A if not delivered else B
+                self.audit_quote(uuid)
+                self.set_state(trip(uuid, "OnTrip"), {})
+                self.assertEqual(self.run_check(FARE_NOW + 100 * int(delivered), WATCH_RUN="start"), [])
+                self.set_state(None, {uuid: {"status": "COMPLETED"}}, {uuid: REAL_RECEIPT})
+                self.runner_state(fires=5)
+                out = self.run_check(FARE_NOW + 30 + 100 * int(delivered), WATCH_RUN=f"out-{delivered}")
+                self.assertEqual(len(out), 1)
+                if delivered:
+                    self.runner_state(fires=6)
+                else:
+                    self.runner_state(fires=5, pending={"event": out[0]})
+                self.assertEqual(self.run_check(FARE_NOW + 60 + 100 * int(delivered), WATCH_RUN=f"next-{delivered}"), [])
+                self.assertEqual(self.receipt_calls(uuid), 1)
+
+    def test_replay_survives_interrupted_replay_before_exit(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        first = self.run_check(FARE_NOW + 30, WATCH_RUN="r1")
+        self.assertEqual(len(first), 1)
+        # r2 can be cut before saving its rebinding; r3 must still replay.
+        wrapper = self._exe("raise-replay", """#!/usr/bin/python3
+import importlib.util, os
+spec = importlib.util.spec_from_file_location('ride_share_check', os.environ['TEST_HELPER'])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def fail(*args, **kwargs):
+    raise RuntimeError('interrupted replay')
+m.unshare_ended = fail
+m.main()
+""")
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(FARE_NOW + 60), WATCH_RUN="r2", TEST_HELPER=HELPER))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), first)
+        self.ack("r3")
+        self.assertEqual(self.run_check(FARE_NOW + 120, WATCH_RUN="r4"), [])
+        self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_pending_fare_is_not_lost_when_another_trip_is_checked(self):
+        self.audit_quote(A)
+        self.audit_quote(B)
+        self.start_completed(A, REAL_RECEIPT)
+        first = self.run_check(FARE_NOW + 30, WATCH_RUN="r1")
+        self.assertEqual(len(first), 1)
+        self.set_state(trip(B, "OnTrip"), {})
+        self.assertEqual(self.run_check(FARE_NOW + 60, WATCH_RUN="r2"), first)
+        self.set_state(None, {B: {"status": "COMPLETED"}}, {B: REAL_RECEIPT})
+        both = self.run_check(FARE_NOW + 90, WATCH_RUN="r3")
+        self.assertEqual(set(both), {first[0], first[0].replace(A, B)})
+        self.ack("r3")
+        self.assertEqual(self.run_check(FARE_NOW + 120, WATCH_RUN="r4"), [])
+        self.assertEqual((self.receipt_calls(A), self.receipt_calls(B)), (1, 1))
+
+    def test_fare_alert_survives_nonzero_failure_after_final_save(self):
+        self.audit_quote(A)
+        self.start_completed(A, REAL_RECEIPT)
+        wrapper = self._exe("cut-after-save", """#!/usr/bin/python3
+import importlib.util, os
+spec = importlib.util.spec_from_file_location('ride_share_check', os.environ['TEST_HELPER'])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+save = m.save
+def cut(s):
+    save(s)
+    if any(t.get('fare_alert', {}).get('run') for t in s['trips'].values()):
+        os._exit(9)
+m.save = cut
+m.main()
+""")
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, RIDE_SHARE_NOW=str(FARE_NOW + 30), WATCH_RUN="r1", TEST_HELPER=HELPER))
+        self.assertEqual(p.returncode, 9)
+        self.assertEqual(p.stdout, "")
+        out = self.run_check(FARE_NOW + 60, WATCH_RUN="r2")
+        self.assertEqual(len(out), 1)
+        self.assertIn("Wait Time AED 13.55", out[0])
+        self.ack("r2")
+        self.assertEqual(self.run_check(FARE_NOW + 90, WATCH_RUN="r3"), [])
         self.assertEqual(self.receipt_calls(A), 1)
 
     def test_audit_join_crosses_month_and_ignores_bad_rows(self):
