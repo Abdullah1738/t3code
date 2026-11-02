@@ -1,8 +1,10 @@
 """The set of work that is running right now, from both harnesses.
 
 Two sources, unioned:
-  - Robob's control API: GET /api/ardud/control/threads?active=true. Claude and Codex threads (and OpenCode
-    threads Robob drives) show up here, with their worktree path and native session id.
+  - Robob's control API: GET /api/ardud/control/threads over the full list (not active=true, which misses a native
+    child with no run or pending request). Each thread is judged by in_use(), and its workspace is its worktree
+    path or, on the root workspace, its project's workspaceRoot. Claude and Codex threads (and OpenCode threads
+    Robob drives) come from here.
   - The shared OpenCode service: GET /api/session/active, for OpenCode sessions Robob does not front.
 
 The snapshot is "complete" only when both sources answered in full. A source that is down, returns something
