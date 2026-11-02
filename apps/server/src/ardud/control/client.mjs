@@ -16,7 +16,8 @@ const PREFIX = "/api/ardud/control";
 
 /**
  * @typedef {"idle" | "running" | "waiting" | "needs-input" | "queued"} ThreadState
- * @typedef {{ instanceId: string, model: string, variant?: string }} ModelRef
+ * @typedef {{ id: string, value: string | boolean }} ModelOption
+ * @typedef {{ instanceId: string, model: string, options: ModelOption[], variant?: string, effort?: string }} ModelRef
  * @typedef {{
  *   threadId: string, projectId: string, title: string, state: ThreadState, status: string,
  *   origin: string | null, nativeSessionId: string | null, model: ModelRef,
@@ -170,11 +171,12 @@ export class ControlClient {
   }
 
   /**
-   * Starts a thread. `model` is "provider/model" (OpenCode slug), `variant` the
-   * reasoning variant. Pick the folder with one of projectId, directory or
+   * Starts a thread. `providerInstanceId`, `model`, and `options` select a provider
+   * and its options; `variant` is the legacy effort input. Pick a folder with
    * scratch (default: scratch, a fresh folder per thread).
    * @param {{ prompt?: string, title?: string, projectId?: string, directory?: string,
-   *   scratch?: boolean, model?: string, variant?: string, runtimeMode?: string,
+   *   scratch?: boolean, model?: string, variant?: string | null, providerInstanceId?: string,
+   *   options?: ModelOption[], runtimeMode?: string,
    *   interactionMode?: "default" | "plan", origin?: string, clientRequestId?: string,
    *   worktree?: { baseRef: string, branch?: string, startFromOrigin?: boolean },
    *   attachments?: Array<{ attachmentId: string, name: string, mimeType: string, sizeBytes: number, type?: "image" | "file" }> }} input
@@ -230,7 +232,8 @@ export class ControlClient {
 
   /**
    * @param {string} threadId @param {string} text
-   * @param {{ mode?: "auto" | "queue" | "steer" | "restart", model?: string, variant?: string,
+   * @param {{ mode?: "auto" | "queue" | "steer" | "restart", model?: string, variant?: string | null,
+   *   providerInstanceId?: string, options?: ModelOption[],
    *   clientRequestId?: string, attachments?: Array<object> }} [options]
    */
   send(threadId, text, options = {}) {
@@ -267,7 +270,8 @@ export class ControlClient {
   /**
    * @param {string} threadId
    * @param {{ runtimeMode?: string, interactionMode?: string, model?: string,
-   *   variant?: string | null, title?: string, archived?: boolean, settled?: boolean }} settings
+   *   variant?: string | null, providerInstanceId?: string, options?: ModelOption[],
+   *   title?: string, archived?: boolean, settled?: boolean }} settings
    */
   updateThread(threadId, settings) {
     return this.request("PATCH", `/threads/${encodeURIComponent(threadId)}`, settings);

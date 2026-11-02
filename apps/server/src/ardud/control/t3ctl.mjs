@@ -16,20 +16,20 @@ const HELP = `t3ctl <command> [options]
   projects                             list projects
   models                               default model and available models
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
-  create [--prompt P] [--title T] [--dir D | --project ID] [--model provider/model]
-         [--variant V] [--mode full-access|approval-required|...] [--origin O] [--plan]
+  create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
+         [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
   native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
   identity NATIVE_ID [--driver D] [--instance I] [--agent A]
                                        resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
-  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
+  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--instance I] [--variant V] [--option K=V ...] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
   interrupt THREAD [--expect-run RUN] [--expect-attempt ATTEMPT] [--reason TEXT]
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
   origin THREAD ORIGIN|none
-  set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
+  set THREAD [--mode RUNTIME_MODE] [--model M] [--instance I] [--variant V] [--option K=V ...] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
   desktop-lease status
@@ -55,6 +55,7 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     project: { type: "string" },
     model: { type: "string" },
     variant: { type: "string" },
+    option: { type: "string", multiple: true },
     mode: { type: "string" },
     origin: { type: "string" },
     plan: { type: "boolean" },
@@ -105,6 +106,16 @@ const need = (value, name) => {
   return value;
 };
 const timeoutMs = () => (flags.timeout ? Number(flags.timeout) * 1000 : 10 * 60_000);
+const modelOptions = () =>
+  flags.option?.map((entry) => {
+    const index = entry.indexOf("=");
+    if (index <= 0 || index === entry.length - 1) {
+      throw new Error("--option needs a non-empty K=V");
+    }
+    const id = entry.slice(0, index);
+    const value = entry.slice(index + 1);
+    return { id, value: value === "true" ? true : value === "false" ? false : value };
+  });
 
 async function main() {
   if (!command || flags.help) {
@@ -202,6 +213,8 @@ async function main() {
         ...(flags.project ? { projectId: flags.project } : {}),
         model: flags.model,
         variant: flags.variant,
+        providerInstanceId: flags.instance,
+        options: modelOptions(),
         runtimeMode: flags.mode,
         origin: flags.origin,
         ...(flags.plan ? { interactionMode: "plan" } : {}),
@@ -244,6 +257,8 @@ async function main() {
         mode: flags.mode,
         model: flags.model,
         variant: flags.variant,
+        providerInstanceId: flags.instance,
+        options: modelOptions(),
       });
       if (!flags.wait) return print(sent);
       const waited = await client.wait(threadId, { timeoutMs: timeoutMs(), runId: sent.runId });
@@ -308,6 +323,8 @@ async function main() {
           runtimeMode: flags.mode,
           model: flags.model,
           variant: flags.variant,
+          providerInstanceId: flags.instance,
+          options: modelOptions(),
           title: flags.title,
           ...(flags.archive ? { archived: true } : flags.unarchive ? { archived: false } : {}),
           ...(flags.settle ? { settled: true } : flags.unsettle ? { settled: false } : {}),

@@ -1089,7 +1089,15 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+// The migration is opt-in. Keeping this optional also lets settings written by
+// an older server keep their existing behavior until the release cutover.
+export const ArdudHarnessMigrationSettings = Schema.Struct({
+  selections: Schema.optionalKey(Schema.Literals(["off", "dryrun", "apply"])),
+  allowConflicts: Schema.optionalKey(Schema.Boolean),
+});
+
 export const ServerSettings = Schema.Struct({
+  ardudHarnessMigration: Schema.optionalKey(ArdudHarnessMigrationSettings),
   // Null means no client has migrated this preference yet; an empty value is
   // authoritative so another device cannot resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
@@ -1385,6 +1393,7 @@ const ModelSelectionPatch = Schema.Struct({
 });
 
 export const ServerSettingsPatch = Schema.Struct({
+  ardudHarnessMigration: Schema.optionalKey(ArdudHarnessMigrationSettings),
   setModelFavorites: Schema.optionalKey(
     Schema.Array(Schema.Struct({ ...ModelFavorite.fields, favorite: Schema.Boolean })),
   ),

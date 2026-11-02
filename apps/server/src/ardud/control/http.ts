@@ -17,6 +17,7 @@ import {
   ProjectId,
   ProviderApprovalDecision,
   ProviderInteractionMode,
+  ProviderOptionSelection,
   RunId,
   RuntimeMode,
   RuntimeRequestId,
@@ -65,6 +66,8 @@ import {
   pendingRequestSummary,
   runSummary,
   runsNewestFirst,
+  selectionMigrationApplies,
+  selectionProblem,
   shellSummary,
   stateFromRuns,
   stateFromShell,
@@ -209,6 +212,7 @@ const boolParam = (raw: string | null): boolean | undefined =>
 // ---------------------------------------------------------------------------
 
 const OptionalString = Schema.optional(Schema.String);
+const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
 const Attachment = Schema.Struct({
   attachmentId: Schema.String,
   type: Schema.optional(Schema.Literals(["image", "file"])),
@@ -225,8 +229,9 @@ const CreateThreadBody = Schema.Struct({
   title: OptionalString,
   prompt: OptionalString,
   model: OptionalString,
-  variant: OptionalString,
+  variant: Schema.optional(Schema.NullOr(Schema.String)),
   providerInstanceId: OptionalString,
+  options: ModelOptions,
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
   worktree: Schema.optional(
@@ -245,7 +250,9 @@ const SendBody = Schema.Struct({
   text: Schema.String,
   mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
   model: OptionalString,
-  variant: OptionalString,
+  variant: Schema.optional(Schema.NullOr(Schema.String)),
+  providerInstanceId: OptionalString,
+  options: ModelOptions,
   attachments: Schema.optional(Schema.Array(Attachment)),
   clientRequestId: OptionalString,
   // The iMessage bridge still sends the relayed message's id; it is accepted and ignored.
@@ -279,6 +286,8 @@ const SettingsBody = Schema.Struct({
   interactionMode: Schema.optional(ProviderInteractionMode),
   model: OptionalString,
   variant: Schema.optional(Schema.NullOr(Schema.String)),
+  providerInstanceId: OptionalString,
+  options: ModelOptions,
   title: OptionalString,
   archived: Schema.optional(Schema.Boolean),
   settled: Schema.optional(Schema.Boolean),
@@ -448,6 +457,55 @@ const makeRoutes = Effect.gen(function* () {
   >();
   const uploadContext =
     yield* Effect.context<Effect.Services<ReturnType<typeof issueAttachmentUploadUrl>>>();
+
+  const resolveControlSelection = (input: Parameters<typeof modelSelectionFrom>[0]) =>
+    Effect.gen(function* () {
+      const settings =
+        input.settings ??
+        (yield* settingsService.getSettings.pipe(
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+        ));
+      const selection = yield* selectionOrFail(modelSelectionFrom({ ...input, settings }));
+      if (selectionMigrationApplies(settings)) {
+        const catalog = yield* providers.getProviders;
+        const problem = selectionProblem(catalog, selection);
+        if (problem !== null) return yield* fail("invalid_request", problem);
+      } else if (input.options !== undefined) {
+        // Explicit native options have no legacy semantics; never silently prefer
+        // one duplicate or a conflicting compatibility variant.
+        const ids = new Set<string>();
+        for (const option of input.options) {
+          if (ids.has(option.id)) {
+            return yield* fail(
+              "invalid_request",
+              `Option ${option.id} was specified more than once.`,
+            );
+          }
+          ids.add(option.id);
+          if (
+            option.id === "variant" &&
+            input.variant !== undefined &&
+            option.value !== input.variant
+          ) {
+            return yield* fail("invalid_request", "variant conflicts with the options list.");
+          }
+          if (
+            (option.id === "effort" || option.id === "reasoningEffort") &&
+            input.variant !== undefined &&
+            option.value !== input.variant
+          ) {
+            return yield* fail(
+              "invalid_request",
+              "variant conflicts with the native effort option.",
+            );
+          }
+        }
+        const catalog = yield* providers.getProviders;
+        const problem = selectionProblem(catalog, selection);
+        if (problem !== null) return yield* fail("invalid_request", problem);
+      }
+      return selection;
+    });
 
   const authenticate = (scope: Scope) =>
     Effect.gen(function* () {
@@ -622,6 +680,7 @@ const makeRoutes = Effect.gen(function* () {
         models: provider.models.map((model) => ({
           model: model.slug,
           name: model.name,
+          optionDescriptors: model.capabilities?.optionDescriptors ?? [],
           variants:
             model.capabilities?.optionDescriptors?.find((descriptor) => descriptor.id === "variant")
               ?.type === "select"
@@ -721,14 +780,14 @@ const makeRoutes = Effect.gen(function* () {
     if (base === null && body.model === undefined) {
       return yield* fail("invalid_request", "No default model is configured; pass model.");
     }
-    const modelSelection = yield* selectionOrFail(
-      modelSelectionFrom({
-        model: body.model,
-        variant: body.variant,
-        instanceId: body.providerInstanceId,
-        base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
-      }),
-    );
+    const modelSelection = yield* resolveControlSelection({
+      model: body.model,
+      variant: body.variant,
+      instanceId: body.providerInstanceId,
+      options: body.options,
+      base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
+      settings,
+    });
     const commandId = yield* commandIdFor("thread", body.clientRequestId);
     const threadId = ThreadId.make(commandId);
     const prompt = body.prompt?.trim() ?? "";
@@ -969,16 +1028,25 @@ const makeRoutes = Effect.gen(function* () {
       );
     }
     const context = guidanceContext(body.guidance);
+    const hasSelection =
+      body.model !== undefined ||
+      body.variant !== undefined ||
+      body.providerInstanceId !== undefined ||
+      body.options !== undefined;
+    const settings = yield* settingsService.getSettings.pipe(
+      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+    );
     const modelSelection =
-      body.model === undefined && body.variant === undefined
-        ? undefined
-        : yield* selectionOrFail(
-            modelSelectionFrom({
-              model: body.model,
-              variant: body.variant,
-              base: shell.modelSelection,
-            }),
-          );
+      hasSelection || selectionMigrationApplies(settings)
+        ? yield* resolveControlSelection({
+            model: body.model,
+            variant: body.variant,
+            instanceId: body.providerInstanceId,
+            options: body.options,
+            base: shell.modelSelection,
+            settings,
+          })
+        : undefined;
     const result = yield* startup
       .enqueueCommand(
         ThreadMessageIntake.sendToThread({
@@ -1154,6 +1222,21 @@ const makeRoutes = Effect.gen(function* () {
     const shell = yield* getShell(threadId);
     const id = ThreadId.make(threadId);
     const next = (operation: string) => commandIdFor(`${operation}:${threadId}`, undefined);
+    const hasSelection =
+      body.model !== undefined ||
+      body.variant !== undefined ||
+      body.providerInstanceId !== undefined ||
+      body.options !== undefined;
+    // Resolve before any other mutation in a multi-field PATCH.
+    const modelSelection = hasSelection
+      ? yield* resolveControlSelection({
+          model: body.model,
+          variant: body.variant,
+          instanceId: body.providerInstanceId,
+          options: body.options,
+          base: shell.modelSelection,
+        })
+      : undefined;
     if (body.runtimeMode !== undefined && body.runtimeMode !== shell.runtimeMode) {
       yield* dispatch({
         type: "thread.runtime-mode.set",
@@ -1170,14 +1253,7 @@ const makeRoutes = Effect.gen(function* () {
         interactionMode: body.interactionMode,
       });
     }
-    if (body.model !== undefined || body.variant !== undefined) {
-      const modelSelection = yield* selectionOrFail(
-        modelSelectionFrom({
-          model: body.model,
-          variant: body.variant,
-          base: shell.modelSelection,
-        }),
-      );
+    if (modelSelection !== undefined) {
       yield* dispatch({
         type:
           modelSelection.instanceId === shell.providerInstanceId

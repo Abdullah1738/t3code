@@ -1,9 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - the client under test is plain Node by design.
 import * as NodeFS from "node:fs";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import * as NodeChildProcess from "node:child_process";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
 
@@ -124,6 +124,58 @@ describe("ControlClient", () => {
       },
       { url: "/api/ardud/control/threads/thread%2Fone/interrupt", body: options },
     ]);
+  });
+
+  it("t3ctl forwards instances and repeatable typed options on create, send and set", async () => {
+    const requests: Array<{ path: string | undefined; body: unknown }> = [];
+    const url = await listen((request, response) => {
+      let text = "";
+      request.on("data", (chunk) => (text += chunk));
+      request.on("end", () => {
+        requests.push({ path: request.url, body: JSON.parse(text) });
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ ok: true, threadId: "t", runId: "r" }));
+      });
+    });
+    const cli = NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url));
+    const invoke = (args: string[]) =>
+      new Promise<void>((resolve, reject) => {
+        NodeChildProcess.execFile(
+          process.execPath,
+          [cli, ...args, "--url", url, "--token", "test"],
+          (error) => {
+            if (error) reject(error);
+            else resolve();
+          },
+        );
+      });
+    const selection = [
+      "--instance",
+      "claudeAgent",
+      "--model",
+      "claude-opus-5-5",
+      "--option",
+      "effort=max",
+      "--option",
+      "fastMode=true",
+    ];
+    await invoke(["create", "--prompt", "hello", ...selection]);
+    await invoke(["send", "t", "hello", ...selection]);
+    await invoke(["set", "t", ...selection]);
+    expect(requests.map(({ path }) => path)).toEqual([
+      "/api/ardud/control/threads",
+      "/api/ardud/control/threads/t/send",
+      "/api/ardud/control/threads/t",
+    ]);
+    for (const { body } of requests)
+      expect(body).toMatchObject({
+        providerInstanceId: "claudeAgent",
+        model: "claude-opus-5-5",
+        options: [
+          { id: "effort", value: "max" },
+          { id: "fastMode", value: true },
+        ],
+      });
   });
 
   it("sends the bearer token and surfaces API errors", async () => {

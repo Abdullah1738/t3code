@@ -49,9 +49,24 @@ t3ctl's.
   them in paths (the client does).
 - `clientRequestId` (optional on every mutation) makes retries safe: the same
   id replays the first result instead of acting twice.
-- Models are OpenCode slugs, `provider/model` (for example `opus/claude-opus-5-5`),
-  with the reasoning level as `variant` (`low`, `medium`, `high`, `xhigh`, ...).
-  They map to `modelSelection { instanceId: "opencode", model, options: [{ id: "variant", value }] }`.
+- Model inputs use `providerInstanceId`, the provider's `model` slug and
+  `options: [{ "id": "effort", "value": "max" }]` (option values are strings
+  or booleans). Existing OpenCode `model` and `variant` inputs remain supported.
+  Model responses include `instanceId`, `model`, `options`, and the compatibility
+  `variant`/`effort` fields when present. `GET /models` lists all option
+  descriptors for each model, alongside the legacy `variants` list.
+- With `ardudHarnessMigration.selections` set to `apply`, known OpenCode slugs
+  and their `#variant` suffixes resolve to native harness selections. Conflicting
+  inputs or options the catalog cannot validate are rejected. With the flag absent,
+  `off`, or `dryrun`, legacy variant routing is unchanged. Native `options` and
+  `providerInstanceId` can also be passed explicitly. Applying the flag here does
+  not migrate existing threads, queues, schedules or other callers.
+- On `apply`, omitted options inherit only for the same canonical model and
+  instance; `options: []` clears them; a `variant` replaces the target's native
+  effort, and `variant: null` clears it. An options array replaces rather than
+  merges the inherited list. A supplied suffix, variant and effort option must
+  agree, and duplicate option IDs are rejected. Explicit options are checked
+  against the provider catalog even when the migration is off.
 - Thread `state` is the field to act on:
   - `running`: a turn is starting or running.
   - `needs-input`: blocked on an approval or a question (see `pendingRequests`).
@@ -76,13 +91,13 @@ All paths are under `/api/ardud/control`.
 | ------ | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                      |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                          |
-| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models and variants.                                        |
+| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                    |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                 |
 | GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.                           |
 | GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`. |
 | GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                       |
-| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`.                      |
+| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, model selection, `title`, `archived`, `settled`.                        |
 | POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                   |
 | GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                   |
 | GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                    |
@@ -192,12 +207,17 @@ thread needs input, so a caller can answer and wait again.
 
 ### POST /threads/:id/send
 
-`{ "text", "mode"?: "auto"|"queue"|"steer"|"restart", "model"?, "variant"?, "attachments"?, "clientRequestId"? }`.
+`{ "text", "mode"?: "auto"|"queue"|"steer"|"restart", "providerInstanceId"?, "model"?, "variant"?, "options"?, "attachments"?, "clientRequestId"? }`.
 `auto` (default) starts an idle thread, steers a running turn, or queues behind a
 turn that cannot take steering yet. `queue` always waits for a separate turn.
-`model`/`variant` apply to this message's run (OpenCode switches the session
-model). Use `PATCH` to change the thread's default. Response: `messageId`,
+The model selection applies to this message's run. Use `PATCH` to change the
+thread's default. Response: `messageId`,
 `runId`, `status`, `delivery` (`started`, `queued`, `steered`, `restarted`).
+
+For example, `t3ctl send THREAD 'hello' --instance claudeAgent --model claude-opus-5-5 --option effort=max --option fastMode=true`.
+The `create` and `set` commands accept the same repeatable `--option K=V` and
+`--instance` flags. `true` and `false` become booleans; other values remain
+strings. To clear all options, send `"options": []` in the HTTP API or client.
 
 ### POST /threads/:id/requests/:requestId/respond
 

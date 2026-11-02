@@ -68,7 +68,7 @@ export const modelLetter = (model: ModelSelection | null) =>
 
 /**
  * The composer picker's value (instance, model, effort/variant) as the board's
- * ModelSelection. The board stores the variant as an option named "variant".
+ * ModelSelection. The option name depends on the selected provider instance.
  */
 export function boardModelSelection(input: {
   readonly instanceId: ProviderInstanceId;
@@ -119,12 +119,18 @@ export function poolAddLevel(
     .find((entry) => entry.slug === model)
     ?.capabilities?.optionDescriptors?.find((entry) => entry.id === effortOptionId(instanceId));
   const levels = descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
-  const preferred =
+  const preferredCandidate =
     descriptor?.type === "select"
       ? (descriptor.currentValue ??
         descriptor.options.find((option) => option.isDefault)?.id ??
         null)
       : null;
+  const preferred =
+    preferredCandidate !== null && levels.includes(preferredCandidate)
+      ? preferredCandidate
+      : ((descriptor?.type === "select"
+          ? descriptor.options.find((option) => option.isDefault)?.id
+          : undefined) ?? null);
   if (pooled.length === 0) return { variant: preferred };
   const free = [preferred, ...levels].find(
     (level): level is string => level !== null && !pooled.includes(level),
