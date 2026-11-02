@@ -1114,6 +1114,8 @@ def validate_driver(ident: str, driver: str) -> None:
 
 def lineage_exclusions(canonical_or_native_id: str | None) -> frozenset:
     """All known aliases in the caller's complete root tree, or fail closed."""
+    # Robob commits identity rows before creating a transcript; capture reads
+    # that transcript later. Recheck after retrieval before exposing candidates.
     if not canonical_or_native_id:
         raise UnknownCaller("caller identity is missing")
     ident = canonical_or_native_id.strip()
@@ -1142,10 +1144,15 @@ def lineage_exclusions(canonical_or_native_id: str | None) -> frozenset:
         # A migration edge can reveal a later Robob binding, and that binding
         # can reveal more OpenCode aliases. Close both maps until stable.
         frontier = set(aliases)
+        legacy_checked: set[str] = set()
         while frontier:
             found = _opencode_tree(frontier, edges) | _alias_table_tree(frontier) | _catalog_tree(frontier)
             if state_available:
                 found.update(_state_tree(frontier))
+            for sid in frontier:
+                if sid.startswith("ses_") and sid not in legacy_checked:
+                    legacy_checked.add(sid)
+                    found.update(_legacy_lineage(sid))
             frontier = found - aliases
             aliases.update(frontier)
         return frozenset(aliases)

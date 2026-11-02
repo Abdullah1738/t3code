@@ -377,6 +377,173 @@ class RecallTest(unittest.TestCase):
         self.assertIn("ses_migration_new", excluded)
         self.assertIn("other-native", excluded)
 
+    def test_mapped_caller_also_excludes_unmapped_resume(self):
+        state = sqlite3.connect(rc.STATE_DB)
+        state.execute("DELETE FROM ardud_opencode_import WHERE native_session_id='ses_resume_old'")
+        state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_resume_new", "thread-0"))
+        state.commit()
+        state.close()
+        con = sqlite3.connect(rc.MEM_DB)
+        for sid in ("ses_resume_old", "ses_parent1"):
+            con.execute(
+                "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type,metadata_json) "
+                "VALUES('opencode',?,?,?,'assistant','Walrus lantern unusual regression','text','{}')",
+                (sid, f"legacy-{sid}", NOW),
+            )
+        con.commit()
+        con.close()
+        try:
+            excluded = rc.lineage_exclusions("thread-0")
+            self.assertIn("ses_resume_old", excluded)
+            self.assertEqual(self.ids(rc.search("Walrus lantern unusual regression", exclude_sessions=excluded)),
+                             ["ses_parent1"])
+        finally:
+            state = sqlite3.connect(rc.STATE_DB)
+            state.execute("DELETE FROM ardud_opencode_import WHERE native_session_id='ses_resume_new'")
+            state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_resume_old", "thread-0"))
+            state.commit()
+            state.close()
+            con = sqlite3.connect(rc.MEM_DB)
+            con.execute("DELETE FROM episodic_events WHERE turn_id LIKE 'legacy-%'")
+            con.commit()
+            con.close()
+
+    def test_late_child_excluded_before_synthesis_and_from_search(self):
+        import recall_server as server
+
+        mem = sqlite3.connect(rc.MEM_DB)
+        mem.execute("INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type,metadata_json) "
+                    "VALUES('opencode','other-native','race-other',?,'assistant','Quokka lighthouse safe historical result', 'text','{}')", (NOW,))
+        mem.commit()
+        mem.close()
+        real_search = rc.search
+        added = False
+        lock = threading.Lock()
+        retrieved = []
+
+        def search_after_capture(*args, **kwargs):
+            nonlocal added
+            with lock:
+                if not added:
+                    state = sqlite3.connect(rc.STATE_DB)
+                    state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                                  ("thread-race", json.dumps({"lineage": {"parentThreadId": "thread-0", "rootThreadId": "thread-0"}})))
+                    state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+                                  ("thread-race", json.dumps({"nativeThreadRef": {"nativeId": "native-race"}})))
+                    state.commit()
+                    state.close()
+                    memory = sqlite3.connect(rc.MEM_DB)
+                    memory.execute("INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type,metadata_json) "
+                                   "VALUES('opencode','native-race','race-child',?,'assistant','Quokka lighthouse current private result', 'text','{}')", (NOW,))
+                    memory.commit()
+                    memory.close()
+                    added = True
+            result = real_search(*args, **kwargs)
+            retrieved.extend(s["session_id"] for s in result["sessions"])
+            return result
+
+        seen = []
+
+        def fake_llm(messages, **_kwargs):
+            seen.append(messages[-1]["content"])
+            return "fixture answer"
+
+        try:
+            with patch.object(rc, "search", side_effect=search_after_capture), \
+                 patch.object(ra, "plan", return_value={"search": True, "queries": ["quokka lighthouse"]}), \
+                 patch.object(ra, "llm", side_effect=fake_llm):
+                answer = server.recall_ask("quokka lighthouse", caller_thread="thread-0")
+            self.assertIn("native-race", retrieved)
+            self.assertIn("other-native", answer)
+            self.assertNotIn("native-race", answer)
+            self.assertTrue(seen)
+            self.assertNotIn("current private result", "\n".join(seen))
+            self.assertNotIn("native-race", "\n".join(seen))
+
+            # Repeat the ordering on the direct search path with a new child.
+            def second_exclusion():
+                return {"thread-0"} if not added2[0] else {"thread-0", "native-race"}
+            added2 = [False]
+            def changing_search(*args, **kwargs):
+                added2[0] = True
+                return real_search(*args, **kwargs)
+            with patch.object(server, "_caller_exclusions", side_effect=lambda *_a, **_k: second_exclusion()), \
+                 patch.object(rc, "search", side_effect=changing_search):
+                result = server.recall_search("quokka lighthouse", caller_thread="thread-0")
+            self.assertIn("other-native", result)
+            self.assertNotIn("native-race", result)
+        finally:
+            state = sqlite3.connect(rc.STATE_DB)
+            state.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='thread-race'")
+            state.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='thread-race'")
+            state.commit()
+            state.close()
+            mem = sqlite3.connect(rc.MEM_DB)
+            mem.execute("DELETE FROM episodic_events WHERE turn_id IN ('race-child','race-other')")
+            mem.commit()
+            mem.close()
+
+    def test_second_identity_read_failure_fails_closed(self):
+        import recall_server as server
+        sample = {"sessions": [], "queries": [], "total_sessions": 0, "elapsed_ms": 0}
+        with patch.object(server, "_caller_exclusions", side_effect=[{"thread-0"}, rc.UnknownCaller("lost")]), \
+             patch.object(rc, "search", return_value=sample):
+            self.assertIn("error: lost", server.recall_search("quokka", caller_thread="thread-0"))
+        with patch.object(ra, "lineage_of", side_effect=[{"thread-0"}, rc.UnknownCaller("lost")]), \
+             patch.object(ra, "_parallel_plan_and_search", return_value=({"search": True}, {"sessions": []}, {"sessions": []})):
+            result = ra.inject("Investigate a regression", session_id="thread-0")
+            self.assertIsNone(result["note"])
+            self.assertEqual(result["skipped"], "unknown-caller")
+        with patch.object(server, "_caller_exclusions", side_effect=[{"thread-0"}, rc.UnknownCaller("lost")]), \
+             patch.object(ra, "_parallel_plan_and_search", return_value=({"search": True}, {"sessions": []}, {"sessions": []})):
+            self.assertEqual(server.recall_ask("question", caller_thread="thread-0"), "error: lost")
+
+    def test_second_identity_read_applies_to_prompt_and_work_gate(self):
+        candidate = {"session_id": "late-child", "parent_id": None}
+        empty = {"sessions": [], "queries": []}
+        found = {"sessions": [candidate], "queries": []}
+        cases = [
+            lambda: ra.inject("Investigate the lighthouse problem", session_id="thread-0"),
+            lambda: ra.work_check("Investigate the lighthouse problem", "Inspect output and compare database session records for lighthouse regression",
+                                  session_id="thread-0"),
+        ]
+        for call in cases:
+            with self.subTest(call=call), \
+                 patch.object(ra, "lineage_of", side_effect=[{"thread-0"}, {"thread-0", "late-child"}]), \
+                 patch.object(ra, "_parallel_plan_and_search", return_value=({"search": True}, found, empty)), \
+                 patch.object(ra, "build_sources") as synth:
+                result = call()
+                self.assertEqual(result["skipped"], "no-hits")
+                self.assertIsNone(result["note"])
+                synth.assert_not_called()
+
+    def test_second_identity_read_guards_session_read(self):
+        import recall_server as server
+        with patch.object(server, "_caller_exclusions", side_effect=[{"thread-0"}, {"thread-0", "native-race"}]), \
+             patch.object(rc, "resolve_session", return_value="native-race"), \
+             patch.object(server.cli, "format_view", return_value="late private result"):
+            out = server.recall_read("native-race", caller_thread="thread-0")
+            self.assertNotIn("late private result", out)
+            self.assertIn("caller", out)
+        with patch.object(server, "_caller_exclusions", side_effect=[{"thread-0"}, rc.UnknownCaller("lost")]), \
+             patch.object(rc, "resolve_session", return_value="native-race"), \
+             patch.object(server.cli, "format_view", return_value="late private result"):
+            out = server.recall_read("native-race", caller_thread="thread-0")
+            self.assertEqual(out, "error: lost")
+
+    def test_guarded_read_pins_prefix_to_resolved_session(self):
+        import recall_server as server
+        calls = []
+        def view(ref, **_kwargs):
+            calls.append(ref)
+            return "safe result"
+        with patch.object(server, "_caller_exclusions", return_value={"thread-0"}), \
+             patch.object(rc, "resolve_session", return_value="safe-session"), \
+             patch.object(server.cli, "format_view", side_effect=view):
+            out = server.recall_read("safe#e45", caller_thread="thread-0")
+        self.assertEqual(out, "safe result")
+        self.assertEqual(calls, ["safe-session#e45"])
+
     def test_unknown_caller_never_auto_injects(self):
         with patch.object(ra, "_recall_note") as model:
             result = ra.inject("Please investigate the pangolin regression", session_id="unknown-thread")

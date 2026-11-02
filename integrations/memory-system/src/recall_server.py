@@ -72,6 +72,8 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
     cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode|muse|claude.
     """
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         res = ra.ask(
             question,
             cwd=cwd or None,
@@ -79,7 +81,8 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
             since=since or None,
             until=until or None,
             source=source or None,
-            exclude=list(_caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)),
+            exclude=list(exclude),
+            recheck_exclusions=recheck if exclude else None,
             timeout=max(8, min(int(timeout or 30), 90)),
         )
     except Exception as e:  # noqa: BLE001
@@ -112,19 +115,26 @@ def recall_search(
     include_tools=true also searches commands, tool output and errors. Read a hit with recall_read("<session>#e<event>").
     """
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         res = rc.search(
             [query],
             source=source or None,
             since=rc.parse_when(since or None),
             until=rc.parse_when(until or None),
             include_tools=include_tools,
-            exclude_sessions=_caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent),
+            exclude_sessions=exclude,
             cwd=cwd or None,
             cwd_only=bool(cwd),
             exact=exact,
             limit_sessions=max(1, min(int(limit or 10), 30)),
             deadline=rc.Deadline(20),
         )
+        if exclude:
+            excluded = exclude | recheck()
+            sessions = [s for s in res["sessions"] if s["session_id"] not in excluded and s.get("parent_id") not in excluded]
+            res["total_sessions"] = max(0, res["total_sessions"] - (len(res["sessions"]) - len(sessions)))
+            res["sessions"] = sessions
     except Exception as e:  # noqa: BLE001
         return _err(e)
     return cli.format_search(res)
@@ -139,14 +149,22 @@ def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool =
     Session ids accept unique prefixes. include_tools adds tool calls/output; include_reasoning adds model reasoning.
     """
     try:
-        excluded = _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        excluded = recheck()
         if excluded:
             sid = rc.resolve_session(ref)
             if not sid or sid in excluded:
                 raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
-        return cli.format_view(
+            # Pin prefix resolution so the view cannot switch sessions between
+            # the guard and the read if the catalog changes.
+            ident, _, _, _ = cli.parse_ref(ref)
+            ref = sid + ref.strip()[len(ident):]
+        result = cli.format_view(
             ref, include_tools=include_tools, include_reasoning=include_reasoning, total_chars=max(2000, min(int(max_chars or 40000), 120000))
         )
+        if excluded and sid in (excluded | recheck()):
+            raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
+        return result
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -157,6 +175,8 @@ def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = ""
                 ctx: Context = None) -> str:
     """List past sessions, newest first. text filters titles/first prompts; cwd filters by project directory."""
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         rows = rc.list_sessions(
             text=text or None,
             source=source or None,
@@ -164,9 +184,12 @@ def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = ""
             since=rc.parse_when(since or None),
             until=rc.parse_when(until or None),
             include_children=include_subagents,
-            exclude_sessions=_caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent),
+            exclude_sessions=exclude,
             limit=max(1, min(int(limit or 20), 200)),
         )
+        if exclude:
+            excluded = exclude | recheck()
+            rows = [row for row in rows if row["session_id"] not in excluded and row.get("parent_id") not in excluded]
     except Exception as e:  # noqa: BLE001
         return _err(e)
     return cli.format_list(rows)
@@ -282,10 +305,11 @@ async def api_ask(request: Request) -> Response:
 
     def work() -> dict:
         headers = request.headers
-        exclude = _caller_exclusions(None, headers.get("x-robob-thread") or body.get("caller_thread") or "",
-                                     headers.get("x-robob-native") or body.get("caller_native") or "",
-                                     headers.get("x-robob-driver") or body.get("caller_driver") or "",
-                                     headers.get("x-robob-agent") or body.get("caller_agent") or "")
+        recheck = lambda: _caller_exclusions(None, headers.get("x-robob-thread") or body.get("caller_thread") or "",
+                                             headers.get("x-robob-native") or body.get("caller_native") or "",
+                                             headers.get("x-robob-driver") or body.get("caller_driver") or "",
+                                             headers.get("x-robob-agent") or body.get("caller_agent") or "")
+        exclude = recheck()
         return ra.ask(
             str(body.get("question") or ""),
             cwd=body.get("cwd") or None,
@@ -294,6 +318,7 @@ async def api_ask(request: Request) -> Response:
             until=body.get("until") or None,
             source=body.get("source") or None,
             exclude=list(exclude),
+            recheck_exclusions=recheck if exclude else None,
             timeout=float(body.get("timeout") or 30),
         )
 

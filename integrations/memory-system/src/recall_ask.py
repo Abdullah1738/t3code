@@ -18,6 +18,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 import recall_core as rc
 
@@ -262,6 +263,7 @@ def ask(
     timeout: float = 30,
     max_sources: int = 8,
     cwd_only: bool = False,
+    recheck_exclusions: Callable[[], set[str]] | None = None,
 ) -> dict:
     t0 = time.monotonic()
     deadline = rc.Deadline(max(5.0, timeout - 8))
@@ -275,7 +277,13 @@ def ask(
         cwd_only=cwd_only,
     )
     p, raw, planned = _parallel_plan_and_search(question, inject_mode=False, context="", search_kw=kw, plan_timeout=8, deadline=deadline)
-    sessions = merge(planned["sessions"], raw["sessions"], max_sources)
+    # Filter before applying the final limit so excluded late arrivals cannot
+    # crowd out an otherwise valid candidate.
+    sessions = merge(planned["sessions"], raw["sessions"], len(planned["sessions"]) + len(raw["sessions"]))
+    if recheck_exclusions is not None:
+        excluded = set(exclude or ()) | recheck_exclusions()
+        sessions = [s for s in sessions if s["session_id"] not in excluded and s.get("parent_id") not in excluded]
+    sessions = sessions[:max_sources]
     timings = {"search_ms": int((time.monotonic() - t0) * 1000)}
     if not sessions:
         return {
@@ -520,6 +528,7 @@ def _recall_note(
     max_items: int,
     echo_text: str = "",
     known: list[str] | None = None,
+    recheck_exclusions: Callable[[], set[str]] | None = None,
 ) -> dict:
     """Plan + search + strict gate + vetting. Returns {note|None, skipped, ...}."""
     t0 = time.monotonic()
@@ -541,10 +550,17 @@ def _recall_note(
     timings = {"plan_ms": int((time.monotonic() - t0) * 1000)}
     if not p.get("search"):
         return {"note": None, "skipped": "planner", "queries": [], "sources": [], "timings": timings}
-    sessions = merge(planned["sessions"], raw["sessions"], 6)
+    sessions = merge(planned["sessions"], raw["sessions"], len(planned["sessions"]) + len(raw["sessions"]))
+    if recheck_exclusions is not None:
+        try:
+            excluded = exclude | recheck_exclusions()
+        except Exception:
+            return {"note": None, "skipped": "unknown-caller", "sources": []}
+        sessions = [s for s in sessions if s["session_id"] not in excluded and s.get("parent_id") not in excluded]
     if already:
         seen = set(already)
         sessions = [s for s in sessions if s["session_id"] not in seen]
+    sessions = sessions[:6]
     if not sessions:
         return {"note": None, "skipped": "no-hits", "queries": p.get("queries"), "sources": [], "timings": timings}
     evidence, sources = build_sources(sessions, budget=14000, per_hit=(400, 900, 700))
@@ -616,10 +632,12 @@ def inject(
         return {"note": None, "skipped": reason, "sources": []}
     if anonymous_preview and not any((session_id, parent_id, caller_thread, caller_native, caller_driver, caller_agent)):
         exclude = set()
+        recheck = None
     else:
+        recheck = lambda: lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
+                                     caller_driver=caller_driver, caller_agent=caller_agent)
         try:
-            exclude = lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
-                                 caller_driver=caller_driver, caller_agent=caller_agent)
+            exclude = recheck()
         except rc.UnknownCaller:
             return {"note": None, "skipped": "unknown-caller", "sources": []}
     text = rc.clean_text(prompt, "user")[:6000]
@@ -638,6 +656,7 @@ def inject(
         max_items=4,
         echo_text=text,
         known=known,
+        recheck_exclusions=recheck,
     )
 
 
@@ -666,8 +685,9 @@ def work_check(
     if len(rc.words_of(steps, drop_meta=False)) < 6:
         return {"note": None, "skipped": "thin", "sources": []}
     try:
-        exclude = lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
-                             caller_driver=caller_driver, caller_agent=caller_agent)
+        recheck = lambda: lineage_of(session_id, parent_id, caller_thread=caller_thread, caller_native=caller_native,
+                                     caller_driver=caller_driver, caller_agent=caller_agent)
+        exclude = recheck()
     except rc.UnknownCaller:
         return {"note": None, "skipped": "unknown-caller", "sources": []}
     task_part = neutral(task_text[:1500]) or "(not given)"
@@ -701,4 +721,5 @@ def work_check(
         max_items=3,
         echo_text=f"{task_text}\n{steps}\n" + "\n".join(errs),
         known=known,
+        recheck_exclusions=recheck,
     )
