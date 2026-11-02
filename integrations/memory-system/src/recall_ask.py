@@ -506,7 +506,7 @@ def lineage_of(session_id: str | None, parent_id: str | None, *, caller_thread: 
         raise rc.UnknownCaller("caller agent has no native session")
     for ident in ids:
         if ident not in excluded:
-            excluded.update(rc.lineage_exclusions(ident))
+            excluded.update(rc.lineage_exclusions(ident, fresh_legacy=True))
     if caller_agent and f"{caller_native}:agent:{caller_agent}" not in excluded:
         raise rc.UnknownCaller("caller agent is unknown")
     return excluded

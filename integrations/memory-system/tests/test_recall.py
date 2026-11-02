@@ -677,6 +677,38 @@ class RecallTest(unittest.TestCase):
             con.commit()
             con.close()
 
+    def test_second_pass_refreshes_cached_legacy_aliases(self):
+        import recall_server as server
+        first = ra.lineage_of("thread-0", None)
+        self.assertNotIn("ses_late_resume", first)
+        cat = sqlite3.connect(rc.CATALOG_DB)
+        cat.execute("INSERT INTO sessions(session_id,source,title,cwd,parent_id,last_ts) VALUES(?,?,?,?,NULL,?)",
+                    ("ses_late_resume", "opencode", "Risk cell lane (resume)", "/Users/ardud/crpko", NOW))
+        cat.commit()
+        cat.close()
+        mem = sqlite3.connect(rc.MEM_DB)
+        mem.execute("INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type,metadata_json) "
+                    "VALUES('opencode','ses_late_resume','late-resume',?,'assistant','Walrus lighthouse old private context','text','{}')", (NOW,))
+        mem.commit()
+        mem.close()
+        try:
+            real_search = rc.search
+            with patch.object(server, "_caller_exclusions", side_effect=[first, ra.lineage_of("thread-0", None)]), \
+                 patch.object(rc, "search", side_effect=real_search):
+                out = server.recall_search("Walrus lighthouse", caller_thread="thread-0")
+            self.assertNotIn("ses_late_resume", out)
+            self.assertNotIn("old private context", out)
+        finally:
+            cat = sqlite3.connect(rc.CATALOG_DB)
+            cat.execute("DELETE FROM sessions WHERE session_id='ses_late_resume'")
+            cat.commit()
+            cat.close()
+            mem = sqlite3.connect(rc.MEM_DB)
+            mem.execute("DELETE FROM episodic_events WHERE turn_id='late-resume'")
+            mem.commit()
+            mem.close()
+            rc._lineage_cache.clear()
+
     def test_late_child_excluded_before_synthesis_and_from_search(self):
         import recall_server as server
 

@@ -1138,10 +1138,11 @@ def validate_driver(ident: str, driver: str) -> None:
             raise UnknownCaller("caller driver does not match")
 
 
-def lineage_exclusions(canonical_or_native_id: str | None) -> frozenset:
+def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
     """All known aliases in the caller's complete root tree, or fail closed."""
     # Robob commits identity rows before creating a transcript; capture reads
     # that transcript later. Recheck after retrieval before exposing candidates.
+    # Legacy results are only an additional exclusion, never proof of identity.
     if not canonical_or_native_id:
         raise UnknownCaller("caller identity is missing")
     ident = canonical_or_native_id.strip()
@@ -1165,7 +1166,7 @@ def lineage_exclusions(canonical_or_native_id: str | None) -> frozenset:
                 raise UnknownCaller("caller identity is unknown")
             explicit = {ident} | _opencode_tree({ident}, edges) | _catalog_tree({ident})
             aliases.update(_alias_table_tree(explicit) | _state_tree(explicit))
-            aliases.update(explicit if aliases else _legacy_lineage(ident))
+            aliases.update(explicit if aliases else _legacy_lineage(ident, fresh=fresh_legacy))
         aliases.add(ident)
         # A migration edge can reveal a later Robob binding, and that binding
         # can reveal more OpenCode aliases. Close both maps until stable.
@@ -1178,7 +1179,7 @@ def lineage_exclusions(canonical_or_native_id: str | None) -> frozenset:
             for sid in frontier:
                 if sid.startswith("ses_") and sid not in legacy_checked:
                     legacy_checked.add(sid)
-                    found.update(_legacy_lineage(sid))
+                    found.update(_legacy_lineage(sid, fresh=fresh_legacy))
             frontier = found - aliases
             aliases.update(frontier)
         return frozenset(aliases)
@@ -1195,7 +1196,7 @@ def base_title(title: str) -> str:
         t = s
 
 
-def _legacy_lineage(session_id: str | None, days: int = 14) -> frozenset:
+def _legacy_lineage(session_id: str | None, days: int = 14, *, fresh: bool = False) -> frozenset:
     """The session, its subagents, and recent earlier incarnations of the same thread.
 
     A resumed thread starts a new session with the same title and directory; its
@@ -1205,7 +1206,7 @@ def _legacy_lineage(session_id: str | None, days: int = 14) -> frozenset:
     if not session_id:
         return frozenset()
     hit = _lineage_cache.get(session_id)
-    if hit and time.monotonic() - hit[0] < 300:
+    if not fresh and hit and time.monotonic() - hit[0] < 300:
         return hit[1]
     roots = {session_id}
     oc = opencode_ro()
