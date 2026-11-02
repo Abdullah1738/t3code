@@ -183,32 +183,30 @@ const run = <A, E>(
   Effect.scoped(Effect.flatMap(makeHarness(mode), body)).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control resolver routes", () => {
-  for (const mode of ["off", "dryrun", "apply"] as const) {
-    it.effect(`create, send and settings use ${mode}`, () =>
-      run(mode, ({ request, calls, shell }) =>
-        Effect.gen(function* () {
-          const create = yield* request("POST", "/threads", { projectId: shell.projectId });
-          assert.strictEqual(create.status, 201);
-          const send = yield* request("POST", "/threads/thread/send", {
-            text: "hello",
-            mode: "queue",
-            model: legacy.model,
-          });
-          assert.strictEqual(send.status, 200);
-          const patch = yield* request("PATCH", "/threads/thread", { model: legacy.model });
-          assert.strictEqual(patch.status, 200);
-          const recorded = yield* Ref.get(calls);
-          assert.strictEqual(recorded.length, 3);
-          for (const item of recorded) {
-            assert.deepStrictEqual(
-              (item.value as { modelSelection: unknown }).modelSelection,
-              mode === "apply" ? native : legacy,
-            );
-          }
-        }),
-      ),
-    );
-  }
+  it.effect.each(["off", "dryrun", "apply"] as const)("create, send and settings use %s", (mode) =>
+    run(mode, ({ request, calls, shell }) =>
+      Effect.gen(function* () {
+        const create = yield* request("POST", "/threads", { projectId: shell.projectId });
+        assert.strictEqual(create.status, 201);
+        const send = yield* request("POST", "/threads/thread/send", {
+          text: "hello",
+          mode: "queue",
+          model: legacy.model,
+        });
+        assert.strictEqual(send.status, 200);
+        const patch = yield* request("PATCH", "/threads/thread", { model: legacy.model });
+        assert.strictEqual(patch.status, 200);
+        const recorded = yield* Ref.get(calls);
+        assert.strictEqual(recorded.length, 3);
+        for (const item of recorded) {
+          assert.deepStrictEqual(
+            (item.value as { modelSelection: unknown }).modelSelection,
+            mode === "apply" ? native : legacy,
+          );
+        }
+      }),
+    ),
+  );
 
   it.effect("rejects conflicts and unavailable options before any PATCH mutation", () =>
     run("apply", ({ request, calls }) =>

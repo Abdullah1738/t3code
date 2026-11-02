@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - the migration command needs a unique id for each attempt.
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import {
   mergeSelection,
   resolveSelection,
@@ -812,7 +812,7 @@ const make = Effect.gen(function* () {
       }
       yield* orchestrator.dispatch({
         type: "thread.model-selection.set",
-        commandId: CommandId.make(`command:ardud:harness-migration:${randomUUID()}`),
+        commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
         threadId: command.threadId,
         modelSelection: resolvedStored.selection,
       });

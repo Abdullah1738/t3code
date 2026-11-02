@@ -215,8 +215,8 @@ export const make = Effect.gen(function* () {
   });
 
   // Preserve historical models even if OpenCode no longer lists them as runnable.
-  const childSelection = (conn: OpenCodeHttp.OpenCodeConnection, sessionId: string) =>
-    Effect.gen(function* () {
+  const childSelection = Effect.fn("OpenCodeImporter.childSelection")(
+    function* (conn: OpenCodeHttp.OpenCodeConnection, sessionId: string) {
       const client = yield* HttpClient.HttpClient;
       const request = (path: string) =>
         client.execute(
@@ -257,10 +257,9 @@ export const make = Effect.gen(function* () {
         OPENCODE_INSTANCE,
         fallback,
       );
-    }).pipe(
-      Effect.timeout("60 seconds"),
-      Effect.provide(FetchHttpClient.layer),
-    );
+    },
+    (effect) => effect.pipe(Effect.timeout("60 seconds"), Effect.provide(FetchHttpClient.layer)),
+  );
 
   const readImportRows = sql<ImportRow>`
     SELECT

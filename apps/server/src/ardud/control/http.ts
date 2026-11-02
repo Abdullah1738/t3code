@@ -458,54 +458,52 @@ const makeRoutes = Effect.gen(function* () {
   const uploadContext =
     yield* Effect.context<Effect.Services<ReturnType<typeof issueAttachmentUploadUrl>>>();
 
-  const resolveControlSelection = (input: Parameters<typeof modelSelectionFrom>[0]) =>
-    Effect.gen(function* () {
-      const settings =
-        input.settings ??
-        (yield* settingsService.getSettings.pipe(
-          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-        ));
-      const selection = yield* selectionOrFail(modelSelectionFrom({ ...input, settings }));
-      if (selectionMigrationApplies(settings)) {
-        const catalog = yield* providers.getProviders;
-        const problem = selectionProblem(catalog, selection);
-        if (problem !== null) return yield* fail("invalid_request", problem);
-      } else if (input.options !== undefined) {
-        // Explicit native options have no legacy semantics; never silently prefer
-        // one duplicate or a conflicting compatibility variant.
-        const ids = new Set<string>();
-        for (const option of input.options) {
-          if (ids.has(option.id)) {
-            return yield* fail(
-              "invalid_request",
-              `Option ${option.id} was specified more than once.`,
-            );
-          }
-          ids.add(option.id);
-          if (
-            option.id === "variant" &&
-            input.variant !== undefined &&
-            option.value !== input.variant
-          ) {
-            return yield* fail("invalid_request", "variant conflicts with the options list.");
-          }
-          if (
-            (option.id === "effort" || option.id === "reasoningEffort") &&
-            input.variant !== undefined &&
-            option.value !== input.variant
-          ) {
-            return yield* fail(
-              "invalid_request",
-              "variant conflicts with the native effort option.",
-            );
-          }
+  const resolveControlSelection = Effect.fn("ControlApi.resolveSelection")(function* (
+    input: Parameters<typeof modelSelectionFrom>[0],
+  ) {
+    const settings =
+      input.settings ??
+      (yield* settingsService.getSettings.pipe(
+        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      ));
+    const selection = yield* selectionOrFail(modelSelectionFrom({ ...input, settings }));
+    if (selectionMigrationApplies(settings)) {
+      const catalog = yield* providers.getProviders;
+      const problem = selectionProblem(catalog, selection);
+      if (problem !== null) return yield* fail("invalid_request", problem);
+    } else if (input.options !== undefined) {
+      // Explicit native options have no legacy semantics; never silently prefer
+      // one duplicate or a conflicting compatibility variant.
+      const ids = new Set<string>();
+      for (const option of input.options) {
+        if (ids.has(option.id)) {
+          return yield* fail(
+            "invalid_request",
+            `Option ${option.id} was specified more than once.`,
+          );
         }
-        const catalog = yield* providers.getProviders;
-        const problem = selectionProblem(catalog, selection);
-        if (problem !== null) return yield* fail("invalid_request", problem);
+        ids.add(option.id);
+        if (
+          option.id === "variant" &&
+          input.variant !== undefined &&
+          option.value !== input.variant
+        ) {
+          return yield* fail("invalid_request", "variant conflicts with the options list.");
+        }
+        if (
+          (option.id === "effort" || option.id === "reasoningEffort") &&
+          input.variant !== undefined &&
+          option.value !== input.variant
+        ) {
+          return yield* fail("invalid_request", "variant conflicts with the native effort option.");
+        }
       }
-      return selection;
-    });
+      const catalog = yield* providers.getProviders;
+      const problem = selectionProblem(catalog, selection);
+      if (problem !== null) return yield* fail("invalid_request", problem);
+    }
+    return selection;
+  });
 
   const authenticate = (scope: Scope) =>
     Effect.gen(function* () {
