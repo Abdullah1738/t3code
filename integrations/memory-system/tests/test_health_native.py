@@ -22,6 +22,13 @@ CREATE TABLE thread_aliases (alias_key TEXT PRIMARY KEY, last_seen INTEGER);
 """
 
 
+
+def fake_entries(homes):
+    """D1 manifest entries (transcript_roots.json shape) rooted in a temp dir."""
+    return [{"driver": "claudeAgent", "instance": "claudeAgent", "root": os.path.join(homes, "claude")},
+            {"driver": "codex", "instance": "codex", "root": os.path.join(homes, "codex")},
+            {"driver": "codex", "instance": "codex-cu", "root": os.path.join(homes, "codex-cu")}]
+
 class NativeHealth(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -36,7 +43,7 @@ class NativeHealth(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger)) as con, con:
             con.executescript(DDL)
             con.execute("INSERT INTO thread_aliases VALUES ('alias', ?)", (self.now,))
-        patches = [mock.patch.object(roots, "HARNESS_HOMES", self.homes),
+        patches = [mock.patch.object(roots, "load", return_value=fake_entries(self.homes)),
                    mock.patch.object(hc, "NATIVE_LEDGER", self.ledger),
                    mock.patch.object(hc, "ROBOB_SETTINGS", self.settings),
                    mock.patch.object(hc, "CLAUDE_SETTINGS", self.claude_settings)]
@@ -86,14 +93,14 @@ class NativeHealth(unittest.TestCase):
 
     def test_enabled_missing_root_fails(self):
         missing = os.path.join(self.homes, "new-codex")
-        with mock.patch.object(roots, "roots", return_value=[
+        with mock.patch.object(roots, "resolve", return_value=[
                 {"instance": "codex", "driver": "codex", "root": missing, "exists": False}]):
             self.assertTrue(any("root missing" in p for p in self.problems()))
 
     def test_disabled_never_created_root_from_real_settings_is_exempt(self):
         self.write_settings(codex_cu=False)
         missing = os.path.join(self.homes, "never-created")
-        with mock.patch.object(roots, "roots", return_value=[
+        with mock.patch.object(roots, "resolve", return_value=[
                 {"instance": "codex-cu", "driver": "codex", "root": missing, "exists": False}]):
             self.assertEqual(self.problems(), [])
 
@@ -101,7 +108,7 @@ class NativeHealth(unittest.TestCase):
         root = os.path.realpath(os.path.join(self.homes, "was-here"))
         self.seen["roots"] = [root]
         self.write_settings(codex_cu=False)
-        with mock.patch.object(roots, "roots", return_value=[
+        with mock.patch.object(roots, "resolve", return_value=[
                 {"instance": "codex-cu", "driver": "codex", "root": root, "exists": False}]):
             self.assertTrue(any("root missing" in p for p in self.problems()))
 

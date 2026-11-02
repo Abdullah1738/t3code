@@ -22,11 +22,19 @@ import transcript_backup_manifest as tbm  # noqa: E402
 import transcript_roots as tr  # noqa: E402
 
 
+
+def fake_entries(homes):
+    """D1 manifest entries (transcript_roots.json shape) rooted in a temp dir."""
+    return [{"driver": "claudeAgent", "instance": "claudeAgent", "root": os.path.join(homes, "claude")},
+            {"driver": "codex", "instance": "codex", "root": os.path.join(homes, "codex")},
+            {"driver": "codex", "instance": "codex-cu", "root": os.path.join(homes, "codex-cu")}]
+
 class ReportOnly(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.homes = os.path.join(self.tmp.name, "harness-homes")
+        # realpath: D1's resolve() realpaths roots (macOS /var -> /private/var), and so do ledger keys.
+        self.homes = os.path.join(os.path.realpath(self.tmp.name), "harness-homes")
         self.stage = os.path.join(self.tmp.name, "staged-transcripts")
         self.now = 1_800_000_000.0
         self.old = self.now - 200 * 86400
@@ -34,7 +42,7 @@ class ReportOnly(unittest.TestCase):
         os.utime(self.file, (self.old, self.old))
         self.back_up()
         self.ledger = {self.file: self.capture(self.file)}
-        p = mock.patch.object(tr, "HARNESS_HOMES", self.homes)
+        p = mock.patch.object(tr, "load", return_value=fake_entries(self.homes))
         p.start()
         self.addCleanup(p.stop)
 
@@ -46,7 +54,7 @@ class ReportOnly(unittest.TestCase):
         return path
 
     def roots(self):
-        return tr.roots()
+        return tr.resolve()
 
     def capture(self, path):
         st = os.stat(path)
