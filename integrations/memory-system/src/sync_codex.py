@@ -233,7 +233,8 @@ class CodexSync:
         self.mem.execute("PRAGMA busy_timeout=600000")
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
-        self.seeded = load_seeded()
+        self.seed_roots = list(self.roots) + list(self.all_roots)
+        self.seeded = load_seeded(roots=self.seed_roots)
         self.stats = dict(files=0, rows=0, raw=0, skipped_inherited=0, skipped_seeded=0, errors=0,
                           quarantined=0, unchanged=0, missing_roots=[])
         self.errors = []
@@ -304,6 +305,7 @@ class CodexSync:
         The consumed prefix is replayed first (state only, no rows, unbounded but no writes) so
         session identity, the inherited boundary and line/ordinal numbering continue exactly.
         """
+        file_ident = tc.seed_identity(path, self.seed_roots)
         file_hash = _first_line_hash(path)
         proj = CodexProjector(file_hash)
         line_no = 0
@@ -321,27 +323,32 @@ class CodexSync:
                     proj.feed(rec, line_no, line_sha=tc.raw_sha1(line))  # state only: same as the live path
             proj.inherited = 0
             pos = rep["offset"]
-        batch_rows, batch_raw, batch_end = [], [], pos
+        batch_rows, batch_raw, batch_end, batch_bytes = [], [], pos, 0
         for line, end in _physical_lines(path, pos):
             line_no += 1
             batch_end = end
+            batch_bytes += len(line)
             try:
                 rec = json.loads(line)
             except ValueError:
                 rec = None
             batch_raw.append((line, line_no))
             if rec is not None:
-                if is_seeded(self.seeded, path, line_no, proj.session_id):
+                if is_seeded(self.seeded, file_ident, line_no, proj.session_id):
                     proj.feed(rec, line_no)  # seeded: identity/ordinal state only
                     self.stats["skipped_seeded"] += 1
                 else:
                     for row in proj.feed(rec, line_no, line_sha=tc.raw_sha1(line)):
                         batch_rows.append(row)
-            if sum(len(x[0]) for x in batch_raw) >= tc.BATCH_BYTES:
+            if batch_bytes >= tc.BATCH_BYTES:
                 self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=False)
-                batch_rows, batch_raw = [], []
-        # the loop ran to the end of the stream: this final commit is the one that marks it complete
-        if batch_raw or batch_end != rep["offset"] or not rep.get("complete"):
+                batch_rows, batch_raw, batch_bytes = [], [], 0
+        # Reached only when the loop read the stream to its end (a read or zstd error raises first).
+        # The final commit marks the checkpoint complete. It also runs when the physical identity
+        # changed: a plain rollout converted to .zst under the same name keeps its old inode
+        # otherwise, the unchanged shortcut never fires, and every tick decodes the archive again.
+        # An unchanged, complete file costs no write.
+        if batch_raw or batch_end != rep["offset"] or not rep.get("complete") or rep.get("inode") != st.st_ino:
             self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=True)
         self.stats["skipped_inherited"] += proj.inherited
 
@@ -363,7 +370,7 @@ class CodexSync:
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tc.tail_sha1(path, pos) if pos and not path.endswith(tc.ZST) else None,
-                         complete=eof)
+                         complete=eof, inode=st.st_ino)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)

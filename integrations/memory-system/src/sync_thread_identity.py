@@ -86,7 +86,6 @@ def gather(state):
     # subagent is keyed by its PARENT's native session plus its own native agent id, so the
     # parent is resolved through the owning provider thread, never through providerThreadId
     # (an internal projection id, null for native Claude tasks) or the app thread id.
-    native_of = {}
     out = []
     for tid, payload, driver, instance in state.execute(
         "SELECT thread_id, payload_json, driver, provider_instance_id FROM orchestration_v2_projection_provider_threads"
@@ -97,7 +96,6 @@ def gather(state):
         native = _str(ref.get("nativeId"))
         if not native:
             continue
-        native_of.setdefault(tid, (native, driver or _str(ref.get("driver")), instance or _str(p.get("providerInstanceId"))))
         out.append(dict(canonical=tid, native=native, agent=None, driver=driver or _str(ref.get("driver")),
                         instance=instance or _str(p.get("providerInstanceId")),
                         model=threads.get(tid, {}).get("model")))
@@ -126,6 +124,7 @@ def gather(state):
         pj = _j(payload)
         if _str(pj.get("id")) and _str(pj.get("parentNodeId")):
             task_parent[_str(pj.get("id"))] = _str(pj.get("parentNodeId"))
+    unresolved = {}  # reason -> child thread ids left without an alias this tick
     for child_tid, parent_tid, payload, driver, instance in subagent_rows:
         p = _j(payload)
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
@@ -134,19 +133,20 @@ def gather(state):
             continue  # no native task id: nothing native to key this child by
         owners = resolve_owner(_str(p.get("parentNodeId")), turn_owner, task_parent)
         if owners is None:
-            log_unresolved(child_tid, "no provider turn in the parent chain")
+            note_unresolved(unresolved, child_tid, "no provider turn in the parent chain")
             continue
         if len(owners) != 1:
-            log_unresolved(child_tid, f"{len(owners)} provider threads claim the parent chain")
+            note_unresolved(unresolved, child_tid, f"{len(owners)} provider threads claim the parent chain")
             continue
         pt = next(iter(owners))
         if pt not in by_provider or not by_provider[pt][0]:
-            log_unresolved(child_tid, "owning provider thread has no native session")
+            note_unresolved(unresolved, child_tid, "owning provider thread has no native session")
             continue
         parent_native, parent_driver, parent_instance = by_provider[pt]
         out.append(dict(canonical=child_tid, native=parent_native, agent=task,
                         driver=driver or parent_driver or _str(ref.get("driver")),
                         instance=instance or parent_instance, model=None))
+    report_unresolved(unresolved)
     for native, tid in state.execute("SELECT native_session_id, thread_id FROM ardud_opencode_import"):
         out.append(dict(canonical=tid, native=native, agent=None, driver="opencode", instance="opencode", model=None))
     for row in out:
@@ -179,9 +179,22 @@ def resolve_owner(node_id, turn_owner, task_parent):
     return None
 
 
-def log_unresolved(child_tid, reason):
-    """A child that cannot be bound gets no alias; the reason goes to stderr for the tick log."""
-    print(f"thread identity: no alias for child {child_tid}: {reason}", file=sys.stderr, flush=True)
+def note_unresolved(unresolved, child_tid, reason):
+    """A child that cannot be bound gets no alias. Its reason is kept for report_unresolved."""
+    unresolved.setdefault(reason, []).append(child_tid)
+
+
+def report_unresolved(unresolved, sample=5):
+    """One stderr line per reason: the count and a few child ids.
+
+    Unbound children stay unbound on every tick, so one line per child would repeat thousands
+    of times in the tick log.
+    """
+    for reason, ids in sorted(unresolved.items()):
+        more = f" and {len(ids) - sample} more" if len(ids) > sample else ""
+        shown = ", ".join(ids[:sample])
+        print(f"thread identity: {len(ids)} child thread(s) without an alias ({reason}): {shown}{more}",
+              file=sys.stderr, flush=True)
 
 
 def _root_of(tid, threads, limit=200):

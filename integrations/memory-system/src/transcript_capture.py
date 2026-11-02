@@ -100,6 +100,22 @@ def seed_stem(path):
     return base
 
 
+def seed_identity(path, roots):
+    """(home realpath, rollout stem) of a transcript, or None when no given home contains it.
+
+    Seeded ranges are matched on this identity from both sides: the manifest entry and the live
+    file. The home part keeps two homes that hold a rollout with the same stem apart; the stem part
+    keeps a rollout that moved between sessions/ and archived_sessions/, or was compressed, on the
+    same identity.
+    """
+    real = os.path.realpath(path)
+    for r in roots:
+        base = os.path.realpath(r["path"])
+        if real.startswith(base + os.sep):
+            return (base, seed_stem(path))
+    return None
+
+
 def zstd_bin():
     import shutil
 
@@ -270,16 +286,18 @@ def record_error(con, rep_id, message, now=None):
     )
 
 
-def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None, complete=None):
-    """Commit a batch. `tail` is the tail checksum at `offset` (plain files), the value the next pass verifies.
+def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None, complete=False, inode=None):
+    """Commit one batch: the offset consumed, the physical identity it was read from, and the checksums.
 
-    `complete` says whether this batch reached the end of the stream. It is set to 1 only then,
-    and a later partial batch never clears it: a finished file stays finished unless it changes.
+    `tail` is the tail checksum at `offset` (plain files), the value the next pass verifies.
+    `complete` is True only for the batch that reached the end of the stream. Every other batch
+    writes False, so a pass killed partway never leaves a checkpoint that looks finished. `inode`
+    restamps the identity when a file became a different representation under the same logical name.
     """
     now = int(time.time()) if now is None else now
     con.execute(
         "UPDATE native_capture_files SET offset=?, phys_size=?, mtime=?, lines=?, last_ok_at=?, error=NULL,"
-        " error_count=0, quarantined_until=0, tail_sha1=coalesce(?, tail_sha1),"
+        " error_count=0, quarantined_until=0, tail_sha1=coalesce(?, tail_sha1), inode=coalesce(?, inode),"
         " complete=CASE WHEN ? THEN 1 ELSE 0 END WHERE rep_id=?",
-        (offset, phys_size, mtime, lines, now, tail, 1 if complete else 0, rep_id),
+        (offset, phys_size, mtime, lines, now, tail, inode, 1 if complete else 0, rep_id),
     )

@@ -416,6 +416,49 @@ class CodexSyncTest(unittest.TestCase):
         self.assertEqual(len({r[1] for r in self.rows()}), 1200)
         tc.BATCH_BYTES = real_batch
 
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_stream_killed_mid_file_is_finished_on_rerun(self):
+        """A kill inside the read loop, with no write in progress, leaves an incomplete checkpoint.
+
+        The committed batches stay; the rerun finishes from the committed offset with no duplicates,
+        and the tick after that takes the shortcut.
+        """
+        import subprocess
+        import transcript_capture as tc
+        plain = os.path.join(self.tmp.name, "mid.jsonl")
+        write_rollout(plain, [meta(CHILD_ID, ROOT_ID)] + [msg("user", f"mid {i} " + "q" * 400) for i in range(1200)])
+        zst = self.rollout + ".zst"
+        os.makedirs(os.path.dirname(zst), exist_ok=True)
+        subprocess.run([ZSTD, "-q", "-o", zst, plain], check=True)
+        real_batch, real_lines = tc.BATCH_BYTES, self.sx._physical_lines
+        seen = {"n": 0}
+
+        def dying(path, start=0):
+            for item in real_lines(path, start):
+                seen["n"] += 1
+                if seen["n"] > 300:
+                    raise KeyboardInterrupt("killed mid-stream, after two committed batches")
+                yield item
+
+        tc.BATCH_BYTES = 60000
+        self.sx._physical_lines = dying
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        finally:
+            self.sx._physical_lines = real_lines
+            tc.BATCH_BYTES = real_batch
+        partial = len(self.rows())
+        self.assertGreater(partial, 0)
+        self.assertLess(partial, 1200)
+        s2 = self.sync()
+        self.assertEqual(s2["unchanged"], 0)
+        self.assertEqual(len(self.rows()), 1200)
+        self.assertEqual(len({r[1] for r in self.rows()}), 1200)
+        s3 = self.sync()
+        self.assertEqual(s3["unchanged"], 1)
+        self.assertEqual(len(self.rows()), 1200)
+
     def test_seeded_rollout_archived_before_first_capture_is_not_projected(self):
         """A manifest written for sessions/ still suppresses the same lines once the file is in archived_sessions/."""
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "seeded one"), msg("user", "seeded two"),
@@ -447,6 +490,71 @@ class CodexSyncTest(unittest.TestCase):
         self.sync()
         self.sync()
         self.assertEqual([r[4] for r in self.rows()], ["genuine child work"])
+
+    @unittest.skipUnless(ZSTD, "zstd binary not installed")
+    def test_plain_capture_converted_to_zst_takes_the_shortcut_next_tick(self):
+        """A rollout captured as plain and later compressed under the same name is restamped with its
+        .zst identity; the tick after that takes the unchanged shortcut and decodes nothing."""
+        import subprocess
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "before conversion"),
+                                     msg("assistant", "answer")])
+        self.sync()
+        zst = self.rollout.replace(os.sep + "sessions" + os.sep, os.sep + "archived_sessions" + os.sep) + ".zst"
+        os.makedirs(os.path.dirname(zst), exist_ok=True)
+        subprocess.run([ZSTD, "-q", "-o", zst, self.rollout], check=True)
+        os.remove(self.rollout)
+        self.sync()
+        self.assertEqual(len(self.rows()), 2)
+        con = sqlite3.connect(self.db)
+        inode, phys, complete = con.execute(
+            "SELECT inode, phys_size, complete FROM native_capture_files WHERE retired=0").fetchone()
+        con.close()
+        st = os.stat(zst)
+        self.assertEqual((inode, phys, complete), (st.st_ino, st.st_size, 1))
+        reads = {"n": 0}
+        real = self.sx._physical_lines
+
+        def counting(path, start=0):
+            reads["n"] += 1
+            return real(path, start)
+
+        self.sx._physical_lines = counting
+        try:
+            s3 = self.sync()
+        finally:
+            self.sx._physical_lines = real
+        self.assertEqual(s3["unchanged"], 1)
+        self.assertEqual(reads["n"], 0, "an unchanged archive was decoded")
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_seed_identity_is_root_qualified_across_homes(self):
+        """The same rollout stem in another home must not inherit a seeded range from this home."""
+        other = os.path.join(self.tmp.name, "codex-cu")
+        self.roots.append({"driver": "codex", "instance": "codex-cu", "root": other, "path": other, "exists": True})
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "seeded in home one")])
+        twin = os.path.join(other, "sessions/2026/10/31", os.path.basename(self.rollout))
+        write_rollout(twin, [meta(CHILD_ID, ROOT_ID), msg("user", "same stem, other home")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": self.rollout,
+                                "first_line": 2, "last_line": 2}) + "\n")
+        self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["same stem, other home"])
+
+    def test_seeded_entry_outside_every_home_is_ignored_and_logged(self):
+        """A manifest path no captured home contains cannot be matched safely: it is logged and ignored,
+        even when a home holds a file with the same name."""
+        import contextlib
+        import io
+        elsewhere = os.path.join(self.tmp.name, "elsewhere", os.path.basename(self.rollout))
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "must be projected")])
+        with open(self.seeded, "w") as f:
+            f.write(json.dumps({"native_session_id": CHILD_ID, "path": elsewhere,
+                                "first_line": 2, "last_line": 2}) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self.sync()
+        self.assertEqual([r[4] for r in self.rows()], ["must be projected"])
+        self.assertIn("outside every captured home", buf.getvalue())
 
     def test_seeded_record_still_advances_identity_state(self):
         """A seeded record's effect on the projector must match the replay path (no events, but state)."""

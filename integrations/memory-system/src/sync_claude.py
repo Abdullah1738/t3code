@@ -64,13 +64,14 @@ def seeded_path():
     return os.environ.get("HARNESS_SEEDED_MANIFEST", SEEDED_DEFAULT)
 
 
-def load_seeded(path=None):
-    """{native_session_id: [(first_line, last_line, seed_stem|None), ...]} from an optional JSONL manifest.
+def load_seeded(path=None, roots=()):
+    """{native_session_id: [(first_line, last_line, seed_identity|None), ...]} from an optional JSONL manifest.
 
-    The card that writes seeded.jsonl owns its format; a missing file means
-    nothing is seeded, and a malformed line is ignored rather than fatal. The
-    file part of an entry is reduced to its seed stem (see tc.seed_stem), the
-    same normalisation applied to the live file it is matched against.
+    The card that writes seeded.jsonl owns its format; a missing file means nothing is seeded, and a
+    malformed line is ignored rather than fatal. An entry's path becomes its seed identity against the
+    given homes (see tc.seed_identity). An entry whose path no home contains is logged and ignored:
+    matching it on the file name alone could cross homes. An entry without a path covers any
+    transcript of that session.
     """
     out = {}
     try:
@@ -81,8 +82,16 @@ def load_seeded(path=None):
         for line in f:
             try:
                 e = json.loads(line)
-                file_hint = tc.seed_stem(e["path"]) if isinstance(e.get("path"), str) and e["path"] else None
-                out.setdefault(e["native_session_id"], []).append((int(e["first_line"]), int(e["last_line"]), file_hint))
+                native = e["native_session_id"]
+                first, last = int(e["first_line"]), int(e["last_line"])
+                ident = None
+                if isinstance(e.get("path"), str) and e["path"]:
+                    ident = tc.seed_identity(e["path"], roots)
+                    if ident is None:
+                        print(f"seeded entry for {native} ignored: {e['path']} is outside every captured home",
+                              file=sys.stderr, flush=True)
+                        continue
+                out.setdefault(native, []).append((first, last, ident))
             except (ValueError, KeyError, TypeError):
                 continue
     return out
@@ -188,19 +197,18 @@ def project(rec, path, line_no):
     return rows
 
 
-def is_seeded(seeded, path, line_no, key):
+def is_seeded(seeded, file_ident, line_no, key):
     """True when this line sits in a seeded (transplanted) range for its capture key.
 
-    `key` is the capture identity of the transcript line: the top-level
-    sessionId, or "<sessionId>:agent:<agentId>" for a child. Ranges are keyed by
-    the same identity, and an optional file name narrows them further.
+    `key` is the capture identity of the transcript line: the top-level sessionId, or
+    "<sessionId>:agent:<agentId>" for a child. `file_ident` is tc.seed_identity of the file (None
+    when no captured home contains it). A range with an identity applies only to that transcript;
+    a range without one applies to any transcript of the session.
     """
     if not isinstance(key, str):
         return False
-    # Compare seed stems: a transcript that became .jsonl.zst or moved archives keeps its range.
-    base = tc.seed_stem(path)
-    for first, last, file_hint in seeded.get(key, ()):
-        if (not file_hint or file_hint == base) and first <= line_no <= last:
+    for first, last, ident in seeded.get(key, ()):
+        if (ident is None or ident == file_ident) and first <= line_no <= last:
             return True
     return False
 
@@ -215,7 +223,8 @@ class ClaudeSync:
         self.mem.execute("PRAGMA busy_timeout=600000")
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
-        self.seeded = load_seeded()
+        self.seed_roots = list(self.roots) + list(self.all_roots)
+        self.seeded = load_seeded(roots=self.seed_roots)
         self.stats = dict(files=0, rows=0, raw=0, skipped_seeded=0, errors=0, quarantined=0, unchanged=0,
                           missing_roots=[])
         self.errors = []
@@ -271,6 +280,7 @@ class ClaudeSync:
         if self._unchanged(path, st, rep):
             self.stats["unchanged"] += 1
             return  # nothing new since the last clean pass, and the consumed bytes still match
+        file_ident = tc.seed_identity(path, self.seed_roots)
         events, raw = [], []
         pos = rep["offset"]
         line_no = rep["lines"]  # lines already journaled for this representation
@@ -285,7 +295,7 @@ class ClaudeSync:
             if rec is None:
                 continue
             key_line = self._key_of_line(path, rec)
-            if is_seeded(self.seeded, path, line_no, key_line):
+            if is_seeded(self.seeded, file_ident, line_no, key_line):
                 self.stats["skipped_seeded"] += 1
                 continue
             events.extend(project(rec, path, line_no))

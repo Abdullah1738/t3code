@@ -251,6 +251,28 @@ class IdentityTest(unittest.TestCase):
         self.assertIn("AMBC", buf.getvalue())
         self.assertIn("provider threads claim", buf.getvalue())
 
+    def test_cyclic_task_chain_gets_no_alias(self):
+        """Two subagent task nodes that name each other as parent never reach a turn: no alias, logged."""
+        import contextlib
+        import io
+        s = sqlite3.connect(self.state)
+        s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("CYC", "Cycle"))
+        s.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES('cyc-1','CYC','claudeAgent','claudeAgent','claudeAgent',?)",
+                  (json.dumps({"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "CYC-S"}}),))
+        for tid, own, up in (("CYA", "task-cya", "task-cyb"), ("CYB", "task-cyb", "task-cya")):
+            s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread(tid, tid, parent="CYC"))
+            s.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
+                      (f"sub-{tid}", "CYC", tid, "claudeAgent", "claudeAgent",
+                       json.dumps({"id": own, "nativeTaskRef": {"driver": "claudeAgent", "nativeId": f"AGT-{tid}"},
+                                   "parentNodeId": up, "providerThreadId": None})))
+        s.commit()
+        s.close()
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            ti.sync(self.mem, self.state)
+        self.assertEqual([r for r in self.aliases() if r[0] in ("CYA", "CYB")], [])
+        self.assertIn("no provider turn in the parent chain", buf.getvalue())
+
     def test_refresh_updates_title_and_bumps_revision_without_new_rows(self):
         ti.sync(self.mem, self.state)
         n = len(self.aliases())
