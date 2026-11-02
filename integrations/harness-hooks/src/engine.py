@@ -229,34 +229,75 @@ def _command_needs_eval(command):
     return "<<" in command
 
 
+def _exit_trap_argument(snapshot):
+    """Read the shell-quoted action from the first `trap` record, if EXIT."""
+    prefix = "trap -- "
+    if not snapshot.startswith(prefix):
+        return None
+    pos, quote = len(prefix), None
+    start = pos
+    while pos < len(snapshot):
+        char = snapshot[pos]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif quote in ('"', "ansi"):
+            if char == "\\":
+                pos += 1
+            elif char == ('"' if quote == '"' else "'"):
+                quote = None
+        elif char == "\\":
+            pos += 1
+        elif char == "$" and snapshot[pos:pos + 2] == "$'":
+            quote = "ansi"
+            pos += 1
+        elif char in ("'", '"'):
+            quote = char
+        elif char.isspace():
+            break
+        pos += 1
+    if quote is not None or not snapshot.startswith(" EXIT\n", pos):
+        return None
+    return snapshot[start:pos]
+
+
 def _exit_trap_update(path, before, identity, pin):
     """Bind a changed EXIT trap to its registration context."""
     trap_file = Path(path)
     try:
         current = trap_file.read_text(encoding="utf-8")
         previous = Path(before).read_text(encoding="utf-8")
-        match = re.search(r"^trap -- (.*?) EXIT(?:\n|$)", current, re.MULTILINE | re.DOTALL)
-        old_match = re.search(r"^trap -- (.*?) EXIT(?:\n|$)", previous, re.MULTILINE | re.DOTALL)
-        if not match or (old_match and match.group(0) == old_match.group(0)):
-            return
-        # The quoted value comes from the shell's own `trap` builtin; leaving
-        # it quoted lets bash and zsh round-trip their different formats.
-        argument = match.group(1)
+        function_file = Path(path + ".function")
+        old_function_file = Path(before + ".function")
+        function = function_file.read_text(encoding="utf-8") if function_file.exists() else ""
+        old_function = old_function_file.read_text(encoding="utf-8") if old_function_file.exists() else ""
         variable = "__harness_exit_" + secrets.token_hex(8)
         values = {COMMAND_IDENTITY_ENV: identity or "", "HARNESS_COORD_APPROVED": pin or "",
                   "AGENT_GUARD_APPROVED": pin or ""}
         exports = "; ".join("export " + k + "=" + shlex.quote(v) for k, v in values.items())
+        if function:
+            if function == old_function:
+                return
+            # zsh's TRAPEXIT is a function, not a `trap --` record. Copy it
+            # before replacing it, and pass the signal argument and status on.
+            saved = variable + "_function"
+            sys.stdout.write("functions -c TRAPEXIT " + saved + "\nTRAPEXIT() {\nlocal " + variable +
+                             "=$?; " + exports + "; (exit \"$" + variable + "\") && :; " +
+                             saved + ' "$@"\n}\n')
+            return
+        argument = _exit_trap_argument(current)
+        if argument is None or argument == _exit_trap_argument(previous):
+            return
+        # The argument is from the shell's `trap` builtin, with its quoting
+        # intact for both bash and zsh, including embedded newlines.
         action = (variable + "=$?; " + exports + "; (exit \"$" + variable + "\") && :; eval " + argument)
         sys.stdout.write("trap -- " + shlex.quote(action) + " EXIT\n")
     finally:
-        try:
-            trap_file.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            Path(before).unlink()
-        except FileNotFoundError:
-            pass
+        for filename in (path, before, path + ".function", before + ".function"):
+            try:
+                Path(filename).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _command_with_context(command, identity, pin):
@@ -278,14 +319,18 @@ def _command_with_context(command, identity, pin):
     # parameters, functions and cwd). eval preserves a heredoc's EOF boundary.
     # Restore inherited context before this shell can run another command.
     body = "eval " + shlex.quote(command) if _command_needs_eval(command) else command
+    # zsh inherits TRAPEXIT in command substitutions, so clear it in the
+    # helper subshells without changing the caller's handler.
     snapshot = (
-        trap_file + "=$(mktemp \"${TMPDIR:-/tmp}/harness-exit.XXXXXXXX\")\n" +
+        trap_file + "=$(trap - EXIT; mktemp \"${TMPDIR:-/tmp}/harness-exit.XXXXXXXX\")\n" +
         before + "=\"$" + trap_file + ".before\"\n" +
-        "if [ -n \"$" + trap_file + "\" ]; then\ntrap > \"$" + before + "\"\nfi\n"
+        "if [ -n \"$" + trap_file + "\" ]; then\ntrap > \"$" + before + "\"\n" +
+        "if [ -n \"${ZSH_VERSION-}\" ]; then functions TRAPEXIT > \"$" + before + ".function\" || :; fi\nfi\n"
     )
     bind_exit = (
         "if [ -n \"$" + trap_file + "\" ]; then\ntrap > \"$" + trap_file + "\"\n" +
-        install + "=$(" + shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__)) +
+        "if [ -n \"${ZSH_VERSION-}\" ]; then functions TRAPEXIT > \"$" + trap_file + ".function\" || :; fi\n" +
+        install + "=$(trap - EXIT; " + shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__)) +
         " --bind-exit \"$" + trap_file + "\" \"$" + before + "\" " +
         shlex.quote(identity or "") + " " + shlex.quote(pin or "") + ")\n" +
         "if [ -n \"$" + install + "\" ]; then eval \"$" + install + "\"; fi\nfi\n"

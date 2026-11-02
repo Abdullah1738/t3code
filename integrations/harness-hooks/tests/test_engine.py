@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -782,6 +783,75 @@ printf done | cat"""
                 result = self.run_shell(rewritten, env, shell=shell)
                 self.assertEqual(result.stdout, "deferred\n")
                 self.assertEqual(result.stderr, engine.COORD_REASON + "\n")
+
+    def test_multiline_exit_trap_keeps_embedded_terminator_and_trap_text(self):
+        self.actor()
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        action = "echo cleanup EXIT\n# trap -- 'pretend' EXIT\nprintf cleaned > cleanup-marker"
+        command = "trap " + shlex.quote(action) + " EXIT; trap 'true' USR1"
+        rewritten = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]["updatedInput"]["command"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                (self.root / "cleanup-marker").unlink(missing_ok=True)
+                result = self.run_shell(rewritten + "\nexit 19", env, shell=shell)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (19, "cleanup EXIT\n", ""))
+                self.assertEqual((self.root / "cleanup-marker").read_text(), "cleaned")
+
+    def test_zsh_exit_function_retains_child_identity_without_helper_invocations(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.add_identity("codex-parent", "parent", model="claude-opus-5-5")
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        probe = self.root / "probe.sh"
+        probe.write_text("#!/bin/sh\nprintf 'called\\n' >> calls\npsql\n")
+        probe.chmod(0o755)
+        command = "TRAPEXIT() { ./probe.sh; }"
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                (self.root / "calls").unlink(missing_ok=True)
+                if harness == "claude":
+                    event = self.event(command)
+                    env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+                else:
+                    event = self.event(command, session="codex-parent", agent="codex-child")
+                    env = self.shell_environment(CODEX_THREAD_ID="codex-parent", ROBOB_HARNESS="codex")
+                rewritten = self.run_adapter(harness, event)["hookSpecificOutput"]["updatedInput"]["command"]
+                suffix = "\nprintf 'context=%s\\n' \"${HARNESS_HOOKS_COMMAND_IDENTITY-unset}\"\nexit 19"
+                result = self.run_shell(rewritten + suffix, env, shell="/bin/zsh")
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (19, "context=unset\n", engine.COORD_REASON + "\n"))
+                self.assertEqual((self.root / "calls").read_text(), "called\n")
+
+    def test_zsh_exit_function_preserves_status_and_later_replacement_or_reset(self):
+        self.actor()
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        self.state.identities[("session", "agent-sibling")]["model"] = {"model": "claude-opus-5-5"}
+        probe = self.root / "probe.sh"
+        probe.write_text("#!/bin/sh\nprintf 'called\\n' >> calls\npsql\n")
+        probe.chmod(0o755)
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        command = "TRAPEXIT() { printf 'status=%s arg=%s\\n' \"$?\" \"$1\"; ./probe.sh; }"
+        first = self.run_adapter("claude", self.event(command))["hookSpecificOutput"]["updatedInput"]["command"]
+        cases = (("printf sibling", "siblingstatus=19 arg=0\n", engine.COORD_REASON + "\n", True),
+                 (command, "status=19 arg=0\nreal-psql\n", "", True),
+                 ("trap - EXIT", "", "", False))
+        for second, expected, error, called in cases:
+            with self.subTest(second=second):
+                (self.root / "calls").unlink(missing_ok=True)
+                sibling = self.run_adapter("claude", self.event(second, agent="agent-sibling"))["hookSpecificOutput"]["updatedInput"]["command"]
+                result = self.run_shell(first + "\n" + sibling + "\nexit 19", env, shell="/bin/zsh")
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (19, expected, error))
+                self.assertEqual((self.root / "calls").read_text() if called else "", "called\n" if called else "")
+                self.assertEqual((self.root / "calls").exists(), called)
+
+    def test_zsh_inherited_exit_function_is_not_run_by_snapshot_helpers(self):
+        self.actor()
+        env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
+        rewritten = self.run_adapter("claude", self.event("printf child"))["hookSpecificOutput"]["updatedInput"]["command"]
+        command = "TRAPEXIT() { printf 'called\\n' >> calls; }\n" + rewritten
+        result = self.run_shell(command, env, shell="/bin/zsh")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "child", ""))
+        self.assertEqual((self.root / "calls").read_text(), "called\n")
 
     def test_preexisting_exit_trap_runs_with_original_context(self):
         self.actor()
