@@ -19,6 +19,7 @@ import {
   type ScheduledTaskMutationResult,
   type ScheduledTaskRunNowInput,
   type ScheduledTaskRunNowResult,
+  type ModelSelection,
   type ScheduledTaskSetEnabledInput,
   type ScheduledTaskUpsertInput,
 } from "@t3tools/contracts";
@@ -153,9 +154,9 @@ const decodeScheduleJson = Schema.decodeUnknownEffect(
 const decodeWorkspaceStrategyJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ScheduledTask.fields.workspaceStrategy),
 );
-const decodeModelSelectionJson = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(ScheduledTask.fields.modelSelection),
-);
+const ModelSelectionJson = Schema.fromJsonString(ScheduledTask.fields.modelSelection);
+const decodeModelSelectionJson = Schema.decodeUnknownEffect(ModelSelectionJson);
+const encodeModelSelectionJson = Schema.encodeEffect(ModelSelectionJson);
 const HeadersJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema.String));
 const MissingFieldsJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeHeadersJson = Schema.decodeUnknownOption(HeadersJson);
@@ -216,6 +217,16 @@ export class ScheduledTaskService extends Context.Service<
     readonly setEnabled: (
       input: ScheduledTaskSetEnabledInput,
     ) => Effect.Effect<ScheduledTaskMutationResult, ScheduledTaskError>;
+    /**
+     * Rewrites only the stored model selection, and only while it still holds
+     * `expected`. Run schedule, next run, counters and webhook credentials stay as
+     * they are. Returns false when the schedule is gone or changed since it was read.
+     */
+    readonly migrateModelSelection: (input: {
+      readonly id: ScheduledTaskId;
+      readonly expected: ModelSelection;
+      readonly next: ModelSelection;
+    }) => Effect.Effect<boolean, ScheduledTaskError>;
     readonly delete: (
       input: ScheduledTaskDeleteInput,
     ) => Effect.Effect<ScheduledTaskDeleteResult, ScheduledTaskError>;
@@ -1233,6 +1244,27 @@ export const layer = Layer.effect(
       };
     });
 
+    const migrateModelSelection: ScheduledTaskService["Service"]["migrateModelSelection"] =
+      Effect.fn("ScheduledTaskService.migrateModelSelection")(function* (input) {
+        // The same codec saveTask's rows are read with, so the guard compares the stored text.
+        const next = yield* encodeModelSelectionJson(input.next).pipe(Effect.orDie);
+        const expected = yield* encodeModelSelectionJson(input.expected).pipe(Effect.orDie);
+        const updated = yield* sql<{ task_id: string }>`
+          UPDATE scheduled_tasks
+          SET model_selection_json = ${next}
+          WHERE task_id = ${input.id}
+            AND model_selection_json = ${expected}
+          RETURNING task_id
+        `.pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not migrate schedule model selection.", { taskId: input.id, cause }),
+          ),
+        );
+        if (updated.length === 0) return false;
+        yield* notifyChanged;
+        return true;
+      });
+
     const forgetWebhookTask = (id: ScheduledTaskId) =>
       Effect.all(
         [
@@ -1791,6 +1823,7 @@ export const layer = Layer.effect(
       subscribeList,
       upsert,
       setEnabled,
+      migrateModelSelection,
       delete: deleteTask,
       deleteForThread,
       runNow,

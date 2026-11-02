@@ -1089,6 +1089,18 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+/**
+ * ardud: the harness migration switch. `selections` decides what the startup
+ * SelectionMigration does: nothing (absent or "off"), log counts ("dryrun"), or
+ * rewrite stored selections ("apply"). `allowConflicts` lets "apply" run past
+ * conflicts and collisions that a dry run reported.
+ */
+export const ArdudHarnessMigrationSettings = Schema.Struct({
+  selections: Schema.optionalKey(Schema.Literals(["off", "dryrun", "apply"])),
+  allowConflicts: Schema.optionalKey(Schema.Boolean),
+});
+export type ArdudHarnessMigrationSettings = typeof ArdudHarnessMigrationSettings.Type;
+
 export const ServerSettings = Schema.Struct({
   // Null means no client has migrated this preference yet; an empty value is
   // authoritative so another device cannot resurrect cleared preferences.
@@ -1275,6 +1287,10 @@ export const ServerSettings = Schema.Struct({
   usageModelAliases: Schema.Record(TrimmedNonEmptyString, TrimmedNonEmptyString).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+
+  // ardud: the harness migration gate. Absent or "off" leaves every stored
+  // selection as it is; "dryrun" only logs counts; "apply" rewrites them.
+  ardudHarnessMigration: Schema.optionalKey(ArdudHarnessMigrationSettings),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -1544,6 +1560,7 @@ export const ServerSettingsPatch = Schema.Struct({
   usageModelAliases: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
   ),
+  ardudHarnessMigration: Schema.optionalKey(ArdudHarnessMigrationSettings),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 

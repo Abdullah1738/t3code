@@ -499,6 +499,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "queued-run.reorder":
     case "queued-run.cancel":
     case "queued-run.edit":
+    case "queued-run.rebind-selection":
     case "runtime-request.respond":
     case "thread.user-input.dismiss":
     case "checkpoint.rollback":
@@ -8419,6 +8420,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
   });
 
+  // ardud: only the harness migration sends this. Same guards as queued-run.edit;
+  // it changes the run's model and nothing else, so order, attachments, hold and
+  // the message stay as they were. A run that already started is never rebound.
+  const dispatchQueuedRunRebindSelection = Effect.fn(
+    "Orchestrator.dispatchQueuedRunRebindSelection",
+  )(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "queued-run.rebind-selection" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const projection = yield* projectionStore
+      .getThreadRecords(command.threadId, ["runs"])
+      .pipe(Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })));
+    const queuedRun = projection.runs.find((candidate) => candidate.id === command.runId);
+    if (queuedRun === undefined || queuedRun.status !== "queued") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Run ${command.runId} is not queued.`,
+      });
+    }
+    if (modelSelectionsEqual(queuedRun.modelSelection, command.modelSelection)) return;
+    const now = yield* DateTime.now;
+    const emitEvent = emit(events, command);
+    yield* emitEvent({
+      type: "run.updated",
+      threadId: command.threadId,
+      runId: queuedRun.id,
+      providerInstanceId: command.modelSelection.instanceId,
+      occurredAt: now,
+      payload: {
+        ...queuedRun,
+        providerInstanceId: command.modelSelection.instanceId,
+        modelSelection: command.modelSelection,
+      },
+    });
+  });
+
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
     command: OrchestrationV2Command,
     fields: ReadonlyArray<K>,
@@ -11585,6 +11626,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "queued-run.edit":
         yield* dispatchQueuedRunEdit(command, events);
+        break;
+      case "queued-run.rebind-selection":
+        yield* dispatchQueuedRunRebindSelection(command, events);
         break;
       case "checkpoint.rollback":
         yield* dispatchCheckpointRollback(command, events, effects);

@@ -3081,6 +3081,16 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  // ardud: the harness migration (SelectionMigration) rebinds a queued run's
+  // stored selection. Only that path may change a queued run's model, so the
+  // command is server-only. The run keeps its order, attachments and hold.
+  Schema.Struct({
+    type: Schema.Literal("queued-run.rebind-selection"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    modelSelection: ModelSelection,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),
     commandId: CommandId,

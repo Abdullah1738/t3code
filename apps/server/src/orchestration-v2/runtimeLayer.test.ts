@@ -5798,6 +5798,145 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(cancelAgainError._tag, "OrchestratorDispatchError");
     }),
   );
+
+  it.effect("rebinds a queued run's selection and keeps its place and hold", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-queued-rebind-thread");
+
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-queued-rebind-create"),
+        threadId,
+        projectId: ProjectId.make("runtime-layer-queued-rebind-project"),
+        title: "Rebind queued work",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-queued-rebind",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-queued-rebind-active-message"),
+        threadId,
+        messageId: MessageId.make("runtime-layer-queued-rebind-active-message"),
+        text: "Keep the provider occupied.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-queued-rebind-first"),
+        threadId,
+        messageId: MessageId.make("runtime-layer-queued-rebind-first"),
+        text: "First queued.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-queued-rebind-second"),
+        threadId,
+        messageId: MessageId.make("runtime-layer-queued-rebind-second"),
+        text: "Second queued.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const [first, second] = before.runs
+        .filter((run) => run.status === "queued")
+        .toSorted((left, right) => left.ordinal - right.ordinal);
+      assert.isDefined(first);
+      assert.isDefined(second);
+      const rebound = {
+        instanceId: alternateInstanceId,
+        model: "gpt-5.4",
+      } satisfies ModelSelection;
+
+      yield* orchestrator.dispatch({
+        type: "queued-run.rebind-selection",
+        commandId: CommandId.make("runtime-layer-queued-rebind-rebind"),
+        threadId,
+        runId: first.id,
+        modelSelection: rebound,
+      });
+
+      const afterRebind = yield* orchestrator.getThreadProjection(threadId);
+      const reboundRun = afterRebind.runs.find((run) => run.id === first.id);
+      assert.deepEqual(reboundRun?.modelSelection, rebound);
+      assert.equal(reboundRun?.providerInstanceId, alternateInstanceId);
+      assert.equal(reboundRun?.status, "queued", "a rebind must not start or cancel the run");
+      assert.equal(reboundRun?.ordinal, first.ordinal, "a rebind must keep the run's ordinal");
+      assert.equal(
+        reboundRun?.queuePosition,
+        first.queuePosition,
+        "a rebind must keep the run's queue position",
+      );
+      assert.equal(
+        reboundRun?.queueHeld,
+        first.queueHeld,
+        "a rebind must keep the run's hold as it was",
+      );
+      assert.deepEqual(
+        afterRebind.runs.find((run) => run.id === second.id)?.modelSelection,
+        modelSelection,
+        "a rebind must leave the other queued run alone",
+      );
+      assert.deepEqual(
+        afterRebind.messages.find((message) => message.id === first.userMessageId)?.text,
+        "First queued.",
+        "a rebind must not change the queued message",
+      );
+
+      // A rebind to the selection the run already has produces no events, so it's refused like
+      // any other empty dispatch. The migration checks for that before it sends the command.
+      const sameError = yield* orchestrator
+        .dispatch({
+          type: "queued-run.rebind-selection",
+          commandId: CommandId.make("runtime-layer-queued-rebind-same"),
+          threadId,
+          runId: first.id,
+          modelSelection: rebound,
+        })
+        .pipe(Effect.flip);
+      assert.equal(sameError._tag, "OrchestratorDispatchError");
+      const afterSame = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(afterSame.runs.find((run) => run.id === first.id)?.modelSelection, rebound);
+
+      const started = before.runs.find((run) => run.status !== "queued");
+      assert.isDefined(started);
+      const startedRejected = yield* orchestrator
+        .dispatch({
+          type: "queued-run.rebind-selection",
+          commandId: CommandId.make("runtime-layer-queued-rebind-started"),
+          threadId,
+          runId: started.id,
+          modelSelection: rebound,
+        })
+        .pipe(Effect.flip);
+      // Only queued-run.edit gets a rejection receipt; a migration command's refusal is the dispatch error itself.
+      assert.equal(startedRejected._tag, "OrchestratorDispatchError");
+      const afterRejected = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        afterRejected.runs.find((run) => run.id === started.id)?.modelSelection,
+        started.modelSelection,
+        "a run that already started keeps its stored selection",
+      );
+    }),
+  );
 });
 
 it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (it) => {
