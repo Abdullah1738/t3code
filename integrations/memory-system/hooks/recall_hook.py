@@ -194,7 +194,73 @@ def body_base(identity: dict, event: dict, cfg: dict) -> dict:
 
 
 def text(value) -> str:
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def result_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        inner = next((value[k] for k in ("value", "text", "output") if value.get(k) is not None), None)
+        if isinstance(inner, str):
+            return inner
+        if isinstance(inner, list):
+            return "\n".join(x if isinstance(x, str) else x.get("text", "")
+                             if isinstance(x, dict) and isinstance(x.get("text"), str) else "" for x in inner)
+        if inner is not None:
+            value = inner
+    return js_head(text(value), 4000)
+
+
+def js_length(value: str) -> int:
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def js_head(value: str, length: int) -> str:
+    return value.encode("utf-16-le", "surrogatepass")[:length * 2].decode("utf-16-le", "surrogatepass")
+
+
+def js_tail(value: str, length: int) -> str:
+    return value.encode("utf-16-le", "surrogatepass")[-length * 2:].decode("utf-16-le", "surrogatepass")
+
+
+def squash(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def clip(value: str, length: int) -> str:
+    return value if js_length(value) <= length else js_head(value, length) + "…"
+
+
+QUIET_TOOLS = re.compile(r"(^|[_.-])(read|grep|glob|list|ls|search|fetch|view|skill|todo)", re.I)
+STRONG_ERR = re.compile(r"Traceback \(most recent call last\)|^\s*(?:error|fatal|panic)\b[\s:\[]|"
+                        r"command not found|No such file or directory|Permission denied|Connection refused|"
+                        r"ECONNREFUSED|ETIMEDOUT|AssertionError|Unhandled exception", re.I | re.M)
+EXIT_RE = re.compile(r"\b(?:exit code|exit status|exited with code|returned non-zero exit status):? ([1-9]\d*)", re.I)
+NO_MATCH_OK = re.compile(r'(^|[|;&(]\s*|\bxargs\s+|"command":\s*")(grep|egrep|fgrep|rg|ag|diff|cmp|test|\[)\b')
+
+
+def looks_failed(result: str, command: str) -> bool:
+    sample = js_head(result, 400) + "\n" + js_tail(result, 1500)
+    if STRONG_ERR.search(sample) or re.search(r"\bFAILED\b", sample):
+        return True
+    match = EXIT_RE.search(sample)
+    return bool(match and not (match.group(1) == "1" and NO_MATCH_OK.search(command)))
+
+
+def append_activity(state: dict, lines: list[str]):
+    retained = []
+    size = 0
+    prior = [line for item in state["activity"] for line in item.split("\n")]
+    for line in reversed(prior + lines):
+        length = js_length(line)
+        if size + length > 6000:
+            break
+        retained.append(line)
+        size += length + 1
+    state["activity"] = list(reversed(retained))
 
 
 def should_skip_prompt(prompt: str) -> bool:
@@ -352,38 +418,24 @@ def add_activity(state: dict, event: dict, now: float):
         state["calls"] += 1
     state["last_event"] = now
     name = str(event.get("tool_name") or "tool")[:100]
-    result = text(event.get("tool_response") or event.get("tool_result") or event.get("error") or "")
-    failure = event.get("hook_event_name") == "PostToolUseFailure" or event.get("is_error") is True
-    if not failure and not re.search(r"(^|[_.-])(read|grep|glob|list|ls|search|fetch|view|skill|todo)", name, re.I):
-        failure = bool(re.search(r"Traceback \(most recent call last\)|^\s*(?:error|fatal|panic)\b|"
-                                 r"command not found|Permission denied|Connection refused|ECONNREFUSED|ETIMEDOUT|"
-                                 r"AssertionError|(?:exit code|exit status):? [1-9]\d*", result, re.I | re.M)
-                       or re.search(r"\bFAILED\b", result))
-        if failure and re.search(r"(?:exit code|exit status):? 1\b", result, re.I):
-            command = event.get("tool_input") or {}
-            command = command.get("command", "") if isinstance(command, dict) else ""
-            if re.search(r"(?:^|[|;&(]\s*)(?:grep|egrep|fgrep|rg|ag|diff|cmp|test)\b", command):
-                failure = False
-    # Arbitrary shell output and nested inputs can contain unlabelled OTPs or
-    # credentials, so pattern-based redaction cannot make excerpts safe.
-    # Preserve tool and failure signals, never raw input or output content.
     name = "tool" if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name) else name
-    raw_result = result
-    inp, result = "[tool input omitted]", "[tool output omitted]"
-    compact = lambda x: re.sub(r"\s+", " ", x).strip()
-    state["activity"].append(f"call {name}: {compact(inp)[:240]}\nresult {name}: {compact(result)[:400]}")
-    state["activity"] = state["activity"][-100:]
+    raw_input = event.get("tool_input")
+    inp = js_head(text(raw_input), 2000) if raw_input is not None else ""
+    value = next((event[k] for k in ("tool_response", "tool_result", "error") if event.get(k) is not None), None)
+    result = result_text(value)
+    failure = (event.get("hook_event_name") == "PostToolUseFailure" or event.get("is_error") is True or
+               isinstance(value, dict) and value.get("type") == "error" or
+               not QUIET_TOOLS.search(name) and looks_failed(result, inp))
+    lines = [f"call {name}: {clip(squash(js_head(inp, 600)), 240)}"]
     if failure:
-        # Only fixed diagnostic vocabulary is retained; never persist arbitrary
-        # fragments of output (which can include unlabeled secrets).
-        allowed = ("ECONNREFUSED", "ETIMEDOUT", "ECONNRESET", "ENOENT", "EACCES", "EPIPE",
-                   "ModuleNotFoundError", "ImportError", "TypeError", "ValueError", "AssertionError",
-                   "PermissionError", "FileNotFoundError", "TimeoutError", "ConnectionError")
-        markers = [item for item in allowed if re.search(r"\b" + re.escape(item) + r"\b", raw_result)]
-        err = f"{name}: " + (", ".join(markers) if markers else "tool failure")
-        normalized = re.sub(r"\d+", "#", re.sub(r"(?:0x)?[0-9a-f]{8,}", "#", compact(raw_result[-300:]), flags=re.I))
-        sig = hashlib.sha256((name + "|" + normalized).encode()).hexdigest()
+        err = clip(f"{name}: {clip(squash(js_head(result, 300)), 200)} … {squash(js_tail(result, 500))}", 700)
+        normalized = re.sub(r"\d+", "#", re.sub(r"(?:0x)?[0-9a-f]{8,}", "#", squash(js_tail(result, 300)), flags=re.I))
+        sig = hashlib.sha256((name + "|" + normalized).encode("utf-8", "surrogatepass")).hexdigest()
         state["errors"] = (state["errors"] + [[sig, err]])[-100:]
+        lines.append("FAILED " + err)
+    else:
+        lines.append(f"result {name}: {clip(squash(js_head(result, 400)), 160)}")
+    append_activity(state, lines)
 
 
 def prepare_work(state: dict, cfg: dict, now: float) -> bool:
@@ -460,10 +512,25 @@ def worker(job: str):
 
 def handle(harness: str, event: dict):
     cfg = config()
-    if cfg["mode"] not in ("on", "observe"):
-        return
     name = event.get("hook_event_name")
-    if name not in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart"):
+    if name not in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart",
+                    "Stop", "SubagentStop", "SessionEnd"):
+        return
+    native = native_key(harness, event)
+    if name in ("Stop", "SubagentStop", "SessionEnd"):
+        # Cleanup still runs if recall was disabled mid-turn, without creating a new database.
+        if not native or not os.path.exists(state_path()):
+            return
+        db = Store(state_path(), cfg["note_ttl_days"])
+        try:
+            with db.transaction():
+                now = time.time()
+                db.prune(now)
+                db.end_turn(native, turn_id(harness, event), now)
+        finally:
+            db.close()
+        return
+    if cfg["mode"] not in ("on", "observe"):
         return
     if name == "PostToolUseFailure" and harness != "claude":
         return
@@ -485,7 +552,6 @@ def handle(harness: str, event: dict):
             db.close()
     identity_event = ({k: v for k, v in event.items() if k != "agent_id"}
                       if name == "SubagentStart" and harness == "claude" else event)
-    native = native_key(harness, event)
     if not native:
         return
     prompt_generation = uuid.uuid4().hex if name == "UserPromptSubmit" else None
@@ -552,7 +618,7 @@ def handle(harness: str, event: dict):
                 # Existing pre-guard state cannot be safely bound retroactively.
                 if name != "UserPromptSubmit":
                     return
-                db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+                db.discard_turn(key, state)
                 state = None
             if state and state.get("invalidated") and name != "UserPromptSubmit":
                 return
@@ -587,15 +653,17 @@ def handle(harness: str, event: dict):
                 else:
                     provisional = False
                 if skipped:
+                    if state:
+                        db.discard_turn(key, state)
                     state = next_turn(state, tid, "", now, provisional)
                     state["_native_key"] = native
-                    db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
                     db.save(key, state, now)
                     db.release_prompt(native, prompt_generation)
                     return
                 if not state or state.get("invalidated") or state["turn"] != tid or state["task"] != prompt[:6000]:
+                    if state:
+                        db.discard_turn(key, state)
                     state = next_turn(state, tid, prompt, now, provisional)
-                    db.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
                 state["_native_key"] = native
                 if is_child:
                     db.save(key, state, now)
@@ -633,7 +701,7 @@ def handle(harness: str, event: dict):
                         state["checks"] += 1
                         state["last_step"], state["last_check"] = state["calls"], now
                         state["seen_errors"] = list(dict.fromkeys(state["seen_errors"] + [x[0] for x in state["errors"]]))[-300:]
-                        activity = "\n".join(state["activity"])[-6000:]
+                        activity = "\n".join(state["activity"]).strip()
                         known = db.parent_recent(identity) + db.recent(key)
                         work_body = {**body_base(identity, event, cfg), "mode": "work", "prompt": state["task"],
                                      "activity": activity, "errors": [x[1] for x in state["errors"][-3:]],

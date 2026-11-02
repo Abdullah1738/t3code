@@ -169,17 +169,16 @@ class RecallHookTests(unittest.TestCase):
         self.assertEqual(self.state()["calls"], 1)
         self.assertEqual(self.jobs, [])
 
-    def test_distinct_failure_signatures_keep_only_safe_diagnostic_markers(self):
+    def test_distinct_failure_signatures_and_error_excerpts(self):
         self.call(self.event())
         self.call(self.event("PostToolUseFailure", tool_use_id="err-a", tool_name="Bash",
-                             error="ECONNREFUSED password=fixtureSuperSecret"), now=1100)
+                             error="ECONNREFUSED connecting to service 123"), now=1100)
         self.call(self.event("PostToolUseFailure", tool_use_id="err-b", tool_name="Bash",
-                             error="ModuleNotFoundError token=fixtureOtherSecret"), now=1103)
+                             error="ModuleNotFoundError missing package"), now=1103)
         errors = self.state()["errors"]
         self.assertNotEqual(errors[-2][0], errors[-1][0])
-        self.assertIn("ECONNREFUSED", errors[-2][1])
-        self.assertIn("ModuleNotFoundError", errors[-1][1])
-        self.assertNotIn("fixture", json.dumps(errors))
+        self.assertEqual(errors[-2][1], "Bash: ECONNREFUSED connecting to service 123 … ECONNREFUSED connecting to service 123")
+        self.assertEqual(errors[-1][1], "Bash: ModuleNotFoundError missing package … ModuleNotFoundError missing package")
 
     def test_first_work_mailbox_next_hook_and_known_cited(self):
         self.call(self.event())
@@ -191,9 +190,8 @@ class RecallHookTests(unittest.TestCase):
         self.assertEqual(body["known"], ["past fact"])
         self.assertEqual(body["already"], ["old"])
         self.assertEqual(body["session_id"], "root")
-        self.assertIn("[tool input omitted]", body["activity"])
-        self.assertIn("[tool output omitted]", body["activity"])
-        self.assertNotIn("make thing", body["activity"])
+        self.assertIn('call Bash: {"command":"make thing"}', body["activity"])
+        self.assertIn("result Bash: ok", body["activity"])
         output = self.call(self.event("PostToolUse", tool_use_id="next"), now=1200)
         self.assertEqual(output["hookSpecificOutput"]["additionalContext"], "<recall>\npast fact\n</recall>")
         self.assertIsNone(self.call(self.event("PostToolUse", tool_use_id="next2"), now=1201))
@@ -261,27 +259,240 @@ class RecallHookTests(unittest.TestCase):
             self.assertIsNone(self.call(self.event(prompt_id="turn-2"), now=1005))
         self.assertNotIn("during-lookup", self.state()["seen_tools"])
 
-    def test_tool_content_is_never_persisted_or_sent_in_work_payload(self):
+    def test_tool_content_is_persisted_and_sent_in_work_payload(self):
         self.call(self.event())
-        dummy_secrets = ["dummy-password-abc", "dummy-otp-741983", "dummy-token-qwerty",
-                         "dummy-output-secret", "dummy-raw-code-390872"]
         self.call(self.event("PostToolUseFailure", tool_use_id="private", tool_name="Bash",
-                             tool_input={"password": dummy_secrets[0], "otpCode": dummy_secrets[1],
-                                         "nested": {"accessToken": dummy_secrets[2]}},
-                             tool_response="error: " + " ".join(dummy_secrets[3:])), now=1100)
+                             tool_input={"command": "make fixture"},
+                             tool_response="error: fixture build failed"), now=1100)
         self.work(7, start=1103)
         hook.worker(self.jobs.pop())
-        self.assertEqual(self.server.requests[-1]["mode"], "work")
-        self.assertEqual(self.server.requests[-1]["errors"][0], "Bash: tool failure")
+        body = self.server.requests[-1]
+        self.assertEqual(body["mode"], "work")
+        self.assertEqual(body["errors"], ["Bash: error: fixture build failed … error: fixture build failed"])
+        self.assertIn('call Bash: {"command":"make fixture"}', body["activity"])
+        self.assertIn("FAILED " + body["errors"][0], body["activity"])
         db = sqlite3.connect(self.state_file)
         try:
-            persisted = " ".join(str(cell) for table in ("sessions", "jobs", "notes", "mailbox", "seeds")
-                                 for row in db.execute(f"SELECT * FROM {table}") for cell in row)
+            persisted = db.execute("SELECT state FROM sessions").fetchone()[0]
         finally:
             db.close()
-        for secret in dummy_secrets:
-            self.assertNotIn(secret, persisted)
-            self.assertNotIn(secret, json.dumps(self.server.requests))
+        self.assertIn("make fixture", persisted)
+        self.assertIn("fixture build failed", persisted)
+
+    def test_exact_input_and_result_clips_match_plugin(self):
+        state = hook.new_turn("turn", "task", 0)
+        hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": "1",
+            "tool_input": "A" * 240 + "B" * 30,
+            "tool_response": "C" * 160 + "D" * 30}, 0)
+        self.assertEqual(state["activity"], ["call Bash: " + "A" * 240 + "…",
+                                             "result Bash: " + "C" * 160 + "…"])
+        # Slice the original string before squashing whitespace, not after.
+        hook.add_activity(state, {"tool_name": "Read", "tool_use_id": "2",
+            "tool_input": " " * 500 + "X" * 120,
+            "tool_response": " " * 350 + "Y" * 100}, 3)
+        self.assertEqual(state["activity"][-2:], ["call Read: " + "X" * 100,
+                                                  "result Read: " + "Y" * 50])
+        # JavaScript clips UTF-16 code units, including a character split at the boundary.
+        hook.add_activity(state, {"tool_name": "Read", "tool_use_id": "3",
+            "tool_input": "Z" * 239 + "😀tail", "tool_response": "ok"}, 6)
+        self.assertEqual(state["activity"][-2], "call Read: " + "Z" * 239 + "\ud83d…")
+
+    def test_error_head_tail_and_outer_clip_are_exact(self):
+        self.call(self.event())
+        result = "H" * 220 + "OMIT-MIDDLE" + "M" * 1000 + " " * 30 + "T" * 466 + "\nEND"
+        self.call(self.event("PostToolUseFailure", tool_use_id="err", tool_name="Bash",
+                             tool_input={"command": "make broken"}, error=result), now=1100)
+        self.work(7, start=1103)
+        hook.worker(self.jobs.pop())
+        body = self.server.requests[-1]
+        expected = "Bash: " + "H" * 200 + "… … " + "T" * 466 + " END"
+        self.assertEqual(body["errors"], [expected])
+        self.assertIn("FAILED " + expected, body["activity"])
+        self.assertNotIn("OMIT-MIDDLE", body["activity"])
+        state = hook.new_turn("turn", "task", 0)
+        hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": "2", "is_error": True,
+                                  "tool_response": "H" * 300 + "T" * 500}, 0)
+        capped = "Bash: " + "H" * 200 + "… … " + "T" * 490 + "…"
+        self.assertEqual(state["errors"][0][1], capped)
+        self.assertEqual(len(capped), 701)
+
+    def test_error_classification_and_signature_dedupe(self):
+        state = hook.new_turn("turn", "task", 0)
+        for i, result in enumerate(("fatal: job 123 at 0xdeadbeef12345678",
+                                    "fatal: job 456 at 0x1234567890abcdef")):
+            hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": str(i),
+                                      "tool_response": result}, i * 3)
+        self.assertEqual(state["errors"][0][0], state["errors"][1][0])
+        hook.add_activity(state, {"tool_name": "Read", "tool_use_id": "read",
+                                  "tool_response": "fatal: quoted error"}, 6)
+        hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": "grep",
+                                  "tool_input": {"command": "grep missing file"},
+                                  "tool_response": "exited with code: 1"}, 9)
+        self.assertEqual(len(state["errors"]), 2)
+        hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": "real",
+                                  "tool_input": {"command": "grep missing file"},
+                                  "tool_response": "Permission denied\nexit code: 1"}, 12)
+        self.assertEqual(len(state["errors"]), 3)
+
+    def test_structured_results_and_last_three_errors_reach_work_payload(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUse", tool_use_id="structured", tool_name="Bash",
+                             tool_response={"value": [{"text": "first"}, "second", {"other": "ignored"}]}), now=1100)
+        self.assertEqual(self.state()["activity"][-1], "result Bash: first second")
+        for i in range(4):
+            self.call(self.event("PostToolUseFailure", tool_use_id=f"err-{i}", tool_name="Bash",
+                                 error=f"error {i}"), now=1103 + i * 3)
+        self.work(3, start=1116)
+        hook.worker(self.jobs.pop())
+        self.assertEqual(self.server.requests[-1]["errors"],
+                         [f"Bash: error {i} … error {i}" for i in range(1, 4)])
+
+    def test_activity_cap_keeps_whole_most_recent_lines(self):
+        state = hook.new_turn("turn", "task", 0)
+        for i in range(40):
+            hook.add_activity(state, {"tool_name": "Bash", "tool_use_id": str(i),
+                "tool_input": f"{i:02d}" + "I" * 250,
+                "tool_response": f"{i:02d}" + "O" * 180}, i * 3)
+        all_lines = []
+        for i in range(40):
+            all_lines.extend([f"call Bash: {i:02d}" + "I" * 238 + "…",
+                              f"result Bash: {i:02d}" + "O" * 158 + "…"])
+        expected = ""
+        for line in reversed(all_lines):
+            if len(expected) + len(line) > 6000:
+                break
+            expected = line + "\n" + expected
+        self.assertEqual("\n".join(state["activity"]), expected.strip())
+        self.assertLessEqual(len(expected.strip()), 6000)
+        self.assertTrue(expected.strip().endswith("result Bash: 39" + "O" * 158 + "…"))
+
+    def test_turn_change_clears_activity_errors_and_old_job_payload(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUseFailure", tool_use_id="old-error", tool_name="Bash",
+                             tool_input={"command": "old-command"}, error="old failure"), now=1100)
+        self.work(7, start=1103)
+        job = self.jobs.pop()
+        db = Store(str(self.state_file))
+        try:
+            self.assertIn("old failure", json.dumps(db.job(job)))
+        finally:
+            db.close()
+        self.call(self.event(prompt_id="turn-2", prompt="Investigate another issue"), now=1130)
+        state = self.state()
+        self.assertEqual((state["activity"], state["errors"], state["seen_errors"]), ([], [], []))
+        db = Store(str(self.state_file))
+        try:
+            self.assertIsNone(db.job(job))
+            stored = db.db.execute("SELECT state FROM sessions").fetchone()[0]
+            self.assertNotIn("old-command", stored)
+            self.assertNotIn("old failure", stored)
+        finally:
+            db.close()
+        request_count = len(self.server.requests)
+        hook.worker(job)
+        self.assertEqual(len(self.server.requests), request_count)
+        self.call(self.event("PostToolUse", prompt_id="turn-2", tool_use_id="new",
+                             tool_input="new-input", tool_response="new-result"), now=1140)
+        self.call(self.event(prompt_id="turn-2", prompt="Same id, different prompt"), now=1150)
+        self.assertEqual((self.state()["activity"], self.state()["errors"]), ([], []))
+
+    def test_failed_prompt_resolution_clears_active_digest_and_jobs(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUseFailure", tool_use_id="old-error", error="old failure"), now=1100)
+        self.work(7, start=1103)
+        job = self.jobs.pop()
+        self.server.resolution = "pending"
+        self.call(self.event(prompt_id="turn-2", prompt="Next task"), now=1130)
+        self.assertTrue(self.state()["invalidated"])
+        self.assertEqual((self.state()["activity"], self.state()["errors"]), ([], []))
+        db = Store(str(self.state_file))
+        try:
+            self.assertIsNone(db.job(job))
+        finally:
+            db.close()
+
+    def test_end_events_clear_only_the_matching_turn_and_block_late_work(self):
+        for i, end in enumerate(("Stop", "SubagentStop", "SessionEnd")):
+            with self.subTest(end=end):
+                turn = f"turn-{i}"
+                start = 1000 + i * 100
+                self.call(self.event(prompt_id=turn, prompt=f"Investigate task {i}"), now=start)
+                self.call(self.event("PostToolUseFailure", prompt_id=turn, tool_use_id=f"err-{i}",
+                                     error="failure to clear"), now=start + 3)
+                self.call(self.event(end, prompt_id="stale-turn"), now=start + 4)
+                self.assertTrue(self.state()["errors"])
+                self.call(self.event(end, prompt_id=turn), now=start + 5)
+                state = self.state()
+                self.assertEqual((state["activity"], state["errors"]), ([], []))
+                self.assertTrue(state["invalidated"])
+                self.assertIsNone(self.call(self.event("PostToolUse", prompt_id=turn,
+                                                      tool_use_id=f"late-{i}"), now=start + 6))
+                self.assertEqual(self.state()["activity"], [])
+
+    def test_end_clears_pending_job_even_if_recall_was_disabled(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUseFailure", tool_use_id="err", error="failure to clear"), now=1100)
+        self.work(7, start=1103)
+        job = self.jobs.pop()
+        self.config_file.write_text(json.dumps({"mode": "off"}))
+        self.call(self.event("Stop"), now=1130)
+        self.assertEqual((self.state()["activity"], self.state()["errors"]), ([], []))
+        db = Store(str(self.state_file))
+        try:
+            self.assertIsNone(db.job(job))
+        finally:
+            db.close()
+
+    def test_end_during_prompt_resolution_does_not_invalidate_new_turn(self):
+        self.call(self.event())
+        self.call(self.event("PostToolUseFailure", tool_use_id="old", error="remove old error"), now=1003)
+        actual_resolve = hook.resolve
+        def resolve_with_late_end(harness, event):
+            if event.get("hook_event_name") == "UserPromptSubmit":
+                hook.handle("claude", self.event("Stop", prompt_id="turn-1"))
+                self.assertEqual((self.state()["activity"], self.state()["errors"]), ([], []))
+            return actual_resolve(harness, event)
+        with mock.patch.object(hook, "resolve", side_effect=resolve_with_late_end):
+            self.call(self.event(prompt_id="turn-2", prompt="Investigate the next issue"), now=1010)
+        self.assertEqual(self.state()["turn"], "turn-2")
+        self.assertFalse(self.state().get("invalidated", False))
+        self.call(self.event("PostToolUse", prompt_id="turn-2", tool_use_id="new",
+                             tool_input="new input"), now=1020)
+        self.assertIn("new input", "\n".join(self.state()["activity"]))
+
+    def test_ttl_prunes_expired_session_and_its_fresh_jobs(self):
+        db = Store(str(self.state_file), ttl_days=1)
+        try:
+            with db.transaction():
+                old = hook.new_turn("old", "task", 100)
+                old["activity"], old["errors"] = ["old excerpt"], [["signature", "old error"]]
+                fresh = hook.new_turn("fresh", "task", 101)
+                db.save("old-key", old, 100)
+                db.save("fresh-key", fresh, 101)
+                old_job = db.enqueue("old-key", old, {"activity": "old excerpt"}, 86500)
+                fresh_job = db.enqueue("fresh-key", fresh, {"activity": "fresh excerpt"}, 86500)
+                db.db.execute("INSERT INTO notes VALUES (?, ?, ?)", ("old-key", "old note", 100))
+                db.db.execute("INSERT INTO notes VALUES (?, ?, ?)", ("fresh-key", "fresh note", 101))
+                db.prune(86501)
+                self.assertIsNone(db.get("old-key"))
+                self.assertIsNone(db.job(old_job))
+                self.assertIsNotNone(db.get("fresh-key"))
+                self.assertIsNotNone(db.job(fresh_job))
+                self.assertEqual(db.recent("old-key"), [])
+                self.assertEqual(db.recent("fresh-key"), ["fresh note"])
+        finally:
+            db.close()
+
+    def test_state_file_is_private_for_new_and_existing_database(self):
+        self.state_file.touch(mode=0o666)
+        os.chmod(self.state_file, 0o666)
+        db = Store(str(self.state_file))
+        db.close()
+        self.assertEqual(self.state_file.stat().st_mode & 0o777, 0o600)
+        self.state_file.unlink()
+        db = Store(str(self.state_file))
+        db.close()
+        self.assertEqual(self.state_file.stat().st_mode & 0o777, 0o600)
 
     def test_backoff_error_trigger_limit_and_compaction(self):
         self.server.answer = {"note": None, "sources": []}
@@ -402,6 +613,8 @@ class RecallHookTests(unittest.TestCase):
                 self.assertIsNone(self.call(self.event("PostToolUse", prompt_id=f"skip-{i}",
                                                       tool_use_id=f"next-{i}"), now=1140 + n))
                 self.assertEqual(self.state()["task"], "")
+                self.assertEqual(self.state()["errors"], [])
+                self.assertNotIn("make thing", "\n".join(self.state()["activity"]))
                 self.assertEqual(len(self.server.requests), count)
 
     def test_provisional_turn_adopts_real_id_and_rejects_stale_events(self):
@@ -554,8 +767,9 @@ class RecallManifestTests(unittest.TestCase):
         generator.validate_manifest(manifest)
         claude = generator.claude_hooks(manifest["hooks"], "claude")
         codex = generator.codex_hooks_json(manifest["hooks"])["hooks"]
-        self.assertEqual(set(claude), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart"})
-        self.assertEqual(set(codex), {"UserPromptSubmit", "PostToolUse", "SubagentStart"})
+        end_events = {"Stop", "SubagentStop", "SessionEnd"}
+        self.assertEqual(set(claude), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart"} | end_events)
+        self.assertEqual(set(codex), {"UserPromptSubmit", "PostToolUse", "SubagentStart"} | end_events)
         self.assertEqual(manifest["homeHarnesses"]["codex-cu"], "codex")
         for event, groups in claude.items():
             self.assertTrue(all("--harness claude" in g["hooks"][0]["command"] for g in groups))

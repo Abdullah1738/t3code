@@ -27,7 +27,7 @@ PERSONAL_HOMES = ("~/.claude", "~/.codex", "/Volumes/ExternalSSD/codex")
 INLINE_KEYS = {"http_headers", "env", "set"}
 CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
-HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SessionStart")
+HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop", "SessionStart", "SessionEnd")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 
 
@@ -348,7 +348,8 @@ def codex_hook_trust_failures(home: str, config: dict, positions: list[tuple], f
     # hash = canonical JSON of the normalized event, matcher and single handler.
     labels = {"UserPromptSubmit": "user_prompt_submit", "PostToolUse": "post_tool_use",
               "SubagentStart": "subagent_start", "PreToolUse": "pre_tool_use",
-              "SessionStart": "session_start"}
+              "SessionStart": "session_start", "Stop": "stop", "SubagentStop": "subagent_stop",
+              "SessionEnd": "session_end"}
     hooks = config.get("hooks", {})
     state = hooks.get("state", {}) if isinstance(hooks, dict) else {}
     if not isinstance(state, dict):

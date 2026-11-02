@@ -32,9 +32,15 @@
     {"harness": "claude", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
     {"harness": "claude", "event": "PostToolUseFailure", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
     {"harness": "claude", "event": "SubagentStart", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "Stop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "SubagentStop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
+    {"harness": "claude", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
     {"harness": "codex", "event": "UserPromptSubmit", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
     {"harness": "codex", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
-    {"harness": "codex", "event": "SubagentStart", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
+    {"harness": "codex", "event": "SubagentStart", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
+    {"harness": "codex", "event": "Stop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
+    {"harness": "codex", "event": "SubagentStop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15},
+    {"harness": "codex", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
   ],
   "codexModels": {
     "catalogSource": "vendor/codex-models-0.166.0.json",

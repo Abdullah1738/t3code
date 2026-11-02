@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -24,7 +25,8 @@ ORACLE_HASH = {
     "PostToolUse": "sha256:142a148b5dc091dbeb7dbd33f3ac2cd410fe2f1781b7381d286896f657f25b6e",
     "SubagentStart": "sha256:cf651b4c22a5fce355e3c6d631acdd72209689bbaf6dd3ee463841194db02f4e",
 }
-LABEL = {"UserPromptSubmit": "user_prompt_submit", "PostToolUse": "post_tool_use", "SubagentStart": "subagent_start"}
+LABEL = {"UserPromptSubmit": "user_prompt_submit", "PostToolUse": "post_tool_use", "SubagentStart": "subagent_start",
+         "Stop": "stop", "SubagentStop": "subagent_stop", "SessionEnd": "session_end"}
 
 
 class RecallHomeTests(unittest.TestCase):
@@ -70,7 +72,13 @@ class RecallHomeTests(unittest.TestCase):
             self.assertEqual(len(indices), 1)
             i, j = indices[0]
             key = f"{os.path.realpath(home / 'hooks.json')}:{label}:{i}:{j}"
-            state[key] = {"trusted_hash": "sha256:invalid" if bad_hash else ORACLE_HASH[name]}
+            wanted = groups[name][i]
+            identity = {"event_name": label, "hooks": [{**wanted["hooks"][j], "async": False}]}
+            if "matcher" in wanted:
+                identity["matcher"] = wanted["matcher"]
+            derived = "sha256:" + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                                                             separators=(",", ":")).encode()).hexdigest()
+            state[key] = {"trusted_hash": "sha256:invalid" if bad_hash else ORACLE_HASH.get(name, derived)}
             if disabled:
                 state[key]["enabled"] = False
         path.write_text(gh.toml_dump(config))

@@ -30,11 +30,15 @@ class Store:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Create private from the start, even under a permissive umask.
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        os.close(fd)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         self.path = path
         self.ttl = max(1.0, float(ttl_days)) * 86400
         self.db = sqlite3.connect(path, timeout=3, isolation_level=None)
         self.db.execute("PRAGMA busy_timeout=3000")
+        self.db.execute("PRAGMA secure_delete=ON")
         try:
             self.db.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -76,6 +80,9 @@ class Store:
 
     def prune(self, now: float):
         cutoff = now - self.ttl
+        for table in ("jobs", "mailbox"):
+            self.db.execute(f"DELETE FROM {table} WHERE key IN (SELECT key FROM sessions WHERE updated < ?)",
+                            (cutoff,))
         for table, column in (("sessions", "updated"), ("notes", "created"),
                               ("jobs", "created"), ("mailbox", "created"), ("seeds", "created")):
             self.db.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
@@ -104,6 +111,31 @@ class Store:
     def release_prompt(self, native_key: str, generation: str):
         self.db.execute("DELETE FROM prompt_guards WHERE native_key=? AND generation=?", (native_key, generation))
 
+    def discard_turn(self, key: str, state: dict):
+        # Jobs contain the same excerpts as the session, and may be waiting for a worker.
+        self.db.execute("DELETE FROM jobs WHERE key=?", (key,))
+        self.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+        state["activity"] = []
+        state["errors"] = []
+        state["seen_errors"] = []
+        state["inflight"] = state["prompt_inflight"] = None
+
+    def end_turn(self, native_key: str, turn: str | None, now: float):
+        rows = self.db.execute("SELECT key, state FROM sessions WHERE json_extract(state, '$._native_key')=?",
+                               (native_key,)).fetchall()
+        for key, encoded in rows:
+            state = json.loads(encoded)
+            # A guard is a newer prompt still resolving. An identified old turn
+            # can be scrubbed without invalidating that pending prompt, but an
+            # anonymous end cannot distinguish old from new.
+            if not turn and self.prompt_guarded(native_key):
+                continue
+            if turn and state.get("turn") != turn:
+                continue
+            self.discard_turn(key, state)
+            state["invalidated"] = True
+            self.save(key, state, now)
+
     def invalidate_prompt(self, native_key: str, generation: str, now: float, except_key: str | None = None):
         # A failed older lookup must not invalidate a newer successful prompt.
         if not self.prompt_is_current(native_key, generation):
@@ -115,8 +147,7 @@ class Store:
                 continue
             state = json.loads(encoded)
             state["invalidated"] = True
-            state["inflight"] = state["prompt_inflight"] = None
-            self.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+            self.discard_turn(key, state)
             self.save(key, state, now)
 
     def recent(self, key: str, limit: int = 4) -> list[str]:
