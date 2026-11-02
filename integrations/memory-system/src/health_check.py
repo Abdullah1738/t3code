@@ -170,6 +170,229 @@ def check_muse_lag():
     return True, f"{len(behind)} Muse sessions behind"
 
 
+NATIVE_LAG_MAX = 15 * 60         # oldest complete line not yet captured
+NATIVE_ERROR_MAX = 30 * 60       # a quarantined file must recover within this
+NATIVE_ALIAS_MAX = 15 * 60       # thread_aliases refresh (card D1)
+NATIVE_LEDGER = os.path.join(DATA, "memory.db")
+ROBOB_SETTINGS = os.path.join(HOME, ".robob/userdata/settings.json")
+NATIVE_SEEN = os.path.join(LOGS, "native_capture_seen.json")
+CLAUDE_SETTINGS = os.path.join(HOME, ".robob/harness-homes/claude/settings.json")
+CLEANUP_MIN_DAYS = 3650
+# D1's representation offsets are uncompressed, including for .zst files.
+NATIVE_LEDGER_COLUMNS = {"rep_id", "path", "inode", "offset", "phys_size", "complete", "error_count", "retired"}
+
+
+def _native_enabled(instance):
+    """Robob's real settings: providerInstances is a dict keyed by instance id, and
+    `enabled` on each entry (absent means on). True/False when readable, None when
+    the file is missing or unreadable (unknown: the root check then stays strict)."""
+    try:
+        with open(ROBOB_SETTINGS) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    instances = st.get("providerInstances") if isinstance(st, dict) else None
+    if not isinstance(instances, dict):
+        return None
+    # The generated Claude home is named "claude", but the instance id is claudeAgent.
+    inst = instances.get("claudeAgent" if instance == "claude" else instance)
+    if not isinstance(inst, dict):
+        return None
+    config = inst.get("config")
+    if inst.get("enabled") is False or (isinstance(config, dict) and config.get("enabled") is False):
+        return False
+    return True
+
+
+def _load_native_ledger():
+    """(ledger rows by path, alias refresh epoch, problems). A missing, unreadable or
+    wrong-shaped ledger is a problem, never an empty success."""
+    if not os.path.isfile(NATIVE_LEDGER):
+        return {}, None, "native capture ledger missing (memory.db)"
+    try:
+        c = ro(NATIVE_LEDGER)
+    except sqlite3.Error as e:
+        return {}, None, f"native capture ledger unreadable ({e})"
+    try:
+        cols = [d[1] for d in c.execute("PRAGMA table_info(native_capture_files)")]
+        if not NATIVE_LEDGER_COLUMNS <= set(cols):
+            return {}, None, f"native_capture_files lacks columns {sorted(NATIVE_LEDGER_COLUMNS - set(cols))}"
+        rows = {os.path.realpath(row[cols.index("path")]): dict(zip(cols, row))
+                for row in c.execute("SELECT * FROM native_capture_files WHERE retired=0 ORDER BY rep_id")}
+        alias_cols = {r[1] for r in c.execute("PRAGMA table_info(thread_aliases)")}
+        if "last_seen" not in alias_cols:
+            return rows, None, "thread_aliases table or last_seen watermark missing"
+        alias_epoch = c.execute("SELECT max(last_seen) FROM thread_aliases").fetchone()[0]
+        return rows, alias_epoch, None
+    except sqlite3.Error as e:
+        return {}, None, f"native capture ledger read failed ({e})"
+    finally:
+        c.close()
+
+
+def _complete_pending_bytes(path, offset, size):
+    """Bytes past the consumed offset up to the last newline. A fresh partial tail
+    (no newline yet) counts as 0: it gets grace until its line completes."""
+    extra = size - offset
+    if extra <= 0:
+        return 0
+    with open(path, "rb") as fh:
+        end = size
+        while end > offset:
+            start = max(offset, end - 65536)
+            fh.seek(start)
+            chunk = fh.read(end - start)
+            pos = chunk.rfind(b"\n")
+            if pos >= 0:
+                return start + pos + 1 - offset
+            end = start
+    return 0
+
+
+def native_roots_report(now=None, seen=None):
+    """Report per root; update `seen` with observed backlog/error start times.
+
+    The capture ledger has no per-record arrival timestamps. Remember the first
+    observed complete backlog until its observed byte boundary is consumed; a
+    fresh mtime or a partial consumer checkpoint cannot reset the clock.
+    """
+    import transcript_roots
+    now = time.time() if now is None else now
+    seen = {} if seen is None else seen
+    prior_files = seen.get("files", {})
+    prior_roots = set(seen.get("roots", []))
+    next_files = {}
+    report, problems = [], []
+    ledger, alias_epoch, ledger_problem = _load_native_ledger()
+    root_rows = transcript_roots.resolve() if hasattr(transcript_roots, "resolve") else transcript_roots.roots()
+    for r in root_rows:
+        inst = r["instance"]
+        root = os.path.realpath(os.path.expanduser(r.get("path") or r["root"]))
+        exists = os.path.isdir(root)
+        entry = {"instance": inst, "root": root, "exists": exists, "files": 0,
+                 "backlog_bytes": 0, "oldest_lag_s": 0}
+        report.append(entry)
+        if not exists:
+            if _native_enabled(inst) is False and root not in prior_roots and not any(
+                    p.startswith(root + os.sep) for p in ledger):
+                continue
+            problems.append(f"{inst}: expected root missing ({root})")
+            continue
+        prior_roots.add(root)
+        if ledger_problem:
+            problems.append(f"{inst}: {ledger_problem}")
+        elif not any(p.startswith(root + os.sep) for p in ledger):
+            problems.append(f"{inst}: no capture ledger entries for root")
+        if alias_epoch is None:
+            problems.append(f"{inst}: no thread_aliases refresh watermark")
+        elif not isinstance(alias_epoch, (int, float)) or alias_epoch > now or now - alias_epoch > NATIVE_ALIAS_MAX:
+            problems.append(f"{inst}: thread_aliases refresh stale or invalid")
+        subdirs = ("projects",) if inst in ("claude", "claudeAgent") else ("sessions", "archived_sessions")
+        for subdir in subdirs:
+            directory = os.path.join(root, subdir)
+            def walk_error(e):
+                problems.append(f"{inst}: cannot scan transcript directory: {e}")
+            for dirpath, _, names in os.walk(directory, onerror=walk_error):
+                for name in names:
+                    if not name.endswith((".jsonl", ".jsonl.zst")):
+                        continue
+                    full = os.path.realpath(os.path.join(dirpath, name))
+                    try:
+                        st = os.stat(full)
+                        row = ledger.get(full)
+                        offset = int(row["offset"]) if row else 0
+                        compressed = name.endswith(".zst")
+                        if compressed:
+                            pending = not (row and row["inode"] == st.st_ino and
+                                           row["phys_size"] == st.st_size and row["complete"])
+                            complete_bytes = st.st_size if pending else 0
+                        else:
+                            if offset < 0 or offset > st.st_size or (row and row["inode"] != st.st_ino):
+                                problems.append(f"{inst}: {name} capture checkpoint does not match file")
+                                offset = 0
+                            complete_bytes = _complete_pending_bytes(full, offset, st.st_size)
+                    except (OSError, TypeError, ValueError) as e:
+                        problems.append(f"{inst}: cannot inspect {name}: {e}")
+                        continue
+                    entry["files"] += 1
+                    previous = prior_files.get(full, {})
+                    same = previous.get("inode") == st.st_ino
+                    record = {"inode": st.st_ino}
+                    if complete_bytes:
+                        entry["backlog_bytes"] += complete_bytes
+                        # An observed byte boundary stays outstanding across partial progress.
+                        old_boundary = previous.get("boundary") if same else None
+                        old_pending = previous.get("pending_since") if same else None
+                        if (not isinstance(old_pending, (int, float)) or isinstance(old_pending, bool)
+                                or not math.isfinite(old_pending) or old_pending > now):
+                            old_pending = None
+                        still_pending = old_pending is not None and (compressed or
+                                          (isinstance(old_boundary, int) and offset < old_boundary))
+                        since = old_pending if still_pending else now
+                        invalid_time = (same and previous.get("pending_since") is not None and old_pending is None)
+                        unknown = previous.get("unknown", False) if still_pending else not same or invalid_time
+                        boundary = old_boundary if still_pending else (st.st_size if compressed else offset + complete_bytes)
+                        record.update(pending_since=since, boundary=boundary, unknown=unknown)
+                        lag = max(0, now - since)
+                        entry["oldest_lag_s"] = max(entry["oldest_lag_s"], int(lag))
+                        if unknown or lag > NATIVE_LAG_MAX or not row:
+                            problems.append(f"{inst}: {name} has {complete_bytes} pending bytes, "
+                                            f"oldest {'unknown' if unknown else str(int(lag)) + ' s'}")
+                    if row and (row.get("error_count") or 0) > 0:
+                        error_since = previous.get("error_since", now) if same else now
+                        if (not isinstance(error_since, (int, float)) or isinstance(error_since, bool)
+                                or not math.isfinite(error_since) or error_since > now):
+                            error_since = now
+                            same = False
+                        record["error_since"] = error_since
+                        # The ledger has no first-error time. An error that was
+                        # already present at first observation has unknown age.
+                        error_unknown = previous.get("error_unknown", False) if same else True
+                        record["error_unknown"] = error_unknown
+                        if error_unknown or now - error_since > NATIVE_ERROR_MAX:
+                            problems.append(f"{inst}: {name} capture errors for {int(now - error_since)} s")
+                    next_files[full] = record
+    seen["roots"] = sorted(prior_roots)
+    seen["files"] = next_files
+    return report, problems
+
+
+def check_native_capture():
+    try:
+        try:
+            with open(NATIVE_SEEN) as f:
+                seen = json.load(f)
+            if not isinstance(seen, dict) or not isinstance(seen.get("files", {}), dict):
+                raise ValueError("invalid native observation state")
+        except FileNotFoundError:
+            seen = {}
+        report, problems = native_roots_report(seen=seen)
+        if not DRY_RUN:
+            tmp = NATIVE_SEEN + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(seen, f)
+            os.replace(tmp, NATIVE_SEEN)
+    except Exception as e:
+        return False, f"native capture check crashed: {type(e).__name__}: {e}"
+    summary = "; ".join(f"{r['instance']} {r['files']} files, {r['backlog_bytes']} B backlog, "
+                        f"oldest {r['oldest_lag_s']} s" if r["exists"] else f"{r['instance']} absent"
+                        for r in report)
+    if problems:
+        return False, "; ".join(problems[:3]) + f" [{summary}]"
+    return True, summary
+
+
+def check_claude_retention():
+    try:
+        with open(CLAUDE_SETTINGS) as f:
+            days = json.load(f).get("cleanupPeriodDays")
+    except (OSError, ValueError):
+        return False, f"cannot read {CLAUDE_SETTINGS}"
+    if not isinstance(days, int) or days < CLEANUP_MIN_DAYS:
+        return False, f"cleanupPeriodDays is {days}, need >= {CLEANUP_MIN_DAYS}"
+    return True, f"cleanupPeriodDays {days}"
+
+
 def check_recall():
     import urllib.request
     try:
@@ -526,7 +749,8 @@ def check_msgs():
     return False, msg
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("recall", check_recall),
+CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
+          ("claude_retention", check_claude_retention), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
           ("health_backup", check_health_backup), ("person_backup", check_person_backups),

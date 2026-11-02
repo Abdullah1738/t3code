@@ -306,15 +306,41 @@ def scheduled_task_session_ids(con):
     return native_ids_for_threads(con, threads)
 
 
-def board_backlog_session_ids(con):
-    """Native session ids of threads on the retired Robob board's Backlog lane,
-    or None when its table is not in the DB."""
-    board = tables(con, "ardud_board_%")
-    if "ardud_board_rows" not in board:
-        return None
-    cols = {r[1] for r in con.execute("PRAGMA table_info(ardud_board_rows)")}
-    if not {"thread_id", "backlog"} <= cols:
-        raise RuntimeError(f"ardud_board_rows has an unknown shape ({sorted(cols)})")
-    where = "backlog != 0" + (" AND deleted = 0" if "deleted" in cols else "")
-    threads = [r[0] for r in con.execute(f"SELECT thread_id FROM ardud_board_rows WHERE {where}")]
+ROLLBACK_DAYS = 90
+
+
+def kanban_session_ids(con):
+    """Native session ids of Robob threads that unsettled kanban cards still use
+    (active/work/review thread) or that have an open kanban thread link (ended = 0).
+    Fails closed: a missing kanban table raises instead of protecting nothing."""
+    have = tables(con, "ardud_kanban_%")
+    if not {"ardud_kanban_cards", "ardud_kanban_threads"} <= have:
+        raise RuntimeError("kanban tables missing from the Robob state DB")
+    threads = set()
+    for row in con.execute(
+            "SELECT active_thread_id, json_extract(json, '$.activeThreadId'), "
+            "json_extract(json, '$.workThreadId'), json_extract(json, '$.reviewThreadId') "
+            "FROM ardud_kanban_cards WHERE json_extract(json, '$.settledAt') IS NULL"):
+        threads |= {t for t in row if t}
+    threads |= {r[0] for r in con.execute(
+        "SELECT thread_id FROM ardud_kanban_threads WHERE ended = 0 AND thread_id IS NOT NULL")}
     return native_ids_for_threads(con, threads)
+
+
+def migrated_rollback_session_ids(con, now=None):
+    """OpenCode sessions of Robob threads whose provider thread moved to another
+    driver (Claude/Codex/Muse) within ROLLBACK_DAYS. Those OpenCode sessions are the
+    rollback source for the migration, so they are never reaped in that window.
+    The move time is approximated by the non-OpenCode provider row's updated_at.
+    A missing or invalid driver/timestamp cannot prove the rollback window ended."""
+    import datetime
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now - datetime.timedelta(days=ROLLBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    moved = [r[0] for r in con.execute(
+        "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
+        "WHERE (driver IS NULL OR driver != 'opencode') "
+        "AND (driver IS NULL OR julianday(updated_at) IS NULL OR julianday(updated_at) >= julianday(?))",
+        (cutoff,))]
+    if any(not isinstance(tid, str) or not tid for tid in moved):
+        raise RuntimeError("migrated provider thread has no thread id")
+    return native_ids_for_threads(con, moved)
