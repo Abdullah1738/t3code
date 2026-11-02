@@ -285,12 +285,31 @@ export function reviewerQuietDue(
 const OUTAGE_TEXT =
   /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers/i;
 
-/** A failed run the same request would pass once the provider is back. */
+/**
+ * A failed run the same request would pass once the provider is back. The normalized
+ * category decides when a driver sets one: quota, transient and expired auth are outages,
+ * while config, model, context and content failures never are, even when their text reads
+ * like an outage. Text and codes are the fallback for failures without a category.
+ */
 export function isOutage(failure: {
   readonly class: string;
   readonly code: string | null;
   readonly message: string;
+  readonly category?: string | undefined;
 }): boolean {
+  switch (failure.category) {
+    case "quota":
+    case "transient":
+    case "auth_expired":
+      return true;
+    case "config":
+    case "model_invalid":
+    case "context_exhausted":
+    case "content_filter":
+      return false;
+    default:
+      break;
+  }
   if (failure.class === "usage_limit") return true;
   if (failure.code === "provider.quota" || failure.code === "provider.rate-limit") return true;
   return OUTAGE_TEXT.test(failure.message);
