@@ -139,6 +139,11 @@ export class RobobBackend implements ChatBackend {
   private readonly runEvidence: RunEvidence;
   /** A step's finish never changes once written, so each is looked up once. */
   private readonly finished = new Map<string, string>();
+  /**
+   * Proven evidence for runs that have settled, keyed by thread and run. Only `ran` or `none` is kept:
+   * an `unknown` can still resolve, so it is always asked again. A settled run's proof never changes.
+   */
+  private readonly settledEvidence = new Map<string, "ran" | "none">();
 
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
@@ -287,22 +292,23 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
     const records = recordsFromThread(thread, messages);
-    await this.markRunEvidence(thread, records);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
     const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
     const page = records.slice(start);
+    // Evidence is fetched for the runs on this page only, never the whole history.
+    await this.markRunEvidence(thread, page);
     // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
     return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
   }
 
   /**
-   * Whether the thread runs on OpenCode, the only driver whose step rows the bridge can read as a
-   * fallback: its native session, its model's instance, or a message id OpenCode wrote.
+   * Whether the thread's driver is OpenCode, the only driver whose step rows the bridge can read as a
+   * fallback. Keyed on the driver alone: a `ses_` id can survive a migration from OpenCode (ControlStore
+   * keeps historical bindings), so an id is not proof of the driver the thread runs on now.
    */
   private isOpenCodeThread(thread: ThreadDetail): boolean {
-    return thread.model?.instanceId === "opencode" || thread.nativeSessionId?.startsWith("ses_") === true
-      || thread.threadId.startsWith("ses_");
+    return thread.model?.instanceId === "opencode";
   }
 
   /**
@@ -315,8 +321,22 @@ export class RobobBackend implements ChatBackend {
     const runIds = [...new Set(records.flatMap(record => record.type === "assistant" && record.runId ? [record.runId] : []))];
     const byRun = new Map<string, "ran" | "none" | "unknown">();
     for (const runId of runIds) {
+      const key = `${thread.threadId}\u0000${runId}`;
+      const proven = this.settledEvidence.get(key);
+      if (proven !== undefined) {
+        byRun.set(runId, proven);
+        continue;
+      }
       try {
-        byRun.set(runId, (await this.client.runEvidence(thread.threadId, runId)).toolEvidence);
+        const evidence = (await this.client.runEvidence(thread.threadId, runId)).toolEvidence;
+        byRun.set(runId, evidence);
+        const run = thread.recentRuns.find(candidate => candidate.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined);
+        // Only a settled run's proof is final. A running run may still call tools, so it is never cached.
+        if (evidence !== "unknown" && run !== undefined && TERMINAL.has(run.status)) {
+          // Clearing is safe: an entry dropped here is only fetched again.
+          if (this.settledEvidence.size > 5_000) this.settledEvidence.clear();
+          this.settledEvidence.set(key, evidence);
+        }
       } catch {
         byRun.set(runId, "unknown");
       }

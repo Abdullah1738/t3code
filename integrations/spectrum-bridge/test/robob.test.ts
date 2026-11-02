@@ -21,6 +21,8 @@ type Thread = {
   messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
   /** What the run-evidence route reports per run; absent means `unknown`. */
   evidence?: Record<string, "ran" | "none" | "unknown">;
+  /** The thread's driver; absent means OpenCode, the driver the OpenCode fixtures represent. */
+  driver?: { instanceId: string; model: string };
 };
 type Call = { method: string; path: string; body?: any; auth: string | null };
 
@@ -47,6 +49,8 @@ function fakeControl() {
     : thread.runs.some(run => run.status === "running") ? "running" : thread.runs.some(run => run.status === "waiting") ? "waiting" : "idle";
   const summary = (thread: Thread) => ({
     threadId: thread.threadId, projectId: thread.projectId, title: thread.title, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle",
+    // The driver decides the OpenCode fallback. Fixtures default to OpenCode, the driver their step rows come from.
+    model: thread.driver ?? { instanceId: "opencode", model: "opencode-test" },
     origin: thread.origin, nativeSessionId: thread.nativeSessionId, runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId,
     rootThreadId: thread.parentThreadId ?? thread.threadId, worktreePath: thread.worktreePath, latestRunId: thread.runs.at(-1)?.runId ?? null,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
@@ -298,6 +302,54 @@ test("records: a Robob phase decides answer vs narration; no finish is invented 
   const steps = records.filter((record): record is Extract<typeof record, { type: "assistant" }> => record.type === "assistant");
   expect(steps.map(step => [step.id, step.answer])).toEqual([["narrate", false], ["reply", true], ["unsure", undefined]]);
   for (const step of steps) expect(step).not.toHaveProperty("finish");
+});
+
+test("a Claude thread with a historical ses_ session never reads OpenCode's database for its evidence", async () => {
+  const control = fakeControl();
+  const { id } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  // A thread that moved from OpenCode keeps its old `ses_` session; its driver is now Claude.
+  thread.nativeSessionId = "ses_historical_opencode";
+  thread.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  thread.runs.push({ runId: "run:thread:claude:ordinal:1", ordinal: 1, status: "completed", requestedAt: "2026-01-01T00:00:00Z" });
+  thread.evidence = { "run:thread:claude:ordinal:1": "unknown" };
+  // OpenCode's step rows are read through this reader; a Claude thread must never reach it.
+  const reads: string[] = [];
+  const backend = control.backend();
+  (backend as unknown as { runEvidence: (session: string, since: number) => "none" }).runEvidence = session => {
+    reads.push(session);
+    return "none";
+  };
+  expect(await backend.runToolEvidence(id, "/chats", Date.parse("2026-01-01T00:00:00Z") - 1000)).toBe("unknown");
+  expect(reads).toEqual([]);
+});
+
+test("a long thread asks Robob for evidence only for the runs on the page, and a settled run once", async () => {
+  const control = fakeControl();
+  const { id } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  thread.evidence = {};
+  for (let ordinal = 1; ordinal <= 100; ordinal++) {
+    const runId = `run:thread:${threadId}:ordinal:${ordinal}`;
+    thread.runs.push({ runId, ordinal, status: "completed", requestedAt: new Date(Date.UTC(2026, 0, 1, 0, ordinal)).toISOString() });
+    // The prompt is written before the answer, as in a real run, so the answer sorts after it.
+    const asked = new Date(Date.UTC(2026, 0, 1, 0, ordinal, 0)).toISOString();
+    const answered = new Date(Date.UTC(2026, 0, 1, 0, ordinal, 1)).toISOString();
+    thread.messages.push({ messageId: `user-${ordinal}`, runId, role: "user", text: `question ${ordinal}`, streaming: false, createdBy: "user", createdAt: asked, updatedAt: asked });
+    thread.messages.push({ messageId: `assistant-${ordinal}`, runId, role: "assistant", text: `answer ${ordinal}`, streaming: false, createdBy: "agent", createdAt: answered, updatedAt: answered });
+    thread.evidence[runId] = "none";
+  }
+  // The cache is per backend instance, so both polls use the same one, as the router does.
+  const backend = control.backend();
+  const evidenceReads = () => control.calls.filter(call => call.path.includes("/evidence")).length;
+  // The newest page is the last run's answer and its idle marker: one run, one read.
+  expect((await backend.messages(id, "/chats", { limit: 2 })).filter(record => record.type === "assistant")).toHaveLength(1);
+  expect(evidenceReads()).toBe(1);
+  // Polled again, the settled run's proof is kept rather than asked for again.
+  await backend.messages(id, "/chats", { limit: 2 });
+  expect(evidenceReads()).toBe(1);
 });
 
 test("a run's tool evidence from Robob reaches its steps; unknown never becomes none", async () => {
