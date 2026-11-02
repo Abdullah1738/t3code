@@ -26,6 +26,14 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "bindToCurrentThread=false");
   });
 
+  it("keeps large conversations in the same thread", () => {
+    assert.include(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      "Don't reset or hand off to a new thread because of context size",
+    );
+    assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "When your context is nearly full");
+  });
+
   it("injects prompt fallback only for an MCP-enabled first run", () => {
     const prompt = "Inspect the repository.";
     const injected = t3OrchestrationPromptForFirstRun({

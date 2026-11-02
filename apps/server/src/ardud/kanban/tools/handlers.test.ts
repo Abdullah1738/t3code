@@ -94,6 +94,8 @@ const fakeThreads = () => {
         }),
       find: () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
+      latestRun: () => Effect.succeed(null),
+      compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {
           launches.push(input.text);

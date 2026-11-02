@@ -20,6 +20,7 @@ import {
   discussionSettleDue,
   isBlocked,
   isContextFull,
+  isHandoffBudget,
   isOutage,
   MAX_BATCH,
   maskDownPools,
@@ -954,6 +955,14 @@ describe("isContextFull", () => {
       false,
     );
     expect(isContextFull({ message: "The run failed without an error message." })).toBe(false);
+  });
+});
+
+describe("isHandoffBudget", () => {
+  it("distinguishes handoff budget errors from provider overflows", () => {
+    expect(isHandoffBudget({ message: "Insufficient context allowance for the provider handoff." })).toBe(true);
+    expect(isHandoffBudget({ message: "The request leaves too little context for a provider handoff." })).toBe(true);
+    expect(isHandoffBudget({ message: "prompt is too long" })).toBe(false);
   });
 });
 

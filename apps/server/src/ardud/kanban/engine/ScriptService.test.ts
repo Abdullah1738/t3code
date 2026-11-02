@@ -43,6 +43,8 @@ const threads = Layer.succeed(
     view: () => Effect.succeed(null),
     find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
+    latestRun: () => Effect.succeed(null),
+    compactRun: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
     model: () => Effect.succeed(null),
@@ -686,6 +688,8 @@ it.effect(
         view: () => Effect.succeed(null),
         find: () => Effect.succeed(null),
         lastFailure: () => Effect.succeed(null),
+        latestRun: () => Effect.succeed(null),
+        compactRun: () => Effect.succeed(null),
         launch: (input) => {
           sent.push(input.text);
           return Effect.succeed(ThreadId.make("thread-1"));

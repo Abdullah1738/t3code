@@ -983,18 +983,43 @@ const make = Effect.gen(function* () {
 
   // Logged when a card leaves a thread that got too long; a repeat inside an hour is flagged.
   const FRESH_START = "Thread too long; the next run starts on a fresh thread";
-  const freshStartedRecently = (card: KanbanCard, at: string) =>
-    store
-      .cardEvents(card.id)
-      .pipe(
-        Effect.map((events) =>
-          events.some(
-            (event) =>
-              event.body?.startsWith(FRESH_START) === true &&
-              Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
-          ),
+  const COMPACT_FIRST = "Thread too long; compacting it before the next run";
+  const happenedRecently = (card: KanbanCard, at: string, prefix: string) =>
+    store.cardEvents(card.id).pipe(
+      Effect.map((events) =>
+        events.some(
+          (event) =>
+            event.body?.startsWith(prefix) === true &&
+            Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
         ),
+      ),
+    );
+  const freshStartedRecently = (card: KanbanCard, at: string) =>
+    happenedRecently(card, at, FRESH_START);
+  const compactedRecently = (card: KanbanCard, at: string) =>
+    happenedRecently(card, at, COMPACT_FIRST);
+  // A released todo card records maintenance even when it shares the thread
+  // with other cards that were not running when the compaction was requested.
+  const threadCompacting = Effect.fn("KanbanService.threadCompacting")(function* (
+    threadId: ThreadId,
+    boardId: KanbanBoardId,
+  ) {
+    let latest: KanbanCardEvent | undefined;
+    for (const candidate of yield* store.cards(boardId)) {
+      if (
+        candidate.stage !== "todo" ||
+        candidate.activeThreadId !== null ||
+        candidate.workThreadId !== threadId
+      ) continue;
+      const lastMove = (yield* store.cardEvents(candidate.id)).findLast(
+        (event) => event.kind === "moved",
       );
+      if (lastMove?.body?.startsWith(COMPACT_FIRST) && (latest === undefined || lastMove.id > latest.id)) {
+        latest = lastMove;
+      }
+    }
+    return latest;
+  });
   const withFreshNote = (note: string | null | undefined) =>
     [note?.trim(), Briefs.FRESH_THREAD_NOTE].filter((part): part is string => !!part).join("\n\n");
 
@@ -2270,7 +2295,11 @@ const make = Effect.gen(function* () {
         : card.reviewThreadId;
     let threadId: ThreadId | null = null;
     if (existing !== null) {
-      const view = yield* threads.view(existing);
+      // Do not mistake a failed projection read for a missing work thread.
+      const existingRead = dispatch.role === "work" ? yield* Effect.result(threads.find(existing)) : null;
+      if (existingRead?._tag === "Failure") return;
+      const view = existingRead === null ? yield* threads.view(existing) : existingRead.success;
+      const compactEvent = dispatch.role === "work" ? yield* threadCompacting(existing, board.id) : undefined;
       if (dispatch.joins && !view) {
         // The thread holding the slot is gone: the card stops pointing at it,
         // so the next pass gives it a slot of its own instead of joining again.
@@ -2282,7 +2311,44 @@ const make = Effect.gen(function* () {
       // A turn still finishing (for example the one that called card_move) gets
       // the next message only after it ends; the next pass retries. A thread
       // that holds the slot for other cards is steered right away.
-      if (view && view.state !== "idle" && !dispatch.joins) return;
+      if (view && view.state !== "idle") {
+        // A batch can plan several joins before its first card starts. If that
+        // first card is waiting for compaction, none may queue behind it.
+        const waitingForCompact =
+          dispatch.joins &&
+          dispatch.role === "work" &&
+          compactEvent !== undefined &&
+          (yield* store.cardsByThread(existing)).length === 0;
+        if (!dispatch.joins || waitingForCompact) return;
+      }
+      if (view?.state === "idle" && compactEvent !== undefined) {
+        const compactRunId = compactEvent.body?.match(/\[compact-run ([^\]]+)\]$/)?.[1];
+        const latest = yield* Effect.result(
+          compactRunId === undefined ? threads.latestRun(existing) : threads.compactRun(existing, compactRunId),
+        );
+        // A failed read or the original failure is not proof that maintenance
+        // finished; wait rather than silently abandon the thread.
+        if (latest._tag === "Failure" || latest.success?.message?.trim().toLowerCase() !== "/compact") return;
+        if (latest.success.status !== "completed") {
+          if (!["failed", "cancelled", "interrupted"].includes(latest.success.status)) return;
+          // An accepted send can still fail as a provider maintenance run.
+          const fresh: KanbanCard = {
+            ...card,
+            workThreadId: null,
+            wakeNote: withFreshNote(card.wakeNote),
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(fresh, system, "moved", {
+            fromStage: card.stage,
+            toStage: "todo",
+            body: `${FRESH_START}: compaction failed`,
+          });
+          yield* saveCard(fresh);
+          yield* kick;
+          return;
+        }
+      }
       if (view) {
         threadId = existing;
         // The reused thread now runs on this model; its link must say so, or an
@@ -2896,7 +2962,44 @@ const make = Effect.gen(function* () {
       if (outage !== null) return;
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
+        const recentCompactions = yield* Effect.forEach(carried, (entry) => compactedRecently(entry, at));
+        const hasRecentCompaction = recentCompactions.some(Boolean);
+        const candidates = Rules.isContextFull(failure) && !Rules.isHandoffBudget(failure) && !hasRecentCompaction
+          ? yield* Effect.filter(carried, (entry) =>
+              freshStartedRecently(entry, at).pipe(Effect.map((recent) => !recent)),
+            )
+          : [];
+        // One maintenance turn covers every card sharing this thread. Start it
+        // only when idle: a queued turn could be held behind the failed run.
+        const found = candidates.length > 0 ? yield* Effect.result(threads.find(threadId)) : null;
+        if (found?._tag === "Failure") return;
+        const view = found?.success ?? null;
+        if (view !== null && view.state !== "idle") return;
+        const compactSent = view?.state === "idle"
+          ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
+          : null;
         for (const entry of carried) {
+          if (compactSent?._tag === "Success" && candidates.some((candidate) => candidate.id === entry.id)) {
+            const compacting: KanbanCard = {
+              ...release(entry),
+              stage: "todo",
+              stalled: null,
+              nudgedAt: null,
+              movedAt: at,
+              updatedAt: at,
+            };
+            yield* logEvent(compacting, system, "moved", {
+              fromStage: entry.stage,
+              toStage: "todo",
+              body: `${COMPACT_FIRST}: ${failure.message}${
+                typeof compactSent.success === "string"
+                  ? ` [compact-run ${compactSent.success}]`
+                  : ""
+              }`,
+            });
+            yield* saveCard(compacting);
+            continue;
+          }
           // A thread too long to send again can't run the card: the next
           // dispatch starts it on a fresh thread.
           if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(entry, at))) {
@@ -3139,6 +3242,10 @@ const make = Effect.gen(function* () {
         // A paused worker waits for probeOutages, not a nudge.
         if ((yield* store.threadLink(threadId))?.paused) continue;
         const view = yield* threads.view(threadId);
+        if (view?.state === "idle" && (yield* threads.lastFailure(threadId)) !== null) {
+          yield* turnEndedUnlocked(threadId);
+          continue;
+        }
         if (
           view === null ||
           Rules.waitingOnBackground(view, now) ||

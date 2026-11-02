@@ -11,7 +11,7 @@ import * as ContextResetService from "./ContextResetService.ts";
 
 const ContextResetTool = Tool.make("t3_context_reset", {
   description:
-    "Needs an agent running inside a T3 thread. Use when your context is nearly full and you want to keep working in this same thread. Write a resume note first (point it at the plan or notes file), then call this as the last action of the turn: T3 ends your current provider session and starts a fresh one in this thread with the note as its only context. The thread, its history, workspace, model, schedules and watchers stay the same. Refused while this thread has running background subagents or tasks (the refusal names them); wait for them, or pass cancelBackgroundWork: true to stop them first and get them listed at the end of the resume note. If this tool fails, fall back to t3_thread_launch with the same note.",
+    "Needs an agent running inside a T3 thread. Only for a fresh start the user or a bridge asks for, not for a large context: the provider compacts by itself. Write a resume note first (point it at the plan or notes file), then call this as the last action of the turn: T3 ends your current provider session and starts a fresh one in this thread with the note as its only context. The thread, its history, workspace, model, schedules and watchers stay the same. Refused while this thread has running background subagents or tasks (the refusal names them); wait for them, or pass cancelBackgroundWork: true to stop them first and get them listed at the end of the resume note.",
   parameters: ContextResetMcpInput,
   success: ContextResetMcpResult,
   failure: OrchestratorMcpFailure,

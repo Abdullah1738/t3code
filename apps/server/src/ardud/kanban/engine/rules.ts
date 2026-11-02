@@ -300,9 +300,14 @@ export function isOutage(failure: {
 const CONTEXT_FULL_TEXT =
   /prompt is too long|input is too long|context[ _]length|maximum context|context window|too many tokens|request_too_large|insufficient context allowance|too little context for a provider handoff/i;
 
-/** A failed run only a fresh thread gets past: the thread is too long to send again. */
+/** A failed run whose context no longer fits. */
 export function isContextFull(failure: { readonly message: string }): boolean {
   return CONTEXT_FULL_TEXT.test(failure.message);
+}
+
+/** A T3 handoff-budget failure, which provider-side compaction cannot reliably fix. */
+export function isHandoffBudget(failure: { readonly message: string }): boolean {
+  return /insufficient context allowance|too little context for a provider handoff/i.test(failure.message);
 }
 
 /** How long after a fresh start a second context-full run is flagged instead of restarted. */

@@ -77,6 +77,8 @@ const makeFake = Effect.gen(function* () {
     string,
     OrchestrationV2ProviderFailure & { readonly model?: ModelSelection | null }
   >();
+  const lastRuns = new Map<string, { runId: string; status: string; message: string | null }>();
+  const runHistory = new Map<string, { status: string; message: string | null }>();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
   let nextRun = 0;
@@ -165,6 +167,15 @@ const makeFake = Effect.gen(function* () {
               return Effect.fail(new KanbanThreadError({ operation: "send", detail: "refused" }));
             }
             if (thread) thread.messages.push(input.text);
+            if (input.text === "/compact") {
+              const run = { runId: `compact-${nextRun += 1}`, status: "completed", message: input.text };
+              lastRuns.set(input.threadId, run);
+              runHistory.set(run.runId, run);
+              sends.push({ threadId: input.threadId, model: input.model, key: input.key });
+              return Effect.succeed(run.runId);
+            } else if (thread?.running) {
+              lastRuns.set(input.threadId, { runId: `wake-${nextRun += 1}`, status: "running", message: input.text });
+            }
             sends.push({ threadId: input.threadId, model: input.model, key: input.key });
             return Effect.void;
           }),
@@ -173,6 +184,8 @@ const makeFake = Effect.gen(function* () {
         Effect.sync(() => void modelSwitches.push({ threadId, model })),
       // Each stored failure is one executed run; a repeat notification of it reports the same runId.
       lastFailure: (threadId) => Effect.succeed(failureOf(threadId)),
+      latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
+      compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
   );
@@ -182,6 +195,8 @@ const makeFake = Effect.gen(function* () {
     interrupted,
     prs,
     failures,
+    lastRuns,
+    runHistory,
     sends,
     modelSwitches,
     rejectSends,
@@ -1475,9 +1490,9 @@ const overflow = {
   class: "provider_error",
   code: "provider.invalid-request",
   message: "[400]: prompt is too long: 1000528 tokens > 1000000 maximum",
-} as never;
+} as OrchestrationV2ProviderFailure;
 
-it.effect("a work thread that gets too long starts the card on a fresh thread", () =>
+it.effect("a work thread that gets too long compacts before starting a fresh thread", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -1485,15 +1500,41 @@ it.effect("a work thread that gets too long starts the card on a fresh thread", 
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const oldThread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      // A note arriving while the card is working must survive maintenance.
+      const store = yield* KanbanStore.KanbanStore;
+      const running = (yield* kanban.card(created.id)).card;
+      yield* store.putCard({ ...running, wakeNote: "Keep this note." });
       const before = (yield* Ref.get(fake.threads)).get(oldThread)!.messages.length;
       fake.failures.set(oldThread, overflow);
       yield* kanban.turnEnded(oldThread);
-      assert.strictEqual((yield* Ref.get(fake.threads)).get(oldThread)!.messages.length, before);
-      const moved = (yield* kanban.card(created.id)).card;
+      const old = (yield* Ref.get(fake.threads)).get(oldThread)!;
+      assert.deepStrictEqual(old.messages.slice(before), ["/compact"]);
+      const detail = yield* kanban.card(created.id);
+      const moved = detail.card;
       assert.strictEqual(moved.stage, "todo");
       assert.isNull(moved.stalled);
-      assert.isNull(moved.workThreadId);
+      assert.strictEqual(moved.workThreadId, oldThread);
+      assert.strictEqual(moved.wakeNote, "Keep this note.");
       assert.isNull(moved.activeThreadId);
+      assert.isTrue(detail.events.some((event) =>
+        event.kind === "moved" && event.body?.startsWith("Thread too long; compacting it before the next run") === true,
+      ));
+      // The next dispatch waits until compaction ends, then wakes the same thread.
+      old.running = true;
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(created.id)).card.stage, "todo");
+      assert.deepStrictEqual(old.messages.slice(before), ["/compact"]);
+      old.running = false;
+      fake.failures.delete(oldThread);
+      yield* kanban.dispatchNow;
+      const resumed = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(resumed.stage, "working");
+      assert.strictEqual(resumed.activeThreadId, oldThread);
+      assert.strictEqual(old.messages.length, before + 2);
+      assert.include(old.messages.at(-1)!, "Keep this note.");
+      fake.failures.set(oldThread, overflow);
+      yield* kanban.turnEnded(oldThread);
+      assert.isNull((yield* kanban.card(created.id)).card.workThreadId);
       yield* kanban.dispatchNow;
       const fresh = (yield* kanban.card(created.id)).card;
       assert.strictEqual(fresh.stage, "working");
@@ -1501,6 +1542,74 @@ it.effect("a work thread that gets too long starts the card on a fresh thread", 
       const first = (yield* Ref.get(fake.threads)).get(fresh.activeThreadId!)!.messages[0];
       assert.include(first, "Fresh thread:");
       assert.include(first, "x");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a busy work thread is not sent a compact turn behind its failed run", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const view = (yield* Ref.get(fake.threads)).get(thread)!;
+      const before = view.messages.length;
+      view.running = true;
+      fake.failures.set(thread, overflow);
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(view.messages.length, before);
+      assert.strictEqual((yield* kanban.card(created.id)).card.stage, "working");
+      view.running = false;
+      yield* kanban.turnEnded(thread);
+      assert.deepStrictEqual(view.messages.slice(before), ["/compact"]);
+      assert.strictEqual((yield* kanban.card(created.id)).card.stage, "todo");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a failed thread read retries the compact path on the next tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+      fake.failures.set(thread, overflow);
+      // State publishing and PR sync read before the compact safety check.
+      fake.failReads.left = 3;
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual((yield* kanban.card(created.id)).card.stage, "working");
+      yield* kanban.tick;
+      assert.include(messages, "/compact");
+      assert.strictEqual((yield* kanban.card(created.id)).card.workThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("one recent compact attempt covers a newly claimed card on the same thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+      fake.failures.set(thread, { ...overflow });
+      yield* kanban.turnEnded(thread);
+      fake.failures.delete(thread);
+      yield* kanban.dispatchNow;
+      const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      const before = messages.length;
+      fake.failures.set(thread, { ...overflow });
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(messages.length, before);
+      assert.isNull((yield* kanban.card(first.id)).card.workThreadId);
+      assert.isNull((yield* kanban.card(second.card.id)).card.workThreadId);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -1540,7 +1649,7 @@ it.effect("a work thread refused for handoff context starts the card on a fresh 
   }),
 );
 
-it.effect("a second overflow within the hour is flagged", () =>
+it.effect("an overflow after compaction and a fresh start within the hour is flagged", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -1548,6 +1657,11 @@ it.effect("a second overflow within the hour is flagged", () =>
       const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
       yield* kanban.dispatchNow;
       const first = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(first, overflow);
+      yield* kanban.turnEnded(first);
+      fake.failures.delete(first);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(created.id)).card.activeThreadId, first);
       fake.failures.set(first, overflow);
       yield* kanban.turnEnded(first);
       yield* kanban.dispatchNow;
@@ -1559,6 +1673,116 @@ it.effect("a second overflow within the hour is flagged", () =>
       assert.strictEqual(flagged.stage, "todo");
       assert.match(flagged.stalled?.reason ?? "", /^Run failed: .*prompt is too long/);
       assert.strictEqual(flagged.workThreadId, second);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a rejected compact send takes the fresh-thread path", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.rejectSends.add(thread);
+      fake.failures.set(thread, overflow);
+      yield* kanban.turnEnded(thread);
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "todo");
+      assert.isNull(moved.stalled);
+      assert.isNull(moved.workThreadId);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.notStrictEqual(fresh, thread);
+      assert.include((yield* Ref.get(fake.threads)).get(fresh)!.messages[0], "Fresh thread:");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a compact turn that fails after acceptance starts a fresh thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(thread, { ...overflow });
+      yield* kanban.turnEnded(thread);
+      const oldMessages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+      assert.strictEqual(oldMessages.at(-1), "/compact");
+      // The accepted maintenance turn itself then fails, rather than the send.
+      fake.failures.set(thread, { ...overflow, message: "This provider does not support context compaction." });
+      const runId = fake.lastRuns.get(thread)!.runId;
+      fake.lastRuns.set(thread, { runId, status: "failed", message: "/compact" });
+      fake.runHistory.set(runId, { status: "failed", message: "/compact" });
+      yield* kanban.turnEnded(thread);
+      yield* kanban.dispatchNow;
+      const moved = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(moved.stage, "todo");
+      assert.isNull(moved.workThreadId);
+      assert.isNull(moved.stalled);
+      yield* kanban.dispatchNow;
+      const fresh = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.notStrictEqual(fresh, thread);
+      assert.include((yield* Ref.get(fake.threads)).get(fresh)!.messages[0], "Fresh thread:");
+      assert.strictEqual(oldMessages.at(-1), "/compact");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a later unrelated turn does not hide a completed compaction", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(thread, { ...overflow });
+      yield* kanban.turnEnded(thread);
+      fake.failures.delete(thread);
+      fake.lastRuns.set(thread, { runId: "later-run", status: "completed", message: "Another task" });
+      yield* kanban.dispatchNow;
+      const resumed = (yield* kanban.card(created.id)).card;
+      assert.strictEqual(resumed.stage, "working");
+      assert.strictEqual(resumed.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("one compact turn covers all work cards sharing a thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+      const before = messages.length;
+      fake.failures.set(thread, overflow);
+      yield* kanban.turnEnded(thread);
+      assert.deepStrictEqual(messages.slice(before), ["/compact"]);
+      for (const id of [first.id, second.card.id]) {
+        const detail = yield* kanban.card(id);
+        assert.strictEqual(detail.card.stage, "todo");
+        assert.strictEqual(detail.card.workThreadId, thread);
+        assert.isNull(detail.card.stalled);
+        assert.isTrue(detail.events.some((event) => event.body?.startsWith("Thread too long; compacting it before the next run") === true));
+      }
+      (yield* Ref.get(fake.threads)).get(thread)!.running = true;
+      yield* kanban.dispatchNow;
+      assert.deepStrictEqual(messages.slice(before), ["/compact"]);
+      assert.strictEqual((yield* kanban.card(first.id)).card.stage, "todo");
+      assert.strictEqual((yield* kanban.card(second.card.id)).card.stage, "todo");
+      (yield* Ref.get(fake.threads)).get(thread)!.running = false;
+      fake.failures.delete(thread);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(first.id)).card.activeThreadId, thread);
+      assert.strictEqual((yield* kanban.card(second.card.id)).card.activeThreadId, thread);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
