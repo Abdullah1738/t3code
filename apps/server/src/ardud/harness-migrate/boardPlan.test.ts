@@ -4,6 +4,7 @@ import {
   KanbanCardId,
   KanbanPool,
   ProjectId,
+  ProviderInstanceId,
   type KanbanBoard,
   type KanbanCard,
   type ModelSelection,
@@ -14,10 +15,10 @@ import { planBoard, type BoardSnapshot } from "./boardPlan.ts";
 
 const sel = (model: string, level?: string): ModelSelection =>
   ({
-    instanceId: "opencode",
+    instanceId: ProviderInstanceId.make("opencode"),
     model,
     ...(level === undefined ? {} : { options: [{ id: "variant", value: level }] }),
-  }) as ModelSelection;
+  }) as unknown as ModelSelection;
 
 const pool = (model: ModelSelection, slots: number): KanbanPool =>
   ({
@@ -87,7 +88,7 @@ it("keeps a card's occupancy on the pool it runs in", () => {
   const plan = planBoard(
     snapshot({
       pools: [oldPool],
-      cards: [card({ activePool: oldPool.key, stage: "work" })],
+      cards: [card({ activePool: oldPool.key, stage: "working" })],
     }),
   );
   assert.strictEqual(plan.collisions.length, 0);
