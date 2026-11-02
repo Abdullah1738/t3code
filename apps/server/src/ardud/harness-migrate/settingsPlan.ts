@@ -10,12 +10,14 @@ type ModelFavorite = typeof ModelFavoriteSchema.Type;
 
 import { planSelection, type SelectionPlan } from "./selectionPlan.ts";
 
-/** One settings field the migration rewrites: where it lives and what it becomes. */
+/**
+ * One settings field the migration rewrites. `before` and `after` are the whole field: a list,
+ * a map, or one selection. A ledger row restores the field as a whole, never an element of it.
+ */
 export interface SettingsChange {
   readonly field: string;
   readonly before: unknown;
   readonly after: unknown;
-  readonly plan: Extract<SelectionPlan, { _tag: "mapped" }>;
 }
 
 /** Every change and conflict in the settings, computed without writing anything. */
@@ -39,7 +41,7 @@ const withSelection = (
     return selection;
   }
   if (plan._tag === "mapped") {
-    changes.push({ field, before: selection, after: plan.next, plan });
+    changes.push({ field, before: selection, after: plan.next });
     return plan.next;
   }
   return selection;
@@ -88,8 +90,8 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
     patch.reviewGuideModelSelection = review ?? null;
   }
 
-  // Favorites carry `provider` (the instance) and a model slug. Plan them as the selection
-  // they name; an unmapped favorite comes back unchanged.
+  // Favorites: the whole list is one ledger field, so a rollback restores the list as it was,
+  // never one element of it. An unmapped favorite comes back unchanged.
   if (settings.favorites !== null) {
     let favoritesChanged = false;
     const favorites: Array<ModelFavorite> = settings.favorites.map((favorite) => {
@@ -103,19 +105,16 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
       }
       if (plan._tag !== "mapped") return favorite;
       favoritesChanged = true;
-      changes.push({
-        field: "favorites",
-        before: favorite,
-        after: { provider: plan.next.instanceId, model: plan.next.model },
-        plan,
-      });
       return { provider: plan.next.instanceId as ProviderInstanceId, model: plan.next.model };
     });
-    if (favoritesChanged) patch.favorites = favorites;
+    if (favoritesChanged) {
+      patch.favorites = favorites;
+      changes.push({ field: "favorites", before: settings.favorites, after: favorites });
+    }
   }
 
-  // A hidden slug that maps is copied to the new instance; the old entry stays as it was, so
-  // nothing a user hid is lost. Unmapped entries are left untouched.
+  // Hidden models: a hidden slug that maps is copied to the new instance; the old entry stays, so
+  // nothing a user hid is lost. The whole map is one ledger field.
   if (settings.providerModelPreferences !== null) {
     const next: Record<string, { hiddenModels: Array<string>; modelOrder: Array<string> }> = {};
     for (const [instanceId, preference] of Object.entries(settings.providerModelPreferences)) {
@@ -138,31 +137,32 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
       }
     }
     if (preferencesChanged) {
-      patch.providerModelPreferences = next as NonNullable<
-        ServerSettingsPatch["providerModelPreferences"]
-      >;
+      const written = next as NonNullable<ServerSettingsPatch["providerModelPreferences"]>;
+      patch.providerModelPreferences = written;
+      changes.push({
+        field: "providerModelPreferences",
+        before: settings.providerModelPreferences,
+        after: written,
+      });
     }
   }
 
-  // Per-project overrides: only their three selection fields. textGenerationModelSelection stays.
+  // Per-project overrides: one ledger field per project and selection, holding that selection only.
+  // textGenerationModelSelection stays.
   const overrides = settings.projectSettingsOverrides;
   const nextOverrides: Record<string, Record<string, unknown>> = {};
   let overridesChanged = false;
+  const fields = [
+    "defaultModelSelection",
+    "sourceControlWriterModelSelection",
+    "reviewGuideModelSelection",
+  ] as const;
   for (const [projectId, override] of Object.entries(overrides)) {
     const projectFields: Record<string, unknown> = {};
-    const fields = [
-      "defaultModelSelection",
-      "sourceControlWriterModelSelection",
-      "reviewGuideModelSelection",
-    ] as const;
     for (const field of fields) {
       const current = override[field];
-      const selection = withSelection(
-        changes,
-        conflicts,
-        `projectSettingsOverrides.${projectId}.${field}`,
-        current,
-      );
+      const fieldPath = `projectSettingsOverrides.${projectId}.${field}`;
+      const selection = withSelection(changes, conflicts, fieldPath, current);
       if (selection !== current) {
         projectFields[field] = selection;
         overridesChanged = true;

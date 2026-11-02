@@ -145,6 +145,43 @@ const LedgerValueJson = Schema.fromJsonString(Schema.Unknown);
 const encodeLedgerValue = Schema.encodeEffect(LedgerValueJson);
 const decodeLedgerValue = Schema.decodeUnknownEffect(LedgerValueJson);
 
+/**
+ * Reads a settings ref: a top-level field (`favorites`) or a per-project override
+ * (`projectSettingsOverrides.<projectId>.<field>`). Only the three selection fields are overrides.
+ */
+const readSettingsPath = (settingsValue: ServerSettings, ref: string): unknown => {
+  const parts = ref.split(".");
+  if (parts[0] === "projectSettingsOverrides" && parts.length === 3) {
+    const overrides: Record<string, Record<string, unknown> | undefined> =
+      settingsValue.projectSettingsOverrides;
+    return overrides[parts[1] ?? ""]?.[parts[2] ?? ""];
+  }
+  return (settingsValue as unknown as Record<string, unknown>)[ref];
+};
+
+/** The settings patch that puts one ref back to `value`, read from the current settings. */
+const settingsPatchFor = (
+  settingsValue: ServerSettings,
+  ref: string,
+  value: unknown,
+): ServerSettingsPatch => {
+  const parts = ref.split(".");
+  if (parts[0] === "projectSettingsOverrides" && parts.length === 3) {
+    const projectId = parts[1] ?? "";
+    const field = parts[2] ?? "";
+    const overrides: Record<string, Record<string, unknown> | undefined> =
+      settingsValue.projectSettingsOverrides;
+    const current = overrides[projectId] ?? {};
+    return {
+      projectSettingsOverrides: {
+        ...settingsValue.projectSettingsOverrides,
+        [projectId]: { ...current, [field]: value },
+      },
+    } as ServerSettingsPatch;
+  }
+  return { [ref]: value } as ServerSettingsPatch;
+};
+
 /** One ledger row as the rollback reads it. */
 interface LedgerRow {
   readonly id: number;
@@ -549,7 +586,10 @@ export const make = Effect.gen(function* () {
     return yield* writeValue(row.scope, row.ref, before, after);
   });
 
-  /** The owner's current value for one ledger row, or undefined when the record is gone. */
+  /**
+   * The owner's current value for one ledger row. `undefined` means the record is gone. Board and
+   * card rows are not read here: a board is restored as a whole, by `restoreBoard`.
+   */
   const currentValue = (
     scope: MigrationScope,
     ref: string,
@@ -558,8 +598,7 @@ export const make = Effect.gen(function* () {
       switch (scope) {
         case "settings": {
           const current = yield* readSettings;
-          const field = ref.split(".")[0] ?? ref;
-          return current[field as keyof ServerSettings];
+          return readSettingsPath(current, ref);
         }
         case "project": {
           const project = yield* projects
@@ -576,32 +615,13 @@ export const make = Effect.gen(function* () {
         case "queued-run":
         case "thread":
         case "board":
-          return yield* currentValueOfThreadOrBoard(scope, ref);
+          return undefined;
       }
-    });
-
-  /** Thread, queued-run and board values: read from the orchestrator or the store. */
-  const currentValueOfThreadOrBoard = (
-    scope: "queued-run" | "thread" | "board",
-    ref: string,
-  ): Effect.Effect<unknown, SelectionMigrationError> =>
-    Effect.gen(function* () {
-      if (scope === "board") {
-        // A board ref is `board:<id>` or a card/pool/thread ref; the board record is the first.
-        const boardId = ref.startsWith("board:") ? ref.slice("board:".length) : null;
-        if (boardId === null) return undefined;
-        const boards = yield* kanban.boards.pipe(
-          Effect.mapError((cause) => migrationError("read board", cause)),
-        );
-        return boards.find((board) => board.id === boardId);
-      }
-      // Thread-level values are read from the thread's own projection. A queued run is found by its id.
-      return undefined;
     });
 
   /**
-   * Puts one value back through the owner that holds it. Returns null when written, or the reason it
-   * could not be written. A scope with no restore path is reported, never stamped as reverted.
+   * Puts one ledger row back through its owner. Returns null when written, or the reason it was not.
+   * A board, queued-run or thread row is never restored alone: see `restoreBoardRows` and the skips.
    */
   const writeValue = (
     scope: MigrationScope,
@@ -612,9 +632,9 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       switch (scope) {
         case "settings": {
-          const field = ref.split(".")[0] ?? ref;
+          const current = yield* readSettings;
           yield* settings
-            .updateSettings({ [field]: before } as ServerSettingsPatch)
+            .updateSettings(settingsPatchFor(current, ref, before))
             .pipe(Effect.mapError((cause) => migrationError("restore settings", cause)));
           return null;
         }
@@ -639,9 +659,9 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => migrationError("restore schedule", cause)));
           return wrote ? null : "schedule changed after apply";
         }
+        case "board":
         case "queued-run":
         case "thread":
-        case "board":
           return `${scope} rollback is not implemented yet`;
       }
     });
