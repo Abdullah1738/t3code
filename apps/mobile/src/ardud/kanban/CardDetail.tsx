@@ -3,13 +3,13 @@ import {
   askViews,
   cardView,
   modelName,
-  modelVariant,
   STAGE_LABELS,
   subtaskOwnerLabel,
   subtaskSteps,
   type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { type ReactNode, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
@@ -340,7 +340,7 @@ function CardFacts(props: {
   const { card, state } = props;
   const action = useBoardAction();
   const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
-  const variant = modelVariant(card.model);
+  const effort = selectionEffort(card.model);
   const chainName = card.reviewChain ?? state.board.defaultReviewChain;
   const chain = state.board.reviewChains.find((entry) => entry.name === chainName);
   return (
@@ -369,7 +369,7 @@ function CardFacts(props: {
         <DetailRow label="Models">
           {card.models.map((entry) => (
             <KChip
-              key={`${entry.model.instanceId}/${entry.model.model}#${modelVariant(entry.model) ?? ""}`}
+              key={`${entry.model.instanceId}/${entry.model.model}#${selectionEffort(entry.model) ?? ""}`}
               label={`${modelName(entry.model)} ${entry.weight}`}
             />
           ))}
@@ -377,7 +377,7 @@ function CardFacts(props: {
       ) : (
         <DetailRow label="Model">
           <KChip label={modelName(card.model)} />
-          {variant ? <KChip label={variant} /> : null}
+          {effort ? <KChip label={effort} /> : null}
         </DetailRow>
       )}
       <DetailRow label="Links">
