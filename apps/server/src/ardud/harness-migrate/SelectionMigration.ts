@@ -671,14 +671,24 @@ export const make = Effect.gen(function* () {
     });
 
   /** Board ids this migration wrote, read from the ledger's board rows for one version. */
+  /** The record id in a board-scoped ref: the segment after the board, or the whole id for a board. */
+  const refIdOf = (ref: string): string => {
+    const match = /^(board|card|thread|pool):(.+)$/.exec(ref);
+    const rest = match?.[2] ?? ref;
+    if (match?.[1] === "board") return rest;
+    const at = rest.indexOf(":");
+    return at === -1 ? rest : rest.slice(at + 1);
+  };
+
   const boardIdOf = (ref: string): string | null => {
+    // board:<id> | card:<boardId>:<cardId> | thread:<boardId>:<threadId> | pool:<boardId>:<key>
+    // Board ids are `board-<slug>` and never contain a colon, so the first segment is the board.
     const match = /^(board|card|thread|pool):(.+)$/.exec(ref);
     if (match === null) return null;
     const kind = match[1];
     const rest = match[2] ?? "";
     if (kind === "board") return rest;
-    if (kind === "pool") return rest.split(":")[0] ?? null;
-    return null;
+    return rest.split(":")[0] ?? null;
   };
 
   /**
@@ -737,18 +747,17 @@ export const make = Effect.gen(function* () {
       const after = yield* decodeLedgerValue(row.after_json).pipe(
         Effect.mapError((cause) => migrationError("decode board ledger", cause)),
       );
+      const id = refIdOf(row.ref);
       if (row.ref.startsWith("card:")) {
-        const id = row.ref.slice("card:".length);
         const live = current.cards.find((card) => card.id === id);
         if (live === undefined || !sameJson(live, after)) return `card ${id} changed after apply`;
         restored.cards.set(id, before as KanbanCard);
       } else if (row.ref.startsWith("thread:")) {
-        const id = row.ref.slice("thread:".length);
         const live = current.links.find((link) => link.threadId === id);
         if (live === undefined || !sameJson(live, after)) return `thread link ${id} changed after apply`;
         restored.links.set(id, before as KanbanThreadLink);
       } else if (row.ref.startsWith("pool:")) {
-        const key = row.ref.slice(`pool:${boardId}:`.length);
+        const key = id;
         const afterPool = after as KanbanPool;
         const live = current.pools.find((pool) => pool.key === afterPool.key);
         if (live === undefined || !sameJson(live, afterPool)) return `pool ${key} changed after apply`;

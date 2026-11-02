@@ -125,7 +125,7 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
       card.activePool === null ? null : (keyOf.get(card.activePool) ?? card.activePool);
     const next = { ...card, model, models, activePool };
     if (!sameJson(next, card)) {
-      changes.push({ ref: `card:${card.id}`, before: card, after: next });
+      changes.push({ ref: `card:${board.id}:${card.id}`, before: card, after: next });
     }
     return next;
   });
@@ -135,7 +135,7 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
     const model = mapOne(conflicts, `thread ${link.threadId} model`, link.model);
     const next = { ...link, model };
     if (!sameJson(next, link)) {
-      changes.push({ ref: `thread:${link.threadId}`, before: link, after: next });
+      changes.push({ ref: `thread:${board.id}:${link.threadId}`, before: link, after: next });
     }
     return next;
   });

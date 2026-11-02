@@ -575,16 +575,30 @@ const make = Effect.gen(function* () {
             INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${input.board.id}, ${input.board.slug}, ${boardJson})
             ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
           `;
-          // Old keys go first, so a pool that keeps its key is rewritten, not dropped.
-          for (const key of input.oldPoolKeys) {
-            yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
-          }
-          for (const pool of input.pools) {
+          // The board reads its pools in insertion order (ORDER BY rowid), so a migrated pool keeps its row
+          // and its place: a key change is an in-place UPDATE, never a delete and re-insert. Only a key
+          // that leaves the board is deleted. `oldPoolKeys` and `pools` are paired by position.
+          // Re-keyed pools move first, so their rows are never deleted in the way; the removal pass that
+          // follows only sees keys that genuinely left the board.
+          const survivingKeys = new Set(input.pools.map((pool) => pool.key));
+          for (const [index, pool] of input.pools.entries()) {
             const poolJson = yield* Pool.encode(pool);
+            const oldKey = input.oldPoolKeys[index];
+            if (oldKey !== undefined && oldKey !== pool.key) {
+              yield* sql`
+                UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${poolJson}
+                WHERE board_id = ${input.board.id} AND key = ${oldKey}
+              `;
+              continue;
+            }
             yield* sql`
               INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${input.board.id}, ${pool.key}, ${poolJson})
               ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
             `;
+          }
+          for (const key of input.oldPoolKeys) {
+            if (survivingKeys.has(key)) continue;
+            yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
           }
           for (const card of input.cards) {
             const json = yield* Card.encode(card);

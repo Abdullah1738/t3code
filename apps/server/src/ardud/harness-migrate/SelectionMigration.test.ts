@@ -111,6 +111,56 @@ it.effect("apply moves a board's pools to Claude Code and a second apply writes 
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("rollback restores a board's pools exactly as they were before apply", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const board = yield* kanban.ensureBoard({
+      slug: "rollback",
+      name: "Rollback",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    const poolsBefore = yield* store.pools(board.id);
+
+    yield* migration.apply;
+    const rolled = yield* migration.rollback(SelectionMigration.SELECTION_MIGRATION_VERSION);
+
+    assert.strictEqual(rolled.skipped.length, 0);
+    assert.isTrue(rolled.reverted > 0);
+    // Restored means the stored pools are the ones from before apply, not merely a same-looking set.
+    const poolsAfter = yield* store.pools(board.id);
+    assert.deepStrictEqual(poolsAfter, poolsBefore);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rollback leaves a board alone when it changed after apply, and reports it", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const board = yield* kanban.ensureBoard({
+      slug: "edited",
+      name: "Edited",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    yield* migration.apply;
+
+    // An operator edits a pool after apply: rollback must not undo it silently.
+    const migrated = yield* store.pools(board.id);
+    const edited = migrated.map((pool) => ({ ...pool, slots: pool.slots + 1 }));
+    yield* store.putPool(board.id, edited[0]!);
+    const poolsAfterEdit = yield* store.pools(board.id);
+
+    const rolled = yield* migration.rollback(SelectionMigration.SELECTION_MIGRATION_VERSION);
+
+    assert.isTrue(rolled.skipped.length > 0, "the edited board must be reported as skipped");
+    assert.deepStrictEqual(yield* store.pools(board.id), poolsAfterEdit);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("dry-run reports a board's selections and writes nothing", () =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
