@@ -160,7 +160,9 @@ const runOutcome = (
   const failure = latestRootProviderFailure(run, turnItems);
   return failed(
     failure?.message ?? "The run failed.",
-    failure?.code === BLOCKED_CODE || failure?.message === BLOCKED_MESSAGE,
+    failure?.code === BLOCKED_CODE ||
+      failure?.message === BLOCKED_MESSAGE ||
+      failure?.category === "content_filter",
   );
 };
 
