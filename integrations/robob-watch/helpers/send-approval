@@ -726,6 +726,12 @@ def check_app(raw, drafted):
     if ident.get("resolution") != "resolved" or not ident.get("robobThreadId"):
         refuse(f"this session isn't resolved to a Robob thread yet ({ident.get('resolution') or 'unknown'}). "
                "Nothing was approved; wait a few seconds and send again.")
+    # A Claude shell carries only its session id. A native child shares that id with its parent, and C1 answers a
+    # bare Claude id with the parent's top-level identity, so "top-level" can't show the caller isn't a child.
+    # Approval authority is not granted on that evidence: refuse until the harness gives a per-agent id.
+    if driver == "claudeAgent":
+        refuse("can't prove this Claude session is the top-level thread and not a child that shares its session id. "
+               "Nothing was approved. Approve from the Robob thread itself or from iMessage.")
     # Only a top-level thread may hold an approval stream. Subagents and app-managed children return drafts to
     # their parent, and a provider-native child shares its parent's session id, so it can't authorise anything.
     if ident.get("executionKind") != "top-level":

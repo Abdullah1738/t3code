@@ -957,33 +957,48 @@ class SendApprovalTest(unittest.TestCase):
         con.close()
         return native_env
 
-    def test_claude_child_is_refused_even_when_the_parent_stream_is_shared(self):
-        # A Claude child shares its parent's session id. C1 answers "provider-native-child": refused, not approved
-        # on the parent's stream.
+    def test_provider_native_child_is_refused_by_its_execution_kind(self):
+        # The child rule itself: C1 answers "provider-native-child" for a caller it can prove is a child (a Codex
+        # thread id). Refused on the execution kind, not on the Claude rule.
         self.claude_top(None, self.CLAUDE_UUID)
         child = {"resolution": "resolved", "robobThreadId": "t-child", "parentThreadId": "t1",
                  "executionKind": "provider-native-child", "acceptsMessages": False}
-        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"claudeAgent:" + self.CLAUDE_UUID: child},
-                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"codex:" + self.CLAUDE_UUID: child},
+                                      native_env={"CODEX_THREAD_ID": self.CLAUDE_UUID})
         self.assertEqual(code, 2, err)
         self.assertIn("subagent or child", err)
 
     def test_app_managed_child_is_refused(self):
+        # An app-managed child is refused by its execution kind. Use a Codex caller (provable) so the Claude rule
+        # can't be the reason.
         self.claude_top(None, self.CLAUDE_UUID)
         child = {"resolution": "resolved", "robobThreadId": "t-child", "parentThreadId": "t1",
                  "executionKind": "app-managed-child", "acceptsMessages": True}
-        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"claudeAgent:" + self.CLAUDE_UUID: child},
-                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"codex:" + self.CLAUDE_UUID: child},
+                                      native_env={"CODEX_THREAD_ID": self.CLAUDE_UUID})
         self.assertEqual(code, 2, err)
         self.assertIn("subagent or child", err)
 
-    def test_top_level_claude_thread_is_accepted(self):
+    def test_top_level_claude_thread_is_not_accepted_on_a_shared_session_id(self):
+        # Acceptance needs a per-agent proof the shell env doesn't carry, so a top-level answer alone is refused.
         self.claude_top(None, self.CLAUDE_UUID)
         top = {"resolution": "resolved", "robobThreadId": "t-native", "parentThreadId": None,
                "executionKind": "top-level", "acceptsMessages": True}
         code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"claudeAgent:" + self.CLAUDE_UUID: top},
                                       native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 2, err)
+
+    def test_claude_shell_is_refused_even_when_c1_says_top_level(self):
+        # A Claude child's shell carries its parent's session id, and C1 answers a bare Claude id with the
+        # parent's top-level identity. So C1's "top-level" can't prove the caller is not a child: refuse.
+        self.claude_top(None, self.CLAUDE_UUID)
+        top = {"resolution": "resolved", "robobThreadId": "t-native", "parentThreadId": None,
+               "executionKind": "top-level", "acceptsMessages": True}
+        code, _, err = self.run_check("--app", "--preview", PREVIEW,
+                                      identity={"claudeAgent:" + self.CLAUDE_UUID: top},
+                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+        self.assertIn("can't prove", err)
 
     def test_same_uuid_under_a_different_driver_never_crosses(self):
         # The same UUID is a Claude thread in one home and a Codex thread in another. A Codex caller resolved
