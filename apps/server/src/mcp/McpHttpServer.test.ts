@@ -1265,17 +1265,61 @@ it.effect("admits provider and OAuth client credentials and points only clients 
 
       const missing = yield* call(undefined);
       expect(missing.status).toBe(401);
+      expect(missing.headers["cache-control"]).toBe("no-store");
       expect(missing.headers["www-authenticate"]).toMatch(
         /^Bearer resource_metadata="http:\/\/[^"]+\/\.well-known\/oauth-protected-resource\/mcp"$/,
       );
+      expect(yield* missing.json).toEqual({
+        error: "invalid_mcp_credential",
+        message: "A valid T3 Code MCP credential is required.",
+      });
 
       const expiredClient = yield* call("stale-payload.stale-signature");
-      expect(expiredClient.headers["www-authenticate"]).toContain("resource_metadata=");
-      expect(expiredClient.headers["www-authenticate"]).toContain('error="invalid_token"');
+      expect(expiredClient.status).toBe(401);
+      expect(expiredClient.headers["cache-control"]).toBe("no-store");
+      expect(expiredClient.headers["www-authenticate"]).toMatch(
+        /^Bearer resource_metadata="http:\/\/[^"]+\/\.well-known\/oauth-protected-resource\/mcp", error="invalid_token"$/,
+      );
+      expect(yield* expiredClient.json).toEqual({
+        error: "invalid_mcp_credential",
+        message: "A valid T3 Code MCP credential is required.",
+      });
 
       const deadProvider = yield* call("deadProviderToken");
       expect(deadProvider.status).toBe(401);
+      expect(deadProvider.headers["cache-control"]).toBe("no-store");
       expect(deadProvider.headers["www-authenticate"]).toBe('Bearer error="invalid_token"');
+      expect(yield* deadProvider.json).toEqual({
+        error: "invalid_mcp_credential",
+        message:
+          "This T3 Code MCP credential is no longer valid (revoked, expired, or issued before a Robob restart). Don't retry T3 tools in this run: finish or end your turn; the next turn gets a fresh credential.",
+      });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("preserves the missing-token response when OAuth is unavailable", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const serverLayer = McpHttpServer.layerMcpTransport.pipe(
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: () => Effect.succeed(undefined),
+          }),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const response = yield* httpClient.post("/mcp");
+      expect(response.status).toBe(401);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.headers["www-authenticate"]).toBe("Bearer");
+      expect(yield* response.json).toEqual({
+        error: "invalid_mcp_credential",
+        message: "A valid T3 Code MCP credential is required.",
+      });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

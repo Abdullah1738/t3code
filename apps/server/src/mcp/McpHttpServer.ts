@@ -111,7 +111,11 @@ const unauthorized = (input: {
   return HttpServerResponse.jsonUnsafe(
     {
       error: "invalid_mcp_credential",
-      message: "A valid T3 Code MCP credential is required.",
+      // ardud: A dead run credential cannot be refreshed until the next turn.
+      message:
+        input.presentedToken && !input.offerOAuth
+          ? "This T3 Code MCP credential is no longer valid (revoked, expired, or issued before a Robob restart). Don't retry T3 tools in this run: finish or end your turn; the next turn gets a fresh credential."
+          : "A valid T3 Code MCP credential is required.",
     },
     {
       status: 401,
