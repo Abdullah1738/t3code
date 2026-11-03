@@ -754,7 +754,21 @@ function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2Provid
     providerThread.status === "not_loaded" &&
     providerThread.firstRunOrdinal === null &&
     providerThread.nativeThreadRef === null &&
-    providerThread.providerSessionId === null
+    providerThread.providerSessionId === null &&
+    providerThread.nativeMetadata?.seededHistory === undefined
+  );
+}
+
+// ardud: a late event may update the old row, but cannot undo an adoption.
+export function keepsAdoptedActive(
+  thread: OrchestrationV2AppThread,
+  activeRow: OrchestrationV2ProviderThread | undefined,
+  payload: OrchestrationV2ProviderThread,
+): boolean {
+  return (
+    activeRow?.nativeMetadata?.seededHistory !== undefined &&
+    activeRow.id !== payload.id &&
+    payload.providerInstanceId !== thread.providerInstanceId
   );
 }
 
@@ -876,7 +890,12 @@ export function applyToProjection(
         ...base,
         thread:
           event.payload.appThreadId === base.thread.id &&
-          !isQueuedProviderThreadPlaceholder(event.payload)
+          !isQueuedProviderThreadPlaceholder(event.payload) &&
+          !keepsAdoptedActive(
+            base.thread,
+            base.providerThreads.find((row) => row.id === base.thread.activeProviderThreadId),
+            event.payload,
+          )
             ? {
                 ...base.thread,
                 activeProviderThreadId: event.payload.id,
@@ -2340,6 +2359,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 const threadRow = threadRows[0];
                 if (threadRow !== undefined) {
                   const thread = yield* decodeThreadPayload(threadRow.payload_json);
+                  const activeRows =
+                    thread.activeProviderThreadId === null ||
+                    thread.activeProviderThreadId === event.payload.id
+                      ? []
+                      : yield* sql<PayloadRow>`
+                          SELECT payload_json FROM orchestration_v2_projection_provider_threads
+                          WHERE provider_thread_id = ${thread.activeProviderThreadId}
+                          LIMIT 1
+                        `;
+                  const activeRow =
+                    activeRows[0] === undefined
+                      ? undefined
+                      : yield* decodeProviderThreadPayload(activeRows[0].payload_json);
+                  if (keepsAdoptedActive(thread, activeRow, event.payload)) break;
                   const updatedThread = {
                     ...thread,
                     activeProviderThreadId: event.payload.id,

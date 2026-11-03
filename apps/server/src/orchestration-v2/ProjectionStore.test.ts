@@ -192,6 +192,351 @@ const addRolledBackRecoveryCandidate = Effect.fn("addRolledBackRecoveryCandidate
   return threadId;
 });
 
+const seededHistoryProjectionFixture = Effect.fn("seededHistoryProjectionFixture")(function* (
+  mode: "claude-transcript" | "codex-inject",
+) {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const at = DateTime.makeUnsafe("2026-11-01T12:00:00.000Z");
+  const threadId = ThreadId.make(`thread:seeded-history:${mode}`);
+  const sourceInstanceId = ProviderInstanceId.make("opencode");
+  const sourceDriver = ProviderDriverKind.make("opencode");
+  const sourceModelSelection = { instanceId: sourceInstanceId, model: "source-model" };
+  const targetInstanceId = ProviderInstanceId.make(mode === "codex-inject" ? "codex" : "claude");
+  const targetDriver = ProviderDriverKind.make(mode === "codex-inject" ? "codex" : "claudeAgent");
+  const targetModelSelection = { instanceId: targetInstanceId, model: "target-model" };
+
+  yield* store.apply({
+    id: EventId.make(`event:seeded-history:${mode}:thread`),
+    type: "thread.created",
+    threadId,
+    occurredAt: at,
+    payload: {
+      createdBy: "user",
+      creationSource: "web",
+      id: threadId,
+      projectId: ProjectId.make("project:seeded-history"),
+      title: "Seeded history",
+      providerInstanceId: sourceInstanceId,
+      modelSelection: sourceModelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: at,
+      updatedAt: at,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    },
+  });
+
+  const sourceRow = {
+    id: ProviderThreadId.make(`provider-thread:seeded-history:${mode}:source`),
+    driver: sourceDriver,
+    providerInstanceId: sourceInstanceId,
+    providerSessionId: null,
+    appThreadId: threadId,
+    ownerNodeId: null,
+    nativeThreadRef: {
+      driver: sourceDriver,
+      nativeId: "source-session",
+      strength: "strong" as const,
+    },
+    nativeConversationHeadRef: null,
+    status: "idle" as const,
+    firstRunOrdinal: 1,
+    lastRunOrdinal: 1,
+    handoffIds: [],
+    forkedFrom: null,
+    pendingBackgroundTasks: [],
+    contextUsage: null,
+    nativeMetadata: null,
+    goal: null,
+    createdAt: at,
+    updatedAt: at,
+  } satisfies OrchestrationV2ProviderThread;
+  yield* store.apply({
+    id: EventId.make(`event:seeded-history:${mode}:source`),
+    type: "provider-thread.updated",
+    threadId,
+    occurredAt: at,
+    payload: sourceRow,
+  });
+  const sourceProjection = yield* store.getThreadProjection(threadId);
+  assert.equal(sourceProjection.thread.activeProviderThreadId, sourceRow.id);
+
+  yield* store.apply({
+    id: EventId.make(`event:seeded-history:${mode}:select-target`),
+    type: "thread.provider-switched",
+    threadId,
+    occurredAt: at,
+    payload: {
+      ...sourceProjection.thread,
+      providerInstanceId: targetInstanceId,
+      modelSelection: targetModelSelection,
+    },
+  });
+  const targetRow = {
+    id: ProviderThreadId.make(`provider-thread:seeded-history:${mode}:target`),
+    driver: targetDriver,
+    providerInstanceId: targetInstanceId,
+    providerSessionId: null,
+    appThreadId: threadId,
+    ownerNodeId: null,
+    nativeThreadRef:
+      mode === "codex-inject"
+        ? null
+        : { driver: targetDriver, nativeId: "staged-session", strength: "strong" as const },
+    nativeConversationHeadRef: null,
+    status: "not_loaded" as const,
+    firstRunOrdinal: null,
+    lastRunOrdinal: null,
+    handoffIds: [],
+    forkedFrom: null,
+    pendingBackgroundTasks: [],
+    contextUsage: null,
+    nativeMetadata: {
+      seededHistory: {
+        source: "opencode" as const,
+        sourceSessionId: "source-session",
+        digest: "sha256:seeded-history",
+        mode,
+        ...(mode === "claude-transcript" ? { stagedPath: "/staged/transcript.jsonl" } : {}),
+      },
+    },
+    goal: null,
+    createdAt: at,
+    updatedAt: at,
+  } satisfies OrchestrationV2ProviderThread;
+  yield* store.apply({
+    id: EventId.make(`event:seeded-history:${mode}:target`),
+    type: "provider-thread.updated",
+    threadId,
+    occurredAt: at,
+    payload: targetRow,
+  });
+
+  return { store, at, threadId, sourceRow, sourceModelSelection, targetRow };
+});
+
+it.effect.each(["claude-transcript", "codex-inject"] as const)(
+  "memory %s seeded history stays active on late provider updates, but allows a real switch",
+  (mode) =>
+    Effect.gen(function* () {
+      const { store, at, threadId, sourceRow, sourceModelSelection, targetRow } =
+        yield* seededHistoryProjectionFixture(mode);
+      const adopted = yield* store.getThreadProjection(threadId);
+      assert.equal(adopted.thread.providerInstanceId, targetRow.providerInstanceId);
+      assert.equal(adopted.thread.activeProviderThreadId, targetRow.id);
+      assert.deepEqual(
+        adopted.providerThreads.find((row) => row.id === targetRow.id)?.nativeMetadata,
+        targetRow.nativeMetadata,
+      );
+
+      const lateAt = DateTime.add(at, { seconds: 1 });
+      const lateSourceRow = {
+        ...sourceRow,
+        status: "active" as const,
+        lastRunOrdinal: 2,
+        updatedAt: lateAt,
+      };
+      yield* store.apply({
+        id: EventId.make(`event:seeded-history:${mode}:late-source`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: lateAt,
+        payload: lateSourceRow,
+      });
+      const afterLateUpdate = yield* store.getThreadProjection(threadId);
+      assert.equal(afterLateUpdate.thread.providerInstanceId, targetRow.providerInstanceId);
+      assert.equal(afterLateUpdate.thread.activeProviderThreadId, targetRow.id);
+      assert.deepEqual(
+        afterLateUpdate.providerThreads.find((row) => row.id === sourceRow.id),
+        lateSourceRow,
+      );
+      assert.deepEqual(
+        afterLateUpdate.providerThreads.find((row) => row.id === targetRow.id),
+        targetRow,
+      );
+
+      const switchedAt = DateTime.add(at, { seconds: 2 });
+      yield* store.apply({
+        id: EventId.make(`event:seeded-history:${mode}:switch-back`),
+        type: "thread.provider-switched",
+        threadId,
+        occurredAt: switchedAt,
+        payload: {
+          ...afterLateUpdate.thread,
+          providerInstanceId: sourceRow.providerInstanceId,
+          modelSelection: sourceModelSelection,
+          updatedAt: switchedAt,
+        },
+      });
+      const afterSelection = yield* store.getThreadProjection(threadId);
+      assert.equal(afterSelection.thread.providerInstanceId, sourceRow.providerInstanceId);
+      assert.equal(afterSelection.thread.activeProviderThreadId, targetRow.id);
+
+      const targetUpdatedAt = DateTime.add(at, { seconds: 3 });
+      const updatedTargetRow = {
+        ...targetRow,
+        status: "idle" as const,
+        updatedAt: targetUpdatedAt,
+      };
+      yield* store.apply({
+        id: EventId.make(`event:seeded-history:${mode}:update-active-target`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: targetUpdatedAt,
+        payload: updatedTargetRow,
+      });
+      const afterTargetUpdate = yield* store.getThreadProjection(threadId);
+      assert.equal(afterTargetUpdate.thread.activeProviderThreadId, targetRow.id);
+      assert.deepEqual(
+        afterTargetUpdate.providerThreads.find((row) => row.id === targetRow.id),
+        updatedTargetRow,
+      );
+
+      const activatedAt = DateTime.add(at, { seconds: 4 });
+      const selectedSourceRow = {
+        ...lateSourceRow,
+        status: "idle" as const,
+        lastRunOrdinal: 3,
+        updatedAt: activatedAt,
+      };
+      yield* store.apply({
+        id: EventId.make(`event:seeded-history:${mode}:activate-selected-source`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: activatedAt,
+        payload: selectedSourceRow,
+      });
+      const afterSwitch = yield* store.getThreadProjection(threadId);
+      assert.equal(afterSwitch.thread.providerInstanceId, sourceRow.providerInstanceId);
+      assert.equal(afterSwitch.thread.activeProviderThreadId, sourceRow.id);
+      assert.deepEqual(
+        afterSwitch.providerThreads.find((row) => row.id === sourceRow.id),
+        selectedSourceRow,
+      );
+      assert.deepEqual(
+        afterSwitch.providerThreads.find((row) => row.id === targetRow.id),
+        updatedTargetRow,
+      );
+    }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("memory accepts a replacement for the selected seeded provider", () =>
+  Effect.gen(function* () {
+    const { store, at, threadId, targetRow } =
+      yield* seededHistoryProjectionFixture("codex-inject");
+    const replacement = {
+      ...targetRow,
+      id: ProviderThreadId.make("provider-thread:seeded-history:replacement"),
+      status: "idle" as const,
+      nativeMetadata: null,
+    };
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:replacement"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: replacement,
+    });
+    const projection = yield* store.getThreadProjection(threadId);
+    assert.equal(projection.thread.providerInstanceId, targetRow.providerInstanceId);
+    assert.equal(projection.thread.activeProviderThreadId, replacement.id);
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === replacement.id),
+      replacement,
+    );
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === targetRow.id),
+      targetRow,
+    );
+  }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("memory keeps existing activation behavior when the active row is not seeded", () =>
+  Effect.gen(function* () {
+    const { store, at, threadId, sourceRow, targetRow } =
+      yield* seededHistoryProjectionFixture("codex-inject");
+    const unseededTargetRow = {
+      ...targetRow,
+      status: "idle" as const,
+      nativeMetadata: { title: "Ordinary provider thread" },
+    };
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:remove-seed-metadata"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: unseededTargetRow,
+    });
+    assert.equal(
+      (yield* store.getThreadProjection(threadId)).thread.activeProviderThreadId,
+      targetRow.id,
+    );
+
+    const updatedSourceRow = { ...sourceRow, status: "active" as const };
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:unseeded-source-update"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: updatedSourceRow,
+    });
+    const projection = yield* store.getThreadProjection(threadId);
+    assert.equal(projection.thread.providerInstanceId, targetRow.providerInstanceId);
+    assert.equal(projection.thread.activeProviderThreadId, sourceRow.id);
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === sourceRow.id),
+      updatedSourceRow,
+    );
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === targetRow.id),
+      unseededTargetRow,
+    );
+  }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("memory activates a null-ref codex seed but not an ordinary queued placeholder", () =>
+  Effect.gen(function* () {
+    const { store, at, threadId, targetRow } =
+      yield* seededHistoryProjectionFixture("codex-inject");
+    assert.isNull(targetRow.nativeThreadRef);
+    assert.equal(targetRow.status, "not_loaded");
+    const seeded = yield* store.getThreadProjection(threadId);
+    assert.equal(seeded.thread.activeProviderThreadId, targetRow.id);
+
+    const placeholder = {
+      ...targetRow,
+      id: ProviderThreadId.make("provider-thread:seeded-history:queued-placeholder"),
+      nativeMetadata: null,
+    };
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:queued-placeholder"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: placeholder,
+    });
+    const projection = yield* store.getThreadProjection(threadId);
+    assert.equal(projection.thread.activeProviderThreadId, targetRow.id);
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === placeholder.id),
+      placeholder,
+    );
+    assert.deepEqual(
+      projection.providerThreads.find((row) => row.id === targetRow.id),
+      targetRow,
+    );
+  }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
 it.effect.each([
   ["memory", ProjectionStore.layerMemory],
   ["SQL", layerTest],

@@ -1129,6 +1129,14 @@ export const layer: Layer.Layer<
         lastRunOrdinal: run.ordinal,
         handoffIds: providerThread.handoffIds,
         forkedFrom: providerThread.forkedFrom,
+        // ardud: ensureThread may return a fresh row on Codex's first turn.
+        nativeMetadata:
+          providerThread.nativeMetadata?.seededHistory === undefined
+            ? loadedProviderThread.nativeMetadata
+            : {
+                ...loadedProviderThread.nativeMetadata,
+                seededHistory: providerThread.nativeMetadata.seededHistory,
+              },
         status: "active",
         createdAt: providerThread.createdAt,
         updatedAt: now,

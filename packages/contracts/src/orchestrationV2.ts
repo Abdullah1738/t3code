@@ -863,11 +863,22 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
 );
 export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2PendingBackgroundTask.Type;
 
+// ardud: native history staged from OpenCode, before the target's first turn.
+export const OrchestrationV2SeededHistory = Schema.Struct({
+  source: Schema.Literal("opencode"),
+  sourceSessionId: TrimmedNonEmptyString,
+  digest: TrimmedNonEmptyString,
+  mode: Schema.Literals(["claude-transcript", "codex-inject"]),
+  stagedPath: Schema.optional(TrimmedNonEmptyString),
+  injectedNativeId: Schema.optional(TrimmedNonEmptyString),
+});
+
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  seededHistory: Schema.optional(OrchestrationV2SeededHistory),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -3194,6 +3205,28 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     htmlRender: OrchestrationV2HtmlRender,
+  }),
+  // ardud: internal so only the migration service can re-point a thread.
+  // Codex injection has no native ID until the first turn.
+  Schema.Struct({
+    type: Schema.Literal("thread.adopt-native-history"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    modelSelection: ModelSelection,
+    expectedActiveProviderThreadId: Schema.NullOr(ProviderThreadId),
+    target: Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("new"),
+        driver: ProviderDriverKind,
+        nativeId: Schema.NullOr(TrimmedNonEmptyString),
+        headId: Schema.NullOr(TrimmedNonEmptyString),
+        seededHistory: OrchestrationV2SeededHistory,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("existing"),
+        providerThreadId: ProviderThreadId,
+      }),
+    ]),
   }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;

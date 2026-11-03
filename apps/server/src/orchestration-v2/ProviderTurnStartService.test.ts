@@ -1181,6 +1181,35 @@ effectIt.effect("does not mistake a failed state read for a superseded run", () 
   }),
 );
 
+effectIt.effect("keeps seeded history when a new Codex native thread is loaded", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
+    const history = {
+      source: "opencode" as const,
+      sourceSessionId: "ses_x",
+      digest: "sha256:seed",
+      mode: "codex-inject" as const,
+      stagedPath: "/staged/input",
+    };
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: { seededHistory: history },
+      })),
+    });
+
+    yield* harness.start;
+
+    const updated = harness.events.find((event) => event.type === "provider-thread.updated");
+    expect(updated?.type).toBe("provider-thread.updated");
+    if (updated?.type === "provider-thread.updated") {
+      expect(updated.payload.nativeMetadata?.seededHistory).toEqual(history);
+    }
+  }),
+);
+
 effectIt.effect("does not overwrite a run interrupted while its thread loads", () =>
   Effect.gen(function* () {
     const harness = makeLocalCommandHarness({
