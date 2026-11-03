@@ -3306,6 +3306,11 @@ interface ActiveClaudeTurnContext {
     >;
     /** SDK message groups (by `message.id`) that contained a tool call. */
     readonly toolGroups: Set<string>;
+    /**
+     * SDK message groups whose stream reported `stop_reason: end_turn`. That proves the reply even when
+     * a steer keeps the run going, so the turn's final result is not the only answer.
+     */
+    readonly endedGroups: Set<string>;
   };
   readonly reasoning: {
     messageId: string | null;
@@ -7432,6 +7437,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 usage === undefined ? null : { messageId: event.message.id, usage };
               if (usage !== undefined) yield* emitContextUsage(context, usage);
             } else if (event.type === "message_delta") {
+              const endedGroup = reasoning.messageId;
+              if (event.delta.stop_reason === "end_turn" && endedGroup !== null) {
+                context.assistant.endedGroups.add(endedGroup);
+                if (!context.assistant.toolGroups.has(endedGroup)) {
+                  for (const recorded of context.assistant.textGroups.values()) {
+                    if (recorded.groupId === endedGroup) {
+                      yield* reemitAssistantPhase({
+                        context,
+                        nativeItemId: recorded.nativeItemId,
+                        phase: "answer",
+                      });
+                    }
+                  }
+                }
+              }
               const usage: typeof event.usage | undefined = event.usage;
               const stream = context.streamUsage;
               if (stream?.usage && usage !== undefined) {
@@ -8326,12 +8346,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
           }
           if (assistantText !== null && assistantText.text.length > 0) {
+            const textGroupId =
+              message.type === "assistant" && typeof message.message.id === "string" ? message.message.id : null;
+            const nativePhase = claudeAssistantPhase(message);
+            // The stream can report the group's end_turn before the CLI writes its text line.
+            const endedReply =
+              nativePhase === "unknown" &&
+              textGroupId !== null &&
+              context.assistant.endedGroups.has(textGroupId) &&
+              !context.assistant.toolGroups.has(textGroupId);
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
-              phase: claudeAssistantPhase(message),
-              groupId: message.type === "assistant" && typeof message.message.id === "string" ? message.message.id : null,
+              phase: endedReply ? "answer" : nativePhase,
+              groupId: textGroupId,
             });
             return;
           }
@@ -9350,6 +9379,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 noticeTexts: new Set(),
                 textGroups: new Map(),
                 toolGroups: new Set(),
+                endedGroups: new Set(),
               },
               reasoning: {
                 messageId: null,

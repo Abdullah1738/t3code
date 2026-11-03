@@ -3519,6 +3519,32 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect("review r3: an end_turn message before a steer keeps answer phase when the run continues", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const attemptId = RunAttemptId.make("review-steer-phases");
+      const input = makeClaudeTestTurnInput({threadId: harness.threadId, providerThread: harness.providerThread,
+        now: yield* DateTime.now, attemptId, text: "Book the car", attachments: []});
+      yield* harness.runtime.startTurn(input);
+      const frame = (id: string, text: string) => claudeSdkFrame({type: "assistant", uuid: id,
+        session_id: WAKE_NATIVE_SESSION, parent_tool_use_id: null,
+        message: {id, model: "claude-opus-5-5", content: [{type: "text", text}], stop_reason: null}});
+      yield* Queue.offer(harness.sdkMessages, usageStreamFrame({type: "message_start", message: {id: "review-a", usage: zeroUsage}}));
+      yield* Queue.offer(harness.sdkMessages, frame("review-a", "Booked for 11:50"));
+      yield* Queue.offer(harness.sdkMessages, usageStreamFrame({type: "message_delta", delta: {stop_reason: "end_turn", stop_sequence: null}, usage: zeroUsage}));
+      yield* awaitUntil(() => harness.events.some(event => event.type === "message.updated" && event.message.text === "Booked for 11:50"), "answer A arrived");
+      yield* harness.runtime.steerTurn({threadId: harness.threadId, runId: input.runId, providerThread: harness.providerThread,
+        providerTurnId: idAllocator.derive.providerTurn({driver: ClaudeAdapterV2.CLAUDE_PROVIDER, nativeTurnId: `turn:${attemptId}`}),
+        message: {createdBy: "user", creationSource: "web", messageId: MessageId.make("review-steer"), text: "Also draft the clinic message", attachments: []}});
+      yield* Queue.offer(harness.sdkMessages, frame("review-b", "Here's the draft"));
+      yield* Queue.offer(harness.sdkMessages, makeResultFrame({uuid: "review-terminal", result: "Here's the draft", stopReason: "end_turn"}));
+      yield* Queue.take(harness.terminalReceipts);
+      const phases = new Map(harness.events.flatMap(event => event.type === "message.updated" ? [[event.message.text, event.message.phase] as const] : []));
+      assert.deepEqual([phases.get("Booked for 11:50"), phases.get("Here's the draft")], ["answer", "answer"]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer))),
+  );
+
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
     "preserves native tool non-execution metadata %s without inferring a denial from text",
     (kind) =>

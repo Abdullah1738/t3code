@@ -4258,6 +4258,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         "assistant_message:completed",
         "command_execution:completed",
       ]);
+      const phases = collected.flatMap(event => event.type === "turn_item.updated" && event.turnItem.type === "assistant_message" ? [event.turnItem.phase] : []);
+      const finished = collected.findLast(event => event.type === "provider_turn.updated" && event.providerTurn.status === "completed");
+      assert.deepEqual({phase: phases.at(-1), finish: finished?.type === "provider_turn.updated" ? finished.providerTurn.finish : undefined}, {phase: "narration", finish: "stop"});
       assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
     }).pipe(Effect.scoped),
   );
