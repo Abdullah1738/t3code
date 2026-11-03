@@ -1126,6 +1126,19 @@ function codexExhaustionHttpStatus(errorInfo: CodexErrorInfo | null | undefined)
     : null;
 }
 
+function codexHttpStatus(errorInfo: CodexErrorInfo | null | undefined): number | null {
+  if (typeof errorInfo !== "object" || errorInfo === null) return null;
+  if ("httpConnectionFailed" in errorInfo)
+    return errorInfo.httpConnectionFailed.httpStatusCode ?? null;
+  if ("responseStreamConnectionFailed" in errorInfo)
+    return errorInfo.responseStreamConnectionFailed.httpStatusCode ?? null;
+  if ("responseStreamDisconnected" in errorInfo)
+    return errorInfo.responseStreamDisconnected.httpStatusCode ?? null;
+  if ("responseTooManyFailedAttempts" in errorInfo)
+    return errorInfo.responseTooManyFailedAttempts.httpStatusCode ?? null;
+  return null;
+}
+
 /**
  * What a Codex failure means for the next attempt, from the app-server's own error
  * code. The literals are the generated CodexErrorInfo union; anything else is unknown.
@@ -1135,8 +1148,14 @@ export function codexFailureCategory(
   errorInfo: CodexErrorInfo | null | undefined,
 ): OrchestrationV2ProviderFailureCategory {
   if (code === "usageLimitExceeded" || code === "rateLimitExceeded") return "quota";
-  if (codexExhaustionHttpStatus(errorInfo) === 429) return "quota";
-  if (codexExhaustionHttpStatus(errorInfo) === 503) return "transient";
+  const status = codexHttpStatus(errorInfo);
+  if (status !== null) {
+    if (status === 429) return "quota";
+    if (status === 401) return "auth_expired";
+    if (status === 408 || status === 425 || (status >= 500 && status < 600)) return "transient";
+    if (status >= 400 && status < 500) return "config";
+    return "unknown";
+  }
   // Only codes whose meaning the generated schema states are mapped. badRequest and
   // internalServerError have no description there, so they stay unknown (flag path).
   switch (code) {
@@ -1153,7 +1172,7 @@ export function codexFailureCategory(
     default:
       break;
   }
-  // An HTTP or stream connection failure never got an answer: a timeout or a reset.
+  // Without an HTTP response a connection/stream failure is a timeout or reset.
   if (
     code === "httpConnectionFailed" ||
     code === "responseStreamConnectionFailed" ||
@@ -5732,20 +5751,27 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : "provider_error";
               // The notification carries the richer message, so it wins when the
               // completion repeats it. An explicit exhaustion status on the
-              // completion still decides the class; a missing one is not evidence.
-              const exhaustionStatus = codexExhaustionHttpStatus(input.failureErrorInfo);
+              // completion still decides class and category; a missing one is not evidence.
+              const completionStatus = codexHttpStatus(input.failureErrorInfo);
+              const completionCategory = codexFailureCategory(
+                failureCode ?? null,
+                input.failureErrorInfo,
+              );
               const failure =
                 previousFailure !== undefined &&
                 (input.failureMessage === undefined ||
                   input.failureMessage === previousFailure.nativeMessage) &&
                 (failureCode === undefined || failureCode === previousFailure.failure.code) &&
-                (exhaustionStatus === null || previousFailure.failure.class === failureClass)
-                  ? previousFailure.failure
+                (completionStatus === null || previousFailure.failure.class === failureClass)
+                  ? completionStatus !== null &&
+                    previousFailure.failure.category !== completionCategory
+                    ? { ...previousFailure.failure, category: completionCategory }
+                    : previousFailure.failure
                   : makeProviderFailure({
                       message: input.failureMessage,
                       code: failureCode,
                       class: failureClass,
-                      category: codexFailureCategory(failureCode ?? null, input.failureErrorInfo),
+                      category: completionCategory,
                     });
               return {
                 type: "turn.terminal",

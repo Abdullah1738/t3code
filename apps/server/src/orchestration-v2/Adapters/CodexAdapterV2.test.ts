@@ -7244,6 +7244,44 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     }
   });
 
+  it("classifies the HTTP status on every connection, stream and exhaustion error", () => {
+    const codes = [
+      "httpConnectionFailed",
+      "responseStreamConnectionFailed",
+      "responseStreamDisconnected",
+      "responseTooManyFailedAttempts",
+    ];
+    const statuses = [
+      [400, "config"],
+      [401, "auth_expired"],
+      [404, "config"],
+      [408, "transient"],
+      [429, "quota"],
+      [500, "transient"],
+      [502, "transient"],
+      [503, "transient"],
+      [302, "unknown"],
+    ] as const;
+    for (const code of codes) {
+      for (const [status, expected] of statuses) {
+        assert.equal(
+          CodexAdapterV2.codexFailureCategory(code, {
+            [code]: { httpStatusCode: status },
+          } as never),
+          expected,
+          `${code} HTTP ${status}`,
+        );
+      }
+      assert.equal(
+        CodexAdapterV2.codexFailureCategory(code, {
+          [code]: { httpStatusCode: null },
+        } as never),
+        code === "responseTooManyFailedAttempts" ? "unknown" : "transient",
+        `${code} without an HTTP status`,
+      );
+    }
+  });
+
   it.effect.each([
     {
       name: "usage",
@@ -7308,6 +7346,31 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       errorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 500 } },
       notification: false,
       expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "exhausted-502",
+      code: "responseTooManyFailedAttempts",
+      errorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 502 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "connection-400",
+      code: "httpConnectionFailed",
+      errorInfo: { httpConnectionFailed: { httpStatusCode: 400 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
+    },
+    {
+      name: "stream-404",
+      code: "responseStreamConnectionFailed",
+      errorInfo: { responseStreamConnectionFailed: { httpStatusCode: 404 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
     },
   ] as const)("classifies Codex terminal failures from $name evidence", (scenario) =>
     Effect.scoped(
@@ -7475,6 +7538,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(terminal?.status, "failed");
         if (terminal?.status !== "failed") return;
         assert.equal(terminal.failure.class, scenario.expectedClass);
+        if ("expectedCategory" in scenario) {
+          assert.equal(terminal.failure.category, scenario.expectedCategory);
+        }
         assert.equal(terminal.threadDisposition, "reusable");
         if (scenario.name === "known-reset" || scenario.name === "deferred-reset")
           assert.equal(terminal.failure.resetAt, resetAt);
@@ -7523,12 +7589,42 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       completionStatus: null,
       willRetry: true,
       expectedClass: "usage_limit",
+      expectedCategory: "quota",
+    },
+    {
+      notificationStatus: 400,
+      completionStatus: 503,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      notificationStatus: 500,
+      completionStatus: 503,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      notificationStatus: 503,
+      completionStatus: 400,
+      willRetry: true,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
+    },
+    {
+      notificationStatus: 503,
+      completionStatus: null,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
     },
   ] as const)(
     "honors completion HTTP status from $notificationStatus to $completionStatus (retry: $willRetry)",
-    ({ notificationStatus, completionStatus, expectedClass, willRetry }) =>
+    (scenario) =>
       Effect.scoped(
         Effect.gen(function* () {
+          const { notificationStatus, completionStatus, expectedClass, willRetry } = scenario;
           const name = `${notificationStatus}-${completionStatus}-${willRetry}`;
           const nativeThreadId = `native-exhaustion-status-${name}`;
           const nativeTurnId = `turn-exhaustion-status-${name}`;
@@ -7593,6 +7689,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(terminal?.status, "failed");
           if (terminal?.status !== "failed") return;
           assert.equal(terminal.failure.class, expectedClass);
+          if ("expectedCategory" in scenario) {
+            assert.equal(terminal.failure.category, scenario.expectedCategory);
+          }
           assert.equal(terminal.failure.code, "responseTooManyFailedAttempts");
           assert.equal(terminal.threadDisposition, "reusable");
           const notificationClass = notificationStatus === 429 ? "usage_limit" : "provider_error";
