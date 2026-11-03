@@ -113,6 +113,8 @@ export interface KanbanClient {
   ): Promise<{ discussionId: string }>;
   /** Owner ends the board's running setup; card work resumes. */
   endSetup(boardId: string): Promise<void>;
+  /** Owner lifts the board pause; card work resumes. */
+  liftPause(boardId: string): Promise<void>;
   createDiscussion(boardId: string, title: string): Promise<KanbanDiscussion>;
   /** Owner rename, settle or snooze; the board feed brings the result. */
   updateDiscussion(
@@ -845,6 +847,9 @@ export function createKanbanClient(
     },
     async endSetup(boardId) {
       await transport.request(M.setupEnd, { boardId: boardId as never });
+    },
+    async liftPause(boardId) {
+      await transport.request(M.boardPause, { boardId: boardId as never, clear: true });
     },
     async createDiscussion(boardId, title) {
       const discussion = await transport.request(M.discussionCreate, {
