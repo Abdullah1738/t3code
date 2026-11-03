@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
   AuthSessionId,
+  CommandId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -20,10 +21,12 @@ import {
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
+  type OrchestrationV2ShellStreamItem,
   type OrchestrationProjectShell,
   type ServerConfig,
   type ServerConfigStreamEvent,
 } from "@t3tools/contracts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
@@ -123,6 +126,10 @@ import * as EventSink from "./orchestration-v2/EventSink.ts";
 import { CodexProviderCapabilitiesV2 } from "./orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderReplayHarness from "./orchestration-v2/testkit/ProviderReplayHarness.ts";
+import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
+import { loadShellSnapshotParts } from "./orchestration-v2/ShellStream.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
@@ -356,6 +363,507 @@ const layerNoThreadSessionUpdates = Layer.mock(ProviderSessionManager.ProviderSe
 });
 
 const ResumeSessionTestLayer = Layer.merge(ReplayTestLayer, ProjectionStore.layerMemory);
+
+// A real file DB and the real session manager, event store, sink and importer.
+// Project metadata is deterministic so the test never launches VCS commands.
+const fileReplayLayer = (filename: string) => {
+  const database = SqlitePersistence.layerFromPath(filename).pipe(
+    Layer.provide(NodeServices.layer),
+  );
+  const instanceId = ProviderInstanceId.make("codex");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Unexpected provider process"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const harness = ProviderReplayHarness.layerWithRegistry(
+    { name: "ws-file-reader" },
+    ProviderAdapterRegistry.layerFromAdapters([adapter]),
+    { databaseLayer: database, runEffectWorker: false },
+  );
+  const application = OrchestrationEventStore.layer.pipe(Layer.provide(database));
+  const stores = Layer.mergeAll(
+    database,
+    application,
+    EventStore.layerFromOrchestrationEventStore.pipe(Layer.provide(application)),
+    ProjectionStore.layer.pipe(Layer.provide(database)),
+    ProjectStore.layer.pipe(Layer.provide(database)),
+    harness,
+  );
+  const importer = LegacyV1ThreadImporter.layer.pipe(Layer.provide(stores));
+  return Layer.mergeAll(stores, importer);
+};
+
+const fileReplayFixture = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const sink = yield* EventSink.EventSinkV2;
+  const application = yield* OrchestrationEventStore.OrchestrationEventStore;
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+  const projects = yield* ProjectStore.ProjectStoreV2;
+  const now = DateTime.makeUnsafe("2026-10-30T10:00:00.000Z");
+  const timestamp = DateTime.formatIso(now);
+  const projectId = ProjectId.make("project:ws-reader");
+  const threadId = ThreadId.make("thread:ws-reader");
+  const archivedId = ThreadId.make("thread:ws-reader-archived");
+  const instanceId = ProviderInstanceId.make("codex");
+  yield* sql`INSERT INTO projection_projects
+    (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+    VALUES (${projectId}, 'Reader project', '/ws-reader', '[]', ${timestamp}, ${timestamp})`;
+  const create = (id: ThreadId) =>
+    orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`create:${id}`),
+      threadId: id,
+      projectId,
+      title: id === threadId ? "Reader thread" : "Archived thread",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+  yield* create(threadId);
+  yield* create(archivedId);
+  const archivedThread = (yield* orchestrator.getThreadRecords(archivedId, [])).thread;
+  const [archived] = yield* sink.write({
+    events: [
+      {
+        id: EventId.make("ws-reader:archive"),
+        type: "thread.archived",
+        threadId: archivedId,
+        occurredAt: now,
+        payload: { ...archivedThread, archivedAt: now },
+      },
+    ],
+  });
+  assert.isDefined(archived);
+  const cursor = yield* application.latestApplicationSequence;
+  let ordinal = 0;
+  const appendMessage = (text: string) =>
+    sink.write({
+      events: [
+        {
+          id: EventId.make(`ws-reader:message-event:${++ordinal}`),
+          type: "message.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: MessageId.make(`ws-reader:message:${ordinal}`),
+            threadId,
+            runId: null,
+            nodeId: null,
+            role: "user",
+            text,
+            attachments: [],
+            streaming: false,
+            createdBy: "user",
+            creationSource: "web",
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+      ],
+    });
+  const first = (yield* appendMessage("one"))[0]!;
+  const second = (yield* appendMessage("two"))[0]!;
+  const projectEvent = yield* application.appendProjectEvent({
+    type: "project.meta-updated",
+    eventId: EventId.make("ws-reader:project"),
+    aggregateKind: "project",
+    aggregateId: projectId,
+    occurredAt: timestamp,
+    commandId: CommandId.make("ws-reader:project"),
+    causationEventId: null,
+    correlationId: CommandId.make("ws-reader:project"),
+    metadata: {},
+    payload: { projectId, title: "Reader project", updatedAt: timestamp },
+  });
+  const changes = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+  const available = {
+    repositoryIdentity: null,
+    faviconPath: null,
+    repositoryIdentityResolved: false,
+  };
+  const services = Layer.mergeAll(
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      ensureLegacyTranscript: (id) => importer.ensureTranscript(id).pipe(Effect.asVoid),
+      streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
+      getThreadShell: orchestrator.getThreadShell,
+      getThreadSnapshot: orchestrator.getThreadSnapshot,
+      getThreadSnapshotWindow: orchestrator.getThreadSnapshotWindow,
+      readShellSnapshot: orchestrator.readShellSnapshot,
+    }),
+    Layer.mock(ProjectService.ProjectService)({
+      getShell: (id) =>
+        projects.getShell(id).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectService.ProjectOperationError({
+                operation: "read-project",
+                projectId: id,
+                cause,
+              }),
+          ),
+        ),
+    }),
+    Layer.mock(ProjectEnrichment.ProjectEnrichmentService)({
+      getAvailable: () => Effect.succeed(available),
+      subscribeChanges: PubSub.subscribe(changes),
+    }),
+  );
+  return {
+    sql,
+    sink,
+    application,
+    orchestrator,
+    importer,
+    projects,
+    threadId,
+    archivedId,
+    projectId,
+    cursor,
+    first,
+    second,
+    projectEvent,
+    appendMessage,
+    changes,
+    services,
+    now,
+  };
+});
+
+it.live.each([false, true])(
+  "valid file-DB thread replay bypasses a held writer (bounded=%s)",
+  (acceptBoundedSnapshot) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-thread-reader-" });
+      yield* Effect.gen(function* () {
+        const fixture = yield* fileReplayFixture;
+        const input = {
+          threadId: fixture.threadId,
+          afterSequence: fixture.cursor,
+          requestCompletionMarker: true,
+          acceptBoundedSnapshot,
+        };
+        const baseline = yield* subscribeOrchestrationV2Thread(input).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.scoped,
+          Effect.provide(fixture.services),
+        );
+        assert.deepEqual(
+          baseline.map((item) => item.kind),
+          ["event", "event", "synchronized"],
+        );
+        assert.deepEqual(
+          baseline.flatMap((item) =>
+            item.kind === "event" ? [{ sequence: item.sequence, event: item.event }] : [],
+          ),
+          [fixture.first, fixture.second].map((stored) => ({
+            sequence: stored.sequence,
+            event: stored.event,
+          })),
+        );
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* fixture.sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(held);
+        const items = yield* Queue.unbounded<OrchestrationV2ThreadStreamItem>();
+        const consumer = yield* subscribeOrchestrationV2Thread(input).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(Stream.runForEach((item) => Queue.offer(items, item))),
+          ),
+          Effect.scoped,
+          Effect.provide(fixture.services),
+          Effect.forkScoped,
+        );
+        const replay = yield* Effect.all([
+          Queue.take(items),
+          Queue.take(items),
+          Queue.take(items),
+        ]).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.onError(() => Deferred.succeed(release, undefined)),
+        );
+        assert.deepEqual(Array.from(replay), Array.from(baseline));
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(writer);
+        const [tail] = yield* fixture.appendMessage("after release");
+        const delivered = yield* Queue.take(items).pipe(Effect.timeout("10 seconds"));
+        assert.equal(delivered.kind, "event");
+        if (delivered.kind === "event") {
+          assert.equal(delivered.sequence, tail!.sequence);
+          assert.deepEqual(delivered.event, tail!.event);
+        }
+        assert.equal(yield* Queue.size(items), 0);
+        yield* Fiber.interrupt(consumer);
+      }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "replays shell changes and reads initial, archive and enrichment while a writer is held",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-shell-reader-" });
+      yield* Effect.gen(function* () {
+        const fixture = yield* fileReplayFixture;
+        const input = { afterSequence: fixture.cursor, requestCompletionMarker: true };
+        const throughSync = subscribeOrchestrationV2Shell(input).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.scoped,
+          Effect.provide(fixture.services),
+        );
+        const baseline = Array.from(yield* throughSync);
+        assert.deepEqual(
+          baseline.map((item) => item.kind),
+          ["thread.updated", "project.updated", "synchronized"],
+        );
+        assert.equal(
+          baseline[0]?.kind === "thread.updated" ? baseline[0].sequence : 0,
+          fixture.second.sequence,
+        );
+        assert.equal(
+          baseline[1]?.kind === "project.updated" ? baseline[1].sequence : 0,
+          fixture.projectEvent.sequence,
+        );
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* fixture.sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(held);
+        const items = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+        const consumer = yield* subscribeOrchestrationV2Shell(input).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(Stream.runForEach((item) => Queue.offer(items, item))),
+          ),
+          Effect.scoped,
+          Effect.provide(fixture.services),
+          Effect.forkScoped,
+        );
+        const replay = yield* Effect.all([
+          Queue.take(items),
+          Queue.take(items),
+          Queue.take(items),
+        ]).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.onError(() => Deferred.succeed(release, undefined)),
+        );
+        assert.deepEqual(replay, baseline);
+
+        const initial = yield* subscribeOrchestrationV2Shell({
+          requestCompletionMarker: true,
+        }).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.scoped,
+          Effect.provide(fixture.services),
+          Effect.timeout("10 seconds"),
+          Effect.onError(() => Deferred.succeed(release, undefined)),
+        );
+        const initialSnapshot = initial.find((item) => item.kind === "snapshot");
+        assert.equal(initialSnapshot?.kind, "snapshot");
+        if (initialSnapshot?.kind === "snapshot") {
+          assert.isTrue(
+            initialSnapshot.snapshot.threads.some((thread) => thread.id === fixture.threadId),
+          );
+          assert.isTrue(
+            initialSnapshot.snapshot.projects.some((project) => project.id === fixture.projectId),
+          );
+          assert.isFalse(
+            initialSnapshot.snapshot.threads.some((thread) => thread.id === fixture.archivedId),
+          );
+        }
+        const archive = yield* loadShellSnapshotParts({
+          sql: fixture.sql,
+          readThreads: fixture.orchestrator.readShellSnapshot({ location: "archive" }),
+          listProjects: fixture.projects.listShells(),
+          latestSequence: fixture.application.latestApplicationSequence,
+        }).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.onError(() => Deferred.succeed(release, undefined)),
+        );
+        assert.isTrue(
+          archive.threads.archivedThreads.some((thread) => thread.id === fixture.archivedId),
+        );
+        assert.equal(archive.snapshotSequence, fixture.projectEvent.sequence);
+
+        const identity = {
+          canonicalKey: "test:ws-reader",
+          locator: {
+            source: "git-remote" as const,
+            remoteName: "origin",
+            remoteUrl: "https://example.test/repo.git",
+          },
+        };
+        yield* PubSub.publish(fixture.changes, {
+          workspaceRoot: "/ws-reader",
+          enrichment: {
+            repositoryIdentity: identity,
+            faviconPath: null,
+            repositoryIdentityResolved: true,
+          },
+          repositoryIdentityResolved: true,
+        });
+        const enriched = yield* Queue.take(items).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.onError(() => Deferred.succeed(release, undefined)),
+        );
+        assert.equal(enriched.kind, "snapshot");
+        if (enriched.kind === "snapshot") {
+          assert.equal(enriched.snapshot.snapshotSequence, fixture.projectEvent.sequence);
+          assert.deepEqual(enriched.snapshot.projects[0]?.repositoryIdentity, identity);
+        }
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(writer);
+        const [tail] = yield* fixture.appendMessage("shell live");
+        const live = yield* Queue.take(items).pipe(Effect.timeout("10 seconds"));
+        assert.equal(live.kind, "thread.updated");
+        if (live.kind === "thread.updated") assert.equal(live.sequence, tail!.sequence);
+        assert.equal(yield* Queue.size(items), 0);
+        yield* Fiber.interrupt(consumer);
+      }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("keeps an opted-in OpenCode refresh write on the writer during resume", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-refresh-writer-" });
+    yield* Effect.gen(function* () {
+      const fixture = yield* fileReplayFixture;
+      const instanceId = ProviderInstanceId.make("opencode");
+      const session: OrchestrationV2ProviderSession = {
+        id: ProviderSessionId.make("session:ws-refresh"),
+        driver: ProviderDriverKind.make("opencode"),
+        providerInstanceId: instanceId,
+        status: "ready",
+        cwd: "/ws-reader",
+        model: "test-model",
+        capabilities: {
+          ...CodexProviderCapabilitiesV2,
+          sessions: {
+            ...CodexProviderCapabilitiesV2.sessions,
+            supportsMultipleProviderThreadsPerSession: true,
+          },
+        },
+        createdAt: fixture.now,
+        updatedAt: fixture.now,
+        lastError: null,
+      };
+      yield* fixture.sink.write({
+        events: [
+          {
+            id: EventId.make("ws-reader:session-attached"),
+            type: "provider-session.attached",
+            threadId: fixture.threadId,
+            driver: session.driver,
+            providerInstanceId: instanceId,
+            occurredAt: fixture.now,
+            payload: session,
+          },
+        ],
+      });
+      const cursor = yield* fixture.application.latestAgentSequence(fixture.threadId);
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* fixture.sql
+        .withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(held);
+      const prepared = yield* Deferred.make<void>();
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sessions = Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
+        ...manager,
+        refreshThreadSessionUpdates: (id) =>
+          Deferred.succeed(prepared, undefined).pipe(
+            Effect.andThen(manager.refreshThreadSessionUpdates(id)),
+          ),
+      });
+      const running = yield* subscribeOrchestrationV2Thread({
+        threadId: fixture.threadId,
+        afterSequence: cursor,
+        requestCompletionMarker: true,
+      }).pipe(
+        Effect.flatMap((stream) =>
+          stream.pipe(
+            Stream.takeUntil((item) => item.kind === "synchronized"),
+            Stream.runCollect,
+          ),
+        ),
+        Effect.scoped,
+        Effect.provide(Layer.merge(fixture.services, sessions)),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(prepared).pipe(
+        Effect.timeout("10 seconds"),
+        Effect.onError(() => Deferred.succeed(release, undefined)),
+      );
+      // The writer admits only after release. The real refresh may finish its
+      // reader preflight now, but must not perform the write on that reader.
+      assert.isFalse(yield* Deferred.isDone(release));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writer);
+      const replay = yield* Fiber.join(running).pipe(Effect.timeout("10 seconds"));
+      assert.deepEqual(
+        replay.map((item) => item.kind),
+        ["event", "synchronized"],
+      );
+      const update = replay[0];
+      assert.equal(update?.kind, "event");
+      if (update?.kind === "event") {
+        assert.equal(update.event.type, "provider-session.updated");
+        assert.isAbove(update.sequence, cursor);
+        if (update.event.type === "provider-session.updated")
+          assert.equal(update.event.payload.id, session.id);
+        const persisted = yield* fixture.application
+          .readAgentEvents({
+            threadId: fixture.threadId,
+            afterSequence: cursor,
+            throughSequence: update.sequence,
+          })
+          .pipe(Stream.runCollect);
+        assert.equal(persisted.length, 1);
+        assert.equal(persisted[0]?.sequence, update.sequence);
+        assert.equal(persisted[0]?.event.type, "provider-session.updated");
+      }
+    }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 const makeSessionResumeFixture = Effect.fn("makeSessionResumeFixture")(function* (
   options: {

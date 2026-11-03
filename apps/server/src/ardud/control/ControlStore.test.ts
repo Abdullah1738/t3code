@@ -4,6 +4,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -182,7 +183,13 @@ describe("ControlStore native ids", () => {
           }),
         );
         assert.strictEqual(yield* store.getOrigin("t-moved"), "automation");
-      }).pipe(Effect.provide(ControlStore.layer), Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(
+        Effect.provide(
+          ControlStore.layer.pipe(
+            Layer.provideMerge(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))),
+          ),
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("reports no current session id for a thread whose active binding has none", () =>
