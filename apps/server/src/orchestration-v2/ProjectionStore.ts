@@ -759,15 +759,16 @@ function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2Provid
   );
 }
 
-// ardud: a late event may update the old row, but cannot undo an adoption.
+// ardud: a late event may update its row, but cannot undo adoption or rollback.
 export function keepsAdoptedActive(
   thread: OrchestrationV2AppThread,
   activeRow: OrchestrationV2ProviderThread | undefined,
   payload: OrchestrationV2ProviderThread,
 ): boolean {
   return (
-    activeRow?.nativeMetadata?.seededHistory !== undefined &&
-    activeRow.id !== payload.id &&
+    (thread.harnessMigrationFence === true ||
+      activeRow?.nativeMetadata?.seededHistory !== undefined) &&
+    thread.activeProviderThreadId !== payload.id &&
     payload.providerInstanceId !== thread.providerInstanceId
   );
 }

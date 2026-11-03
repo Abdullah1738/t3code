@@ -383,6 +383,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  // ardud: once history is migrated, selection owns the active provider row, including after rollback.
+  harnessMigrationFence: Schema.optional(Schema.Boolean),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(

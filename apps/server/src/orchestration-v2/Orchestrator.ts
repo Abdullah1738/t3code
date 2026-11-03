@@ -7883,6 +7883,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           providerInstanceId: command.modelSelection.instanceId,
           modelSelection: command.modelSelection,
           activeProviderThreadId: target.id,
+          harnessMigrationFence: true,
           updatedAt: now,
         },
       });

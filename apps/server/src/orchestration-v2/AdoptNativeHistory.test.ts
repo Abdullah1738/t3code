@@ -300,6 +300,50 @@ it.effect("adopts native Claude history once, preserves the source, and can rest
     assert.equal(rebuiltRestore.thread.activeProviderThreadId, source.id);
     assert.deepEqual(rebuiltRestore.thread.modelSelection, openCodeSelection);
     assert.deepEqual(rebuiltRestore.providerThreads, restored.providerThreads);
+
+    // A delayed target update cannot undo the explicit rollback, but its row is retained.
+    const lateTargetAt = DateTime.add(lateAt, { seconds: 1 });
+    const lateTarget = { ...target!, status: "idle" as const, updatedAt: lateTargetAt };
+    const event = {
+      id: EventId.make("event:adopt:late-claude-after-rollback"),
+      type: "provider-thread.updated" as const,
+      threadId,
+      driver: claudeDriver,
+      providerInstanceId: claudeInstance,
+      occurredAt: lateTargetAt,
+      payload: lateTarget,
+    };
+    const memory = ProjectionStore.applyToProjection(restored, event);
+    assert.equal(memory.thread.activeProviderThreadId, source.id);
+    assert.deepEqual(memory.providerThreads.find((row) => row.id === targetId), lateTarget);
+    yield* sink.write({ events: [event] });
+    const afterRollbackLate = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(afterRollbackLate.thread.activeProviderThreadId, source.id);
+    assert.equal(afterRollbackLate.thread.providerInstanceId, openCodeInstance);
+    assert.deepEqual(afterRollbackLate.thread.modelSelection, openCodeSelection);
+    assert.deepEqual(afterRollbackLate.providerThreads.find((row) => row.id === targetId), lateTarget);
+    assert.isTrue((yield* maintenance.rebuild).valid);
+    const replayedLate = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(replayedLate.thread.activeProviderThreadId, source.id);
+    assert.deepEqual(replayedLate.providerThreads, afterRollbackLate.providerThreads);
+
+    // A subsequent deliberate switch still makes the target active.
+    yield* orchestrator.dispatch({
+      type: "thread.adopt-native-history",
+      commandId: CommandId.make("adopt:restore-target"),
+      threadId,
+      modelSelection: claudeSelection,
+      expectedActiveProviderThreadId: source.id,
+      target: { kind: "existing", providerThreadId: targetId! },
+    });
+    const switchedAgain = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(switchedAgain.thread.activeProviderThreadId, targetId);
+    assert.deepEqual(switchedAgain.thread.modelSelection, claudeSelection);
+    assert.isTrue((yield* maintenance.rebuild).valid);
+    assert.equal(
+      (yield* orchestrator.getThreadProjection(threadId)).thread.activeProviderThreadId,
+      targetId,
+    );
   }).pipe(Effect.provide(layerTest)),
 );
 

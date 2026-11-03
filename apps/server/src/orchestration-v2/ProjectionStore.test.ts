@@ -460,6 +460,68 @@ it.effect("memory accepts a replacement for the selected seeded provider", () =>
   }).pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
 
+it.effect("memory keeps rollback active against a late target, and allows a later switch", () =>
+  Effect.gen(function* () {
+    const { store, at, threadId, sourceRow, sourceModelSelection, targetRow } =
+      yield* seededHistoryProjectionFixture("claude-transcript");
+    const adopted = yield* store.getThreadProjection(threadId);
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:rollback"),
+      type: "thread.provider-switched",
+      threadId,
+      occurredAt: at,
+      payload: {
+        ...adopted.thread,
+        providerInstanceId: sourceRow.providerInstanceId,
+        modelSelection: sourceModelSelection,
+        activeProviderThreadId: sourceRow.id,
+        harnessMigrationFence: true,
+      },
+    });
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:rollback-source"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: sourceRow,
+    });
+    const late = { ...targetRow, status: "idle" as const };
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:rollback-late-target"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: late,
+    });
+    const rolledBack = yield* store.getThreadProjection(threadId);
+    assert.equal(rolledBack.thread.activeProviderThreadId, sourceRow.id);
+    assert.deepEqual(rolledBack.providerThreads.find((row) => row.id === targetRow.id), late);
+
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:rollback-real-switch"),
+      type: "thread.provider-switched",
+      threadId,
+      occurredAt: at,
+      payload: {
+        ...rolledBack.thread,
+        providerInstanceId: targetRow.providerInstanceId,
+        modelSelection: { instanceId: targetRow.providerInstanceId, model: "target-model" },
+      },
+    });
+    yield* store.apply({
+      id: EventId.make("event:seeded-history:rollback-switch-target"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: at,
+      payload: late,
+    });
+    assert.equal(
+      (yield* store.getThreadProjection(threadId)).thread.activeProviderThreadId,
+      targetRow.id,
+    );
+  }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
 it.effect("memory keeps existing activation behavior when the active row is not seeded", () =>
   Effect.gen(function* () {
     const { store, at, threadId, sourceRow, targetRow } =
