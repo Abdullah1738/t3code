@@ -2237,6 +2237,48 @@ it.effect("a failed worker whose run has not changed is still flagged on tick", 
   }),
 );
 
+it.effect("a held sibling does not prevent another shared card from recovering on repeated ticks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      yield* kanban.flagCard(second.card.id, "Owner hold", owner);
+      const waiting = yield* kanban.createCard(board.id, { prompt: "C", title: "C" }, owner);
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "invalid previous request",
+      } as OrchestrationV2ProviderFailure);
+      let releasedEvents: number[] | null = null;
+      for (let i = 0; i < 2; i++) {
+        yield* kanban.tick;
+        const aDetail = yield* kanban.card(first.id);
+        const a = aDetail.card;
+        const b = (yield* kanban.card(second.card.id)).card;
+        assert.strictEqual(a.stage, "todo");
+        assert.isNull(a.activeThreadId);
+        assert.strictEqual(a.stalled?.reason, "Run failed: invalid previous request");
+        assert.strictEqual(b.stalled?.reason, "Owner hold");
+        assert.strictEqual(b.stalled?.by._tag, "owner");
+        assert.strictEqual(b.activeThreadId, thread);
+        assert.isFalse((yield* kanban.carried(thread)).some((card) => card.id === first.id));
+        const holding = Rules.poolThreads((yield* kanban.snapshot(board.id)).cards);
+        assert.isNotNull(b.activePool);
+        assert.deepStrictEqual([...holding.get(b.activePool!)!], [thread]);
+        assert.strictEqual((yield* kanban.card(waiting.id)).card.stage, "todo");
+        const ids = aDetail.events.map((event) => event.id);
+        if (releasedEvents !== null) assert.deepStrictEqual(ids, releasedEvents);
+        releasedEvents = ids;
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("later ticks ignore the same failure after its work card is released", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

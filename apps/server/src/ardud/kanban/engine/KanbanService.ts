@@ -3510,17 +3510,18 @@ const make = Effect.gen(function* () {
       if (outage !== null) return;
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
-        const carriedWorkIsCurrent = Effect.fn("KanbanService.carriedWorkIsCurrent")(function* () {
+        const hasCurrentCarriedWork = Effect.fn("KanbanService.hasCurrentCarriedWork")(function* () {
           if (!(yield* failedRunIsCurrent())) return false;
+          let eligible = false;
           for (const entry of carried) {
             const current = yield* store.card(entry.id);
             if (
-              current === null || current.stage !== "working" ||
-              current.activeRole !== "work" || current.activeThreadId !== threadId ||
-              current.stalled !== null
-            ) return false;
+              current !== null && current.stage === "working" &&
+              current.activeRole === "work" && current.activeThreadId === threadId &&
+              current.stalled === null
+            ) eligible = true;
           }
-          return yield* failedRunIsCurrent();
+          return eligible && (yield* failedRunIsCurrent());
         });
         const recentCompactions = yield* Effect.forEach(carried, (entry) =>
           compactedRecently(entry, at),
@@ -3538,7 +3539,7 @@ const make = Effect.gen(function* () {
         if (found?._tag === "Failure") return;
         const view = found?.success ?? null;
         if (view !== null && view.state !== "idle") return;
-        if (expectedFailedWorkRunId !== undefined && !(yield* carriedWorkIsCurrent())) return;
+        if (expectedFailedWorkRunId !== undefined && !(yield* hasCurrentCarriedWork())) return;
         // The send-then-save gap is accepted: a crash leaves /compact's turn
         // end to normal handling (usually a nudge or flag).
         const compactSent =
@@ -3945,7 +3946,7 @@ const make = Effect.gen(function* () {
         const card = cardsForAfterMutation(plannedCard);
         if (!card) continue;
         const threadId = card.activeThreadId;
-        if (threadId === null || card.activeRole !== "work") continue;
+        if (threadId === null || card.activeRole !== "work" || card.stalled !== null) continue;
         if (board.pause && !board.pause.keep.includes(card.id)) continue;
         if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) continue;
         if (discussionWakes.has(threadId)) continue;
@@ -3962,7 +3963,9 @@ const make = Effect.gen(function* () {
           if (
             Option.isNone(fresh) || fresh.value?.state !== "idle" ||
             current?.activeThreadId !== threadId || current.activeRole !== "work" ||
-            (yield* store.threadLink(threadId))?.paused || foundFailure.success.runId == null
+            current.stage !== "working" || current.stalled !== null ||
+            (yield* store.threadLink(threadId))?.paused ||
+            foundFailure.success.runId == null
           ) continue;
           views.clear();
           yield* turnEndedUnlocked(threadId, foundFailure.success.runId).pipe(Effect.ensuring(Effect.sync(() => {
