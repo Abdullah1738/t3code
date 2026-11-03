@@ -357,18 +357,18 @@ describe("usage feed", () => {
         const missing = (yield* usage.list({ since, until })).items.find(
           (item) => item.threadId === "other",
         );
-          assert.strictEqual(missing?.providerInstanceId, "codex-cu");
-          assert.isNull(missing?.model);
-          assert.isNull(missing?.effort);
-          yield* sql`UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.modelSelection',
+        assert.strictEqual(missing?.providerInstanceId, "codex-cu");
+        assert.isNull(missing?.model);
+        assert.isNull(missing?.effort);
+        yield* sql`UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.modelSelection',
             json('{"instanceId":"claudeAgent","model":"wrong-provider"}'))
             WHERE event_id = 'running-other'`;
-          const mismatch = (yield* usage.list({ since, until })).items.find(
-            (item) => item.threadId === "other",
-          );
-          assert.strictEqual(mismatch?.providerInstanceId, "codex-cu");
-          assert.isNull(mismatch?.model);
-        }),
+        const mismatch = (yield* usage.list({ since, until })).items.find(
+          (item) => item.threadId === "other",
+        );
+        assert.strictEqual(mismatch?.providerInstanceId, "codex-cu");
+        assert.isNull(mismatch?.model);
+      }),
     ),
   );
   it.effect(
