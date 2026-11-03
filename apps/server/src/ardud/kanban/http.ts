@@ -6,7 +6,7 @@
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
-  KanbanBlock,
+  KanbanBlockInput,
   type KanbanBoard,
   KanbanBoardIcon,
   KanbanBoardIconImage,
@@ -118,7 +118,10 @@ const CreateCardBody = Schema.Struct({
 
 const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
 
-const PostBody = Schema.Struct({ text: Text, blocks: Schema.optional(Schema.Array(KanbanBlock)) });
+const PostBody = Schema.Struct({
+  text: Text,
+  blocks: Schema.optional(Schema.Array(KanbanBlockInput)),
+});
 
 const TitleBody = Schema.Struct({ title: Schema.String });
 

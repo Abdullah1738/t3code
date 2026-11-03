@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -21,13 +22,14 @@ import * as TestClock from "effect/testing/TestClock";
 import {
   KanbanDiscussionId,
   KanbanCardId,
+  KanbanBlock,
+  KanbanBlockInput,
   KanbanScriptId,
   KANBAN_WS_METHODS as M,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
-  type KanbanBlock,
   type KanbanScript,
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
@@ -364,6 +366,58 @@ it.effect("refuses corrupted board text before saving and preserves clean commen
         assert.include(rejected.detail, "message has a control character U+0002 at offset 3");
       }
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the shared HTTP and WS block input preserves controls for service validation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "raw-blocks",
+        name: "Raw blocks",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const discussion = yield* kanban.createDiscussion(board.id, "Test", owner);
+      const decode = Schema.decodeUnknownEffect(KanbanBlockInput);
+      const existingDecode = Schema.decodeUnknownEffect(KanbanBlock);
+      const legacy = yield* existingDecode({
+        _tag: "collapse",
+        title: "\u000bOld\u000c",
+        text: "text",
+      });
+      assert.strictEqual(legacy._tag === "collapse" ? legacy.title : null, "Old");
+      const blocks = yield* Effect.all([
+        decode({ _tag: "collapse", title: "\u000bReport\u000c", text: "text" }),
+        decode({
+          _tag: "choice",
+          id: "x",
+          style: "pick",
+          question: "\u000bQuestion",
+          options: [],
+          multi: false,
+        }),
+        decode({
+          _tag: "choice",
+          id: "x",
+          style: "pick",
+          question: "Question",
+          options: [{ id: "a", label: "\u000bLabel" }],
+          multi: false,
+        }),
+      ]);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      for (const block of blocks) {
+        const error = yield* ws[M.messagePost]({
+          discussionId: discussion.id,
+          blocks: [block],
+        }).pipe(Effect.flip);
+        assert.strictEqual(error.code, "invalid");
+        assert.include(error.detail, "message has a control character U+000B at offset 0");
+      }
+      assert.deepStrictEqual(yield* kanban.messages(discussion.id), []);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

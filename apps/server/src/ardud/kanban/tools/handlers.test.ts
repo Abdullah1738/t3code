@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
   KanbanCardId,
+  KanbanDiscussionId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -189,6 +190,111 @@ it.effect("discussion tools refuse corrupted text before creating a discussion",
     assert.isTrue(created.isError);
     assert.include(created.text, "message has a control character U+0000 at offset 3");
     assert.deepStrictEqual(yield* kanban.discussions(board.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "raw-text",
+      name: "Raw text",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const evaluator = ThreadId.make("thread-evaluator");
+    const discussionsBefore = yield* kanban.discussions(board.id);
+    const tests = [
+      { _tag: "collapse", title: "\u000bReport\u000c", text: "text" },
+      {
+        _tag: "choice",
+        id: "x",
+        style: "pick",
+        question: "\u000bQuestion",
+        options: [],
+        multi: false,
+      },
+      {
+        _tag: "choice",
+        id: "x",
+        style: "pick",
+        question: "Question",
+        options: [{ id: "a", label: "\u000bLabel" }],
+        multi: false,
+      },
+    ];
+    for (const block of tests) {
+      const result = yield* call(evaluator, "discussion_create", {
+        title: "Test",
+        blocks: [block],
+      });
+      assert.isTrue(result.isError, result.text);
+      assert.include(result.text, "message has a control character U+000B at offset 0");
+      assert.deepStrictEqual(yield* kanban.discussions(board.id), discussionsBefore);
+    }
+    const title = yield* call(evaluator, "discussion_create", { title: "\u000bTitle\u000c" });
+    assert.isTrue(title.isError, title.text);
+    assert.include(title.text, "title has a control character U+000B at offset 0 (2 in all)");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), discussionsBefore);
+
+    const wikiBefore = yield* kanban.wiki(board.id);
+    const wiki = yield* call(evaluator, "wiki_write", {
+      slug: "test",
+      title: "\u000bTitle\u000c",
+      body: "body",
+    });
+    assert.isTrue(wiki.isError, wiki.text);
+    assert.include(wiki.text, "title has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.wiki(board.id), wikiBefore);
+
+    const before = yield* kanban.card(card.id);
+    const edit = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [{ text: "\u000bSubtask\u000c", owner: "work" }],
+    });
+    assert.isTrue(edit.isError, edit.text);
+    assert.include(edit.text, "subtask text has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+
+    const cardsBefore = yield* kanban.cards(board.id);
+    const createdCard = yield* call(evaluator, "card_create", {
+      prompt: "New card",
+      title: "New card",
+      description: "Explicit",
+      subtasks: [{ text: "\u000bSubtask\u000c", owner: "work" }],
+    });
+    assert.isTrue(createdCard.isError, createdCard.text);
+    assert.include(createdCard.text, "subtask text has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.cards(board.id), cardsBefore);
+
+    const clean = yield* call(evaluator, "discussion_create", {
+      title: "  Clean  ",
+      blocks: [
+        {
+          _tag: "choice",
+          id: "pick",
+          style: "pick",
+          question: "  Question  ",
+          options: [{ id: "a", label: "  Answer  " }],
+          multi: false,
+        },
+      ],
+    });
+    assert.isFalse(clean.isError, clean.text);
+    const discussion = clean.structured.discussion as { id: string; title: string };
+    assert.strictEqual(discussion.title, "Clean");
+    const messages = yield* kanban.messages(KanbanDiscussionId.make(discussion.id));
+    const block = messages[0]!.blocks[0]!;
+    assert.strictEqual(block._tag, "choice");
+    if (block._tag === "choice") {
+      assert.strictEqual(block.question, "Question");
+      assert.strictEqual(block.options[0]?.label, "Answer");
+    }
   }).pipe(Effect.provide(layer));
 });
 

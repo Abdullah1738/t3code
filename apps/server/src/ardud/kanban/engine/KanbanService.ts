@@ -538,6 +538,18 @@ const cardTextFields = (input: NewCard | CardPatch) => [
   ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
 ] as const;
 
+const normalizeMessageBlock = (block: KanbanBlock): KanbanBlock => {
+  if (block._tag === "collapse") return { ...block, title: block.title.trim() };
+  if (block._tag === "choice") {
+    return {
+      ...block,
+      question: block.question.trim(),
+      options: block.options.map((option) => ({ ...option, label: option.label.trim() })),
+    };
+  }
+  return block;
+};
+
 export const messageTextFields = (blocks: ReadonlyArray<KanbanBlock>) => {
   const fields: Array<readonly [string, string | null]> = [];
   for (const block of blocks) {
@@ -2184,7 +2196,7 @@ const make = Effect.gen(function* () {
     }
     // Board files are kept on purpose: nothing deletes them yet. Claimed paths
     // are released if the message never gets stored.
-    const claim = yield* attachments.claim(discussion.boardId, blocks);
+    const claim = yield* attachments.claim(discussion.boardId, blocks.map(normalizeMessageBlock));
     const storedBlocks = [...claim.blocks];
     const message: KanbanMessage = {
       discussionId,
@@ -5360,7 +5372,7 @@ const make = Effect.gen(function* () {
           ]),
         );
         const at = yield* nowIso;
-        const next = groups.map((group) => ({ ...group, updatedAt: at }));
+        const next = groups.map((group) => ({ ...group, name: group.name.trim(), updatedAt: at }));
         yield* store.putGroups(boardId, next);
         yield* publish(boardId, { _tag: "groups", groups: next });
       }),

@@ -21,7 +21,7 @@ import {
 } from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
-  KanbanBlock,
+  KanbanBlockInput,
   KanbanBoard,
   KanbanBoardIcon,
   KanbanBoardIconImage,
@@ -250,7 +250,7 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.discussionUpdate, KanbanDiscussionUpdateInput, KanbanDiscussion),
   call(
     M.messagePost,
-    Schema.Struct({ discussionId: KanbanDiscussionId, blocks: Schema.Array(KanbanBlock) }),
+    Schema.Struct({ discussionId: KanbanDiscussionId, blocks: Schema.Array(KanbanBlockInput) }),
     KanbanMessage,
   ),
   call(
