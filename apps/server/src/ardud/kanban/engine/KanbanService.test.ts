@@ -179,7 +179,11 @@ const makeFake = Effect.gen(function* () {
                 new KanbanThreadError({ operation: "send", detail: "thread is archived" }),
               );
             }
-            if (input.key && acceptedKeys.has(input.key)) return Effect.void;
+            if (input.key && acceptedKeys.has(input.key)) {
+              // An accepted key is idempotent: record the attempt, deliver nothing.
+              sends.push({ threadId: input.threadId, model: input.model, key: input.key });
+              return Effect.void;
+            }
             if (conclusiveReject.delete(input.threadId)) {
               return Effect.fail(new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }));
             }
