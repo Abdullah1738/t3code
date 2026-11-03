@@ -74,15 +74,14 @@ def parse(q):
         elif sep and val and key == "account":
             where.append("items.account " + ("!= ?" if negate else "= ?"))
             params.append(val.lower())
-        elif sep and val and key == "after":
+        elif sep and val and key in ("after", "newer_than"):
+            ts = _date(val) if key == "after" else int(time.time()) - _span(val)
             where.append("items.ts >= ?")
-            params.append(_date(val))
+            params.append(ts)
+            flags["min_ts"] = max(flags.get("min_ts", ts), ts)
         elif sep and val and key == "before":
             where.append("items.ts < ?")
             params.append(_date(val))
-        elif sep and val and key == "newer_than":
-            where.append("items.ts >= ?")
-            params.append(int(time.time()) - _span(val))
         elif sep and val and key == "older_than":
             where.append("items.ts < ?")
             params.append(int(time.time()) - _span(val))
@@ -147,12 +146,35 @@ def run(db, q, limit=20, sort="rank", include_junk=False, dedupe=True):
     fts, where, params, flags = parse(q)
     if not include_junk and not flags["junk"]:
         where.append("items.junk = 0")
+    if fts and flags.get("min_ts") is not None:
+        own_transaction = not db.in_transaction
+        if own_transaction:
+            db.execute("BEGIN")
+        try:
+            floor = db.execute("SELECT min(id) FROM items INDEXED BY items_ts WHERE ts >= ?",
+                               (flags["min_ts"],)).fetchone()[0]
+            if floor is None:
+                return []
+            # Every row inside the window has id >= its minimum, including backfills.
+            # Keep both reads on one snapshot in case a sync changes an older row's timestamp.
+            return _run(db, fts, where, params, limit, sort, dedupe, floor)
+        finally:
+            if own_transaction:
+                db.rollback()
+    return _run(db, fts, where, params, limit, sort, dedupe)
+
+
+def _run(db, fts, where, params, limit, sort, dedupe, floor=None):
     now = int(time.time())
     if fts:
         sql = (f"SELECT items.*, snippet(items_fts, -1, '[', ']', '...', 14) AS snip, "
                f"bm25(items_fts, {WEIGHTS}) AS score FROM items_fts JOIN items ON items.id = items_fts.rowid "
                f"WHERE items_fts MATCH ?")
-        args = [fts] + params
+        args = [fts]
+        if floor is not None:
+            sql += " AND items_fts.rowid >= ?"
+            args.append(floor)
+        args += params
     else:
         sql = "SELECT items.*, substr(COALESCE(items.body, ''), 1, 160) AS snip, 0.0 AS score FROM items WHERE 1"
         args = list(params)
