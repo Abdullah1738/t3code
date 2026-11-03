@@ -10,6 +10,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -19,7 +20,6 @@ import * as Schema from "effect/Schema";
 
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
-import { sessionHoldsWork } from "../archive-if-idle/idle.ts";
 import * as ControlStore from "../control/ControlStore.ts";
 import { runsNewestFirst, TERMINAL_RUN_STATUSES } from "../control/model.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
@@ -115,6 +115,26 @@ const activeProviderThread = (
     ? null
     : (providerThreads.find((providerThread) => providerThread.id === activeId) ?? null);
 
+// Unlike archive-if-idle, recovery must distinguish an unsuccessful probe from
+// confirmed held work. Preserve the same probe order and thread-wide fallback.
+const snapshotHoldsWork = Effect.fn("RecoverySnapshot.holdsWork")(function* (
+  runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+  providerThread: OrchestrationV2ProviderThread,
+) {
+  const threadProbes = [
+    runtime.hasPendingBackgroundWorkForThread?.(providerThread),
+    runtime.holdsWorkForThread?.(providerThread),
+  ].filter((probe) => probe !== undefined);
+  const probes =
+    threadProbes.length > 0
+      ? threadProbes
+      : runtime.hasPendingBackgroundWork === undefined
+        ? []
+        : [runtime.hasPendingBackgroundWork];
+  const holding = yield* Effect.findFirst(probes, (probe) => probe);
+  return Option.isSome(holding);
+});
+
 /**
  * Runtime state of the active provider thread. A failed or missing `peek` is
  * "unknown", never "absent": only a confirmed missing session counts as absent.
@@ -134,7 +154,7 @@ const probeRuntime = Effect.fn("RecoverySnapshot.probeRuntime")(function* (
   );
   if (!peeked.readable) return { runtime: "unknown", heldWork: null } as const;
   if (Option.isNone(peeked.session)) return { runtime: "absent", heldWork: null } as const;
-  const heldWork = yield* sessionHoldsWork(peeked.session.value, providerThread).pipe(
+  const heldWork = yield* snapshotHoldsWork(peeked.session.value, providerThread).pipe(
     Effect.catchCause(() => Effect.succeed(null)),
   );
   return { runtime: "present", heldWork } as const;

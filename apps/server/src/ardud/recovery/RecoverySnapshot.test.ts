@@ -259,6 +259,41 @@ describe("RecoverySnapshot", () => {
     }),
   );
 
+  it.effect("reports heldWork as unknown when a present session's work probe dies", () =>
+    Effect.gen(function* () {
+      const fixture: Fixture = {
+        ...liveFixture(1),
+        providerThreads: new Map([
+          ["thread-0000", [providerThreadFor("thread-0000", "session-a")]],
+        ]),
+      };
+      // Both thread-specific probes and the session-wide fallback must preserve
+      // failure rather than reporting the archive path's conservative true.
+      const runtimes = [
+        {
+          hasPendingBackgroundWorkForThread: () => Effect.die("running work probe failed"),
+          holdsWorkForThread: () => Effect.succeed(true),
+        },
+        {
+          hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+          holdsWorkForThread: () => Effect.die("held work probe failed"),
+        },
+        { hasPendingBackgroundWork: Effect.die("session-wide probe failed") },
+      ];
+      for (const runtime of runtimes) {
+        const layer = layerFor(
+          fixture,
+          sessionsWith(() => Effect.succeed(Option.some(runtime as never))),
+        );
+        const page = yield* snapshotOf(layer, (snapshot) =>
+          snapshot.page({ active: true, cursor: null, limit: 10 }),
+        );
+        assert.strictEqual(page.threads[0]?.runtime, "present");
+        assert.strictEqual(page.threads[0]?.heldWork, null);
+      }
+    }),
+  );
+
   it.effect("never loads or touches an idle session", () =>
     Effect.gen(function* () {
       // get, open and isLive die if called (see idleSession). A present session
