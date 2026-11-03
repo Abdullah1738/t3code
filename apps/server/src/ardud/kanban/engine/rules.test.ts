@@ -960,8 +960,12 @@ describe("isContextFull", () => {
 
 describe("isHandoffBudget", () => {
   it("distinguishes handoff budget errors from provider overflows", () => {
-    expect(isHandoffBudget({ message: "Insufficient context allowance for the provider handoff." })).toBe(true);
-    expect(isHandoffBudget({ message: "The request leaves too little context for a provider handoff." })).toBe(true);
+    expect(
+      isHandoffBudget({ message: "Insufficient context allowance for the provider handoff." }),
+    ).toBe(true);
+    expect(
+      isHandoffBudget({ message: "The request leaves too little context for a provider handoff." }),
+    ).toBe(true);
     expect(isHandoffBudget({ message: "prompt is too long" })).toBe(false);
   });
 });

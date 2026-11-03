@@ -169,13 +169,21 @@ const makeFake = Effect.gen(function* () {
             }
             if (thread) thread.messages.push(input.text);
             if (input.text === "/compact") {
-              const run = { runId: `compact-${nextRun += 1}`, status: "completed", message: input.text };
+              const run = {
+                runId: `compact-${(nextRun += 1)}`,
+                status: "completed",
+                message: input.text,
+              };
               lastRuns.set(input.threadId, run);
               runHistory.set(run.runId, run);
               sends.push({ threadId: input.threadId, model: input.model, key: input.key });
               return Effect.succeed(run.runId);
             } else if (thread?.running) {
-              lastRuns.set(input.threadId, { runId: `wake-${nextRun += 1}`, status: "running", message: input.text });
+              lastRuns.set(input.threadId, {
+                runId: `wake-${(nextRun += 1)}`,
+                status: "running",
+                message: input.text,
+              });
             }
             sends.push({ threadId: input.threadId, model: input.model, key: input.key });
             return Effect.void;
@@ -184,10 +192,11 @@ const makeFake = Effect.gen(function* () {
       setModel: (threadId, model) =>
         Effect.sync(() => void modelSwitches.push({ threadId, model })),
       // Each stored failure is one executed run; a repeat notification of it reports the same runId.
-      lastFailure: (threadId) => Effect.sync(() => {
-        failureReads.push(threadId);
-        return failureOf(threadId);
-      }),
+      lastFailure: (threadId) =>
+        Effect.sync(() => {
+          failureReads.push(threadId);
+          return failureOf(threadId);
+        }),
       latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
@@ -1521,9 +1530,13 @@ it.effect("a work thread that gets too long compacts before starting a fresh thr
       assert.strictEqual(moved.workThreadId, oldThread);
       assert.strictEqual(moved.wakeNote, "Keep this note.");
       assert.isNull(moved.activeThreadId);
-      assert.isTrue(detail.events.some((event) =>
-        event.kind === "moved" && event.body?.startsWith("Thread too long; compacting it before the next run") === true,
-      ));
+      assert.isTrue(
+        detail.events.some(
+          (event) =>
+            event.kind === "moved" &&
+            event.body?.startsWith("Thread too long; compacting it before the next run") === true,
+        ),
+      );
       // The next dispatch waits until compaction ends, then wakes the same thread.
       old.running = true;
       yield* kanban.dispatchNow;
@@ -1613,7 +1626,10 @@ it.effect("later ticks ignore the same failure after its work card is released",
       assert.strictEqual(released.card.stage, "todo");
       assert.isNull(released.card.activeThreadId);
       assert.strictEqual(released.card.workThreadId, thread);
-      assert.strictEqual(threadState.messages.filter((message) => message === "/compact").length, 1);
+      assert.strictEqual(
+        threadState.messages.filter((message) => message === "/compact").length,
+        1,
+      );
       yield* kanban.setPool(board.id, board.defaultCardModel, 0);
       const messages = [...threadState.messages];
       const eventIds = released.events.map((event) => event.id);
@@ -1626,7 +1642,10 @@ it.effect("later ticks ignore the same failure after its work card is released",
       assert.strictEqual(after.card.workThreadId, thread);
       assert.isNull(after.card.activeThreadId);
       assert.deepStrictEqual(threadState.messages, messages);
-      assert.deepStrictEqual(after.events.map((event) => event.id), eventIds);
+      assert.deepStrictEqual(
+        after.events.map((event) => event.id),
+        eventIds,
+      );
       assert.strictEqual(fake.failureReads.length, reads);
 
       // The fresh-thread path likewise releases it; stale failures cannot be replayed.
@@ -1647,7 +1666,10 @@ it.effect("later ticks ignore the same failure after its work card is released",
       yield* kanban.setPool(board.id, board.defaultCardModel, 0);
       yield* kanban.tick;
       yield* kanban.tick;
-      assert.deepStrictEqual((yield* kanban.card(created.id)).events.map((event) => event.id), freshEventIds);
+      assert.deepStrictEqual(
+        (yield* kanban.card(created.id)).events.map((event) => event.id),
+        freshEventIds,
+      );
       assert.deepStrictEqual(threadState.messages, freshMessages);
       assert.strictEqual(fake.failureReads.length, freshReads);
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -1777,7 +1799,10 @@ it.effect("a compact turn that fails after acceptance starts a fresh thread", ()
       const oldMessages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
       assert.strictEqual(oldMessages.at(-1), "/compact");
       // The accepted maintenance turn itself then fails, rather than the send.
-      fake.failures.set(thread, { ...overflow, message: "This provider does not support context compaction." });
+      fake.failures.set(thread, {
+        ...overflow,
+        message: "This provider does not support context compaction.",
+      });
       const runId = fake.lastRuns.get(thread)!.runId;
       fake.lastRuns.set(thread, { runId, status: "failed", message: "/compact" });
       fake.runHistory.set(runId, { status: "failed", message: "/compact" });
@@ -1807,7 +1832,11 @@ it.effect("a later unrelated turn does not hide a completed compaction", () =>
       fake.failures.set(thread, { ...overflow });
       yield* kanban.turnEnded(thread);
       fake.failures.delete(thread);
-      fake.lastRuns.set(thread, { runId: "later-run", status: "completed", message: "Another task" });
+      fake.lastRuns.set(thread, {
+        runId: "later-run",
+        status: "completed",
+        message: "Another task",
+      });
       yield* kanban.dispatchNow;
       const resumed = (yield* kanban.card(created.id)).card;
       assert.strictEqual(resumed.stage, "working");
@@ -1835,7 +1864,12 @@ it.effect("one compact turn covers all work cards sharing a thread", () =>
         assert.strictEqual(detail.card.stage, "todo");
         assert.strictEqual(detail.card.workThreadId, thread);
         assert.isNull(detail.card.stalled);
-        assert.isTrue(detail.events.some((event) => event.body?.startsWith("Thread too long; compacting it before the next run") === true));
+        assert.isTrue(
+          detail.events.some(
+            (event) =>
+              event.body?.startsWith("Thread too long; compacting it before the next run") === true,
+          ),
+        );
       }
       (yield* Ref.get(fake.threads)).get(thread)!.running = true;
       yield* kanban.dispatchNow;

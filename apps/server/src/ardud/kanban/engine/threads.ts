@@ -97,15 +97,24 @@ export interface KanbanThreadsShape {
     | null
   >;
   /** Strict read used to reconcile a released card after its maintenance turn. */
-  readonly latestRun: (threadId: ThreadId) => Effect.Effect<{
-    readonly runId: string;
-    readonly status: string;
-    readonly message: string | null;
-  } | null, KanbanThreadError>;
-  readonly compactRun: (threadId: ThreadId, runId: string) => Effect.Effect<{
-    readonly status: string;
-    readonly message: string | null;
-  } | null, KanbanThreadError>;
+  readonly latestRun: (threadId: ThreadId) => Effect.Effect<
+    {
+      readonly runId: string;
+      readonly status: string;
+      readonly message: string | null;
+    } | null,
+    KanbanThreadError
+  >;
+  readonly compactRun: (
+    threadId: ThreadId,
+    runId: string,
+  ) => Effect.Effect<
+    {
+      readonly status: string;
+      readonly message: string | null;
+    } | null,
+    KanbanThreadError
+  >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
@@ -233,15 +242,21 @@ const make = Effect.gen(function* () {
       Effect.flatMap((records) => {
         const run = latestExecutedRun(records.runs);
         if (run === null) return Effect.succeed(null);
-        return threads.getThreadRecords(threadId, ["messages"], {
-          messageIds: run.userMessageId === null ? [] : [run.userMessageId],
-        }).pipe(Effect.map((messages) => ({
-          runId: run.id,
-          status: run.status,
-          message: messages.messages[0]?.text ?? null,
-        })));
+        return threads
+          .getThreadRecords(threadId, ["messages"], {
+            messageIds: run.userMessageId === null ? [] : [run.userMessageId],
+          })
+          .pipe(
+            Effect.map((messages) => ({
+              runId: run.id,
+              status: run.status,
+              message: messages.messages[0]?.text ?? null,
+            })),
+          );
       }),
-      Effect.mapError((error) => new KanbanThreadError({ operation: "latestRun", detail: detailOf(error) })),
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "latestRun", detail: detailOf(error) }),
+      ),
     );
 
   const compactRun: KanbanThreadsShape["compactRun"] = (threadId, runId) =>
@@ -249,11 +264,20 @@ const make = Effect.gen(function* () {
       Effect.flatMap((records) => {
         const run = records.runs.find((candidate) => candidate.id === runId);
         if (run === undefined) return Effect.succeed(null);
-        return threads.getThreadRecords(threadId, ["messages"], {
-          messageIds: run.userMessageId === null ? [] : [run.userMessageId],
-        }).pipe(Effect.map((messages) => ({ status: run.status, message: messages.messages[0]?.text ?? null })));
+        return threads
+          .getThreadRecords(threadId, ["messages"], {
+            messageIds: run.userMessageId === null ? [] : [run.userMessageId],
+          })
+          .pipe(
+            Effect.map((messages) => ({
+              status: run.status,
+              message: messages.messages[0]?.text ?? null,
+            })),
+          );
       }),
-      Effect.mapError((error) => new KanbanThreadError({ operation: "compactRun", detail: detailOf(error) })),
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "compactRun", detail: detailOf(error) }),
+      ),
     );
 
   const launch: KanbanThreadsShape["launch"] = (input) =>
@@ -362,7 +386,18 @@ const make = Effect.gen(function* () {
     Effect.catchCause(() => Effect.void),
   );
 
-  return KanbanThreads.of({ view, find, model, lastFailure, latestRun, compactRun, launch, send, setModel, interrupt });
+  return KanbanThreads.of({
+    view,
+    find,
+    model,
+    lastFailure,
+    latestRun,
+    compactRun,
+    launch,
+    send,
+    setModel,
+    interrupt,
+  });
 });
 
 export const layer = Layer.effect(KanbanThreads, make).pipe(

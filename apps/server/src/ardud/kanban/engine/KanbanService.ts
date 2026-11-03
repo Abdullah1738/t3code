@@ -985,15 +985,17 @@ const make = Effect.gen(function* () {
   const FRESH_START = "Thread too long; the next run starts on a fresh thread";
   const COMPACT_FIRST = "Thread too long; compacting it before the next run";
   const happenedRecently = (card: KanbanCard, at: string, prefix: string) =>
-    store.cardEvents(card.id).pipe(
-      Effect.map((events) =>
-        events.some(
-          (event) =>
-            event.body?.startsWith(prefix) === true &&
-            Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
+    store
+      .cardEvents(card.id)
+      .pipe(
+        Effect.map((events) =>
+          events.some(
+            (event) =>
+              event.body?.startsWith(prefix) === true &&
+              Date.parse(at) - Date.parse(event.at) < Rules.CONTEXT_FULL_RETRY_MS,
+          ),
         ),
-      ),
-    );
+      );
   const freshStartedRecently = (card: KanbanCard, at: string) =>
     happenedRecently(card, at, FRESH_START);
   const compactedRecently = (card: KanbanCard, at: string) =>
@@ -1010,11 +1012,15 @@ const make = Effect.gen(function* () {
         candidate.stage !== "todo" ||
         candidate.activeThreadId !== null ||
         candidate.workThreadId !== threadId
-      ) continue;
+      )
+        continue;
       const lastMove = (yield* store.cardEvents(candidate.id)).findLast(
         (event) => event.kind === "moved",
       );
-      if (lastMove?.body?.startsWith(COMPACT_FIRST) && (latest === undefined || lastMove.id > latest.id)) {
+      if (
+        lastMove?.body?.startsWith(COMPACT_FIRST) &&
+        (latest === undefined || lastMove.id > latest.id)
+      ) {
         latest = lastMove;
       }
     }
@@ -2296,10 +2302,12 @@ const make = Effect.gen(function* () {
     let threadId: ThreadId | null = null;
     if (existing !== null) {
       // Do not mistake a failed projection read for a missing work thread.
-      const existingRead = dispatch.role === "work" ? yield* Effect.result(threads.find(existing)) : null;
+      const existingRead =
+        dispatch.role === "work" ? yield* Effect.result(threads.find(existing)) : null;
       if (existingRead?._tag === "Failure") return;
       const view = existingRead === null ? yield* threads.view(existing) : existingRead.success;
-      const compactEvent = dispatch.role === "work" ? yield* threadCompacting(existing, board.id) : undefined;
+      const compactEvent =
+        dispatch.role === "work" ? yield* threadCompacting(existing, board.id) : undefined;
       if (dispatch.joins && !view) {
         // The thread holding the slot is gone: the card stops pointing at it,
         // so the next pass gives it a slot of its own instead of joining again.
@@ -2324,11 +2332,17 @@ const make = Effect.gen(function* () {
       if (view?.state === "idle" && compactEvent !== undefined) {
         const compactRunId = compactEvent.body?.match(/\[compact-run ([^\]]+)\]$/)?.[1];
         const latest = yield* Effect.result(
-          compactRunId === undefined ? threads.latestRun(existing) : threads.compactRun(existing, compactRunId),
+          compactRunId === undefined
+            ? threads.latestRun(existing)
+            : threads.compactRun(existing, compactRunId),
         );
         // A failed read or the original failure is not proof that maintenance
         // finished; wait rather than silently abandon the thread.
-        if (latest._tag === "Failure" || latest.success?.message?.trim().toLowerCase() !== "/compact") return;
+        if (
+          latest._tag === "Failure" ||
+          latest.success?.message?.trim().toLowerCase() !== "/compact"
+        )
+          return;
         if (latest.success.status !== "completed") {
           if (!["failed", "cancelled", "interrupted"].includes(latest.success.status)) return;
           // An accepted send can still fail as a provider maintenance run.
@@ -2962,13 +2976,16 @@ const make = Effect.gen(function* () {
       if (outage !== null) return;
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
-        const recentCompactions = yield* Effect.forEach(carried, (entry) => compactedRecently(entry, at));
+        const recentCompactions = yield* Effect.forEach(carried, (entry) =>
+          compactedRecently(entry, at),
+        );
         const hasRecentCompaction = recentCompactions.some(Boolean);
-        const candidates = Rules.isContextFull(failure) && !Rules.isHandoffBudget(failure) && !hasRecentCompaction
-          ? yield* Effect.filter(carried, (entry) =>
-              freshStartedRecently(entry, at).pipe(Effect.map((recent) => !recent)),
-            )
-          : [];
+        const candidates =
+          Rules.isContextFull(failure) && !Rules.isHandoffBudget(failure) && !hasRecentCompaction
+            ? yield* Effect.filter(carried, (entry) =>
+                freshStartedRecently(entry, at).pipe(Effect.map((recent) => !recent)),
+              )
+            : [];
         // One maintenance turn covers every card sharing this thread. Start it
         // only when idle: a queued turn could be held behind the failed run.
         const found = candidates.length > 0 ? yield* Effect.result(threads.find(threadId)) : null;
@@ -2977,11 +2994,15 @@ const make = Effect.gen(function* () {
         if (view !== null && view.state !== "idle") return;
         // The send-then-save gap is accepted: a crash leaves /compact's turn
         // end to normal handling (usually a nudge or flag).
-        const compactSent = view?.state === "idle"
-          ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
-          : null;
+        const compactSent =
+          view?.state === "idle"
+            ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
+            : null;
         for (const entry of carried) {
-          if (compactSent?._tag === "Success" && candidates.some((candidate) => candidate.id === entry.id)) {
+          if (
+            compactSent?._tag === "Success" &&
+            candidates.some((candidate) => candidate.id === entry.id)
+          ) {
             const compacting: KanbanCard = {
               ...release(entry),
               stage: "todo",

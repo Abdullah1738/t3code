@@ -307,7 +307,9 @@ export function isContextFull(failure: { readonly message: string }): boolean {
 
 /** A T3 handoff-budget failure, which provider-side compaction cannot reliably fix. */
 export function isHandoffBudget(failure: { readonly message: string }): boolean {
-  return /insufficient context allowance|too little context for a provider handoff/i.test(failure.message);
+  return /insufficient context allowance|too little context for a provider handoff/i.test(
+    failure.message,
+  );
 }
 
 /** How long after a fresh start a second context-full run is flagged instead of restarted. */
