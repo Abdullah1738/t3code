@@ -12,7 +12,7 @@ Commands:
   canary <tool> <version>   throwaway HOME + homes + 9router prompts + memory-off canary
   promote <tool> <version>  canary-gated atomic switch (Codex leaves rotation pending)
   rollback <tool>           current -> lastKnownGood
-  rotate-codex [--when-idle]  refresh the Codex provider once it is safe (standing OK only)
+  rotate-codex [--when-idle]  report unsupported; keep the shared Codex runtimes pending
   status                    pins, rotation state, last records
   auto                      daily job: discover, stage, canary, promote Claude; Codex pending
   --before-release          discover + stage + canary both, print the pinned versions
@@ -454,11 +454,40 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def prepare_isolated_home(home: Path) -> None:
+    """Create the disposable login keychain before a CLI can use a temporary HOME on macOS."""
+    home.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "darwin":
+        return
+    keychain = home / "Library" / "Keychains" / "login.keychain-db"
+    if keychain.is_file():
+        return
+    keychain.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(["/usr/bin/security", "create-keychain", "-p", "", str(keychain)],
+                              env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                              capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HarnessError("could not create the disposable login keychain") from exc
+    if proc.returncode != 0 or not keychain.is_file():
+        raise HarnessError("could not create the disposable login keychain")
+
+
+def require_isolated_home(env: dict) -> None:
+    if sys.platform == "darwin":
+        home = env.get("HOME")
+        if not home or not (Path(home) / "Library" / "Keychains" / "login.keychain-db").is_file():
+            raise HarnessError("refusing to start a CLI without its disposable login keychain")
+
+
 def binary_version(binary: Path, tool: str) -> str:
-    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path(tempfile.gettempdir())),
-           "LANG": "en_US.UTF-8"}
-    proc = subprocess.run([str(binary), *TOOLS[tool]["version_flag"]], env=env, capture_output=True,
-                          text=True, timeout=60)
+    with tempfile.TemporaryDirectory(prefix="harness-cli-version-") as work:
+        home = Path(work) / "home"
+        prepare_isolated_home(home)
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "en_US.UTF-8"}
+        require_isolated_home(env)
+        proc = subprocess.run([str(binary), *TOOLS[tool]["version_flag"]], env=env, capture_output=True,
+                              text=True, timeout=60)
     m = re.search(TOOLS[tool]["version_regex"], proc.stdout + proc.stderr, re.M)
     if not m:
         raise HarnessError(f"{tool} --version printed no version")
@@ -468,7 +497,14 @@ def binary_version(binary: Path, tool: str) -> str:
 # ---------- canary ----------
 
 class Recorder:
-    """A tiny localhost proxy that forwards to 9router and keeps every request body."""
+    """A tiny localhost proxy that forwards to 9router and records each upstream request.
+
+    For every request it keeps the path, the non-secret headers the CLI sent (anthropic-beta,
+    x-app and similar), and the parsed JSON body. The key itself is never recorded: the forwarded
+    auth headers are replaced, and the recorded headers exclude them.
+    """
+
+    SECRET_HEADERS = ("authorization", "x-api-key", "cookie")
 
     def __init__(self, upstream: str, key: str):
         if not re.match(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", upstream):
@@ -477,6 +513,7 @@ class Recorder:
         self.key = key
         self.bodies: list[bytes] = []
         self.paths: list[str] = []
+        self.requests: list[dict] = []
         self.server = None
         self.thread = None
 
@@ -497,8 +534,27 @@ class Recorder:
                 body = self.rfile.read(length)
                 recorder.bodies.append(body)
                 recorder.paths.append(self.path)
+                safe_headers = {k.lower(): v for k, v in self.headers.items()
+                                if k.lower() == "anthropic-beta"}
+                try:
+                    parsed = json.loads(body.decode("utf-8")) if body else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    parsed = None
+                record = {"path": self.path, "headers": safe_headers, "body": parsed}
+                recorder.requests.append(record)
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in ("host", "content-length", "authorization", "x-api-key")}
+                if self.path.startswith("/v1/messages") and isinstance(parsed, dict) and any(
+                        isinstance(msg, dict) and isinstance(msg.get("content"), list)
+                        and any(isinstance(block, dict) and block.get("type") == "thinking"
+                                for block in msg["content"])
+                        for msg in parsed.get("messages", [])):
+                    beta = next((k for k in headers if k.lower() == "anthropic-beta"), "anthropic-beta")
+                    values = [v.strip() for v in headers.get(beta, "").split(",") if v.strip()]
+                    if "thinking-binding-controls-2026-08-01" not in values:
+                        values.append("thinking-binding-controls-2026-08-01")
+                    headers[beta] = ",".join(values)
+                    record["headers"]["anthropic-beta"] = headers[beta]
                 headers["x-api-key"] = recorder.key
                 headers["authorization"] = f"Bearer {recorder.key}"
                 req = urllib.request.Request(recorder.upstream + self.path, data=body, headers=headers,
@@ -506,6 +562,7 @@ class Recorder:
                 try:
                     with urllib.request.urlopen(req, timeout=300) as resp:
                         payload = resp.read()
+                        recorder.capture_response(payload, record)
                         self.send_response(resp.status)
                         for k, v in resp.headers.items():
                             if k.lower() not in ("transfer-encoding", "connection", "content-length"):
@@ -530,6 +587,71 @@ class Recorder:
             self.server.shutdown()
             self.server.server_close()
 
+    @staticmethod
+    def thinking_blocks_from(payload: bytes) -> list[dict]:
+        """Every thinking block the model returned, from a JSON reply or a server-sent-events stream.
+
+        Anthropic's stream sends a content_block_start with the thinking block (type, thinking,
+        signature) and thinking_delta / signature_delta events. Both forms are handled.
+        """
+        found: list[dict] = []
+        text = payload.decode("utf-8", errors="replace")
+        try:
+            doc = json.loads(text)
+            for block in (doc.get("content") or []) if isinstance(doc, dict) else []:
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    found.append({"thinking": block.get("thinking", ""), "signature": block.get("signature", "")})
+            return found
+        except json.JSONDecodeError:
+            pass
+        current: dict | None = None
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            try:
+                event = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "content_block_start":
+                block = event.get("content_block") or {}
+                if block.get("type") == "thinking":
+                    current = {"thinking": block.get("thinking", ""), "signature": block.get("signature", "")}
+                    found.append(current)
+                else:
+                    current = None
+            elif event.get("type") == "content_block_delta" and current is not None:
+                delta = event.get("delta") or {}
+                if delta.get("type") == "thinking_delta":
+                    current["thinking"] += delta.get("thinking", "")
+                elif delta.get("type") == "signature_delta":
+                    current["signature"] += delta.get("signature", "")
+            elif event.get("type") == "content_block_stop":
+                current = None
+        return found
+
+    def capture_response(self, payload: bytes, record: dict) -> None:
+        """Keep only the fields needed to verify the response; never persist the response body."""
+        record["response_thinking"] = self.thinking_blocks_from(payload)
+        docs = []
+        try:
+            docs.append(json.loads(payload))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            for line in payload.decode("utf-8", errors="replace").splitlines():
+                if line.startswith("data:"):
+                    try:
+                        docs.append(json.loads(line[5:].strip()))
+                    except json.JSONDecodeError:
+                        pass
+        transformations = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            # Anthropic exposes this on a message, not in its tool inputs or text.
+            message = doc.get("message") if doc.get("type") == "message_start" else doc
+            if isinstance(message, dict) and "input_transformations" in message:
+                transformations.append(message["input_transformations"])
+        record["response_transformations"] = transformations
+
 
 def nine_router_key() -> str:
     key = os.environ.get("NINEROUTER_KEY", "")
@@ -539,6 +661,7 @@ def nine_router_key() -> str:
 def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
             cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Run a CLI with an explicit cwd, so per-project state (memory) is the one the canary seeded."""
+    require_isolated_home(env)
     return subprocess.run([str(binary), *args], env=env, capture_output=True, text=True,
                           timeout=timeout, cwd=str(cwd) if cwd else None)
 
@@ -554,7 +677,7 @@ def make_throwaway_homes(work: Path) -> tuple[Path, Path]:
     if not gen.is_file():
         raise HarnessError("harness-homes generator is not installed (card B1); cannot canary")
     fake_home = work / "home"
-    fake_home.mkdir(parents=True, exist_ok=True)
+    prepare_isolated_home(fake_home)
     live_cfg = Path(os.environ.get("HARNESS_CLI_SOURCE_HOME", Path.home())) / ".config" / "opencode"
     dst_cfg = fake_home / ".config" / "opencode"
     if not (live_cfg / "AGENTS.md").is_file():
@@ -576,6 +699,15 @@ def make_throwaway_homes(work: Path) -> tuple[Path, Path]:
     return work / "homes" / "claude", work / "homes" / "codex"
 
 
+def make_codex_cu_home(work: Path) -> Path:
+    """The generated codex-cu home (Terra, computer use). Generated by the same B1 generator."""
+    make_throwaway_homes(work)
+    cu = work / "homes" / "codex-cu"
+    if not (cu / "config.toml").is_file():
+        raise HarnessError("harness-homes did not generate the codex-cu home")
+    return cu
+
+
 def claude_env(home: Path, config_dir: Path, base: str) -> dict:
     return {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -594,15 +726,50 @@ def claude_env(home: Path, config_dir: Path, base: str) -> dict:
 
 
 def claude_project_slug(project_dir: Path) -> str:
-    """Claude Code's per-project memory folder name: the absolute path with '/' turned into '-'."""
-    return str(project_dir.resolve()).replace("/", "-")
+    """Claude Code replaces non-alphanumeric path characters in project directory names."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(project_dir.resolve()))
+
+
+THINKING_CANARY_WORD = "ROBOB-THINK-4417"
+
+
+def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> dict:
+    """Require a matching signed block in turn two and explicit empty response transformations."""
+    replies = [b for rec in first_turn for b in rec.get("response_thinking", [])
+               if b.get("thinking") and b.get("signature")]
+    matched = False
+    reports = []
+    observed = False
+    for rec in second_turn:
+        body = rec.get("body")
+        if not isinstance(body, dict):
+            continue
+        for message in body.get("messages", []):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, list):
+                    blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
+                    this_match = any(b.get("thinking") == r["thinking"] and b.get("signature") == r["signature"]
+                                     for b in blocks for r in replies)
+                    if this_match:
+                        matched = True
+                        transformations = rec.get("response_transformations") or []
+                        observed = observed or bool(transformations)
+                        reports.append(bool(transformations) and all(v == [] for v in transformations))
+    return {"turn1ThinkingBlocks": len(replies), "thinkingReplayed": matched,
+            "inputTransformationsObserved": observed, "inputTransformationsEmpty": bool(reports) and all(reports)}
 
 
 def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> dict:
-    """Run the real CLI in a fixed project dir with a seeded MEMORY.md for that exact dir.
+    """Run the real CLI: a memory-off check plus a two-turn Opus preserved-thinking check.
 
-    The seed is only meaningful if the CLI reads memory for the directory it runs in, so the
-    project directory and its memory slug are created here and the CLI runs with that cwd.
+    Memory: the seed is written for the project dir the CLI runs in, and the marker must be absent
+    from every request body. Thinking: turn 1 (one session) produces a thinking block; turn 2 (the
+    same session) must send that block back with its signature, and must carry no
+    input_transformations. A gateway that drops the thinking blocks fails promotion here.
+
+    The context-management edits and the anthropic-beta header are recorded as informational
+    diagnostics only; they never fail the canary.
     """
     home = work / "claude-home"
     cdir = home / ".claude"
@@ -617,13 +784,45 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
     base = recorder.start()
     results: dict = {}
     try:
+        prepare_isolated_home(home)
+        # Claude settings' env takes precedence over the process env; otherwise it bypasses the proxy.
+        settings_path = cdir / "settings.json"
+        settings = read_json(settings_path, {})
+        settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = base
+        write_json_atomic(settings_path, settings)
         env = claude_env(home, cdir, base)
-        for model in MODEL_CANARIES["claude"]:
-            routed = CLAUDE_MODEL_IDS.get(model, model)
-            proc = run_cli(binary, ["-p", "Reply exactly OK.", "--model", routed, "--effort", "low",
-                                    "--output-format", "text"], env=env, timeout=240, cwd=project)
-            ok = proc.returncode == 0 and "OK" in proc.stdout
-            results[model] = {"ok": ok, "stdoutLen": len(proc.stdout)}
+        model = "claude-opus-5-5"
+        routed = CLAUDE_MODEL_IDS[model]
+        session_id = str(uuid_for(work))
+        turn1 = run_cli(binary, ["-p", f"Remember the code {THINKING_CANARY_WORD}. Think it through briefly, "
+                                 "then reply with the single word OK.", "--model", routed,
+                                 "--effort", "high", "--session-id", session_id, "--output-format", "text"],
+                        env=env, timeout=240, cwd=project)
+        turn1_ok = turn1.returncode == 0 and "OK" in turn1.stdout
+        first_turn = list(recorder.requests)
+        boundary = len(first_turn)
+        turn2 = run_cli(binary, ["-p", "What code did I ask you to remember? Reply with the code only.",
+                                 "--model", routed, "--effort", "high", "--resume", session_id,
+                                 "--output-format", "text"], env=env, timeout=240, cwd=project)
+        turn2_ok = turn2.returncode == 0 and THINKING_CANARY_WORD in turn2.stdout
+        results[model] = {"ok": turn1_ok and turn2_ok, "turn1Ok": turn1_ok, "turn2Ok": turn2_ok}
+        # The recorder keeps every upstream request and the thinking blocks each reply returned.
+        preserved = thinking_replay_check(first_turn, recorder.requests[boundary:])
+        results["thinking"] = preserved
+        results["thinkingCheckChecked"] = bool(first_turn and recorder.requests[boundary:])
+        results["thinkingReplayed"] = preserved["thinkingReplayed"]
+        results["inputTransformationsEmpty"] = preserved["inputTransformationsEmpty"]
+        haiku = run_cli(binary, ["-p", "Reply exactly OK.", "--model", CLAUDE_MODEL_IDS["claude-haiku-5-5"],
+                                  "--effort", "low", "--output-format", "text"], env=env, timeout=240, cwd=project)
+        results["claude-haiku-5-5"] = {"ok": haiku.returncode == 0 and "OK" in haiku.stdout}
+        # Informational diagnostics for the record (never promotion failures).
+        results["diagnostics"] = {
+            "contextManagement": [(r.get("body") or {}).get("context_management")
+                                  for r in recorder.requests if isinstance(r.get("body"), dict)
+                                  and "context_management" in r["body"]],
+            "anthropicBeta": sorted({str(r.get("headers", {}).get("anthropic-beta"))
+                                     for r in recorder.requests if r.get("headers", {}).get("anthropic-beta")}),
+        }
         # The marker must be absent from every request body the CLI sent, and the seed must
         # have been there to be read (a seed the CLI never reads proves nothing).
         seed_present = (mem_dir / "MEMORY.md").is_file()
@@ -634,6 +833,12 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
     finally:
         recorder.stop()
     return results
+
+
+def uuid_for(work: Path) -> str:
+    """A stable session UUID for this canary run (derived from the disposable dir name)."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, str(work)))
 
 
 # Names the memory pipeline writes: the memories folder and its stores (memories_1.sqlite and
@@ -653,42 +858,101 @@ def codex_memory_artifacts(chome: Path) -> list[str]:
     return sorted(found)
 
 
-def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
-                 models: list[str] | None = None, chome_name: str = "codex-home") -> dict:
-    """Run Codex in the generated home with the proxy recording every request body.
+def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, models: list[str],
+                           *, enable_memory: bool) -> dict:
+    """Run Codex against a disposable copy of a generated home, with the memory check.
 
-    Two checks: no request body may carry a memory section, and no memory-pipeline artifact may
-    appear anywhere in the home. Both are checked for each model, including Terra (which the
-    `codex-cu` instance uses).
+    Not ephemeral: Codex 0.166.0 disables the memory pipeline for ephemeral sessions, so an
+    ephemeral run proves nothing about memory. The copy lives under `work` and CODEX_HOME points
+    at it, so nothing is written to the generator's output or any personal home.
+
+    enable_memory=True turns memory ON in the copy: the positive control. The detector must fire
+    there, otherwise a "clean" result on the real home could just mean the detector is blind.
     """
-    home = work / chome_name
-    chome = home / ".codex"
-    _, homes_codex = make_throwaway_homes(work / f"gen-{chome_name}")
-    shutil.copytree(homes_codex, chome, dirs_exist_ok=True)
+    chome = work / "codex-home" / ".codex"
+    shutil.copytree(generated_home, chome, dirs_exist_ok=True)
+    if enable_memory:
+        cfg_path = chome / "config.toml"
+        text = cfg_path.read_text(encoding="utf-8")
+        text = text.replace("generate_memories = false", "generate_memories = true")
+        text = text.replace("use_memories = false", "use_memories = true")
+        text = text.replace("memories = false", "memories = true")
+        cfg_path.write_text(text, encoding="utf-8")
+    # Seed a completed, non-ephemeral rollout in the disposable home. If the installed
+    # Codex release does not process it, the enabled positive control fails closed.
+    sessions = chome / "sessions" / "2025" / "01" / "01"
+    sessions.mkdir(parents=True, exist_ok=True)
+    rollout = sessions / "rollout-2025-01-01T00-00-00-00000000-0000-4000-8000-000000000001.jsonl"
+    fixture = [
+        {"timestamp": "2025-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "00000000-0000-4000-8000-000000000001", "timestamp": "2025-01-01T00:00:00Z",
+                     "cwd": str(work), "originator": "codex_cli_rs", "cli_version": "0.166.0", "source": "cli"}},
+        {"timestamp": "2025-01-01T00:00:01Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Remember the fixture preference: blue."}]}},
+        {"timestamp": "2025-01-01T00:00:02Z", "type": "response_item",
+         "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The fixture preference is blue."}]}},
+    ]
+    rollout.write_text("".join(json.dumps(event) + "\n" for event in fixture), encoding="utf-8")
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
-    results: dict = {}
+    results: dict = {"positiveControl": enable_memory, "models": {}}
     try:
-        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "CODEX_HOME": str(chome),
-               "NINEROUTER_KEY": nine_router_key(), "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
+        prepare_isolated_home(work / "codex-home")
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(work / "codex-home"),
+               "CODEX_HOME": str(chome), "NINEROUTER_KEY": nine_router_key(),
+               "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
-        for model in models or MODEL_CANARIES["codex"]:
-            before = len(recorder.bodies)
-            proc = run_cli(binary, ["exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
-                                    "-m", model, *cfg, "Reply exactly OK."], env=env, timeout=240)
+        if enable_memory:
+            cfg += ["-c", "memories.min_rollout_idle_hours=0", "-c", "memories.max_rollouts_per_startup=1"]
+        for model in models:
+            before = len(recorder.requests)
+            proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
+                                    "-m", model, *cfg, "Reply exactly OK."], env=env, timeout=240,
+                           cwd=work)
             ok = proc.returncode == 0 and "OK" in proc.stdout
-            bodies = recorder.bodies[before:]
-            section = any(marker in body for body in bodies for marker in CODEX_MEMORY_SECTION_MARKERS)
-            results[model] = {"ok": ok, "requests": len(bodies), "memorySectionInRequest": section}
+            records = recorder.requests[before:]
+            section = any(marker in json.dumps(r.get("body") or "", ensure_ascii=False)
+                          for r in records for marker in ("## Memory", "<memories>", "memory_summary",
+                                                          "Memory Phase 2"))
+            results["models"][model] = {"ok": ok and bool(records), "requests": len(records),
+                                        "memorySectionInRequest": section}
         artifacts = codex_memory_artifacts(chome)
         results["memoryArtifacts"] = artifacts
         results["memoryPipelineRan"] = bool(artifacts)
-        results["memoryPromptSeen"] = any(
-            r.get("memorySectionInRequest") for r in results.values() if isinstance(r, dict))
-        results["memoryCanaryChecked"] = len(recorder.bodies) > 0
-        results["requests"] = len(recorder.bodies)
+        results["memoryPromptSeen"] = any(m.get("memorySectionInRequest") for m in results["models"].values())
+        results["requests"] = len(recorder.requests)
     finally:
         recorder.stop()
+    return results
+
+
+def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
+                 models: list[str] | None = None, generated_home: Path | None = None) -> dict:
+    """The memory-off check on a generated Codex home, with a positive control first.
+
+    The positive control (memory enabled on a copy) must show the detector firing. Only then does
+    the real generated home count: no memory section in any request, no memory artifact on disk.
+    """
+    models = models or MODEL_CANARIES["codex"]
+    if generated_home is None:
+        _, generated_home = make_throwaway_homes(work / "gen")
+    control_work = work / "control"
+    control_work.mkdir(parents=True, exist_ok=True)
+    control = run_codex_memory_probe(binary, generated_home, control_work, models[:1], enable_memory=True)
+    detector_fires = bool(control["memoryPipelineRan"] or control["memoryPromptSeen"])
+    real_work = work / "real"
+    real_work.mkdir(parents=True, exist_ok=True)
+    real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False)
+    results = {
+        "positiveControlFired": detector_fires,
+        "positiveControlArtifacts": control["memoryArtifacts"],
+        "models": real["models"],
+        "memoryArtifacts": real["memoryArtifacts"],
+        "memoryPipelineRan": real["memoryPipelineRan"],
+        "memoryPromptSeen": real["memoryPromptSeen"],
+        "memoryCanaryChecked": bool(detector_fires and real["requests"] > 0),
+        "requests": real["requests"],
+    }
     return results
 
 
@@ -724,22 +988,38 @@ def canary(tool: str, version: str) -> dict:
             memory_fail = result.get("memoryCanaryLeaked") is True
             memory_checked = result.get("memoryCanaryChecked") is True
             requests = result.get("requests", 0)
+            # Preserved thinking is a promotion gate: turn 2 must replay turn 1's thinking block with
+            # its signature, and the gateway must not have rewritten the conversation.
+            if not result.get("thinkingCheckChecked"):
+                reasons.append("preserved-thinking check did not run (fewer than two turns)")
+            elif not result.get("thinkingReplayed"):
+                reasons.append("preserved thinking was not replayed in turn 2 (dropped or altered)")
+            if result.get("thinkingCheckChecked") and not result.get("inputTransformationsEmpty"):
+                reasons.append("turn 2 response did not confirm empty input_transformations")
         else:
             # Two homes: the plain Codex home (Astra, Sol) and the codex-cu home (Terra).
             plain_work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-"))
             cu_work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-cu-"))
             try:
+                plain_home = make_throwaway_homes(plain_work / "gen")[1]
+                cu_home = make_codex_cu_home(cu_work / "gen")
+                import tomllib
+                cu_config = tomllib.loads((cu_home / "config.toml").read_text(encoding="utf-8"))
+                if (cu_config.get("model") != CODEX_CU_MODELS[0]
+                        or (cu_config.get("features") or {}).get("computer_use") is not True
+                        or not (cu_home / "models.json").is_file() or not (cu_home / "AGENTS.md").is_file()):
+                    raise HarnessError("generated codex-cu home is missing Terra settings")
                 plain = canary_codex(binary, version, plain_work, key_present,
-                                     models=MODEL_CANARIES["codex"], chome_name="codex-home")
+                                     models=MODEL_CANARIES["codex"], generated_home=plain_home)
                 cu = canary_codex(binary, version, cu_work, key_present,
-                                  models=CODEX_CU_MODELS, chome_name="codex-cu-home")
+                                  models=CODEX_CU_MODELS, generated_home=cu_home)
             finally:
                 remove_tree(plain_work)
                 remove_tree(cu_work)
             result = {**plain, **{f"cu:{k}": v for k, v in cu.items()}, "cu": cu}
             models = MODEL_CANARIES["codex"] + CODEX_CU_MODELS
-            failed = [m for m in MODEL_CANARIES["codex"] if not plain.get(m, {}).get("ok")]
-            failed += [m for m in CODEX_CU_MODELS if not cu.get(m, {}).get("ok")]
+            failed = [m for m in MODEL_CANARIES["codex"] if not plain.get("models", {}).get(m, {}).get("ok")]
+            failed += [m for m in CODEX_CU_MODELS if not cu.get("models", {}).get(m, {}).get("ok")]
             memory_fail = (plain.get("memoryPipelineRan") or cu.get("memoryPipelineRan")
                            or plain.get("memoryPromptSeen") or cu.get("memoryPromptSeen"))
             memory_checked = plain.get("memoryCanaryChecked") is True and cu.get("memoryCanaryChecked") is True
@@ -775,7 +1055,7 @@ def swap_current(tool: str, version: str) -> None:
     os.replace(tmp, link)  # atomic rename over the old symlink
 
 
-def promote(tool: str, version: str) -> dict:
+def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     if tool not in TOOLS:
         raise HarnessError(f"unknown tool {tool}")
     if not version_dir(tool, version).is_dir():
@@ -790,6 +1070,9 @@ def promote(tool: str, version: str) -> dict:
         raise HarnessError(f"{tool} {version} has no passing canary; refusing to promote")
     if verdict.get("memoryCheckedAt") is None:
         raise HarnessError("canary record lacks the memory-off check")
+    binary = version_dir(tool, version) / "bin" / ("claude" if tool == "claude" else "codex")
+    if not binary.is_file() or not verdict.get("binarySha256") or sha256_file(binary) != verdict["binarySha256"]:
+        raise HarnessError("staged binary differs from the canary record")
     swap_current(tool, version)
     slot["lastKnownGood"] = previous
     slot["current"] = version
@@ -801,6 +1084,10 @@ def promote(tool: str, version: str) -> dict:
     else:
         slot["rotationPending"] = False
         status = "promoted"
+    if queue_notice:
+        key = f"harness-cli:{tool}:{version}:promoted"
+        state.setdefault("pendingNotices", {})[key] = {
+            "severity": "info", "text": f"Harness CLI: {tool} {version} {status} (previous {previous})."}
     save_state(state)
     digest = verdict.get("binarySha256")
     write_record("promote", tool, version, status, binarySha256=digest,
@@ -847,7 +1134,15 @@ def latest_canary(tool: str, version: str) -> dict | None:
         else (canary_body.get("memoryPipelineRan") or canary_body.get("memoryPromptSeen")
               or (canary_body.get("cu") or {}).get("memoryPipelineRan")
               or (canary_body.get("cu") or {}).get("memoryPromptSeen")))
-    passed = found.get("result") == "passed" and not found.get("reasons") and memory_ok
+    if tool == "claude":
+        checks_ok = (canary_body.get("thinkingCheckChecked") is True
+                     and canary_body.get("thinkingReplayed") is True
+                     and canary_body.get("inputTransformationsEmpty") is True)
+    else:
+        checks_ok = ((canary_body.get("cu") or {}).get("memoryCanaryChecked") is True
+                     and canary_body.get("positiveControlFired") is True
+                     and (canary_body.get("cu") or {}).get("positiveControlFired") is True)
+    passed = found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
     return {
         "passed": passed,
         "binarySha256": found.get("binarySha256"),
@@ -859,38 +1154,15 @@ def latest_canary(tool: str, version: str) -> dict | None:
 
 def rotate_codex(*, when_idle: bool = True, quiet_seconds: int = 300, checker=None, refresher=None,
                  sleep=time.sleep, clock=time.monotonic, max_wait_seconds: int = 1800) -> str:
-    """Rotate the shared Codex app-server onto the promoted binary, but only when all of these hold.
-
-    1. Codex is actually pending a rotation.
-    2. Abdullah's standing OK is recorded (autoRotateCodex). This applies to every call, with or
-       without --when-idle, so omitting a flag can never bypass it.
-    3. The recovery snapshot is valid and shows no busy Codex thread for quiet_seconds.
-    """
+    """Leave rotation pending until both shared runtimes can be safely recreated and verified."""
     state = load_state()
     if not state["codex"].get("rotationPending"):
         return "no Codex rotation pending"
     if state.get("autoRotateCodex") is not True:
         return "autoRotateCodex is off; Codex rotates only at the next Robob release (standing OK not recorded)"
-    checker = checker or idle_snapshot
-    try:
-        idle_since = wait_for_idle(checker, quiet_seconds, sleep=sleep, clock=clock,
-                                   max_wait_seconds=max_wait_seconds)
-    except HarnessError as exc:
-        return str(exc)
-    refresher = refresher or refresh_codex_provider
-    try:
-        refresher()
-    except HarnessError as exc:
-        write_record("rotate-codex", "codex", state["codex"].get("current"), f"failed: {exc}")
-        return str(exc)
-    state["codex"]["rotationPending"] = False
-    state["codex"]["rotatedAt"] = now_iso()
-    save_state(state)
-    write_record("rotate-codex", "codex", state["codex"].get("current"), "rotated",
-                 idleSince=idle_since, harnessHomes=harness_home_hashes())
-    return "Codex app-server refreshed onto the current binary"
-
-
+    # Refreshing a provider snapshot is not a runtime drain/recreation. Do not touch either
+    # instance until both runtimes can be recreated and their launched versions verified.
+    return "Codex runtime rotation is unsupported for codex and codex-cu; rotation remains pending"
 def idle_snapshot() -> dict:
     """GET the recovery snapshot (card E7). Absent route = refuse to rotate."""
     token = control_token()
@@ -919,6 +1191,7 @@ def control_token() -> str:
 
 
 SNAPSHOT_THREAD_FIELDS = ("threadId", "provider", "runningRun", "heldWork", "pendingRequest")
+SNAPSHOT_PROVIDERS = {"codex", "codex-cu", "claudeagent", "opencode", "cursor", "grok", "antigravity", "pi", "muse"}
 
 
 def codex_busy(snapshot: dict) -> bool:
@@ -935,10 +1208,18 @@ def codex_busy(snapshot: dict) -> bool:
     for thread in snapshot["threads"]:
         if not isinstance(thread, dict) or any(f not in thread for f in SNAPSHOT_THREAD_FIELDS):
             raise HarnessError("recovery snapshot thread is missing required fields; not rotating")
-        provider = str(thread.get("provider") or "").lower()
-        if not provider.startswith("codex"):
+        identity, provider = thread["threadId"], thread["provider"]
+        if not isinstance(identity, str) or not identity.strip():
+            raise HarnessError("recovery snapshot has invalid thread identity; not rotating")
+        if not isinstance(provider, str) or provider.lower() not in SNAPSHOT_PROVIDERS:
+            raise HarnessError("recovery snapshot has invalid provider identity; not rotating")
+        if (thread["runningRun"] is not None and not isinstance(thread["runningRun"], dict)
+                or type(thread["heldWork"]) is not bool
+                or thread["pendingRequest"] is not None and not isinstance(thread["pendingRequest"], dict)):
+            raise HarnessError("recovery snapshot has invalid work fields; not rotating")
+        if provider.lower() not in ("codex", "codex-cu"):
             continue
-        if thread.get("runningRun") or thread.get("heldWork") or thread.get("pendingRequest"):
+        if thread["runningRun"] is not None or thread["heldWork"] or thread["pendingRequest"] is not None:
             busy = True
     return busy
 
@@ -1069,7 +1350,7 @@ def refresh_codex_provider(instance_id: str = "codex") -> None:
 
     Same framing as catalog-guard's client: a Request frame with the bearer token; the reply is an
     Exit frame. Only Codex instance ids are accepted, and only a Success Exit counts as refreshed.
-    No restart happens here: Robob re-probes the instance and the shared app-server rotates.
+    This re-probes a snapshot only; it does not rotate the shared app-server.
     """
     import json as _json
     if instance_id not in CODEX_INSTANCE_IDS:
@@ -1135,6 +1416,7 @@ def auto(*, dry: bool = False) -> dict:
     not). When Codex is pending and Abdullah's standing OK is recorded, it also tries the gated
     rotation; rotate_codex enforces the OK and the idle snapshot itself.
     """
+    retry_pending_notices()
     report: dict = {"discover": discover()}
     outcome: dict = {}
     for tool in TOOLS:
@@ -1154,10 +1436,9 @@ def auto(*, dry: bool = False) -> dict:
                             f"Harness CLI canary failed: {tool} {candidate}. "
                             f"{'; '.join(verdict['reasons'])}. Current pin unchanged.")
                 continue
-            promoted = promote(tool, candidate)
+            promoted = promote(tool, candidate, queue_notice=True)
             outcome[tool] = promoted["status"]
-            notify_once(f"{key}:promoted", "info",
-                        f"Harness CLI: {tool} {candidate} {promoted['status']} (previous {promoted['previous']}).")
+            retry_pending_notices()
         except HarnessError as exc:
             outcome[tool] = f"stopped: {exc}"
             notify_once(f"{key}:stopped", "error", f"Harness CLI job stopped for {tool} {candidate}: {exc}")
@@ -1168,12 +1449,25 @@ def auto(*, dry: bool = False) -> dict:
 
 
 def notify_once(key: str, severity: str, text: str) -> None:
-    """Send one notice per key. A key is recorded only after the Telegram CLI accepts it, so a
-    failed send is retried on the next run instead of being marked sent."""
+    """Persist before attempting delivery, and retain failures for the next run."""
     if notified_before(key):
         return
-    if notify(key, severity, text):
-        append_record({"at": now_iso(), "action": "notify", "notifyKey": key, "text": text, "result": "sent"})
+    state = load_state()
+    state.setdefault("pendingNotices", {}).setdefault(key, {"severity": severity, "text": text})
+    save_state(state)
+    retry_pending_notices()
+
+
+def retry_pending_notices() -> None:
+    state = load_state()
+    pending = state.setdefault("pendingNotices", {})
+    for key, notice in list(pending.items()):
+        if notified_before(key) or notify(key, notice["severity"], notice["text"]):
+            if not notified_before(key):
+                append_record({"at": now_iso(), "action": "notify", "notifyKey": key,
+                               "text": notice["text"], "result": "sent"})
+            del pending[key]
+            save_state(state)
 
 
 def before_release() -> dict:

@@ -93,11 +93,19 @@ class FakeCliTestCase(unittest.TestCase):
         })
         self.env_patch.start()
         (self.tmp / "home").mkdir()
+        # Fake CLIs do not use Keychain; never mutate the host Keychain during tests.
+        def fake_home(home):
+            keychain = home / "Library" / "Keychains" / "login.keychain-db"
+            keychain.parent.mkdir(parents=True, exist_ok=True)
+            keychain.touch()
+        self.home_patch = mock.patch.object(hc, "prepare_isolated_home", side_effect=fake_home)
+        self.home_patch.start()
         self.write_fake_npm()
         self.write_notify_stub()
         self.write_plist()
 
     def tearDown(self) -> None:
+        self.home_patch.stop()
         self.env_patch.stop()
         # Staged version trees are read-only; restore write bits so the sandbox always goes.
         for dirpath, dirs, files in os.walk(self.tmp):
@@ -152,34 +160,51 @@ class FakeCliTestCase(unittest.TestCase):
         }), encoding="utf-8")
 
     def fake_claude_binary(self, version: str, body_extra: str = "") -> bytes:
-        """A stand-in for the native binary: prints its version and, per prompt, posts one request
-        through ANTHROPIC_BASE_URL (the recording proxy) like the real CLI does, then answers OK."""
-        post = (
-            'python3 -c "import urllib.request,sys;'
-            "urllib.request.urlopen(urllib.request.Request(sys.argv[1],"
-            "data=b'{\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Reply exactly OK.\\\"}]}',"
-            "method='POST'),timeout=30).read()\" \"$ANTHROPIC_BASE_URL/v1/messages\" >/dev/null 2>&1 || true\n"
-        )
-        return (
-            "#!/bin/sh\n"
-            f'if [ "$1" = "--version" ]; then echo "{version} (Claude Code)"; exit 0; fi\n'
-            f"{post}{body_extra}"
-            'echo "OK"\n'
-        ).encode()
+        script = r'''#!/opt/homebrew/bin/python3
+import json, os, sys, urllib.request
+from pathlib import Path
+if "--version" in sys.argv:
+    print("VERSION (Claude Code)"); sys.exit(0)
+settings = json.loads((Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json").read_text())
+base = settings["env"]["ANTHROPIC_BASE_URL"]
+session = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "fake-session.json"
+messages = [{"role": "user", "content": "hello"}]
+if "--resume" in sys.argv and session.exists():
+    messages.append({"role": "assistant", "content": [json.loads(session.read_text())]})
+if LEAK:
+    messages.append({"role": "user", "content": "ROBOB-MEMCANARY-7f3a91"})
+body = {"messages": messages, "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
+req = urllib.request.Request(base + "/v1/messages", data=json.dumps(body).encode(),
+                             headers={"content-type": "application/json", "anthropic-beta": "context-management-test"})
+response = json.loads(urllib.request.urlopen(req, timeout=10).read())
+if "--session-id" in sys.argv:
+    session.write_text(json.dumps(response["content"][0]))
+print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
+'''
+        return script.replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode()
 
     def fake_codex_binary(self, version: str, body_extra: str = "") -> bytes:
-        post = (
-            'python3 -c "import urllib.request,sys;'
-            "urllib.request.urlopen(urllib.request.Request(sys.argv[1],"
-            "data=b'{\\\"input\\\":\\\"Reply exactly OK.\\\"}',method='POST'),timeout=30).read()\""
-            ' "$NINEROUTER_BASE/v1/responses" >/dev/null 2>&1 || true\n'
-        )
-        return (
-            "#!/bin/sh\n"
-            f'if [ "$1" = "--version" ]; then echo "codex-cli {version}"; exit 0; fi\n'
-            f"{post}{body_extra}"
-            'echo "OK"\n'
-        ).encode()
+        script = r'''#!/opt/homebrew/bin/python3
+import json, os, sys, tomllib, urllib.request
+from pathlib import Path
+if "--version" in sys.argv:
+    print("codex-cli VERSION"); sys.exit(0)
+home = Path(os.environ["CODEX_HOME"])
+config = tomllib.loads((home / "config.toml").read_text())
+assert "--ephemeral" not in sys.argv
+assert list((home / "sessions").rglob("rollout-*.jsonl"))
+if "gpt-6.1-terra" in sys.argv:
+    assert config.get("model") == "gpt-6.1-terra"
+    assert config.get("features", {}).get("computer_use") is True
+    assert config.get("model_context_window") == 1050000
+    assert (home / "models.json").is_file() and (home / "AGENTS.md").is_file()
+if config.get("features", {}).get("memories") or LEAK:
+    (home / "memories").mkdir(exist_ok=True)
+req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=b'{"input":"hello"}', method="POST")
+urllib.request.urlopen(req, timeout=10).read()
+print("OK")
+'''
+        return script.replace("VERSION", version).replace("LEAK", str(bool(body_extra))).encode()
 
     def package_tgz(self, name: str, tool: str, version: str, binary: bytes) -> Path:
         path = self.tmp / f"{name}.tgz"
@@ -269,10 +294,13 @@ class PromoteRollbackTests(FakeCliTestCase):
         (bin_dir / name).chmod(0o555)
 
     def record_canary(self, tool: str, version: str, *, passed: bool = True, memory_ok: bool = True) -> None:
-        canary = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": not memory_ok} if tool == "claude"
-                  else {"memoryCanaryChecked": True, "memoryPipelineRan": not memory_ok})
+        canary = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": not memory_ok,
+                   "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True}
+                  if tool == "claude" else {"memoryCanaryChecked": True, "memoryPipelineRan": not memory_ok,
+                    "positiveControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+        binary = self.root / tool / version / "bin" / tool
         hc.write_record("canary", tool, version, "passed" if passed else "failed",
-                        binarySha256="deadbeef", canary=canary)
+                        binarySha256=hc.sha256_file(binary), canary=canary)
 
     def test_promote_swaps_current_and_records_last_known_good(self) -> None:
         self.install_version("claude", "2.1.316")
@@ -341,7 +369,9 @@ class CodexRotationTests(FakeCliTestCase):
 
     def record_codex_canary(self, version: str) -> None:
         hc.write_record("canary", "codex", version, "passed",
-                        binarySha256="cafe", canary={"memoryCanaryChecked": True, "memoryPipelineRan": False})
+                        binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
+                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
+                                "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
 
     def test_codex_promote_leaves_rotation_pending(self) -> None:
         self.install_codex("0.166.0")
@@ -359,7 +389,7 @@ class CodexRotationTests(FakeCliTestCase):
         self.assertIn("autoRotateCodex is off", msg)
         refresh.assert_not_called()
 
-    def test_codex_never_rotated_while_busy(self) -> None:
+    def test_codex_rotation_unsupported_even_while_busy(self) -> None:
         self.install_codex("0.166.0")
         self.record_codex_canary("0.166.0")
         hc.promote("codex", "0.166.0")
@@ -381,10 +411,10 @@ class CodexRotationTests(FakeCliTestCase):
                               refresher=refresh, sleep=fake_sleep, clock=fake_clock,
                               max_wait_seconds=900)
         refresh.assert_not_called()
-        self.assertIn("rotation skipped", msg)
+        self.assertIn("unsupported", msg)
         self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
-    def test_codex_rotation_skipped_when_route_missing(self) -> None:
+    def test_codex_rotation_unsupported_without_contacting_snapshot(self) -> None:
         self.install_codex("0.166.0")
         self.record_codex_canary("0.166.0")
         hc.promote("codex", "0.166.0")
@@ -397,10 +427,10 @@ class CodexRotationTests(FakeCliTestCase):
 
         refresh = mock.Mock()
         msg = hc.rotate_codex(when_idle=True, checker=missing, refresher=refresh, quiet_seconds=0)
-        self.assertIn("route is missing", msg)
+        self.assertIn("unsupported", msg)
         refresh.assert_not_called()
 
-    def test_codex_rotates_after_quiet_window_with_standing_ok(self) -> None:
+    def test_codex_stays_pending_with_standing_ok(self) -> None:
         self.install_codex("0.166.0")
         self.record_codex_canary("0.166.0")
         hc.promote("codex", "0.166.0")
@@ -409,9 +439,9 @@ class CodexRotationTests(FakeCliTestCase):
         hc.save_state(state)
         refresh = mock.Mock()
         msg = hc.rotate_codex(when_idle=True, checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
-        refresh.assert_called_once()
-        self.assertIn("refreshed", msg)
-        self.assertFalse(hc.load_state()["codex"]["rotationPending"])
+        refresh.assert_not_called()
+        self.assertIn("unsupported", msg)
+        self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
     def test_claude_promote_never_needs_rotation(self) -> None:
         self.install_version_claude()
@@ -427,8 +457,10 @@ class CodexRotationTests(FakeCliTestCase):
         (bin_dir / "claude").chmod(0o555)
 
     def record_claude(self) -> None:
-        hc.write_record("canary", "claude", "2.1.316", "passed", binarySha256="ab",
-                        canary={"memoryCanaryChecked": True, "memoryCanaryLeaked": False})
+        hc.write_record("canary", "claude", "2.1.316", "passed",
+                        binarySha256=hc.sha256_file(self.root / "claude" / "2.1.316" / "bin" / "claude"),
+                        canary={"memoryCanaryChecked": True, "memoryCanaryLeaked": False,
+                                "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True})
 
 
 class CanaryTests(FakeCliTestCase):
@@ -449,6 +481,26 @@ class CanaryTests(FakeCliTestCase):
         (self.skills / "SKILL.md").write_text("---\nname: alpha\ndescription: t\n---\nbody\n", encoding="utf-8")
         self.manifest_home = self.homes_pkg / "manifest.json"
         self.proxy_hits = []
+        import http.server
+        import threading
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", "0")))
+                body = json.dumps({"content": [{"type": "thinking", "thinking": "thinking", "signature": "sig"},
+                                                {"type": "text", "text": "OK"}], "input_transformations": []}).encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        self.upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.router_patch = mock.patch.dict(os.environ, {"HARNESS_CLI_9ROUTER": f"http://127.0.0.1:{self.upstream.server_address[1]}"})
+        self.router_patch.start()
+        self.addCleanup(self.router_patch.stop)
 
     def install_binary(self, tool: str, version: str, body: bytes) -> Path:
         bin_dir = self.root / tool / version / "bin"
@@ -464,6 +516,50 @@ class CanaryTests(FakeCliTestCase):
         self.install_binary("claude", "2.1.316", body)
         verdict = self.run_canary("claude", "2.1.316", fake_proxy_body=None)
         self.assertTrue(verdict["passed"], verdict)
+        self.assertEqual(verdict["result"]["diagnostics"]["contextManagement"][0]["edits"][0]["type"],
+                         "clear_thinking_20251015")
+        self.assertTrue(any("context-management-test" in beta and "thinking-binding-controls-2026-08-01" in beta
+                            for beta in verdict["result"]["diagnostics"]["anthropicBeta"]))
+
+    def test_dropped_thinking_blocks_promotion(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(
+            b'if "--resume" in sys.argv and session.exists():', b'if False:')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(any("preserved thinking" in r for r in verdict["reasons"]))
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
+
+    def test_transformed_or_unreported_thinking_response_fails_closed(self) -> None:
+        first = [{"response_thinking": [{"thinking": "t", "signature": "s"}]}]
+        request = {"body": {"messages": [{"role": "assistant", "content":
+                    [{"type": "thinking", "thinking": "t", "signature": "s"}]}]}}
+        for reported in ([], [[{"type": "dropped_thinking"}]]):
+            result = hc.thinking_replay_check(first, [{**request, "response_transformations": reported}])
+            self.assertFalse(result["inputTransformationsEmpty"])
+        result = hc.thinking_replay_check(first, [{**request, "response_transformations": [[]]}])
+        self.assertTrue(result["thinkingReplayed"] and result["inputTransformationsEmpty"])
+        other = {"body": {"messages": []}, "response_transformations": [[]]}
+        result = hc.thinking_replay_check(first, [request, other])
+        self.assertFalse(result["inputTransformationsEmpty"])
+        result = hc.thinking_replay_check(first, [{**request, "response_transformations": [[]]},
+                                                  {**request, "response_transformations": [[{"type": "dropped"}]]}])
+        self.assertFalse(result["inputTransformationsEmpty"])
+
+    def test_nested_tool_input_is_not_transformation_evidence(self) -> None:
+        record = {}
+        hc.Recorder("http://127.0.0.1", "dummy").capture_response(
+            b'{"content":[{"type":"tool_use","input":{"input_transformations":[]}}]}', record)
+        self.assertEqual(record["response_transformations"], [])
+
+    def test_codex_uses_generated_cu_home_and_memory_positive_control(self) -> None:
+        self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertTrue(verdict["passed"], verdict)
+        self.assertTrue(verdict["result"]["positiveControlFired"])
+        self.assertTrue(verdict["result"]["cu"]["positiveControlFired"])
+        self.assertTrue(verdict["result"]["cu"]["models"]["gpt-6.1-terra"]["ok"])
 
     def test_canary_fails_when_claude_request_body_contains_memory_canary(self) -> None:
         # A fake CLI that echoes the memory canary into its outgoing request body, as built-in memory would.
@@ -529,9 +625,12 @@ class CanaryTests(FakeCliTestCase):
 def passing_canary(tool: str, version: str) -> dict:
     """Stands in for canary(): writes the same durable record the real canary writes, so promote()
     checks what it would check in production (a passing record with the memory-off result)."""
-    body = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": False} if tool == "claude"
-            else {"memoryCanaryChecked": True, "memoryPipelineRan": False})
-    hc.write_record("canary", tool, version, "passed", binarySha256="ab", canary=body)
+    body = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
+             "thinkingReplayed": True, "inputTransformationsEmpty": True} if tool == "claude"
+            else {"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
+                  "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+    binary = hc.version_dir(tool, version) / "bin" / tool
+    hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body)
     return {"passed": True, "reasons": [], "result": body}
 
 
@@ -723,8 +822,10 @@ class RotationGateTests(FakeCliTestCase):
 
     def pend(self, version: str = "0.166.0") -> None:
         self.install_codex(version)
-        hc.write_record("canary", "codex", version, "passed", binarySha256="x",
-                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False})
+        hc.write_record("canary", "codex", version, "passed",
+                        binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
+                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False,
+                                "positiveControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
         hc.promote("codex", version)
 
     def test_rotation_refused_without_standing_ok_even_without_when_idle_flag(self) -> None:
@@ -734,7 +835,7 @@ class RotationGateTests(FakeCliTestCase):
         self.assertIn("autoRotateCodex is off", msg)
         refresh.assert_not_called()
 
-    def test_empty_snapshot_fails_closed(self) -> None:
+    def test_unsupported_rotation_does_not_query_snapshot(self) -> None:
         self.pend()
         state = hc.load_state()
         state["autoRotateCodex"] = True
@@ -742,32 +843,42 @@ class RotationGateTests(FakeCliTestCase):
         refresh = mock.Mock()
         msg = hc.rotate_codex(checker=lambda: {}, refresher=refresh, quiet_seconds=0)
         refresh.assert_not_called()
-        self.assertIn("not rotating", msg)
+        self.assertIn("unsupported", msg)
         self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
     def test_thread_missing_fields_fails_closed(self) -> None:
         with self.assertRaises(hc.HarnessError):
             hc.codex_busy({"threads": [{"provider": "codex"}]})
 
-    def test_rotation_with_standing_ok_and_idle_calls_refresh_and_clears_pending(self) -> None:
+    def test_unknown_provider_or_invalid_work_fields_fail_closed(self) -> None:
+        row = {"threadId": "t", "provider": "codex", "runningRun": None,
+               "heldWork": False, "pendingRequest": None}
+        for changes in ({"provider": None, "runningRun": {"id": "r"}},
+                        {"provider": "codex-unknown"}, {"heldWork": "false"},
+                        {"threadId": ""}, {"pendingRequest": []}):
+            with self.subTest(changes=changes), self.assertRaises(hc.HarnessError):
+                hc.codex_busy({"threads": [{**row, **changes}]})
+
+    def test_rotation_does_not_refresh_or_clear_pending(self) -> None:
         self.pend()
         state = hc.load_state()
         state["autoRotateCodex"] = True
         hc.save_state(state)
         refresh = mock.Mock()
         msg = hc.rotate_codex(checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
-        refresh.assert_called_once()
-        self.assertIn("refreshed", msg)
-        self.assertFalse(hc.load_state()["codex"]["rotationPending"])
+        refresh.assert_not_called()
+        self.assertIn("unsupported", msg)
+        self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
-    def test_failed_refresh_keeps_rotation_pending(self) -> None:
+    def test_rotation_never_calls_refresher(self) -> None:
         self.pend()
         state = hc.load_state()
         state["autoRotateCodex"] = True
         hc.save_state(state)
         refresh = mock.Mock(side_effect=hc.HarnessError("server.refreshProviders failed: Failure"))
         msg = hc.rotate_codex(checker=lambda: {"threads": []}, refresher=refresh, quiet_seconds=0)
-        self.assertIn("refreshProviders failed", msg)
+        self.assertIn("unsupported", msg)
+        refresh.assert_not_called()
         self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
     def test_auto_drives_codex_rotation_when_standing_ok_recorded(self) -> None:
@@ -775,10 +886,11 @@ class RotationGateTests(FakeCliTestCase):
         state = hc.load_state()
         state["autoRotateCodex"] = True
         hc.save_state(state)
-        with mock.patch.object(hc, "rotate_codex", return_value="Codex app-server refreshed onto the current binary") as rot:
+        with mock.patch.object(hc, "rotate_codex", return_value="unsupported" ) as rot, \
+             mock.patch.object(hc, "discover", return_value={}):
             report = hc.auto()
         rot.assert_called_once()
-        self.assertEqual(report["codexRotation"], "Codex app-server refreshed onto the current binary")
+        self.assertEqual(report["codexRotation"], "unsupported")
 
 
 class ManifestLocationTests(FakeCliTestCase):
@@ -835,6 +947,38 @@ class StatusAndNotifyTests(FakeCliTestCase):
         hc.notify_once("harness-cli:claude:9.9.9", "info", "hello")
         hc.notify_once("harness-cli:claude:9.9.9", "info", "hello")
         self.assertEqual(self.notify_log.read_text(encoding="utf-8").count("harness-cli:claude:9.9.9"), 1)
+
+    def test_failed_notice_retries_without_candidate_discovery(self) -> None:
+        with mock.patch.object(hc, "notify", side_effect=[False, False, True]) as send:
+            hc.notify_once("key", "info", "exact text")
+            hc.retry_pending_notices()
+            self.assertIn("key", hc.load_state()["pendingNotices"])
+            with mock.patch.object(hc, "discover", return_value={}):
+                hc.auto()
+            self.assertNotIn("key", hc.load_state()["pendingNotices"])
+            self.assertEqual(send.call_args_list[-1].args, ("key", "info", "exact text"))
+
+    def test_cli_rejects_home_without_keychain(self) -> None:
+        with mock.patch.object(hc.sys, "platform", "darwin"):
+            with self.assertRaises(hc.HarnessError):
+                hc.run_cli(Path("/not/executed"), [], env={"HOME": str(self.tmp / "missing")})
+
+    def test_prepare_home_creates_keychain_before_spawn(self) -> None:
+        self.home_patch.stop()
+        home = self.tmp / "isolated"
+        keychain = home / "Library" / "Keychains" / "login.keychain-db"
+        def create(cmd, **kwargs):
+            self.assertEqual(kwargs["env"]["HOME"], str(home))
+            self.assertEqual(cmd[-1], str(keychain))
+            keychain.touch()
+            return subprocess.CompletedProcess(cmd, 0)
+        try:
+            with mock.patch.object(hc.sys, "platform", "darwin"), \
+                 mock.patch.object(hc.subprocess, "run", side_effect=create):
+                hc.prepare_isolated_home(home)
+                hc.require_isolated_home({"HOME": str(home)})
+        finally:
+            self.home_patch.start()
 
 
 if __name__ == "__main__":
