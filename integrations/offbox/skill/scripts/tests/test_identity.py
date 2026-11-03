@@ -15,7 +15,8 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import common, identity  # noqa: E402
+from offbox_lib import bases, capacity, common, identity, lease, misc, pool  # noqa: E402
+from offbox_lib.common import OffboxError  # noqa: E402
 
 PARENT = "thread-parent"
 CHILD = "thread-child"
@@ -256,6 +257,125 @@ class IdentityTests(unittest.TestCase):
         with patch.dict(os.environ, {"OFFBOX_ROBOB_THREAD": "stale-from-shell"}):
             unresolved = localfirst.local_env(Args(), "run-x", "/nonexistent", None, {"robobThreadId": None})
         self.assertNotIn("OFFBOX_ROBOB_THREAD", unresolved)
+
+
+class SharedSessionOwnerTests(unittest.TestCase):
+    """A Claude parent and two children share one session id. Their owner strings are the same, so they must not
+    select, reuse, release or exempt each other's leases. Each check runs the real selector against a real row."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.repo = str(root)
+        self.stub = StubControl()
+        self.addCleanup(self.stub.close)
+        cfg_dir = root / "home/.robob/components"
+        cfg_dir.mkdir(parents=True)
+        cfg = cfg_dir / "offbox.json"
+        cfg.write_text(json.dumps({"url": self.stub.url, "token": "test-token"}))
+        cfg.chmod(0o600)
+        self.stack = [
+            patch.object(common, "STATE", root / "STATE"),
+            patch.object(common, "DB_PATH", root / "db.sqlite"),
+            patch.object(common, "LOG_PATH", root / "log"),
+            patch.object(common, "LOCKS_DIR", root / "locks"),
+            patch.object(common, "EXEMPTIONS", root / "exemptions.json"),
+            # misc and lease hold their own references to these names, so each one is pointed at the temp dir too.
+            patch.object(misc, "EXEMPTIONS", root / "exemptions.json"),
+            patch.object(misc, "CAP_PATH", root / "cap.json"),
+            patch.object(identity, "CTL_CFGS", (cfg, root / "none.json")),
+            patch.object(identity, "repo_root", return_value=root),
+            patch.object(identity, "repo_key", return_value="repo"),
+        ]
+        for p in self.stack:
+            p.start()
+            self.addCleanup(p.stop)
+        (root / "locks").mkdir(exist_ok=True)
+        self.envp = patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                            if k not in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                                                         "CODEX_SESSION_ID", "OPENCODE_SESSION_ID",
+                                                         "OFFBOX_THREAD")}, clear=True)
+        self.envp.start()
+        self.addCleanup(self.envp.stop)
+        # The Claude session resolves (C1 answers the parent's identity). Both children and the parent see that answer.
+        self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(OTHER)
+
+    def claude_caller(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": CLAUDE_UUID}):
+            return identity.whoami(self.repo)
+
+    def seed_rows(self):
+        """A lease the parent's own resolved thread holds, and a legacy row under the old shared owner string."""
+        con = common.db()
+        capacity.schema(con)
+        legacy_owner = f"unresolved:claudeAgent:{CLAUDE_UUID}"
+        con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, state, created_at, "
+                    "last_used_at) VALUES ('box-resolved', ?, ?, 'repo', 'w/r', 'running', 1, 1)", (OTHER, self.repo))
+        con.execute("INSERT INTO leases (box_id, owner, repo_root, repo_key, remote_dir, state, created_at, "
+                    "last_used_at) VALUES ('box-legacy', ?, ?, 'repo', 'w/l', 'running', 1, 1)",
+                    (legacy_owner, self.repo))
+        con.execute("INSERT INTO pool_callers (owner, repo_root, box_id, remote_dir) VALUES (?, ?, 'box-legacy', 'w/l')",
+                    (legacy_owner, self.repo))
+        con.commit()
+        return con
+
+    def lease_state(self):
+        con = common.db()
+        return sorted(tuple(r) for r in con.execute("SELECT box_id, owner, state FROM leases ORDER BY box_id"))
+
+    def test_claude_parent_and_children_are_all_unproven(self):
+        # Three callers, one session: none may be treated as proven, and all share the same display owner.
+        parent = self.claude_caller()
+        child_a = self.claude_caller()
+        child_b = self.claude_caller()
+        for me in (parent, child_a, child_b):
+            self.assertFalse(me["proven"], me)
+            self.assertIsNone(me["thread"])
+            self.assertEqual(me["owner"], f"unresolved:claudeAgent:{CLAUDE_UUID}")
+
+    def test_every_claude_selector_refuses_and_changes_nothing(self):
+        self.seed_rows()
+        before = self.lease_state()
+        me = self.claude_caller()
+        cases = {
+            "release --mine": lambda: misc.release(me, None, True, False),
+            "release by id": lambda: misc.release(me, "box-legacy", False, False),
+            "release (own lease)": lambda: misc.release(me, None, False, False),
+            "list (own leases)": lambda: misc.list_leases(me, False, False),
+            "ssh/ports/keep (resolve_box)": lambda: misc.resolve_box(me, None),
+            "save/keep/base (caller lease)": lambda: bases._caller_lease(me),
+            "local exemption": lambda: misc.local_exempt(me, "a reason long enough to pass", "2h", False, False),
+            "run (acquire_private)": lambda: lease.acquire_private(me),
+            "run (pooled acquire)": lambda: pool.acquire(me),
+        }
+        for label, call in cases.items():
+            with self.subTest(selector=label), self.assertRaises(OffboxError) as refused:
+                call()
+            self.assertIn("can't be proven", str(refused.exception))
+        self.assertEqual(self.lease_state(), before, "a refused selector must not change any lease")
+        self.assertFalse((Path(self.tmp.name) / "exemptions.json").exists(), "no exemption may be written")
+
+    def test_listing_every_lease_stays_read_only_for_an_unproven_caller(self):
+        # `list --all` selects no owner, so it is read-only and allowed. It must not change anything.
+        self.seed_rows()
+        me = self.claude_caller()
+        with patch("builtins.print"):
+            misc.list_leases(me, True, False)
+        self.assertEqual(len(self.lease_state()), 2)
+
+    def test_a_resolved_codex_caller_still_selects_its_own_lease(self):
+        # The positive control: the gate blocks only a caller that can't be proven.
+        con = self.seed_rows()
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(OTHER, driver="codex")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": CODEX_UUID}):
+            me = identity.whoami(self.repo)
+        self.assertTrue(me["proven"])
+        self.assertEqual(me["owner"], OTHER)
+        found = lease.find_lease(con, me["owner"], self.repo)
+        self.assertIsNotNone(found)
+        self.assertEqual(found["box_id"], "box-resolved")
+        self.assertNotEqual(found["box_id"], "box-legacy", "a resolved caller never sees the shared legacy row")
 
 
 if __name__ == "__main__":

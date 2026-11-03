@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .common import HOME, db, kv_get, kv_set, log, now
+from .common import HOME, OffboxError, db, kv_get, kv_set, log, now
 
 # offbox's own component credential first, the old shared file last.
 CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
@@ -285,11 +285,32 @@ def whoami(cwd: str | None = None) -> dict:
         if explicit is not None:
             me["thread"] = explicit
     me["owner"] = me["thread"] or f"local:{root}"
-    if driver not in (None, "opencode") and me["resolution"] != "resolved":
-        # Unresolved native callers get their own owner, never the shared repo-wide local one,
-        # so a pending child can't claim or release another caller's lease.
+    # `proven` says whether this call may take or change leases. An unresolved native caller is not proven: its
+    # owner string is shared by every process on its session (a Claude parent and its children), so acting under
+    # it could select or release a sibling's lease. OpenCode, plain shells and an explicit person owner are proven:
+    # the person owner is set by the wrapper on purpose, not by the agent's shell.
+    unproven_native = driver not in (None, "opencode") and me["resolution"] != "resolved"
+    explicit_person = (me["thread"] or "").startswith(PERSON_OWNER_PREFIX)
+    me["proven"] = not unproven_native or explicit_person
+    if unproven_native and not explicit_person:
+        # The owner string is kept for display only; nothing selects or writes by it (see require_proven).
         me["owner"] = f"unresolved:{driver}:{native}"
     return me
+
+
+def require_proven(me: dict, action: str) -> None:
+    """Refuse an identity-dependent action for a caller that isn't proven to be one execution.
+
+    The shared Claude session and a pending Codex thread can't be told apart from their siblings, so a lease they
+    would acquire, reuse, release or exempt is not theirs to act on. The refusal is explicit: a null or shared owner
+    must never reach a selector, where it would silently match nothing or the wrong caller's rows.
+    """
+    if not me.get("proven", True):
+        raise OffboxError(
+            f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
+            f"(resolution={me.get('resolution') or 'none'}). A Claude shell shares its session id with its native "
+            f"children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
+            f"a few seconds. Nothing was changed.", code=2)
 
 
 def remote_dir_for(root: Path | str) -> str:

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, lease, ssh_sync
+from .identity import require_proven
 from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError, ago,
                      db, event, file_lock, iso, iso_ts, kv_get, kv_set, new_id, now, say)
 
@@ -23,6 +24,8 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
 
 
 def _caller_lease(me: dict):
+    # save, keep and base act on the caller's own box, selected by owner: an unproven caller can't name one.
+    require_proven(me, "this box action")
     con = db()
     row = lease.find_lease(con, me["owner"], me["repo_root"])
     if not row:

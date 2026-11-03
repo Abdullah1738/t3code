@@ -14,6 +14,7 @@ from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
                      offsets_path, out, read_json, say, silence)
+from .identity import require_proven
 
 WAIT_POLL_S = 5
 # A lock-blocked waiter asks boat about the process this often, and once boat has said it ended for HOLDER_GRACE_S
@@ -32,6 +33,9 @@ def parse_ttl(s: str) -> int:
 
 
 def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear: bool) -> None:
+    # Listing is read-only. Adding or clearing an exemption writes a grant for a session id that the proof is about.
+    if not do_list:
+        require_proven(me, "local exemption")
     with file_lock("exemptions", timeout=30):
         cur = [e for e in read_json(EXEMPTIONS, []) if (e.get("expires_at") or 0) > now()]
         if do_list:
@@ -68,6 +72,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     if show_all:
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') ORDER BY last_used_at DESC").fetchall()
     else:
+        # The caller's own leases are selected by owner. An unproven caller's owner string is shared, so it sees none.
+        require_proven(me, "list")
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?)) ORDER BY last_used_at DESC",
                            (me['owner'], me['owner'])).fetchall()
@@ -89,6 +95,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
 
 
 def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
+    # An explicit box id still ends another caller's lease, so it is refused for an unproven caller too.
+    require_proven(me, "release")
     con = db()
     capacity.schema(con)
     if box_id:
@@ -179,6 +187,9 @@ def kill_run(run_id: str) -> int:
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:
+    # Every caller of resolve_box (ssh, ports, keep, save) is acting on a box. Without a box id, it selects the
+    # caller's own lease, so an unproven caller is refused before any lookup.
+    require_proven(me, "this box action")
     if box_id:
         return box_id
     con = db()
