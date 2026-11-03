@@ -7,7 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { evaluatorBrief, workBrief, type EvaluatorPurpose } from "./briefs.ts";
+import { evaluatorBrief, reviewBrief, workBrief, type EvaluatorPurpose } from "./briefs.ts";
 
 const model = { instanceId: ProviderInstanceId.make("opencode"), model: "example" };
 const board: KanbanBoard = {
@@ -94,6 +94,12 @@ describe("board briefs", () => {
   it("includes the review input-class instruction in the worker brief", () => {
     expect(workBrief(board, card, null)).toContain(
       "- Before card_move to needs_review, check what reviewers keep finding: list the sibling paths and call sites of what you changed (other entry points, clients, providers, the way back) and fix or name each; search skills, watchers and the wiki for rules your change contradicts; name any change needed outside the repo (live config, skills, deploys) in card_update. When a review finds one input form your code misses (a label, separator, date or number shape), write a table of that whole class, add a test row for each, and run them all before the next round.",
+    );
+  });
+
+  it("tells reviewers how to retry a lost verdict", () => {
+    expect(reviewBrief(board, card, null, null, [])).toContain(
+      "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
     );
   });
 });

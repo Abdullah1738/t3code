@@ -625,6 +625,156 @@ it.effect("a review event records the head the reviewer passed", () =>
   }),
 );
 
+const startReplayReview = Effect.gen(function* () {
+  const kanban = yield* KanbanService.KanbanService;
+  const board = yield* kanban.ensureBoard({
+    slug: "replay",
+    name: "Replay",
+    defaultProjectId: ProjectId.make("project-1"),
+  });
+  yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+  const card = yield* kanban.createCard(board.id, { prompt: "Review", title: "Review" }, owner);
+  yield* kanban.dispatchNow;
+  const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+  const worker: KanbanActor = { _tag: "thread", threadId: workThread };
+  yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+  yield* kanban.dispatchNow;
+  const reviewing = (yield* kanban.card(card.id)).card;
+  assert.strictEqual(reviewing.stage, "in_review");
+  assert.isNotNull(reviewing.activeThreadId);
+  assert.notStrictEqual(reviewing.activeThreadId, workThread);
+  return { kanban, card, worker, reviewThread: reviewing.activeThreadId! };
+});
+
+it.effect("ignores a repeated clear with the same normalized head", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      const first = yield* kanban.reviewResult(reviewThread, "clear", [], "abc1234");
+      const before = yield* kanban.card(card.id);
+      const sends = fake.sends.length;
+      const replay = yield* kanban.reviewResult(reviewThread, "clear", [], " ABC1234 ");
+      const after = yield* kanban.card(card.id);
+      assert.deepStrictEqual(replay, first);
+      assert.deepStrictEqual(after.card, before.card);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.strictEqual(after.card.stage, first.stage);
+      assert.strictEqual(after.card.reviewStep, first.reviewStep);
+      assert.strictEqual(after.card.reviewRound, first.reviewRound);
+      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 1);
+      assert.strictEqual(fake.sends.length, sends);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("ignores repeated findings without bumping the review round", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      const first = yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      const before = yield* kanban.card(card.id);
+      const replay = yield* kanban.reviewResult(reviewThread, "findings", [" Fee is wrong "], "abc1234");
+      const after = yield* kanban.card(card.id);
+      assert.strictEqual(first.reviewRound, 1);
+      assert.deepStrictEqual(replay, first);
+      assert.deepStrictEqual(after.card, before.card);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("rejects verdict replays that differ or lack a valid head", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      const before = yield* kanban.card(card.id);
+      const attempts = [
+        { verdict: "clear" as const, findings: [] as string[], head: "abc1234" },
+        { verdict: "findings" as const, findings: ["Fee is incorrect"], head: "abc1234" },
+        { verdict: "findings" as const, findings: ["Fee is wrong"], head: "def1234" },
+        { verdict: "findings" as const, findings: ["Fee is wrong"], head: undefined },
+        { verdict: "findings" as const, findings: ["Fee is wrong"], head: "invalid" },
+      ];
+      for (const attempt of attempts) {
+        const error = yield* kanban
+          .reviewResult(reviewThread, attempt.verdict, attempt.findings, attempt.head)
+          .pipe(Effect.flip);
+        assert.strictEqual(error.code, "conflict");
+        assert.strictEqual(error.detail, `card #${card.number} is not in review with this thread`);
+      }
+      const after = yield* kanban.card(card.id);
+      assert.deepStrictEqual(after.card, before.card);
+      assert.deepStrictEqual(after.events, before.events);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("rejects an old reviewer's replay after another thread records a review", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      yield* kanban.dispatchNow;
+      const workThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: workThread,
+      });
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, reviewThread);
+      yield* kanban.cardThread(card.id, "reset", "Fresh review", owner);
+      yield* kanban.dispatchNow;
+      const nextReview = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.notStrictEqual(nextReview, reviewThread);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "in_review");
+      yield* kanban.reviewResult(nextReview, "findings", ["Fee is wrong"], "abc1234");
+      const before = yield* kanban.card(card.id);
+      const error = yield* kanban
+        .reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234")
+        .pipe(Effect.flip);
+      assert.strictEqual(error.code, "conflict");
+      const after = yield* kanban.card(card.id);
+      assert.deepStrictEqual(after.card, before.card);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 2);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("records the same verdict normally when the review thread is live or late again", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, worker, reviewThread } = yield* startReplayReview;
+      yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      for (const late of [false, true]) {
+        yield* kanban.dispatchNow;
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(reviewing.activeThreadId, reviewThread);
+        if (late) {
+          yield* kanban.flagCard(card.id, "Needs attention", {
+            _tag: "thread",
+            threadId: reviewThread,
+          });
+        }
+        yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      }
+      const after = yield* kanban.card(card.id);
+      assert.strictEqual(after.card.reviewRound, 3);
+      assert.strictEqual(after.card.stalled?.reason, "Needs attention");
+      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 3);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("tells the card's evaluator to decide scope after the third findings round", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
