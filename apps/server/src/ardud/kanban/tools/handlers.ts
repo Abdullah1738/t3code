@@ -142,8 +142,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
     const board = yield* boardFor(service, caller);
-    const snapshot = yield* service.snapshot(board.id);
-    const card = snapshot.cards.find((candidate) => candidate.number === number);
+    const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
     return card;
   }
@@ -293,7 +292,11 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId);
-        return { board: yield* service.snapshot(board.id) };
+        const snapshot = yield* service.snapshot(board.id);
+        return {
+          board: { ...snapshot, cards: snapshot.cards.map((card) => ({ ...card, prompt: "" })) },
+          prompts: "omitted; card_get returns a card's prompt",
+        };
       }),
     ),
   ),
@@ -302,8 +305,8 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId);
-        const snapshot = yield* service.snapshot(board.id);
-        const found = snapshot.cards
+        const cards = yield* service.cards(board.id);
+        const found = cards
           .filter(
             (card) =>
               (input.includeSettled === true || card.settledAt === null) &&
@@ -478,7 +481,7 @@ const handlers = {
           input.afterSeq !== undefined ? { afterSeq: input.afterSeq } : undefined,
         );
         if (discussion.lastSeq > 0)
-          yield* service.markRead(discussion.id, caller.actor, discussion.lastSeq);
+          yield* service.markReadSoon(discussion.id, caller.actor, discussion.lastSeq);
         // Agents open attachments by path; the id alone is not enough to read the file.
         const withPaths = messages.map((message) => ({
           ...message,

@@ -8,9 +8,14 @@ import {
   type KanbanActor,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Path from "effect/Path";
+import * as SqlClient from "effect/sql/SqlClient";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
@@ -72,25 +77,29 @@ const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =
   );
 
 // Threads launch idle; `running` keeps a work thread's slot between cards.
-const fakeThreads = () => {
+const fakeThreads = (dbPath?: string) => {
   const running = new Set<string>();
   let launched = 0;
   const launches: Array<string> = [];
+  const views: Array<string> = [];
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
       view: (threadId) =>
-        Effect.succeed({
-          threadId,
-          projectId: ProjectId.make("project-1"),
-          title: "thread",
-          state: running.has(threadId) ? "running" : "idle",
-          updatedAt: "2026-10-26T08:00:00.000Z",
-          quietSince: "2026-10-26T08:00:00.000Z",
-          runStartedAt: null,
-          backgroundWork: 0,
-          prs: [],
-          archived: false,
+        Effect.sync(() => {
+          views.push(threadId);
+          return {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "thread",
+            state: running.has(threadId) ? "running" : "idle",
+            updatedAt: "2026-10-26T08:00:00.000Z",
+            quietSince: "2026-10-26T08:00:00.000Z",
+            runStartedAt: null,
+            backgroundWork: 0,
+            prs: [],
+            archived: false,
+          };
         }),
       find: () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
@@ -117,13 +126,13 @@ const fakeThreads = () => {
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
     Layer.provideMerge(KanbanStore.layer),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(dbPath ? Sqlite.layerFromPath(dbPath) : Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
-  return { running, launches, layer };
+  return { running, launches, views, layer };
 };
 
 const owner: KanbanActor = { _tag: "owner" };
@@ -189,6 +198,24 @@ it.effect(
       running.add(thread);
       const second = (yield* kanban.createForThread(thread, { prompt: "B", title: "B" })).card;
 
+      const cardByNumber = yield* call(thread, "card_get", { card: `#${second.number}` });
+      assert.isFalse(cardByNumber.isError, cardByNumber.text);
+      assert.strictEqual((cardByNumber.structured.card as { id: string }).id, second.id);
+      assert.strictEqual((cardByNumber.structured.card as { prompt: string }).prompt, "B");
+      const missing = yield* call(thread, "card_get", { card: "#99999" });
+      assert.isTrue(missing.isError);
+      assert.include(missing.text, "No card #99999 on Toy.");
+
+      const boardResult = yield* call(thread, "board_get", {});
+      assert.isFalse(boardResult.isError, boardResult.text);
+      assert.strictEqual(
+        boardResult.structured.prompts,
+        "omitted; card_get returns a card's prompt",
+      );
+      const snapshot = boardResult.structured.board as { cards: Array<{ prompt: string }> };
+      assert.lengthOf(snapshot.cards, 3);
+      assert.isTrue(snapshot.cards.every((card) => card.prompt === ""));
+
       const unnamed = yield* call(thread, "discussion_post", { text: "hi" });
       assert.isTrue(unnamed.isError);
       assert.include(unnamed.text, "Pass card or discussionId");
@@ -200,7 +227,9 @@ it.effect(
       assert.isFalse(posted.isError, posted.text);
       const discussion = yield* kanban.cardDiscussion(second.id);
       const read = yield* call(thread, "discussion_read", { card: String(second.number) });
+      assert.isFalse(read.isError, read.text);
       assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
+      assert.include(read.text, "Done with B");
 
       const theirs = yield* call(thread, "discussion_post", {
         card: `#${other.number}`,
@@ -210,6 +239,67 @@ it.effect(
       assert.include(theirs.text, `can't change card #${other.number}`);
     }).pipe(Effect.provide(layer));
   },
+);
+
+it.live("card and discussion tools answer while the SQLite writer is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-kanban-tools-reader-" });
+    const { layer, views } = fakeThreads(path.join(directory, "state.sqlite"));
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const sql = yield* SqlClient.SqlClient;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Reader packet", title: "Reader", description: "Reader" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.isNotNull(thread);
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(discussion.id, { _tag: "system", component: "test" }, [
+        { _tag: "md", text: "Read this" },
+      ]);
+      const viewsBeforeSearch = views.length;
+      const search = yield* call(thread, "card_search", { query: "Reader packet" });
+      assert.isFalse(search.isError, search.text);
+      assert.strictEqual(search.structured.total, 1);
+      assert.strictEqual(views.length, viewsBeforeSearch);
+      const writerHeld = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          Deferred.succeed(writerHeld, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        ),
+      );
+      yield* Deferred.await(writerHeld);
+      const reads = yield* Effect.all({
+        number: call(thread, "card_get", { card: `#${card.number}` }),
+        implicit: call(thread, "card_get", {}),
+        search: call(thread, "card_search", { query: "Reader packet" }),
+        discussion: call(thread, "discussion_read", { card: `#${card.number}` }),
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+      );
+      yield* Fiber.join(writer);
+      for (const result of Object.values(reads)) assert.isFalse(result.isError, result.text);
+      assert.strictEqual((reads.number.structured.card as { id: string }).id, card.id);
+      assert.strictEqual((reads.implicit.structured.card as { id: string }).id, card.id);
+      assert.strictEqual(reads.search.structured.total, 1);
+      assert.include(reads.discussion.text, "Read this");
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect("board_open gives a board its icon only while it has none", () => {

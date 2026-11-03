@@ -245,6 +245,13 @@ export interface KanbanServiceShape {
   >;
 
   readonly card: (cardId: KanbanCard["id"]) => Effect.Effect<CardDetail, KanbanError>;
+  readonly cardByNumber: (
+    boardId: KanbanBoard["id"],
+    number: number,
+  ) => Effect.Effect<KanbanCard | null, KanbanError>;
+  readonly cards: (
+    boardId: KanbanBoard["id"],
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
   readonly createCard: (
     boardId: KanbanBoard["id"],
     input: NewCard,
@@ -399,6 +406,11 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     seq: number,
   ) => Effect.Effect<void, KanbanError>;
+  readonly markReadSoon: (
+    discussionId: KanbanDiscussion["id"],
+    actor: KanbanActor,
+    seq: number,
+  ) => Effect.Effect<void>;
 
   readonly wiki: (
     boardId: KanbanBoard["id"],
@@ -5444,6 +5456,15 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const markReadSoon: KanbanServiceShape["markReadSoon"] = (discussionId, actor, seq) =>
+    markRead(discussionId, actor, seq).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban mark read failed", { discussionId, cause }),
+      ),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
     guard(
       Effect.gen(function* () {
@@ -5591,6 +5612,8 @@ const make = Effect.gen(function* () {
           } satisfies CardDetail;
         }),
       ),
+    cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
+    cards: (boardId) => readDb(store.cards(boardId)),
     createCard,
     editCard,
     moveCard,
@@ -5611,12 +5634,21 @@ const make = Effect.gen(function* () {
     discussion: (id) => readDb(discussionOf(id)),
     createDiscussion,
     updateDiscussion,
-    cardDiscussion: (cardId) => guard(cardDiscussionUnlocked(cardId)),
+    cardDiscussion: Effect.fn("KanbanService.cardDiscussion")(function* (cardId) {
+      const existing = yield* readDb(
+        Effect.gen(function* () {
+          const card = yield* cardOf(cardId);
+          return card.discussionId === null ? null : yield* store.discussion(card.discussionId);
+        }),
+      );
+      return existing ?? (yield* guard(cardDiscussionUnlocked(cardId)));
+    }),
     messages: (id, options) => readDb(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
+    markReadSoon,
     wiki: (boardId) => readDb(store.wiki(boardId)),
     writeWiki,
     endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
@@ -5662,10 +5694,10 @@ const make = Effect.gen(function* () {
           return yield* startEvaluatorUnlocked(board, purpose, { text });
         }),
       ),
-    caller: (threadId) => read(store.threadLink(threadId)),
-    carried: (threadId) => read(store.cardsByThread(threadId)),
+    caller: (threadId) => readDb(store.threadLink(threadId)),
+    carried: (threadId) => readDb(store.cardsByThread(threadId)),
     ownCards: (threadId) =>
-      read(
+      readDb(
         Effect.gen(function* () {
           const ids = yield* carriedIds(threadId);
           const cards = yield* Effect.forEach([...ids], (id) => store.card(KanbanCardId.make(id)));

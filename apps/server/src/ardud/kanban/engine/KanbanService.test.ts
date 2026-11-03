@@ -11,6 +11,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -18,6 +19,8 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KanbanDiscussionId,
+  KanbanCardId,
   KanbanScriptId,
   KANBAN_WS_METHODS as M,
   ProjectId,
@@ -253,6 +256,44 @@ const fileTestLayer = (fake: Layer.Layer<KanbanThreads>, dbPath: string) =>
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(KanbanStore.layer),
     Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(boardFilesLayer),
+  );
+
+const observedStoreLayer = (observe: (discussionId: KanbanDiscussionId) => Effect.Effect<void>) =>
+  Layer.effect(
+    KanbanStore.KanbanStore,
+    Effect.map(KanbanStore.KanbanStore, (real) =>
+      KanbanStore.KanbanStore.of({
+        ...real,
+        putDiscussion: (discussion) =>
+          real.putDiscussion(discussion).pipe(
+            Effect.tap(() =>
+              discussion.participants.some(
+                (participant) =>
+                  participant.actor._tag === "owner" &&
+                  discussion.lastSeq > 0 &&
+                  participant.lastReadSeq === discussion.lastSeq,
+              )
+                ? observe(discussion.id)
+                : Effect.void,
+            ),
+          ),
+      }),
+    ),
+  );
+
+const observedTestLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  observe: (discussionId: KanbanDiscussionId) => Effect.Effect<void>,
+) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(observedStoreLayer(observe).pipe(Layer.provide(KanbanStore.layer))),
+    Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
@@ -8357,4 +8398,247 @@ it.live("answers board reads while the SQLite writer is held", () =>
       assert.strictEqual(reads.card.card.id, created.id);
     }).pipe(Effect.provide(fileTestLayer(fake.layer, path.join(directory, "state.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("card lookups by number and an existing card discussion don't wait for the writer", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: "t3-kanban-card-reader-",
+    });
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const sql = yield* SqlClient.SqlClient;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Read me", title: "Reader", description: "Reader" },
+        owner,
+      );
+      const discussion = yield* kanban.cardDiscussion(created.id);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.isNotNull(thread);
+      const writerHeld = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          Deferred.succeed(writerHeld, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        ),
+      );
+      yield* Deferred.await(writerHeld);
+      const reads = yield* Effect.all({
+        card: kanban.cardByNumber(board.id, created.number),
+        cards: kanban.cards(board.id),
+        discussion: kanban.cardDiscussion(created.id),
+        caller: kanban.caller(thread),
+        carried: kanban.carried(thread),
+        ownCards: kanban.ownCards(thread),
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+      );
+      yield* Fiber.join(writer);
+      assert.strictEqual(reads.card?.id, created.id);
+      assert.isTrue(reads.cards.some((card) => card.id === created.id));
+      assert.strictEqual(reads.discussion.id, discussion.id);
+      assert.strictEqual(reads.caller?.cardId, created.id);
+      assert.isTrue(reads.carried.some((card) => card.id === created.id));
+      assert.isTrue(reads.ownCards.some((card) => card.id === created.id));
+    }).pipe(Effect.provide(fileTestLayer(fake.layer, path.join(directory, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("an existing discussion and deferred read don't wait for the board lock", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const lockHeld = yield* Deferred.make<void>();
+    const releaseLock = yield* Deferred.make<void>();
+    const marked = yield* Deferred.make<void>();
+    const blockedThreads = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            Deferred.succeed(lockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLock)),
+              Effect.andThen(threads.launch(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Lock test", title: "Lock test", description: "Lock test" },
+        owner,
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const message = yield* kanban.post(discussion.id, { _tag: "system", component: "test" }, [
+        { _tag: "md", text: "Hello" },
+      ]);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(lockHeld);
+      const read = yield* Effect.gen(function* () {
+        const existing = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.markReadSoon(discussion.id, owner, message.seq);
+        const current = yield* kanban.discussion(discussion.id);
+        return { existing, current };
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(Deferred.succeed(releaseLock, undefined)),
+      );
+      assert.strictEqual(read.existing.id, discussion.id);
+      assert.notStrictEqual(
+        read.current.participants.find((participant) => participant.actor._tag === "owner")
+          ?.lastReadSeq,
+        message.seq,
+      );
+      yield* Fiber.join(dispatch);
+      yield* Deferred.await(marked).pipe(Effect.timeout("5 seconds"));
+      const after = yield* kanban.discussion(discussion.id);
+      assert.strictEqual(
+        after.participants.find((participant) => participant.actor._tag === "owner")?.lastReadSeq,
+        message.seq,
+      );
+    }).pipe(
+      Effect.provide(
+        observedTestLayer(blockedThreads, () =>
+          Deferred.succeed(marked, undefined).pipe(Effect.asVoid),
+        ),
+      ),
+    );
+  }),
+);
+
+it.live("concurrent requests create a missing card discussion only once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const readPair = yield* Deferred.make<void>();
+    const releaseReads = yield* Deferred.make<void>();
+    let target: KanbanCardId | null = null;
+    let reads = 0;
+    const gatedStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          card: (cardId) =>
+            real.card(cardId).pipe(
+              Effect.flatMap((card) =>
+                cardId === target && card?.discussionId === null && reads < 2
+                  ? Effect.gen(function* () {
+                      reads += 1;
+                      if (reads === 2) yield* Deferred.succeed(readPair, undefined);
+                      yield* Deferred.await(releaseReads);
+                      return card;
+                    })
+                  : Effect.succeed(card),
+              ),
+            ),
+        }),
+      ),
+    );
+    const layer = KanbanService.layer.pipe(
+      Layer.provideMerge(fake.layer),
+      Layer.provideMerge(KanbanModels.layerTest(null)),
+      Layer.provideMerge(gatedStore.pipe(Layer.provide(KanbanStore.layer))),
+      Layer.provideMerge(Sqlite.layerMemory),
+      Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+      Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+      Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+      Layer.provideMerge(boardFilesLayer),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "A", description: "A" },
+        owner,
+      );
+      target = card.id;
+      const lookup = yield* Effect.forkChild(
+        Effect.all([kanban.cardDiscussion(card.id), kanban.cardDiscussion(card.id)], {
+          concurrency: "unbounded",
+        }),
+      );
+      yield* Deferred.await(readPair).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(Deferred.succeed(releaseReads, undefined)),
+      );
+      const discussions = yield* Fiber.join(lookup).pipe(Effect.timeout("5 seconds"));
+      assert.strictEqual(reads, 2);
+      assert.strictEqual(new Set(discussions.map((discussion) => discussion.id)).size, 1);
+      assert.strictEqual(
+        (yield* kanban.discussions(board.id)).filter((discussion) => discussion.cardId === card.id)
+          .length,
+        1,
+      );
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.live("markReadSoon records the read later", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const marked = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const discussion = yield* kanban.createDiscussion(board.id, "Read later", owner);
+      const message = yield* kanban.post(discussion.id, { _tag: "system", component: "test" }, [
+        { _tag: "md", text: "Hello" },
+      ]);
+      assert.notStrictEqual(
+        (yield* kanban.discussion(discussion.id)).participants.find(
+          (participant) => participant.actor._tag === "owner",
+        )?.lastReadSeq,
+        message.seq,
+      );
+      yield* kanban.markReadSoon(discussion.id, owner, message.seq);
+      yield* Deferred.await(marked).pipe(Effect.timeout("5 seconds"));
+      const current = yield* kanban.discussion(discussion.id);
+      assert.strictEqual(
+        current.participants.find((participant) => participant.actor._tag === "owner")?.lastReadSeq,
+        message.seq,
+      );
+    }).pipe(
+      Effect.provide(
+        observedTestLayer(fake.layer, () =>
+          Deferred.succeed(marked, undefined).pipe(Effect.asVoid),
+        ),
+      ),
+    );
+  }),
+);
+
+it.live("markReadSoon logs a failed read mark without failing the caller", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const logged = yield* Deferred.make<void>();
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      if (Array.isArray(message) && message.includes("kanban mark read failed")) {
+        Deferred.doneUnsafe(logged, Effect.void);
+      }
+    });
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      yield* kanban.markReadSoon(KanbanDiscussionId.make("disc-missing"), owner, 1);
+      yield* Deferred.await(logged).pipe(Effect.timeout("5 seconds"));
+    }).pipe(
+      Effect.provide(
+        Layer.merge(testLayer(fake.layer), Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+    );
+  }),
 );

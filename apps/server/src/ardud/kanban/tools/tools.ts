@@ -155,9 +155,9 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "The Missions board you work on: board settings and instructions, every card, goals, pools, groups, live thread states and unread counts. Threads outside a board pass boardId.",
+  "The Missions board you work on: board settings and instructions, every card, goals, pools, groups, live thread states and unread counts. Card prompts are left out; card_get returns them. Threads outside a board pass boardId.",
   { boardId: Schema.optional(TrimmedNonEmptyString) },
-  { board: Record },
+  { board: Record, prompts: Schema.String },
   { readonly: true },
 );
 
