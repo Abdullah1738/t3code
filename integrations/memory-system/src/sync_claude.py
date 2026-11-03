@@ -288,10 +288,11 @@ class ClaudeSync:
 
     def sync_file(self, path, st):
         key = self.key_of(path)
+        instance = self._root_of(path)["instance"]
         if tc.quarantined(self.mem, key):
+            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance))
             self.stats["quarantined"] += 1
             return
-        instance = self._root_of(path)["instance"]
         rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1

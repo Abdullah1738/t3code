@@ -288,6 +288,7 @@ class CodexSync:
         key = self.key_of(path)
         instance = self._root_of(path)["instance"]
         if tc.quarantined(self.mem, key):
+            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance))
             self.stats["quarantined"] += 1
             return
         if path.endswith(tc.ZST) and not tc.zstd_bin():

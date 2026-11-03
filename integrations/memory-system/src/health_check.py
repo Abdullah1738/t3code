@@ -402,6 +402,8 @@ def native_roots_report(now=None, seen=None):
         for subdir in subdirs:
             directory = os.path.join(root, subdir)
             def walk_error(e):
+                if isinstance(e, FileNotFoundError) and e.filename == directory and os.path.isdir(root):
+                    return
                 problems.append(f"{inst}: cannot scan transcript directory: {e}")
             for dirpath, _, names in os.walk(directory, onerror=walk_error):
                 for name in names:

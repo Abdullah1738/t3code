@@ -377,6 +377,41 @@ class IdentityTest(unittest.TestCase):
             self.assertIsNone(ni.resolve_thread(con, "codex", "codex", "CODEX-T"))
             self.assertEqual(ni.resolve_thread(con, "claudeAgent", "claude", "CLAUDE-S"), "T")
 
+    def test_app_owned_child_does_not_block_its_or_unrelated_provider_alias(self):
+        with closing(sqlite3.connect(self.state)) as con, con:
+            con.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)",
+                        thread("APP-CHILD", "App child", parent="T"))
+            con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?,?,?,?)",
+                        ("app-provider", "APP-CHILD", "codex", "codex", "codex",
+                         json.dumps({"nativeThreadRef": {"nativeId": "APP-SESSION"}})))
+            con.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
+                        ("app-sub", "T", "APP-CHILD", "codex", "codex",
+                         json.dumps({"origin": "app_owned", "nativeTaskRef": None})))
+        ti.sync(self.mem, self.state)
+        with closing(sqlite3.connect(self.mem)) as con:
+            self.assertEqual(ni.resolve_thread(con, "codex", "codex", "U-NATIVE"), "U")
+            self.assertEqual(ni.resolve_thread(con, "codex", "codex", "APP-SESSION"), "APP-CHILD")
+
+    def test_recovery_keeps_historical_parent_and_child_without_guessing_new_child_parent(self):
+        with closing(sqlite3.connect(self.state)) as con, con:
+            con.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)",
+                        thread("REC-CHILD", "Child", parent="T"))
+            add_turn(con, "rec-turn", "T", "pt2", "rec-node")
+            con.execute("INSERT INTO orchestration_v2_projection_subagents VALUES(?,?,?,?,?,?)",
+                        ("rec-sub", "T", "REC-CHILD", "claudeAgent", "claudeAgent",
+                         json.dumps({"nativeTaskRef": {"nativeId": "REC-AGENT"}, "parentNodeId": "rec-node"})))
+        ti.sync(self.mem, self.state)
+        with closing(sqlite3.connect(self.state)) as con, con:
+            for pt, native in (("pt2", "CLAUDE-RECOVERED"), ("pt3", "CODEX-RECOVERED")):
+                con.execute("UPDATE orchestration_v2_projection_provider_threads SET payload_json=? WHERE provider_thread_id=?",
+                            (json.dumps({"nativeThreadRef": {"nativeId": native}}), pt))
+        ti.sync(self.mem, self.state)
+        with closing(sqlite3.connect(self.mem)) as con:
+            self.assertEqual(ni.resolve_thread(con, "codex", "codex", "CODEX-T"), "T")
+            self.assertEqual(ni.resolve_thread(con, "codex", "codex", "CODEX-RECOVERED"), "T")
+            self.assertEqual(ni.resolve_thread(con, "claudeAgent", "claude", "CLAUDE-S:agent:REC-AGENT"), "REC-CHILD")
+            self.assertIsNone(ni.resolve_thread(con, "claudeAgent", "claude", "CLAUDE-RECOVERED:agent:REC-AGENT"))
+
     def test_valid_child_then_ambiguous_owner_drops_previous_alias(self):
         with closing(sqlite3.connect(self.state)) as con, con:
             con.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)",
@@ -512,7 +547,7 @@ class IdentityTest(unittest.TestCase):
         with closing(sqlite3.connect(self.mem)) as con:
             self.assertEqual(con.execute("SELECT value FROM harness_schema_meta WHERE key='thread_identity_last_ok'").fetchone(),
                              ("300",))
-            self.assertEqual(con.execute("SELECT count(*) FROM thread_aliases").fetchone()[0], 0)
+            self.assertGreater(con.execute("SELECT count(*) FROM thread_aliases").fetchone()[0], 0)
 
     def test_failed_write_rolls_back_watermark_and_alias_changes(self):
         with mock.patch.object(ti.time, "time", return_value=100):

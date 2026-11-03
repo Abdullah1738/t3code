@@ -12,8 +12,8 @@ Sources (read-only; never write statev2):
   ardud_opencode_import                          OpenCode native id -> imported thread
 
 Refreshed every tick, independently of transcript growth, so a late rename or
-a late thread binding reaches recall without new messages. Only aliases proved
-by the current state snapshot remain active; revision counts changes to a row.
+a late thread binding reaches recall without new messages. Previously proved
+aliases survive recovery unless current evidence contradicts them.
 """
 
 import json
@@ -152,6 +152,8 @@ def _gather(state):
     unresolved = {}  # reason -> child thread ids left without an alias this tick
     for child_tid, parent_tid, payload, driver, instance in subagent_rows:
         p = _j(payload)
+        if p.get("origin") == "app_owned":
+            continue  # Its child has its own provider thread, not a native task alias.
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
         task = _str(ref.get("nativeId"))
         scope = (child_tid, driver or _str(ref.get("driver")), instance, task)
@@ -278,6 +280,7 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
     now = int(time.time()) if now is None else now
     claims = {}
     conflicts = set()
+    lookup_claimants = {}
     for row in rows:
         parts = (row["driver"], row["instance"], row["native"], row.get("agent"))
         key = f"{parts[0] or ''}|{parts[1] or ''}|{parts[2]}|{parts[3] or ''}"
@@ -290,6 +293,9 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
             conflicts.add(key)
         else:
             claims[key] = row
+        lookup = _lookup_key(*parts)
+        if lookup is not None:
+            lookup_claimants.setdefault(lookup, set()).add(row["canonical"])
     blocked = set()
     unresolved = list(getattr(rows, "unresolved", ()))
     for row in rows:
@@ -303,25 +309,41 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
                 unresolved.append((row["canonical"], parts[0], parts[1], parts[3]))
 
     def txn():
-        # `last_seen` is a wall-clock value and can repeat or go backwards. A
-        # private temp table marks this exact refresh without relying on time.
-        mem.execute("CREATE TEMP TABLE IF NOT EXISTS identity_refresh_keys (alias_key TEXT PRIMARY KEY)")
-        mem.execute("DELETE FROM identity_refresh_keys")
         # A skipped child can have had a different task in the previous snapshot.
         blocked_now = set(blocked)
+        unresolved_children = {child for child, _driver, _instance, _task in unresolved}
         for child, _driver, _instance, _task in unresolved:
             for driver, instance, native, agent in mem.execute(
                     "SELECT driver,instance,native_id,agent_id FROM thread_aliases WHERE canonical_thread_id=?", (child,)):
                 lookup = _lookup_key(driver, instance, native, agent)
                 if lookup is not None:
                     blocked_now.add(lookup)
+        # Each historical child was proved against its then-current parent native id.
+        # Recovery replaces that id in place, so do not invent a child alias for the
+        # new parent; preserve the old one only while the current child is unambiguous.
+        historical_children = {row[0] for row in mem.execute(
+            "SELECT DISTINCT canonical_thread_id FROM thread_aliases WHERE agent_id IS NOT NULL")}
+        def invalid_historical(record):
+            key, canonical, driver, instance, native, agent = record
+            lookup = _lookup_key(driver, instance, native, agent)
+            row = {"driver": driver, "instance": instance, "native": native, "agent": agent}
+            if canonical in unresolved_children or key in conflicts or lookup in blocked_now or _blocked_by_unresolved(row, unresolved):
+                return True
+            current = claims.get(key)
+            if current is not None and current["canonical"] != canonical:
+                return True
+            return bool(lookup is not None and lookup_claimants.get(lookup, set()) - {canonical})
+        for record in list(mem.execute("SELECT alias_key,canonical_thread_id,driver,instance,native_id,agent_id FROM thread_aliases")):
+            if invalid_historical(record):
+                mem.execute("DELETE FROM thread_aliases WHERE alias_key=?", (record[0],))
         for key, r in claims.items():
             lookup = _lookup_key(r["driver"], r["instance"], r["native"], r.get("agent"))
             if key in conflicts or lookup in blocked_now or _blocked_by_unresolved(r, unresolved):
                 continue
-            mem.execute(
-                "INSERT INTO identity_refresh_keys(alias_key) VALUES (?)", (key,)
-            )
+            if r.get("agent") is not None and r["canonical"] in historical_children:
+                existing = mem.execute("SELECT 1 FROM thread_aliases WHERE alias_key=?", (key,)).fetchone()
+                if not existing:
+                    continue
             mem.execute(
                 "INSERT INTO thread_aliases(alias_key, canonical_thread_id, root_thread_id, driver, instance,"
                 " native_id, agent_id, title, cwd, model, first_seen, last_seen, revision)"
@@ -336,7 +358,6 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
                 (key, r["canonical"], r["root"], r["driver"], r["instance"], r["native"], r.get("agent"),
                  r.get("title"), r.get("cwd"), r.get("model"), now, now),
             )
-        mem.execute("DELETE FROM thread_aliases WHERE alias_key NOT IN (SELECT alias_key FROM identity_refresh_keys)")
         mem.execute(
             "INSERT INTO harness_schema_meta(key, value) VALUES('thread_identity_last_ok', ?)"
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",

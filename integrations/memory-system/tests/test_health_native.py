@@ -184,6 +184,26 @@ class NativeHealth(unittest.TestCase):
             con.execute("DELETE FROM native_capture_roots WHERE root=?", (root,))
         self.assertTrue(any("codex: no recent successful capture pass" in p for p in self.problems()))
 
+    def test_unused_roots_and_optional_codex_archive_are_empty(self):
+        import shutil
+        for inst, dirs in (("claude", ("projects",)), ("codex", ("archived_sessions",))):
+            for sub in dirs:
+                shutil.rmtree(os.path.join(self.homes, inst, sub))
+        self.assertEqual(self.problems(), [])  # Claude root-only; Codex sessions-only
+        shutil.rmtree(os.path.join(self.homes, "codex", "sessions"))
+        self.assertEqual(self.problems(), [])  # Codex root-only
+
+    def test_optional_directory_permission_error_is_not_exempt(self):
+        original = os.walk
+        target = os.path.realpath(os.path.join(self.homes, "codex", "archived_sessions"))
+        def denied(top, *args, **kwargs):
+            if top == target:
+                kwargs["onerror"](PermissionError(13, "denied", target))
+                return iter(())
+            return original(top, *args, **kwargs)
+        with mock.patch.object(hc.os, "walk", side_effect=denied):
+            self.assertTrue(any("cannot scan transcript directory" in p for p in self.problems()))
+
     def test_root_pass_table_missing_fails(self):
         with closing(sqlite3.connect(self.ledger)) as con, con:
             con.execute("DROP TABLE native_capture_roots")

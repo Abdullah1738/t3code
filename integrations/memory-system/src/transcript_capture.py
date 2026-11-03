@@ -362,6 +362,14 @@ def quarantined(con, logical, now=None):
     return bool(row and row[0] and row[0] > now)
 
 
+def follow_quarantined_move(con, path, logical, instance):
+    """Move error evidence with a disappeared pathname, without touching its checkpoint."""
+    rows = con.execute("SELECT rep_id,path FROM native_capture_files WHERE logical=? AND retired=0", (logical,)).fetchall()
+    if len(rows) == 1 and rows[0][1] != path and not os.path.exists(rows[0][1]):
+        con.execute("UPDATE native_capture_files SET path=?, instance=coalesce(instance,?) WHERE rep_id=?",
+                    (path, instance, rows[0][0]))
+
+
 def record_error(con, rep_id, message, now=None):
     """Durable per-file failure: error text, count, and the 10-minute quarantine."""
     now = int(time.time()) if now is None else now

@@ -291,6 +291,24 @@ class Watermarks(unittest.TestCase):
             self.assertIsNone(con.execute("SELECT error_since FROM native_capture_files").fetchone()[0])
         self.assertTrue(any("capture errors" in p and "unknown" in p for p in self.report()[1]))
 
+    def test_quarantined_moved_codex_file_keeps_old_error_visible(self):
+        path = self.write(line(60, type="session_meta", payload={"id": "thread"}))
+        self.sync_codex()
+        with closing(sqlite3.connect(self.db)) as con, con:
+            rep = con.execute("SELECT rep_id FROM native_capture_files WHERE path=?", (path,)).fetchone()[0]
+            con.execute("UPDATE native_capture_files SET error='old error',error_count=2,error_since=?,quarantined_until=?"
+                        " WHERE rep_id=?", (NOW - 2000, NOW + 600, rep))
+            tc.record_root_pass(con, "codex", self.home, 1, 1, NOW)
+        self.assertTrue(any("capture errors" in p and "2000" in p for p in self.report()[1]))
+        moved = os.path.join(self.home, "archived_sessions", os.path.basename(path))
+        os.rename(path, moved)
+        with mock.patch.object(sync_codex.time, "time", return_value=NOW):
+            self.sync_codex()
+        with closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute("SELECT rep_id,path,error_count,error_since FROM native_capture_files WHERE retired=0").fetchone(),
+                             (rep, moved, 2, NOW - 2000))
+        self.assertTrue(any("capture errors" in p and "2000" in p for p in self.report()[1]))
+
     def test_schema_upgrade_preserves_ledger_rows_and_is_idempotent(self):
         old_db = os.path.join(self.tmp.name, "old-ledger.db")
         with closing(sqlite3.connect(old_db)) as con, con:
