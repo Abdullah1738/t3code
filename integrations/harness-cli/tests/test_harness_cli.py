@@ -183,7 +183,7 @@ print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
 '''
         return script.replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode()
 
-    def fake_codex_binary(self, version: str, body_extra: str = "") -> bytes:
+    def fake_codex_binary(self, version: str, body_extra: str = "", *, leak_read: bool = False) -> bytes:
         script = r'''#!/opt/homebrew/bin/python3
 import json, os, sys, tomllib, urllib.request
 from pathlib import Path
@@ -199,12 +199,18 @@ if "gpt-6.1-terra" in sys.argv:
     assert config.get("model_context_window") == 1050000
     assert (home / "models.json").is_file() and (home / "AGENTS.md").is_file()
 if config.get("features", {}).get("memories") or LEAK:
-    (home / "memories").mkdir(exist_ok=True)
-req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=b'{"input":"hello"}', method="POST")
+    (home / "memories" / "phase2-output").write_text("pipeline ran")
+enabled = config.get("features", {}).get("memories")
+input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"
+if LEAK_READ:
+    input_text = "<memory>loaded prior memory</memory>"
+body = {"input": [{"role": "developer", "content": [{"type": "input_text", "text": input_text}]}]}
+req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=json.dumps(body).encode(), method="POST")
 urllib.request.urlopen(req, timeout=10).read()
 print("OK")
 '''
-        return script.replace("VERSION", version).replace("LEAK", str(bool(body_extra))).encode()
+        return (script.replace("VERSION", version).replace("LEAK_READ", str(leak_read))
+                .replace("LEAK", str(bool(body_extra))).encode())
 
     def package_tgz(self, name: str, tool: str, version: str, binary: bytes) -> Path:
         path = self.tmp / f"{name}.tgz"
@@ -297,7 +303,8 @@ class PromoteRollbackTests(FakeCliTestCase):
         canary = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": not memory_ok,
                    "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True}
                   if tool == "claude" else {"memoryCanaryChecked": True, "memoryPipelineRan": not memory_ok,
-                    "positiveControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+                    "positiveControlFired": True, "readControlFired": True,
+                    "cu": {"memoryCanaryChecked": True, "positiveControlFired": True, "readControlFired": True}})
         binary = self.root / tool / version / "bin" / tool
         hc.write_record("canary", tool, version, "passed" if passed else "failed",
                         binarySha256=hc.sha256_file(binary), canary=canary)
@@ -359,6 +366,64 @@ class PromoteRollbackTests(FakeCliTestCase):
         self.assertEqual(os.path.realpath(self.root / "claude" / "current"),
                          str((self.root / "claude" / "2.1.320").resolve()))
 
+    def test_promote_and_rollback_recover_each_crash_point(self) -> None:
+        for op in ("promote", "rollback"):
+            for crash in ("before-swap", "after-swap", "after-state-save"):
+                with self.subTest(op=op, crash=crash):
+                    hc.remove_tree(self.root)
+                    for version in ("2.1.316", "2.1.320", "2.1.321"):
+                        self.install_version("claude", version)
+                        self.record_canary("claude", version)
+                    hc.promote("claude", "2.1.316")
+                    hc.promote("claude", "2.1.320")
+                    old = "2.1.320"
+                    new = "2.1.321" if op == "promote" else "2.1.316"
+                    old_lkg = "2.1.316"
+                    key = "harness-cli:claude:2.1.321:promoted"
+                    original_swap, original_save = hc.swap_current, hc.save_state
+                    def fail_swap(tool, version):
+                        if crash == "before-swap":
+                            raise OSError("before swap")
+                        original_swap(tool, version)
+                        if crash == "after-swap":
+                            raise OSError("after swap")
+                    def fail_clear(state):
+                        if crash == "after-state-save" and "pendingTransition" not in state:
+                            raise OSError("before clearing journal")
+                        original_save(state)
+                    with mock.patch.object(hc, "swap_current", side_effect=fail_swap), \
+                         mock.patch.object(hc, "save_state", side_effect=fail_clear), \
+                         self.assertRaises(OSError):
+                        if op == "promote":
+                            hc.promote("claude", new, queue_notice=True)
+                        else:
+                            hc.rollback("claude")
+                    self.assertIn("pendingTransition", hc.load_state())
+                    # A separate state-changing CLI command performs reconciliation under the lock.
+                    with mock.patch.object(hc, "discover", return_value={}), redirect_stdout(io.StringIO()):
+                        self.assertEqual(hc.main(["discover"]), 0)
+                    state = hc.load_state()
+                    expected = old if crash == "before-swap" else new
+                    self.assertEqual(state["claude"]["current"], expected)
+                    self.assertEqual(hc.current_version_from_link("claude"), expected)
+                    self.assertEqual(state["claude"]["lastKnownGood"], old_lkg if crash == "before-swap" else old)
+                    self.assertNotIn("pendingTransition", state)
+                    self.assertEqual(key in state.get("pendingNotices", {}), op == "promote" and crash != "before-swap")
+                    self.assertIsNotNone(state["claude"]["lastKnownGood"])
+
+    def test_pending_transition_with_unexpected_link_fails_closed(self) -> None:
+        for version in ("2.1.316", "2.1.320", "2.1.321"):
+            self.install_version("claude", version)
+            self.record_canary("claude", version)
+        hc.promote("claude", "2.1.316")
+        with mock.patch.object(hc, "swap_current", side_effect=OSError("stopped")), self.assertRaises(OSError):
+            hc.promote("claude", "2.1.320", queue_notice=True)
+        hc.swap_current("claude", "2.1.321")
+        with mock.patch.object(hc, "discover") as discover, redirect_stdout(io.StringIO()):
+            self.assertEqual(hc.main(["discover"]), 1)
+        discover.assert_not_called()
+        self.assertIn("pendingTransition", hc.load_state())
+
 
 class CodexRotationTests(FakeCliTestCase):
     def install_codex(self, version: str) -> None:
@@ -371,7 +436,8 @@ class CodexRotationTests(FakeCliTestCase):
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
                         canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
-                                "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+                                "readControlFired": True, "cu": {"memoryCanaryChecked": True,
+                                "positiveControlFired": True, "readControlFired": True}})
 
     def test_codex_promote_leaves_rotation_pending(self) -> None:
         self.install_codex("0.166.0")
@@ -560,6 +626,44 @@ class CanaryTests(FakeCliTestCase):
         self.assertTrue(verdict["result"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["models"]["gpt-6.1-terra"]["ok"])
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertTrue(result["readControlFired"])
+            self.assertFalse(result["memorySentinelSeen"])
+            self.assertFalse(result["memoryPromptSeen"])
+            self.assertIn("memories/MEMORY.md", result["memoryBaseline"])
+            self.assertEqual(result["memoryArtifacts"], [])
+
+    def test_codex_disabled_memory_read_leaks_block_promotion_on_both_homes(self) -> None:
+        self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0", leak_read=True))
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        plain, cu = verdict["result"], verdict["result"]["cu"]
+        for home in (plain, cu):
+            self.assertTrue(home["positiveControlFired"])
+            self.assertFalse(home["memoryPipelineRan"])
+            self.assertTrue(home["memoryPromptSeen"])
+            self.assertTrue(all(model["memorySectionInRequest"] for model in home["models"].values()))
+        self.assertTrue(any("memory-off canary failed" in r for r in verdict["reasons"]))
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_codex_memory_sentinel_detects_decoded_nested_text(self) -> None:
+        sentinel = "ROBOB-CODEX-MEMORY-test"
+        body = json.loads('{"input":[{"role":"system","content":[{"text":"ROBOB-CODEX-\\u004dEMORY-test"}]}]}')
+        self.assertEqual(hc.codex_memory_in_body(body, sentinel), (True, False))
+        self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
+            "<memory>loaded prior memory</memory>"}]}, sentinel), (False, True))
+        self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
+            "old memory: the user prefers short replies"}]}, sentinel), (False, True))
+
+    def test_codex_memory_baseline_detects_top_level_phase2_files(self) -> None:
+        home = self.tmp / "codex-snapshot"
+        home.mkdir()
+        before = hc.codex_memory_snapshot(home)
+        (home / "phase2-output").write_text("new")
+        (home / "raw_memories.md").write_text("new")
+        after = hc.codex_memory_snapshot(home)
+        self.assertEqual(set(after) - set(before), {"phase2-output", "raw_memories.md"})
 
     def test_canary_fails_when_claude_request_body_contains_memory_canary(self) -> None:
         # A fake CLI that echoes the memory canary into its outgoing request body, as built-in memory would.
@@ -628,7 +732,8 @@ def passing_canary(tool: str, version: str) -> dict:
     body = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
              "thinkingReplayed": True, "inputTransformationsEmpty": True} if tool == "claude"
             else {"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
-                  "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+                  "readControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
+                                                      "readControlFired": True}})
     binary = hc.version_dir(tool, version) / "bin" / tool
     hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body)
     return {"passed": True, "reasons": [], "result": body}
@@ -825,7 +930,9 @@ class RotationGateTests(FakeCliTestCase):
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
                         canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False,
-                                "positiveControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True}})
+                                "positiveControlFired": True, "readControlFired": True,
+                                "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
+                                       "readControlFired": True}})
         hc.promote("codex", version)
 
     def test_rotation_refused_without_standing_ok_even_without_when_idle_flag(self) -> None:

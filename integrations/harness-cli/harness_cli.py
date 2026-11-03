@@ -37,6 +37,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -844,8 +845,13 @@ def uuid_for(work: Path) -> str:
 # Names the memory pipeline writes: the memories folder and its stores (memories_1.sqlite and
 # -wal/-shm), the phase-2 consolidation files, and raw_memories. Codex's own thread state
 # (state_*.sqlite, sessions, rollouts) never matches these prefixes.
-CODEX_MEMORY_ARTIFACT_RE = re.compile(r"^(memories(_\w+)?(\.sqlite(-wal|-shm)?)?|phase2\w*|raw_memories\w*|memory_summary\.md|MEMORY\.md)$")
+CODEX_MEMORY_ARTIFACT_RE = re.compile(r"^(memories[^/]*|phase2[^/]*|raw_memories[^/]*|memory_summary\.md|MEMORY\.md)$")
 CODEX_MEMORY_SECTION_MARKERS = (b"## Memory", b"<memories>", b"memory_summary", b"Memory Phase 2")
+CODEX_MEMORY_SECTION_RE = re.compile(
+    r"<\s*/?\s*memor(?:y|ies)(?:\s[^>]*)?>|^\s*#{1,6}\s+memor(?:y|ies)\b"
+    r"|\b(?:memory_summary|memory phase 2|(?:old|older|prior|previous|saved|stored|persistent|user|retrieved|remembered)\s+memor(?:y|ies))\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def codex_memory_artifacts(chome: Path) -> list[str]:
@@ -856,6 +862,41 @@ def codex_memory_artifacts(chome: Path) -> list[str]:
             if CODEX_MEMORY_ARTIFACT_RE.match(name):
                 found.append(os.path.relpath(os.path.join(dirpath, name), chome))
     return sorted(found)
+
+
+def codex_memory_snapshot(chome: Path) -> dict[str, str]:
+    """Account for the seeded files as well as all files created under memory directories."""
+    snapshot = {}
+    for dirpath, dirs, files in os.walk(chome):
+        directory = Path(dirpath)
+        inside_memory = any(CODEX_MEMORY_ARTIFACT_RE.match(part) for part in directory.relative_to(chome).parts)
+        for name in dirs + files:
+            path = directory / name
+            if inside_memory or CODEX_MEMORY_ARTIFACT_RE.match(name):
+                relative = str(path.relative_to(chome))
+                if path.is_symlink():
+                    raise HarnessError("memory fixture contains a symlink")
+                snapshot[relative] = "directory" if path.is_dir() else sha256_file(path)
+    return snapshot
+
+
+def codex_memory_in_body(body, sentinel: str) -> tuple[bool, bool]:
+    """Inspect decoded JSON strings, including nested Responses API input/content items."""
+    sentinel_seen = False
+    section_seen = False
+    def visit(value):
+        nonlocal sentinel_seen, section_seen
+        if isinstance(value, str):
+            sentinel_seen = sentinel_seen or sentinel in value
+            section_seen = section_seen or bool(CODEX_MEMORY_SECTION_RE.search(value))
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(body)
+    return sentinel_seen, section_seen
 
 
 def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, models: list[str],
@@ -878,7 +919,14 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         text = text.replace("use_memories = false", "use_memories = true")
         text = text.replace("memories = false", "memories = true")
         cfg_path.write_text(text, encoding="utf-8")
-    # Seed a completed, non-ephemeral rollout in the disposable home. If the installed
+    # Seed both read-memory files and a completed, non-ephemeral rollout in the disposable home.
+    sentinel = "ROBOB-CODEX-MEMORY-" + uuid.uuid4().hex
+    memory_dir = chome / "memories"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("MEMORY.md", "memory_summary.md", "raw_memories.md"):
+        (memory_dir / name).write_text(f"Canary preference: {sentinel}\n", encoding="utf-8")
+    baseline = codex_memory_snapshot(chome)
+    # If the installed
     # Codex release does not process it, the enabled positive control fails closed.
     sessions = chome / "sessions" / "2025" / "01" / "01"
     sessions.mkdir(parents=True, exist_ok=True)
@@ -911,14 +959,19 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                            cwd=work)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
-            section = any(marker in json.dumps(r.get("body") or "", ensure_ascii=False)
-                          for r in records for marker in ("## Memory", "<memories>", "memory_summary",
-                                                          "Memory Phase 2"))
-            results["models"][model] = {"ok": ok and bool(records), "requests": len(records),
+            observations = [codex_memory_in_body(r.get("body"), sentinel) for r in records]
+            sentinel_seen = any(item[0] for item in observations)
+            section = any(item[1] for item in observations)
+            bodies_decoded = all(isinstance(r.get("body"), dict) for r in records)
+            results["models"][model] = {"ok": ok and bool(records) and bodies_decoded, "requests": len(records),
+                                        "memorySentinelInRequest": sentinel_seen,
                                         "memorySectionInRequest": section}
-        artifacts = codex_memory_artifacts(chome)
+        after = codex_memory_snapshot(chome)
+        artifacts = sorted(path for path in set(baseline) | set(after) if baseline.get(path) != after.get(path))
+        results["memoryBaseline"] = baseline
         results["memoryArtifacts"] = artifacts
         results["memoryPipelineRan"] = bool(artifacts)
+        results["memorySentinelSeen"] = any(m.get("memorySentinelInRequest") for m in results["models"].values())
         results["memoryPromptSeen"] = any(m.get("memorySectionInRequest") for m in results["models"].values())
         results["requests"] = len(recorder.requests)
     finally:
@@ -939,18 +992,22 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
     control_work = work / "control"
     control_work.mkdir(parents=True, exist_ok=True)
     control = run_codex_memory_probe(binary, generated_home, control_work, models[:1], enable_memory=True)
-    detector_fires = bool(control["memoryPipelineRan"] or control["memoryPromptSeen"])
+    detector_fires = control["memoryPipelineRan"] is True
+    read_control_fires = control["memorySentinelSeen"] is True
     real_work = work / "real"
     real_work.mkdir(parents=True, exist_ok=True)
     real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False)
     results = {
         "positiveControlFired": detector_fires,
+        "readControlFired": read_control_fires,
         "positiveControlArtifacts": control["memoryArtifacts"],
         "models": real["models"],
+        "memoryBaseline": real["memoryBaseline"],
         "memoryArtifacts": real["memoryArtifacts"],
         "memoryPipelineRan": real["memoryPipelineRan"],
+        "memorySentinelSeen": real["memorySentinelSeen"],
         "memoryPromptSeen": real["memoryPromptSeen"],
-        "memoryCanaryChecked": bool(detector_fires and real["requests"] > 0),
+        "memoryCanaryChecked": bool(detector_fires and read_control_fires and real["requests"] > 0),
         "requests": real["requests"],
     }
     return results
@@ -1021,6 +1078,7 @@ def canary(tool: str, version: str) -> dict:
             failed = [m for m in MODEL_CANARIES["codex"] if not plain.get("models", {}).get(m, {}).get("ok")]
             failed += [m for m in CODEX_CU_MODELS if not cu.get("models", {}).get(m, {}).get("ok")]
             memory_fail = (plain.get("memoryPipelineRan") or cu.get("memoryPipelineRan")
+                           or plain.get("memorySentinelSeen") or cu.get("memorySentinelSeen")
                            or plain.get("memoryPromptSeen") or cu.get("memoryPromptSeen"))
             memory_checked = plain.get("memoryCanaryChecked") is True and cu.get("memoryCanaryChecked") is True
             requests = plain.get("requests", 0) + cu.get("requests", 0)
@@ -1055,6 +1113,86 @@ def swap_current(tool: str, version: str) -> None:
     os.replace(tmp, link)  # atomic rename over the old symlink
 
 
+def current_version_from_link(tool: str) -> str | None:
+    link = current_link(tool)
+    if not os.path.lexists(link):
+        return None
+    if not link.is_symlink():
+        raise HarnessError(f"{link} is not a symlink; refusing pin transition")
+    target = Path(os.path.abspath(link.parent / os.readlink(link)))
+    if target.parent != tool_dir(tool).absolute():
+        raise HarnessError(f"{link} points outside the tool directory; refusing pin transition")
+    parse_version(target.name)
+    return target.name
+
+
+def apply_transition(state: dict, transition: dict) -> None:
+    slot = state[transition["tool"]]
+    slot["current"] = transition["to"]
+    slot["lastKnownGood"] = transition["lastKnownGood"]
+    slot["rotationPending"] = transition["tool"] == "codex"
+    if transition["op"] == "promote":
+        slot["candidate"] = None
+        slot["promotedAt"] = transition["promotedAt"]
+    notice = transition["notice"]
+    if notice is not None:
+        state.setdefault("pendingNotices", {}).setdefault(
+            notice["key"], {"severity": notice["severity"], "text": notice["text"]})
+
+
+def reconcile_transition() -> None:
+    """Finish or cancel a journaled pin change. Caller holds StateLock."""
+    state = load_state()
+    transition = state.get("pendingTransition")
+    if transition is None:
+        return
+    if not isinstance(transition, dict) or transition.get("op") not in ("promote", "rollback") \
+            or transition.get("tool") not in TOOLS:
+        raise HarnessError("invalid pending pin transition; refusing to continue")
+    try:
+        tool = transition["tool"]
+        old, new = transition["from"], transition["to"]
+        if old is not None:
+            parse_version(old)
+        parse_version(new)
+        if old == new or transition["lastKnownGood"] != old:
+            raise ValueError("invalid transition")
+        notice = transition["notice"]
+        if notice is not None and (not isinstance(notice, dict) or any(
+                not isinstance(notice.get(k), str) or not notice[k] for k in ("key", "severity", "text"))):
+            raise ValueError("invalid notice")
+        if transition["op"] == "promote" and not isinstance(transition["promotedAt"], str):
+            raise ValueError("invalid promotedAt")
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise HarnessError("invalid pending pin transition; refusing to continue") from exc
+    actual = current_version_from_link(tool)
+    if actual == new:
+        apply_transition(state, transition)
+        save_state(state)  # Keep the journal until the resulting state and outbox are durable.
+    elif actual == old:
+        if state[tool].get("current") != old:
+            raise HarnessError("pending transition disagrees with state; refusing to continue")
+    else:
+        raise HarnessError("pending transition disagrees with current symlink; refusing to continue")
+    del state["pendingTransition"]
+    save_state(state)
+
+
+def transition_current(state: dict, transition: dict) -> None:
+    """Journal first, swap, commit state/outbox, then clear the journal under StateLock."""
+    if state.get("pendingTransition") is not None:
+        raise HarnessError("pending pin transition must be reconciled first")
+    if current_version_from_link(transition["tool"]) != transition["from"]:
+        raise HarnessError("current symlink disagrees with state; refusing pin transition")
+    state["pendingTransition"] = transition
+    save_state(state)
+    swap_current(transition["tool"], transition["to"])
+    apply_transition(state, transition)
+    save_state(state)
+    del state["pendingTransition"]
+    save_state(state)
+
+
 def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     if tool not in TOOLS:
         raise HarnessError(f"unknown tool {tool}")
@@ -1073,22 +1211,17 @@ def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     binary = version_dir(tool, version) / "bin" / ("claude" if tool == "claude" else "codex")
     if not binary.is_file() or not verdict.get("binarySha256") or sha256_file(binary) != verdict["binarySha256"]:
         raise HarnessError("staged binary differs from the canary record")
-    swap_current(tool, version)
-    slot["lastKnownGood"] = previous
-    slot["current"] = version
-    slot["candidate"] = None
-    slot["promotedAt"] = now_iso()
     if tool == "codex":
-        slot["rotationPending"] = True
         status = "promoted, rotation pending"
     else:
-        slot["rotationPending"] = False
         status = "promoted"
+    notice = None
     if queue_notice:
         key = f"harness-cli:{tool}:{version}:promoted"
-        state.setdefault("pendingNotices", {})[key] = {
-            "severity": "info", "text": f"Harness CLI: {tool} {version} {status} (previous {previous})."}
-    save_state(state)
+        notice = {"key": key, "severity": "info",
+                  "text": f"Harness CLI: {tool} {version} {status} (previous {previous})."}
+    transition_current(state, {"op": "promote", "tool": tool, "from": previous, "to": version,
+                               "lastKnownGood": previous, "notice": notice, "promotedAt": now_iso()})
     digest = verdict.get("binarySha256")
     write_record("promote", tool, version, status, binarySha256=digest,
                  previous=previous, harnessHomes=harness_home_hashes())
@@ -1104,11 +1237,8 @@ def rollback(tool: str) -> dict:
     if not version_dir(tool, target).is_dir():
         raise HarnessError(f"lastKnownGood {target} is no longer on disk")
     previous = slot.get("current")
-    swap_current(tool, target)
-    slot["current"] = target
-    slot["lastKnownGood"] = previous
-    slot["rotationPending"] = tool == "codex"
-    save_state(state)
+    transition_current(state, {"op": "rollback", "tool": tool, "from": previous, "to": target,
+                               "lastKnownGood": previous, "notice": None})
     write_record("rollback", tool, target, "rolled back", previous=previous,
                  harnessHomes=harness_home_hashes())
     return {"tool": tool, "version": target, "previous": previous}
@@ -1132,7 +1262,9 @@ def latest_canary(tool: str, version: str) -> dict | None:
     memory_ok = canary_body.get("memoryCanaryChecked") is True and not (
         canary_body.get("memoryCanaryLeaked") is True if tool == "claude"
         else (canary_body.get("memoryPipelineRan") or canary_body.get("memoryPromptSeen")
+              or canary_body.get("memorySentinelSeen")
               or (canary_body.get("cu") or {}).get("memoryPipelineRan")
+              or (canary_body.get("cu") or {}).get("memorySentinelSeen")
               or (canary_body.get("cu") or {}).get("memoryPromptSeen")))
     if tool == "claude":
         checks_ok = (canary_body.get("thinkingCheckChecked") is True
@@ -1141,7 +1273,9 @@ def latest_canary(tool: str, version: str) -> dict | None:
     else:
         checks_ok = ((canary_body.get("cu") or {}).get("memoryCanaryChecked") is True
                      and canary_body.get("positiveControlFired") is True
-                     and (canary_body.get("cu") or {}).get("positiveControlFired") is True)
+                     and (canary_body.get("cu") or {}).get("positiveControlFired") is True
+                     and canary_body.get("readControlFired") is True
+                     and (canary_body.get("cu") or {}).get("readControlFired") is True)
     passed = found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
     return {
         "passed": passed,
@@ -1563,6 +1697,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.before_release or args.cmd in LOCKED_COMMANDS:
         try:
             with StateLock(root() / "lock"):
+                reconcile_transition()
                 return _dispatch(args)
         except HarnessError as exc:
             print(f"error: {exc}", file=sys.stderr)
