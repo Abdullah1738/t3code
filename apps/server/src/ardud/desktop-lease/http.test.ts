@@ -58,6 +58,8 @@ const makeHarness = (
           providerInstanceId: null,
           nativeSessionId: input.nativeId,
           nativeAgentId: input.agentId ?? null,
+          parentNativeAgentId: null,
+          nativeOwnerThreadId: null,
           model: null,
           acceptsMessages: resolution === "resolved",
           candidates: resolution === "ambiguous" ? ["thread-a", "thread-b"] : [],
