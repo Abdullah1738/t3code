@@ -89,9 +89,7 @@ export interface KanbanThreadsShape {
   readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
   // runId names the executed run, so a repeated notification of the same run is recognised.
-  readonly lastFailure: (
-    threadId: ThreadId,
-  ) => Effect.Effect<
+  readonly lastFailure: (threadId: ThreadId) => Effect.Effect<
     | (OrchestrationV2ProviderFailure & {
         readonly runId?: string | null;
         readonly model?: ModelSelection | null;

@@ -7708,7 +7708,10 @@ const failingLinkStore = Layer.effect(
         linkFailures.alertReads > 0
           ? ((linkFailures.alertReads -= 1),
             Effect.fail(
-              new KanbanStore.KanbanStoreError({ operation: "read discussions", cause: "injected" }),
+              new KanbanStore.KanbanStoreError({
+                operation: "read discussions",
+                cause: "injected",
+              }),
             ))
           : real.discussions(boardId),
     };
