@@ -3,7 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { ProjectId, type KanbanActor } from "@t3tools/contracts";
+import { ProjectId, ServerSettingsError, type KanbanActor } from "@t3tools/contracts";
 
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -64,24 +64,39 @@ const inertThreads = Layer.succeed(
   }),
 );
 
-const kanbanLayer = KanbanService.layer.pipe(
-  Layer.provideMerge(inertThreads),
-  Layer.provideMerge(KanbanStore.layer),
-  Layer.provideMerge(KanbanModels.layerTest(null)),
-  Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
-  Layer.provideMerge(Sqlite.layerMemory),
-  Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
-  Layer.provideMerge(emptyOwners),
-  Layer.provideMerge(ServerSettings.layerTest()),
+const kanbanStack = (
+  settingsLayer: Layer.Layer<ServerSettings.ServerSettingsService, ServerSettingsError>,
+) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(inertThreads),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(emptyOwners),
+    Layer.provideMerge(settingsLayer),
   Layer.provideMerge(
     ServerConfig.layerTest(process.cwd(), { prefix: "t3-harness-migrate-test-" }).pipe(
       Layer.provideMerge(NodeServices.layer),
     ),
   ),
-  Layer.provideMerge(NodeCrypto.layer),
-);
+    Layer.provideMerge(NodeCrypto.layer),
+  );
+
+const kanbanLayer = kanbanStack(ServerSettings.layerTest());
 
 const testLayer = SelectionMigration.layer.pipe(Layer.provideMerge(kanbanLayer));
+
+/**
+ * The same stack with `ardudHarnessMigration.allowConflicts` on. The settings layer is the one the
+ * kanban stack reads, so it is provided over the default rather than beneath it.
+ */
+const allowConflictsLayer = SelectionMigration.layer.pipe(
+  Layer.provideMerge(
+    kanbanStack(ServerSettings.layerTest({ ardudHarnessMigration: { allowConflicts: true } })),
+  ),
+);
 
 it.effect("apply moves a board's pools to Claude Code and a second apply writes nothing", () =>
   Effect.gen(function* () {
@@ -191,6 +206,43 @@ it.effect("apply refuses a conflicting board and leaves every board as it was", 
     // Refused means nothing was written: the store is exactly as it was before apply.
     assert.deepStrictEqual(yield* store.pools(board.id), poolsBefore);
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("allowConflicts lets apply proceed past a conflict, and only the clean boards move", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const clean = yield* kanban.ensureBoard({
+      slug: "allowed-clean",
+      name: "Allowed clean",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(clean.id, clean.defaultCardModel, 2);
+    const conflicted = yield* kanban.ensureBoard({
+      slug: "allowed-conflict",
+      name: "Allowed conflict",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* store.putPool(conflicted.id, {
+      key: "opencode/opus/claude-opus-5-5#xhigh",
+      model: {
+        instanceId: "opencode",
+        model: "opus/claude-opus-5-5#xhigh",
+        options: [{ id: "variant", value: "high" }],
+      },
+      slots: 1,
+    } as unknown as Parameters<typeof store.putPool>[1]);
+    const conflictedBefore = yield* store.pools(conflicted.id);
+
+    const applied = yield* migration.apply;
+    assert.isTrue(applied.applied > 0, "the clean board must still be migrated");
+
+    // The clean board moved to Claude Code; the conflicting one was left exactly as it was.
+    const cleanPools = yield* store.pools(clean.id);
+    assert.isTrue(cleanPools.every((pool) => pool.model.instanceId === "claudeAgent"));
+    assert.deepStrictEqual(yield* store.pools(conflicted.id), conflictedBefore);
+  }).pipe(Effect.provide(allowConflictsLayer)),
 );
 
 it.effect("dry-run reports a board's selections and writes nothing", () =>
