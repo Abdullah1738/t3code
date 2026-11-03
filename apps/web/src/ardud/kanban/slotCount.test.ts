@@ -7,6 +7,7 @@ import {
   failedSlot,
   observeSlots,
   sentSlots,
+  serialSender,
   type SlotWrites,
 } from "./slotCount";
 
@@ -72,5 +73,107 @@ describe("committedSlots", () => {
     expect(currentSlots(failedSlot(pending, 2))).toBe(12);
     expect(currentSlots(failedSlot(pending, 1))).toBe(13);
     expect(currentSlots(failedSlot(failedSlot(pending, 1), 2))).toBe(5);
+  });
+});
+
+describe("serialSender", () => {
+  it("saves one count at a time, newest pending wins", async () => {
+    const calls: number[] = [];
+    const dropped: number[] = [];
+    const resolve: Array<(result: boolean | void) => void> = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let state: SlotWrites = { feed: 5, sent: [] };
+    const sender = serialSender(
+      (value) => {
+        calls.push(value);
+        maxInFlight = Math.max(maxInFlight, ++inFlight);
+        return new Promise<boolean | void>((done) => {
+          resolve.push((result) => {
+            inFlight--;
+            done(result);
+          });
+        });
+      },
+      (id) => {
+        dropped.push(id);
+        state = failedSlot(state, id);
+      },
+    );
+    const send = (id: number, value: number) => {
+      state = sentSlots(state, { id, value });
+      sender(id, value);
+    };
+
+    send(1, 12);
+    send(2, 13);
+    send(3, 14);
+    expect(calls).toEqual([12]);
+    expect(dropped).toEqual([2]);
+    expect(state.sent).toEqual([
+      { id: 1, value: 12 },
+      { id: 3, value: 14 },
+    ]);
+    expect(currentSlots(observeSlots(state, 12))).toBe(14);
+
+    resolve[0]!(true);
+    await Promise.resolve();
+    expect(calls).toEqual([12, 14]);
+    expect(maxInFlight).toBe(1);
+    resolve[1]!(true);
+    await Promise.resolve();
+    expect(inFlight).toBe(0);
+  });
+
+  it("continues with the queued count after a failed write", async () => {
+    const calls: number[] = [];
+    const dropped: number[] = [];
+    let finishFirst!: (result: boolean) => void;
+    let state: SlotWrites = { feed: 5, sent: [] };
+    const sender = serialSender(
+      (value) => {
+        calls.push(value);
+        return value === 12 ? new Promise<boolean>((resolve) => (finishFirst = resolve)) : true;
+      },
+      (id) => {
+        dropped.push(id);
+        state = failedSlot(state, id);
+      },
+    );
+    state = sentSlots(state, { id: 1, value: 12 });
+    sender(1, 12);
+    state = sentSlots(state, { id: 2, value: 13 });
+    sender(2, 13);
+    expect(calls).toEqual([12]);
+
+    finishFirst(false);
+    await Promise.resolve();
+    expect(calls).toEqual([12, 13]);
+    expect(dropped).toEqual([1]);
+    expect(state.sent).toEqual([{ id: 2, value: 13 }]);
+    await Promise.resolve();
+  });
+
+  it("continues after a rejected write", async () => {
+    const calls: number[] = [];
+    const dropped: number[] = [];
+    let rejectFirst!: (error: Error) => void;
+    const sender = serialSender(
+      (value) => {
+        calls.push(value);
+        return value === 12
+          ? new Promise<boolean>((_resolve, reject) => (rejectFirst = reject))
+          : true;
+      },
+      (id) => dropped.push(id),
+    );
+    sender(1, 12);
+    sender(2, 13);
+
+    rejectFirst(new Error("failed"));
+    await Promise.resolve();
+    expect(calls).toEqual([12, 13]);
+    expect(dropped).toEqual([1]);
+    await Promise.resolve();
   });
 });

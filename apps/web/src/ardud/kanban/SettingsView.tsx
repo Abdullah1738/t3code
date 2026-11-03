@@ -50,6 +50,7 @@ import {
   failedSlot,
   observeSlots,
   sentSlots,
+  serialSender,
   type SlotWrites,
 } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
@@ -748,6 +749,15 @@ function Stepper(props: {
   const nextId = useRef(0);
   const edited = useRef(false);
   const cancelled = useRef(false);
+  const onChangeRef = useRef(props.onChange);
+  // The queued write needs the latest pool callback, not the one from its first render.
+  // oxlint-disable-next-line react/refs
+  onChangeRef.current = props.onChange;
+  const sender = useRef<ReturnType<typeof serialSender> | null>(null);
+  sender.current ??= serialSender(
+    (value) => onChangeRef.current(value),
+    (id) => setWrites((state) => failedSlot(state, id)),
+  );
   const current = currentSlots(observed);
   const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : current;
   const base = Number.isSafeInteger(typed) ? typed : current;
@@ -755,9 +765,7 @@ function Stepper(props: {
   const send = (next: number) => {
     const id = ++nextId.current;
     setWrites((state) => sentSlots(observeSlots(state, props.value), { id, value: next }));
-    void Promise.resolve(props.onChange(next)).then((ok) => {
-      if (ok === false) setWrites((state) => failedSlot(state, id));
-    });
+    sender.current!(id, next);
   };
   // While typing, the buttons step the draft, so a click never races the typed number.
   const step = (by: number) => {

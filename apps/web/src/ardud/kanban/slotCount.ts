@@ -34,6 +34,41 @@ export interface SlotWrites {
   readonly sent: ReadonlyArray<SlotWrite>;
 }
 
+/** Serialize writes and discard superseded or failed pending IDs. */
+export function serialSender(
+  write: (value: number) => Promise<boolean | void> | boolean | void,
+  dropped: (id: number) => void,
+): (id: number, value: number) => void {
+  let inFlight = false;
+  let queued: SlotWrite | null = null;
+
+  const run = async (id: number, value: number) => {
+    inFlight = true;
+    let result: boolean | void;
+    try {
+      result = await Promise.resolve(write(value));
+    } catch {
+      result = false;
+    }
+    if (result === false) dropped(id);
+    inFlight = false;
+    if (queued !== null) {
+      const next = queued;
+      queued = null;
+      void run(next.id, next.value);
+    }
+  };
+
+  return (id, value) => {
+    if (!inFlight) {
+      void run(id, value);
+      return;
+    }
+    if (queued !== null) dropped(queued.id);
+    queued = { id, value };
+  };
+}
+
 /**
  * Reconcile local writes with intermediate pool snapshots, preserving newer edits.
  * Matching the last equal write makes a coalesced feed (12, 13, 12 seen only as 12) retire all
