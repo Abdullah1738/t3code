@@ -101,7 +101,11 @@ const make = Effect.gen(function* () {
     const result = yield* maintenance.compactEventStore;
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
-    if (result.deletedEventCount > 0 || result.deletedReceiptCount > 0) {
+    if (
+      result.deletedEventCount > 0 ||
+      result.deletedReceiptCount > 0 ||
+      result.consideredTextEventCount > 0
+    ) {
       yield* Effect.logInfo("Compacted orchestration history", result);
     }
   }).pipe(

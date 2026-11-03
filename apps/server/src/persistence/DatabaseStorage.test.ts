@@ -129,7 +129,15 @@ const compactionLayer = (
 const minute = 60_000;
 const hour = 60 * minute;
 const startupTime = Date.UTC(2026, 9, 19);
-const emptyCompaction = { deletedEventCount: 0, deletedReceiptCount: 0, reclaimableBytes: 0 };
+const emptyCompaction = {
+  deletedEventCount: 0,
+  deletedReceiptCount: 0,
+  reclaimableBytes: 0,
+  consideredTextEventCount: 0,
+  deletedTextEventCount: 0,
+  retainedTextEventCount: 0,
+  deletedTextPayloadBytes: 0,
+};
 
 it.effect.each([
   { name: "recent success", saved: String(startupTime - 2 * hour), delay: 4 * hour },
