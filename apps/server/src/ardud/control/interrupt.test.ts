@@ -25,6 +25,8 @@ import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import { OrchestratorDispatchError } from "../../orchestration-v2/Orchestrator.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
@@ -151,6 +153,8 @@ const makeHarness = Effect.gen(function* () {
                 enqueueCommand: <A, E>(effect: Effect.Effect<A, E>) => effect,
               }),
               Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
+              Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+              Layer.mock(Orchestrator.OrchestratorV2)({}),
               Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
               Layer.mock(ServerSecretStore.ServerSecretStore)({}),
               ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-interrupt" }),

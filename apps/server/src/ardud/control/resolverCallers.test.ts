@@ -19,6 +19,8 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
@@ -108,6 +110,8 @@ const makeHarness = (mode: "off" | "dryrun" | "apply") =>
                   dispatch: (command) =>
                     record("dispatch", command).pipe(Effect.as({ sequence: 1 } as never)),
                 }),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Layer.mock(Orchestrator.OrchestratorV2)({}),
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                   launch: (input) =>
                     record("launch", input).pipe(
