@@ -44,6 +44,7 @@ import {
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -624,6 +625,21 @@ export const asksSomething = (blocks: ReadonlyArray<KanbanBlock>, text: string) 
 
 const roleName = (role: KanbanThreadLink["role"]) =>
   role === "work" ? "Worker" : role === "review" ? "Reviewer" : "Evaluator";
+
+const withDefaultLevel = (selection: ModelSelection, fallback: ModelSelection): ModelSelection => {
+  if (
+    Rules.modelLevel(selection) !== null ||
+    Rules.modelKey(selection) !== Rules.modelKey(fallback)
+  ) {
+    return selection;
+  }
+  const effortId = effortOptionId(fallback.instanceId);
+  if (selection.options?.some((option) => option.id === effortId)) return selection;
+  const effort = fallback.options?.find((option) => option.id === effortId);
+  return effort === undefined
+    ? selection
+    : { ...selection, options: [...(selection.options ?? []), effort] };
+};
 
 const make = Effect.gen(function* () {
   const context =
@@ -3711,7 +3727,8 @@ const make = Effect.gen(function* () {
     };
     add(board.managerModel);
     add(board.evaluatorModel);
-    add(board.defaultCardModel);
+    // A shared pool drives card options, so the card default wins when keys match.
+    seen.set(Rules.poolKey(board.defaultCardModel), board.defaultCardModel);
     for (const chain of board.reviewChains) for (const step of chain.steps) add(step);
     return [...seen.values()];
   };
@@ -3755,12 +3772,14 @@ const make = Effect.gen(function* () {
     const managerModel = yield* canonicalModel(
       input.managerModel ?? Defaults.DEFAULT_MANAGER_MODEL,
     );
-    const evaluatorModel = yield* canonicalModel(
-      input.evaluatorModel ?? Defaults.DEFAULT_EVALUATOR_MODEL,
-    );
-    const defaultCardModel = yield* canonicalModel(
-      input.defaultCardModel ?? Defaults.DEFAULT_CARD_MODEL,
-    );
+    const evaluatorDefault = yield* canonicalModel(Defaults.DEFAULT_EVALUATOR_MODEL);
+    const cardDefault = yield* canonicalModel(Defaults.DEFAULT_CARD_MODEL);
+    const evaluatorModel = input.evaluatorModel
+      ? withDefaultLevel(yield* canonicalModel(input.evaluatorModel), evaluatorDefault)
+      : evaluatorDefault;
+    const defaultCardModel = input.defaultCardModel
+      ? withDefaultLevel(yield* canonicalModel(input.defaultCardModel), cardDefault)
+      : cardDefault;
     if (input.managerModel) yield* checkModel(managerModel);
     if (input.evaluatorModel) yield* checkModel(evaluatorModel);
     if (input.defaultCardModel) yield* checkModel(defaultCardModel);
@@ -5659,7 +5678,10 @@ const make = Effect.gen(function* () {
           if (board.setup?.status === "running") {
             return yield* failWith("invalid", `board ${board.slug} is already in setup`);
           }
-          const evaluatorModel = yield* canonicalModel(input.evaluatorModel);
+          const evaluatorModel = withDefaultLevel(
+            yield* canonicalModel(input.evaluatorModel),
+            yield* canonicalModel(Defaults.DEFAULT_EVALUATOR_MODEL),
+          );
           yield* checkModel(evaluatorModel);
           const saved: KanbanBoard = { ...board, evaluatorModel };
           yield* store.putBoard(saved);

@@ -24,6 +24,7 @@ import {
   KanbanScriptId,
   KANBAN_WS_METHODS as M,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
@@ -4300,8 +4301,13 @@ it.effect("setupStart saves the picked model, starts setup once and refuses a se
       const started = yield* kanban.startSetup(board.id, { evaluatorModel: picked });
       const after = (yield* kanban.boards).find((b) => b.id === board.id)!;
       assert.strictEqual(after.evaluatorModel.model, "opus/claude-opus-5-5");
+      assert.strictEqual(Rules.modelLevel(after.evaluatorModel), "high");
       assert.strictEqual(after.setup?.status, "running");
       assert.strictEqual(after.setup?.discussionId, started.discussionId);
+      assert.deepStrictEqual(
+        (yield* Ref.get(fake.threads)).get(after.setup!.threadId)!.model,
+        after.evaluatorModel,
+      );
       // The setup evaluator talks in the Setup discussion it was handed.
       const discussion = yield* kanban.discussion(started.discussionId);
       assert.strictEqual(discussion.title, "Setup");
@@ -4315,6 +4321,42 @@ it.effect("setupStart saves the picked model, starts setup once and refuses a se
         (yield* kanban.boards).find((b) => b.id === board.id)!.setup?.discussionId,
         started.discussionId,
       );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("setupStart preserves an explicit Opus level and a different model without one", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const picked = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      yield* kanban.startSetup(board.id, { evaluatorModel: picked });
+      const after = (yield* kanban.boards).find((b) => b.id === board.id)!;
+      assert.deepStrictEqual(after.evaluatorModel, picked);
+      assert.deepStrictEqual(
+        (yield* Ref.get(fake.threads)).get(after.setup!.threadId)!.model,
+        picked,
+      );
+      const invalid = yield* Effect.exit(
+        kanban.createBoard({
+          slug: "invalid-effort",
+          name: "Invalid effort",
+          defaultProjectId: null,
+          evaluatorModel: { ...picked, options: [{ id: "variant", value: true }] },
+        }),
+      );
+      assert.isTrue(Exit.isFailure(invalid));
+
+      const otherBoard = yield* kanban.createBoard({
+        slug: "setup-other",
+        name: "Other setup",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const other = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol" });
+      yield* kanban.startSetup(otherBoard.id, { evaluatorModel: other });
+      assert.deepStrictEqual((yield* kanban.snapshot(otherBoard.id)).board.evaluatorModel, other);
+      assert.isNull(Rules.modelLevel(other));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -6388,6 +6430,223 @@ it.effect("createBoard uses the same default models as ensureBoard", () =>
       assert.deepStrictEqual(board.evaluatorModel, opus);
       assert.deepStrictEqual(board.defaultCardModel, opus);
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("new boards fill only missing levels on their matching default models", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const provider = opencodeTestProvider();
+    const providerWithFastMode: ServerProvider = {
+      ...provider,
+      models: provider.models.map((model) =>
+        model.slug === "opus/claude-opus-5-5"
+          ? {
+              ...model,
+              capabilities: {
+                ...model.capabilities,
+                optionDescriptors: [
+                  ...(model.capabilities?.optionDescriptors ?? []),
+                  { id: "fastMode", label: "Fast mode", type: "boolean" },
+                ],
+              },
+            }
+          : model,
+      ),
+    };
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const opus = modelSelectionOf({ model: "opus/claude-opus-5-5" });
+      const withOtherOption = { ...opus, options: [{ id: "fastMode", value: true }] };
+      const board = yield* kanban.createBoard({
+        slug: "picked-defaults",
+        name: "Picked defaults",
+        defaultProjectId: null,
+        evaluatorModel: withOtherOption,
+      });
+      assert.deepStrictEqual(board.evaluatorModel.options, [
+        { id: "fastMode", value: true },
+        { id: "variant", value: "high" },
+      ]);
+      assert.strictEqual(Rules.modelLevel(board.defaultCardModel), "high");
+      const stored = (yield* kanban.snapshot(board.id)).board;
+      assert.deepStrictEqual(stored.evaluatorModel, board.evaluatorModel);
+      assert.deepStrictEqual(stored.defaultCardModel, board.defaultCardModel);
+      const pools = (yield* kanban.snapshot(board.id)).pools;
+      const cardPool = pools.find((pool) => pool.key === Rules.poolKey(board.defaultCardModel));
+      assert.deepStrictEqual(cardPool?.model, board.defaultCardModel);
+      const card = yield* kanban.createCard(board.id, { prompt: "A default card" }, owner);
+      assert.deepStrictEqual(card.model, board.defaultCardModel);
+
+      const plain = yield* kanban.createBoard({
+        slug: "plain-picked-default",
+        name: "Plain picked default",
+        defaultProjectId: null,
+        evaluatorModel: opus,
+      });
+      assert.strictEqual(Rules.modelLevel(plain.evaluatorModel), "high");
+
+      const explicit = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      const other = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol" });
+      const alternative = yield* kanban.createBoard({
+        slug: "other-defaults",
+        name: "Other defaults",
+        defaultProjectId: null,
+        evaluatorModel: other,
+      });
+      assert.deepStrictEqual(alternative.evaluatorModel, other);
+      assert.isNull(Rules.modelLevel(alternative.evaluatorModel));
+
+      const ensured = yield* kanban.ensureBoard({
+        slug: "ensure-picked-defaults",
+        name: "Ensured defaults",
+        defaultProjectId: null,
+        managerModel: opus,
+        evaluatorModel: explicit,
+        defaultCardModel: withOtherOption,
+      });
+      assert.deepStrictEqual(ensured.managerModel, opus);
+      assert.deepStrictEqual(ensured.evaluatorModel, explicit);
+      assert.deepStrictEqual(ensured.defaultCardModel.options, board.evaluatorModel.options);
+      const ensuredPools = (yield* kanban.snapshot(ensured.id)).pools;
+      assert.deepStrictEqual(
+        ensuredPools.find((pool) => pool.key === Rules.poolKey(ensured.defaultCardModel))?.model,
+        ensured.defaultCardModel,
+      );
+      const sameManager = yield* kanban.ensureBoard({
+        slug: "same-manager",
+        name: "Same manager",
+        defaultProjectId: null,
+        managerModel: {
+          ...withOtherOption,
+          options: [...withOtherOption.options, { id: "variant", value: "high" }],
+        },
+        defaultCardModel: opus,
+      });
+      assert.strictEqual(
+        Rules.poolKey(sameManager.managerModel),
+        Rules.poolKey(sameManager.defaultCardModel),
+      );
+      assert.deepStrictEqual(
+        (yield* kanban.snapshot(sameManager.id)).pools.find(
+          (pool) => pool.key === Rules.poolKey(sameManager.defaultCardModel),
+        )?.model,
+        sameManager.defaultCardModel,
+      );
+      const otherCard = yield* kanban.ensureBoard({
+        slug: "ensure-other-card",
+        name: "Other card",
+        defaultProjectId: null,
+        defaultCardModel: other,
+      });
+      assert.deepStrictEqual(otherCard.defaultCardModel, other);
+    }).pipe(
+      Effect.provide(testLayer(fake.layer, KanbanModels.layerTest(null), [providerWithFastMode])),
+    );
+  }),
+);
+
+it.effect("new board and setup defaults follow canonical model routing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const nativeProvider: ServerProvider = {
+      ...opencodeTestProvider(),
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models: [
+        {
+          slug: "claude-opus-5-5",
+          name: "Claude Opus 5.5",
+          isCustom: false,
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Effort",
+                type: "select",
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "xhigh", label: "Xhigh" },
+                ],
+              },
+              { id: "fastMode", label: "Fast mode", type: "boolean" },
+            ],
+          },
+        },
+      ],
+    };
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const legacy = modelSelectionOf({ model: "opus/claude-opus-5-5" });
+      const native = {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-opus-5-5",
+        options: [{ id: "fastMode", value: true }],
+      };
+      const unmapped = yield* kanban.createBoard({
+        slug: "native-routing-off",
+        name: "Native routing off",
+        defaultProjectId: null,
+        evaluatorModel: native,
+      });
+      assert.deepStrictEqual(unmapped.evaluatorModel, native);
+
+      yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
+      const expected = { ...native, options: [...native.options, { id: "effort", value: "high" }] };
+      const board = yield* kanban.createBoard({
+        slug: "routed-picked-defaults",
+        name: "Routed defaults",
+        defaultProjectId: ProjectId.make("project-1"),
+        evaluatorModel: native,
+      });
+      assert.deepStrictEqual(board.evaluatorModel, expected);
+      assert.strictEqual(Rules.modelLevel(board.defaultCardModel), "high");
+      assert.strictEqual(board.defaultCardModel.instanceId, native.instanceId);
+      const ensured = yield* kanban.ensureBoard({
+        slug: "routed-card-default",
+        name: "Routed card default",
+        defaultProjectId: null,
+        defaultCardModel: legacy,
+      });
+      assert.strictEqual(Rules.modelLevel(ensured.defaultCardModel), "high");
+      assert.strictEqual(ensured.defaultCardModel.instanceId, native.instanceId);
+
+      const explicit = { ...native, options: [...native.options, { id: "effort", value: "xhigh" }] };
+      const explicitBoard = yield* kanban.createBoard({
+        slug: "native-explicit",
+        name: "Native explicit",
+        defaultProjectId: ProjectId.make("project-1"),
+        evaluatorModel: explicit,
+      });
+      assert.deepStrictEqual(explicitBoard.evaluatorModel, explicit);
+      yield* kanban.startSetup(explicitBoard.id, { evaluatorModel: explicit });
+      assert.deepStrictEqual(
+        (yield* kanban.snapshot(explicitBoard.id)).board.evaluatorModel,
+        explicit,
+      );
+      const refused = yield* Effect.exit(
+        kanban.createBoard({
+          slug: "native-invalid",
+          name: "Native invalid",
+          defaultProjectId: null,
+          evaluatorModel: { ...native, options: [{ id: "effort", value: "unavailable" }] },
+        }),
+      );
+      assert.isTrue(Exit.isFailure(refused));
+
+      yield* kanban.startSetup(board.id, { evaluatorModel: native });
+      const after = (yield* kanban.snapshot(board.id)).board;
+      assert.deepStrictEqual(after.evaluatorModel, expected);
+      assert.deepStrictEqual(
+        (yield* Ref.get(fake.threads)).get(after.setup!.threadId)!.model,
+        expected,
+      );
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer, KanbanModels.layerTest(null), [opencodeTestProvider(), nativeProvider]),
+      ),
+    );
   }),
 );
 
