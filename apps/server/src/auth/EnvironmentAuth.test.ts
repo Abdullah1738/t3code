@@ -25,6 +25,8 @@ import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "../ardud/control/http.t
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as PersistenceErrors from "../persistence/Errors.ts";
@@ -174,6 +176,8 @@ it.live("authenticates control, websocket, and MCP clients while an unrelated wr
                   Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
                     latestAgentSequence: () => Effect.succeed(42),
                   }),
+                  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                  Layer.mock(Orchestrator.OrchestratorV2)({}),
                   Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
                   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
                   ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-auth-" }),
