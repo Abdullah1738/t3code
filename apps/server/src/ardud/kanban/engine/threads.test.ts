@@ -126,7 +126,7 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       sendToThread: (input) =>
         Effect.sync(() => {
           sent.push(input);
-          return {} as never;
+          return { run: { id: `run-${sent.length}` } } as never;
         }),
     });
     yield* Effect.gen(function* () {
