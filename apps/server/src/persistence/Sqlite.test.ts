@@ -68,9 +68,11 @@ it.effect("logs the actual SQLite open, setup, migration and index boundaries", 
       yield* SqlClient.SqlClient;
     }).pipe(
       Effect.provide(
-        SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer)),
+        SqlitePersistence.layerFromPath(dbPath).pipe(
+          Layer.provide(NodeServices.layer),
+          Layer.provide(StartupPhaseLog.layer(tempDir)),
+        ),
       ),
-      Effect.provide(StartupPhaseLog.layer(tempDir)),
     );
     const records = NodeFS.readFileSync(NodePath.join(tempDir, "startup-phases.ndjson"), "utf8")
       .trim()
