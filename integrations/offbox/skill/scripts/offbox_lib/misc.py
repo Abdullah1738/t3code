@@ -148,12 +148,19 @@ def _release_one(con, r, delete):
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 
-def kill_run(run_id: str) -> int:
+def kill_run(run_id: str, me: dict | None = None) -> int:
     """Stop a hung starting/running box run. The row is marked killed only after boat confirms the process is gone.
-    No box lock: the hung run's client may be holding it."""
+    No box lock: the hung run's client may be holding it.
+
+    With a caller (`me`), the run must be the caller's own: an unproven caller is refused, and a proven one may only
+    stop a run its owner string names. Killing another execution's run is an authority transfer, like a release."""
     from .runs import finish
     r = _run_row(run_id)
     rid = r["run_id"]
+    if me is not None:
+        require_proven(me, "kill")
+        if r["owner"] != me["owner"]:
+            raise OffboxError(f"run {rid} belongs to another caller; only its owner can kill it", code=2)
     if r["status"] not in ("starting", "running"):
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
@@ -200,6 +207,9 @@ def resolve_box(me: dict, box_id: str | None) -> str:
 
 
 def ssh_shell(me: dict, box_id: str | None, cmd: list[str]) -> int:
+    # Gated first, with or without an explicit box: an explicit id names a box this caller may not own, and the
+    # no-id path acquires a lease. Nothing below (lease, API, ssh setup, subprocess) may run for an unproven caller.
+    require_proven(me, "ssh")
     row = None
     if not box_id:
         row = lease.acquire(me)

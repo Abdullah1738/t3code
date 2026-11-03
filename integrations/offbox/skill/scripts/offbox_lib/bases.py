@@ -296,6 +296,9 @@ def list_bases(as_json: bool) -> None:
 
 
 def rm_base(me: dict, name: str) -> None:
+    # Deletes the base's box and saved snapshot, which other leases were forked from. Refused before the lookup, so an
+    # unproven caller can't even learn which box a base points at.
+    require_proven(me, "base rm")
     con = db()
     full = name if ":" in name else f"{me['repo_key']}:{name}"
     r = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
