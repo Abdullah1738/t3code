@@ -4872,8 +4872,9 @@ it.effect("reserves a held reasoning item's position before an intervening tool"
                     new Map(items).set(event.turnItem.id, { ...event.turnItem, ordinal }),
                   );
                   if (event.turnItem.type === "reasoning") {
-                    yield* Ref.update(writes, (current) => [...current, event.turnItem.text]);
-                    if (!event.turnItem.streaming) yield* Deferred.succeed(done, undefined);
+                    const item = event.turnItem;
+                    yield* Ref.update(writes, (current) => [...current, item.text]);
+                    if (!item.streaming) yield* Deferred.succeed(done, undefined);
                   }
                 }
                 return [];

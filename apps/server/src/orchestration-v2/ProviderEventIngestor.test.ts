@@ -464,14 +464,14 @@ it.layer(layerCheckpointReplay)("reasoning checkpoint persistence", (it) => {
           rows.reduce((total, row) => total + row.bytes, 0);
         // Values come from the persisted payload_json BLOB lengths, not text
         // estimates, JS callback counts, WAL size, or physical disk bytes.
-        console.info(
-          "C3 synthetic checkpoint replay (logical persisted payload bytes)",
-          JSON.stringify({
+        yield* Effect.logInfo(
+          "C3 synthetic checkpoint replay (logical persisted payload bytes): " +
+            JSON.stringify({
             inputEvents: entries.length,
             before: { bytes: sum(before.aggregates), byType: before.aggregates },
             after: { bytes: sum(after.aggregates), byType: after.aggregates },
             savedBytes: sum(before.aggregates) - sum(after.aggregates),
-          }),
+            }),
         );
       }),
     { timeout: 180_000 },
