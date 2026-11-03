@@ -194,8 +194,7 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:
-    # Every caller of resolve_box (ssh, ports, keep, save) is acting on a box. Without a box id, it selects the
-    # caller's own lease, so an unproven caller is refused before any lookup.
+    # Ports uses this for both explicit IDs and the caller's lease; refuse before either selection.
     require_proven(me, "this box action")
     if box_id:
         return box_id

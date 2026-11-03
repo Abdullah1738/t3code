@@ -343,9 +343,8 @@ class SharedSessionOwnerTests(unittest.TestCase):
             "release by id": lambda: misc.release(me, "box-legacy", False, False),
             "release (own lease)": lambda: misc.release(me, None, False, False),
             "list (own leases)": lambda: misc.list_leases(me, False, False),
-            # resolve_box covers ports and the no-id ssh path. An explicit ssh id skips it: that is covered by
-            # ExplicitIdEntryPointTests through cli.main, not here.
-            "ports/no-id box (resolve_box)": lambda: misc.resolve_box(me, None),
+            # resolve_box covers ports. ssh_shell is separate, including its no-id acquisition path.
+            "ports (resolve_box)": lambda: misc.resolve_box(me, None),
             # _caller_lease covers save and keep, which act on the caller's own lease. base rm is a different path
             # (rm_base) and is covered by ExplicitIdEntryPointTests.
             "save/keep (caller lease)": lambda: bases._caller_lease(me),
