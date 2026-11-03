@@ -211,7 +211,7 @@ interface Plans {
     readonly before: ModelSelection;
     readonly next: ModelSelection;
   }>;
-  readonly boards: ReadonlyArray<{ readonly board: KanbanBoard; readonly pools: ReadonlyArray<KanbanPool>; readonly plan: BoardPlan }>;
+  readonly boards: ReadonlyArray<{ readonly board: KanbanBoard; readonly pools: ReadonlyArray<KanbanPool>; readonly snapshot: BoardSnapshot; readonly plan: BoardPlan }>;
   readonly schedules: ReadonlyArray<{
     readonly id: ScheduledTaskId;
     readonly before: ModelSelection;
@@ -314,14 +314,15 @@ export const make = Effect.gen(function* () {
       const openLinks = yield* store
         .threadLinks({ boardId: board.id, open: true })
         .pipe(Effect.mapError((cause) => migrationError("read thread links", cause)));
-      const plan = planBoard({ board, pools, cards, openLinks } satisfies BoardSnapshot);
+      const boardSnapshot = { board, pools, cards, openLinks } satisfies BoardSnapshot;
+      const plan = planBoard(boardSnapshot);
       for (const conflict of plan.conflicts) {
         conflicts.push({ scope: "board", ref: `${board.id}:${conflict.field}`, reason: conflict.reason });
       }
       for (const collision of plan.collisions) {
         collisions.push({ boardId: board.id, newKey: collision.newKey, oldKeys: collision.oldKeys });
       }
-      boards.push({ board, pools, plan });
+      boards.push({ board, pools, snapshot: boardSnapshot, plan });
     }
 
     // Schedules: every stored task, disabled ones included.
@@ -362,7 +363,7 @@ export const make = Effect.gen(function* () {
     const threadIds: Array<ThreadId> = [];
     for (const project of snapshot.projects) {
       const listedThreads = yield* threads
-        .listProjectThreads({ projectId: project.id, includeSubagents: false })
+        .listProjectThreads({ projectId: project.id, includeSubagents: true })
         .pipe(Effect.mapError((cause) => migrationError("read threads", cause)));
       for (const thread of listedThreads) {
         if (thread.archivedAt !== null || thread.settledAt !== null) continue;
@@ -374,6 +375,7 @@ export const make = Effect.gen(function* () {
         const next = plan._tag === "mapped" ? plan.next : null;
         // DECISIONS 3: migrated threads run full access, except plan mode (validation-core 4.1).
         const widenTo =
+          next !== null &&
           (thread.runtimeMode === "approval-required" || thread.runtimeMode === "auto-accept-edits") &&
           thread.interactionMode !== "plan"
             ? ("full-access" as const)
@@ -483,15 +485,33 @@ export const make = Effect.gen(function* () {
     const next = entry.plan.next;
     if (next === null || !entry.plan.changed) return 0;
     const oldPoolKeys = entry.pools.map((pool) => pool.key);
-    yield* store
-      .migrateBoardSelections({
+    yield* kanban.withSelectionMigrationLock(sql.withTransaction(Effect.gen(function* () {
+      const currentBoard = (yield* store.boards).find((board) => board.id === entry.board.id);
+      const current = {
+        board: currentBoard,
+        pools: yield* store.pools(entry.board.id),
+        cards: yield* store.cards(entry.board.id),
+        openLinks: yield* store.threadLinks({ boardId: entry.board.id, open: true }),
+      };
+      if (!sameValue(current, entry.snapshot)) {
+        return yield* Effect.fail(migrationError(`board ${entry.board.id} changed after planning`));
+      }
+      yield* store.migrateBoardSelections({
         board: next.board,
         pools: next.pools,
         oldPoolKeys,
         cards: next.cards,
         threadLinks: next.openLinks,
-      })
-      .pipe(Effect.mapError((cause) => migrationError(`write board ${entry.board.id}`, cause)));
+      });
+      const now = DateTime.formatIso(yield* DateTime.now);
+      for (const change of entry.plan.changes) {
+        const before = yield* encodeLedgerValue(change.before);
+        const after = yield* encodeLedgerValue(change.after);
+        yield* sql`INSERT INTO ardud_harness_selection_migration
+          (version, scope, ref, before_json, after_json, applied_at, rolled_back_at)
+          VALUES (${SELECTION_MIGRATION_VERSION}, ${"board"}, ${change.ref}, ${before}, ${after}, ${now}, NULL)`;
+      }
+    }))).pipe(Effect.mapError((cause) => migrationError(`write board ${entry.board.id}`, cause)));
     return entry.plan.changes.length;
   });
 
@@ -553,9 +573,7 @@ export const make = Effect.gen(function* () {
     for (const entry of plans.boards) {
       const changes = yield* writeBoard(entry);
       if (changes > 0) {
-        for (const change of entry.plan.changes) {
-          yield* record("board", change.ref, change.before, change.after);
-        }
+        counter.applied += changes;
       }
     }
     // Schedules: guarded per row, so a schedule edited since the dry run is skipped, not overwritten.
@@ -761,12 +779,10 @@ export const make = Effect.gen(function* () {
     rows: ReadonlyArray<LedgerRow>,
   ) {
     const boardRows = rows.filter((row) => row.scope === "board");
-    const boardRecord = boardRows.find((row) => row.ref === `board:${boardId}`);
-    if (boardRecord === undefined) return "board row is missing from the ledger";
 
     // Read the board's current state and check every row against what apply wrote.
     const current = {
-      board: (yield* kanban.boards.pipe(
+      board: (yield* store.boards.pipe(
         Effect.mapError((cause) => migrationError("read board", cause)),
       )).find((board) => board.id === boardId),
       pools: yield* store
@@ -782,7 +798,7 @@ export const make = Effect.gen(function* () {
     if (current.board === undefined) return "board is gone";
 
     const restored = {
-      board: undefined as KanbanBoard | undefined,
+      board: current.board,
       pools: new Map<string, KanbanPool>(),
       cards: new Map<string, KanbanCard>(),
       links: new Map<string, KanbanThreadLink>(),
@@ -826,8 +842,6 @@ export const make = Effect.gen(function* () {
         restored.oldPoolKeys.push(afterPool.key);
       }
     }
-    if (restored.board === undefined) return "board row is missing from the ledger";
-
     // The rows restored in full. Old keys are the after keys, so the store removes them first.
     yield* store
       .migrateBoardSelections({
@@ -879,9 +893,16 @@ export const make = Effect.gen(function* () {
         const boardRows = rows.filter(
           (row) => row.scope === "board" && boardIdOf(row.ref) === boardId,
         );
-        const reason = yield* restoreBoard(boardId, boardRows);
+        const reason = yield* kanban.withSelectionMigrationLock(
+          sql.withTransaction(Effect.gen(function* () {
+            const reason = yield* restoreBoard(boardId, boardRows);
+            if (reason === null) yield* markRolledBack(boardRows.map((row) => row.id));
+            return reason;
+          })).pipe(
+            Effect.mapError((cause) => migrationError(`restore board ${boardId}`, cause)),
+          ),
+        );
         if (reason === null) {
-          yield* markRolledBack(boardRows.map((row) => row.id));
           reverted += boardRows.length;
         } else {
           skipped.push({ ref: `board:${boardId}`, reason });

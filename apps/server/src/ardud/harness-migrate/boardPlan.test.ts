@@ -127,3 +127,11 @@ it("blocks the whole board when two old pools land on one new key", () => {
   assert.isFalse(plan.changed);
   assert.isNull(plan.next);
 });
+
+it("review: a card-only conflict blocks the entire board", () => {
+  const plan = planBoard(snapshot({
+    cards: [card({ model: sel("opus/claude-opus-5-5#xhigh", "high") })],
+  }));
+  assert.strictEqual(plan.conflicts.length, 1);
+  assert.isNull(plan.next, "allowConflicts must skip a conflicted board, not partially migrate it");
+});

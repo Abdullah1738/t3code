@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import { ProjectId, ServerSettingsError, type KanbanActor } from "@t3tools/contracts";
 
 import * as ProjectService from "../../project/ProjectService.ts";
@@ -262,5 +263,47 @@ it.effect("dry-run reports a board's selections and writes nothing", () =>
 
     assert.strictEqual(report.version, SelectionMigration.SELECTION_MIGRATION_VERSION);
     assert.deepStrictEqual(after, before);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("review: rollback handles a board whose defaults were already migrated", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const board = yield* kanban.ensureBoard({
+      slug: "already-native",
+      name: "Already native",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const native = { instanceId: "claudeAgent", model: "claude-opus-5-5" } as never;
+    yield* store.putBoard({ ...board, managerModel: native, evaluatorModel: native,
+      defaultCardModel: native, reviewChains: [] });
+    yield* store.putPool(board.id, { key: "opencode/opus/claude-opus-5-5",
+      model: { instanceId: "opencode", model: "opus/claude-opus-5-5" }, slots: 2 } as never);
+    const before = yield* store.pools(board.id);
+    yield* migration.apply;
+    const rolled = yield* migration.rollback(1);
+    assert.deepStrictEqual(rolled.skipped, []);
+    assert.deepStrictEqual(yield* store.pools(board.id), before);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("review: a ledger failure cannot leave a migrated board without rollback data", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const sql = yield* SqlClient.SqlClient;
+    const board = yield* kanban.ensureBoard({ slug: "ledger-fail", name: "Ledger fail",
+      defaultProjectId: ProjectId.make("project-1") });
+    yield* store.putPool(board.id, { key: "opencode/opus/claude-opus-5-5",
+      model: { instanceId: "opencode", model: "opus/claude-opus-5-5" }, slots: 2 } as never);
+    const before = yield* store.pools(board.id);
+    yield* sql.unsafe(`CREATE TRIGGER review_reject_ledger BEFORE INSERT ON ardud_harness_selection_migration
+      BEGIN SELECT RAISE(FAIL, 'review injected failure'); END`);
+    yield* migration.apply.pipe(Effect.flip);
+    assert.deepStrictEqual(yield* store.pools(board.id), before,
+      "a failed migration must retain the original board or durable rollback data");
   }).pipe(Effect.provide(testLayer)),
 );

@@ -94,8 +94,6 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
     .filter(([, oldKeys]) => oldKeys.length > 1)
     .map(([newKey, oldKeys]) => ({ newKey, oldKeys }));
 
-  const blocked = conflicts.length > 0 || collisions.length > 0;
-
   const boardNext: KanbanBoard = {
     ...board,
     managerModel: mapOne(conflicts, "managerModel", board.managerModel),
@@ -151,6 +149,7 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
   });
 
   // The blocked case reports; the store is never asked to write it.
+  const blocked = conflicts.length > 0 || collisions.length > 0;
   const finalChanged = changes.length > 0;
   return {
     boardId: board.id,

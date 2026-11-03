@@ -5878,6 +5878,23 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reboundRun = afterRebind.runs.find((run) => run.id === first.id);
       assert.deepEqual(reboundRun?.modelSelection, rebound);
       assert.equal(reboundRun?.providerInstanceId, alternateInstanceId);
+      assert.equal(
+        afterRebind.providerThreads.find((entry) => entry.id === reboundRun?.providerThreadId)?.providerInstanceId,
+        alternateInstanceId,
+        "review: the rebound run must not keep the old instance's native provider thread",
+      );
+      assert.deepEqual(
+        afterRebind.providerThreads.find((entry) => entry.id === first.providerThreadId),
+        before.providerThreads.find((entry) => entry.id === first.providerThreadId),
+        "rebinding must preserve the source provider thread",
+      );
+      const attempt = afterRebind.attempts.find((item) => item.id === reboundRun?.activeAttemptId);
+      assert.equal(attempt?.providerThreadId, reboundRun?.providerThreadId);
+      assert.equal(attempt?.providerInstanceId, alternateInstanceId);
+      assert.equal(
+        afterRebind.nodes.find((item) => item.id === reboundRun?.rootNodeId)?.providerThreadId,
+        reboundRun?.providerThreadId,
+      );
       assert.equal(reboundRun?.status, "queued", "a rebind must not start or cancel the run");
       assert.equal(reboundRun?.ordinal, first.ordinal, "a rebind must keep the run's ordinal");
       assert.equal(
