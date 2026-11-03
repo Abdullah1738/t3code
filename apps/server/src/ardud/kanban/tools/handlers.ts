@@ -20,7 +20,8 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
-import { KanbanService } from "../engine/KanbanService.ts";
+import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
+import { textProblem } from "../engine/text.ts";
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 
@@ -431,6 +432,8 @@ const handlers = {
   card_flag: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        const problem = textProblem([["reason", input.reason]]);
+        if (problem) return yield* invalid(problem);
         const card = yield* cardFor(service, caller, input.card);
         yield* ownCard(caller, card);
         const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
@@ -445,6 +448,10 @@ const handlers = {
         if (caller.link?.role !== "review") {
           return yield* refuse("Only a card's review thread records a review verdict.");
         }
+        const problem = textProblem(
+          (input.findings ?? []).map((line) => ["finding", line] as const),
+        );
+        if (problem) return yield* invalid(problem);
         const findings = (input.findings ?? []).map((line) => line.trim()).filter(Boolean);
         if (input.verdict === "findings" && findings.length === 0) {
           return yield* invalid("A findings verdict needs at least one finding.");
@@ -464,6 +471,11 @@ const handlers = {
   discussion_post: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        const problem = textProblem([
+          ["message", input.text],
+          ...messageTextFields(input.blocks ?? []),
+        ]);
+        if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
         const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
@@ -731,9 +743,14 @@ const handlers = {
   discussion_create: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        const problem = textProblem([
+          ["message", input.text],
+          ...messageTextFields(input.blocks ?? []),
+        ]);
+        if (problem) return yield* invalid(problem);
+        const blocks = blocksOf(input);
         const board = yield* boardFor(service, caller);
         const discussion = yield* service.createDiscussion(board.id, input.title, caller.actor);
-        const blocks = blocksOf(input);
         if (blocks.length > 0) yield* service.post(discussion.id, caller.actor, blocks);
         return { discussion: yield* service.discussion(discussion.id) };
       }),
@@ -786,6 +803,8 @@ const handlers = {
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        const problem = textProblem([["text", input.text]]);
+        if (problem) return yield* invalid(problem);
         const cardThread = isCardThread(caller);
         if (cardThread && input.kind !== "request") {
           return yield* refuse(

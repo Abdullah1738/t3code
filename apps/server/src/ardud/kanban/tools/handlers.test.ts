@@ -137,6 +137,61 @@ const fakeThreads = (dbPath?: string) => {
 
 const owner: KanbanActor = { _tag: "owner" };
 
+it.effect("card_edit reports control characters to an evaluator", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "text-guard",
+      name: "Text guard",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_edit", {
+      card: card.id,
+      comment: "ok\u0000\u0000",
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, "control character U+0000");
+    assert.isFalse((yield* kanban.card(card.id)).events.some((event) => event.kind === "comment"));
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion tools refuse corrupted text before creating a discussion", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "post-guard",
+      name: "Post guard",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const evaluator = ThreadId.make("thread-evaluator");
+    const before = yield* kanban.discussions(board.id);
+    const posted = yield* call(evaluator, "discussion_post", { card: card.id, text: "bad\u0000" });
+    assert.isTrue(posted.isError);
+    assert.include(posted.text, "message has a control character U+0000 at offset 3");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), before);
+    assert.isNull((yield* kanban.card(card.id)).card.discussionId);
+    const created = yield* call(evaluator, "discussion_create", {
+      title: "New discussion",
+      text: "bad\u0000",
+    });
+    assert.isTrue(created.isError);
+    assert.include(created.text, "message has a control character U+0000 at offset 3");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a work thread with nothing active defaults to the cards still its own", () => {
   const { running, layer } = fakeThreads();
   return Effect.gen(function* () {

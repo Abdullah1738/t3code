@@ -76,6 +76,7 @@ import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
+import * as Text from "./text.ts";
 import { KanbanThreads } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
@@ -522,6 +523,45 @@ const uuid = () => NodeCrypto.randomUUID();
 
 const failWith = (code: KanbanError["code"], detail: string) =>
   Effect.fail(new KanbanError({ code, detail }));
+
+const checkText = (fields: ReadonlyArray<readonly [string, string | null | undefined]>) => {
+  const problem = Text.textProblem(fields);
+  return problem ? failWith("invalid", problem) : Effect.void;
+};
+
+const cardTextFields = (input: NewCard | CardPatch) => [
+  ["title", input.title],
+  ["description", input.description],
+  ["prompt", input.prompt],
+  ...("question" in input ? [["question", input.question] as const] : []),
+  ...("comment" in input ? [["comment", input.comment] as const] : []),
+  ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
+] as const;
+
+export const messageTextFields = (blocks: ReadonlyArray<KanbanBlock>) => {
+  const fields: Array<readonly [string, string | null]> = [];
+  for (const block of blocks) {
+    switch (block._tag) {
+      case "md":
+        fields.push(["message", block.text]);
+        break;
+      case "collapse":
+        fields.push(["message", block.title], ["message", block.text]);
+        break;
+      case "html":
+        fields.push(["message", block.html], ["message", block.title]);
+        break;
+      case "choice":
+        fields.push(["message", block.question]);
+        for (const option of block.options) fields.push(["message", option.label]);
+        break;
+      case "image":
+        fields.push(["message", block.alt]);
+        break;
+    }
+  }
+  return fields;
+};
 
 const isKanbanError = Schema.is(KanbanError);
 
@@ -2128,6 +2168,7 @@ const make = Effect.gen(function* () {
     blocks: ReadonlyArray<KanbanBlock>,
     route = true,
   ) {
+    yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
       return yield* failWith("invalid", "a message needs at least one block");
     const discussion = yield* discussionOf(discussionId);
@@ -3735,6 +3776,7 @@ const make = Effect.gen(function* () {
   const createBoard: KanbanServiceShape["createBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
         if ((yield* store.boards).some((board) => board.slug === slug)) {
           return yield* failWith("conflict", `a board with slug ${slug} already exists`);
@@ -3790,6 +3832,7 @@ const make = Effect.gen(function* () {
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
         const existing = (yield* store.boards).find((board) => board.slug === slug);
         if (existing) return existing;
@@ -3800,6 +3843,12 @@ const make = Effect.gen(function* () {
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["name", patch.name],
+          ["model routing", patch.instructions?.modelRouting],
+          ["reviewer routing", patch.instructions?.reviewerRouting],
+          ["escalation", patch.instructions?.escalation],
+        ]);
         const board = yield* boardOf(boardId);
         const managerModel = patch.managerModel
           ? yield* canonicalModel(patch.managerModel)
@@ -3995,6 +4044,7 @@ const make = Effect.gen(function* () {
     input: NewCard,
     actor: KanbanActor,
   ) {
+    yield* checkText(cardTextFields(input));
     // A thread's or a script's card waits for an evaluator to write its packet;
     // the owner's and the evaluators' own come written.
     const packet = actor._tag === "thread" || actor._tag === "script";
@@ -4162,6 +4212,7 @@ const make = Effect.gen(function* () {
   const createForThread: KanbanServiceShape["createForThread"] = (threadId, input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(cardTextFields(input));
         const thread = yield* workThreadOf(threadId);
         // The thread's live model comes first: a switch moves the thread even after every
         // card that carried the switch is released, and the held slot follows it.
@@ -4270,6 +4321,7 @@ const make = Effect.gen(function* () {
   const editCard: KanbanServiceShape["editCard"] = (cardId, patch, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
@@ -4382,6 +4434,10 @@ const make = Effect.gen(function* () {
   const moveCard: KanbanServiceShape["moveCard"] = (cardId, to, role, actor, options) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["note", options?.note],
+          ["question", options?.question],
+        ]);
         const card = yield* cardOf(cardId);
         if (role === "cardThread") {
           if (actor._tag !== "thread" || card.activeThreadId !== actor.threadId) {
@@ -4457,6 +4513,10 @@ const make = Effect.gen(function* () {
   const askOwner: KanbanServiceShape["askOwner"] = (cardId, input, actor, role) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["question", input.question],
+          ...(input.options ?? []).map((option) => ["question", option] as const),
+        ]);
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
@@ -4526,6 +4586,7 @@ const make = Effect.gen(function* () {
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["reason", reason]]);
         const card = yield* cardOf(cardId);
         // A stop from the owner, an evaluator or another thread is theirs to lift
         // or reword; a thread replacing it with its own flag could then clear it.
@@ -4612,6 +4673,7 @@ const make = Effect.gen(function* () {
   ) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
         const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
         const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
@@ -4691,6 +4753,7 @@ const make = Effect.gen(function* () {
   const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
         const script = yield* scriptFor(card, actor);
         const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
@@ -4774,6 +4837,7 @@ const make = Effect.gen(function* () {
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(findings.map((finding) => ["finding", finding] as const));
         const link = yield* store.threadLink(threadId);
         if (!link || link.role !== "review" || link.cardId === null) {
           return yield* failWith("denied", "only a card's review thread records a review result");
@@ -4864,6 +4928,7 @@ const make = Effect.gen(function* () {
   const cardThread: KanbanServiceShape["cardThread"] = (cardId, action, text, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", text]]);
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
         if (action === "steer") {
@@ -5250,6 +5315,11 @@ const make = Effect.gen(function* () {
   const setGoal: KanbanServiceShape["setGoal"] = (boardId, input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["name", input.name],
+          ["now", input.now],
+          ["story", input.story],
+        ]);
         const goals = yield* store.goals(boardId);
         const at = yield* nowIso;
         const existing = input.id ? goals.find((goal) => goal.id === input.id) : undefined;
@@ -5283,6 +5353,12 @@ const make = Effect.gen(function* () {
   const setGroups: KanbanServiceShape["setGroups"] = (boardId, groups) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(
+          groups.flatMap((group) => [
+            ["name", group.name] as const,
+            ["summary", group.summary] as const,
+          ]),
+        );
         const at = yield* nowIso;
         const next = groups.map((group) => ({ ...group, updatedAt: at }));
         yield* store.putGroups(boardId, next);
@@ -5293,6 +5369,7 @@ const make = Effect.gen(function* () {
   const createDiscussion: KanbanServiceShape["createDiscussion"] = (boardId, title, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["title", title]]);
         yield* boardOf(boardId);
         return yield* newDiscussion(boardId, title, null, actor);
       }),
@@ -5301,6 +5378,7 @@ const make = Effect.gen(function* () {
   const updateDiscussion: KanbanServiceShape["updateDiscussion"] = (discussionId, patch, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["title", patch.title]]);
         if (actor._tag !== "owner") {
           return yield* failWith("denied", "only the owner renames, settles, snoozes or pins");
         }
@@ -5359,6 +5437,7 @@ const make = Effect.gen(function* () {
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["answer", text]]);
         const discussion = yield* discussionOf(discussionId);
         const message = yield* store.message(discussionId, seq);
         if (!message) return yield* failWith("not-found", `message ${seq}`);
@@ -5468,6 +5547,10 @@ const make = Effect.gen(function* () {
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["title", page.title],
+          ["wiki body", page.body],
+        ]);
         yield* boardOf(boardId);
         const slug = page.slug
           .trim()
@@ -5655,6 +5738,7 @@ const make = Effect.gen(function* () {
     startSetup: (boardId, input) =>
       guard(
         Effect.gen(function* () {
+          yield* checkText([["text", input.text]]);
           const board = yield* boardOf(boardId);
           if (board.setup?.status === "running") {
             return yield* failWith("invalid", `board ${board.slug} is already in setup`);
@@ -5676,6 +5760,13 @@ const make = Effect.gen(function* () {
     startEvaluator: (boardId, purpose, text) =>
       guard(
         Effect.gen(function* () {
+          yield* checkText([
+            ["text", text],
+            [
+              "text",
+              purpose.kind === "setup" || purpose.kind === "request" ? purpose.text : undefined,
+            ],
+          ]);
           const board = yield* boardOf(boardId);
           if (
             purpose.kind === "stalled" ||

@@ -302,6 +302,72 @@ const observedTestLayer = (
 
 const owner: KanbanActor = { _tag: "owner" };
 
+it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "text-guard",
+        name: "Text guard",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+        owner,
+      );
+      const before = yield* kanban.card(created.id);
+      const error = yield* kanban
+        .editCard(created.id, { comment: "ok\u0000\u0000", description: "not saved" }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(error.code, "invalid");
+      assert.include(error.detail, "comment has a control character U+0000 at offset 2");
+      const after = yield* kanban.card(created.id);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.strictEqual(after.card.description, before.card.description);
+
+      const comment = "§ tab\tline\nend";
+      yield* kanban.editCard(created.id, { comment }, owner);
+      const events = (yield* kanban.card(created.id)).events;
+      assert.strictEqual(events.filter((event) => event.kind === "comment").at(-1)?.body, comment);
+
+      const cardsBefore = yield* kanban.cards(board.id);
+      const badPrompt = yield* kanban
+        .createCard(board.id, { prompt: "bad\u0001", title: "Bad prompt" }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(badPrompt.code, "invalid");
+      assert.include(badPrompt.detail, "prompt has a control character U+0001 at offset 3");
+      assert.deepStrictEqual(yield* kanban.cards(board.id), cardsBefore);
+
+      const discussion = yield* kanban.createDiscussion(board.id, "Discussion", owner);
+      const messages = yield* kanban.messages(discussion.id);
+      const badPost = yield* kanban
+        .post(discussion.id, owner, [{ _tag: "md", text: "bad\u0000" }])
+        .pipe(Effect.flip);
+      assert.strictEqual(badPost.code, "invalid");
+      assert.include(badPost.detail, "message has a control character U+0000 at offset 3");
+      assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
+      assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, discussion.lastSeq);
+      const blocks: ReadonlyArray<KanbanBlock> = [
+        { _tag: "collapse", title: "ok", text: "bad\u0002" },
+        { _tag: "collapse", title: "bad\u0002", text: "ok" },
+        { _tag: "html", title: null, html: "bad\u0002", height: null },
+        { _tag: "html", title: "bad\u0002", html: "ok", height: null },
+        { _tag: "choice", id: "id", style: "pick", question: "bad\u0002", options: [], multi: false },
+        { _tag: "choice", id: "id", style: "pick", question: "ok", options: [{ id: "id", label: "bad\u0002" }], multi: false },
+        { _tag: "image", url: "https://example.com/image", alt: "bad\u0002" },
+      ];
+      for (const block of blocks) {
+        const rejected = yield* kanban.post(discussion.id, owner, [block]).pipe(Effect.flip);
+        assert.strictEqual(rejected.code, "invalid");
+        assert.include(rejected.detail, "message has a control character U+0002 at offset 3");
+      }
+      assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("new board defaults follow the migration setting without rewriting existing boards", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

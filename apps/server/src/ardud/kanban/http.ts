@@ -34,6 +34,7 @@ import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
+import { textProblem } from "./engine/text.ts";
 
 export const KANBAN_ROUTE_PREFIX = "/api/ardud/kanban";
 
@@ -423,6 +424,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
         const input = yield* body(PostBody);
+        const problem = textProblem([["message", input.text]]);
+        if (problem) return yield* fail("invalid", problem);
         const blocks = [
           ...(input.text?.trim() ? [{ _tag: "md" as const, text: input.text }] : []),
           ...(input.blocks ?? []),

@@ -49,6 +49,7 @@ import { modelSelectionResult } from "./defaults.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
+import * as Text from "./text.ts";
 
 /** A run past this is killed with its whole process group. */
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -312,6 +313,15 @@ const make = Effect.gen(function* () {
     const cards = [...(yield* io(store.cards(script.boardId)))];
     for (const command of commands) {
       if (command.kanban === "card") {
+        const problem = Text.textProblem([
+          ["title", command.title],
+          ["description", command.description],
+          ["prompt", command.prompt],
+        ]);
+        if (problem) {
+          notes.push(`Couldn't add a card: ${problem}`);
+          continue;
+        }
         const existing = Scripts.duplicateOf(cards, command);
         if (existing) {
           notes.push(`Card #${existing.number} is already on the board.`);
@@ -392,8 +402,9 @@ const make = Effect.gen(function* () {
         }
         continue;
       }
+      const problem = Text.textProblem([["message", command.text]]);
       const posted = yield* Effect.result(
-        targetOf(script, command, cards).pipe(
+        (problem ? fail("invalid", problem) : targetOf(script, command, cards)).pipe(
           Effect.flatMap((discussion) =>
             service
               .post(discussion.id, actor, [{ _tag: "md", text: command.text }])
