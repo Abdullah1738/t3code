@@ -926,6 +926,12 @@ export const layerQueryRunner: Layer.Layer<
                           ),
                       }),
                     );
+                    if (failed.includes("recall")) {
+                      return yield* queryRunnerError(
+                        "Caller-aware recall could not be registered.",
+                        "setMcpServers",
+                      );
+                    }
                     if (failed.length > 0) {
                       yield* Effect.logWarning("orchestration-v2.claude-mcp-servers-unavailable", {
                         threadId: input.threadId,
@@ -1296,7 +1302,7 @@ export function makeClaudeQueryOptions(input: {
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined
+        (input.mcpServers?.["t3-code"] === undefined
           ? ""
           : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
             t3ToolInstructionsSuffix(
@@ -1375,29 +1381,46 @@ export function claudeMcpQueryOverrides(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly readOnlySandbox: boolean;
   readonly allowedTools?: ReadonlyArray<string>;
+  readonly recall?: { readonly url: string; readonly threadId: ThreadId };
 }): {
   readonly allowedTools?: ReadonlyArray<string>;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
 } {
   const session = input.mcpSession;
-  if (session === undefined) {
-    return input.allowedTools === undefined ? {} : { allowedTools: input.allowedTools };
-  }
   const mcpAllowedTools = input.readOnlySandbox
     ? CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS
     : [CLAUDE_T3_MCP_TOOL_WILDCARD];
+  const mcpServers: NonNullable<ClaudeQueryOptions["mcpServers"]> = {
+    ...(session === undefined
+      ? {}
+      : {
+          "t3-code": {
+            type: "http" as const,
+            url: session.endpoint,
+            headers: { Authorization: session.authorizationHeader },
+            timeout: CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
+          },
+        }),
+    ...(input.recall === undefined
+      ? {}
+      : {
+          recall: {
+            type: "http" as const,
+            url: input.recall.url,
+            headers: {
+              "X-Robob-Thread": input.recall.threadId,
+              "X-Robob-Driver": CLAUDE_PROVIDER,
+            },
+          },
+        }),
+  };
   return {
-    allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
-    mcpServers: {
-      "t3-code": {
-        type: "http",
-        url: session.endpoint,
-        headers: {
-          Authorization: session.authorizationHeader,
-        },
-        timeout: CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
-      },
-    },
+    ...(session === undefined
+      ? input.allowedTools === undefined
+        ? {}
+        : { allowedTools: input.allowedTools }
+      : { allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])) }),
+    ...(Object.keys(mcpServers).length === 0 ? {} : { mcpServers }),
   };
 }
 
@@ -9111,6 +9134,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const recallUrl = adapterOptions.environment.ROBOB_RECALL_MCP_URL?.trim();
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession,
             readOnlySandbox:
@@ -9118,6 +9142,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(queryPolicy.allowedTools === undefined
               ? {}
               : { allowedTools: queryPolicy.allowedTools }),
+            ...(recallUrl ? { recall: { url: recallUrl, threadId: turnInput.threadId } } : {}),
           });
           const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);

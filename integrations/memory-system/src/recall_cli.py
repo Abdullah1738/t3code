@@ -75,9 +75,10 @@ def format_search(res: dict, *, show_queries: bool = True) -> str:
     return "\n".join(l for l in lines if l is not None)
 
 
-def format_view(ref: str, *, include_tools: bool = False, include_reasoning: bool = False, total_chars: int = 60000) -> str:
+def format_view(ref: str, *, include_tools: bool = False, include_reasoning: bool = False, total_chars: int = 60000,
+                resolved_session: str | None = None) -> str:
     ident, start, end, at = parse_ref(ref)
-    sid = rc.resolve_session(ident)
+    sid = resolved_session if resolved_session is not None else rc.resolve_session(ident)
     if not sid:
         return f"No session matches '{ident}'."
     head = rc.session_header(sid)
@@ -113,7 +114,7 @@ def format_list(rows: list[dict]) -> str:
 
 def _common(p: argparse.ArgumentParser, *, window: bool = True) -> None:
     p.add_argument("--json", action="store_true")
-    p.add_argument("--source", choices=["codex", "hermes", "opencode", "muse"])
+    p.add_argument("--source", choices=["codex", "hermes", "opencode", "muse", "claude"])
     p.add_argument("--cwd", help="only sessions in this directory (or below)")
     if window:
         p.add_argument("--since", help="YYYY-MM-DD, 7d, 3w, 2m")
@@ -203,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             import recall_ask as ra
 
             t0 = time.monotonic()
-            res = ra.inject(" ".join(a.prompt), cwd=a.cwd, session_id=a.session)
+            res = ra.inject(" ".join(a.prompt), cwd=a.cwd, session_id=a.session, anonymous_preview=not a.session)
             res["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
             out(res, res.get("note") or f"(nothing injected: {res.get('skipped')}; queries: {res.get('queries')}; {res['elapsed_ms']} ms)")
         elif a.cmd == "refresh":

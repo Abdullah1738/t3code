@@ -24,7 +24,8 @@ PERSONAL_HOMES = ("~/.claude", "~/.codex", "/Volumes/ExternalSSD/codex")
 INLINE_KEYS = {"http_headers", "env", "set"}
 CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
-HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SessionStart")
+HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart",
+               "SubagentStop", "Stop", "SessionStart", "SessionEnd")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 HARNESSES = ("claude", "codex", "codex-cu")
 NODE_REPL = "node_repl"

@@ -634,6 +634,29 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     assert.deepEqual(overrides, { allowedTools: ["Read"] });
   });
 
+  it("does not add T3 instructions when recall is the only scoped server", () => {
+    const overrides = ClaudeAdapterV2.claudeMcpQueryOverrides({
+      mcpSession: undefined,
+      readOnlySandbox: false,
+      recall: { url: "http://127.0.0.1:18765/mcp", threadId: ThreadId.make("thread-recall") },
+    });
+    const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      nativeThreadId: "native-recall",
+      resume: false,
+      cwd: "/workspace",
+      mcpServers: overrides.mcpServers!,
+    });
+    assert.deepEqual(overrides.mcpServers?.recall, {
+      type: "http",
+      url: "http://127.0.0.1:18765/mcp",
+      headers: { "X-Robob-Thread": "thread-recall", "X-Robob-Driver": "claudeAgent" },
+    });
+    assert.isObject(options.systemPrompt);
+    const prompt = options.systemPrompt as { readonly append?: string };
+    assert.notInclude(prompt.append ?? "", "Use `delegate_task`");
+  });
+
   it("pre-approves all t3-code tools when attaching an MCP session without an allowlist", () => {
     const threadId = ThreadId.make("thread-claude-mcp-no-allowlist");
     const mcpSession = mcpSessionFor(threadId);
@@ -770,6 +793,169 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
       readOnlyToolNames,
     );
   });
+
+  it.effect.each([true, false])(
+    "routes recall through the app thread when configured: %s",
+    (recallEnabled) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-recall-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: recallEnabled ? { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" } : {},
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-claude-recall"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const threadId = ThreadId.make("thread-claude-recall");
+        yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        yield* runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-recall"),
+            text: "hello",
+            attachments: [],
+          }),
+        );
+        assert.deepEqual(openedOptions?.mcpServers, {
+          ...T3_MCP_SERVERS,
+          ...(recallEnabled
+            ? {
+                recall: {
+                  type: "http",
+                  url: "http://127.0.0.1:18765/mcp",
+                  headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "claudeAgent" },
+                },
+              }
+            : {}),
+        });
+        assert.include(openedOptions?.allowedTools ?? [], "mcp__t3-code__*");
+        assert.notInclude(
+          JSON.stringify(ClaudeAdapterV2.loggedClaudeQueryOptions(openedOptions!)),
+          "http://127.0.0.1:18765/mcp",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("uses the turn's app thread instead of the session thread for recall", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-child-recall-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" },
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-claude-child-recall"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const sessionThreadId = ThreadId.make("thread-claude-parent-recall");
+        const childThreadId = ThreadId.make("thread-claude-child-recall");
+        const runtime = yield* adapter.openSession({
+          threadId: sessionThreadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-child-recall"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId: childThreadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: childThreadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-child-recall"),
+          text: "hello",
+          attachments: [],
+        });
+        yield* runtime.startTurn(turn);
+        assert.deepEqual(openedOptions?.mcpServers?.recall, {
+          type: "http",
+          url: "http://127.0.0.1:18765/mcp",
+          headers: { "X-Robob-Thread": childThreadId, "X-Robob-Driver": "claudeAgent" },
+        });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 });
 
 describe("ClaudeAdapterV2 native protocol logging", () => {
@@ -875,7 +1061,7 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
         resume: false,
         cwd: "/workspace",
         allowedTools: [],
-        mcpServers: {},
+        mcpServers: { "t3-code": { type: "http", url: "http://127.0.0.1:1/mcp" } },
         t3ToolAvailability: { browser: true, device: true },
         environment: {},
       });
@@ -888,7 +1074,7 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
         resume: false,
         cwd: "/workspace",
         allowedTools: [],
-        mcpServers: {},
+        mcpServers: { "t3-code": { type: "http", url: "http://127.0.0.1:1/mcp" } },
         t3ToolAvailability: { browser: false, device: false },
         environment: {},
       });

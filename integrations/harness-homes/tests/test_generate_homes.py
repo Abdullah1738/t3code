@@ -570,11 +570,29 @@ class GenerateTests(HarnessTestCase):
     def test_hooks_are_selected_by_harness(self) -> None:
         m = self.manifest()
         self.run_gen(m)
-        claude_hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        codex_hooks = json.loads((self.codex / "hooks.json").read_text())["hooks"]
+        all_claude = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        all_codex = json.loads((self.codex / "hooks.json").read_text())["hooks"]
+        self.assertEqual(all_codex, json.loads((self.codex_cu / "hooks.json").read_text())["hooks"])
+
+        def split(hooks: dict, recall: bool) -> dict:
+            out = {}
+            for event, groups in hooks.items():
+                kept = [g for g in groups if ("/recall_hook.py" in g["hooks"][0]["command"]) == recall]
+                if kept:
+                    out[event] = kept
+            return out
+
+        claude_hooks, codex_hooks = split(all_claude, False), split(all_codex, False)
         self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
         self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse"})
-        self.assertEqual(codex_hooks, json.loads((self.codex_cu / "hooks.json").read_text())["hooks"])
+        claude_recall, codex_recall = split(all_claude, True), split(all_codex, True)
+        self.assertEqual(set(claude_recall), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
+                                              "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
+        self.assertEqual(set(codex_recall), {"UserPromptSubmit", "PostToolUse", "SubagentStart",
+                                             "Stop", "SubagentStop", "SessionEnd"})
+        for hooks, harness in ((claude_recall, "claude"), (codex_recall, "codex")):
+            for groups in hooks.values():
+                self.assertTrue(all(g["hooks"][0]["command"].endswith(f"--harness {harness}") for g in groups))
         for groups in claude_hooks.values():
             for group in groups:
                 self.assertIn("/claude.py", group["hooks"][0]["command"])
