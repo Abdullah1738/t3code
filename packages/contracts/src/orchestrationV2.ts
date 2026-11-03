@@ -2828,6 +2828,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     runtimeMode: RuntimeMode,
+    expectedRuntimeMode: Schema.optional(RuntimeMode),
+    expectedInteractionMode: Schema.optional(ProviderInteractionMode),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.interaction-mode.set"),
@@ -2840,6 +2842,7 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    expectedModelSelection: Schema.optional(ModelSelection),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -3071,6 +3074,7 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    expectedModelSelection: Schema.optional(ModelSelection),
   }),
 ]);
 export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
@@ -3090,6 +3094,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     modelSelection: ModelSelection,
+    expectedModelSelection: Schema.optional(ModelSelection),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),

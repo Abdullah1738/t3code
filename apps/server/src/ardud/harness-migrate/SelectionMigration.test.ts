@@ -307,3 +307,49 @@ it.effect("review: a ledger failure cannot leave a migrated board without rollba
       "a failed migration must retain the original board or durable rollback data");
   }).pipe(Effect.provide(testLayer)),
 );
+
+it.effect("round 2: settings journal failure must not lose rollback state", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const sql = yield* SqlClient.SqlClient;
+    const original = {instanceId: "opencode", model: "opus/claude-opus-5-5"} as never;
+    yield* settings.updateSettings({defaultModelSelection: original});
+    yield* sql.unsafe(`CREATE TRIGGER r2_reject_settings BEFORE INSERT ON ardud_harness_selection_migration
+      BEGIN SELECT RAISE(FAIL, 'review injected failure'); END`);
+    yield* migration.apply.pipe(Effect.flip);
+    assert.deepStrictEqual((yield* settings.getSettings).defaultModelSelection, original);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("round 2: a lost settings receipt is reconciled on retry and can roll back", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const sql = yield* SqlClient.SqlClient;
+    const original = { instanceId: "opencode", model: "opus/claude-opus-5-5" } as never;
+    yield* settings.updateSettings({ defaultModelSelection: original });
+    yield* sql.unsafe(`CREATE TRIGGER r2_reject_receipt BEFORE UPDATE OF applied_at ON ardud_harness_selection_migration
+      WHEN OLD.scope = 'settings' BEGIN SELECT RAISE(FAIL, 'lost receipt'); END`);
+    yield* migration.apply.pipe(Effect.flip);
+    assert.strictEqual((yield* settings.getSettings).defaultModelSelection?.instanceId, "claudeAgent");
+    yield* sql.unsafe(`DROP TRIGGER r2_reject_receipt`);
+    yield* migration.apply;
+    const rolled = yield* migration.rollback(1);
+    assert.deepStrictEqual(rolled.skipped, []);
+    assert.deepStrictEqual((yield* settings.getSettings).defaultModelSelection, original);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("round 2: rollback reports an operator's edit back to the original settings", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const original = { instanceId: "opencode", model: "opus/claude-opus-5-5" } as never;
+    yield* settings.updateSettings({ defaultModelSelection: original });
+    yield* migration.apply;
+    yield* settings.updateSettings({ defaultModelSelection: original });
+    const rolled = yield* migration.rollback(1);
+    assert.isTrue(rolled.skipped.some((entry) => entry.ref === "defaultModelSelection"));
+  }).pipe(Effect.provide(testLayer)),
+);

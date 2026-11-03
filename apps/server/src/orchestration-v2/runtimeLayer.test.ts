@@ -5840,6 +5840,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         text: "First queued.",
         attachments: [],
         modelSelection,
+        contextReset: true,
         dispatchMode: { type: "queue_after_active" },
       });
       yield* orchestrator.dispatch({
@@ -5866,6 +5867,18 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         model: "gpt-5.4",
       } satisfies ModelSelection;
 
+      const events = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      yield* events.write({events: [{
+        id: EventId.make("round2-target-history"), type: "provider-thread.updated",
+        threadId, providerInstanceId: alternateInstanceId, occurredAt: now,
+        payload: { id: ProviderThreadId.make("round2-historical-target"), driver,
+          providerInstanceId: alternateInstanceId, providerSessionId: null, appThreadId: threadId,
+          ownerNodeId: null, nativeThreadRef: {driver, nativeId: "round2-old-native", strength: "strong"},
+          nativeConversationHeadRef: null, status: "idle", firstRunOrdinal: 1, lastRunOrdinal: 1,
+          handoffIds: [], forkedFrom: null, createdAt: now, updatedAt: now },
+      }]});
+
       yield* orchestrator.dispatch({
         type: "queued-run.rebind-selection",
         commandId: CommandId.make("runtime-layer-queued-rebind-rebind"),
@@ -5878,6 +5891,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reboundRun = afterRebind.runs.find((run) => run.id === first.id);
       assert.deepEqual(reboundRun?.modelSelection, rebound);
       assert.equal(reboundRun?.providerInstanceId, alternateInstanceId);
+      assert.isNull(afterRebind.providerThreads.find(entry => entry.id === reboundRun?.providerThreadId)?.nativeThreadRef,
+        "round 2: a context-reset queued run must not resume old target history");
       assert.equal(
         afterRebind.providerThreads.find((entry) => entry.id === reboundRun?.providerThreadId)?.providerInstanceId,
         alternateInstanceId,
@@ -5918,6 +5933,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         "a rebind must not change the queued message",
       );
 
+      const staleGuard = yield* orchestrator.dispatch({
+        type: "queued-run.rebind-selection",
+        commandId: CommandId.make("runtime-layer-queued-rebind-stale-guard"),
+        threadId,
+        runId: first.id,
+        modelSelection,
+        expectedModelSelection: modelSelection,
+      }).pipe(Effect.flip);
+      assert.equal(staleGuard._tag, "OrchestratorDispatchError");
+      assert.deepEqual((yield* orchestrator.getThreadProjection(threadId)).runs.find((run) => run.id === first.id)?.modelSelection, rebound);
+
       // A rebind to the selection the run already has produces no events, so it's refused like
       // any other empty dispatch. The migration checks for that before it sends the command.
       const sameError = yield* orchestrator
@@ -5952,6 +5978,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         started.modelSelection,
         "a run that already started keeps its stored selection",
       );
+      yield* orchestrator.dispatch({
+        type: "run.interrupt",
+        commandId: CommandId.make("runtime-layer-queued-rebind-interrupt"),
+        threadId,
+        runId: started.id,
+        holdQueue: true,
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("runtime-layer-queued-rebind-resume"),
+        threadId,
+      });
+      const delivered = yield* orchestrator.getThreadProjection(threadId);
+      const deliveredRun = delivered.runs.find((run) => run.id === first.id);
+      assert.equal(deliveredRun?.status, "starting");
+      assert.equal(deliveredRun?.providerInstanceId, alternateInstanceId);
+      const deliveredThread = delivered.providerThreads.find((entry) => entry.id === deliveredRun?.providerThreadId);
+      assert.isNull(deliveredThread?.nativeThreadRef, "the reset must start without old native history");
+      assert.equal(delivered.providerThreads.find((entry) => entry.id === ProviderThreadId.make("round2-historical-target"))?.nativeThreadRef?.nativeId, "round2-old-native");
+      assert.deepEqual(delivered.providerThreads.find((entry) => entry.id === first.providerThreadId), before.providerThreads.find((entry) => entry.id === first.providerThreadId));
     }),
   );
 });

@@ -2599,6 +2599,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     if (
+      ((command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
+        command.expectedModelSelection !== undefined &&
+        (!modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection) ||
+         thread.archivedAt !== null || thread.settledAt !== null)) ||
+      (command.type === "thread.runtime-mode.set" &&
+        ((command.expectedRuntimeMode !== undefined && thread.runtimeMode !== command.expectedRuntimeMode) ||
+         (command.expectedInteractionMode !== undefined && thread.interactionMode !== command.expectedInteractionMode) ||
+         (command.expectedRuntimeMode !== undefined && (thread.archivedAt !== null || thread.settledAt !== null))))
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} changed since the mutation was planned.`,
+      });
+    }
+    if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
       isProviderNativeSubagentThread(thread)
@@ -8441,6 +8457,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Run ${command.runId} is not queued.`,
       });
     }
+    if (command.expectedModelSelection !== undefined && !modelSelectionsEqual(queuedRun.modelSelection, command.expectedModelSelection)) {
+      return yield* new OrchestratorDispatchError({ commandId: command.commandId, commandType: command.type, cause: `Queued run ${command.runId} changed selection.` });
+    }
     if (modelSelectionsEqual(queuedRun.modelSelection, command.modelSelection)) return;
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
@@ -8456,9 +8475,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       const adapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(mapDispatchError(command));
-      const existing = rootProviderThreadsForProvider(projection, command.modelSelection.instanceId)[0];
+      const existing = queuedRun.contextReset === true
+        ? undefined
+        : rootProviderThreadsForProvider(projection, command.modelSelection.instanceId)[0];
       const target: OrchestrationV2ProviderThread = existing ?? {
-        id: idAllocator.derive.providerThread({ driver: adapter.driver, nativeThreadId: `pending:${queuedRun.id}:${command.modelSelection.instanceId}` }),
+        id: idAllocator.derive.providerThread({ driver: adapter.driver, nativeThreadId: `pending:${queuedRun.id}:${command.modelSelection.instanceId}:${command.commandId}` }),
         driver: adapter.driver,
         providerInstanceId: command.modelSelection.instanceId,
         providerSessionId: null,

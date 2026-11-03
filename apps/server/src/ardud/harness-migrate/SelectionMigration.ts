@@ -4,6 +4,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import type {
   CommandId,
@@ -22,7 +23,9 @@ import {
   CommandId as CommandIdSchema,
   KanbanBoardId as KanbanBoardIdSchema,
   ProjectId as ProjectIdSchema,
+  RunId as RunIdSchema,
   ScheduledTaskId as ScheduledTaskIdSchema,
+  ThreadId as ThreadIdSchema,
 } from "@t3tools/contracts";
 
 import * as KanbanService from "../kanban/engine/KanbanService.ts";
@@ -49,6 +52,8 @@ export type MigrationScope =
   | "schedule-fallbacks"
   | "queued-run"
   | "thread";
+
+type LedgerScope = MigrationScope | "thread-runtime";
 
 const SCOPES: ReadonlyArray<MigrationScope> = [
   "settings",
@@ -172,6 +177,15 @@ const readSettingsPath = (settingsValue: ServerSettings, ref: string): unknown =
   return (settingsValue as unknown as Record<string, unknown>)[ref];
 };
 
+const fallbackRef = (id: string, createdAt: string): string =>
+  `v1:${encodeURIComponent(id)}:${encodeURIComponent(createdAt)}`;
+
+const readFallbackRef = (ref: string): { id: string; createdAt?: string } => {
+  if (!ref.startsWith("v1:")) return { id: ref };
+  const [, id, createdAt] = ref.split(":");
+  return { id: decodeURIComponent(id ?? ""), createdAt: decodeURIComponent(createdAt ?? "") };
+};
+
 /** The settings patch that puts one ref back to `value`, read from the current settings. */
 const settingsPatchFor = (
   settingsValue: ServerSettings,
@@ -198,10 +212,11 @@ const settingsPatchFor = (
 /** One ledger row as the rollback reads it. */
 interface LedgerRow {
   readonly id: number;
-  readonly scope: MigrationScope;
+  readonly scope: LedgerScope;
   readonly ref: string;
   readonly before_json: string;
   readonly after_json: string;
+  readonly applied_at: string | null;
 }
 
 interface Plans {
@@ -224,7 +239,7 @@ interface Plans {
   }>;
   readonly queued: ReadonlyArray<{
     readonly threadId: ThreadId;
-    readonly runId: string;
+    readonly runId: typeof RunIdSchema.Type;
     readonly before: ModelSelection;
     readonly next: ModelSelection;
   }>;
@@ -233,6 +248,8 @@ interface Plans {
     readonly before: ModelSelection;
     readonly next: ModelSelection | null;
     readonly widenTo: "full-access" | null;
+    readonly runtimeBefore: "approval-required" | "auto" | "auto-accept-edits" | "full-access";
+    readonly interactionBefore: typeof import("@t3tools/contracts").ProviderInteractionMode.Type;
   }>;
   readonly conflicts: ReadonlyArray<MigrationConflict>;
   readonly collisions: ReadonlyArray<MigrationCollision>;
@@ -254,6 +271,7 @@ export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const crypto = yield* Crypto.Crypto;
+  const migrationLock = yield* Semaphore.make(1);
 
   /** A fresh command id per owner write, so each dispatch is its own command. */
   const newCommandId = Effect.fn("SelectionMigration.newCommandId")(function* (label: string) {
@@ -381,7 +399,7 @@ export const make = Effect.gen(function* () {
             ? ("full-access" as const)
             : null;
         if (next === null && widenTo === null) continue;
-        threadPlans.push({ threadId: thread.id, before: thread.modelSelection, next, widenTo });
+        threadPlans.push({ threadId: thread.id, before: thread.modelSelection, next, widenTo, runtimeBefore: thread.runtimeMode, interactionBefore: thread.interactionMode });
         threadIds.push(thread.id);
       }
     }
@@ -460,12 +478,7 @@ export const make = Effect.gen(function* () {
     }
     for (const plan of plans.threads) {
       counts.thread += 1;
-      changes.push({
-        scope: "thread",
-        ref: plan.threadId,
-        before: plan.before,
-        after: plan.next ?? plan.before,
-      });
+      changes.push({ scope: "thread", ref: plan.threadId, before: plan.before, after: plan.next ?? plan.before });
     }
     return {
       version: SELECTION_MIGRATION_VERSION,
@@ -515,7 +528,71 @@ export const make = Effect.gen(function* () {
     return entry.plan.changes.length;
   });
 
+  // Persist the intended transition before calling an owner whose data and ledger do not share a
+  // transaction. A pending intent is checked against the owner on retry and rollback.
+  const beginIntent = Effect.fn("SelectionMigration.beginIntent")(function* (
+    scope: LedgerScope, ref: string, before: unknown, after: unknown,
+  ) {
+    const beforeJson = yield* encodeLedgerValue(before).pipe(Effect.mapError((cause) => migrationError("encode intent", cause)));
+    const afterJson = yield* encodeLedgerValue(after).pipe(Effect.mapError((cause) => migrationError("encode intent", cause)));
+    const existing = yield* sql<{ id: number; before_json: string; after_json: string; applied_at: string | null; rolled_back_at: string | null }>`
+      SELECT id, before_json, after_json, applied_at, rolled_back_at FROM ardud_harness_selection_migration
+      WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${scope} AND ref = ${ref}
+      ORDER BY id DESC LIMIT 1`
+      .pipe(Effect.mapError((cause) => migrationError("read intent", cause)));
+    if (existing[0] !== undefined && existing[0].rolled_back_at === null) {
+      if (existing[0].applied_at === null && existing[0].before_json === beforeJson && existing[0].after_json === afterJson) return existing[0].id;
+      if (existing[0].applied_at === null) return yield* Effect.fail(migrationError(`unreverted intent for ${scope}:${ref}`));
+    }
+    const rows = yield* sql<{ id: number }>`INSERT INTO ardud_harness_selection_migration
+      (version, scope, ref, before_json, after_json, applied_at, rolled_back_at)
+      VALUES (${SELECTION_MIGRATION_VERSION}, ${scope}, ${ref}, ${beforeJson}, ${afterJson}, NULL, NULL)
+      RETURNING id`.pipe(Effect.mapError((cause) => migrationError("write intent", cause)));
+    if (rows[0] === undefined) return yield* Effect.fail(migrationError("intent insert returned no id"));
+    return rows[0].id;
+  });
+  const finishIntent = Effect.fn("SelectionMigration.finishIntent")(function* (id: number) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    yield* sql`UPDATE ardud_harness_selection_migration SET applied_at = ${now} WHERE id = ${id}`
+      .pipe(Effect.mapError((cause) => migrationError("confirm intent", cause)));
+  });
+
   const apply: SelectionMigrationShape["apply"] = Effect.gen(function* () {
+    // Reconcile a write whose owner committed but whose receipt did not. Never guess when the
+    // current value differs from both sides; surface it as a conflict for an operator.
+    const pending = yield* sql<LedgerRow>`SELECT id, scope, ref, before_json, after_json, applied_at
+      FROM ardud_harness_selection_migration WHERE version = ${SELECTION_MIGRATION_VERSION}
+      AND applied_at IS NULL AND rolled_back_at IS NULL ORDER BY id`
+      .pipe(Effect.mapError((cause) => migrationError("read pending intents", cause)));
+    for (const row of pending) {
+      const before = yield* decodeLedgerValue(row.before_json).pipe(Effect.mapError((cause) => migrationError("decode intent", cause)));
+      const after = yield* decodeLedgerValue(row.after_json).pipe(Effect.mapError((cause) => migrationError("decode intent", cause)));
+      const current = yield* currentValue(row.scope, row.ref);
+      if (sameValue(current, after)) yield* finishIntent(row.id);
+      else if (!sameValue(current, before)) return yield* Effect.fail(migrationError(`pending intent ${row.scope}:${row.ref} diverged`));
+      else if (row.scope === "thread-runtime") {
+        const related = yield* sql<{ after_json: string }>`SELECT after_json FROM ardud_harness_selection_migration
+          WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${row.ref}
+          AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`
+          .pipe(Effect.mapError((cause) => migrationError("read thread intent", cause)));
+        if (related[0] !== undefined) {
+          const selection = yield* decodeLedgerValue(related[0].after_json).pipe(Effect.mapError((cause) => migrationError("decode thread intent", cause)));
+          const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(row.ref))
+            .pipe(Effect.mapError((cause) => migrationError("read thread intent owner", cause)));
+          if (sameValue(projection.thread.modelSelection, selection)) {
+            if (projection.thread.interactionMode === "plan") return yield* Effect.fail(migrationError(`pending runtime intent ${row.ref} is now in plan mode`));
+            yield* orchestrator.dispatch({
+              type: "thread.runtime-mode.set", commandId: yield* newCommandId(`recover-runtime:${row.ref}`),
+              threadId: ThreadIdSchema.make(row.ref),
+              runtimeMode: after as "full-access",
+              expectedRuntimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access",
+              expectedInteractionMode: projection.thread.interactionMode,
+            }).pipe(Effect.mapError((cause) => migrationError("recover runtime intent", cause)));
+            yield* finishIntent(row.id);
+          }
+        }
+      }
+    }
     const plans = yield* readPlans();
     const current = yield* readSettings;
     const allowConflicts = current.ardudHarnessMigration?.allowConflicts === true;
@@ -528,46 +605,34 @@ export const make = Effect.gen(function* () {
     }
     const report = reportOf(plans);
     const counter = { applied: 0 };
-    const record = Effect.fn("SelectionMigration.record")(function* (
-      scope: MigrationScope,
-      ref: string,
-      before: unknown,
-      after: unknown,
-    ) {
-      const beforeJson = yield* encodeLedgerValue(before).pipe(
-        Effect.mapError((cause) => migrationError("encode ledger value", cause)),
-      );
-      const afterJson = yield* encodeLedgerValue(after).pipe(
-        Effect.mapError((cause) => migrationError("encode ledger value", cause)),
-      );
-      const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
-        INSERT INTO ardud_harness_selection_migration (version, scope, ref, before_json, after_json, applied_at, rolled_back_at)
-        VALUES (${SELECTION_MIGRATION_VERSION}, ${scope}, ${ref}, ${beforeJson}, ${afterJson}, ${now}, NULL)
-      `.pipe(Effect.mapError((cause) => migrationError("write ledger", cause)));
-      counter.applied += 1;
-    });
-
     // Settings: one patch, one ledger row per field it changes.
     if (plans.settings.patch !== null) {
-      yield* settings.updateSettings(plans.settings.patch).pipe(
+      const intents = yield* Effect.forEach(plans.settings.changes, (change) =>
+        beginIntent("settings", change.field, change.before, change.after));
+      const wrote = yield* settings.updateSettingsIf((current) => {
+        const fresh = planSettings(current);
+        return sameValue(fresh.changes, plans.settings.changes) ? fresh.patch : null;
+      }).pipe(
         Effect.mapError((cause) => migrationError("write settings", cause)),
       );
-      for (const change of plans.settings.changes) {
-        yield* record("settings", change.field, change.before, change.after);
-      }
+      if (!wrote) return yield* Effect.fail(migrationError("settings changed after planning"));
+      for (const id of intents) yield* finishIntent(id);
+      counter.applied += intents.length;
     }
     // Projects: the project owner's update, one command per project.
     for (const project of plans.projectDefaults) {
+      const intent = yield* beginIntent("project", project.projectId, project.before, project.next);
       const projectCommandId = yield* newCommandId(`project:${project.projectId}`);
       yield* projects
         .update({
           projectId: project.projectId,
           commandId: projectCommandId,
           defaultModelSelection: project.next,
+          expectedDefaultModelSelection: project.before,
         })
         .pipe(Effect.mapError((cause) => migrationError(`write project ${project.projectId}`, cause)));
-      yield* record("project", project.projectId, project.before, project.next);
+      yield* finishIntent(intent);
+      counter.applied++;
     }
     // Boards: one transaction each, and a failure leaves that board untouched.
     for (const entry of plans.boards) {
@@ -578,39 +643,55 @@ export const make = Effect.gen(function* () {
     }
     // Schedules: guarded per row, so a schedule edited since the dry run is skipped, not overwritten.
     for (const plan of plans.schedules) {
+      const intent = yield* beginIntent("schedule", plan.id, plan.before, plan.next);
       const wrote = yield* scheduled
         .migrateModelSelection({ id: plan.id, expected: plan.before, next: plan.next })
         .pipe(Effect.mapError((cause) => migrationError(`write schedule ${plan.id}`, cause)));
-      if (wrote) yield* record("schedule", plan.id, plan.before, plan.next);
+      if (!wrote) return yield* Effect.fail(migrationError(`schedule ${plan.id} changed after planning`));
+      yield* finishIntent(intent);
+      counter.applied++;
     }
     // Provider-block fallbacks: written through the table's own writer, keeping its creation-time guard
     // and limits. Each list is re-read first, and only written while it still equals what was planned.
     for (const entry of plans.fallbacks) {
-      const current = yield* readBlockRetry(sql, entry.task).pipe(
-        Effect.mapError((cause) => migrationError(`reread fallbacks ${entry.task.id}`, cause)),
-      );
-      if (current === null || !sameValue(current.fallbacks, entry.plan.before)) continue;
-      yield* writeBlockRetry(sql, entry.task, { ...entry.stored, fallbacks: entry.plan.after }).pipe(
-        Effect.mapError((cause) => migrationError(`write fallbacks ${entry.task.id}`, cause)),
-      );
-      yield* record("schedule-fallbacks", entry.task.id, entry.plan.before, entry.plan.after);
+      const wrote = yield* sql.withTransaction(Effect.gen(function* () {
+        const current = yield* readBlockRetry(sql, entry.task);
+        if (current === null || !sameValue(current.fallbacks, entry.plan.before)) return false;
+        const ref = fallbackRef(entry.task.id, entry.task.createdAt);
+        const intent = yield* beginIntent("schedule-fallbacks", ref, entry.plan.before, entry.plan.after);
+        yield* writeBlockRetry(sql, entry.task, { ...current, fallbacks: entry.plan.after });
+        yield* finishIntent(intent);
+        return true;
+      })).pipe(Effect.mapError((cause) => migrationError(`write fallbacks ${entry.task.id}`, cause)));
+      if (!wrote) return yield* Effect.fail(migrationError(`fallbacks ${entry.task.id} changed after planning`));
+      counter.applied++;
     }
     // Queued runs: the orchestrator's rebind, which keeps order, attachments and the hold.
     for (const plan of plans.queued) {
+      const ref = `${encodeURIComponent(plan.threadId)}:${encodeURIComponent(plan.runId)}`;
+      const intent = yield* beginIntent("queued-run", ref, plan.before, plan.next);
       const queuedCommandId = yield* newCommandId(`queued:${plan.runId}`);
       yield* orchestrator
         .dispatch({
           type: "queued-run.rebind-selection",
           commandId: queuedCommandId,
           threadId: plan.threadId,
-          runId: plan.runId as never,
+          runId: plan.runId,
           modelSelection: plan.next,
+          expectedModelSelection: plan.before,
         })
         .pipe(Effect.mapError((cause) => migrationError(`write queued run ${plan.runId}`, cause)));
-      yield* record("queued-run", plan.runId, plan.before, plan.next);
+      yield* finishIntent(intent);
+      counter.applied++;
     }
     // Threads: the live model switch and the full-access widening, through the thread owner.
     for (const plan of plans.threads) {
+      // Both intents must exist before either owner write: after a crash the mapped
+      // selection alone no longer tells the planner that runtime widening was due.
+      const selectionIntent = plan.next === null ? null :
+        yield* beginIntent("thread", plan.threadId, plan.before, plan.next);
+      const runtimeIntent = plan.widenTo === null ? null :
+        yield* beginIntent("thread-runtime", plan.threadId, plan.runtimeBefore, plan.widenTo);
       if (plan.next !== null) {
         const type =
           plan.next.instanceId === plan.before.instanceId
@@ -623,9 +704,10 @@ export const make = Effect.gen(function* () {
             commandId: threadCommandId,
             threadId: plan.threadId,
             modelSelection: plan.next,
+            expectedModelSelection: plan.before,
           })
           .pipe(Effect.mapError((cause) => migrationError(`write thread ${plan.threadId}`, cause)));
-        yield* record("thread", plan.threadId, plan.before, plan.next);
+        yield* finishIntent(selectionIntent!);
       }
       if (plan.widenTo !== null) {
         const runtimeCommandId = yield* newCommandId(`runtime:${plan.threadId}`);
@@ -635,9 +717,13 @@ export const make = Effect.gen(function* () {
             commandId: runtimeCommandId,
             threadId: plan.threadId,
             runtimeMode: plan.widenTo,
+            expectedRuntimeMode: plan.runtimeBefore,
+            expectedInteractionMode: plan.interactionBefore,
           })
           .pipe(Effect.mapError((cause) => migrationError(`widen thread ${plan.threadId}`, cause)));
+        yield* finishIntent(runtimeIntent!);
       }
+      counter.applied++;
     }
     return {
       applied: counter.applied,
@@ -659,7 +745,22 @@ export const make = Effect.gen(function* () {
     );
     const current = yield* currentValue(row.scope, row.ref);
     if (current === undefined) return "owner has no record for this row";
+    // An unfinished apply intent that never reached the owner is not an applied row.
+    if (row.applied_at === null && sameValue(current, before)) return "intent was not applied";
     if (!sameJson(current, after)) return "value changed after apply";
+    // A pending runtime intent is only ours if the corresponding selection switch
+    // committed; the same permission value alone could have been set by a user.
+    if (row.scope === "thread-runtime" && row.applied_at === null) {
+      const selectionRows = yield* sql<{ after_json: string }>`SELECT after_json FROM ardud_harness_selection_migration
+        WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${row.ref}
+        AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`
+        .pipe(Effect.mapError((cause) => migrationError("read runtime's selection intent", cause)));
+      const selection = selectionRows[0] === undefined ? undefined : yield* decodeLedgerValue(selectionRows[0].after_json)
+        .pipe(Effect.mapError((cause) => migrationError("decode runtime's selection intent", cause)));
+      if (selection === undefined || !sameValue(yield* currentValue("thread", row.ref), selection)) {
+        return "thread selection changed before runtime intent was confirmed";
+      }
+    }
     return yield* writeValue(row.scope, row.ref, before, after);
   });
 
@@ -668,7 +769,7 @@ export const make = Effect.gen(function* () {
    * card rows are not read here: a board is restored as a whole, by `restoreBoard`.
    */
   const currentValue = (
-    scope: MigrationScope,
+    scope: LedgerScope,
     ref: string,
   ): Effect.Effect<unknown, SelectionMigrationError> =>
     Effect.gen(function* () {
@@ -689,20 +790,36 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
           return listed.tasks.find((task) => task.id === ref)?.modelSelection;
         }
-        case "queued-run":
+        case "schedule-fallbacks": {
+          const listed = yield* scheduled.list().pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
+          const { id, createdAt } = readFallbackRef(ref);
+          const task = listed.tasks.find((item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt));
+          if (task === undefined) return undefined;
+          return (yield* readBlockRetry(sql, task).pipe(Effect.mapError((cause) => migrationError("read fallbacks", cause))))?.fallbacks;
+        }
+        case "queued-run": {
+          const [encodedThread, encodedRun] = ref.split(":");
+          if (!encodedThread || !encodedRun) return undefined;
+          const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(decodeURIComponent(encodedThread)))
+            .pipe(Effect.mapError((cause) => migrationError("read queued run", cause)));
+          const run = projection.runs.find((item) => item.id === decodeURIComponent(encodedRun));
+          return run?.status === "queued" ? run.modelSelection : undefined;
+        }
         case "thread":
+        case "thread-runtime": {
+          const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(ref))
+            .pipe(Effect.mapError((cause) => migrationError("read thread", cause)));
+          if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null || projection.thread.settledAt !== null) return undefined;
+          return scope === "thread" ? projection.thread.modelSelection : projection.thread.runtimeMode;
+        }
         case "board":
-        case "schedule-fallbacks":
           return undefined;
       }
     });
 
-  /**
-   * Puts one ledger row back through its owner. Returns null when written, or the reason it was not.
-   * A board, queued-run or thread row is never restored alone: see `restoreBoard` and the skips.
-   */
+  /** Puts one ledger row back through its owner, or returns the reason it was not restored. */
   const writeValue = (
-    scope: MigrationScope,
+    scope: LedgerScope,
     ref: string,
     before: unknown,
     after: unknown,
@@ -710,11 +827,12 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       switch (scope) {
         case "settings": {
-          const current = yield* readSettings;
-          yield* settings
-            .updateSettings(settingsPatchFor(current, ref, before))
+          const wrote = yield* settings
+            .updateSettingsIf((current) => sameValue(readSettingsPath(current, ref), after)
+              ? settingsPatchFor(current, ref, before)
+              : null)
             .pipe(Effect.mapError((cause) => migrationError("restore settings", cause)));
-          return null;
+          return wrote ? null : "settings changed after apply";
         }
         case "project": {
           const commandId = yield* newCommandId(`rollback-project:${ref}`);
@@ -723,6 +841,7 @@ export const make = Effect.gen(function* () {
               projectId: ProjectIdSchema.make(ref),
               commandId,
               defaultModelSelection: before as ModelSelection,
+              expectedDefaultModelSelection: after as ModelSelection,
             })
             .pipe(Effect.mapError((cause) => migrationError("restore project", cause)));
           return null;
@@ -737,15 +856,39 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => migrationError("restore schedule", cause)));
           return wrote ? null : "schedule changed after apply";
         }
+        case "schedule-fallbacks": {
+          const listed = yield* scheduled.list().pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
+          const { id, createdAt } = readFallbackRef(ref);
+          const task = listed.tasks.find((item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt));
+          if (task === undefined) return "schedule is gone";
+          return yield* sql.withTransaction(Effect.gen(function* () {
+            const value = yield* readBlockRetry(sql, task);
+            if (value === null || !sameValue(value.fallbacks, after)) return "fallbacks changed after apply";
+            yield* writeBlockRetry(sql, task, { ...value, fallbacks: before as ReadonlyArray<ModelSelection> });
+            return null;
+          })).pipe(Effect.mapError((cause) => migrationError("restore fallbacks", cause)));
+        }
+        case "queued-run": {
+          const [encodedThread, encodedRun] = ref.split(":");
+          if (!encodedThread || !encodedRun) return "queued run ref is missing its thread";
+          yield* orchestrator.dispatch({ type: "queued-run.rebind-selection", commandId: yield* newCommandId(`rollback-queued:${ref}`), threadId: ThreadIdSchema.make(decodeURIComponent(encodedThread)), runId: RunIdSchema.make(decodeURIComponent(encodedRun)), modelSelection: before as ModelSelection, expectedModelSelection: after as ModelSelection })
+            .pipe(Effect.mapError((cause) => migrationError("restore queued run", cause)));
+          return null;
+        }
+        case "thread": {
+          const from = after as ModelSelection;
+          const to = before as ModelSelection;
+          yield* orchestrator.dispatch({ type: from.instanceId === to.instanceId ? "thread.model-selection.set" : "provider.switch", commandId: yield* newCommandId(`rollback-thread:${ref}`), threadId: ThreadIdSchema.make(ref), modelSelection: to, expectedModelSelection: from })
+            .pipe(Effect.mapError((cause) => migrationError("restore thread", cause)));
+          return null;
+        }
+        case "thread-runtime": {
+          yield* orchestrator.dispatch({ type: "thread.runtime-mode.set", commandId: yield* newCommandId(`rollback-runtime:${ref}`), threadId: ThreadIdSchema.make(ref), runtimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedRuntimeMode: after as "approval-required" | "auto" | "auto-accept-edits" | "full-access" })
+            .pipe(Effect.mapError((cause) => migrationError("restore runtime mode", cause)));
+          return null;
+        }
         case "board":
-        case "queued-run":
-        case "thread":
-          // Board rows are restored together by restoreBoards; a lone row is never written.
-          return `${scope} rows restore with their board, not alone`;
-        case "schedule-fallbacks":
-          // The fallback list is restorable in principle, but the restore path is not built yet. It is
-          // reported as skipped, never stamped as reverted.
-          return "schedule-fallbacks rollback is not implemented yet";
+          return "board rows restore together";
       }
     });
 
@@ -871,9 +1014,9 @@ export const make = Effect.gen(function* () {
   const rollback: SelectionMigrationShape["rollback"] = Effect.fn("SelectionMigration.rollback")(
     function* (version) {
       const rows = yield* sql<LedgerRow>`
-        SELECT id, scope, ref, before_json, after_json
+        SELECT id, scope, ref, before_json, after_json, applied_at
         FROM ardud_harness_selection_migration
-        WHERE version = ${version} AND applied_at IS NOT NULL AND rolled_back_at IS NULL
+         WHERE version = ${version} AND rolled_back_at IS NULL
         ORDER BY id DESC
       `.pipe(Effect.mapError((cause) => migrationError("read ledger", cause)));
 
@@ -924,7 +1067,11 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return SelectionMigration.of({ dryRun, apply, rollback });
+  return SelectionMigration.of({
+    dryRun,
+    apply: migrationLock.withPermits(1)(apply),
+    rollback: (version) => migrationLock.withPermits(1)(rollback(version)),
+  });
 });
 
 export const layer = Layer.effect(SelectionMigration, make);

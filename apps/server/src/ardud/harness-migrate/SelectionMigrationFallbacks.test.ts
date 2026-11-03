@@ -121,5 +121,15 @@ it.effect("apply maps a schedule's stored fallbacks in order and keeps its retry
       ["codex/gpt-6-astra"],
     );
     assert.deepStrictEqual(after?.limits, limits);
+    yield* writeBlockRetry(sql, created.task, { fallbacks: [{ instanceId: "codex", model: "operator-edit" } as never], limits });
+    const guarded = yield* migration.rollback(1);
+    assert.isTrue(guarded.skipped.some((entry) => entry.ref.startsWith(`v1:${encodeURIComponent(taskId)}:`)));
+    assert.strictEqual((yield* readBlockRetry(sql, created.task))?.fallbacks[0]?.model, "operator-edit");
+    yield* writeBlockRetry(sql, created.task, after!);
+    const rolled = yield* migration.rollback(1);
+    assert.deepStrictEqual(rolled.skipped, [], "round 2: unchanged fallbacks must roll back");
+    const restored = yield* readBlockRetry(sql, created.task);
+    assert.deepStrictEqual(restored?.fallbacks.map(entry => `${entry.instanceId}/${entry.model}`),
+      ["opencode/opus/gpt-6-astra", "opencode/layso/gpt-6-astra"]);
   }).pipe(Effect.provide(testLayer)),
 );
