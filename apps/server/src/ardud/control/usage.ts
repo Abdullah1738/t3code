@@ -105,7 +105,10 @@ const itemFromRow = (row: Row) => {
   const usage = turn.turnTokenUsage;
   const selection =
     row.selection_json === null ? Option.none() : decodeSelection(row.selection_json);
-  const model = Option.isSome(selection) ? selection.value : null;
+  const model =
+    Option.isSome(selection) && selection.value.instanceId === row.provider_instance_id
+      ? selection.value
+      : null;
   return {
     threadId: row.thread_id,
     rootThreadId: row.root_thread_id,
@@ -206,11 +209,23 @@ const make = Effect.gen(function* () {
         COALESCE(json_extract(t.payload_json, '$.lineage.rootThreadId'), c.thread_id) AS root_thread_id,
         k.board_id, k.card_id,
         COALESCE(json_extract(t.payload_json, '$.worktreePath'), p.workspace_root) AS workspace,
-        COALESCE(r.provider_instance_id, pt.provider_instance_id, json_extract(t.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+        COALESCE(a.provider_instance_id, pt.provider_instance_id,
+          CASE WHEN c.run_attempt_id IS NULL THEN json_extract(t.payload_json, '$.providerInstanceId') END) AS provider_instance_id,
         COALESCE(pt.driver, pt.provider, r.provider) AS driver,
         CASE WHEN c.run_attempt_id IS NULL
           THEN json_extract(t.payload_json, '$.modelSelection')
-          ELSE json_extract(r.payload_json, '$.modelSelection') END AS selection_json
+          ELSE (
+            SELECT json_extract(event.payload_json, '$.modelSelection')
+            FROM orchestration_events AS event INDEXED BY idx_orchestration_events_agent_stream_sequence
+            WHERE event.aggregate_kind = 'thread'
+              AND event.application_event_version = 2
+              AND event.stream_id = a.thread_id
+              AND event.event_type = 'run.updated'
+              AND json_extract(event.payload_json, '$.id') = a.run_id
+              AND json_extract(event.payload_json, '$.activeAttemptId') = a.attempt_id
+              AND json_extract(event.payload_json, '$.status') = 'running'
+            ORDER BY event.sequence LIMIT 1
+          ) END AS selection_json
       FROM candidates c
       LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = c.thread_id
       LEFT JOIN projection_projects p ON p.project_id = t.project_id

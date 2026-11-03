@@ -123,6 +123,27 @@ const seed = Effect.gen(function* () {
       status: "completed",
       payload_json: "{}",
     })}`;
+    yield* sql`INSERT INTO orchestration_events ${sql.insert({
+      event_id: `running-${source.thread}`,
+      aggregate_kind: "thread",
+      stream_id: source.thread,
+      stream_version: 1,
+      event_type: "run.updated",
+      occurred_at: since,
+      actor_kind: "system",
+      metadata_json: "{}",
+      application_event_version: 2,
+      payload_json: JSON.stringify({
+        id: `run-${source.thread}`,
+        activeAttemptId: `attempt-${source.thread}`,
+        status: "running",
+        modelSelection: {
+          instanceId: source.instance,
+          model: source.model,
+          options: [{ id: source.option, value: source.value }],
+        },
+      }),
+    })}`;
   }
   for (const turn of [
     {
@@ -214,6 +235,140 @@ const run = <A, E>(body: Effect.Effect<A, E, Usage.Usage | SqlClient.SqlClient |
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("usage feed", () => {
+  it.effect("attributes restarted turns to the selection and instance of each attempt", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const usage = yield* Usage.Usage;
+        // The first attempt was Codex. A restart reused the run for Claude.
+        yield* sql`UPDATE orchestration_v2_projection_runs SET
+        provider = 'claudeAgent', provider_instance_id = 'claudeAgent', provider_thread_id = 'pt-restarted',
+        payload_json = ${JSON.stringify({ modelSelection: { instanceId: "claudeAgent", model: "claude-opus", options: [{ id: "effort", value: "max" }] } })}
+        WHERE run_id = 'run-other'`;
+        yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert({
+          provider_thread_id: "pt-restarted",
+          thread_id: "other",
+          owner_node_id: null,
+          provider: "claudeAgent",
+          provider_session_id: null,
+          status: "active",
+          first_run_ordinal: 1,
+          last_run_ordinal: 1,
+          updated_at: since,
+          driver: "claudeAgent",
+          provider_instance_id: "claudeAgent",
+          payload_json: "{}",
+        })}`;
+        yield* sql`INSERT INTO orchestration_v2_projection_run_attempts ${sql.insert({
+          attempt_id: "attempt-restarted",
+          thread_id: "other",
+          run_id: "run-other",
+          attempt_ordinal: 2,
+          root_node_id: "node-restarted",
+          provider: "claudeAgent",
+          provider_thread_id: "pt-restarted",
+          provider_turn_id: null,
+          provider_instance_id: "claudeAgent",
+          status: "completed",
+          payload_json: "{}",
+        })}`;
+        yield* sql`INSERT INTO orchestration_v2_projection_provider_turns ${sql.insert({
+          provider_turn_id: "restarted",
+          thread_id: "other",
+          provider_thread_id: "pt-restarted",
+          node_id: "node-restarted",
+          run_attempt_id: "attempt-restarted",
+          ordinal: 1,
+          status: "completed",
+          started_at: at(2),
+          completed_at: at(3),
+          payload_json: "{}",
+        })}`;
+        for (const [index, payload] of [
+          {
+            id: "run-other",
+            activeAttemptId: "attempt-other",
+            status: "running",
+            modelSelection: {
+              instanceId: "codex-cu",
+              model: "later-steered-model",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+          {
+            id: "run-other",
+            activeAttemptId: "attempt-restarted",
+            status: "starting",
+            modelSelection: { instanceId: "claudeAgent", model: "starting-model" },
+          },
+          {
+            id: "run-other",
+            activeAttemptId: "attempt-restarted",
+            status: "running",
+            modelSelection: {
+              instanceId: "claudeAgent",
+              model: "claude-opus",
+              options: [{ id: "effort", value: "max" }],
+            },
+          },
+        ].entries()) {
+          yield* sql`INSERT INTO orchestration_events ${sql.insert({
+            event_id: `restart-event-${index}`,
+            aggregate_kind: "thread",
+            stream_id: "other",
+            stream_version: index + 2,
+            event_type: "run.updated",
+            occurred_at: at(2),
+            actor_kind: "system",
+            metadata_json: "{}",
+            application_event_version: 2,
+            payload_json: JSON.stringify(payload),
+          })}`;
+        }
+        const page = yield* usage.list({ since, until });
+        const turns = page.items.filter((item) => item.threadId === "other");
+        assert.deepStrictEqual(
+          turns.map(({ providerInstanceId, driver, model, effort }) => ({
+            providerInstanceId,
+            driver,
+            model,
+            effort,
+          })),
+          [
+            {
+              providerInstanceId: "codex-cu",
+              driver: "codex",
+              model: "gpt-terra",
+              effort: "xhigh",
+            },
+            {
+              providerInstanceId: "claudeAgent",
+              driver: "claudeAgent",
+              model: "claude-opus",
+              effort: "max",
+            },
+          ],
+        );
+        // Missing historical evidence must not fall back to the latest Claude projection.
+        yield* sql`UPDATE orchestration_events SET payload_json = json_remove(payload_json, '$.modelSelection')
+        WHERE event_id = 'running-other'`;
+        const missing = (yield* usage.list({ since, until })).items.find(
+          (item) => item.threadId === "other",
+        );
+          assert.strictEqual(missing?.providerInstanceId, "codex-cu");
+          assert.isNull(missing?.model);
+          assert.isNull(missing?.effort);
+          yield* sql`UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.modelSelection',
+            json('{"instanceId":"claudeAgent","model":"wrong-provider"}'))
+            WHERE event_id = 'running-other'`;
+          const mismatch = (yield* usage.list({ since, until })).items.find(
+            (item) => item.threadId === "other",
+          );
+          assert.strictEqual(mismatch?.providerInstanceId, "codex-cu");
+          assert.isNull(mismatch?.model);
+        }),
+    ),
+  );
   it.effect(
     "pages equal timestamps, returns unavailable and running turns, and attributes the root board",
     () =>

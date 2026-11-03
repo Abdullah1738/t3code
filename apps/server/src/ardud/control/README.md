@@ -133,8 +133,9 @@ Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 The window includes completed turns by completion time and currently running
 turns by start time. Unknown counts are `null`, not zero; missing usage has
 `usageStatus: "unavailable"`. Input includes cached tokens; output includes
-reasoning. Native subagent turns without a run use their current thread
-selection; other turns use their run's selection.
+reasoning. Turns with an attempt use the selection in that attempt's first
+running event; missing historical evidence yields a null model and effort.
+Native subagent turns without an attempt use their current thread selection.
 
 Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
