@@ -469,14 +469,16 @@ export function planRestartThread({
 const PROMPT_MAX = 1_200;
 const PROMPTS_TOTAL = 10_000;
 
-export function buildRestartNote({ incident, lost = [], turnCut = false, held = [], staleHeld = [], ocUrl }) {
+export function buildRestartNote({ incident, lost = [], turnCut = false, held = [], staleHeld = [], ocUrl, incremental = false }) {
   const at = hhmm(incident.failAllMs ?? incident.startMs);
   const needs = lost.filter((l) => NEEDS.has(l.status));
   const done = lost.filter((l) => l.status === "redispatched" || l.status === "delivered");
   const delegated = needs.filter((l) => l.kind === 'delegated');
   const native = needs.filter((l) => l.kind !== 'delegated');
   const auth = `-u "opencode:$(cat ~/.config/opencode-service/password)"`;
-  const parts = [
+  const parts = incremental ? [
+    `[stream-recovery] Additional delegated task discovered after the restart at ${at}. Check its status before relaunching.`,
+  ] : [
     `[stream-recovery] ${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restarted at ${at}` +
       (delegated.length
         ? ` and affected ${[native.length ? `${native.length} background subagent(s)` : '', `${delegated.length} delegated task(s)`].filter(Boolean).join(' and ')} this thread had running. Check their status before resuming them.${native.length ? " Robob will not deliver the native subagents' results, so nothing will wake you for them." : ''}`

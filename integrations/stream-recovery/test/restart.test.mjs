@@ -261,12 +261,40 @@ test('delegated lookup uses the task node ID and never mistakes an earlier stopp
     const row = task('retry', { payload: { id: undefined, taskId: 'not-a-node-id', clientRequestId: 'request-retry' } });
     addRun('old-stop', row.child_thread_id, 1, 'interrupted', T0 - 120_000, T0 - 60_000);
     stop('old-stop', row.child_thread_id, T0 - 60_000);
-    addRun('cut-run', row.child_thread_id, 2, 'interrupted', T0 - 50_000, T0 + 1_000);
+    addRun('cut-run', row.child_thread_id, 2, 'interrupted', T0 - 50_000, T0 + 1_000,
+      { restartContinuationOfRunId: 'old-stop' });
     const [found] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
     assert.equal(found.taskRef, row.subagent_id);
     assert.equal(found.clientRequestId, 'request-retry');
     assert.equal(dbIo.childRunOutcomeSince(db, row.child_thread_id, row.subagent_id, row.completed_at), null);
     assert.equal(dbIo.childRunOutcomeSince(db, null, row.subagent_id, row.completed_at), null);
+  } finally { db.close(); }
+});
+
+test('a cancelled unstarted buffered notification cannot hide a stopped task run', async () => {
+  const { db, task, addRun, stop } = delegatedFixture();
+  try {
+    const stopped = task('buffered-stop');
+    addRun('executed-child', stopped.child_thread_id, 1, 'interrupted', T0 - 50_000, T0,
+      { startedAt: iso(T0 - 49_000), delegatedTaskId: stopped.subagent_id });
+    stop('executed-child', stopped.child_thread_id, T0);
+    addRun('buffered-cancel', stopped.child_thread_id, 2, 'cancelled', T0 - 10_000, T0,
+      { startedAt: null, delegatedTaskId: stopped.subagent_id });
+    db.prepare('insert into orchestration_v2_projection_turn_items values (?,?,?,?)')
+      .run('buffered-cancel', 'notification', stopped.child_thread_id, iso(T0 - 10_000));
+    const safe = task('safe');
+    addRun('unrelated-stopped', safe.child_thread_id, 1, 'interrupted', T0 - 50_000, T0,
+      { delegatedTaskId: 'node:delegated-task:other', startedAt: iso(T0 - 49_000) });
+    stop('unrelated-stopped', safe.child_thread_id, T0);
+    addRun('safe-run', safe.child_thread_id, 2, 'interrupted', T0 - 20_000, T0 + 1_000,
+      { delegatedTaskId: safe.subagent_id, startedAt: iso(T0 - 19_000) });
+    assert.deepEqual(dbIo.cancelledDelegatedTasksSince(db, iso(T0)).map((s) => s.subagent_id), [safe.subagent_id]);
+    const { io, calls } = fakeIo({ threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    assert.match(calls.send[0].text, /Task safe/);
+    assert.doesNotMatch(calls.send[0].text, /Task buffered-stop/);
   } finally { db.close(); }
 });
 
@@ -586,6 +614,170 @@ test('a fast scan notes threads right away and keeps the incident open for a run
   assert.equal(calls.telegram.length, 1);
   assert.equal(state.handled[id].done, true);
   assert.equal(calls.send.length, 2);
+});
+
+test('a later delegated cut is sent once as an incremental queued note without delaying the parent', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    const row = task('late-task');
+    // Start with an own-run cut only; the delegated projection appears later.
+    const delegated = [];
+    const parent = { title: 'Architecture lane', activeRunId: null, status: 'idle' };
+    const { io, calls } = fakeIo({ runs: [run('batch')], delegated, threads: { batch: parent } });
+    io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state, { now: T0 + 30_000 }), io);
+    assert.equal(calls.send.length, 1);
+    assert.match(calls.send[0].text, /Your own turn was cut off/);
+    assert.doesNotMatch(calls.send[0].text, /Task late-task/);
+    const [found] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    found.completed_at = iso(T0 + 40_000);
+    delegated.push(found);
+    parent.activeRunId = 'parent-continued';
+    parent.status = 'running';
+    await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.equal(calls.send[1].mode, 'queue');
+    assert.match(calls.send[1].clientRequestId, /^rs-.*:delegated:[0-9a-f]{64}$/);
+    assert.match(calls.send[1].text, /Additional delegated task discovered/);
+    assert.match(calls.send[1].text, /Task late-task.*task_status node:delegated-task:late-task/);
+    assert.doesNotMatch(calls.send[1].text, /Your own turn was cut off/);
+    await restartScan(scanArgs(state, { now: T0 + 95_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.equal(calls.telegram.length, 1);
+    assert.match(calls.telegram[0].text, /1 delegated task\(s\) to pick up/);
+    assert.match(calls.telegram[0].text, /1 delegated task\(s\) to pick up/);
+    assert.equal(row.child_thread_id, 'thread:delegated-task:late-task');
+  } finally { db.close(); }
+});
+
+test('incremental task retry uses its durable receipt even if send succeeded before state save', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    task('late-receipt');
+    const delegated = [];
+    const { io, calls } = fakeIo({ runs: [run('batch')], delegated, threads: { batch: { title: 'Batch' } } });
+    io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state, { now: T0 + 30_000 }), io);
+    const [found] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    found.completed_at = iso(T0 + 40_000);
+    delegated.push(found);
+    let receipt = null;
+    const send = io.sendToThread;
+    io.sendToThread = async (threadId, text, opts) => {
+      await send(threadId, text, opts);
+      receipt = opts.clientRequestId;
+      throw new Error('reply lost after accept');
+    };
+    io.restartNoteRun = (_db, _id, requestId) => requestId === receipt ? 'receipt-run' : null;
+    await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.equal(Object.values(state.handled)[0].threads.batch.done, false);
+    await restartScan(scanArgs(state, { now: T0 + 95_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.equal(calls.telegram.length, 1);
+  } finally { db.close(); }
+});
+
+test('a main-note receipt only covers the delegated IDs captured before that send', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    task('first-attempt');
+    task('appeared-after-accept');
+    const [first, later] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    const delegated = [first];
+    const { io, calls } = fakeIo({ runs: [run('batch')], delegated, threads: { batch: { title: 'Batch' } } });
+    io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+    const state = { handled: {}, servers: [] };
+    let mainReceipt = false;
+    const send = io.sendToThread;
+    io.sendToThread = async (id, text, opts) => {
+      await send(id, text, opts);
+      if (!opts.clientRequestId.includes(':delegated:')) {
+        mainReceipt = true;
+        throw new Error('main send accepted but reply lost');
+      }
+    };
+    io.restartNoteRun = (_db, _thread, id) => mainReceipt && !id.includes(':delegated:') ? 'main-note-run' : null;
+    await restartScan(scanArgs(state, { now: T0 + 30_000 }), io);
+    assert.equal(calls.send.length, 1);
+    assert.match(calls.send[0].text, /Task first-attempt/);
+    assert.doesNotMatch(calls.send[0].text, /Task appeared-after-accept/);
+    later.completed_at = iso(T0 + 40_000);
+    delegated.push(later);
+    await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
+    await restartScan(scanArgs(state, { now: T0 + 95_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.match(calls.send[1].text, /Task appeared-after-accept/);
+    assert.doesNotMatch(calls.send[1].text, /Task first-attempt/);
+  } finally { db.close(); }
+});
+
+test('late-note send exhaustion identifies the undelivered task in the summary', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    task('undelivered');
+    const delegated = [];
+    const { io, calls } = fakeIo({ runs: [run('batch')], delegated, threads: { batch: { title: 'Batch' } } });
+    io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state, { now: T0 + 30_000 }), io);
+    const [late] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    late.completed_at = iso(T0 + 40_000);
+    delegated.push(late);
+    io.sendToThread = async () => { throw new Error('service unavailable'); };
+    for (const at of [65_000, 70_000, 95_000]) await restartScan(scanArgs(state, { now: T0 + at }), io);
+    assert.equal(calls.telegram.length, 1);
+    assert.match(calls.telegram[0].text, /delegated task node:delegated-task:undelivered not noted/);
+    assert.equal(calls.telegram[0].severity, 'attention');
+  } finally { db.close(); }
+});
+
+test('late delegated delivery retries a missing receipt and never includes a task stopped before the retry', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    task('retry-late');
+    task('stopped-late');
+    const delegated = [];
+    const { io, calls } = fakeIo({ runs: [run('batch')], delegated, threads: { batch: { title: 'Batch' } } });
+    io.serverRuntime = () => ({ pid: 7, procStartMs: T0 - 30_000, readyMs: T0 + 10_000 });
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state, { now: T0 + 30_000 }), io);
+    for (const row of dbIo.cancelledDelegatedTasksSince(db, iso(T0))) {
+      row.completed_at = iso(T0 + 40_000);
+      delegated.push(row);
+    }
+    let stopLate = false;
+    io.delegatedStoppedSince = (_db, sub) => stopLate && sub.subagent_id === 'node:delegated-task:stopped-late';
+    const send = io.sendToThread;
+    let failure = true;
+    io.sendToThread = async (...args) => {
+      if (failure) { failure = false; throw new Error('unavailable before accept'); }
+      return send(...args);
+    };
+    await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
+    assert.equal(calls.send.length, 1);
+    stopLate = true;
+    await restartScan(scanArgs(state, { now: T0 + 95_000 }), io);
+    assert.equal(calls.send.length, 2);
+    assert.match(calls.send[1].text, /Task retry-late/);
+    assert.doesNotMatch(calls.send[1].text, /Task stopped-late/);
+    assert.equal(calls.telegram.length, 1);
+  } finally { db.close(); }
+});
+
+test('a stopped unstarted continuation remains a Stop target', () => {
+  const { db, task, addRun, stop } = delegatedFixture();
+  try {
+    const row = task('stopped-start');
+    addRun('initial-cut', row.child_thread_id, 1, 'cancelled', T0 - 50_000, T0,
+      { startedAt: iso(T0 - 49_000), delegatedTaskId: row.subagent_id });
+    addRun('continuation-stop', row.child_thread_id, 2, 'cancelled', T0, T0 + 1_000,
+      { startedAt: null, restartContinuationOfRunId: 'initial-cut' });
+    stop('continuation-stop', row.child_thread_id, T0 + 500);
+    assert.equal(dbIo.cancelledDelegatedTasksSince(db, iso(T0)).length, 0);
+  } finally { db.close(); }
 });
 
 test('OpenCode-only restarts recover own turns and track sightings separately from Robob', async () => {

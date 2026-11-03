@@ -92,28 +92,34 @@ export function cancelledDelegatedTasksSince(db, sinceIso) {
         and coalesce(json_extract(s.payload_json,'$.completionDelivery.state'),'') != 'disposed'
         and not exists(select 1 from orchestration_v2_projection_turn_items i
           where i.run_id=s.run_id and i.type='run_interrupt_request' and i.updated_at >= s.started_at)
-        and not exists(select 1 from orchestration_v2_projection_turn_items i
-          where i.run_id=(select r.run_id from orchestration_v2_projection_runs r
-            where r.thread_id=s.child_thread_id and r.status != 'queued' and r.requested_at <= s.completed_at
-            order by r.ordinal desc limit 1) and i.type='run_interrupt_request')
       order by s.completed_at`,
   ).all(sinceIso).map(({ client_request_id, ...row }) => ({
     ...row, kind: 'delegated', childThreadId: row.child_thread_id,
     // task_status takes a node ID, not the client request ID used to make it.
     taskRef: row.subagent_id,
     clientRequestId: client_request_id ?? null,
-  }));
+  })).filter((row) => {
+    const runs = taskChildRuns(db, row.childThreadId, row.taskRef);
+    // Buffered notifications can be cancelled without ever starting; they
+    // must not hide the Stop on the task's last executed run.
+    const last = runs.findLast((r) => r.requested_at <= row.completed_at && r.status !== 'queued'
+      && (r.status !== 'cancelled' || r.started_at != null || r.continued_from != null || r.stop_requested));
+    return !last?.stop_requested;
+  });
 }
 
-export function childRunOutcomeSince(db, childThreadId, taskRef, sinceIso) {
-  if (!childThreadId) return null;
+function taskChildRuns(db, childThreadId, taskRef) {
+  if (!childThreadId) return [];
   const rows = db.prepare(
     `select run_id, ordinal, status, requested_at, completed_at,
             json_extract(payload_json,'$.delegatedTaskId') task_id,
             json_extract(payload_json,'$.restartContinuationOfRunId') continued_from,
             json_extract(payload_json,'$.queueHeld') queue_held,
-            json_extract(payload_json,'$.restartCancelledBackgroundWork') cancelled_work
-       from orchestration_v2_projection_runs where thread_id=? order by ordinal`,
+            json_extract(payload_json,'$.startedAt') started_at,
+            json_extract(payload_json,'$.restartCancelledBackgroundWork') cancelled_work,
+            exists(select 1 from orchestration_v2_projection_turn_items i
+              where i.run_id=r.run_id and i.type='run_interrupt_request') stop_requested
+       from orchestration_v2_projection_runs r where thread_id=? order by ordinal`,
   ).all(childThreadId);
   // Legacy initial tasks have no delegatedTaskId. A later task sharing that
   // thread must never inherit another task's completed follow-up.
@@ -122,10 +128,14 @@ export function childRunOutcomeSince(db, childThreadId, taskRef, sinceIso) {
   const legacyTask = childThreadId.startsWith('thread:delegated-task:')
     ? `node:delegated-task:${childThreadId.slice('thread:delegated-task:'.length)}` : null;
   if (!initial.length && taskRef === legacyTask && first && !first.task_id) initial.push(first);
-  if (!initial.length) return null;
+  if (!initial.length) return [];
   const ids = new Set(initial.map((r) => r.run_id));
   for (const r of rows) if (ids.has(r.continued_from)) ids.add(r.run_id);
-  const owned = rows.filter((r) => ids.has(r.run_id));
+  return rows.filter((r) => ids.has(r.run_id));
+}
+
+export function childRunOutcomeSince(db, childThreadId, taskRef, sinceIso) {
+  const owned = taskChildRuns(db, childThreadId, taskRef);
   const active = owned.findLast((r) => ['preparing', 'starting', 'running', 'waiting'].includes(r.status)
     || (r.status === 'queued' && r.queue_held !== 1 && r.queue_held !== true));
   if (active) return { status: 'running', run_id: active.run_id };
