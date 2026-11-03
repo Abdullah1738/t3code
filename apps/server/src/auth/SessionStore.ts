@@ -10,6 +10,7 @@ import {
   RuntimeMode,
   type ServerAuthSessionMethod,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -760,14 +761,13 @@ export const make = Effect.gen(function* () {
   const verify: SessionStore["Service"]["verify"] = Effect.fn("SessionStore.verify")(
     function* (token) {
       if (devAuth?.matches(token)) {
-        const row = yield* authSessions
-          .getById({ sessionId: devAuth.sessionId })
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
-            ),
-          );
+        const row = yield* authSessions.getById({ sessionId: devAuth.sessionId }).pipe(
+          NodeSqliteClient.readOnly,
+          Effect.mapError(
+            (cause) =>
+              new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
+          ),
+        );
         if (Option.isNone(row)) {
           return yield* new UnknownSessionTokenError({ sessionId: devAuth.sessionId });
         }
@@ -825,13 +825,12 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      const row = yield* authSessions
-        .getById({ sessionId: claims.sid })
-        .pipe(
-          Effect.mapError(
-            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
-          ),
-        );
+      const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError(
+          (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+        ),
+      );
       if (Option.isNone(row)) {
         return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
       }
@@ -928,13 +927,12 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    const row = yield* authSessions
-      .getById({ sessionId: claims.sid })
-      .pipe(
-        Effect.mapError(
-          (cause) => new WebSocketTokenVerificationError({ sessionId: claims.sid, cause }),
-        ),
-      );
+    const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
+      NodeSqliteClient.readOnly,
+      Effect.mapError(
+        (cause) => new WebSocketTokenVerificationError({ sessionId: claims.sid, cause }),
+      ),
+    );
     if (Option.isNone(row)) {
       return yield* new UnknownWebSocketSessionError({ sessionId: claims.sid });
     }
