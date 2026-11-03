@@ -79,7 +79,7 @@ import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
-import { KanbanThreads } from "./threads.ts";
+import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 
@@ -793,8 +793,7 @@ const make = Effect.gen(function* () {
           ),
         ),
     );
-  // Threads a card was running on that were missing at the last tick. `view`
-  // also answers null on a read error, so a card is let go on the second miss.
+  // Threads confirmed missing at the previous tick; a failed read is not a miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
   // Pool keys whose model is out of usage or down, with when to probe next. In memory:
   // after a restart seedDown rebuilds it from the paused thread links.
@@ -3655,11 +3654,45 @@ const make = Effect.gen(function* () {
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
       yield* turnEndedUnlocked(threadId);
     }
+    // This is planning data only. A failed read must remain distinct from a
+    // successful absence, and nothing survives this invocation of the tick.
+    const views = new Map<ThreadId, KanbanThreadView | null>();
+    const freshFind = (threadId: ThreadId) =>
+      threads.find(threadId).pipe(
+        Effect.map((view) => Option.some(view)),
+        Effect.catch(() => Effect.succeed(Option.none<KanbanThreadView | null>())),
+        Effect.tap(() => Effect.sync(() => { views.delete(threadId); })),
+      );
+    const confirmFind = (threadId: ThreadId) =>
+      freshFind(threadId).pipe(
+        Effect.tap((found) =>
+          Effect.sync(() => {
+            if (Option.isSome(found)) views.set(threadId, found.value);
+          }),
+        ),
+      );
+    const planFind = (threadId: ThreadId) =>
+      Effect.suspend(() => {
+        if (views.has(threadId)) return Effect.succeed(Option.some(views.get(threadId)!));
+        return freshFind(threadId).pipe(
+          Effect.tap((found) =>
+            Effect.sync(() => {
+              if (Option.isSome(found)) views.set(threadId, found.value);
+            }),
+          ),
+        );
+      });
+    const planView = (threadId: ThreadId) =>
+      planFind(threadId).pipe(Effect.map((found) => Option.getOrNull(found)));
     // A hold lasts for the turn; a missed turn end or a thread stuck waiting
     // on something must not keep the slot.
     for (const [threadId, held] of yield* Ref.get(holds)) {
-      const view = yield* threads.view(threadId);
+      const view = yield* planView(threadId);
       if (!view || view.state !== "running" || now - held.at > HOLD_MAX_MS) {
+        const current = yield* freshFind(threadId);
+        if (Option.isNone(current)) continue;
+        if (current.value?.state === "running" && now - held.at <= HOLD_MAX_MS) continue;
+        views.delete(threadId);
         yield* dropHold(threadId);
         yield* kick;
       }
@@ -3667,7 +3700,12 @@ const make = Effect.gen(function* () {
     // A failed evaluator's one retry, once its wait is over.
     for (const [threadId, entry] of yield* Ref.get(evaluatorFailures)) {
       if (entry.state !== "retry" || entry.dueAt > now) continue;
-      const view = yield* threads.view(threadId);
+      const found = yield* planFind(threadId);
+      if (Option.isNone(found)) continue;
+      // Sending or changing the retry depends on the current run, not the plan.
+      const fresh = yield* freshFind(threadId);
+      if (Option.isNone(fresh)) continue;
+      const view = fresh.value;
       if (!view || view.archived) {
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
@@ -3682,6 +3720,8 @@ const make = Effect.gen(function* () {
         yield* setState("sent");
         continue;
       }
+      const failure = yield* threads.lastFailure(threadId);
+      if (failure === null || (entry.runId !== null && failure.runId !== entry.runId)) continue;
       const sent = yield* threads
         .send({ threadId, text: Briefs.evaluatorRetryText(entry.message) })
         .pipe(
@@ -3692,13 +3732,19 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
+      views.delete(threadId);
       yield* setState("sent");
       if (!sent) {
         const link = yield* store.threadLink(threadId);
-        if (link) yield* evaluatorGiveUp(link, entry.message);
+        if (link) {
+          views.clear();
+          yield* evaluatorGiveUp(link, entry.message);
+          views.clear();
+        }
       }
     }
     const missed = new Set<ThreadId>();
+    const failedMissingReads = new Set<ThreadId>();
     const before = yield* Ref.get(missing);
     for (const board of yield* store.boards) {
       if (board.archivedAt !== null) continue;
@@ -3706,8 +3752,33 @@ const make = Effect.gen(function* () {
       yield* reconcileHeldDiscussions(board);
       const discussionWakes = yield* wakeDiscussionNudges(board);
       yield* wakeBoardNudges(board, discussionWakes);
+      views.clear();
+      let boardCards: ReadonlyArray<KanbanCard> | undefined;
+      const cardsForPlan = Effect.suspend(() =>
+        boardCards === undefined
+          ? store.cards(board.id).pipe(
+              Effect.tap((cards) => Effect.sync(() => { boardCards = cards; })),
+            )
+          : Effect.succeed(boardCards),
+      );
+      const invalidateCards = () => {
+        boardCards = undefined;
+      };
+      const savedCard = (card: KanbanCard) => {
+        if (boardCards !== undefined) {
+          boardCards = boardCards.map((existing) => (existing.id === card.id ? card : existing));
+        }
+      };
+      const cardChanges = new Map<KanbanCard["id"], KanbanCard | null>();
+      let refreshedCards = false;
+      const cardsForAfterMutation = (card: KanbanCard) =>
+        cardChanges.has(card.id) ? cardChanges.get(card.id) ?? null : refreshedCards ? null : card;
+      const updateCard = (card: KanbanCard) => {
+        savedCard(card);
+        cardChanges.set(card.id, card);
+      };
       // The scribe regroups at most every SCRIBE_EVERY_MS, and only when open cards changed.
-      const fingerprint = Scribe.groupsFingerprint(yield* store.cards(board.id));
+      const fingerprint = Scribe.groupsFingerprint(yield* cardsForPlan);
       const last = (yield* Ref.get(scribed)).get(board.id);
       const cooled = last === undefined || now - last.at >= Scribe.SCRIBE_EVERY_MS;
       // A failed attempt is retried once the cooldown has passed, cards changed or not.
@@ -3722,7 +3793,7 @@ const make = Effect.gen(function* () {
         yield* forkGroups(board.id);
       }
       const goalsPrint = Scribe.goalsFingerprint(
-        yield* store.cards(board.id),
+        yield* cardsForPlan,
         yield* store.goals(board.id),
       );
       const lastGoals = (yield* Ref.get(goalsScribed)).get(board.id);
@@ -3750,37 +3821,62 @@ const make = Effect.gen(function* () {
                 .filter((message) => message.author._tag === "system")
                 .at(-1) ?? null);
         if (
-          Scribe.proposalDue(yield* store.cards(board.id), yield* store.goals(board.id), last, now)
+          Scribe.proposalDue(yield* cardsForPlan, yield* store.goals(board.id), last, now)
         ) {
           yield* Ref.update(proposalsRunning, (all) => new Set(all).add(board.id));
           yield* forkProposals(board.id);
         }
       }
       // A card whose thread was deleted goes back to its queue for a new one.
-      for (const card of yield* store.cards(board.id)) {
+      for (const card of yield* cardsForPlan) {
         const threadId = card.activeThreadId;
-        if (threadId === null || (yield* threads.view(threadId))) continue;
+        if (threadId === null) continue;
+        const planned = yield* planFind(threadId);
+        if (Option.isNone(planned)) {
+          failedMissingReads.add(threadId);
+          missed.delete(threadId);
+          continue;
+        }
+        if (planned.value !== null) {
+          missed.delete(threadId);
+          continue;
+        }
+        if (failedMissingReads.has(threadId)) continue;
+        // A failed probe cannot count as a miss, even if an earlier read was absent.
+        const confirmed = yield* confirmFind(threadId);
+        if (Option.isNone(confirmed) || confirmed.value !== null) {
+          if (Option.isNone(confirmed)) failedMissingReads.add(threadId);
+          views.delete(threadId);
+          missed.delete(threadId);
+          continue;
+        }
         missed.add(threadId);
         if (!before.has(threadId)) continue;
+        const current = yield* store.card(card.id);
+        if (current === null || current.activeThreadId !== threadId) continue;
         const at = yield* nowIso;
-        const review = card.activeRole === "review";
+        const review = current.activeRole === "review";
         const next: KanbanCard = {
-          ...release(card),
+          ...release(current),
           stage: review ? "needs_review" : "todo",
-          workThreadId: review ? card.workThreadId : null,
-          reviewThreadId: review ? null : card.reviewThreadId,
+          workThreadId: review ? current.workThreadId : null,
+          reviewThreadId: review ? null : current.reviewThreadId,
           movedAt: at,
           updatedAt: at,
         };
         yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
-          fromStage: card.stage,
+          fromStage: current.stage,
           toStage: next.stage,
           body: "Its thread is gone",
         });
         yield* saveCard(next);
+        updateCard(next);
       }
       // Backstop for a missed turn end, or a worker stuck on its own question.
-      for (const card of yield* store.cards(board.id)) {
+      for (const plannedCard of yield* cardsForPlan) {
+        // A failed-run helper can release several cards from this snapshot.
+        const card = cardsForAfterMutation(plannedCard);
+        if (!card) continue;
         const threadId = card.activeThreadId;
         if (threadId === null || card.activeRole !== "work") continue;
         if (board.pause && !board.pause.keep.includes(card.id)) continue;
@@ -3794,35 +3890,63 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
-          yield* turnEndedUnlocked(threadId);
+          views.clear();
+          yield* turnEndedUnlocked(threadId).pipe(Effect.ensuring(Effect.sync(() => {
+            views.clear();
+            invalidateCards();
+          })));
+          cardChanges.clear();
+          refreshedCards = true;
+          for (const carried of yield* cardsForPlan) cardChanges.set(carried.id, carried);
           continue;
         }
-        const view = yield* threads.view(threadId);
-        if (view?.state === "idle" && (yield* threads.lastFailure(threadId)) !== null) {
-          yield* turnEndedUnlocked(threadId);
-          continue;
-        }
+        const view = yield* planView(threadId);
         if (
           view === null ||
           Rules.waitingOnBackground(view, now) ||
           !Rules.workerQuietDue(card, view, now)
         )
           continue;
-        if (view.state === "needs-input") {
+        const fresh = yield* freshFind(threadId);
+        const current = yield* store.card(card.id);
+        if (
+          Option.isNone(fresh) || fresh.value === null ||
+          current?.activeThreadId !== threadId || current.activeRole !== "work" ||
+          fresh.value.state !== view.state ||
+          (yield* store.threadLink(threadId))?.paused ||
+          Rules.waitingOnBackground(fresh.value, now) ||
+          !Rules.workerQuietDue(current, fresh.value, now)
+        ) continue;
+        // A newly failed idle run is handled by the failure backstop next tick.
+        if (fresh.value.state === "idle") {
+          const latestFailure = yield* Effect.result(threads.findLastFailure(threadId));
+          if (Result.isFailure(latestFailure)) {
+            yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+            continue;
+          }
+          if (latestFailure.success !== null) continue;
+        }
+        views.delete(threadId);
+        if (fresh.value.state === "needs-input") {
           // Its turn end after the interrupt brings the nudge.
           yield* threads.interrupt(threadId, "Stuck on its own question; the board nudges it");
           const at = yield* nowIso;
-          yield* logEvent(card, { _tag: "system", component: "dispatcher" }, "thread", {
+          yield* logEvent(current, { _tag: "system", component: "dispatcher" }, "thread", {
             body: "Interrupted: stuck on its own question",
           });
-          yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+          const interrupted = { ...current, nudgedAt: at, updatedAt: at };
+          yield* saveCard(interrupted);
+          updateCard(interrupted);
           continue;
         }
-        yield* nudgeWorker(threadId, [card]);
+        yield* nudgeWorker(threadId, [current]);
+        const saved = yield* store.card(current.id);
+        if (saved) updateCard(saved);
+        else invalidateCards();
       }
       // Backstop for a reviewer left idle with no verdict: a turn end skipped while
       // its own background work ran, or one that never arrived.
-      for (const card of yield* store.cards(board.id)) {
+      for (const card of yield* cardsForPlan) {
         const threadId = card.activeThreadId;
         if (threadId === null || card.activeRole !== "review") continue;
         if (board.pause && !board.pause.keep.includes(card.id)) continue;
@@ -3835,27 +3959,55 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
-          yield* turnEndedUnlocked(threadId);
+          views.clear();
+          yield* turnEndedUnlocked(threadId).pipe(Effect.ensuring(Effect.sync(() => {
+            views.clear();
+            invalidateCards();
+          })));
           continue;
         }
-        const view = yield* threads.view(threadId);
+        const view = yield* planView(threadId);
         if (
           view === null ||
           Rules.waitingOnBackground(view, now) ||
           !Rules.reviewerQuietDue(card, view, now)
         )
           continue;
-        yield* reviewerStopped(card, threadId);
+        const fresh = yield* freshFind(threadId);
+        const current = yield* store.card(card.id);
+        if (
+          Option.isNone(fresh) || fresh.value === null ||
+          current?.activeThreadId !== threadId || current.activeRole !== "review" ||
+          (yield* store.threadLink(threadId))?.paused ||
+          Rules.waitingOnBackground(fresh.value, now) ||
+          !Rules.reviewerQuietDue(current, fresh.value, now)
+        ) continue;
+        const latestFailure = yield* Effect.result(threads.findLastFailure(threadId));
+        if (Result.isFailure(latestFailure)) {
+          yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+          continue;
+        }
+        if (latestFailure.success !== null) continue;
+        views.delete(threadId);
+        yield* reviewerStopped(current, threadId);
+        const saved = yield* store.card(current.id);
+        if (saved) updateCard(saved);
+        else invalidateCards();
       }
       // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
       for (const link of yield* store.threadLinks({ boardId: board.id, open: true })) {
         if (link.role !== "evaluator") continue;
         // A failed read skips this thread and keeps its ask record, so a blip
         // can't make the next healthy tick ask again inside the hour.
-        const read = yield* Effect.result(threads.find(link.threadId));
-        if (read._tag === "Failure") continue;
-        const view = read.success;
+        const read = yield* planFind(link.threadId);
+        if (Option.isNone(read)) continue;
+        let view = read.value;
         if (view?.state !== "running" || view.runStartedAt === null) {
+          if (!(yield* Ref.get(statusAsked)).has(link.threadId)) continue;
+          const fresh = yield* freshFind(link.threadId);
+          if (Option.isNone(fresh)) continue;
+          view = fresh.value;
+          if (view?.state === "running" && view.runStartedAt !== null) continue;
           yield* Ref.update(statusAsked, (all) => {
             if (!all.has(link.threadId)) return all;
             const next = new Map(all);
@@ -3870,6 +4022,14 @@ const make = Effect.gen(function* () {
         const due =
           asked?.run === run ? now - asked.at >= STATUS_EVERY_MS : now - started >= STATUS_FIRST_MS;
         if (!due) continue;
+        const fresh = yield* freshFind(link.threadId);
+        const currentLink = yield* store.threadLink(link.threadId);
+        if (
+          Option.isNone(fresh) || fresh.value?.state !== "running" ||
+          fresh.value.runStartedAt !== run || currentLink?.endedAt !== null ||
+          currentLink.role !== "evaluator" || currentLink.boardId !== board.id
+        ) continue;
+        views.delete(link.threadId);
         const minutes = Math.round((now - started) / 60_000);
         const sent = yield* threads
           .send({
@@ -3893,7 +4053,7 @@ const make = Effect.gen(function* () {
       }
       // A todo card whose step is only evaluator subtasks (its packet) and nobody has
       // done them: its discussion's evaluator is woken once, after a wait.
-      for (const card of yield* store.cards(board.id)) {
+      for (const card of yield* cardsForPlan) {
         const waiting =
           card.stage === "todo" &&
           card.settledAt === null &&
@@ -3918,13 +4078,23 @@ const make = Effect.gen(function* () {
         }
         const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
         if (wait.woken || now - wait.since < limit) continue;
+        const current = yield* store.card(card.id);
+        const currentWait = (yield* Ref.get(stepWaits)).get(card.id);
+        if (
+          current === null || current.stage !== "todo" || current.settledAt !== null ||
+          current.activeThreadId !== null || !kanbanEvaluatorStep(current) ||
+          Subtasks.subtaskIds(kanbanStepSubtasks(current, "evaluator")) !== key ||
+          currentWait !== wait || now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS)
+        ) continue;
         const minutes = Math.round((now - wait.since) / 60_000);
         // A settled or archived discussion is finished: its evaluator isn't woken for it.
+        views.clear();
+        invalidateCards();
         const woke = yield* cardDiscussionUnlocked(card.id).pipe(
           Effect.flatMap((discussion) =>
             discussion.settledAt !== null || discussion.archivedAt !== null
               ? Effect.succeed(false)
-              : toEvaluator(discussion, Briefs.evaluatorStepWaitingText(card, minutes), true).pipe(
+              : toEvaluator(discussion, Briefs.evaluatorStepWaitingText(current, minutes), true).pipe(
                   Effect.as(true),
                 ),
           ),
@@ -3933,6 +4103,10 @@ const make = Effect.gen(function* () {
               Effect.as(false),
             ),
           ),
+          Effect.ensuring(Effect.sync(() => {
+            views.clear();
+            invalidateCards();
+          })),
         );
         if (woke) {
           yield* Ref.update(stepWaits, (all) =>
@@ -3966,8 +4140,14 @@ const make = Effect.gen(function* () {
             const actor = participant.actor;
             if (actor._tag !== "evaluator") continue;
             const evaluatorId = actor.threadId;
-            const read = yield* Effect.result(threads.find(evaluatorId));
-            if (read._tag === "Failure" || read.success?.state !== "running") continue;
+            const read = yield* planFind(evaluatorId);
+            if (Option.isNone(read) || read.value?.state !== "running") continue;
+            const fresh = yield* freshFind(evaluatorId);
+            if (
+              Option.isNone(fresh) || fresh.value?.state !== "running" ||
+              fresh.value.runStartedAt !== read.value.runStartedAt
+            ) continue;
+            views.delete(evaluatorId);
             const minutes = Math.round(idleMs / 60_000);
             const sent = yield* threads
               .send({
@@ -4003,11 +4183,16 @@ const make = Effect.gen(function* () {
           if (participant.typingUntil === null) continue;
           const actor = participant.actor;
           if (actor._tag !== "thread" && actor._tag !== "evaluator") continue;
-          const view = yield* threads.view(actor.threadId);
+          const view = yield* planView(actor.threadId);
           // Typing is kept alive only where the agent is working on a reply.
           // Once it lapses, a non-home thread's owes go too; home keeps them so
           // its turn end still nudges.
-          if (view && view.state !== "idle" && (yield* isHome(discussion, actor.threadId))) {
+          const home = view && view.state !== "idle" && (yield* isHome(discussion, actor.threadId));
+          if (!home && Date.parse(participant.typingUntil) >= now) continue;
+          const fresh = yield* freshFind(actor.threadId);
+          if (Option.isNone(fresh)) continue;
+          const currentView = fresh.value;
+          if (currentView && currentView.state !== "idle" && (yield* isHome(discussion, actor.threadId))) {
             next = withParticipant(next, actor, participant.name, {
               typingUntil: yield* typingUntil,
             });
@@ -4042,19 +4227,40 @@ const make = Effect.gen(function* () {
         let working = false;
         for (const threadId of threadIds) {
           if (threadId === null) continue;
-          const view = yield* threads.view(threadId);
+          const view = yield* planView(threadId);
           if (view !== null && view.state !== "idle") working = true;
         }
         if (working) continue;
-        yield* saveDiscussion({ ...discussion, settledAt: idleNow, snoozedUntil: null });
+        // Settling is a mutation based on all participating threads being idle.
+        for (const threadId of new Set(threadIds)) {
+          if (threadId === null) continue;
+          const fresh = yield* freshFind(threadId);
+          if (Option.isNone(fresh) || (fresh.value !== null && fresh.value.state !== "idle")) {
+            working = true;
+            break;
+          }
+        }
+        if (working) continue;
+        const current = yield* store.discussion(discussion.id);
+        const currentCard = current?.cardId ? yield* store.card(current.cardId) : null;
+        if (!current || !Rules.discussionSettleDue(current, currentCard, now)) continue;
+        yield* saveDiscussion({ ...current, settledAt: idleNow, snoozedUntil: null });
       }
       // Reviewed cards wait in review until their PRs land.
       const chains = board.reviewChains;
-      for (const card of yield* store.cards(board.id)) {
+      // syncPrs and evaluatorTurn can change cards and send to other threads.
+      for (const card of yield* cardsForPlan) {
         if (card.stage !== "in_review" || card.activeThreadId !== null) continue;
         const chain = Rules.chainFor({ ...board, reviewChains: chains }, card);
         if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) continue;
-        const synced = yield* syncPrs(card);
+        const current = yield* store.card(card.id);
+        if (
+          !current || current.stage !== "in_review" || current.activeThreadId !== null ||
+          !Rules.reviewFinished(current, Rules.chainFor({ ...board, reviewChains: chains }, current)?.steps.length ?? 1)
+        ) continue;
+        views.clear();
+        invalidateCards();
+        const synced = yield* syncPrs(current);
         if (!Rules.prsLanded(synced)) continue;
         // The plan's next step decides where it goes: the worker's sends it
         // back to work, a review-only one to review, else it's completed.
@@ -4086,6 +4292,7 @@ const make = Effect.gen(function* () {
         });
         yield* saveCard(landed);
         yield* evaluatorTurn(synced, landed, dispatcher);
+        views.clear();
       }
     }
     // A pool whose model left the composer's list drops to 0 slots after two
