@@ -28,6 +28,23 @@ const listen = (handler: Parameters<typeof NodeHttp.createServer>[1]) =>
   });
 
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
+const cli = NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url));
+
+const runCommand = (file: string, args: string[], env: NodeJS.ProcessEnv) =>
+  new Promise<{ code: number | string | null; stdout: string; stderr: string }>((resolve) => {
+    NodeChildProcess.execFile(file, args, { env }, (error, stdout, stderr) => {
+      resolve({ code: error?.code ?? 0, stdout, stderr });
+    });
+  });
+
+const controlEnv = (url: string) => ({
+  ...process.env,
+  T3_CONTROL_URL: url,
+  T3_CONTROL_TOKEN: "test",
+});
+
+const runCli = (url: string, args: string[]) =>
+  runCommand(process.execPath, [cli, ...args], controlEnv(url));
 
 describe("discoverConfig", () => {
   const saved = {
@@ -87,6 +104,243 @@ describe("discoverConfig", () => {
 });
 
 describe("ControlClient", () => {
+  it("t3ctl sends an explicit request id or a fresh UUID", async () => {
+    const bodies: Array<{ text: string; clientRequestId: string }> = [];
+    const url = await listen((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        bodies.push(JSON.parse(body));
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const first = await runCli(url, ["send", "t", "--request-id", "chosen-id", "hello", "world"]);
+    const second = await runCli(url, ["send", "t", "hello"]);
+    const third = await runCli(url, ["send", "t", "hello"]);
+    expect([first.code, second.code, third.code]).toEqual([0, 0, 0]);
+    expect(bodies[0]).toMatchObject({ text: "hello world", clientRequestId: "chosen-id" });
+    expect(bodies[1]?.clientRequestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(bodies[2]?.clientRequestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(bodies[1]?.clientRequestId).not.toBe(bodies[2]?.clientRequestId);
+  });
+
+  it.each([
+    { label: "generated UUID", requestId: undefined, thread: "thread/' $HOME" },
+    { label: "provided id", requestId: "-request'id $HOME", thread: "-thread ' $HOME" },
+  ])("prints a shell-safe retry with the same $label after a send timeout", async (test) => {
+    const seen: Array<{ path: string | undefined; body: Record<string, unknown> }> = [];
+    const deliveries = new Set<unknown>();
+    const url = await listen((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        seen.push({ path: request.url, body: parsed });
+        const duplicate = deliveries.has(parsed.clientRequestId);
+        deliveries.add(parsed.clientRequestId);
+        if (!duplicate) return; // The server accepted it, but the response was lost.
+        response.end(JSON.stringify({ ok: true, runId: "run-1" }));
+      });
+    });
+    // The explicit URL path exercises quoting independently of thread and text.
+    const explicitUrl = `${url}/path'quote`;
+    const text = '--don\'t expand $(printf hacked); $HOME\n"quoted" \\ `false`';
+    const result = await runCli(url, [
+      "send",
+      "--url",
+      explicitUrl,
+      "--request-timeout",
+      "1",
+      ...(test.requestId === undefined ? [] : [`--request-id=${test.requestId}`]),
+      "--mode",
+      "queue",
+      "--model",
+      "model with 'quotes'",
+      "--option",
+      "effort=max",
+      "--",
+      test.thread,
+      text,
+    ]);
+    expect(result.code).toBe(4);
+    expect(result.stdout).toBe("");
+    expect(seen).toHaveLength(1);
+    const id = seen[0]?.body.clientRequestId;
+    if (test.requestId === undefined) {
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    } else {
+      expect(id).toBe(test.requestId);
+    }
+    const prefix = "send timed out; it may or may not have been delivered. Retry safely with: ";
+    expect(result.stderr.startsWith(prefix)).toBe(true);
+    const retry = result.stderr.slice(prefix.length).replace(/\n$/, "");
+    const retried = await runCommand(
+      "/bin/sh",
+      ["-c", `t3ctl() { "$T3CTL_NODE" "$T3CTL_SCRIPT" "$@"; }\n${retry}`],
+      { ...controlEnv(url), T3CTL_NODE: process.execPath, T3CTL_SCRIPT: cli },
+    );
+    expect(retried.code).toBe(0);
+    expect(retried.stderr).toBe("");
+    expect(JSON.parse(retried.stdout)).toEqual({ ok: true, runId: "run-1" });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toEqual(seen[1]);
+    expect(seen[0]).toEqual({
+      path: `/path'quote/api/ardud/control/threads/${encodeURIComponent(test.thread)}/send`,
+      body: {
+        text,
+        mode: "queue",
+        model: "model with 'quotes'",
+        options: [{ id: "effort", value: "max" }],
+        clientRequestId: id,
+      },
+    });
+    expect(deliveries.size).toBe(1);
+  });
+
+  it("uses the explicit request timeout for ordinary requests and long polls", async () => {
+    const paths: Array<string | undefined> = [];
+    const url = await listen((request, response) => {
+      paths.push(request.url);
+      if (request.url === "/api/ardud/control/events") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.flushHeaders();
+      }
+    });
+    for (const args of [
+      ["--request-timeout", "0.1", "health"],
+      ["wait", "thread", "--request-timeout", "0.1"],
+      ["events", "--request-timeout", "0.1"],
+    ]) {
+      const result = await runCli(url, args);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/timeout/i);
+      expect(result.stderr).not.toMatch(/Retry safely/);
+    }
+    expect(paths[0]).toBe("/api/ardud/control/health");
+    expect(paths[1]).toMatch(/^\/api\/ardud\/control\/threads\/thread\/wait\?/);
+    expect(paths[2]).toBe("/api/ardud/control/events");
+  });
+
+  it("does not call a timed-out wait an uncertain send", async () => {
+    const paths: Array<string | undefined> = [];
+    const url = await listen((request, response) => {
+      paths.push(request.url);
+      if (request.url?.endsWith("/send")) {
+        request.resume();
+        request.on("end", () => response.end(JSON.stringify({ ok: true, runId: "run-1" })));
+      }
+    });
+    const result = await runCli(url, ["send", "t", "hello", "--wait", "--request-timeout", "0.1"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/timeout/i);
+    expect(result.stderr).not.toMatch(/Retry safely/);
+    expect(paths).toHaveLength(2);
+    expect(paths[1]).toMatch(/\/wait\?/);
+  });
+
+  it("reports a send that times out while reading the response body", async () => {
+    const url = await listen((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"ok":');
+      });
+    });
+    const result = await runCli(url, ["send", "t", "hello", "--request-timeout", "0.1"]);
+    expect(result.code).toBe(4);
+    expect(result.stderr).toMatch(/^send timed out; it may or may not have been delivered/);
+  });
+
+  it("omits explicit credentials from the retry while retaining the explicit URL", async () => {
+    const seen: Array<{ path: string | undefined; body: unknown }> = [];
+    const url = await listen((request) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => seen.push({ path: request.url, body: JSON.parse(body) }));
+    });
+    const result = await runCli(url, [
+      "send",
+      "t",
+      "hello",
+      "--url",
+      url,
+      "--token",
+      "private-test-token",
+      "--request-id",
+      "id",
+      "--request-timeout",
+      "0.1",
+    ]);
+    expect(result.code).toBe(4);
+    expect(result.stderr).toContain(`--url '${url}'`);
+    expect(result.stderr).not.toContain("private-test-token");
+    expect(result.stderr).not.toContain("--token");
+    expect(seen).toEqual([
+      {
+        path: "/api/ardud/control/threads/t/send",
+        body: { text: "hello", clientRequestId: "id" },
+      },
+    ]);
+  });
+
+  it("does not claim a rejected send timed out or print its token", async () => {
+    const url = await listen((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({ ok: false, error: { code: "invalid_request", message: "bad" } }),
+        );
+      });
+    });
+    const result = await runCli(url, ["send", "t", "hello", "--token", "sensitive-token"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("invalid_request: bad");
+    expect(result.stderr).not.toContain("Retry safely");
+    expect(result.stderr).not.toContain("sensitive-token");
+  });
+
+  it("reports an interrupted send with the same safe-retry exit", async () => {
+    let received!: () => void;
+    const receivedRequest = new Promise<void>((resolve) => {
+      received = resolve;
+    });
+    const url = await listen((request) => {
+      request.resume();
+      request.on("end", received);
+    });
+    const child = NodeChildProcess.spawn(process.execPath, [cli, "send", "t", "message"], {
+      env: controlEnv(url),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    const exited = new Promise<number | null>((resolve) => child.once("close", resolve));
+    await receivedRequest;
+    child.kill("SIGTERM");
+    expect(await exited).toBe(4);
+    expect(stderr).toMatch(
+      /^send timed out; it may or may not have been delivered\. Retry safely with: t3ctl send /,
+    );
+    expect(stderr).toMatch(/--request-id '[0-9a-f-]{36}'/);
+  });
+
+  it("rejects invalid request timeouts before making a request", async () => {
+    const url = await listen((_request, response) => {
+      response.end(JSON.stringify({ ok: true }));
+    });
+    for (const value of ["", "  ", "0", "-1", "NaN", "Infinity", "2147484"]) {
+      const result = await runCli(url, ["--request-timeout=" + value, "health"]);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/--request-timeout must be a positive number of seconds/);
+    }
+  });
+
   it("forwards guarded interrupt options from the client and CLI", async () => {
     const seen: Array<{ url: string | undefined; body: unknown }> = [];
     const url = await listen((request, response) => {
