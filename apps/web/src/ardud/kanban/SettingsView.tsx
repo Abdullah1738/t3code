@@ -49,8 +49,8 @@ import {
   editedSlots,
   failedSlot,
   observeSlots,
+  sendPoolSlots,
   sentSlots,
-  serialSender,
   type SlotWrites,
 } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
@@ -376,9 +376,16 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 max={unlisted ? 0 : undefined}
                 disabled={blocked}
                 disabledReason={blockedReason}
-                onChange={(slots) =>
-                  runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, slots, { replaces: pool.key }),
+                onChange={(slots, dropped) =>
+                  sendPoolSlots(
+                    board.id,
+                    pool.key,
+                    slots,
+                    (value) =>
+                      runAction("Couldn't change the pool", () =>
+                        kanban.setPool(board.id, pool.model, value, { replaces: pool.key }),
+                      ),
+                    dropped,
                   )
                 }
               />
@@ -390,10 +397,10 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 title={blockedReason}
                 aria-label={`${pool.name} pool on`}
                 onCheckedChange={(on) =>
-                  void runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, on ? Math.max(1, pool.busy) : 0, {
-                      replaces: pool.key,
-                    }),
+                  sendPoolSlots(board.id, pool.key, on ? Math.max(1, pool.busy) : 0, (value) =>
+                    runAction("Couldn't change the pool", () =>
+                      kanban.setPool(board.id, pool.model, value, { replaces: pool.key }),
+                    ),
                   )
                 }
               />
@@ -739,7 +746,7 @@ function Stepper(props: {
   max?: number | undefined;
   disabled?: boolean;
   disabledReason?: string | undefined;
-  onChange: (value: number) => Promise<boolean> | void;
+  onChange: (value: number, dropped: () => void) => void;
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
@@ -749,15 +756,6 @@ function Stepper(props: {
   const nextId = useRef(0);
   const edited = useRef(false);
   const cancelled = useRef(false);
-  const onChangeRef = useRef(props.onChange);
-  // The queued write needs the latest pool callback, not the one from its first render.
-  // oxlint-disable-next-line react/refs
-  onChangeRef.current = props.onChange;
-  const sender = useRef<ReturnType<typeof serialSender> | null>(null);
-  sender.current ??= serialSender(
-    (value) => onChangeRef.current(value),
-    (id) => setWrites((state) => failedSlot(state, id)),
-  );
   const current = currentSlots(observed);
   const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : current;
   const base = Number.isSafeInteger(typed) ? typed : current;
@@ -765,7 +763,7 @@ function Stepper(props: {
   const send = (next: number) => {
     const id = ++nextId.current;
     setWrites((state) => sentSlots(observeSlots(state, props.value), { id, value: next }));
-    sender.current!(id, next);
+    props.onChange(next, () => setWrites((state) => failedSlot(state, id)));
   };
   // While typing, the buttons step the draft, so a click never races the typed number.
   const step = (by: number) => {

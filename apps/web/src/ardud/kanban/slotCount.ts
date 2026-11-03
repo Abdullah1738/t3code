@@ -34,39 +34,71 @@ export interface SlotWrites {
   readonly sent: ReadonlyArray<SlotWrite>;
 }
 
+type SlotWriteRequest = {
+  write: () => Promise<boolean | void> | boolean | void;
+  dropped: () => void;
+};
+
+function serialQueue(onIdle: () => void = () => {}) {
+  let inFlight = false;
+  let queued: SlotWriteRequest | null = null;
+
+  const run = async (request: SlotWriteRequest) => {
+    inFlight = true;
+    let result: boolean | void;
+    try {
+      result = await Promise.resolve(request.write());
+    } catch {
+      result = false;
+    }
+    if (result === false) request.dropped();
+    if (queued !== null) {
+      const next = queued;
+      queued = null;
+      void run(next);
+    } else {
+      inFlight = false;
+      onIdle();
+    }
+  };
+
+  return (request: SlotWriteRequest) => {
+    if (!inFlight) {
+      void run(request);
+      return;
+    }
+    const previous = queued;
+    queued = request;
+    previous?.dropped();
+  };
+}
+
 /** Serialize writes and discard superseded or failed pending IDs. */
 export function serialSender(
   write: (value: number) => Promise<boolean | void> | boolean | void,
   dropped: (id: number) => void,
 ): (id: number, value: number) => void {
-  let inFlight = false;
-  let queued: SlotWrite | null = null;
+  const send = serialQueue();
+  return (id, value) => send({ write: () => write(value), dropped: () => dropped(id) });
+}
 
-  const run = async (id: number, value: number) => {
-    inFlight = true;
-    let result: boolean | void;
-    try {
-      result = await Promise.resolve(write(value));
-    } catch {
-      result = false;
-    }
-    if (result === false) dropped(id);
-    inFlight = false;
-    if (queued !== null) {
-      const next = queued;
-      queued = null;
-      void run(next.id, next.value);
-    }
-  };
+// A Settings view can unmount while its RPC is pending. Share the queue until it drains.
+const poolQueues = new Map<string, ReturnType<typeof serialQueue>>();
 
-  return (id, value) => {
-    if (!inFlight) {
-      void run(id, value);
-      return;
-    }
-    if (queued !== null) dropped(queued.id);
-    queued = { id, value };
-  };
+export function sendPoolSlots(
+  boardId: string,
+  poolKey: string,
+  value: number,
+  write: (value: number) => Promise<boolean | void> | boolean | void,
+  dropped: () => void = () => {},
+): void {
+  const key = JSON.stringify([boardId, poolKey]);
+  let send = poolQueues.get(key);
+  if (send === undefined) {
+    send = serialQueue(() => poolQueues.delete(key));
+    poolQueues.set(key, send);
+  }
+  send({ write: () => write(value), dropped });
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   editedSlots,
   failedSlot,
   observeSlots,
+  sendPoolSlots,
   sentSlots,
   serialSender,
   type SlotWrites,
@@ -174,6 +175,159 @@ describe("serialSender", () => {
     await Promise.resolve();
     expect(calls).toEqual([12, 13]);
     expect(dropped).toEqual([1]);
+    await Promise.resolve();
+  });
+
+  it("keeps the newest queued count across Settings remounts", async () => {
+    const calls: number[] = [];
+    const saved: number[] = [];
+    const resolvers: Array<() => void> = [];
+    let active = 0;
+    let maxActive = 0;
+    let oldView: SlotWrites = { feed: 5, sent: [] };
+    let newView: SlotWrites = { feed: 5, sent: [] };
+    const write = (value: number) => {
+      calls.push(value);
+      maxActive = Math.max(maxActive, ++active);
+      return new Promise<boolean>((resolve) => {
+        resolvers.push(() => {
+          saved.push(value);
+          active--;
+          resolve(true);
+        });
+      });
+    };
+    const oldStepper = (id: number, value: number) => {
+      oldView = sentSlots(oldView, { id, value });
+      sendPoolSlots("board-remount", "pool", value, write, () => {
+        oldView = failedSlot(oldView, id);
+      });
+    };
+    const newStepper = (id: number, value: number) => {
+      newView = sentSlots(newView, { id, value });
+      sendPoolSlots("board-remount", "pool", value, write, () => {
+        newView = failedSlot(newView, id);
+      });
+    };
+
+    oldStepper(1, 12);
+    oldStepper(2, 13);
+    newStepper(1, 14);
+    expect(calls).toEqual([12]);
+    expect(oldView.sent).toEqual([{ id: 1, value: 12 }]);
+    expect(newView.sent).toEqual([{ id: 1, value: 14 }]);
+    resolvers[0]!();
+    await Promise.resolve();
+    expect(calls).toEqual([12, 14]);
+    expect(maxActive).toBe(1);
+    resolvers[1]!();
+    await Promise.resolve();
+    expect(saved).toEqual([12, 14]);
+    expect(active).toBe(0);
+  });
+
+  it("lets a pause supersede a queued Stepper count", async () => {
+    const calls: number[] = [];
+    const saved: number[] = [];
+    const resolvers: Array<() => void> = [];
+    let active = 0;
+    let maxActive = 0;
+    let state: SlotWrites = { feed: 5, sent: [] };
+    const write = (value: number) => {
+      calls.push(value);
+      maxActive = Math.max(maxActive, ++active);
+      return new Promise<boolean>((resolve) => {
+        resolvers.push(() => {
+          saved.push(value);
+          active--;
+          resolve(true);
+        });
+      });
+    };
+    const stepper = (id: number, value: number) => {
+      state = sentSlots(state, { id, value });
+      sendPoolSlots("board-pause", "pool", value, write, () => {
+        state = failedSlot(state, id);
+      });
+    };
+
+    stepper(1, 12);
+    stepper(2, 13);
+    sendPoolSlots("board-pause", "pool", 0, write);
+    expect(calls).toEqual([12]);
+    expect(state.sent).toEqual([{ id: 1, value: 12 }]);
+    resolvers[0]!();
+    await Promise.resolve();
+    expect(calls).toEqual([12, 0]);
+    expect(maxActive).toBe(1);
+    resolvers[1]!();
+    await Promise.resolve();
+    expect(saved).toEqual([12, 0]);
+    expect(active).toBe(0);
+  });
+
+  it("keeps independent boards and pools independent", async () => {
+    const calls: string[] = [];
+    const resolvers: Array<() => void> = [];
+    const write = (label: string) => (value: number) => {
+      calls.push(`${label}:${value}`);
+      return new Promise<boolean>((resolve) => resolvers.push(() => resolve(true)));
+    };
+
+    sendPoolSlots("board-a", "pool-a", 12, write("a"));
+    sendPoolSlots("board-a", "pool-a", 13, write("a"));
+    sendPoolSlots("board-a", "pool-b", 2, write("b"));
+    sendPoolSlots("board-b", "pool-a", 3, write("c"));
+    expect(calls).toEqual(["a:12", "b:2", "c:3"]);
+    resolvers[0]!();
+    await Promise.resolve();
+    expect(calls).toEqual(["a:12", "b:2", "c:3", "a:13"]);
+    resolvers[1]!();
+    resolvers[2]!();
+    resolvers[3]!();
+    await Promise.resolve();
+  });
+
+  it("uses the new write callback after a remount", async () => {
+    const calls: string[] = [];
+    let finishFirst!: () => void;
+    sendPoolSlots("board-callback", "pool", 12, (value) => {
+      calls.push(`old:${value}`);
+      return new Promise<boolean>((resolve) => (finishFirst = () => resolve(true)));
+    });
+    sendPoolSlots("board-callback", "pool", 13, (value) => {
+      calls.push(`new:${value}`);
+      return true;
+    });
+    finishFirst();
+    await Promise.resolve();
+    expect(calls).toEqual(["old:12", "new:13"]);
+    await Promise.resolve();
+  });
+
+  it("keeps the newest write when dropping a queued write sends another", async () => {
+    const calls: number[] = [];
+    const dropped: number[] = [];
+    let finishFirst!: () => void;
+    const sender = serialSender(
+      (value) => {
+        calls.push(value);
+        return value === 12
+          ? new Promise<boolean>((resolve) => (finishFirst = () => resolve(true)))
+          : true;
+      },
+      (id) => {
+        dropped.push(id);
+        if (id === 2) sender(4, 15);
+      },
+    );
+    sender(1, 12);
+    sender(2, 13);
+    sender(3, 14);
+    expect(dropped).toEqual([2, 3]);
+    finishFirst();
+    await Promise.resolve();
+    expect(calls).toEqual([12, 15]);
     await Promise.resolve();
   });
 });
