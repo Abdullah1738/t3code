@@ -483,6 +483,64 @@ it.effect("paces both compaction scans without holding the reader and preserves 
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("rechecks the page deadline when the clock wakes a sleep early", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const now = DateTime.formatIso(yield* DateTime.now);
+      yield* sql`
+        WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 51)
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        )
+        SELECT 'early:' || n, 'thread', 'thread:early', n,
+          'provider-session.detached', ${now}, 'server', '{}', '{}', 2 FROM history
+      `;
+      const starts = yield* Queue.unbounded<bigint>();
+      const sleeps = yield* Queue.unbounded<number>();
+      const clock = yield* Clock.Clock;
+      let firstSleep = true;
+      const observedClock: Clock.Clock = {
+        ...clock,
+        sleep: (duration) => {
+          const requestedMs = Duration.toMillis(duration);
+          const actualMs = firstSleep ? requestedMs - 0.5 : requestedMs;
+          firstSleep = false;
+          return Queue.offer(sleeps, requestedMs).pipe(
+            Effect.andThen(clock.sleep(Duration.millis(actualMs))),
+          );
+        },
+      };
+      const observePage: Statement.Transformer = (statement) => {
+        if (!/^\s*SELECT\s+event\.sequence/.test(statement.compile()[0])) {
+          return Effect.succeed(statement);
+        }
+        return Clock.monotonicTimeNanos.pipe(
+          Effect.flatMap((time) => Queue.offer(starts, time)),
+          Effect.as(statement),
+        );
+      };
+      const fiber = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
+        Effect.provideService(Statement.CurrentTransformer, observePage),
+        Effect.provideService(Clock.Clock, observedClock),
+        Effect.forkChild,
+      );
+      const first = yield* Queue.take(starts);
+      // The first sleep is shortened once to simulate a fractional timeout waking early.
+      assert.equal(yield* Queue.take(sleeps), 25);
+      yield* TestClock.adjust(Duration.millis(24.5));
+      assert.equal(yield* Queue.take(sleeps), 0.5);
+      assert.equal(yield* Queue.size(starts), 0);
+      yield* TestClock.adjust(Duration.millis(0.5));
+      const second = yield* Queue.take(starts);
+      assert.isTrue(second - first >= 25_000_000n);
+      yield* Fiber.join(fiber);
+    }).pipe(Effect.provide(layerTest)),
+  ),
+);
+
 it.effect("a slow page consumes its pacing interval and a sleeping scan is interruptible", () =>
   Effect.scoped(
     Effect.gen(function* () {

@@ -257,20 +257,23 @@ export const layer: Layer.Layer<
         let deletedReceiptCount = 0;
         // Both loops share the same clock, including the transition between them.
         const startPage = Effect.gen(function* () {
-          const now = yield* Clock.monotonicTimeNanos;
+          let now = yield* Clock.monotonicTimeNanos;
           if (lastPageStart !== undefined && intervalNanos > 0n) {
-            const remaining = intervalNanos - (now - lastPageStart);
-            if (remaining > 0n) {
-              yield* Effect.sleep(Duration.nanos(remaining)).pipe(
+            const deadline = lastPageStart + intervalNanos;
+            // Timers can wake early when sub-millisecond delays are truncated.
+            while (now < deadline) {
+              const waitStarted = now;
+              yield* Effect.sleep(Duration.nanos(deadline - now)).pipe(
                 Effect.ensuring(
                   Clock.monotonicTimeNanos.pipe(
-                    Effect.tap((end) => Effect.sync(() => { pacedWaitNanos += end - now; })),
+                    Effect.tap((end) => Effect.sync(() => { pacedWaitNanos += end - waitStarted; })),
                   ),
                 ),
               );
+              now = yield* Clock.monotonicTimeNanos;
             }
           }
-          lastPageStart = yield* Clock.monotonicTimeNanos;
+          lastPageStart = now;
           pages += 1;
         });
 
