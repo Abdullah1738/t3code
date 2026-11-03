@@ -39,6 +39,7 @@ Keep list (one id, name or cwd per line): `~/.config/opencode/dev-janitor-keep.t
 - the container logged non-healthcheck lines in the last 60 min
 - Docker Desktop: any container still running
 - running sessions unreadable (OpenCode service `127.0.0.1:49374` `/api/session/active`, `scripts/active_sessions.py`) -> keep everything
+- Robob's active set is two complete control-API queries, unioned by threadId: every non-idle thread (`active=true`), and provider-native children updated in the last 48 h (`creationSource=provider`). If either is truncated or fails, the set is incomplete and everything is kept. Until the server's `creationSource` filter ships, the second query comes back truncated, so this stays fail-closed.
 - keep file
 
 Sessions whose prompt contains `DEV-RESOURCE-JANITOR-RUN` (the scheduled run
