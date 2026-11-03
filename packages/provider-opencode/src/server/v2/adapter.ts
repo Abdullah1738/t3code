@@ -2790,6 +2790,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const idle = recent.find((message) => message.type === "idle");
       for (const message of recent.toReversed()) {
         if (message.type !== "assistant" || state.active !== turn) continue;
+        // The listed message carries its step's native finish, as the live step-ended event does. Record
+        // it before its texts are emitted, so each text gets the same phase the live path would give it.
+        if (typeof message.finish === "string" && !turn.finishByMessage.has(message.id)) {
+          turn.finishByMessage.set(message.id, message.finish);
+        }
         const ordinals = { text: 0, reasoning: 0 };
         for (const part of message.content) {
           if (part.type === "text" || part.type === "reasoning") {

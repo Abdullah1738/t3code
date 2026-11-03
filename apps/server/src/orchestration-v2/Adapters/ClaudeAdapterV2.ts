@@ -3295,6 +3295,17 @@ interface ActiveClaudeTurnContext {
     emittedNativeItemIds: Set<string>;
     // The CLI repeats a notice that ends a prompt as the turn's result text.
     noticeTexts: Set<string>;
+    /**
+     * Each emitted text, with the SDK message it came from. The CLI writes one message per content
+     * block, so a text and the tool call after it can be separate messages that share `message.id`.
+     * A group that later calls a tool makes its texts narration; the turn's result settles the rest.
+     */
+    readonly textGroups: Map<
+      string,
+      { readonly nativeItemId: string; readonly text: string; readonly groupId: string | null }
+    >;
+    /** SDK message groups (by `message.id`) that contained a tool call. */
+    readonly toolGroups: Set<string>;
   };
   readonly reasoning: {
     messageId: string | null;
@@ -6688,11 +6699,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly nativeItemId: string;
           readonly text: string;
           readonly phase?: OrchestrationV2AssistantPhase;
+          /** The SDK message this text came from (`message.id`), which later tool or end evidence can name. */
+          readonly groupId?: string | null;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
           }
           input.context.assistant.emittedNativeItemIds.add(input.nativeItemId);
+          input.context.assistant.textGroups.set(input.nativeItemId, {
+            nativeItemId: input.nativeItemId,
+            text: input.text,
+            groupId: input.groupId ?? null,
+          });
           const now = yield* DateTime.now;
           const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
           const artifacts = buildAssistantArtifacts({
@@ -6723,6 +6741,40 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 driver: CLAUDE_PROVIDER,
                 turnItem: artifacts.turnItem,
               }),
+            ],
+            { concurrency: 1 },
+          );
+        });
+
+        /**
+         * Corrects the phase of a text already emitted, once later evidence settles it. The ids are
+         * derived from the native item, so the projection updates the same message in place.
+         */
+        const reemitAssistantPhase = Effect.fnUntraced(function* (input: {
+          readonly context: ActiveClaudeTurnContext;
+          readonly nativeItemId: string;
+          readonly phase: OrchestrationV2AssistantPhase;
+        }) {
+          const recorded = input.context.assistant.textGroups.get(input.nativeItemId);
+          if (recorded === undefined) return;
+          const now = yield* DateTime.now;
+          const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+          const artifacts = buildAssistantArtifacts({
+            idAllocator,
+            turnInput: input.context.input,
+            providerTurnId: input.context.providerTurnId,
+            nativeItemId: input.nativeItemId,
+            text: recorded.text,
+            ordinal,
+            startedAt: now,
+            completedAt: now,
+            phase: input.phase,
+          });
+          yield* Effect.all(
+            [
+              emitProviderEvent({ type: "node.updated", driver: CLAUDE_PROVIDER, node: artifacts.node }),
+              emitProviderEvent({ type: "message.updated", driver: CLAUDE_PROVIDER, message: artifacts.message }),
+              emitProviderEvent({ type: "turn_item.updated", driver: CLAUDE_PROVIDER, turnItem: artifacts.turnItem }),
             ],
             { concurrency: 1 },
           );
@@ -8256,12 +8308,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
             return;
           }
+          if (message.type === "assistant") {
+            const groupId = typeof message.message.id === "string" ? message.message.id : null;
+            // A tool call in this message makes the message's texts narration, and so does an earlier
+            // text from the same message group that the CLI split out before the tool call.
+            if (groupId !== null && message.message.content.some((block) => block.type === "tool_use")) {
+              context.assistant.toolGroups.add(groupId);
+              for (const recorded of context.assistant.textGroups.values()) {
+                if (recorded.groupId === groupId) {
+                  yield* reemitAssistantPhase({
+                    context,
+                    nativeItemId: recorded.nativeItemId,
+                    phase: "narration",
+                  });
+                }
+              }
+            }
+          }
           if (assistantText !== null && assistantText.text.length > 0) {
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
               phase: claudeAssistantPhase(message),
+              groupId: message.type === "assistant" && typeof message.message.id === "string" ? message.message.id : null,
             });
             return;
           }
@@ -8411,6 +8481,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               resultFailure?.class === "usage_limit"
                 ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
                 : resultFailure;
+            // The result is the only place the turn's stop reason is reported. A text with no tool call
+            // in its message group is the reply when the turn ended with end_turn: settle its phase now.
+            if (message.stop_reason === "end_turn") {
+              // Only the last tool-free text is the reply. An earlier one that no tool call followed is
+              // still an aside, so it stays unknown rather than being presented as the answer.
+              const tailFree = [...context.assistant.textGroups.values()].filter(
+                (recorded) => recorded.groupId === null || !context.assistant.toolGroups.has(recorded.groupId),
+              );
+              const reply = tailFree.at(-1);
+              if (reply !== undefined) {
+                yield* reemitAssistantPhase({
+                  context,
+                  nativeItemId: reply.nativeItemId,
+                  phase: "answer",
+                });
+              }
+            }
             yield* finalizeActiveTurn({
               context,
               status: interrupted
@@ -9261,6 +9348,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 fallbackNativeItemId: `assistant:${turnInput.runId}`,
                 emittedNativeItemIds: new Set(),
                 noticeTexts: new Set(),
+                textGroups: new Map(),
+                toolGroups: new Set(),
               },
               reasoning: {
                 messageId: null,

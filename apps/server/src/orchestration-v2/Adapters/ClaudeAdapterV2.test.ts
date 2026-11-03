@@ -3471,6 +3471,54 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect("gives split text and tool frames their own phases: narration before a tool, the reply after it", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("split-phase-attempt"),
+          text: "Check the prices and reply",
+          attachments: [],
+        }),
+      );
+      const message = (id: string, uuid: string, content: ReadonlyArray<unknown>, stopReason: string | null) =>
+        claudeSdkFrame({
+          type: "assistant",
+          uuid,
+          session_id: WAKE_NATIVE_SESSION,
+          parent_tool_use_id: null,
+          message: { id, model: "claude-opus-5-5", content, stop_reason: stopReason },
+        });
+      const frames = [
+        // Group A: the narration text and the tool call are separate messages that share one id.
+        message("group-a", "split-text", [{ type: "text", text: "Checking prices now." }], null),
+        message("group-a", "split-tool", [{ type: "tool_use", id: "tool-p", name: "Bash", input: { command: "ls" } }], "tool_use"),
+        // Group B: the reply, ended by end_turn.
+        message("group-b", "split-answer", [{ type: "text", text: "Booked for 11:50." }], null),
+        makeResultFrame({ uuid: "split-result", result: "Booked for 11:50.", stopReason: "end_turn" }),
+      ];
+      for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
+      yield* Queue.take(harness.terminalReceipts);
+      const latest = new Map(
+        harness.events.flatMap((event) =>
+          event.type === "message.updated" && event.message.role === "assistant"
+            ? [[event.message.text, event.message] as const]
+            : [],
+        ),
+      );
+      assert.equal(latest.get("Checking prices now.")?.phase, "narration");
+      assert.equal(latest.get("Booked for 11:50.")?.phase, "answer");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
     "preserves native tool non-execution metadata %s without inferring a denial from text",
     (kind) =>
@@ -8191,12 +8239,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* awaitUntil(() => harness.terminalEvents().length === 2, "second turn terminal");
         assert.equal(harness.terminalEvents()[1]?.status, "completed");
         assert.lengthOf(harness.continuationRequests, 0);
+        // One entry per assistant message, from its latest update (see assistantTexts above).
         assert.deepEqual(
-          harness.events.flatMap((event) =>
-            event.type === "message.updated" && event.message.role === "assistant"
-              ? [event.message.text]
-              : [],
-          ),
+          [
+            ...new Map(
+              harness.events.flatMap((event) =>
+                event.type === "message.updated" && event.message.role === "assistant"
+                  ? [[event.message.id, event.message.text] as const]
+                  : [],
+              ),
+            ).values(),
+          ],
           ["One.", "Stale.", "Two."],
         );
         assert.isFalse(
@@ -8228,12 +8281,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             ...frame,
             user_message_uuid: harness.promptUuid(promptIndex),
           });
+        // One entry per assistant message, from its latest update: the projection upserts by id, so a
+        // phase correction re-emits the same message rather than adding one.
         const assistantTexts = () =>
-          harness.events.flatMap((event) =>
-            event.type === "message.updated" && event.message.role === "assistant"
-              ? [event.message.text]
-              : [],
-          );
+          [
+            ...new Map(
+              harness.events.flatMap((event) =>
+                event.type === "message.updated" && event.message.role === "assistant"
+                  ? [[event.message.id, event.message.text] as const]
+                  : [],
+              ),
+            ).values(),
+          ];
 
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({
