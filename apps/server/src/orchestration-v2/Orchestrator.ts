@@ -1593,7 +1593,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
       const legacyImportItems =
-        !freshContext && projection.thread.historyOrigin === "v1_import"
+        !freshContext &&
+        deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" &&
+        projection.thread.historyOrigin === "v1_import"
           ? yield* readHandoffItems(threadId, [null])
           : [];
       const handoffStrategy = needsFullContext
@@ -5583,7 +5585,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
     // ardud: a context reset's only context is its note, so no imported history either.
     const legacyImportItems =
-      command.contextReset !== true && projection.thread.historyOrigin === "v1_import"
+      command.contextReset !== true &&
+      !(activeProviderThread?.nativeMetadata?.seededHistory?.mode === "codex-inject" &&
+        activeProviderThread.providerInstanceId === modelSelection.instanceId) &&
+      projection.thread.historyOrigin === "v1_import"
         ? yield* readHandoffItems(command.threadId, [null])
         : [];
     const isProviderSwitch =

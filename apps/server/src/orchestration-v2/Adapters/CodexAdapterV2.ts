@@ -1,4 +1,5 @@
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
+import { codexHistoryItems, readStagedHistory } from "../../ardud/harness-migrate/StagedHistory.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
@@ -6773,10 +6774,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           holdsWorkForThread: (providerThread) =>
             Effect.sync(() => threadHoldsWorkUnsafe(providerThread.id)),
           ensureThread: (threadInput) =>
-            ensureInitialized.pipe(
-              Effect.andThen(mcpSessions.read(threadInput.threadId)),
-              Effect.flatMap((mcpSession) =>
-                client.request(
+            Effect.gen(function* () {
+                const existing = threadInput.existingProviderThread;
+                const seeded = existing?.nativeMetadata?.seededHistory;
+                // ardud: only a native id recorded on this row can contain its staged history.
+                if (seeded?.mode === "codex-inject" && seeded.injectedNativeId !== undefined) {
+                  return yield* Effect.fail(new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Moved history could not be delivered: the injected native thread must be resumed, not replaced",
+                  }));
+                }
+                const mcpSession = yield* ensureInitialized.pipe(
+                  Effect.andThen(mcpSessions.read(threadInput.threadId)),
+                );
+                const response = yield* client.request(
                   "thread/start",
                   codexThreadRuntimeParams({
                     mcpSession,
@@ -6784,18 +6795,65 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     modelSelection: threadInput.modelSelection,
                     runtimePolicy: threadInput.runtimePolicy,
                   }),
-                ),
-              ),
-              Effect.map((response): OrchestrationV2ProviderThread =>
-                providerThreadFromCodexThread({
+                );
+                const row = providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
                   idAllocator,
                   ownerNodeId: null,
                   providerSessionId: input.providerSessionId,
                   providerInstanceId: adapterOptions.instanceId,
                   thread: response.thread,
-                }),
-              ),
+                });
+                if (seeded?.mode === "codex-inject") {
+                  yield* Effect.gen(function* () {
+                    if (seeded.stagedPath === undefined) {
+                      return yield* Effect.fail(toProtocolError("Staged history path is missing."));
+                    }
+                    const history = yield* readStagedHistory(seeded.stagedPath).pipe(
+                      Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    );
+                    if (history.sourceSessionId !== seeded.sourceSessionId || history.digest !== seeded.digest) {
+                      return yield* Effect.fail(toProtocolError("Staged history does not match the adopted source."));
+                    }
+                    yield* client.request("thread/inject_items", {
+                      threadId: response.thread.id,
+                      items: codexHistoryItems(history),
+                    });
+                  }).pipe(
+                    Effect.mapError((cause) => new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Moved history could not be delivered.",
+                      cause,
+                    })),
+                  );
+                  const { injectionPending: _pending, ...deliveredSeed } = seeded;
+                  return {
+                    ...row,
+                    ...existing,
+                    providerSessionId: input.providerSessionId,
+                    providerInstanceId: adapterOptions.instanceId,
+                    nativeThreadRef: row.nativeThreadRef,
+                    status: row.status,
+                    updatedAt: row.updatedAt,
+                    nativeMetadata: {
+                      ...existing?.nativeMetadata,
+                      seededHistory: {
+                        ...deliveredSeed,
+                        injectedNativeId: response.thread.id,
+                      },
+                    },
+                  } satisfies OrchestrationV2ProviderThread;
+                }
+                return existing === undefined ? row : {
+                  ...row,
+                  ...existing,
+                  providerSessionId: input.providerSessionId,
+                  providerInstanceId: adapterOptions.instanceId,
+                  nativeThreadRef: row.nativeThreadRef,
+                  status: row.status,
+                  updatedAt: row.updatedAt,
+                } satisfies OrchestrationV2ProviderThread;
+              }).pipe(
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterEnsureThreadError({

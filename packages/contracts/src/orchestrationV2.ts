@@ -873,6 +873,8 @@ export const OrchestrationV2SeededHistory = Schema.Struct({
   mode: Schema.Literals(["claude-transcript", "codex-inject"]),
   stagedPath: Schema.optional(TrimmedNonEmptyString),
   injectedNativeId: Schema.optional(TrimmedNonEmptyString),
+  // ardud: a persisted first-start fence; a crash must not silently repeat injection.
+  injectionPending: Schema.optional(Schema.Literal(true)),
 });
 
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({

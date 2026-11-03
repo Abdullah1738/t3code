@@ -934,6 +934,50 @@ export const layer: Layer.Layer<
           );
         }
         if (providerThread.nativeThreadRef === null) {
+          // ardud: claim staged injection before any native side effect. An
+          // interrupted claim is ambiguous and requires explicit reconciliation.
+          const seeded = providerThread.nativeMetadata?.seededHistory;
+          let existingProviderThread = providerThread;
+          if (seeded?.mode === "codex-inject" && seeded.injectedNativeId === undefined) {
+            if (seeded.injectionPending === true) {
+              return yield* loadFromProvider(Effect.fail(
+                new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                  driver: session.driver,
+                  threadId: projection.thread.id,
+                  cause: new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: session.driver,
+                    detail: "Moved history delivery is uncertain; reconciliation is required before retrying",
+                  }),
+                }),
+              ));
+            }
+            existingProviderThread = {
+              ...providerThread,
+              nativeMetadata: {
+                ...providerThread.nativeMetadata,
+                seededHistory: { ...seeded, injectionPending: true },
+              },
+            };
+            const claimed = yield* eventSink.writeIfProviderThreadUnchanged({
+              expected: providerThread,
+              events: [{
+                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                type: "provider-thread.updated",
+                threadId: projection.thread.id,
+                driver: session.driver,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: yield* DateTime.now,
+                payload: existingProviderThread,
+              }],
+            });
+            if (!claimed.committed) {
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "The adopted provider thread changed before history delivery.",
+              });
+            }
+            if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
+          }
           // Hand the run's provider thread to the adapter so it adopts this
           // row's identity when attaching native state. An adapter that mints
           // its own row instead leaves two live rows per app thread, and
@@ -945,7 +989,7 @@ export const layer: Layer.Layer<
               modelSelection: run.modelSelection,
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
-              existingProviderThread: providerThread,
+              existingProviderThread,
             }),
           );
         }
@@ -1129,14 +1173,11 @@ export const layer: Layer.Layer<
         lastRunOrdinal: run.ordinal,
         handoffIds: providerThread.handoffIds,
         forkedFrom: providerThread.forkedFrom,
-        // ardud: ensureThread may return a fresh row on Codex's first turn.
-        nativeMetadata:
-          providerThread.nativeMetadata?.seededHistory === undefined
-            ? loadedProviderThread.nativeMetadata
-            : {
-                ...loadedProviderThread.nativeMetadata,
-                seededHistory: providerThread.nativeMetadata.seededHistory,
-              },
+        // ardud: retain the adopted marker, including delivery updates from the adapter.
+        nativeMetadata: {
+          ...providerThread.nativeMetadata,
+          ...loadedProviderThread.nativeMetadata,
+        },
         status: "active",
         createdAt: providerThread.createdAt,
         updatedAt: now,

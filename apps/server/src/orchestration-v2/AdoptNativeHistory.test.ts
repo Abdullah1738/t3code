@@ -459,6 +459,37 @@ it.effect("activates codex injection before a native session ID exists", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("does not reissue imported context when dispatching onto an adopted Codex row", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:adopt-codex-imported");
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const source = yield* createSource(threadId);
+    const before = yield* orchestrator.getThreadProjection(threadId);
+    const now = yield* DateTime.now;
+    yield* sink.write({ events: [{
+      id: EventId.make("event:mark-imported"), type: "thread.model-selection-updated",
+      threadId, providerInstanceId: openCodeInstance, occurredAt: now,
+      payload: { ...before.thread, historyOrigin: "v1_import", updatedAt: now },
+    }] });
+    yield* orchestrator.dispatch({
+      type: "thread.adopt-native-history", commandId: CommandId.make("adopt:codex-imported"),
+      threadId, modelSelection: codexSelection, expectedActiveProviderThreadId: source.id,
+      target: { kind: "new", driver: codexDriver, nativeId: null, headId: null, seededHistory: codexHistory },
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch", commandId: CommandId.make("send:codex-imported"), threadId,
+      messageId: MessageId.make("message:codex-imported"), text: "continue", attachments: [],
+      modelSelection: codexSelection, createdBy: "user", creationSource: "web",
+      dispatchMode: { type: "start_immediately" },
+    });
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(projection.thread.historyOrigin, "v1_import");
+    assert.equal(projection.runs.at(-1)?.contextHandoffId, null);
+    assert.deepEqual(projection.contextHandoffs, []);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each(["busy", "queued"] as const)(
   "refuses to adopt while the thread has %s work",
   (state) =>
