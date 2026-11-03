@@ -266,7 +266,7 @@ const CardFlag = tool(
 const CardReviewResult = tool(
   "card_review_result",
   "Record the review verdict",
-  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review.",
+  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review. After a connection error, repeating the exact same call (same verdict, findings and head) is safe: an exact repeat of your latest verdict is ignored.",
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),

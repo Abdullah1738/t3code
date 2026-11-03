@@ -196,7 +196,7 @@ export const reviewBrief = (
     card.subtasks.length > 0
       ? "Check the subtasks the worker marked done really are; a clear verdict ticks off the review's own."
       : null,
-    "Finish by calling card_review_result exactly once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch):",
+    "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
     'After that call, end your final message with one line: "Verdict: clear" or "Verdict: changes needed: <top finding>".',

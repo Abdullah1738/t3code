@@ -5258,7 +5258,27 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(link.cardId);
         const live = card.activeThreadId === threadId && card.stage === "in_review";
         const late = !live && (yield* lateReviewer(card, threadId));
+        const sha = head?.trim().toLowerCase() || null;
+        const body =
+          verdict === "findings" ? findings.map((line) => `- ${line.trim()}`).join("\n") : "clear";
         if (!live && !late) {
+          if (sha !== null && /^[0-9a-f]{7,40}$/.test(sha)) {
+            const events = yield* store.cardEvents(card.id);
+            const lastReview = events.findLast((event) => event.kind === "review");
+            if (
+              lastReview?.actor._tag === "thread" &&
+              lastReview.actor.threadId === threadId &&
+              lastReview.head === sha &&
+              lastReview.body === body
+            ) {
+              yield* Effect.logInfo("kanban review result replay ignored", {
+                cardId: card.id,
+                threadId,
+                head: sha,
+              });
+              return card;
+            }
+          }
           return yield* failWith(
             "conflict",
             `card #${card.number} is not in review with this thread`,
@@ -5267,7 +5287,6 @@ const make = Effect.gen(function* () {
         if (verdict === "findings" && findings.length === 0) {
           return yield* failWith("invalid", "findings need at least one line");
         }
-        const sha = head?.trim().toLowerCase() || null;
         if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
           return yield* failWith(
             "invalid",
@@ -5278,8 +5297,6 @@ const make = Effect.gen(function* () {
         const chain = Rules.chainFor(board, card);
         const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
         const at = yield* nowIso;
-        const body =
-          verdict === "findings" ? findings.map((line) => `- ${line.trim()}`).join("\n") : "clear";
         // The last review step passing ticks off the step's review subtasks. If
         // the plan then has more work, the card goes back to its worker.
         const passed = verdict === "clear" && !outcome.continueReview;
