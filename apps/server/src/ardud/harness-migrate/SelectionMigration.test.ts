@@ -161,6 +161,38 @@ it.effect("rollback leaves a board alone when it changed after apply, and report
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("apply refuses a conflicting board and leaves every board as it was", () =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const board = yield* kanban.ensureBoard({
+      slug: "conflict",
+      name: "Conflict",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    // A suffix and a variant that name different efforts is a conflict the store accepts as-is, so it
+    // can exist in production. The migration must never guess which effort was meant.
+    const conflicting = {
+      key: "opencode/opus/claude-opus-5-5#xhigh",
+      model: {
+        instanceId: "opencode",
+        model: "opus/claude-opus-5-5#xhigh",
+        options: [{ id: "variant", value: "high" }],
+      },
+      slots: 1,
+    } as unknown as Parameters<typeof store.putPool>[1];
+    yield* store.putPool(board.id, conflicting);
+    const poolsBefore = yield* store.pools(board.id);
+
+    const failure = yield* migration.apply.pipe(Effect.flip);
+    assert.isTrue(String(failure.message).includes("refused"), "apply must say it refused");
+
+    // Refused means nothing was written: the store is exactly as it was before apply.
+    assert.deepStrictEqual(yield* store.pools(board.id), poolsBefore);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("dry-run reports a board's selections and writes nothing", () =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
