@@ -196,7 +196,10 @@ const seedRows = Effect.gen(function* () {
 
 // Shaped like the real snapshot: the location picks which threads are read,
 // and archived ones always come back under archivedThreads.
-const snapshotFor = (location: "active" | "archive", extra: ReadonlyArray<OrchestrationV2ThreadShell>) => {
+const snapshotFor = (
+  location: "active" | "archive",
+  extra: ReadonlyArray<OrchestrationV2ThreadShell>,
+) => {
   const read = [...shells, ...extra].filter(
     (candidate) => (candidate.archivedAt !== null) === (location === "archive"),
   );
@@ -208,7 +211,10 @@ const snapshotFor = (location: "active" | "archive", extra: ReadonlyArray<Orches
   };
 };
 
-const makeHarness = (buildCommit?: string, extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = []) =>
+const makeHarness = (
+  buildCommit?: string,
+  extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
@@ -480,20 +486,22 @@ describe("control listings", () => {
       ({ threadIds }) =>
         Effect.gen(function* () {
           // Only the provider-native children, whatever the lineage.
-          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=provider&includeSubagents=true&limit=500"), [
-            "native-child",
-            "old-native-child",
-          ]);
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=provider&includeSubagents=true&limit=500"),
+            ["native-child", "old-native-child"],
+          );
           // Exact match on the one non-web thread.
-          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=mobile&includeSubagents=true&limit=500"), [
-            "app-thread",
-          ]);
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=mobile&includeSubagents=true&limit=500"),
+            ["app-thread"],
+          );
           // A comma list matches any of its values.
-          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=mobile,provider&includeSubagents=true&limit=500"), [
-            "app-thread",
-            "native-child",
-            "old-native-child",
-          ]);
+          assert.deepStrictEqual(
+            yield* threadIds(
+              "/threads?creationSource=mobile,provider&includeSubagents=true&limit=500",
+            ),
+            ["app-thread", "native-child", "old-native-child"],
+          );
           // updatedSince narrows the same filter: the 2025 child drops out, the 2026 child stays.
           assert.deepStrictEqual(
             yield* threadIds(
@@ -502,14 +510,15 @@ describe("control listings", () => {
             ["native-child"],
           );
           // Without includeSubagents the child is hidden even when it matches creationSource.
-          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=provider&limit=500"), []);
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=provider&limit=500"),
+            [],
+          );
           // The active=true fast path is untouched: an idle child is not active.
-          assert.deepStrictEqual(yield* threadIds("/threads?active=true&includeSubagents=true&limit=500"), [
-            "asks-waiting",
-            "live-queued",
-            "live-running",
-            "live-subagent",
-          ]);
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?active=true&includeSubagents=true&limit=500"),
+            ["asks-waiting", "live-queued", "live-running", "live-subagent"],
+          );
         }),
       undefined,
       [nativeChild, appThread, oldNative],
