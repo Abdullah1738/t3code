@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -284,6 +285,125 @@ class GenerateTests(HarnessTestCase):
         self.assertTrue(os.path.islink(self.claude / "skills/foreign"))
         self.assertTrue(os.path.islink(self.claude / "skills/beta"))
 
+    def test_unreadable_symlinked_skill_keeps_farm_links(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(source):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path)
+
+        errors = io.StringIO()
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(errors):
+                output = self.run_gen()
+                rc, check_output = self.run_check()
+        for home in (self.claude, self.codex, self.codex_cu):
+            link = home / "skills/privacy-guard"
+            self.assertTrue(link.is_symlink(), str(link))
+            self.assertEqual(os.readlink(link), str(source))
+            self.assertNotIn(f"unlink {link}", output)
+        self.assertEqual(rc, 1, check_output)
+        self.assertIn("could not inspect", check_output)
+        self.assertEqual(len(errors.getvalue().splitlines()), 2)  # one per invocation
+        self.assertIn(str(source), errors.getvalue())
+
+    def test_dangling_symlinked_skill_is_unlinked(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        shutil.rmtree(target)
+        self.assertTrue(source.is_symlink())
+        self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertFalse(os.path.lexists(home / "skills/privacy-guard"))
+
+    def test_entry_stat_error_preserves_existing_link(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            entries = real_scandir(path)
+            if os.fspath(path) != str(self.skill_root):
+                return entries
+            class UnreadableEntry:
+                name = "external"
+                path = str(source)
+                def is_dir(self, *, follow_symlinks=True):
+                    raise OSError(errno.EIO, "I/O error", self.path)
+            with entries:
+                return [UnreadableEntry() if entry.name == "external" else entry for entry in entries]
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.run_gen()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertEqual(os.readlink(home / "skills/privacy-guard"), str(source))
+
+    def test_unreadable_directory_protects_nested_farm_links_only(self) -> None:
+        self.run_gen()
+        shutil.rmtree(self.skill_root / "alpha")
+        real_scandir = os.scandir
+        parent = self.skill_root / "cat"
+
+        def scandir(path):
+            if os.fspath(path) == str(parent):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.run_gen()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertTrue((home / "skills/beta").is_symlink())
+            self.assertTrue((home / "skills/gamma").is_symlink())
+            self.assertFalse(os.path.lexists(home / "skills/alpha"))
+
+    def test_unreadable_skill_keeps_link_even_when_name_is_reused(self) -> None:
+        self.run_gen()
+        self.make_skill("cat/other", None, name="alpha")
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(self.skill_root / "alpha"):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertEqual(os.readlink(home / "skills/alpha"), str(self.skill_root / "alpha"))
+
+    def test_skill_name_read_errors_do_not_hide_discoverable_children(self) -> None:
+        self.make_skill("alpha/child", None)
+        self.run_gen()
+        real_skill_name = gh.skill_name
+
+        def skill_name(path):
+            if path == self.skill_root / "alpha/SKILL.md":
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_skill_name(path)
+
+        with mock.patch.object(gh, "skill_name", side_effect=skill_name):
+            self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertFalse(os.path.lexists(home / "skills/alpha"))
+            self.assertTrue((home / "skills/child").is_symlink())
+
     def test_real_directory_in_skills_is_never_removed(self) -> None:
         self.run_gen()
         real = self.claude / "skills/alpha"
@@ -458,9 +578,9 @@ class GenerateTests(HarnessTestCase):
 
     def test_skills_dir_is_never_a_real_directory_target_for_foreign_links(self) -> None:
         self.run_gen()
+        skills, unreadable = gh.discover_skills([str(self.skill_root)])
         self.assertEqual(gh.skill_ops(str(self.claude / "skills"),
-                                      gh.discover_skills([str(self.skill_root)]),
-                                      [str(self.skill_root)]), [])
+                                      skills, [str(self.skill_root)], unreadable), [])
 
     def test_codex_config_keeps_existing_hook_trust_state(self) -> None:
         m = self.manifest()
