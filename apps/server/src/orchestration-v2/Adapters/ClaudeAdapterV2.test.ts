@@ -2433,7 +2433,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly subtype?: string;
     readonly isError?: boolean;
     readonly errors?: ReadonlyArray<string>;
-    readonly apiErrorStatus?: number;
+    readonly apiErrorStatus?: number | null;
     // null omits the field, as the CLI does on a zero-turn result.
     readonly terminalReason?: SDKResultMessage["terminal_reason"] | null;
     readonly usage?: {
@@ -6395,6 +6395,195 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         });
         assert.isDefined(terminal.retryStartedAt);
         assert.equal(terminal.failure.code, "api_error_529");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    {
+      name: "first-byte timeout without a response",
+      retries: [{ error: "unknown", status: null, noResponse: true }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "connection error without a response",
+      retries: [{ error: "unknown", status: null }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "explicit null result status",
+      retries: [{ error: "unknown", status: null }],
+      resultStatus: null,
+      expectedCategory: "transient",
+    },
+    {
+      name: "server error with no status on the final result",
+      retries: [{ error: "server_error", status: 500 }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "explicit 500 result",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 500,
+      expectedCategory: "transient",
+    },
+    {
+      name: "latest retry wins",
+      retries: [
+        { error: "rate_limit", status: 429 },
+        { error: "server_error", status: 500 },
+      ],
+      expectedCategory: "transient",
+    },
+    {
+      name: "newer invalid-model result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 400,
+      resultText: "API Error: 400 invalid model requested",
+      expectedCategory: "model_invalid",
+    },
+    {
+      name: "newer unauthorized result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 401,
+      expectedCategory: "auth_expired",
+    },
+    {
+      name: "newer forbidden result wins even when unclassified",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 403,
+      expectedCategory: "unknown",
+    },
+    {
+      name: "newer rate limit result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 429,
+      expectedCategory: "quota",
+    },
+    {
+      name: "unclassified result preserves quota retry and usage class",
+      retries: [{ error: "rate_limit", status: 429 }],
+      expectedCategory: "quota",
+    },
+    {
+      name: "newer prompt-too-long result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultReason: "prompt_too_long",
+      expectedCategory: "context_exhausted",
+    },
+    {
+      name: "newer assistant error wins",
+      retries: [{ error: "server_error", status: 500 }],
+      assistantError: "invalid_request",
+      expectedCategory: "unknown",
+    },
+    {
+      name: "assistant server error retains retry evidence",
+      retries: [{ error: "server_error", status: 500 }],
+      assistantError: "server_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "nested assistant activity does not clear the root failure",
+      retries: [{ error: "server_error", status: 500 }],
+      nestedAssistant: true,
+      expectedCategory: "transient",
+    },
+    {
+      name: "assistant recovery clears stale retry evidence",
+      retries: [{ error: "server_error", status: 500 }],
+      recovered: true,
+      expectedCategory: "unknown",
+    },
+  ] as const)("preserves the applicable Claude cause: $name", (scenario) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-retry-cause"),
+            text: "Continue.",
+            attachments: [],
+          }),
+        );
+        for (const [index, retry] of scenario.retries.entries()) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              attempt: index + 1,
+              max_retries: 2,
+              retry_delay_ms: 100,
+              error_status: retry.status,
+              error: retry.error,
+              ...("noResponse" in retry && retry.noResponse
+                ? { no_response: { waited_ms: 100, retry_wait_ms: 100 } }
+                : {}),
+              uuid: `00000000-0000-4000-8000-${String(900 + index).padStart(12, "0")}`,
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+        }
+        if ("assistantError" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantErrorFrame({
+              uuid: "00000000-0000-4000-8000-000000000910",
+              error: scenario.assistantError,
+            }),
+          );
+        }
+        if ("recovered" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000000911",
+              text: "Recovered.",
+            }),
+          );
+        }
+        if ("nestedAssistant" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantErrorFrame({
+              uuid: "00000000-0000-4000-8000-000000000913",
+              error: undefined,
+              parentToolUseId: "nested-tool",
+            }),
+          );
+        }
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000912",
+            result:
+              "resultText" in scenario
+                ? scenario.resultText
+                : "Claude could not complete this request.",
+            terminalReason: "resultReason" in scenario ? scenario.resultReason : "api_error",
+            ...("resultStatus" in scenario ? { apiErrorStatus: scenario.resultStatus } : {}),
+            isError: true,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(terminal.failure.category, scenario.expectedCategory);
+        assert.equal(
+          terminal.failure.class,
+          scenario.expectedCategory === "quota" ? "usage_limit" : "provider_error",
+        );
+        if (!("recovered" in scenario)) {
+          assert.equal(terminal.retry?.attempt, scenario.retries.length);
+        }
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
