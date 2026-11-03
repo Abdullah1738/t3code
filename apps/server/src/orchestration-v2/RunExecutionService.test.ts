@@ -4782,6 +4782,163 @@ function rootTerminalEvent(
     : { ...common, status, failure: null };
 }
 
+it.effect("reserves a held reasoning item's position before an intervening tool", () =>
+  Effect.gen(function* () {
+    const key = "held-reasoning-position";
+    const ids = backgroundScenarioIds(key);
+    const providerInstanceId = ProviderInstanceId.make("opencode");
+    const reasoningId = TurnItemId.make(`${key}:reasoning`);
+    const toolId = TurnItemId.make(`${key}:tool`);
+    const done = yield* Deferred.make<void>();
+    const positions = yield* Ref.make(new Map<TurnItemId, number>());
+    const stored = yield* Ref.make(new Map<TurnItemId, OrchestrationV2TurnItem>());
+    const writes = yield* Ref.make<ReadonlyArray<string>>([]);
+    const allocate = (itemId: TurnItemId) =>
+      Ref.modify(positions, (current) => {
+        const existing = current.get(itemId);
+        if (existing !== undefined) return [existing, current] as const;
+        const ordinal = current.size + 1;
+        return [ordinal, new Map(current).set(itemId, ordinal)] as const;
+      });
+    const base = {
+      threadId: ids.threadId,
+      runId: ids.runId,
+      nodeId: null,
+      providerThreadId: ids.providerThreadId,
+      providerTurnId: ids.rootProviderTurnId,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 999,
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: DateTime.makeUnsafe("2026-11-02T12:00:00Z"),
+    };
+    const reasoning = (
+      text: string,
+      streaming: boolean,
+    ): ProviderAdapter.ProviderAdapterV2Event => ({
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: reasoningId,
+        type: "reasoning",
+        status: streaming ? "running" : "completed",
+        text,
+        streaming,
+      },
+    });
+    const tool: ProviderAdapter.ProviderAdapterV2Event = {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: toolId,
+        type: "command_execution",
+        status: "completed",
+        input: "echo test",
+        output: "test\n",
+      },
+    };
+    const events = [
+      reasoning("partial", true),
+      tool,
+      reasoning("First\n\npartial", true),
+      reasoning("First\n\nSecond\n\npartial", true),
+      reasoning("Exact final 🐈", false),
+    ];
+    const layerTest = RunExecutionService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          McpAppModelContext.layerEmpty,
+          PreviewAgentActivity.layer,
+          Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
+          Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+            allocate: ({ turnItemId }) => allocate(turnItemId),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            write: () => Effect.succeed([]),
+            writeWithEffects: () => Effect.succeed([]),
+            writeIfRunCurrent: () => Effect.succeed({ committed: true, storedEvents: [] }),
+          }),
+          IdAllocator.layer,
+          Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+            ingestNormalized: ({ event }) =>
+              Effect.gen(function* () {
+                if (event.type === "turn_item.updated") {
+                  const ordinal = yield* allocate(event.turnItem.id);
+                  yield* Ref.update(stored, (items) =>
+                    new Map(items).set(event.turnItem.id, { ...event.turnItem, ordinal }),
+                  );
+                  if (event.turnItem.type === "reasoning") {
+                    yield* Ref.update(writes, (current) => [...current, event.turnItem.text]);
+                    if (!event.turnItem.streaming) yield* Deferred.succeed(done, undefined);
+                  }
+                }
+                return [];
+              }),
+          }),
+          ServerSettings.layerTest({ responseStreamingMode: "paragraph" }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* RunExecutionService.RunExecutionServiceV2;
+      yield* service.startRootRun({
+        commandId: CommandId.make(`command:${key}`),
+        appThread: { id: ids.threadId } as OrchestrationV2AppThread,
+        providerSessionId: ProviderSessionId.make(`session:${key}`),
+        session: {
+          events: Stream.fromIterable(events).pipe(Stream.concat(Stream.never)),
+          startTurn: () => Effect.void,
+        } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        run: {
+          id: ids.runId,
+          threadId: ids.threadId,
+          ordinal: 1,
+          providerInstanceId,
+        } as OrchestrationV2Run,
+        rootNode: { id: ids.rootNodeId } as OrchestrationV2ExecutionNode,
+        checkpointScope: {
+          id: CheckpointScopeId.make(`checkpoint:${key}`),
+        } as OrchestrationV2CheckpointScope,
+        providerThread: { id: ids.providerThreadId, driver } as OrchestrationV2ProviderThread,
+        attempt: {
+          id: ids.attemptId,
+          providerTurnId: ids.rootProviderTurnId,
+        } as OrchestrationV2RunAttempt,
+        attemptId: ids.attemptId,
+        providerTurnOrdinal: 1,
+        message: {
+          messageId: MessageId.make(`message:${key}`),
+          text: "Start",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+        modelSelection: { instanceId: providerInstanceId, model: "test" },
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false },
+        },
+      });
+      yield* Deferred.await(done);
+      assert.deepEqual(yield* Ref.get(writes), ["First\n\n", "Exact final 🐈"]);
+      const items = yield* Ref.get(stored);
+      assert.equal(items.get(reasoningId)?.ordinal, 1);
+      assert.equal(items.get(toolId)?.ordinal, 2);
+      const final = items.get(reasoningId);
+      assert.isTrue(
+        final?.type === "reasoning" && final.text === "Exact final 🐈" && !final.streaming,
+      );
+    }).pipe(Effect.provide(layerTest));
+  }),
+);
+
 function runBackgroundItemScenario(
   key: string,
   makeEvents: (ids: BackgroundScenarioIds) => ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>,

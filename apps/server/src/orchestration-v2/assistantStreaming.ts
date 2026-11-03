@@ -15,6 +15,7 @@ const SECTION_TITLE_PATTERN = /^ {0,3}(?:#{1,6}(?:[ \t]|$)|\*\*(?:[^*]|\*(?!\*))
 // An unindented ATX heading ends the paragraph or list above it, even with no
 // blank line between them. A bold line would continue the paragraph instead.
 const TOP_LEVEL_HEADING_PATTERN = /^#{1,6}(?:[ \t]|$)/;
+const REASONING_CHECKPOINT_MS = 2000;
 
 /**
  * Only fully terminated lines count, so a trailing partial line never leaks; a
@@ -108,7 +109,14 @@ export function makeAssistantStreamingFilter(mode: ResponseStreamingMode) {
     }
     if (mode === "turn") return null;
     const previous = delivered.get(key);
-    if (previous && now - previous.at < 400) return null;
+    // A crash can lose the uncheckpointed reasoning tail. Later updates with
+    // complete paragraphs offer another checkpoint after this cadence; partial
+    // paragraphs and silent stalls can remain held longer.
+    const checkpointMs =
+      event.type === "turn_item.updated" && event.turnItem.type === "reasoning"
+        ? REASONING_CHECKPOINT_MS
+        : 400;
+    if (previous && now - previous.at < checkpointMs) return null;
     const { ready } = splitBufferedAssistantText(message.text);
     if (!ready || ready === previous?.text) return null;
     delivered.set(key, { text: ready, at: now });

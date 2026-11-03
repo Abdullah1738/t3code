@@ -18,6 +18,7 @@ import {
   type OrchestrationV2TurnItem,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   PlanId,
   type ProviderThreadId,
   ProviderTurnId,
@@ -46,6 +47,13 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
+import {
+  makeBeforeCheckpointFilter,
+  makeC3SyntheticReplay,
+  type C3ReplayEntry,
+} from "./reasoningCheckpointReplay.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
   makeProviderEventRoutingState,
@@ -178,6 +186,297 @@ function threadCreatedEvent(
 }
 
 const layer = it.layer(layerTest);
+
+type ReplayEvent = C3ReplayEntry["event"];
+
+const replayThroughIngestor = Effect.fnUntraced(function* (input: {
+  readonly entries: ReadonlyArray<C3ReplayEntry>;
+  readonly policy: "before" | "after";
+  readonly threadId: OrchestrationV2AppThread["id"];
+}) {
+  const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+  const positions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+  const before = makeBeforeCheckpointFilter();
+  const after = makeAssistantStreamingFilter("paragraph");
+  const reserved = new Set<TurnItemId>();
+  const providerSessionId = ProviderSessionId.make("synthetic-replay-provider-session");
+  for (const entry of input.entries) {
+    const delivered = input.policy === "before" ? before(entry) : after(entry.event, entry.at);
+    if (delivered !== null) {
+      yield* ingestor.ingestNormalized({
+        providerSessionId,
+        providerInstanceId: modelSelection.instanceId,
+        threadId: input.threadId,
+        event: delivered,
+      });
+    } else {
+      const item = entry.event.turnItem;
+      // Match RunExecutionService: even a never-delivered partial text item
+      // reserves its place before a later tool can claim it.
+      if (
+        (item.type === "reasoning" || item.type === "assistant_message") &&
+        item.streaming &&
+        !reserved.has(item.id)
+      ) {
+        yield* positions.allocate({
+          threadId: item.threadId,
+          turnItemId: item.id,
+          runId: item.runId,
+        });
+        reserved.add(item.id);
+      }
+    }
+  }
+});
+
+const observeReplay = Effect.fnUntraced(function* (threadId: OrchestrationV2AppThread["id"]) {
+  const sql = yield* SqlClient.SqlClient;
+  const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+  const projection = yield* projectionStore.getThreadProjection(threadId);
+  const aggregates = yield* sql<{
+    readonly type: string;
+    readonly events: number;
+    readonly bytes: number;
+  }>`
+    SELECT json_extract(payload_json, '$.type') AS type,
+           COUNT(*) AS events,
+           COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) AS bytes
+    FROM orchestration_events
+    WHERE stream_id = ${threadId} AND event_type = 'turn-item.updated'
+    GROUP BY json_extract(payload_json, '$.type')
+    ORDER BY type
+  `;
+  const rows = yield* sql<{ readonly item_id: string; readonly payload_json: string }>`
+    SELECT json_extract(payload_json, '$.id') AS item_id, payload_json
+    FROM orchestration_events
+    WHERE stream_id = ${threadId} AND event_type = 'turn-item.updated'
+    ORDER BY sequence
+  `;
+  const lastByItem = new Map(
+    rows.map((row) => [row.item_id, JSON.parse(row.payload_json) as unknown]),
+  );
+  return {
+    aggregates: Array.from(aggregates),
+    thread: projection.thread,
+    projection: projection.turnItems,
+    rows: Array.from(rows),
+    lastByItem: Array.from(lastByItem.entries()).sort(([a], [b]) => a.localeCompare(b)),
+  };
+});
+
+const layerCheckpointReplay = Layer.merge(layerTest, TurnItemPositionStore.layer).pipe(
+  Layer.provide(layerTestDatabase),
+);
+
+it.layer(layerCheckpointReplay)("reasoning checkpoint persistence", (it) => {
+  it.effect.each(["opencode", "claude", "codex"] as const)(
+    "retains exact %s reasoning, replacement and tool ordering across both policies",
+    (driverName) =>
+      Effect.gen(function* () {
+        const now = DateTime.makeUnsafe("2026-11-02T12:00:00.000Z");
+        const start = DateTime.toEpochMillis(now);
+        const eventSink = yield* EventSink.EventSinkV2;
+        const sql = yield* SqlClient.SqlClient;
+        const threadEvent = yield* threadCreatedEvent(now);
+        const threadId = threadEvent.threadId;
+        yield* eventSink.write({ events: [threadEvent] });
+        const driver = ProviderDriverKind.make(driverName);
+        const item = (id: string, text: string, streaming: boolean): ReplayEvent => ({
+          type: "turn_item.updated",
+          driver,
+          turnItem: {
+            id: TurnItemId.make(`checkpoint:${id}`),
+            threadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 999,
+            status: streaming ? "running" : "completed",
+            title: null,
+            startedAt: now,
+            completedAt: streaming ? null : now,
+            updatedAt: now,
+            type: "reasoning",
+            text,
+            streaming,
+          },
+        });
+        const tool: ReplayEvent = {
+          type: "turn_item.updated",
+          driver,
+          turnItem: {
+            id: TurnItemId.make("checkpoint:tool"),
+            threadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 999,
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "cat fixture",
+            output: "complete tool output 🐕\n".repeat(1_000),
+          },
+        };
+        const finalText = "最終 🐈‍⬛ — replacement with no terminating paragraph";
+        const fastFinal = "terminal at 500ms 🧪 with no paragraph";
+        const entries: ReadonlyArray<C3ReplayEntry> = [
+          { at: start, event: item("r", "Beginning 🐕\n\npartial", true) },
+          { at: start + 100, event: item("held", "no paragraph yet", true) },
+          { at: start + 200, event: tool },
+          { at: start + 300, event: item("fast", "Fast first\n\ntail", true) },
+          { at: start + 400, event: item("r", "Changed 🐈\n\npartial", true) },
+          { at: start + 800, event: item("fast", fastFinal, false) },
+          { at: start + 1_999, event: item("r", "Changed 🐈\n\nnext\n\ntail", true) },
+          { at: start + 2_000, event: item("r", "Changed 🐈\n\nnext\n\ntail", true) },
+          { at: start + 2_100, event: item("held", "Uncut held terminal 👩🏽‍💻", false) },
+          { at: start + 2_500, event: item("r", finalText, false) },
+        ];
+        yield* replayThroughIngestor({ entries, policy: "before", threadId });
+        const before = yield* observeReplay(threadId);
+        yield* sql`DELETE FROM orchestration_events WHERE stream_id = ${threadId} AND event_type = 'turn-item.updated'`;
+        yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}`;
+        yield* sql`DELETE FROM orchestration_v2_turn_item_positions WHERE thread_id = ${threadId}`;
+        yield* replayThroughIngestor({ entries, policy: "after", threadId });
+        const after = yield* observeReplay(threadId);
+
+        assert.deepEqual(after.thread, before.thread);
+        assert.deepEqual(after.projection, before.projection);
+        assert.deepEqual(after.lastByItem, before.lastByItem);
+        const textItem = (id: string) =>
+          after.projection.find((entry) => entry.id === `checkpoint:${id}`);
+        const finalReasoning = textItem("r");
+        const fast = textItem("fast");
+        const retainedTool = textItem("tool");
+        assert.isTrue(finalReasoning?.type === "reasoning" && finalReasoning.text === finalText);
+        assert.isTrue(fast?.type === "reasoning" && fast.text === fastFinal);
+        assert.isTrue(
+          retainedTool?.type === "command_execution" &&
+            retainedTool.output === "complete tool output 🐕\n".repeat(1_000),
+        );
+        assert.deepEqual(
+          after.projection.map(({ id, ordinal }) => [id, ordinal]),
+          [
+            ["checkpoint:r", 1],
+            ["checkpoint:held", 2],
+            ["checkpoint:tool", 3],
+            ["checkpoint:fast", 4],
+          ],
+        );
+        assert.deepEqual(
+          after.rows.filter((row) => row.item_id === "checkpoint:tool"),
+          before.rows.filter((row) => row.item_id === "checkpoint:tool"),
+        );
+        const reasoningSnapshots = (rows: typeof after.rows) =>
+          rows
+            .filter((row) => row.item_id === "checkpoint:r")
+            .map((row) => (JSON.parse(row.payload_json) as { text: string }).text);
+        assert.deepEqual(reasoningSnapshots(before.rows), [
+          "Beginning 🐕\n\n",
+          "Changed 🐈\n\n",
+          "Changed 🐈\n\nnext\n\n",
+          finalText,
+        ]);
+        assert.deepEqual(reasoningSnapshots(after.rows), [
+          "Beginning 🐕\n\n",
+          "Changed 🐈\n\nnext\n\n",
+          finalText,
+        ]);
+        for (const [id, expected] of [
+          ["checkpoint:r", finalText],
+          ["checkpoint:fast", fastFinal],
+        ] as const) {
+          const rows = after.rows.filter((row) => row.item_id === id);
+          const persisted = JSON.parse(rows[rows.length - 1]!.payload_json) as {
+            text: string;
+            streaming: boolean;
+          };
+          assert.equal(persisted.text, expected);
+          assert.isFalse(persisted.streaming);
+        }
+      }),
+  );
+
+  it.effect(
+    "reports disposable SQLite payload bytes for the synthetic C3-like replay",
+    () =>
+      Effect.gen(function* () {
+        const now = DateTime.makeUnsafe("2026-11-02T12:11:19.075Z");
+        const eventSink = yield* EventSink.EventSinkV2;
+        const sql = yield* SqlClient.SqlClient;
+        const threadEvent = yield* threadCreatedEvent(now);
+        const threadId = threadEvent.threadId;
+        yield* eventSink.write({ events: [threadEvent] });
+        const entries = makeC3SyntheticReplay(threadId);
+        const observedInput = new Map<string, { items: Set<string>; updates: number }>();
+        for (const { event } of entries) {
+          const { type, id } = event.turnItem;
+          const group = observedInput.get(type) ?? { items: new Set<string>(), updates: 0 };
+          group.items.add(id);
+          group.updates++;
+          observedInput.set(type, group);
+        }
+        assert.deepEqual(
+          Array.from(observedInput, ([type, group]) => [
+            type,
+            group.items.size,
+            group.updates,
+          ]).sort(),
+          [
+            ["assistant_message", 190, 398],
+            ["command_execution", 1007, 2974],
+            ["dynamic_tool", 804, 2398],
+            ["reasoning", 674, 5780],
+          ],
+        );
+        yield* replayThroughIngestor({ entries, policy: "before", threadId });
+        const before = yield* observeReplay(threadId);
+        // Keep the same synthetic thread and IDs; reset only this in-memory DB.
+        yield* sql`DELETE FROM orchestration_events WHERE stream_id = ${threadId} AND event_type = 'turn-item.updated'`;
+        yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}`;
+        yield* sql`DELETE FROM orchestration_v2_turn_item_positions WHERE thread_id = ${threadId}`;
+        yield* replayThroughIngestor({ entries, policy: "after", threadId });
+        const after = yield* observeReplay(threadId);
+
+        assert.deepEqual(after.thread, before.thread);
+        assert.deepEqual(after.projection, before.projection);
+        assert.deepEqual(after.lastByItem, before.lastByItem);
+        for (const type of ["assistant_message", "command_execution", "dynamic_tool"]) {
+          assert.deepEqual(
+            after.aggregates.find((row) => row.type === type),
+            before.aggregates.find((row) => row.type === type),
+          );
+        }
+        const beforeReasoning = before.aggregates.find((row) => row.type === "reasoning")!;
+        const afterReasoning = after.aggregates.find((row) => row.type === "reasoning")!;
+        assert.isBelow(afterReasoning.events, beforeReasoning.events);
+        assert.isBelow(afterReasoning.bytes, beforeReasoning.bytes);
+        const sum = (rows: typeof before.aggregates) =>
+          rows.reduce((total, row) => total + row.bytes, 0);
+        // Values come from the persisted payload_json BLOB lengths, not text
+        // estimates, JS callback counts, WAL size, or physical disk bytes.
+        console.info(
+          "C3 synthetic checkpoint replay (logical persisted payload bytes)",
+          JSON.stringify({
+            inputEvents: entries.length,
+            before: { bytes: sum(before.aggregates), byType: before.aggregates },
+            after: { bytes: sum(after.aggregates), byType: after.aggregates },
+            savedBytes: sum(before.aggregates) - sum(after.aggregates),
+          }),
+        );
+      }),
+    { timeout: 180_000 },
+  );
+});
 
 it.effect("records accepted billed turn usage once without billing the context window", () => {
   const recorded: Array<Readonly<Record<string, unknown>>> = [];
