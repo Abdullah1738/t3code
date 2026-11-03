@@ -3144,7 +3144,7 @@ const make = Effect.gen(function* () {
         continue;
       }
       if (foundFailure.success !== null) {
-        yield* turnEndedUnlocked(threadId);
+        yield* turnEndedUnlocked(threadId, undefined, true);
         continue;
       }
       const view = yield* threads.view(threadId);
@@ -3191,7 +3191,7 @@ const make = Effect.gen(function* () {
           continue;
         const failure = yield* Effect.result(threads.findLastFailure(threadId));
         if (Result.isFailure(failure) || failure.success !== null) {
-          if (Result.isSuccess(failure)) yield* turnEndedUnlocked(threadId);
+          if (Result.isSuccess(failure)) yield* turnEndedUnlocked(threadId, undefined, true);
           wakes.add(threadId);
           continue;
         }
@@ -3294,6 +3294,7 @@ const make = Effect.gen(function* () {
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
     expectedFailedWorkRunId?: string,
+    fromTick = false,
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
@@ -3313,7 +3314,7 @@ const make = Effect.gen(function* () {
         lastActivityAt: at,
       },
     });
-    const card = link.cardId ? yield* store.card(link.cardId) : null;
+    let card = link.cardId ? yield* store.card(link.cardId) : null;
     const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
     const discussionIds = new Set<string>();
@@ -3337,6 +3338,13 @@ const make = Effect.gen(function* () {
       return next;
     });
     const failure = lastFailure.success;
+    if (fromTick && failure !== null && expectedFailedWorkRunId === undefined) {
+      if (failure.runId == null) {
+        yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+        return;
+      }
+      expectedFailedWorkRunId = failure.runId;
+    }
     const failedRunIsCurrent = Effect.fn("KanbanService.failedRunIsCurrent")(function* () {
       if (expectedFailedWorkRunId === undefined) return true;
       const found = yield* Effect.result(threads.find(threadId));
@@ -3665,7 +3673,17 @@ const make = Effect.gen(function* () {
     }
     if (outage !== null) return;
     if (failure !== null) {
-      if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(card, at))) {
+      const startFresh = Rules.isContextFull(failure) && !(yield* freshStartedRecently(card, at));
+      if (expectedFailedWorkRunId !== undefined) {
+        const current = yield* store.card(card.id);
+        if (
+          current === null || current.stage !== "in_review" || current.activeRole !== "review" ||
+          current.activeThreadId !== threadId || current.stalled !== null ||
+          !(yield* failedRunIsCurrent())
+        ) return;
+        card = current;
+      }
+      if (startFresh) {
         const fresh: KanbanCard = {
           ...release(card),
           stage: "needs_review",
@@ -3720,7 +3738,7 @@ const make = Effect.gen(function* () {
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
     const now = yield* nowMillis;
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
-      yield* turnEndedUnlocked(threadId);
+      yield* turnEndedUnlocked(threadId, undefined, true);
     }
     // This is planning data only. A failed read must remain distinct from a
     // successful absence, and nothing survives this invocation of the tick.
@@ -3788,8 +3806,12 @@ const make = Effect.gen(function* () {
         yield* setState("sent");
         continue;
       }
-      const failure = yield* threads.lastFailure(threadId);
-      if (failure === null || (entry.runId !== null && failure.runId !== entry.runId)) continue;
+      const failure = yield* Effect.result(threads.findLastFailure(threadId));
+      if (Result.isFailure(failure)) {
+        yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+        continue;
+      }
+      if (failure.success === null || (entry.runId !== null && failure.success.runId !== entry.runId)) continue;
       const sent = yield* threads
         .send({ threadId, text: Briefs.evaluatorRetryText(entry.message) })
         .pipe(
@@ -3958,14 +3980,18 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
+          if (foundFailure.success.runId == null) {
+            yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+            continue;
+          }
           const fresh = yield* freshFind(threadId);
           const current = yield* store.card(card.id);
           if (
             Option.isNone(fresh) || fresh.value?.state !== "idle" ||
             current?.activeThreadId !== threadId || current.activeRole !== "work" ||
             current.stage !== "working" || current.stalled !== null ||
-            (yield* store.threadLink(threadId))?.paused ||
-            foundFailure.success.runId == null
+            (board.pause !== null && !board.pause.keep.includes(current.id)) ||
+            (yield* store.threadLink(threadId))?.paused
           ) continue;
           views.clear();
           yield* turnEndedUnlocked(threadId, foundFailure.success.runId).pipe(Effect.ensuring(Effect.sync(() => {
@@ -3989,6 +4015,7 @@ const make = Effect.gen(function* () {
         if (
           Option.isNone(fresh) || fresh.value === null ||
           current?.activeThreadId !== threadId || current.activeRole !== "work" ||
+          (board.pause !== null && !board.pause.keep.includes(current.id)) ||
           fresh.value.state !== view.state ||
           (yield* store.threadLink(threadId))?.paused ||
           Rules.waitingOnBackground(fresh.value, now) ||
@@ -4037,7 +4064,7 @@ const make = Effect.gen(function* () {
         }
         if (foundFailure.success !== null) {
           views.clear();
-          yield* turnEndedUnlocked(threadId).pipe(Effect.ensuring(Effect.sync(() => {
+          yield* turnEndedUnlocked(threadId, undefined, true).pipe(Effect.ensuring(Effect.sync(() => {
             views.clear();
             invalidateCards();
           })));
@@ -4055,6 +4082,7 @@ const make = Effect.gen(function* () {
         if (
           Option.isNone(fresh) || fresh.value === null ||
           current?.activeThreadId !== threadId || current.activeRole !== "review" ||
+          (board.pause !== null && !board.pause.keep.includes(current.id)) ||
           (yield* store.threadLink(threadId))?.paused ||
           Rules.waitingOnBackground(fresh.value, now) ||
           !Rules.reviewerQuietDue(current, fresh.value, now)
