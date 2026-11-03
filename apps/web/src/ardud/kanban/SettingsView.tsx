@@ -44,7 +44,14 @@ import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
-import { editedSlots, shownSlots } from "./slotCount";
+import {
+  currentSlots,
+  editedSlots,
+  failedSlot,
+  observeSlots,
+  sentSlots,
+  type SlotWrites,
+} from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../../components/chat/TraitsPicker";
 import {
@@ -735,19 +742,21 @@ function Stepper(props: {
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
-  const [sent, setSent] = useState<{ value: number; from: number } | null>(null);
-  if (sent !== null && sent.from !== props.value) setSent(null);
+  const [writes, setWrites] = useState<SlotWrites>(() => ({ feed: props.value, sent: [] }));
+  const observed = observeSlots(writes, props.value);
+  if (observed !== writes) setWrites(observed);
+  const nextId = useRef(0);
   const edited = useRef(false);
   const cancelled = useRef(false);
-  const current = shownSlots(sent, props.value);
+  const current = currentSlots(observed);
   const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : current;
   const base = Number.isSafeInteger(typed) ? typed : current;
   const atMax = base >= (props.max ?? Number.MAX_SAFE_INTEGER);
   const send = (next: number) => {
-    const mark = { value: next, from: props.value };
-    setSent(mark);
+    const id = ++nextId.current;
+    setWrites((state) => sentSlots(observeSlots(state, props.value), { id, value: next }));
     void Promise.resolve(props.onChange(next)).then((ok) => {
-      if (ok === false) setSent((s) => (s === mark ? null : s));
+      if (ok === false) setWrites((state) => failedSlot(state, id));
     });
   };
   // While typing, the buttons step the draft, so a click never races the typed number.

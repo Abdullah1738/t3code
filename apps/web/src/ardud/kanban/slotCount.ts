@@ -24,10 +24,33 @@ export function editedSlots(
   return edited ? committedSlots(text, current, min, max) : null;
 }
 
-/** The count the stepper shows and steps from: the last one it sent, until the feed's value moves off the one it was sent against. */
-export function shownSlots(
-  sent: { readonly value: number; readonly from: number } | null,
-  feed: number,
-): number {
-  return sent !== null && sent.from === feed ? sent.value : feed;
+export interface SlotWrite {
+  readonly id: number;
+  readonly value: number;
+}
+
+export interface SlotWrites {
+  readonly feed: number;
+  readonly sent: ReadonlyArray<SlotWrite>;
+}
+
+/** Reconcile local writes with intermediate pool snapshots, preserving newer edits. */
+export function observeSlots(state: SlotWrites, feed: number): SlotWrites {
+  if (state.feed === feed) return state;
+  const match = state.sent.findIndex((write) => write.value === feed);
+  return { feed, sent: match < 0 ? [] : state.sent.slice(match + 1) };
+}
+
+export function sentSlots(state: SlotWrites, write: SlotWrite): SlotWrites {
+  return { ...state, sent: [...state.sent, write] };
+}
+
+export function failedSlot(state: SlotWrites, id: number): SlotWrites {
+  const index = state.sent.findIndex((write) => write.id === id);
+  if (index < 0) return state;
+  return { ...state, sent: state.sent.filter((write) => write.id !== id) };
+}
+
+export function currentSlots(state: SlotWrites): number {
+  return state.sent.at(-1)?.value ?? state.feed;
 }

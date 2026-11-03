@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { committedSlots, editedSlots, shownSlots } from "./slotCount";
+import {
+  committedSlots,
+  currentSlots,
+  editedSlots,
+  failedSlot,
+  observeSlots,
+  sentSlots,
+} from "./slotCount";
 
 describe("committedSlots", () => {
   it("accepts whole counts without an upper cap", () => {
@@ -31,10 +38,26 @@ describe("committedSlots", () => {
     expect(editedSlots("abc", true, 0, 0)).toBeNull();
   });
 
-  it("steps from the last sent count until the feed moves", () => {
-    expect(shownSlots(null, 5)).toBe(5);
-    expect(shownSlots({ value: 12, from: 5 }, 5)).toBe(12);
-    expect(shownSlots({ value: 12, from: 5 }, 12)).toBe(12);
-    expect(shownSlots({ value: 12, from: 5 }, 7)).toBe(7);
+  it("preserves the latest count when the feed acknowledges an earlier write", () => {
+    const initial = { feed: 5, sent: [] };
+    const first = sentSlots(initial, { id: 1, value: 12 });
+    const second = sentSlots(first, { id: 2, value: currentSlots(first) + 1 });
+    const intermediate = observeSlots(second, 12);
+    expect(currentSlots(intermediate) + 1).toBe(14);
+    const third = sentSlots(intermediate, { id: 3, value: 14 });
+    expect(currentSlots(observeSlots(third, 13))).toBe(14);
+    expect(currentSlots(observeSlots(third, 14))).toBe(14);
+  });
+
+  it("adopts an unrelated feed change and removes failed writes", () => {
+    const initial = { feed: 5, sent: [] };
+    const pending = sentSlots(sentSlots(initial, { id: 1, value: 12 }), {
+      id: 2,
+      value: 13,
+    });
+    expect(currentSlots(observeSlots(pending, 7))).toBe(7);
+    expect(currentSlots(failedSlot(pending, 2))).toBe(12);
+    expect(currentSlots(failedSlot(pending, 1))).toBe(13);
+    expect(currentSlots(failedSlot(failedSlot(pending, 1), 2))).toBe(5);
   });
 });
