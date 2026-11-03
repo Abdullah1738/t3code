@@ -28,6 +28,8 @@ LOG="$LOGDIR/backup-$(date +%Y%m).log"
 LOCK="$LOGDIR/backup.lock"
 PRUNE_STAMP="$LOGDIR/backup_prune.stamp"
 MIN_FREE_GB="${MEMORY_BACKUP_MIN_FREE_GB:-25}"
+REPLICA_TIMEOUT_S="${MEMORY_BACKUP_REPLICA_TIMEOUT_S:-5400}"
+RESTIC_TIMEOUT_S="${MEMORY_BACKUP_RESTIC_TIMEOUT_S:-7200}"
 
 mkdir -p "$LOGDIR"
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
@@ -69,6 +71,10 @@ os.replace(tmp, path)
 PY
 }
 fail() { log "FAIL [$1] $2"; write_status 0 "$1" "$2" "" 0; exit 1; }
+run_bg_limited() { # seconds command...
+  local seconds="$1"; shift
+  /opt/homebrew/bin/python3 "$ROOT/src/run_limited.py" --seconds "$seconds" --background -- "$@"
+}
 
 log "backup start"
 [ -d "$STAGE" ] || mkdir -p "$STAGE" 2>/dev/null || fail stage "cannot create $STAGE (SSD mounted?)"
@@ -90,15 +96,22 @@ hwm_sql() { # replica name -> query returning the append-only high-water mark ("
   esac
 }
 replicate() { # live-path replica-name
-  local src="$1" db="$2" sql want="" out got attempt
+  local src="$1" db="$2" sql want="" out got attempt rc replica_start
   sql=$(hwm_sql "$db")
   if [ -n "$sql" ]; then
     want=$("$SQLITE" -readonly "$src" "$sql" 2>&1)
     [[ "$want" =~ ^[0-9]+$ ]] || fail replica "$db: cannot read live high-water mark: $want"
   fi
   for attempt in 1 2; do
-    out=$("$SQRSYNC" -v "$src" "$STAGE/$db" 2>&1) || fail replica "$db: $out"
-    log "replica $db try$attempt: $(printf '%s' "$out" | tail -1)"
+    replica_start=$(date +%s)
+    rc=0
+    out=$(run_bg_limited "$REPLICA_TIMEOUT_S" "$SQRSYNC" -v "$src" "$STAGE/$db" 2>&1) || rc=$?
+    if [ "$rc" -eq 124 ]; then
+      [ -z "$out" ] || log "replica $db timeout output: $(printf '%s' "$out" | tail -c 600)"
+      fail replica "$db: sqlite3_rsync timed out after $REPLICA_TIMEOUT_S s (disk contention?)"
+    fi
+    [ "$rc" -eq 0 ] || fail replica "$db: $out"
+    log "replica $db try$attempt: elapsed_s=$(( $(date +%s) - replica_start )) $(printf '%s' "$out" | tail -1)"
     [ -z "$want" ] && break
     got=$("$SQLITE" -readonly "$STAGE/$db" "$sql" 2>&1)
     [[ "$got" =~ ^[0-9]+$ ]] && [ "$got" -ge "$want" ] && break
@@ -228,9 +241,13 @@ for p in "${RETIRED[@]}"; do excl+=(--exclude "$STAGE/$p"); done
 for p in '.credentials.json' 'auth.json' 'settings.local.json' '*.key' '*.sqlite*' '*.db' '*.db-*' '*-wal' '*-shm'; do
   excl+=(--exclude "$TSTAGE/$p" --exclude "$TSTAGE/**/$p")
 done
-out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
+out=$(run_bg_limited "$RESTIC_TIMEOUT_S" nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
   --pack-size 64 "${excl[@]}" "$STAGE" 2>&1)
 rc=$?
+if [ "$rc" -eq 124 ]; then
+  [ -z "$out" ] || log "restic timeout output: $(printf '%s' "$out" | tail -c 600)"
+  fail restic "restic backup timed out after $RESTIC_TIMEOUT_S s (disk contention?)"
+fi
 summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 600)"
 snap=$(printf '%s' "$summary" | /opt/homebrew/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_id"][:8])')
@@ -239,7 +256,7 @@ log "snapshot $snap added_packed=$added"
 
 # 3. retention, daily
 if [ ! -f "$PRUNE_STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$PRUNE_STAMP") )) -gt 86400 ]; then
-  pout=$(nice -n 10 "$RESTIC" forget --host ardud-mac --tag memory-live \
+  pout=$(/usr/sbin/taskpolicy -b nice -n 10 "$RESTIC" forget --host ardud-mac --tag memory-live \
     --keep-last 12 --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
     --prune --max-unused 15% 2>&1)
   prc=$?

@@ -27,6 +27,8 @@ import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -88,6 +90,7 @@ function layerExecutorFor(input: {
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
+  readonly mcpRegistry?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -162,6 +165,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
@@ -203,6 +207,59 @@ it("does not retry pure interrupt races where the turn is already gone", () => {
     ),
   );
 });
+
+it.effect("executes and surfaces failures from thread credential revocation", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const revoked: string[] = [];
+    const timestamp = DateTime.formatIso(yield* DateTime.now);
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      id: "effect:credential-revoke",
+      commandId: CommandId.make("command:credential-revoke"),
+      threadId,
+      request: { type: "mcp-credential.revoke-thread" },
+      status: "running",
+      attemptCount: 1,
+      availableAt: timestamp,
+      leaseOwner: "test-worker",
+      leaseExpiresAt: timestamp,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: null,
+      lastError: null,
+    };
+    const execute = (fail: boolean) =>
+      Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        return yield* Effect.exit(executor.execute(effect));
+      }).pipe(
+        Effect.provide(
+          layerExecutorFor({
+            events,
+            mcpRegistry: Layer.succeed(
+              McpSessionRegistry.McpSessionRegistry,
+              McpSessionRegistry.McpSessionRegistry.of({
+                issue: () => Effect.die("unused"),
+                resolve: () => Effect.succeed(undefined),
+                touch: () => Effect.void,
+                revokeProviderSession: () => Effect.void,
+                revokeAll: Effect.void,
+                revokeThread: (id) =>
+                  fail
+                    ? Effect.die("database unavailable")
+                    : Effect.sync(() => {
+                        revoked.push(id);
+                      }),
+              }),
+            ),
+          }),
+        ),
+      );
+    assert.isTrue(Exit.isSuccess(yield* execute(false)));
+    assert.deepEqual(revoked, [threadId]);
+    assert.isTrue(Exit.isFailure(yield* execute(true)));
+  }),
+);
 
 it.effect("settles a stopped run when its adapter has already lost the native turn", () =>
   Effect.gen(function* () {

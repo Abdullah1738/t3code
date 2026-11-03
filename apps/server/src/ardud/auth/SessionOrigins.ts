@@ -33,6 +33,7 @@
  */
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no sync sha256 helper.
 import * as NodeCrypto from "node:crypto";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -206,6 +207,7 @@ export const make = Effect.gen(function* () {
       : sql<{ readonly origin: string; readonly detail: string }>`
           SELECT origin, detail FROM ardud_mission_session_origins WHERE session_id = ${sessionId}
         `.pipe(
+          NodeSqliteClient.readOnly,
           Effect.map((rows) => {
             const origin = rows[0] ? decodeOrigin(rows[0]) : null;
             remember(sessionId, origin);

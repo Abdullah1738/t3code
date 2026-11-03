@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
@@ -82,6 +83,31 @@ const asEvaluator = <A, R>(
       : run(service, caller),
   );
 
+// An unlinked subagent isn't an outside orchestrator if a card thread started it.
+const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (caller: Caller) {
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const seen = new Set<string>();
+  let id = caller.threadId;
+  while (true) {
+    if (seen.has(id)) return yield* refuse("Cannot verify the calling thread's ancestry.");
+    seen.add(id);
+    const shell = yield* threads.getThreadShell(id).pipe(
+      Effect.mapError(
+        () =>
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "Cannot verify the calling thread's ancestry.",
+          }),
+      ),
+    );
+    if (shell === null || shell.deletedAt !== null) {
+      return yield* refuse("Cannot verify the calling thread's ancestry.");
+    }
+    if (shell.lineage.parentThreadId === null) return [...seen];
+    id = shell.lineage.parentThreadId;
+  }
+});
+
 const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
@@ -137,12 +163,13 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
   ref: string | undefined,
+  boardId?: string,
 ) {
   const trimmed = ref?.trim();
   if (!trimmed) return yield* defaultCard(service, caller);
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
-    const board = yield* boardFor(service, caller);
+    const board = yield* boardFor(service, caller, boardId);
     const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
     return card;
@@ -244,6 +271,37 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
     const card = yield* defaultCard(service, caller);
     return yield* service.cardDiscussion(card.id);
   }
+  return yield* invalid("Pass discussionId: this thread has no discussion of its own.");
+});
+
+/** A post to a card must create its discussion and message under one write guard. */
+const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+  explicit: string | undefined,
+  cardRef: string | undefined,
+) {
+  if (explicit?.trim())
+    return { kind: "discussion" as const, id: KanbanDiscussionId.make(explicit.trim()) };
+  if (cardRef?.trim()) {
+    const card = yield* cardFor(service, caller, cardRef);
+    yield* ownCard(caller, card);
+    return { kind: "card" as const, id: card.id };
+  }
+  if (caller.link?.discussionId)
+    return { kind: "discussion" as const, id: caller.link.discussionId };
+  if (caller.link?.role === "work") {
+    const cards = yield* workCards(service, caller);
+    const [only] = cards;
+    if (cards.length === 1 && only) return { kind: "card" as const, id: only.id };
+    return yield* invalid(
+      cards.length > 1
+        ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
+        : "Pass discussionId: this thread has no card of its own.",
+    );
+  }
+  if (isCardThread(caller))
+    return { kind: "card" as const, id: (yield* defaultCard(service, caller)).id };
   return yield* invalid("Pass discussionId: this thread has no discussion of its own.");
 });
 
@@ -478,8 +536,12 @@ const handlers = {
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
-        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
-        return { message: yield* service.post(discussion.id, caller.actor, blocks) };
+        const target = yield* postTargetFor(service, caller, input.discussionId, input.card);
+        return {
+          message: yield* target.kind === "card"
+            ? service.postToCard(target.id, caller.actor, blocks)
+            : service.post(target.id, caller.actor, blocks),
+        };
       }),
     ),
   ),
@@ -750,9 +812,14 @@ const handlers = {
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         const board = yield* boardFor(service, caller);
-        const discussion = yield* service.createDiscussion(board.id, input.title, caller.actor);
-        if (blocks.length > 0) yield* service.post(discussion.id, caller.actor, blocks);
-        return { discussion: yield* service.discussion(discussion.id) };
+        return {
+          discussion: yield* service.createDiscussion(
+            board.id,
+            input.title,
+            caller.actor,
+            blocks,
+          ),
+        };
       }),
     ),
   ),
@@ -774,19 +841,13 @@ const handlers = {
   board_open: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service) =>
       Effect.gen(function* () {
-        const board = yield* service.ensureBoard({
+        const board = yield* service.openBoard({
           slug: input.slug,
           name: input.name,
           defaultProjectId: input.projectId ? ProjectId.make(input.projectId) : null,
+          icon: input.icon,
         });
-        const patch = {
-          ...(input.projectId && board.defaultProjectId === null
-            ? { defaultProjectId: ProjectId.make(input.projectId) }
-            : {}),
-          ...(input.icon && board.icon === null ? { icon: input.icon } : {}),
-        };
-        if (Object.keys(patch).length === 0) return { board };
-        return { board: yield* service.updateBoard(board.id, patch) };
+        return { board };
       }),
     ),
   ),
@@ -796,6 +857,29 @@ const handlers = {
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
         return { board: yield* service.endSetup(board.id, caller.actor) };
+      }),
+    ),
+  ),
+
+  board_pause: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const ancestors = yield* pauseCallerAncestry(caller);
+        const board = yield* boardFor(service, caller, input.boardId ?? undefined);
+        if (input.clear) {
+          return { board: yield* service.pauseBoard(board.id, null, caller.actor, ancestors) };
+        }
+        const keep = yield* Effect.forEach(input.keep ?? [], (ref) =>
+          cardFor(service, caller, ref, board.id).pipe(Effect.map((card) => card.id)),
+        );
+        return {
+          board: yield* service.pauseBoard(
+            board.id,
+            { reason: input.reason ?? "", keep },
+            caller.actor,
+            ancestors,
+          ),
+        };
       }),
     ),
   ),

@@ -23,6 +23,8 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+import desktop_lease
+
 
 HOME = Path.home()
 BETTERSTACK_REASON = "Better Stack is restricted to CRPKO work. Open the relevant CRPKO project before using this MCP."
@@ -47,8 +49,8 @@ def _state():
 
 # The JSONL file is an audit trail, not a transcript. Untrusted event, tool,
 # identity and classifier fields can themselves contain an entire command.
-_LOG_EVENTS = {"PreToolUse", "SessionStart", "shim"}
-_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker"}
+_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim"}
+_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl"}
 _LOG_RULES = {
     "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
@@ -58,7 +60,8 @@ _LOG_RULES = {
     "approved-sha256", "non-member", "excluded", "coord-haiku", "non-haiku", "database-direct", "secret-read",
     "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
     "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
-    "native-check-unavailable",
+    "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
+    "desktop-unavailable", "desktop-end", "desktop-end-error",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -1020,6 +1023,7 @@ def decide(event, harness):
     pin = None
     identity = {}
     error_type = None
+    log_tool = None
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
     lineage_nodes = None
     lineage_deadline = None
@@ -1036,6 +1040,23 @@ def decide(event, harness):
         if not isinstance(event, dict) or harness not in {"claude", "codex"}:
             raise ValueError("invalid-event")
         tool, cwd = event.get("tool_name", ""), event.get("cwd")
+        kind = event.get("hook_event_name")
+        if desktop_lease.matches(tool) and kind in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
+            log_tool = "desktop-node-repl" if tool == desktop_lease.NODE_REPL else "desktop-cua"
+            # This policy must not enter the general engine's fail-open identity path.
+            try:
+                if kind == "PreToolUse":
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control)
+                else:
+                    rule, error_type = desktop_lease.finish(event, harness, _control)
+                    decision, reason = "allow", ""
+                result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
+            except Exception as error:
+                error_type = type(error).__name__
+                result = {"decision": "deny" if kind == "PreToolUse" else "allow",
+                          "reason": desktop_lease.UNAVAILABLE if kind == "PreToolUse" else "",
+                          "context": {"rule": "desktop-unavailable"}}
+            return result
         native, _, _ = _native(event, harness)
         if native:
             # Do not mistake an unexpired binding cache for a healthy identity
@@ -1106,10 +1127,11 @@ def decide(event, harness):
     except Exception as error:
         error_type = type(error).__name__
         result = {"decision": "allow", "reason": "", "context": {"rule": "hook-error"}}
-    _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
-         tool=event.get("tool_name") if isinstance(event, dict) else None,
-         robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-         command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
+    finally:
+        _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
+             tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
+             robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
+             command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 
 

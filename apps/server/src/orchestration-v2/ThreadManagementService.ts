@@ -38,6 +38,7 @@ import {
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   ProviderInstanceId,
   resolveProjectProviderInstanceEnabled,
+  type RunAttemptId,
   RunId,
   type ScheduledTaskId,
   ThreadId,
@@ -180,6 +181,7 @@ export interface ThreadManagementInterruptInput {
   readonly commandId: CommandId;
   readonly threadId: ThreadId;
   readonly runId?: RunId;
+  readonly attemptId?: RunAttemptId;
   readonly reason?: string;
 }
 
@@ -1178,13 +1180,32 @@ const make = Effect.gen(function* () {
         runId: input.runId,
       });
     }
-    const dispatch = yield* orchestrator.dispatch({
-      type: "run.interrupt",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      runId: interruptibleRun.id,
-      ...(input.reason === undefined ? {} : { reason: input.reason }),
-    });
+    const dispatch = yield* orchestrator
+      .dispatch({
+        type: "run.interrupt",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        runId: interruptibleRun.id,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
+        ...(input.runId === undefined
+          ? {}
+          : {
+              fenced: true,
+              ...(input.attemptId === undefined ? {} : { expectedAttemptId: input.attemptId }),
+            }),
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          input.runId !== undefined &&
+          error._tag === "OrchestratorDispatchError" &&
+          typeof error.cause === "string"
+            ? new ThreadManagementThreadNotInterruptibleError({
+                threadId: input.threadId,
+                runId: input.runId,
+              })
+            : error,
+        ),
+      );
     return { type: "interrupt_requested", run: interruptibleRun, dispatch } as const;
   });
 

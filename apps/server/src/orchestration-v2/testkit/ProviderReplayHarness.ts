@@ -463,6 +463,7 @@ export function layerWithRegistry<Error>(
         layerProviderSwitchServiceProvided,
         layerRunExecutionServiceProvided,
         layerServerSettings,
+        layerDatabase,
         ThreadForkService.layer,
       ),
     ),
@@ -495,6 +496,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(
       Layer.mergeAll(
         layerRunFinalizationServiceProvided,
+        McpSessionRegistryTestkit.layer,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,
         layerProviderTurnControlServiceProvided,

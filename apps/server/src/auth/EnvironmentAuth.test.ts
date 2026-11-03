@@ -3,20 +3,43 @@ import {
   authScopeResponse,
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
+  EnvironmentId,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Etag from "effect/http/Etag";
+import * as HttpPlatform from "effect/http/HttpPlatform";
+import * as HttpRouter from "effect/http/HttpRouter";
+import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
+import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "../ardud/control/http.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as PersistenceErrors from "../persistence/Errors.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
+import * as McpOAuth from "./McpOAuth.ts";
 
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
@@ -38,9 +61,14 @@ const layerServerConfig = (overrides?: Partial<ServerConfig.ServerConfig["Servic
     }),
   ).pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-auth-server-test-" })));
 
-const layerEnvironmentAuth = (overrides?: Partial<ServerConfig.ServerConfig["Service"]>) =>
+const layerEnvironmentAuth = (
+  overrides?: Partial<ServerConfig.ServerConfig["Service"]>,
+  dbPath?: string,
+) =>
   EnvironmentAuth.layer.pipe(
-    Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(
+      dbPath ? SqlitePersistence.layerFromPath(dbPath) : SqlitePersistence.layerMemory,
+    ),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(ServerEnvironment.layerIdentity),
     Layer.provide(layerServerConfig(overrides)),
@@ -77,6 +105,216 @@ const requestMetadata = {
   browser: "Chrome",
   ipAddress: "192.168.1.23",
 };
+
+it.live("authenticates control, websocket, and MCP clients while an unrelated writer is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-auth-entrypoints-" });
+    const layer = McpOAuth.layerMcpClientAuthenticator.pipe(
+      Layer.provideMerge(layerEnvironmentAuth(undefined, path.join(directory, "state.sqlite"))),
+      Layer.provide(
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("auth-entrypoints-test")),
+        }),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sessions = yield* SessionStore.SessionStore;
+      const origins = yield* SessionOrigins.SessionOrigins;
+      const mcpAuthenticator = yield* McpHttpServer.McpClientAuthenticator;
+      const sql = yield* SqlClient.SqlClient;
+
+      const control = yield* auth.issueSession({
+        subject: "control-integration",
+        scopes: ["orchestration:read"],
+      });
+      yield* origins.record(control.sessionId, { _tag: "component", component: "test-control" });
+      const ticket = yield* auth.issueWebSocketTicket({ sessionId: control.sessionId });
+      const owner = yield* auth.issueSession({ subject: "owner-for-browser-pairing" });
+      yield* origins.record(owner.sessionId, { _tag: "owner", source: "desktop" });
+      const pairing = yield* auth.issuePairingCredential(
+        { scopes: ["orchestration:read"] },
+        { sessionId: owner.sessionId },
+      );
+      const browser = yield* auth.createBrowserSession(pairing.credential, requestMetadata);
+      const initialBrowser = yield* sessions.verify(browser.sessionToken);
+      expect(yield* origins.originOf(initialBrowser.sessionId)).toEqual({
+        _tag: "owner",
+        source: "paired-client",
+      });
+      const rotationGrant = yield* auth.issuePairingCredential(
+        { scopes: ["orchestration:read"] },
+        { sessionId: owner.sessionId },
+      );
+      const mcp = yield* auth.issueMcpClientSession({
+        label: "MCP reader",
+        access: "read-only",
+        client: requestMetadata,
+      });
+      const mcpSession = yield* sessions.verify(mcp.token);
+      const revoked = yield* auth.issueSession({ subject: "revoked-control" });
+      yield* sessions.revoke(revoked.sessionId);
+      yield* sql`CREATE TABLE unrelated_auth_writer (value TEXT NOT NULL)`;
+      const web = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          HttpRouter.toWebHandler(
+            controlRouteLayer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  Layer.succeed(EnvironmentAuth.EnvironmentAuth, auth),
+                  Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+                  Layer.mock(ProjectService.ProjectService)({}),
+                  Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                    namedProjectsRoot: "/tmp/named",
+                  }),
+                  Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                  ServerSettings.layerTest(),
+                  Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
+                  Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+                    latestAgentSequence: () => Effect.succeed(42),
+                  }),
+                  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                  Layer.mock(Orchestrator.OrchestratorV2)({}),
+                  Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+                  Layer.mock(ServerSecretStore.ServerSecretStore)({}),
+                  ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-auth-" }),
+                  Layer.succeed(SqlClient.SqlClient, sql),
+                ).pipe(Layer.provideMerge(NodeServices.layer)),
+              ),
+              Layer.provide(
+                HttpPlatform.layer.pipe(
+                  Layer.provideMerge(NodeServices.layer),
+                  Layer.provideMerge(Etag.layerWeak),
+                ),
+              ),
+            ),
+            { disableLogger: true },
+          ),
+        ),
+        (handler) => Effect.promise(() => handler.dispose()),
+      );
+      const controlResponse = (token: string, route = "/health", method = "GET") =>
+        Effect.promise(() =>
+          web.handler(
+            new Request(`http://localhost${CONTROL_ROUTE_PREFIX}${route}`, {
+              method,
+              headers: { authorization: `Bearer ${token}` },
+            }),
+          ),
+        );
+      expect((yield* controlResponse("not-a-valid-token")).status).toBe(401);
+
+      const request = (url: string, headers: Record<string, string>) =>
+        HttpServerRequest.fromWeb(new Request(url, { headers }));
+      const controlRequest = request("http://localhost/api/ardud/control/projects", {
+        authorization: `Bearer ${control.token}`,
+      });
+      const mcpRequest = request("http://localhost/mcp", {
+        authorization: `Bearer ${mcp.token}`,
+      });
+      const browserRequest = request("http://localhost/oauth/mcp/decision", {
+        cookie: `${sessions.cookieName}=${browser.sessionToken}`,
+        origin: "http://localhost",
+        host: "localhost",
+      });
+      const websocketRequest = request(
+        `http://localhost/ws?${new URLSearchParams({ wsTicket: ticket.ticket })}`,
+        {},
+      );
+
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          sql`INSERT INTO unrelated_auth_writer (value) VALUES ('held')`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        yield* Deferred.await(held);
+        const controlSession = yield* auth.authenticateHttpRequest(controlRequest);
+        expect(controlSession.sessionId).toBe(control.sessionId);
+        expect(controlSession.scopes).toEqual(["orchestration:read"]);
+        expect(controlSession.scopes).not.toContain("orchestration:operate");
+        expect(controlSession.origin).toEqual({ _tag: "component", component: "test-control" });
+        expect((yield* controlResponse(control.token)).status).toBe(200);
+        expect(
+          (yield* controlResponse(control.token, "/threads/example/interrupt", "POST")).status,
+        ).toBe(403);
+        expect((yield* controlResponse("not-a-valid-token")).status).toBe(401);
+
+        const socketSession = yield* auth.authenticateWebSocketUpgrade(websocketRequest);
+        expect(socketSession.sessionId).toBe(control.sessionId);
+        expect(socketSession.scopes).toEqual(["orchestration:read"]);
+        expect(socketSession.origin).toEqual({ _tag: "component", component: "test-control" });
+
+        const browserSession = yield* auth.authenticateBrowserSession(browserRequest);
+        expect(browserSession.method).toBe("browser-session-cookie");
+        expect(browserSession.scopes).toEqual(["orchestration:read"]);
+
+        const mcpClient = yield* auth.authenticateMcpClient(mcpRequest);
+        expect(mcpClient).toMatchObject({ sessionId: mcpSession.sessionId, access: "read-only" });
+        const mcpScope = yield* mcpAuthenticator.authenticate(mcpRequest);
+        expect(mcpScope?.client).toMatchObject({
+          sessionId: mcpSession.sessionId,
+          label: "MCP reader",
+          access: "read-only",
+        });
+        expect(mcpScope?.environmentId).toBe("auth-entrypoints-test");
+
+        expect((yield* Effect.flip(auth.authenticateHttpRequest(mcpRequest)))._tag).toBe(
+          "ServerAuthInvalidCredentialError",
+        );
+        expect(yield* mcpAuthenticator.authenticate(controlRequest)).toBeUndefined();
+        const revokedRequest = request("http://localhost/api/ardud/control/projects", {
+          authorization: `Bearer ${revoked.token}`,
+        });
+        expect((yield* Effect.flip(auth.authenticateHttpRequest(revokedRequest)))._tag).toBe(
+          "ServerAuthInvalidCredentialError",
+        );
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(
+          Deferred.succeed(release, undefined).pipe(
+            Effect.andThen(Fiber.join(writer)),
+            Effect.orDie,
+          ),
+        ),
+      );
+
+      yield* sessions.revoke(control.sessionId);
+      yield* sessions.revoke(mcpSession.sessionId);
+      expect((yield* Effect.flip(auth.authenticateHttpRequest(controlRequest)))._tag).toBe(
+        "ServerAuthInvalidCredentialError",
+      );
+      expect((yield* controlResponse(control.token)).status).toBe(401);
+      expect((yield* Effect.flip(auth.authenticateWebSocketUpgrade(websocketRequest)))._tag).toBe(
+        "ServerAuthInvalidCredentialError",
+      );
+      expect(yield* mcpAuthenticator.authenticate(mcpRequest)).toBeUndefined();
+
+      const rotated = yield* auth.createBrowserSession(
+        rotationGrant.credential,
+        requestMetadata,
+        browser.sessionToken,
+      );
+      const rotatedSession = yield* sessions.verify(rotated.sessionToken);
+      expect(rotatedSession.sessionId).not.toBe(initialBrowser.sessionId);
+      expect((yield* Effect.flip(sessions.verify(browser.sessionToken)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+      expect(yield* origins.originOf(rotatedSession.sessionId)).toEqual({
+        _tag: "owner",
+        source: "paired-client",
+      });
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
   it.effect("uses the reusable dev cookie without overriding a normal scoped cookie", () =>

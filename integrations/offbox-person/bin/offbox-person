@@ -342,7 +342,7 @@ cmd_wa() {
     return
   fi
   local a retry=0 q=()
-  case $1 in
+  case ${1:-status} in
     status|link-status|chats|find|read|search|ids|events) retry=1 ;;
   esac
   for a in "$@"; do q+=("${(qq)a}"); done

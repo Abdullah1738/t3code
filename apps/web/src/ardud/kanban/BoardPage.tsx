@@ -1,4 +1,5 @@
 import { ArchiveIcon, ChevronDownIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+import { KANBAN_WS_METHODS } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useState } from "react";
 
@@ -7,6 +8,7 @@ import {
   cardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
+  pauseBanner,
   sanitizeBoardFilterPrefs,
   type BoardFilter,
   type BoardFilterPrefs,
@@ -44,9 +46,17 @@ import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
 import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
-import { kanban, kanbanErrorMessage, runAction, useBoardState, useFeed } from "./kanbanStore";
+import {
+  kanban,
+  kanbanErrorMessage,
+  runAction,
+  useBoardState,
+  useFeed,
+  useKanbanPermission,
+} from "./kanbanStore";
 import { KanbanLinksProvider } from "./links";
 import { Seg } from "./parts";
+import { PauseBanner } from "./PauseBanner";
 import { BOARD_VIEW_LABELS, type BoardSearch } from "./search";
 import { SettingsView } from "./SettingsView";
 import { AutomationsView, WikiView } from "./SideViews";
@@ -83,6 +93,7 @@ export function BoardPage(props: {
   const { boardId, search, onSearch } = props;
   const state = useBoardState(boardId);
   const feed = useFeed(kanban.board(boardId));
+  const canLiftPause = useKanbanPermission(KANBAN_WS_METHODS.boardPause);
   const view = search.view ?? "board";
   const nowMs = useNowMs();
   const [query, setQuery] = useState("");
@@ -110,6 +121,7 @@ export function BoardPage(props: {
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
   const setup = state ? setupBanner(state.board) : null;
+  const pause = state ? pauseBanner(state.board, state.cards) : null;
   const stepCard = (card: string) => go({ card }, { replace: true });
   const steps =
     view === "board" && state && filter && drawerOpen && search.card
@@ -202,6 +214,15 @@ export function BoardPage(props: {
                     }
                     onEnd={() =>
                       void runAction("Couldn't end setup", () => kanban.endSetup(boardId))
+                    }
+                  />
+                ) : null}
+                {pause ? (
+                  <PauseBanner
+                    label={pause.label}
+                    canLift={canLiftPause}
+                    onLift={() =>
+                      void runAction("Couldn't lift the pause", () => kanban.liftPause(boardId))
                     }
                   />
                 ) : null}

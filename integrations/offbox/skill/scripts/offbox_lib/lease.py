@@ -462,6 +462,8 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
 
     A pool caller's row carries the new box's lock in "_guard". It is taken before the row exists and stays held
     through bring-up, so no other caller can adopt the box while it is being made; the pool releases it."""
+    from .identity import require_proven
+    require_proven(me, "run")
     cap_check()
     con = db()
     pooled = me["owner"].startswith("pool:")

@@ -1,6 +1,7 @@
 import type {
   NodeId,
   OrchestrationV2ProviderFailure,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderFailureClass,
   OrchestrationV2ProviderRetry,
   OrchestrationV2TurnItem,
@@ -189,6 +190,7 @@ export function makeProviderFailure(input: {
   readonly message?: string | undefined;
   readonly code?: string | null | undefined;
   readonly class?: OrchestrationV2ProviderFailureClass;
+  readonly category?: OrchestrationV2ProviderFailureCategory;
   readonly retryable?: boolean | null;
   readonly resetAt?: string | null;
 }): OrchestrationV2ProviderFailure {
@@ -203,6 +205,9 @@ export function makeProviderFailure(input: {
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
+    // Only producers that classify a category set it. Others keep the record shape they
+    // always had, so OpenCode and Pi failures serialize exactly as before.
+    ...(input.category === undefined ? {} : { category: input.category }),
     ...(input.class === "usage_limit" &&
     input.resetAt != null &&
     Number.isFinite(Date.parse(input.resetAt))

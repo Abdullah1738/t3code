@@ -18,11 +18,13 @@ import {
   ProviderApprovalDecision,
   ProviderInteractionMode,
   ProviderOptionSelection,
+  RunAttemptId,
   RunId,
   RuntimeMode,
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
@@ -46,9 +48,12 @@ import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
+import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as Usage from "./usage.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
+import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
 import {
   GUIDANCE_MAX_CHARS,
@@ -74,6 +79,7 @@ import {
   TERMINAL_RUN_STATUSES,
   type ControlThreadState,
 } from "./model.ts";
+import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
 const SSE_HEARTBEAT = Duration.seconds(15);
@@ -438,6 +444,14 @@ const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: st
 // ---------------------------------------------------------------------------
 
 const makeRoutes = Effect.gen(function* () {
+  const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
+  const buildCommit =
+    typeof candidateBuildCommit === "string" &&
+    candidateBuildCommit.trim() === candidateBuildCommit &&
+    /^[0-9a-f]{7,40}$/.test(candidateBuildCommit)
+      ? candidateBuildCommit
+      : null;
+  const serverStartedAt = DateTime.formatIso(yield* DateTime.now);
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
@@ -446,7 +460,9 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const usage = yield* Usage.Usage;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
+  const recovery = yield* RecoverySnapshot.RecoverySnapshot;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -635,6 +651,27 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   // -- projects -------------------------------------------------------------
+
+  const listUsage = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const result = yield* usage
+      .list({
+        since: params.get("since"),
+        until: params.get("until"),
+        cursor: params.get("cursor"),
+        limit: params.get("limit"),
+        boardId: params.get("boardId"),
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "UsageInputError"
+            ? fail("invalid_request", error.message)
+            : fail("internal", "Could not read usage."),
+        ),
+      );
+    return json({ ok: true, ...result });
+  });
 
   const listProjects = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -858,6 +895,29 @@ const makeRoutes = Effect.gen(function* () {
     );
   });
 
+  // Read-only recovery view for stream-recovery; see ardud/recovery/RecoverySnapshot.ts.
+  const recoverySnapshot = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const active = boolParam(params.get("active"));
+    if (active === undefined) {
+      return yield* fail("invalid_request", "active=true or active=false is required.");
+    }
+    // Pure reads: keep them off the single writer, as the board reads do.
+    const page = yield* recovery
+      .page({
+        active,
+        cursor: params.get("cursor") || null,
+        // The service applies the default and the 500 cap.
+        limit: Number(params.get("limit") ?? Number.NaN),
+      })
+      .pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      );
+    return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
+  });
+
   const listThreads = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
@@ -1009,6 +1069,63 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
+  // A run's own evidence: its status, its assistant messages with their phase, and
+  // whether any tool ran. Reads only this run's rows through the projection filter.
+  const getRunEvidence = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const threadId = yield* param("threadId");
+    const runId = yield* param("runId");
+    yield* getShell(threadId);
+    const records = yield* threads
+      .getThreadRecords(
+        ThreadId.make(threadId),
+        ["runs", "messages", "turnItems", "attempts", "providerTurns"],
+        {
+          runIds: [RunId.make(runId)],
+          messageRunIds: [RunId.make(runId)],
+          turnItemRunIds: [RunId.make(runId)],
+        },
+      )
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const run = records.runs.find((candidate) => candidate.id === runId);
+    if (run === undefined) {
+      return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
+    }
+    // A provider turn is this run's only when its attempt belongs to the run. Each native
+    // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
+    const attemptIds = new Set(
+      records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id),
+    );
+    const runTurns = records.providerTurns.filter(
+      (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
+    );
+    const messages = records.messages
+      .filter((message) => message.runId === run.id && message.role === "assistant")
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+          left.id.localeCompare(right.id),
+      );
+    const evidence = runToolEvidence({
+      runStatus: run.status,
+      turnItems: records.turnItems.filter((item) => item.runId === run.id),
+      itemsComplete: providerTurnsSettled(runTurns),
+    });
+    return json({
+      ok: true,
+      threadId,
+      runId: run.id,
+      status: run.status,
+      toolEvidence: evidence.toolEvidence,
+      complete: evidence.complete,
+      messages: messages.map((message) => ({
+        id: message.id,
+        phase: message.phase,
+        text: messagePreview(message),
+      })),
+    });
+  });
+
   const send = Effect.gen(function* () {
     const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
@@ -1116,6 +1233,9 @@ const makeRoutes = Effect.gen(function* () {
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
           ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
+          ...(body.expectedAttemptId === undefined
+            ? {}
+            : { attemptId: RunAttemptId.make(body.expectedAttemptId) }),
         }),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
@@ -1398,6 +1518,8 @@ const makeRoutes = Effect.gen(function* () {
       status: "healthy",
       sequence,
       time: DateTime.formatIso(yield* DateTime.now),
+      buildCommit,
+      serverStartedAt,
     });
   });
 
@@ -1543,14 +1665,17 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/requests`, handle(listRequests)),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
+    HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
+    HttpRouter.route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
     HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
     HttpRouter.route("GET", `${p}/threads/:threadId/messages`, handle(getMessages)),
+    HttpRouter.route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
     HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
     HttpRouter.route("POST", `${p}/threads/:threadId/send`, handle(send)),
     HttpRouter.route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
@@ -1561,6 +1686,15 @@ const makeRoutes = Effect.gen(function* () {
   ] as const;
 });
 
+// RecoverySnapshot takes ThreadManagementService and ProviderSessionManagerV2
+// from the server runtime, like the other routes here.
+const controlServices = Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer);
 export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
-  Layer.provide(Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer)),
+  Layer.provide(
+    Layer.mergeAll(
+      controlServices,
+      Usage.layer,
+      RecoverySnapshot.layer.pipe(Layer.provide(controlServices)),
+    ),
+  ),
 );

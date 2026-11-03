@@ -285,12 +285,31 @@ export function reviewerQuietDue(
 const OUTAGE_TEXT =
   /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers/i;
 
-/** A failed run the same request would pass once the provider is back. */
+/**
+ * A failed run the same request would pass once the provider is back. The normalized
+ * category decides when a driver sets one: quota, transient and expired auth are outages,
+ * while config, model, context and content failures never are, even when their text reads
+ * like an outage. Text and codes are the fallback for failures without a category.
+ */
 export function isOutage(failure: {
   readonly class: string;
   readonly code: string | null;
   readonly message: string;
+  readonly category?: string | undefined;
 }): boolean {
+  switch (failure.category) {
+    case "quota":
+    case "transient":
+    case "auth_expired":
+      return true;
+    case "config":
+    case "model_invalid":
+    case "context_exhausted":
+    case "content_filter":
+      return false;
+    default:
+      break;
+  }
   if (failure.class === "usage_limit") return true;
   if (failure.code === "provider.quota" || failure.code === "provider.rate-limit") return true;
   return OUTAGE_TEXT.test(failure.message);
@@ -444,6 +463,7 @@ export function planDispatch(
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
+  const kept = board.pause ? new Set<string>(board.pause.keep) : null;
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
   for (const card of cards) {
@@ -457,6 +477,7 @@ export function planDispatch(
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const waiting = cards.filter(
     (card) =>
+      (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
       card.stalled === null &&
@@ -493,6 +514,9 @@ export function planDispatch(
       // A new thread can't take a card its old thread's own work still holds up.
       if (fresh && isBlocked(card, byId, null)) continue;
       if (fresh) thread = null;
+      if (thread !== null && kept !== null && cards.some(
+        (other) => other.activeThreadId === thread && !kept.has(other.id),
+      )) continue;
       const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
       if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
       if (!joins) {
@@ -534,6 +558,9 @@ export interface ClaimContext {
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
   if (board.setup?.status === "running") return no("Setup is running");
+  if (board.pause && !board.pause.keep.includes(card.id)) {
+    return no(`the board is paused: ${board.pause.reason}`);
+  }
   if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
   if (card.settledAt !== null) return no(`card #${card.number} is settled`);
   if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);

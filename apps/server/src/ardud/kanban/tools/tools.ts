@@ -267,7 +267,7 @@ const CardFlag = tool(
 const CardReviewResult = tool(
   "card_review_result",
   "Record the review verdict",
-  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review.",
+  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review. After a connection error, repeating the exact same call (same verdict, findings and head) is safe: an exact repeat of your latest verdict is ignored.",
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),
@@ -433,7 +433,7 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
   {
     model: ModelInput,
     slots: Schema.optional(NonNegativeInt),
@@ -451,7 +451,7 @@ const PoolSet = tool(
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
-  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses. Name the variant when the model has pools at several levels.",
   { model: ModelInput },
   { pools: Records },
   { readonly: false, destructive: true },
@@ -546,8 +546,23 @@ const SetupDone = tool(
   { readonly: false },
 );
 
+const BoardPause = tool(
+  "board_pause",
+  "Pause or resume a board",
+  "Evaluators: pause the whole board or lift it. While paused, the dispatcher starts no card work or review except the kept cards (keep: #numbers). Threads already running keep running; stop them with card_thread stop if they must stop now. clear:true lifts it. Use this instead of per-card stalled flags.",
+  {
+    boardId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    keep: Schema.optional(Schema.NullOr(Schema.Array(TrimmedNonEmptyString))),
+    reason: Schema.optional(Schema.NullOr(Schema.String)),
+    clear: Schema.optional(Schema.NullOr(Schema.Boolean)),
+  },
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
   SetupDone,
+  BoardPause,
   BoardGet,
   CardSearch,
   CardGet,

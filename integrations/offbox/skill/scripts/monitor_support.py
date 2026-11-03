@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.error
@@ -16,6 +17,7 @@ HOME = Path.home()
 STATE = Path(os.environ.get("OFFBOX_STATE_DIR", HOME / ".local/share/offbox"))
 PREFIX = "[Automated message from the offbox monitor (remote-compute skill), not typed by Abdullah.]"
 _CACHE = {}
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def read_json(path, default):
@@ -95,7 +97,11 @@ def parent_session(session):
     return cached(("parent", session), lookup)
 
 
-def live_exemption(session, now=None):
+def live_exemption(session, now=None, driver=None):
+    """Whether a live exemption covers this session. A native exemption (a bare UUID) matches only the driver it was
+    written under, so one UUID under Claude and Codex is two separate answers. An entry without a driver predates
+    native drivers and only ever meant OpenCode. OpenCode's parent lookup is skipped for native callers, which have
+    no OpenCode parent."""
     now = time.time() if now is None else now
     entries = read_json(STATE / "exemptions.json", [])
     if not isinstance(entries, list):
@@ -112,10 +118,16 @@ def live_exemption(session, now=None):
                 expires = dt.datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).timestamp()
             except ValueError:
                 continue
-        if expires > now and entry.get("session_id"):
-            live.add(entry["session_id"])
+        if expires <= now or not entry.get("session_id"):
+            continue
+        entry_driver = entry.get("driver") or "opencode"
+        if (driver or "opencode") != entry_driver:
+            continue
+        live.add(entry["session_id"])
     if session in live:
         return True
+    if driver not in (None, "opencode"):
+        return False
     return bool(live and parent_session(session) in live)
 
 
@@ -132,7 +144,104 @@ def thread_send(thread, text, request_id):
     return 200 <= status < 300
 
 
-def steer(session, text, request_id, include_parent=False):
+def is_uuid(value):
+    return bool(UUID_RE.fullmatch(value or ""))
+
+
+def resolve(native, driver):
+    """C1 resolution for a native id; "unavailable" on any failure.
+
+    A resolved answer is held for five minutes. Anything else (pending, ambiguous, unavailable)
+    is asked again after a minute, so a fresh mapping or a recovered control API is picked up.
+    """
+    key = ("identity", driver, native)
+    now = time.time()
+    item = _CACHE.get(key)
+    if item and item[0] > now:
+        return item[1]
+    status, data = ctl("GET", "/identity/resolve?nativeId=" + urllib.parse.quote(native, safe="")
+                       + "&driver=" + urllib.parse.quote(driver, safe=""))
+    if status == 200 and isinstance(data, dict) and isinstance(data.get("identity"), dict):
+        ident = data["identity"]
+    else:
+        ident = {"resolution": "unavailable", "acceptsMessages": False, "robobThreadId": None,
+                 "parentThreadId": None}
+    ttl = 300 if ident.get("resolution") == "resolved" else 60
+    _CACHE[key] = (now + ttl, ident)
+    return ident
+
+
+def thread_detail(thread_id):
+    status, data = ctl("GET", "/threads/" + urllib.parse.quote(thread_id, safe=""))
+    if status == 200 and isinstance(data, dict):
+        return data.get("thread") or {}
+    return None
+
+
+def accepts_messages(thread):
+    """Whether a thread can take a message. A provider-native child (its own conversation, created by the
+    provider) cannot. Top-level threads and app-managed children (created through T3 delegation) can, even
+    though both are lineage subagents, so relationshipToParent alone doesn't decide it.
+    """
+    provider_native = thread.get("relationshipToParent") == "subagent" and thread.get("creationSource") == "provider"
+    return not provider_native
+
+
+def writable_ancestor(thread_id):
+    """Nearest ancestor of `thread_id` that accepts messages, or None.
+
+    The walk starts above the caller, so the caller itself is never a target. A missing thread, a missing
+    parent or a lineage cycle ends the walk without a target rather than guessing one. There is no hop cap:
+    the visited set already bounds the walk to the lineage's real length.
+    """
+    visited = {thread_id}
+    current = thread_detail(thread_id)
+    while True:
+        parent = (current or {}).get("parentThreadId")
+        if not parent or parent in visited:
+            return None
+        visited.add(parent)
+        current = thread_detail(parent)
+        if current is None:
+            return None
+        if accepts_messages(current):
+            return parent
+
+
+def steer(session, text, request_id, include_parent=False, driver=None):
+    """Deliver a monitor warning to the caller, or to its nearest writable ancestor.
+
+    A native (Claude/Codex) id never goes to the OpenCode /prompt route: that answered 404
+    for native children. Without a known native driver it isn't delivered at all.
+    OpenCode ses_ ids keep the old path.
+    """
+    if driver in ("claudeAgent", "codex"):
+        return steer_native(session, text, request_id, include_parent, driver)
+    if is_uuid(session):
+        return False
+    return _steer_opencode(session, text, request_id, include_parent)
+
+
+def steer_native(session, text, request_id, include_parent=False, driver="claudeAgent"):
+    ident = resolve(session, driver)
+    tid = ident.get("robobThreadId")
+    delivered = False
+    if tid and ident.get("resolution") == "resolved" and ident.get("acceptsMessages"):
+        delivered = thread_send(tid, text, request_id)
+    if not delivered and tid and ident.get("resolution") == "resolved" and not ident.get("acceptsMessages"):
+        # A native child takes no messages: the warning goes to its nearest writable ancestor.
+        target = writable_ancestor(tid)
+        if target is not None:
+            delivered = thread_send(target, text, request_id + ":ancestor")
+    if include_parent and tid:
+        manager = ident.get("parentThreadId")
+        parent_text = text.replace(PREFIX, PREFIX + "\nFYI for the parent/manager of this session.", 1)
+        if manager and manager != tid:
+            thread_send(manager, parent_text, request_id + ":parent")
+    return delivered
+
+
+def _steer_opencode(session, text, request_id, include_parent=False):
     thread = thread_for(session) or {}
     tid = thread.get("threadId")
     parent = parent_session(session)
@@ -145,7 +254,7 @@ def steer(session, text, request_id, include_parent=False):
         manager = thread.get("parentThreadId")
         parent_text = text.replace(PREFIX, PREFIX + "\nFYI for the parent/manager of this session.", 1)
         if parent:
-            steer(parent, parent_text, request_id + ":parent", include_parent=False)
+            _steer_opencode(parent, parent_text, request_id + ":parent", include_parent=False)
         elif manager and manager != tid:
             thread_send(manager, parent_text, request_id + ":parent")
     return delivered

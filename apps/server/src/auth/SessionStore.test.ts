@@ -20,6 +20,7 @@ import { PersistenceSqlError } from "../persistence/Errors.ts";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
+import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
 import * as SessionStore from "./SessionStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import { base64UrlDecodeUtf8, base64UrlEncode, signPayload } from "./utils.ts";
@@ -71,7 +72,7 @@ const makeDiskSessionStoreLayer = Effect.fn("makeDiskSessionStoreLayer")(functio
   yield* ServerConfig.ensureServerDirectories(paths);
   const layerPersistence = SqlitePersistence.layerFromPath(paths.dbPath);
   return SessionStore.layer.pipe(
-    Layer.provide(layerPersistence),
+    Layer.provideMerge(layerPersistence),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(layerServerEnvironment(EnvironmentId.make(baseDir))),
     Layer.provide(
@@ -85,6 +86,138 @@ const makeDiskSessionStoreLayer = Effect.fn("makeDiskSessionStoreLayer")(functio
     ),
   );
 });
+
+it.live("verifies sessions and uncached origins while an unrelated file-db writer is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-auth-reader-" });
+    const devToken = "reusable-dev-auth-token-that-is-long-enough";
+    const layer = yield* makeDiskSessionStoreLayer(baseDir, devToken);
+
+    yield* Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const origins = yield* SessionOrigins.make;
+      const normal = yield* sessions.issue({
+        subject: "reader-test",
+        scopes: ["orchestration:read"],
+      });
+      const expired = yield* sessions.issue({ subject: "expired", ttl: Duration.zero });
+      const missing = yield* sessions.issue({ subject: "missing" });
+      const websocket = yield* sessions.issueWebSocketToken(normal.sessionId);
+      const expiredSessionWebsocket = yield* sessions.issueWebSocketToken(expired.sessionId);
+      const missingWebsocket = yield* sessions.issueWebSocketToken(missing.sessionId);
+      const expiredWebsocket = yield* sessions.issueWebSocketToken(normal.sessionId, {
+        ttl: Duration.zero,
+      });
+      const dev = yield* sessions.verify(devToken);
+      yield* origins.record(normal.sessionId, { _tag: "component", component: "test" });
+      yield* sql`DELETE FROM auth_sessions WHERE session_id = ${missing.sessionId}`;
+      yield* sql`CREATE TABLE unrelated_writer_test (value TEXT NOT NULL)`;
+
+      const writerHeld = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          sql`INSERT INTO unrelated_writer_test (value) VALUES ('held')`.pipe(
+            Effect.andThen(Deferred.succeed(writerHeld, undefined)),
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        ),
+      );
+      yield* Deferred.await(writerHeld);
+      yield* Effect.gen(function* () {
+        const verified = yield* sessions.verify(normal.token);
+        expect(verified.sessionId).toBe(normal.sessionId);
+        expect(verified.scopes).toEqual(["orchestration:read"]);
+        expect((yield* sessions.verify(devToken)).sessionId).toBe(dev.sessionId);
+        expect((yield* sessions.verifyWebSocketToken(websocket.token)).sessionId).toBe(
+          normal.sessionId,
+        );
+        expect(yield* origins.originOf(normal.sessionId)).toEqual({
+          _tag: "component",
+          component: "test",
+        });
+        expect((yield* Effect.flip(sessions.verify(expired.token)))._tag).toBe(
+          "SessionTokenExpiredError",
+        );
+        expect((yield* Effect.flip(sessions.verify("invalid")))._tag).toBe(
+          "MalformedSessionTokenError",
+        );
+        expect((yield* Effect.flip(sessions.verify(missing.token)))._tag).toBe(
+          "UnknownSessionTokenError",
+        );
+        expect(
+          (yield* Effect.flip(sessions.verifyWebSocketToken(expiredWebsocket.token)))._tag,
+        ).toBe("WebSocketTokenExpiredError");
+        expect(
+          (yield* Effect.flip(sessions.verifyWebSocketToken(expiredSessionWebsocket.token)))._tag,
+        ).toBe("WebSocketSessionExpiredError");
+        expect(
+          (yield* Effect.flip(sessions.verifyWebSocketToken(missingWebsocket.token)))._tag,
+        ).toBe("UnknownWebSocketSessionError");
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+      );
+      yield* Fiber.join(writer);
+
+      yield* sessions.revoke(normal.sessionId);
+      expect((yield* Effect.flip(sessions.verify(normal.token)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+      expect((yield* Effect.flip(sessions.verifyWebSocketToken(websocket.token)))._tag).toBe(
+        "WebSocketSessionRevokedError",
+      );
+      yield* sessions.revoke(dev.sessionId);
+      expect((yield* Effect.flip(sessions.verify(devToken)))._tag).toBe("SessionTokenRevokedError");
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("auth reads inside a writer transaction see its uncommitted changes", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-auth-reader-tx-" });
+    const devToken = "reusable-dev-auth-token-that-is-long-enough";
+    const layer = yield* makeDiskSessionStoreLayer(baseDir, devToken);
+
+    yield* Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const origins = yield* SessionOrigins.make;
+      const dev = yield* sessions.verify(devToken);
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const issued = yield* sessions.issue({ subject: "transaction-test" });
+            const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
+            yield* origins.record(issued.sessionId, { _tag: "owner", source: "desktop" });
+            expect((yield* sessions.verify(issued.token)).sessionId).toBe(issued.sessionId);
+            expect((yield* sessions.verifyWebSocketToken(websocket.token)).sessionId).toBe(
+              issued.sessionId,
+            );
+            expect(yield* origins.originOf(issued.sessionId)).toEqual({
+              _tag: "owner",
+              source: "desktop",
+            });
+            yield* sessions.revoke(issued.sessionId);
+            expect((yield* Effect.flip(sessions.verify(issued.token)))._tag).toBe(
+              "SessionTokenRevokedError",
+            );
+            expect((yield* Effect.flip(sessions.verifyWebSocketToken(websocket.token)))._tag).toBe(
+              "WebSocketSessionRevokedError",
+            );
+            yield* sql`UPDATE auth_sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE session_id = ${dev.sessionId}`;
+            expect((yield* Effect.flip(sessions.verify(devToken)))._tag).toBe(
+              "SessionTokenExpiredError",
+            );
+          }),
+        )
+        .pipe(Effect.timeout("5 seconds"));
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 const repositoryFailure = new PersistenceSqlError({
   operation: "AuthSessionRepository.getById:query",

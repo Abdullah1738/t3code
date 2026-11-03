@@ -1,4 +1,5 @@
 import {
+  KanbanCardId,
   ThreadId,
   type KanbanBlock,
   type KanbanBoardSnapshot,
@@ -28,6 +29,7 @@ import {
   mergeMessages,
   nextDiscussionWakeMs,
   ownerChoiceAnswer,
+  pauseBanner,
   poolViews,
   stageBoard,
   subtaskOwnerLabel,
@@ -82,7 +84,7 @@ function card(number: number, patch: Partial<KanbanCard> = {}): KanbanCard {
 
 function snapshot(cards: KanbanCard[]): KanbanBoardSnapshot {
   return {
-    board: { id: "board-toy", name: "Toy" },
+    board: { id: "board-toy", name: "Toy", pause: null },
     cards,
     goals: [
       {
@@ -101,6 +103,41 @@ function snapshot(cards: KanbanCard[]): KanbanBoardSnapshot {
     unread: [],
   } as never;
 }
+
+describe("pauseBanner", () => {
+  const paused = (keep: string[]) => ({
+    ...snapshot([]).board,
+    pause: {
+      reason: "Until shipping",
+      keep: keep.map((id) => KanbanCardId.make(id)),
+      at: "2026-10-25T10:00:00.000Z",
+      by: "owner",
+    },
+  });
+  const cards = new Map([card(12), card(14)].map((entry) => [entry.id, entry]));
+
+  it("shows kept numbers in the order supplied by the pause", () => {
+    expect(pauseBanner(paused(["card-14", "card-12"]), cards)).toEqual({
+      label: "Paused: Until shipping · only #14, #12 run",
+    });
+  });
+
+  it("skips unknown cards and says nothing runs when none are found", () => {
+    expect(pauseBanner(paused(["missing", "card-12"]), cards)).toEqual({
+      label: "Paused: Until shipping · only #12 run",
+    });
+    expect(pauseBanner(paused(["missing"]), cards)).toEqual({
+      label: "Paused: Until shipping · nothing runs",
+    });
+    expect(pauseBanner(paused([]), cards)).toEqual({
+      label: "Paused: Until shipping · nothing runs",
+    });
+  });
+
+  it("shows no banner when the board is not paused", () => {
+    expect(pauseBanner(snapshot([]).board, cards)).toBeNull();
+  });
+});
 
 function discussion(lastSeq: number, ownerRead: number): KanbanDiscussion {
   return {

@@ -19,6 +19,10 @@ type Thread = {
   worktreePath: string | null; parentThreadId: string | null; nativeSessionId: string | null;
   runs: Array<{ runId: string; ordinal: number; status: string; requestedAt?: string }>;
   messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
+  /** What the run-evidence route reports per run; absent means `unknown`. */
+  evidence?: Record<string, "ran" | "none" | "unknown">;
+  /** The thread's driver; absent means OpenCode, the driver the OpenCode fixtures represent. */
+  driver?: { instanceId: string; model: string };
 };
 type Call = { method: string; path: string; body?: any; auth: string | null };
 
@@ -45,6 +49,8 @@ function fakeControl() {
     : thread.runs.some(run => run.status === "running") ? "running" : thread.runs.some(run => run.status === "waiting") ? "waiting" : "idle";
   const summary = (thread: Thread) => ({
     threadId: thread.threadId, projectId: thread.projectId, title: thread.title, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle",
+    // The driver decides the OpenCode fallback. Fixtures default to OpenCode, the driver their step rows come from.
+    model: thread.driver ?? { instanceId: "opencode", model: "opencode-test" },
     origin: thread.origin, nativeSessionId: thread.nativeSessionId, runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId,
     rootThreadId: thread.parentThreadId ?? thread.threadId, worktreePath: thread.worktreePath, latestRunId: thread.runs.at(-1)?.runId ?? null,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
@@ -91,6 +97,15 @@ function fakeControl() {
       }
       if (thread && parts.length === 2) return ok({ thread: detail(thread) });
       if (thread && parts[2] === "messages") return ok({ threadId: thread.threadId, state: state(thread), messages: thread.messages });
+      if (thread && parts[2] === "runs" && parts[4] === "evidence") {
+        const runId = parts[3]!;
+        const run = thread.runs.find(candidate => candidate.runId === runId);
+        if (!run) return notFound();
+        const forced = thread.evidence?.[runId];
+        const messages = thread.messages.filter(message => message.runId === runId && message.role === "assistant")
+          .map(message => ({ id: message.messageId, phase: message.phase ?? "unknown", text: message.text.slice(0, 200) }));
+        return ok({ runId, status: run.status, toolEvidence: forced ?? "unknown", complete: forced === "none", messages });
+      }
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
@@ -272,6 +287,92 @@ test("records: settled runs end with an idle marker; agent-sent wakes are not ow
   expect(records[2]).toMatchObject({ outcome: "succeeded" });
   expect(records[3]).not.toHaveProperty("finish");
   expect(withoutGuidance("plain")).toBe("plain");
+});
+
+test("records: a Robob phase decides answer vs narration; no finish is invented for a settled message", () => {
+  const at = "2026-01-01T00:00:00Z";
+  const messages: ControlMessage[] = [
+    { messageId: "narrate", runId: "run:thread:t:ordinal:1", role: "assistant", phase: "narration", text: "Checking the calendar.", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "reply", runId: "run:thread:t:ordinal:1", role: "assistant", phase: "answer", text: "You're booked.", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "unsure", runId: "run:thread:t:ordinal:1", role: "assistant", text: "Maybe.", streaming: false, createdAt: at, updatedAt: at },
+  ];
+  const records = recordsFromThread({ threadId: "t", lastError: null, run: null, recentRuns: [
+    { runId: "run:thread:t:ordinal:1", ordinal: 1, status: "completed" },
+  ] }, messages);
+  const steps = records.filter((record): record is Extract<typeof record, { type: "assistant" }> => record.type === "assistant");
+  expect(steps.map(step => [step.id, step.answer])).toEqual([["narrate", false], ["reply", true], ["unsure", undefined]]);
+  for (const step of steps) expect(step).not.toHaveProperty("finish");
+});
+
+test("a Claude thread with a historical ses_ session never reads OpenCode's database for its evidence", async () => {
+  const control = fakeControl();
+  const { id } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  // A thread that moved from OpenCode keeps its old `ses_` session; its driver is now Claude.
+  thread.nativeSessionId = "ses_historical_opencode";
+  thread.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  thread.runs.push({ runId: "run:thread:claude:ordinal:1", ordinal: 1, status: "completed", requestedAt: "2026-01-01T00:00:00Z" });
+  thread.evidence = { "run:thread:claude:ordinal:1": "unknown" };
+  // OpenCode's step rows are read through this reader; a Claude thread must never reach it.
+  const reads: string[] = [];
+  const backend = control.backend();
+  (backend as unknown as { runEvidence: (session: string, since: number) => "none" }).runEvidence = session => {
+    reads.push(session);
+    return "none";
+  };
+  expect(await backend.runToolEvidence(id, "/chats", Date.parse("2026-01-01T00:00:00Z") - 1000)).toBe("unknown");
+  expect(reads).toEqual([]);
+});
+
+test("a long thread asks Robob for evidence only for the runs on the page, and a settled run once", async () => {
+  const control = fakeControl();
+  const { id } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  thread.evidence = {};
+  for (let ordinal = 1; ordinal <= 100; ordinal++) {
+    const runId = `run:thread:${threadId}:ordinal:${ordinal}`;
+    thread.runs.push({ runId, ordinal, status: "completed", requestedAt: new Date(Date.UTC(2026, 0, 1, 0, ordinal)).toISOString() });
+    // The prompt is written before the answer, as in a real run, so the answer sorts after it.
+    const asked = new Date(Date.UTC(2026, 0, 1, 0, ordinal, 0)).toISOString();
+    const answered = new Date(Date.UTC(2026, 0, 1, 0, ordinal, 1)).toISOString();
+    thread.messages.push({ messageId: `user-${ordinal}`, runId, role: "user", text: `question ${ordinal}`, streaming: false, createdBy: "user", createdAt: asked, updatedAt: asked });
+    thread.messages.push({ messageId: `assistant-${ordinal}`, runId, role: "assistant", text: `answer ${ordinal}`, streaming: false, createdBy: "agent", createdAt: answered, updatedAt: answered });
+    thread.evidence[runId] = "none";
+  }
+  // The cache is per backend instance, so both polls use the same one, as the router does.
+  const backend = control.backend();
+  const evidenceReads = () => control.calls.filter(call => call.path.includes("/evidence")).length;
+  // The newest page is the last run's answer and its idle marker: one run, one read.
+  expect((await backend.messages(id, "/chats", { limit: 2 })).filter(record => record.type === "assistant")).toHaveLength(1);
+  expect(evidenceReads()).toBe(1);
+  // Polled again, the settled run's proof is kept rather than asked for again.
+  await backend.messages(id, "/chats", { limit: 2 });
+  expect(evidenceReads()).toBe(1);
+});
+
+test("a run's tool evidence from Robob reaches its steps; unknown never becomes none", async () => {
+  const control = fakeControl();
+  const { id, directory } = await control.backend().createChat();
+  const threadId = await control.backend()["resolve"](id);
+  const thread = control.threads.get(threadId)!;
+  const run = (runId: string) => ({ runId, ordinal: thread.runs.length + 1, status: "completed", requestedAt: "2026-01-01T00:00:00Z" });
+  const at = "2026-01-01T00:00:01Z";
+  thread.runs.push(run("run:a"), run("run:b"), run("run:c"));
+  thread.messages.push(
+    { messageId: "a-1", runId: "run:a", role: "assistant", phase: "answer", text: "done", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "b-1", runId: "run:b", role: "assistant", phase: "narration", text: "checking", streaming: false, createdAt: at, updatedAt: at },
+    { messageId: "c-1", runId: "run:c", role: "assistant", text: "unsure", streaming: false, createdAt: at, updatedAt: at },
+  );
+  thread.evidence = { "run:a": "none", "run:b": "ran", "run:c": "unknown" };
+  const records = await control.backend().messages(id, directory);
+  const step = (messageId: string) => records.find(record => record.id === messageId && record.type === "assistant") as Extract<(typeof records)[number], { type: "assistant" }> | undefined;
+  expect(step("a-1")?.toolEvidence).toBe("none");
+  expect(step("b-1")?.toolEvidence).toBe("ran");
+  expect(step("c-1")?.toolEvidence).toBe("unknown");
+  expect(step("a-1")?.answer).toBe(true);
+  expect(step("b-1")?.answer).toBe(false);
 });
 
 test("records: the bridge's own prompt stays even when Robob attributed it to the bridge, other system sends do not", () => {
@@ -497,6 +598,8 @@ test("a failed run that ran a tool reports tool evidence through messages(), so 
   control.finishes.set(toolStep, "tool-calls");
   control.finishes.set(errorStep, "error");
   control.threads.get(id)!.runs.at(-1)!.status = "failed";
+  // An OpenCode thread: its native session is what OpenCode's step rows are read from.
+  control.threads.get(id)!.nativeSessionId = "ses_tool_run";
   const records = await backend.messages(id, directory);
   const replies = records.filter(record => record.type === "assistant");
   expect(replies.map(record => record.type === "assistant" && record.toolEvidence)).toEqual(["ran", "unknown"]);
@@ -804,6 +907,8 @@ test("a background run's answer before two steered texts reaches the chat along 
   await router.tick();
   expect(store.get("activeTurn")).toBeNull();
   const thread = control.threads.get(route.id)!;
+  // This thread's steps are OpenCode's own messages, so it is an OpenCode thread for the fallback.
+  thread.nativeSessionId = "ses_background_answer";
   const runId = `run:thread:${thread.threadId}:ordinal:2`;
   const at = (s: number) => new Date(Date.now() + s * 1000).toISOString();
   const native = (id: string) => `message:provider:opencode:native-item:${encodeURIComponent(`${id}:text:0`)}`;

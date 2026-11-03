@@ -42,7 +42,7 @@ bash "$S" capture 10 true
 bash "$S" extract 30 true
 grep -q "\[extract\] skip: pid" "$T/logs/test.log" && pass "same-stage overlap skipped" || fail "overlap not skipped"
 kill "$EXT" 2>/dev/null; wait "$EXT" 2>/dev/null
-pkill -f "sleep 31.7" 2>/dev/null
+# The stage runner's signal trap stops its own child tree; never kill by pattern.
 
 # 3. deadline kills the whole process tree (child and grandchild) with rc 124
 rm -rf "$T/logs/state/extract.lock"

@@ -47,6 +47,7 @@ import { forkParked, forkParkedFiber } from "./serverActivation.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import { withStartupPhase, type StartupPhase } from "./ardud/observability/StartupPhaseLog.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -379,8 +380,8 @@ export const maybeOpenBrowser = Effect.fn("serverRuntimeStartup.maybeOpenBrowser
   );
 });
 
-const runStartupPhase = <A, E, R>(phase: string, effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(
+export const runStartupPhase = <A, E, R>(phase: StartupPhase, effect: Effect.Effect<A, E, R>) =>
+  withStartupPhase(phase, effect).pipe(
     // Attributes on the span itself, not annotateSpans: an annotation follows
     // every fiber forked inside the phase, such as the effect worker, for the
     // life of the server.

@@ -1,13 +1,16 @@
 import * as Brand from "effect/Brand";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as LogLevel from "effect/LogLevel";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -197,7 +200,10 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
   readonly onExitObserved?: () => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
-  readonly onReadinessFailure?: (error: BackendReadinessTimeoutError) => Effect.Effect<void>;
+  readonly onReadinessFailure?: (
+    error: BackendReadinessTimeoutError,
+    context: { readonly pid: number; readonly elapsedMs: number; readonly firstTimeout: boolean },
+  ) => Effect.Effect<void>;
   readonly onOutput?: (
     streamName: BackendProcessOutputStream,
     chunk: Uint8Array,
@@ -456,6 +462,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
         }),
     ),
   );
+  const startedAt = yield* Clock.monotonicTimeNanos;
   const outputFibers: Array<Fiber.Fiber<void, never>> = [];
 
   yield* options.onStarted?.(handle.pid) ?? Effect.void;
@@ -548,22 +555,42 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
   // the initial readiness budget while the backend is about to come up moments
   // later; a one-shot probe left the app stuck on "Connecting to WSL…" forever
   // even though the backend kept running and became healthy.
-  const probeReadiness = Effect.fn("desktop.backendProcess.probeReadiness")(() =>
-    waitForHttpReady({
+  let readinessTimedOut = false;
+  const probeReadiness = Effect.fn("desktop.backendProcess.probeReadiness")(function* () {
+    const probe = waitForHttpReady({
       executablePath: options.executablePath,
       entryPath: options.entryPath,
       cwd: options.cwd,
       httpBaseUrl: options.httpBaseUrl,
       timeout: options.readinessTimeout ?? DEFAULT_BACKEND_READINESS_TIMEOUT,
-    }).pipe(
+    });
+    const minimumLogLevel = yield* References.MinimumLogLevel;
+    // The shared probe emits a detailed timeout warning. Keep it on the first
+    // budget, then use the compact per-child warning instead.
+    const probeLogLevel =
+      readinessTimedOut && LogLevel.Order(minimumLogLevel, "Error") < 0 ? "Error" : minimumLogLevel;
+    return yield* probe.pipe(
+      Effect.provideService(References.MinimumLogLevel, probeLogLevel),
       Effect.flatMap(() => options.onReady?.() ?? Effect.void),
       Effect.as(true),
       Effect.catchTags({
         BackendReadinessTimeoutError: (error) =>
-          (options.onReadinessFailure?.(error) ?? Effect.void).pipe(Effect.as(false)),
+          Effect.gen(function* () {
+            const firstTimeout = !readinessTimedOut;
+            readinessTimedOut = true;
+            const elapsedMs = Number((yield* Clock.monotonicTimeNanos) - startedAt) / 1_000_000;
+            yield* (
+              options.onReadinessFailure?.(error, {
+                pid: Number(handle.pid),
+                elapsedMs,
+                firstTimeout,
+              }) ?? Effect.void
+            );
+            return false;
+          }),
       }),
-    ),
-  );
+    );
+  });
 
   yield* probeReadiness().pipe(Effect.repeat({ while: (ready) => !ready }), Effect.forkScoped);
 
@@ -931,16 +958,21 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               );
             }
           }),
-          onReadinessFailure: Effect.fn("desktop.backendInstance.onReadinessFailure")(
-            function* (error) {
-              yield* logInstanceWarning("backend readiness check failed during bootstrap", {
-                error: error.message,
-              });
-              yield* backendOutputLog.persistFailureSnapshot({
-                details: error.message,
-              });
-            },
-          ),
+          onReadinessFailure: Effect.fn("desktop.backendInstance.onReadinessFailure")(function* (
+            error,
+            { pid, elapsedMs, firstTimeout },
+          ) {
+            if (!firstTimeout) {
+              yield* logInstanceWarning("backend still starting", { pid, elapsedMs });
+              return;
+            }
+            yield* logInstanceWarning("backend readiness check failed during bootstrap", {
+              error: error.message,
+            });
+            yield* backendOutputLog.persistFailureSnapshot({
+              details: error.message,
+            });
+          }),
           onOutput: (streamName, chunk) => backendOutputLog.writeOutputChunk(streamName, chunk),
         }).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

@@ -3,6 +3,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
   EnvironmentId,
   OrchestratorMcpFailure,
@@ -34,6 +35,8 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolAccessTestkit from "./McpToolAccess.testkit.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
@@ -907,6 +910,104 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
       expect(reusedSessionResponse.status).toBe(404);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "authenticates a tool call with the same credential after registry recreation and rejects it after revoke",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ProbeToolkit = Toolkit.make(
+          Tool.make("continuity_probe", {
+            description: "Reports the authenticated thread.",
+            success: Schema.Struct({ ok: Schema.Boolean }),
+            failure: OrchestratorMcpFailure,
+            failureMode: "return",
+            dependencies: [McpInvocationContext.McpInvocationContext],
+          }),
+        );
+        const makeRegistry = McpSessionRegistry.__testing.make().pipe(
+          Effect.provideService(
+            ServerEnvironment.ServerEnvironment,
+            ServerEnvironment.ServerEnvironment.of({
+              getEnvironmentId: Effect.succeed(environmentId),
+              getDescriptor: Effect.die("unused"),
+            }),
+          ),
+        );
+        const original = yield* makeRegistry;
+        const issued = yield* original.issue({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          capabilities: new Set(["device"]),
+        });
+        const registry = yield* makeRegistry;
+        const seen: Array<McpInvocationContext.McpInvocationScope> = [];
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          ProbeToolkit,
+          McpToolAccess.toLayer(ProbeToolkit, {
+            continuity_probe: McpToolAccess.reads(() =>
+              McpInvocationContext.McpInvocationContext.pipe(
+                Effect.tap((scope) => Effect.sync(() => seen.push(scope))),
+                Effect.as({ ok: true }),
+              ),
+            ),
+          }),
+        ).pipe(
+          Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(Layer.succeed(McpSessionRegistry.McpSessionRegistry, registry)),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const http = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: issued.config.authorizationHeader,
+        };
+        const init = yield* http.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        expect(init.status).toBe(200);
+        const sessionId = init.headers["mcp-session-id"]!;
+        const call = () =>
+          http.post("/mcp", {
+            headers: {
+              ...headers,
+              "mcp-session-id": sessionId,
+              "mcp-protocol-version": "2025-06-18",
+            },
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"continuity_probe","arguments":{}}}`,
+              "application/json",
+            ),
+          });
+        expect((yield* call()).status).toBe(200);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]?.thread).toEqual({
+          threadId,
+          providerSessionId: issued.config.providerSessionId,
+          providerInstanceId: issued.config.providerInstanceId,
+        });
+        expect(seen[0]?.capabilities.has("device")).toBe(true);
+        yield* registry.revokeThread(threadId);
+        expect((yield* call()).status).toBe(401);
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          CredentialStore.layer.pipe(
+            Layer.provide(NodeSqliteClient.layer({ filename: ":memory:" })),
+          ),
+          NodeHttpServer.layerTest,
+          NodeServices.layer,
+        ),
+      ),
+    ),
 );
 
 it.effect("registers annotated tools and preserves authenticated request context", () =>

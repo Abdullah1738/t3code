@@ -67,6 +67,7 @@ const board: KanbanBoard = {
   defaultReviewChain: "Default",
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
+  pause: null,
   createdAt: "2026-10-25T00:00:00Z",
   archivedAt: null,
 };
@@ -151,7 +152,11 @@ describe("checkMove", () => {
     expect(checkMove("script", card({ stage: "completed" }), "needs_owner").ok).toBe(false);
     expect(checkMove("script", card({ stage: "working" }), "completed").ok).toBe(false);
     expect(
-      checkMove("script", card({ stage: "completed", settledAt: "2026-10-25T01:00:00Z" }), "verified").ok,
+      checkMove(
+        "script",
+        card({ stage: "completed", settledAt: "2026-10-25T01:00:00Z" }),
+        "verified",
+      ).ok,
     ).toBe(false);
   });
 });
@@ -262,6 +267,45 @@ describe("planDispatch", () => {
     expect(planDispatch(setupDone, [review, todo], pools([[opus, 2]])).length).toBe(2);
   });
 
+  it("holds work, reviews and claims except for the kept cards until the pause is lifted", () => {
+    const kept = card();
+    const held = card();
+    const review = card({ stage: "needs_review" });
+    const cards = [kept, held, review];
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Ship the fix", keep: [kept.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    const available = pools([[opus, 3]]);
+    expect(planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role])).toEqual(
+      [[kept.id, "work"]],
+    );
+    const ctx = {
+      threadId: "t1",
+      pool: poolKey(opus),
+      projectId: null,
+      byId: new Map(cards.map((entry) => [entry.id as string, entry])),
+      carrying: 1,
+      slots: 3,
+    };
+    expect(checkClaim(paused, kept, ctx).ok).toBe(true);
+    expect(checkClaim(paused, held, ctx)).toEqual({
+      ok: false,
+      reason: "the board is paused: Ship the fix",
+    });
+    const reviewKept = { ...paused, pause: { ...paused.pause!, keep: [review.id] } };
+    expect(
+      planDispatch(reviewKept, cards, available).map((entry) => [entry.cardId, entry.role]),
+    ).toEqual([[review.id, "review"]]);
+    const lifted = { ...paused, pause: null };
+    expect(planDispatch(lifted, cards, available).map((entry) => entry.cardId)).toEqual([
+      review.id,
+      kept.id,
+      held.id,
+    ]);
+    expect(checkClaim(lifted, held, ctx).ok).toBe(true);
+  });
+
   it("leaves a todo card alone while its step is a board script's", () => {
     const scriptStep = card({
       subtasks: [
@@ -352,9 +396,9 @@ describe("planDispatch", () => {
     );
     const merged = card({ stage: "completed", subtasks: mergeStep("done") });
     const waiting = card({ blockedBy: [merged.id] });
-    expect(
-      planDispatch(board, [merged, waiting], pools([[opus, 2]])).map((d) => d.cardId),
-    ).toEqual([waiting.id]);
+    expect(planDispatch(board, [merged, waiting], pools([[opus, 2]])).map((d) => d.cardId)).toEqual(
+      [waiting.id],
+    );
   });
 
   it("counts running cards against their pool and never goes negative", () => {
@@ -429,6 +473,19 @@ describe("thread batching", () => {
     expect(planDispatch(board, [...full, back], pools([[opus, 1]]))).toEqual([]);
   });
 
+  it("does not wake a mixed batch for a kept card", () => {
+    const held = working();
+    const back = card({ workThreadId: t1 });
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    expect(planDispatch(paused, [held, back], pools([[opus, 1]]))).toEqual([]);
+    expect(planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]]))).toMatchObject([
+      { cardId: back.id, joins: true },
+    ]);
+  });
+
   it("keeps a held slot for a thread between cards", () => {
     const waiting = card();
     const holds = new Map([["t1", poolKey(opus)]]);
@@ -468,8 +525,17 @@ describe("thread batching", () => {
         finishedAt: null,
       },
     };
-    expect(checkClaim(setupRunning, card(), ctx)).toEqual({ ok: false, reason: "Setup is running" });
-    expect(checkClaim({ ...setupRunning, setup: { ...setupRunning.setup!, status: "done" } }, card(), ctx).ok).toBe(true);
+    expect(checkClaim(setupRunning, card(), ctx)).toEqual({
+      ok: false,
+      reason: "Setup is running",
+    });
+    expect(
+      checkClaim(
+        { ...setupRunning, setup: { ...setupRunning.setup!, status: "done" } },
+        card(),
+        ctx,
+      ).ok,
+    ).toBe(true);
     expect(checkClaim(board, card({ projectId: "p2" as KanbanCard["projectId"] }), ctx).ok).toBe(
       false,
     );
@@ -493,6 +559,18 @@ describe("thread batching", () => {
         ]),
       ),
     ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
+  });
+
+  it("starts a kept card fresh when its old thread carries a held card on another pool", () => {
+    const held = working({ model: haiku, activePool: poolKey(haiku) });
+    const back = card({ workThreadId: t1 });
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
+    };
+    expect(planDispatch(paused, [held, back], pools([[opus, 1], [haiku, 1]]))).toMatchObject([
+      { cardId: back.id, joins: false, fresh: true },
+    ]);
   });
 
   it("never picks up a backlog card, not even back to its own thread", () => {
@@ -791,13 +869,25 @@ describe("discussionSettleDue", () => {
 
   it("never settles a pinned, settled or archived discussion", () => {
     expect(
-      discussionSettleDue(discussion({ pinnedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+      discussionSettleDue(
+        discussion({ pinnedAt: "2026-10-25T01:00:00.000Z" }),
+        null,
+        START + 49 * H,
+      ),
     ).toBe(false);
     expect(
-      discussionSettleDue(discussion({ settledAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+      discussionSettleDue(
+        discussion({ settledAt: "2026-10-25T01:00:00.000Z" }),
+        null,
+        START + 49 * H,
+      ),
     ).toBe(false);
     expect(
-      discussionSettleDue(discussion({ archivedAt: "2026-10-25T01:00:00.000Z" }), null, START + 49 * H),
+      discussionSettleDue(
+        discussion({ archivedAt: "2026-10-25T01:00:00.000Z" }),
+        null,
+        START + 49 * H,
+      ),
     ).toBe(false);
   });
 
@@ -933,9 +1023,9 @@ describe("isContextFull", () => {
       }),
     ).toBe(true);
     expect(isContextFull({ message: "context_length_exceeded" })).toBe(true);
-    expect(
-      isContextFull({ message: "This model's maximum context length is 200000 tokens" }),
-    ).toBe(true);
+    expect(isContextFull({ message: "This model's maximum context length is 200000 tokens" })).toBe(
+      true,
+    );
     expect(
       isContextFull({
         message:
@@ -967,6 +1057,55 @@ describe("isHandoffBudget", () => {
       isHandoffBudget({ message: "The request leaves too little context for a provider handoff." }),
     ).toBe(true);
     expect(isHandoffBudget({ message: "prompt is too long" })).toBe(false);
+  });
+});
+
+describe("isOutage category", () => {
+  it("treats quota, transient and expired-auth categories as outages", () => {
+    for (const category of ["quota", "transient", "auth_expired"]) {
+      expect(isOutage({ class: "provider_error", code: null, message: "anything", category })).toBe(
+        true,
+      );
+    }
+  });
+
+  it("never treats config, model, context or content categories as outages, even with outage text", () => {
+    const outageLookingText =
+      "Third-party apps now draw from your extra usage, not your plan limits. Rate limit exceeded.";
+    for (const category of ["config", "model_invalid", "context_exhausted", "content_filter"]) {
+      expect(
+        isOutage({
+          class: "usage_limit",
+          code: "provider.quota",
+          message: outageLookingText,
+          category,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("falls back to the text and code checks when the category is unknown or missing", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.internal",
+        message: "Timed out waiting for response headers",
+        category: "unknown",
+      }),
+    ).toBe(true);
+    expect(
+      isOutage({ class: "provider_error", code: "provider.internal", message: "slow down" }),
+    ).toBe(false);
+  });
+
+  it("keeps a provider.content-filter failure on the flag path without a category", () => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.content-filter",
+        message: "Provider blocked the response",
+      }),
+    ).toBe(false);
   });
 });
 
@@ -1213,7 +1352,10 @@ describe("claude effort pools", () => {
     const all = pools([[opencodeHigh, 1]]);
     const max: ModelSelection = { ...opencodeHigh, options: [{ id: "variant", value: "max" }] };
     expect(poolFor(all, max)).toBeUndefined();
-    const bare: ModelSelection = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/cc/claude-haiku-5-5" };
+    const bare: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/cc/claude-haiku-5-5",
+    };
     expect(poolFor(all, bare)?.key).toBe(poolKey(opencodeHigh));
   });
 });

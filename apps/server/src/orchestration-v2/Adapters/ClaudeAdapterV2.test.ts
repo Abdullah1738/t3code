@@ -634,6 +634,29 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     assert.deepEqual(overrides, { allowedTools: ["Read"] });
   });
 
+  it("does not add T3 instructions when recall is the only scoped server", () => {
+    const overrides = ClaudeAdapterV2.claudeMcpQueryOverrides({
+      mcpSession: undefined,
+      readOnlySandbox: false,
+      recall: { url: "http://127.0.0.1:18765/mcp", threadId: ThreadId.make("thread-recall") },
+    });
+    const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      nativeThreadId: "native-recall",
+      resume: false,
+      cwd: "/workspace",
+      mcpServers: overrides.mcpServers!,
+    });
+    assert.deepEqual(overrides.mcpServers?.recall, {
+      type: "http",
+      url: "http://127.0.0.1:18765/mcp",
+      headers: { "X-Robob-Thread": "thread-recall", "X-Robob-Driver": "claudeAgent" },
+    });
+    assert.isObject(options.systemPrompt);
+    const prompt = options.systemPrompt as { readonly append?: string };
+    assert.notInclude(prompt.append ?? "", "Use `delegate_task`");
+  });
+
   it("pre-approves all t3-code tools when attaching an MCP session without an allowlist", () => {
     const threadId = ThreadId.make("thread-claude-mcp-no-allowlist");
     const mcpSession = mcpSessionFor(threadId);
@@ -770,6 +793,169 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
       readOnlyToolNames,
     );
   });
+
+  it.effect.each([true, false])(
+    "routes recall through the app thread when configured: %s",
+    (recallEnabled) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-recall-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: recallEnabled ? { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" } : {},
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-claude-recall"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const threadId = ThreadId.make("thread-claude-recall");
+        yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        yield* runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-recall"),
+            text: "hello",
+            attachments: [],
+          }),
+        );
+        assert.deepEqual(openedOptions?.mcpServers, {
+          ...T3_MCP_SERVERS,
+          ...(recallEnabled
+            ? {
+                recall: {
+                  type: "http",
+                  url: "http://127.0.0.1:18765/mcp",
+                  headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "claudeAgent" },
+                },
+              }
+            : {}),
+        });
+        assert.include(openedOptions?.allowedTools ?? [], "mcp__t3-code__*");
+        assert.notInclude(
+          JSON.stringify(ClaudeAdapterV2.loggedClaudeQueryOptions(openedOptions!)),
+          "http://127.0.0.1:18765/mcp",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("uses the turn's app thread instead of the session thread for recall", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-child-recall-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" },
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-claude-child-recall"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const sessionThreadId = ThreadId.make("thread-claude-parent-recall");
+        const childThreadId = ThreadId.make("thread-claude-child-recall");
+        const runtime = yield* adapter.openSession({
+          threadId: sessionThreadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-child-recall"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId: childThreadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: childThreadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-child-recall"),
+          text: "hello",
+          attachments: [],
+        });
+        yield* runtime.startTurn(turn);
+        assert.deepEqual(openedOptions?.mcpServers?.recall, {
+          type: "http",
+          url: "http://127.0.0.1:18765/mcp",
+          headers: { "X-Robob-Thread": childThreadId, "X-Robob-Driver": "claudeAgent" },
+        });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 });
 
 describe("ClaudeAdapterV2 native protocol logging", () => {
@@ -829,6 +1015,78 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
     assert.equal(logged.hasMcpServers, true);
     assert.notInclude(JSON.stringify(logged), "secret-claude-token");
   });
+
+  it("marks text before a tool call as narration and the end_turn text as the answer", () => {
+    const assistant = (
+      content: ReadonlyArray<Record<string, unknown>>,
+      stopReason: string | null,
+    ) =>
+      ({
+        type: "assistant",
+        uuid: "uuid-x",
+        message: { id: "msg-x", model: "claude-sonnet-4-6", content, stop_reason: stopReason },
+      }) as unknown as Parameters<typeof ClaudeAdapterV2.claudeAssistantPhase>[0];
+    const text = { type: "text", text: "Let me check." };
+    const toolUse = { type: "tool_use", id: "toolu_1", name: "Bash", input: {} };
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([text, toolUse], "tool_use")),
+      "narration",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(
+        assistant([{ type: "text", text: "Done." }], "end_turn"),
+      ),
+      "answer",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(
+        assistant([{ type: "text", text: "Cut" }], "max_tokens"),
+      ),
+      "unknown",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Mid" }], null)),
+      "unknown",
+    );
+  });
+
+  it.effect("appends the browser and device guidance only when those tools are granted", () =>
+    Effect.gen(function* () {
+      const withTools = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-4-6",
+        },
+        nativeThreadId: "native-thread-claude-tools-on",
+        resume: false,
+        cwd: "/workspace",
+        allowedTools: [],
+        mcpServers: { "t3-code": { type: "http", url: "http://127.0.0.1:1/mcp" } },
+        t3ToolAvailability: { browser: true, device: true },
+        environment: {},
+      });
+      const withoutTools = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-4-6",
+        },
+        nativeThreadId: "native-thread-claude-tools-off",
+        resume: false,
+        cwd: "/workspace",
+        allowedTools: [],
+        mcpServers: { "t3-code": { type: "http", url: "http://127.0.0.1:1/mcp" } },
+        t3ToolAvailability: { browser: false, device: false },
+        environment: {},
+      });
+      const appended = (options: unknown) =>
+        (options as { readonly systemPrompt: { readonly append?: string } }).systemPrompt.append ??
+        "";
+      assert.include(appended(withTools), "T3 Code collaborative browser");
+      assert.include(appended(withTools), "T3 Code devices");
+      assert.notInclude(appended(withoutTools), "T3 Code collaborative browser");
+      assert.notInclude(appended(withoutTools), "T3 Code devices");
+    }),
+  );
 
   it.effect("writes Claude Agent SDK protocol frames to the native provider log", () =>
     Effect.gen(function* () {
@@ -2433,9 +2691,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly subtype?: string;
     readonly isError?: boolean;
     readonly errors?: ReadonlyArray<string>;
-    readonly apiErrorStatus?: number;
+    readonly apiErrorStatus?: number | null;
     // null omits the field, as the CLI does on a zero-turn result.
     readonly terminalReason?: SDKResultMessage["terminal_reason"] | null;
+    readonly stopReason?: string | null;
     readonly usage?: {
       readonly input_tokens: number;
       readonly output_tokens: number;
@@ -2451,7 +2710,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       is_error: input.isError ?? false,
       num_turns: input.numTurns ?? 1,
       result: input.result,
-      stop_reason: "end_turn",
+      stop_reason: input.stopReason === undefined ? "end_turn" : input.stopReason,
       total_cost_usd: 0,
       usage: input.usage ?? {
         input_tokens: 1,
@@ -3163,6 +3422,43 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect("records the terminal result's stop reason on the turn's provider turn", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("finish-attempt"),
+          text: "Keep going",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "finish-terminal",
+          result: "Cut off",
+          stopReason: "max_tokens",
+        }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+      const finishes = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status !== "running"
+          ? [event.providerTurn.finish]
+          : [],
+      );
+      // The CLI's own reason, not a value the adapter invented.
+      assert.equal(finishes.at(-1), "max_tokens");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect.each(["completed", "interrupted"] as const)(
     "projects Claude thinking blocks when %s",
     (status) =>
@@ -3356,6 +3652,168 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.deepEqual(
           items.map((item) => item.text),
           [...texts],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect(
+    "gives split text and tool frames their own phases: narration before a tool, the reply after it",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("split-phase-attempt"),
+            text: "Check the prices and reply",
+            attachments: [],
+          }),
+        );
+        const message = (
+          id: string,
+          uuid: string,
+          content: ReadonlyArray<unknown>,
+          stopReason: string | null,
+        ) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: { id, model: "claude-opus-5-5", content, stop_reason: stopReason },
+          });
+        const frames = [
+          // Group A: the narration text and the tool call are separate messages that share one id.
+          message("group-a", "split-text", [{ type: "text", text: "Checking prices now." }], null),
+          message(
+            "group-a",
+            "split-tool",
+            [{ type: "tool_use", id: "tool-p", name: "Bash", input: { command: "ls" } }],
+            "tool_use",
+          ),
+          // Group B: the reply, ended by end_turn.
+          message("group-b", "split-answer", [{ type: "text", text: "Booked for 11:50." }], null),
+          makeResultFrame({
+            uuid: "split-result",
+            result: "Booked for 11:50.",
+            stopReason: "end_turn",
+          }),
+        ];
+        for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
+        yield* Queue.take(harness.terminalReceipts);
+        const latest = new Map(
+          harness.events.flatMap((event) =>
+            event.type === "message.updated" && event.message.role === "assistant"
+              ? [[event.message.text, event.message] as const]
+              : [],
+          ),
+        );
+        assert.equal(latest.get("Checking prices now.")?.phase, "narration");
+        assert.equal(latest.get("Booked for 11:50.")?.phase, "answer");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect(
+    "review r3: an end_turn message before a steer keeps answer phase when the run continues",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const attemptId = RunAttemptId.make("review-steer-phases");
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId,
+          text: "Book the car",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(input);
+        const frame = (id: string, text: string) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: id,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id,
+              model: "claude-opus-5-5",
+              content: [{ type: "text", text }],
+              stop_reason: null,
+            },
+          });
+        yield* Queue.offer(
+          harness.sdkMessages,
+          usageStreamFrame({
+            type: "message_start",
+            message: { id: "review-a", usage: zeroUsage },
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, frame("review-a", "Booked for 11:50"));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          usageStreamFrame({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: zeroUsage,
+          }),
+        );
+        yield* awaitUntil(
+          () =>
+            harness.events.some(
+              (event) =>
+                event.type === "message.updated" && event.message.text === "Booked for 11:50",
+            ),
+          "answer A arrived",
+        );
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${attemptId}`,
+          }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("review-steer"),
+            text: "Also draft the clinic message",
+            attachments: [],
+          },
+        });
+        yield* Queue.offer(harness.sdkMessages, frame("review-b", "Here's the draft"));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "review-terminal",
+            result: "Here's the draft",
+            stopReason: "end_turn",
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const phases = new Map(
+          harness.events.flatMap((event) =>
+            event.type === "message.updated"
+              ? [[event.message.text, event.message.phase] as const]
+              : [],
+          ),
+        );
+        assert.deepEqual(
+          [phases.get("Booked for 11:50"), phases.get("Here's the draft")],
+          ["answer", "answer"],
         );
       }).pipe(
         Effect.scoped,
@@ -4393,6 +4851,63 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it("maps every Claude failure signal to one normalized category", () => {
+    const cases: ReadonlyArray<
+      readonly [
+        string,
+        Parameters<typeof ClaudeAdapterV2.claudeFailureCategory>[0],
+        ReturnType<typeof ClaudeAdapterV2.claudeFailureCategory>,
+      ]
+    > = [
+      ["429 is quota", { apiErrorStatus: 429 }, "quota"],
+      ["529 is transient", { apiErrorStatus: 529 }, "transient"],
+      ["503 is transient", { apiErrorStatus: 503 }, "transient"],
+      ["401 is expired auth", { apiErrorStatus: 401 }, "auth_expired"],
+      ["a retried rate_limit is quota", { retryError: "rate_limit", retryStatus: 429 }, "quota"],
+      ["overloaded is transient", { retryError: "overloaded", retryStatus: 529 }, "transient"],
+      ["server_error is transient", { retryError: "server_error", retryStatus: 500 }, "transient"],
+      [
+        "no HTTP response is a transient timeout",
+        { retryError: "unknown", retryStatus: null, noResponse: true },
+        "transient",
+      ],
+      [
+        "authentication_failed is expired auth",
+        { retryError: "authentication_failed", retryStatus: null },
+        "auth_expired",
+      ],
+      [
+        "billing_error is a config fault",
+        { retryError: "billing_error", retryStatus: 402 },
+        "config",
+      ],
+      [
+        "model_not_found is an invalid model",
+        { retryError: "model_not_found", retryStatus: 404 },
+        "model_invalid",
+      ],
+      [
+        "an invalid effort in a 400 is an invalid model",
+        { apiErrorStatus: 400, text: "API Error: 400 invalid effort level for this model" },
+        "model_invalid",
+      ],
+      [
+        "prompt too long ends the turn as context exhaustion",
+        { terminalReason: "prompt_too_long" },
+        "context_exhausted",
+      ],
+      [
+        "blocking_limit with rate-limit evidence stays a usage limit",
+        { terminalReason: "blocking_limit", usageLimited: true },
+        "quota",
+      ],
+      ["an unrecognized failure stays unknown", { apiErrorStatus: 418 }, "unknown"],
+    ];
+    for (const [name, input, expected] of cases) {
+      assert.strictEqual(ClaudeAdapterV2.claudeFailureCategory(input), expected, name);
+    }
+  });
+
   it.effect.each([429, 401, 503, 529])(
     "classifies the current Claude API status %s after rate-limit evidence",
     (apiErrorStatus) =>
@@ -4793,6 +5308,60 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
+  );
+
+  it.effect("fails a refused Claude turn as a content filter, not a usage limit", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("claude-refusal-no-fallback-attempt"),
+          text: "Continue the audit",
+          attachments: [],
+        }),
+      );
+      const refusal = "Claude declined to continue this request.";
+      yield* Queue.offer(
+        harness.sdkMessages,
+        claudeSdkFrame({
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          original_model: "claude-fable-5",
+          request_id: "request-refusal-no-fallback",
+          api_refusal_category: "cyber",
+          api_refusal_explanation: null,
+          refused_user_message_uuid: null,
+          content: refusal,
+          session_id: WAKE_NATIVE_SESSION,
+          uuid: "00000000-0000-4000-8000-000000000401",
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000402",
+          result: "API Error: 400 Request refused.",
+          terminalReason: "api_error",
+          apiErrorStatus: 400,
+          isError: true,
+        }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.category, "content_filter");
+      assert.equal(terminal.failure.code, "model_refusal");
+      assert.equal(terminal.failure.message, refusal);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
   );
 
   it.effect("surfaces a Claude safety model fallback without failing the turn", () =>
@@ -6284,6 +6853,195 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         });
         assert.isDefined(terminal.retryStartedAt);
         assert.equal(terminal.failure.code, "api_error_529");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    {
+      name: "first-byte timeout without a response",
+      retries: [{ error: "unknown", status: null, noResponse: true }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "connection error without a response",
+      retries: [{ error: "unknown", status: null }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "explicit null result status",
+      retries: [{ error: "unknown", status: null }],
+      resultStatus: null,
+      expectedCategory: "transient",
+    },
+    {
+      name: "server error with no status on the final result",
+      retries: [{ error: "server_error", status: 500 }],
+      expectedCategory: "transient",
+    },
+    {
+      name: "explicit 500 result",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 500,
+      expectedCategory: "transient",
+    },
+    {
+      name: "latest retry wins",
+      retries: [
+        { error: "rate_limit", status: 429 },
+        { error: "server_error", status: 500 },
+      ],
+      expectedCategory: "transient",
+    },
+    {
+      name: "newer invalid-model result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 400,
+      resultText: "API Error: 400 invalid model requested",
+      expectedCategory: "model_invalid",
+    },
+    {
+      name: "newer unauthorized result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 401,
+      expectedCategory: "auth_expired",
+    },
+    {
+      name: "newer forbidden result wins even when unclassified",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 403,
+      expectedCategory: "unknown",
+    },
+    {
+      name: "newer rate limit result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultStatus: 429,
+      expectedCategory: "quota",
+    },
+    {
+      name: "unclassified result preserves quota retry and usage class",
+      retries: [{ error: "rate_limit", status: 429 }],
+      expectedCategory: "quota",
+    },
+    {
+      name: "newer prompt-too-long result wins",
+      retries: [{ error: "server_error", status: 500 }],
+      resultReason: "prompt_too_long",
+      expectedCategory: "context_exhausted",
+    },
+    {
+      name: "newer assistant error wins",
+      retries: [{ error: "server_error", status: 500 }],
+      assistantError: "invalid_request",
+      expectedCategory: "unknown",
+    },
+    {
+      name: "assistant server error retains retry evidence",
+      retries: [{ error: "server_error", status: 500 }],
+      assistantError: "server_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "nested assistant activity does not clear the root failure",
+      retries: [{ error: "server_error", status: 500 }],
+      nestedAssistant: true,
+      expectedCategory: "transient",
+    },
+    {
+      name: "assistant recovery clears stale retry evidence",
+      retries: [{ error: "server_error", status: 500 }],
+      recovered: true,
+      expectedCategory: "unknown",
+    },
+  ] as const)("preserves the applicable Claude cause: $name", (scenario) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-retry-cause"),
+            text: "Continue.",
+            attachments: [],
+          }),
+        );
+        for (const [index, retry] of scenario.retries.entries()) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              attempt: index + 1,
+              max_retries: 2,
+              retry_delay_ms: 100,
+              error_status: retry.status,
+              error: retry.error,
+              ...("noResponse" in retry && retry.noResponse
+                ? { no_response: { waited_ms: 100, retry_wait_ms: 100 } }
+                : {}),
+              uuid: `00000000-0000-4000-8000-${String(900 + index).padStart(12, "0")}`,
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+        }
+        if ("assistantError" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantErrorFrame({
+              uuid: "00000000-0000-4000-8000-000000000910",
+              error: scenario.assistantError,
+            }),
+          );
+        }
+        if ("recovered" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000000911",
+              text: "Recovered.",
+            }),
+          );
+        }
+        if ("nestedAssistant" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantErrorFrame({
+              uuid: "00000000-0000-4000-8000-000000000913",
+              error: undefined,
+              parentToolUseId: "nested-tool",
+            }),
+          );
+        }
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000912",
+            result:
+              "resultText" in scenario
+                ? scenario.resultText
+                : "Claude could not complete this request.",
+            terminalReason: "resultReason" in scenario ? scenario.resultReason : "api_error",
+            ...("resultStatus" in scenario ? { apiErrorStatus: scenario.resultStatus } : {}),
+            isError: true,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(terminal.failure.category, scenario.expectedCategory);
+        assert.equal(
+          terminal.failure.class,
+          scenario.expectedCategory === "quota" ? "usage_limit" : "provider_error",
+        );
+        if (!("recovered" in scenario)) {
+          assert.equal(terminal.retry?.attempt, scenario.retries.length);
+        }
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -7785,12 +8543,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* awaitUntil(() => harness.terminalEvents().length === 2, "second turn terminal");
         assert.equal(harness.terminalEvents()[1]?.status, "completed");
         assert.lengthOf(harness.continuationRequests, 0);
+        // One entry per assistant message, from its latest update (see assistantTexts above).
         assert.deepEqual(
-          harness.events.flatMap((event) =>
-            event.type === "message.updated" && event.message.role === "assistant"
-              ? [event.message.text]
-              : [],
-          ),
+          [
+            ...new Map(
+              harness.events.flatMap((event) =>
+                event.type === "message.updated" && event.message.role === "assistant"
+                  ? [[event.message.id, event.message.text] as const]
+                  : [],
+              ),
+            ).values(),
+          ],
           ["One.", "Stale.", "Two."],
         );
         assert.isFalse(
@@ -7822,12 +8585,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             ...frame,
             user_message_uuid: harness.promptUuid(promptIndex),
           });
-        const assistantTexts = () =>
-          harness.events.flatMap((event) =>
-            event.type === "message.updated" && event.message.role === "assistant"
-              ? [event.message.text]
-              : [],
-          );
+        // One entry per assistant message, from its latest update: the projection upserts by id, so a
+        // phase correction re-emits the same message rather than adding one.
+        const assistantTexts = () => [
+          ...new Map(
+            harness.events.flatMap((event) =>
+              event.type === "message.updated" && event.message.role === "assistant"
+                ? [[event.message.id, event.message.text] as const]
+                : [],
+            ),
+          ).values(),
+        ];
 
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({

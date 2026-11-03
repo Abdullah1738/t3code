@@ -16,15 +16,14 @@ common options:
   --no-og              skip the preview image (faster, for local checks)
 Prints JSON: {dir, page, og, slug, url?, caption, subcaption, title, description, ms}.
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time
 
 LIB = os.path.expanduser("~/.local/libexec/qcard")
 sys.path.insert(0, LIB)
 import render  # noqa: E402
 
 APPS = os.path.expanduser("~/.local/share/imessage-apps")
-CHROME = os.path.expanduser("~/Library/Caches/ms-playwright/chromium_headless_shell-1223/"
-                            "chrome-headless-shell-mac-arm64/chrome-headless-shell")
+CHROME = os.environ.get("CHROME_PATH")
 BUN = "/Users/ardud/.bun/bin/bun"
 BRIDGE = os.path.expanduser("~/.local/share/spectrum-bridge/src/cli.ts")
 TEMPLATES = ["price", "stat", "compare", "list", "timeline", "breakdown"]
@@ -35,7 +34,33 @@ def slugify(s):
     return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:28] or "card"
 
 
+def chrome():
+    if os.environ.get("CHROME_PATH"):
+        return os.environ["CHROME_PATH"]
+    pattern = os.path.expanduser("~/.robob/tools/chrome-headless-shell/mac-arm64/*/chrome-headless-shell")
+    candidates = []
+    for path in glob.glob(pattern):
+        version = os.path.basename(os.path.dirname(path)).split(".")
+        if all(part.isdigit() for part in version) and os.path.isfile(path) and os.access(path, os.X_OK):
+            candidates.append((tuple(int(part) for part in version), path))
+    if candidates:
+        return max(candidates)[1]
+    try:
+        result = subprocess.run([os.path.expanduser("~/.local/bin/taste"), "chrome"],
+                                capture_output=True, text=True, timeout=10)
+        path = result.stdout.strip()
+        safe = all("ms-playwright" not in p.split(os.sep) for p in (path, os.path.realpath(path)))
+        if result.returncode == 0 and safe and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    raise FileNotFoundError("qcard: no chrome-headless-shell (Robob's ~/.robob/tools/chrome-headless-shell); see taste chrome")
+
+
 def shot(html_path, png, w, h, budget=250):
+    global CHROME
+    if not CHROME:
+        CHROME = chrome()
     with tempfile.TemporaryDirectory() as prof:
         subprocess.run([CHROME, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run", f"--user-data-dir={prof}",
                         "--force-device-scale-factor=1", f"--virtual-time-budget={budget}", f"--window-size={w},{h}",

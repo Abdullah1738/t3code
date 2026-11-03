@@ -72,6 +72,9 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
           onEndSetup={() =>
             void action.run("Couldn't end setup", () => kanbanClient().endSetup(boardId))
           }
+          onLiftPause={() =>
+            void action.run("Couldn't lift the pause", () => kanbanClient().liftPause(boardId))
+          }
         />
         {/* A drawer over the columns, so opening a card never reflows the board. */}
         {paneCard !== null ? (

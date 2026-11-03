@@ -26,7 +26,9 @@ import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
@@ -200,88 +202,135 @@ const snapshotFor = (location: "active" | "archive") => {
   };
 };
 
-const makeHarness = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  yield* seedRows;
-  const snapshotReads = yield* Ref.make(0);
-  const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getShellSnapshot: (options) =>
-      Ref.update(snapshotReads, (count) => count + 1).pipe(
-        Effect.as(snapshotFor(options?.location ?? "active")),
+const makeHarness = (buildCommit?: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* seedRows;
+    const snapshotReads = yield* Ref.make(0);
+    const config = yield* ServerConfig.ServerConfig.pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
       ),
-    getThreadShell: (threadId) =>
-      Effect.succeed(shells.find((candidate) => candidate.id === threadId) ?? null),
-    getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
-  });
-  const web = yield* Effect.acquireRelease(
-    Effect.sync(() =>
-      HttpRouter.toWebHandler(
-        controlRouteLayer.pipe(
-          Layer.provide(
-            Layer.mergeAll(
-              Layer.mock(EnvironmentAuth.EnvironmentAuth)({
-                authenticateHttpRequest: () =>
-                  Effect.succeed({
-                    sessionId: AuthSessionId.make("session-cli"),
-                    subject: "cli-issued-session",
-                    method: "bearer-access-token" as const,
-                    scopes: ["orchestration:read", "orchestration:operate"],
-                  }),
-              }),
-              threads,
-              Layer.mock(ProjectService.ProjectService)({}),
-              Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-                namedProjectsRoot: "/tmp/named",
-              }),
-              Layer.mock(ProviderRegistry.ProviderRegistry)({}),
-              ServerSettings.layerTest(),
-              Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
-                enqueueCommand: (effect) => effect,
-              }),
-              Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
-              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
-              Layer.mock(ServerSecretStore.ServerSecretStore)({}),
-              ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }),
-              Layer.succeed(SqlClient.SqlClient, sql),
-            ).pipe(Layer.provideMerge(NodeServices.layer)),
-          ),
-          Layer.provide(
-            HttpPlatform.layer.pipe(
-              Layer.provideMerge(NodeServices.layer),
-              Layer.provideMerge(Etag.layerWeak),
+    );
+    const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getShellSnapshot: (options) =>
+        Ref.update(snapshotReads, (count) => count + 1).pipe(
+          Effect.as(snapshotFor(options?.location ?? "active")),
+        ),
+      getThreadShell: (threadId) =>
+        Effect.succeed(shells.find((candidate) => candidate.id === threadId) ?? null),
+      getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
+    });
+    const web = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        HttpRouter.toWebHandler(
+          controlRouteLayer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+                  authenticateHttpRequest: () =>
+                    Effect.succeed({
+                      sessionId: AuthSessionId.make("session-cli"),
+                      subject: "cli-issued-session",
+                      method: "bearer-access-token" as const,
+                      scopes: ["orchestration:read", "orchestration:operate"],
+                    }),
+                }),
+                threads,
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Layer.mock(Orchestrator.OrchestratorV2)({}),
+                Layer.mock(ProjectService.ProjectService)({}),
+                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                  namedProjectsRoot: "/tmp/named",
+                }),
+                Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                ServerSettings.layerTest(),
+                Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
+                  enqueueCommand: (effect) => effect,
+                }),
+                Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+                  latestAgentSequence: () => Effect.succeed(42),
+                }),
+                Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+                Layer.mock(ServerSecretStore.ServerSecretStore)({}),
+                Layer.succeed(ServerConfig.ServerConfig, {
+                  ...config,
+                  robobBuildCommit: buildCommit,
+                }),
+                Layer.succeed(SqlClient.SqlClient, sql),
+              ).pipe(Layer.provideMerge(NodeServices.layer)),
+            ),
+            Layer.provide(
+              HttpPlatform.layer.pipe(
+                Layer.provideMerge(NodeServices.layer),
+                Layer.provideMerge(Etag.layerWeak),
+              ),
             ),
           ),
+          { disableLogger: true },
         ),
-        { disableLogger: true },
       ),
-    ),
-    (handler) => Effect.promise(() => handler.dispose()),
-  );
-  const get = (path: string) =>
-    Effect.promise(async () => {
-      const response = await web.handler(
-        new Request(`http://env.local${CONTROL_ROUTE_PREFIX}${path}`, {
-          headers: { authorization: "Bearer shared" },
+      (handler) => Effect.promise(() => handler.dispose()),
+    );
+    const get = (path: string) =>
+      Effect.promise(async () => {
+        const response = await web.handler(
+          new Request(`http://env.local${CONTROL_ROUTE_PREFIX}${path}`, {
+            headers: { authorization: "Bearer shared" },
+          }),
+        );
+        return { status: response.status, body: (await response.json()) as Record<string, any> };
+      });
+    const threadIds = (path: string) =>
+      get(path).pipe(
+        Effect.map((response) => {
+          assert.strictEqual(response.status, 200);
+          return (response.body.threads as ReadonlyArray<{ threadId: string }>)
+            .map((thread) => thread.threadId)
+            .toSorted();
         }),
       );
-      return { status: response.status, body: (await response.json()) as Record<string, any> };
-    });
-  const threadIds = (path: string) =>
-    get(path).pipe(
-      Effect.map((response) => {
-        assert.strictEqual(response.status, 200);
-        return (response.body.threads as ReadonlyArray<{ threadId: string }>)
-          .map((thread) => thread.threadId)
-          .toSorted();
-      }),
-    );
-  return { get, threadIds, snapshotReads };
-});
+    return { get, threadIds, snapshotReads };
+  });
 
-const run = <A, E>(body: (h: Effect.Success<typeof makeHarness>) => Effect.Effect<A, E>) =>
-  Effect.scoped(Effect.flatMap(makeHarness, body)).pipe(Effect.provide(Sqlite.layerMemory));
+const run = <A, E>(
+  body: (h: Effect.Success<ReturnType<typeof makeHarness>>) => Effect.Effect<A, E>,
+  buildCommit?: string,
+) =>
+  Effect.scoped(Effect.flatMap(makeHarness(buildCommit), body)).pipe(
+    Effect.provide(Sqlite.layerMemory),
+  );
 
 describe("control listings", () => {
+  it.effect("reports a validated build commit captured at startup", () =>
+    Effect.gen(function* () {
+      for (const [input, expected] of [
+        ["abcdef012345", "abcdef012345"],
+        [undefined, null],
+        ["unknown", null],
+        ["ABCDEF012345", null],
+        ["abcdef012345\n", null],
+      ] as const) {
+        yield* run(
+          ({ get }) =>
+            Effect.gen(function* () {
+              const first = yield* get("/health");
+              const second = yield* get("/health");
+              assert.strictEqual(first.status, 200);
+              assert.strictEqual(first.body.status, "healthy");
+              assert.strictEqual(first.body.sequence, 42);
+              assert.strictEqual(first.body.buildCommit, expected);
+              assert.strictEqual(second.body.buildCommit, expected);
+              assert.match(first.body.serverStartedAt, /^\d{4}-\d{2}-\d{2}T/);
+              assert.strictEqual(second.body.serverStartedAt, first.body.serverStartedAt);
+            }),
+          input,
+        );
+      }
+    }),
+  );
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads }) =>
       Effect.gen(function* () {

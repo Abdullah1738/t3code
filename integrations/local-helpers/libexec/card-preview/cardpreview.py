@@ -10,12 +10,45 @@ renders a 1200x630 image with one big state/number that reads at ~300px wide.
 
 Rendering uses the headless Chrome shell (real system fonts, no PIL font guessing).
 """
-import html, os, subprocess, tempfile, time
+import glob, html, os, subprocess, tempfile, time
 
-CHROME = os.path.expanduser(
-    "~/Library/Caches/ms-playwright/chromium_headless_shell-1223/"
-    "chrome-headless-shell-mac-arm64/chrome-headless-shell")
 FONT = '-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif'
+
+
+def chrome():
+    """Resolve the shell only when a render needs it."""
+    for name in ("CARD_PREVIEW_CHROME", "CHROME_PATH"):
+        if os.environ.get(name):
+            return os.environ[name]
+
+    # Playwright's bundled Chromium was removed on 2026-11-03 under the CVE rule.
+    pattern = os.path.expanduser("~/.robob/tools/chrome-headless-shell/mac-arm64/*/chrome-headless-shell")
+    candidates = []
+    for path in glob.glob(pattern):
+        version = os.path.basename(os.path.dirname(path)).split(".")
+        if all(part.isdigit() for part in version) and os.path.isfile(path) and os.access(path, os.X_OK):
+            candidates.append((tuple(int(part) for part in version), path))
+    if candidates:
+        return max(candidates)[1]
+
+    try:
+        result = subprocess.run([os.path.expanduser("~/.local/bin/taste"), "chrome"],
+                                capture_output=True, text=True, timeout=10)
+        path = result.stdout.strip()
+        # Older taste wrappers may still return a removed Playwright browser.
+        safe = all("ms-playwright" not in p.split(os.sep) for p in (path, os.path.realpath(path)))
+        if result.returncode == 0 and safe and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    raise FileNotFoundError("cardpreview: no chrome-headless-shell (Robob's ~/.robob/tools/chrome-headless-shell); see taste chrome")
+
+
+def __getattr__(name):
+    # The deployed mailsend still reads CHROME until robob-watch is deployed too.
+    if name == "CHROME":
+        return chrome()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def esc(s):
@@ -37,7 +70,7 @@ def screenshot(src, out, width, height, timeout=40):
     if not src.startswith(("http://", "https://", "file://")):
         src = "file://" + os.path.abspath(src)
     with tempfile.TemporaryDirectory() as prof:
-        subprocess.run([CHROME, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+        subprocess.run([chrome(), "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
                         f"--user-data-dir={prof}", "--force-device-scale-factor=1",
                         "--virtual-time-budget=1500", f"--window-size={width},{height}",
                         f"--screenshot={os.path.abspath(out)}", src],

@@ -68,6 +68,8 @@ class BackupLock(unittest.TestCase):
         ok, msg = hc.check_backup_lock()
         self.assertFalse(ok)
         self.assertIn(f"PID {pid} still running", msg)
+        self.assertIn("should have timed out by itself", msg)
+        self.assertIn("logs/backup-YYYYMM.log", msg)
         self.assertIsNone(self.procs[0].poll())
         self.assertTrue(os.path.isdir(self.lock))
 

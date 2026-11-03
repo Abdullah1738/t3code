@@ -225,6 +225,25 @@ it.effect("cancels active work without reviving a run while disposing delegated 
   }).pipe(Effect.provide(IdAllocator.layer)),
 );
 
+it.effect("always queues credential revocation when a deleted thread has no active session", () =>
+  Effect.gen(function* () {
+    const projection = { ...makeProjection(), providerSessions: [] };
+    const plan = yield* planThreadDeletion({
+      command,
+      projection,
+      attachmentIds: [],
+      now: deletedAt,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+    });
+    assert.deepEqual(
+      plan.effects
+        .filter((effect) => effect.request.type === "mcp-credential.revoke-thread")
+        .map((effect) => effect.request),
+      [{ type: "mcp-credential.revoke-thread" }],
+    );
+  }).pipe(Effect.provide(IdAllocator.layer)),
+);
+
 it.effect("queues provider and resource cleanup and preserves an earlier deletion timestamp", () =>
   Effect.gen(function* () {
     const base = makeProjection();
@@ -288,8 +307,8 @@ it.effect("queues provider and resource cleanup and preserves an earlier deletio
           type: "provider-session.detach",
           providerSessionId: ProviderSessionId.make("session:delete-plan:running"),
           detail: "Thread deleted.",
-          revokeMcpCredential: true,
         },
+        { type: "mcp-credential.revoke-thread" },
         { type: "scheduled-tasks.cleanup" },
         { type: "terminal.cleanup" },
         { type: "preview.cleanup" },

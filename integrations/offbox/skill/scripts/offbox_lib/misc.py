@@ -14,6 +14,7 @@ from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
                      offsets_path, out, read_json, say, silence)
+from .identity import require_proven
 
 WAIT_POLL_S = 5
 # A lock-blocked waiter asks boat about the process this often, and once boat has said it ended for HOLDER_GRACE_S
@@ -32,6 +33,9 @@ def parse_ttl(s: str) -> int:
 
 
 def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear: bool) -> None:
+    # Listing is read-only. Adding or clearing an exemption writes a grant for a session id that the proof is about.
+    if not do_list:
+        require_proven(me, "local exemption")
     with file_lock("exemptions", timeout=30):
         cur = [e for e in read_json(EXEMPTIONS, []) if (e.get("expires_at") or 0) > now()]
         if do_list:
@@ -50,8 +54,11 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
         if not ses and not me.get("thread"):
             say("note: no OPENCODE_SESSION_ID; the exemption is recorded but the gate can't match it to a session")
         secs = parse_ttl(ttl)
-        e = {"session_id": ses, "thread_id": me.get("thread"), "reason": reason.strip()[:500],
-             "created_at": now(), "expires_at": now() + secs, "repo_root": me.get("repo_root"), "pid": os.getppid()}
+        # The driver goes with the session id: the monitor matches a native UUID only under the driver it was written
+        # for, and an entry without one is read as OpenCode.
+        e = {"session_id": ses, "driver": me.get("driver") or "opencode", "thread_id": me.get("thread"),
+             "reason": reason.strip()[:500], "created_at": now(), "expires_at": now() + secs,
+             "repo_root": me.get("repo_root"), "pid": os.getppid()}
         cur.append(e)
         atomic_write_json(EXEMPTIONS, cur)
     event(db(), None, "exemption_add", f"session={ses} thread={me.get('thread')} ttl={secs}s reason={reason[:200]}")
@@ -65,6 +72,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     if show_all:
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') ORDER BY last_used_at DESC").fetchall()
     else:
+        # The caller's own leases are selected by owner. An unproven caller's owner string is shared, so it sees none.
+        require_proven(me, "list")
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?)) ORDER BY last_used_at DESC",
                            (me['owner'], me['owner'])).fetchall()
@@ -86,6 +95,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
 
 
 def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
+    # An explicit box id still ends another caller's lease, so it is refused for an unproven caller too.
+    require_proven(me, "release")
     con = db()
     capacity.schema(con)
     if box_id:
@@ -137,12 +148,19 @@ def _release_one(con, r, delete):
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 
-def kill_run(run_id: str) -> int:
+def kill_run(run_id: str, me: dict | None = None) -> int:
     """Stop a hung starting/running box run. The row is marked killed only after boat confirms the process is gone.
-    No box lock: the hung run's client may be holding it."""
+    No box lock: the hung run's client may be holding it.
+
+    With a caller (`me`), the run must be the caller's own: an unproven caller is refused, and a proven one may only
+    stop a run its owner string names. Killing another execution's run is an authority transfer, like a release."""
     from .runs import finish
     r = _run_row(run_id)
     rid = r["run_id"]
+    if me is not None:
+        require_proven(me, "kill")
+        if r["owner"] != me["owner"]:
+            raise OffboxError(f"run {rid} belongs to another caller; only its owner can kill it", code=2)
     if r["status"] not in ("starting", "running"):
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
@@ -176,6 +194,8 @@ def kill_run(run_id: str) -> int:
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:
+    # Ports uses this for both explicit IDs and the caller's lease; refuse before either selection.
+    require_proven(me, "this box action")
     if box_id:
         return box_id
     con = db()
@@ -186,6 +206,9 @@ def resolve_box(me: dict, box_id: str | None) -> str:
 
 
 def ssh_shell(me: dict, box_id: str | None, cmd: list[str]) -> int:
+    # Gated first, with or without an explicit box: an explicit id names a box this caller may not own, and the
+    # no-id path acquires a lease. Nothing below (lease, API, ssh setup, subprocess) may run for an unproven caller.
+    require_proven(me, "ssh")
     row = None
     if not box_id:
         row = lease.acquire(me)

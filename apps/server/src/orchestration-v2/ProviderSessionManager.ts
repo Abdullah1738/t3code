@@ -1159,13 +1159,16 @@ export const layerWithOptions = (
           ([entry]) =>
             Option.match(entry, {
               onNone: () => Effect.void,
-              onSome: (entry) =>
+              onSome: (entry) => {
+                // A surviving provider process may still use these credentials after restart.
+                if (input.reason === "server_shutdown") return Effect.void;
+
                 // Revoke every credential this session recorded, including for
                 // threads that detached without re-attaching: the provider
                 // process is gone, so nothing holds them anymore. Skip threads
                 // a live replacement session took over, since credential reuse
                 // means the replacement may hold this very credential.
-                Ref.get(sessions).pipe(
+                return Ref.get(sessions).pipe(
                   Effect.flatMap((current) =>
                     Effect.forEach(
                       entry.mcpCredentialIdByThread,
@@ -1189,7 +1192,8 @@ export const layerWithOptions = (
                       { discard: true },
                     ),
                   ),
-                ),
+                );
+              },
             }),
         ).pipe(
           Effect.catchCause((cause) =>

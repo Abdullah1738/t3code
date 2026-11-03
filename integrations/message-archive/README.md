@@ -15,6 +15,7 @@ This directory holds only the code. The data lives on the external SSD.
   own flock in `locks/`, so a manual `msgs sync` of a source the daemon is
   working on prints `busy` and exits.
 - `src/search.py` - Gmail-like query parsing and ranked search (`msgs help-query`).
+  `--since`, `after:` or `newer_than:` prunes full-text search by row ID for watchers; out-of-order inserts or updates can still leave a broad scan.
 - `src/store.py` - `index.db` schema: one `items` row per message, an
   external-content FTS5 index and `sync_state` (cursor and `last_ok` per
   source). Writes go through a FIFO lock because SQLite's busy wait starves

@@ -5,12 +5,14 @@ import type {
   KanbanMessage,
   KanbanThreadRow,
 } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
 import {
   boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
   type KanbanBoardState,
   type KanbanClient,
+  type KanbanRequestTag,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { SnapshotStore } from "@t3tools/client-runtime/ardud/common";
 import { useMemo, useSyncExternalStore } from "react";
@@ -35,6 +37,11 @@ export function kanbanClient(): KanbanClient {
     { keepAliveMs: KEEP_ALIVE_MS },
   );
   return client;
+}
+
+export function useKanbanPermission(tag: KanbanRequestTag): boolean {
+  const permission = useMemo(() => kanbanClient().permission(tag), [tag]);
+  return useAtomValue(permission);
 }
 
 const NONE: SnapshotStore<never> = {

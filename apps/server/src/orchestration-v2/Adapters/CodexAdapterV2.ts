@@ -52,11 +52,13 @@ import type {
   OrchestrationV2PlanArtifact,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderFailure,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderRetry,
   OrchestrationV2ProviderSession,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderTurn,
   OrchestrationV2PlanStep,
+  OrchestrationV2AssistantPhase,
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Subagent,
   OrchestrationV2TurnItem,
@@ -1125,6 +1127,63 @@ function codexExhaustionHttpStatus(errorInfo: CodexErrorInfo | null | undefined)
     : null;
 }
 
+function codexHttpStatus(errorInfo: CodexErrorInfo | null | undefined): number | null {
+  if (typeof errorInfo !== "object" || errorInfo === null) return null;
+  if ("httpConnectionFailed" in errorInfo)
+    return errorInfo.httpConnectionFailed.httpStatusCode ?? null;
+  if ("responseStreamConnectionFailed" in errorInfo)
+    return errorInfo.responseStreamConnectionFailed.httpStatusCode ?? null;
+  if ("responseStreamDisconnected" in errorInfo)
+    return errorInfo.responseStreamDisconnected.httpStatusCode ?? null;
+  if ("responseTooManyFailedAttempts" in errorInfo)
+    return errorInfo.responseTooManyFailedAttempts.httpStatusCode ?? null;
+  return null;
+}
+
+/**
+ * What a Codex failure means for the next attempt, from the app-server's own error
+ * code. The literals are the generated CodexErrorInfo union; anything else is unknown.
+ */
+export function codexFailureCategory(
+  code: string | null,
+  errorInfo: CodexErrorInfo | null | undefined,
+): OrchestrationV2ProviderFailureCategory {
+  if (code === "usageLimitExceeded" || code === "rateLimitExceeded") return "quota";
+  const status = codexHttpStatus(errorInfo);
+  if (status !== null) {
+    if (status === 429) return "quota";
+    if (status === 401) return "auth_expired";
+    if (status === 408 || status === 425 || (status >= 500 && status < 600)) return "transient";
+    if (status >= 400 && status < 500) return "config";
+    return "unknown";
+  }
+  // Only codes whose meaning the generated schema states are mapped. badRequest and
+  // internalServerError have no description there, so they stay unknown (flag path).
+  switch (code) {
+    case "serverOverloaded":
+    case "flexUnavailable":
+      return "transient";
+    case "unauthorized":
+      return "auth_expired";
+    case "contextWindowExceeded":
+      return "context_exhausted";
+    case "cyberPolicy":
+    case "misalignmentPolicyViolation":
+      return "content_filter";
+    default:
+      break;
+  }
+  // Without an HTTP response a connection/stream failure is a timeout or reset.
+  if (
+    code === "httpConnectionFailed" ||
+    code === "responseStreamConnectionFailed" ||
+    code === "responseStreamDisconnected"
+  ) {
+    return "transient";
+  }
+  return "unknown";
+}
+
 function codexUsageLimitError(
   code: string | null,
   errorInfo: CodexErrorInfo | null | undefined,
@@ -1333,6 +1392,7 @@ const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 
 function codexThreadRuntimeParams(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+  readonly recall?: { readonly url: string; readonly threadId: ThreadId } | undefined;
   readonly modelSelection?: { readonly model: string };
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
@@ -1355,6 +1415,17 @@ function codexThreadRuntimeParams(input: {
               tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
               http_headers: {
                 Authorization: mcpSession.authorizationHeader,
+              },
+            },
+          }),
+      ...(input.recall === undefined
+        ? {}
+        : {
+            "mcp_servers.recall": {
+              url: input.recall.url,
+              http_headers: {
+                "X-Robob-Thread": input.recall.threadId,
+                "X-Robob-Driver": CODEX_PROVIDER,
               },
             },
           }),
@@ -1710,8 +1781,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
-  const readMcpSession = (threadId: ThreadId | null) =>
-    threadId === null ? Effect.succeed(undefined) : mcpSessions.read(threadId);
   const { clientFactory, crypto, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
 
@@ -1736,13 +1805,28 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
+        const environment = resolvedRuntime?.environment ?? adapterOptions.environment;
+        const recallUrl = environment.ROBOB_RECALL_MCP_URL?.trim();
+        const readMcpSession = (threadId: ThreadId | null) =>
+          threadId === null
+            ? recallUrl
+              ? Effect.fail(
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Cannot attach recall without an app thread ID.",
+                  }),
+                )
+              : Effect.succeed(undefined)
+            : mcpSessions.read(threadId);
+        const recallForThread = (threadId: ThreadId | null) =>
+          recallUrl && threadId !== null ? { url: recallUrl, threadId } : undefined;
         const client = yield* clientFactory.open({
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
-          environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+          environment,
         });
         const additionalContextByThread = yield* Ref.make(
           new Map<
@@ -1943,6 +2027,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countHandoff(providerThreadId, -1),
           );
         const finalAnswerItemIdsByTurn = yield* Ref.make(new Map<string, Set<string>>());
+        // Codex only says commentary vs final on item/completed, so the phase is
+        // remembered per item and read back when the completed artifact is built.
+        const assistantPhaseByItemId = yield* Ref.make(
+          new Map<string, OrchestrationV2AssistantPhase>(),
+        );
         const completedFinalAnswerTextsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         // Native completion and the interrupt timeout share one finalization
         // path. Serialize the race so only one can publish terminal events.
@@ -3267,6 +3356,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           context: ActiveCodexTurnContext,
           item: { readonly id: string; readonly text: string },
           completed: boolean,
+          phase: OrchestrationV2AssistantPhase = "unknown",
         ) {
           const updatedAt = yield* DateTime.now;
           const completedAt = completed ? updatedAt : null;
@@ -3309,6 +3399,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             role: "assistant",
             text: item.text,
+            phase,
             attachments: [],
             streaming: !completed,
             createdAt: startedAt,
@@ -3332,6 +3423,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             type: "assistant_message",
             messageId,
             text: item.text,
+            phase,
             streaming: !completed,
           };
           return { node, message, turnItem };
@@ -3355,6 +3447,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 context,
                 { id: update.itemId, text: update.text },
                 update.completed,
+                update.completed
+                  ? ((yield* Ref.get(assistantPhaseByItemId)).get(update.itemId) ?? "unknown")
+                  : "unknown",
               );
               const interrupted = (yield* Ref.get(terminalizedNonCompletedNativeTurns)).has(
                 update.turnId,
@@ -3463,6 +3558,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 context,
                 { id: update.itemId, text: update.text },
                 update.completed,
+                update.completed
+                  ? ((yield* Ref.get(assistantPhaseByItemId)).get(update.itemId) ?? "unknown")
+                  : "unknown",
               );
               yield* emitProviderEvent({
                 type: "node.updated",
@@ -4605,6 +4703,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   class: codexUsageLimitError(notificationCode, payload.error.codexErrorInfo)
                     ? "usage_limit"
                     : "provider_error",
+                  category: codexFailureCategory(notificationCode, payload.error.codexErrorInfo),
                 }),
               };
               return;
@@ -4630,6 +4729,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : code?.startsWith("http") === true || code?.startsWith("responseStream") === true
                   ? "transport_error"
                   : "provider_error",
+              category: codexFailureCategory(code, payload.error.codexErrorInfo),
               retryable: true,
             });
             const itemOrdinal =
@@ -5138,6 +5238,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             const finalAnswer = payload.item.phase !== "commentary";
+            // Only an explicit phase is proven. A missing or null phase is not an
+            // answer: Codex has not said it is the reply, so it stays unknown.
+            const completedPhase: OrchestrationV2AssistantPhase =
+              payload.item.phase === "final_answer"
+                ? "answer"
+                : payload.item.phase === "commentary"
+                  ? "narration"
+                  : "unknown";
+            yield* Ref.update(assistantPhaseByItemId, (current) =>
+              new Map(current).set(payload.item.id, completedPhase),
+            );
             if (finalAnswer) {
               yield* Ref.update(finalAnswerItemIdsByTurn, (current) => {
                 const updated = new Map(current);
@@ -5691,19 +5802,27 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : "provider_error";
               // The notification carries the richer message, so it wins when the
               // completion repeats it. An explicit exhaustion status on the
-              // completion still decides the class; a missing one is not evidence.
-              const exhaustionStatus = codexExhaustionHttpStatus(input.failureErrorInfo);
+              // completion still decides class and category; a missing one is not evidence.
+              const completionStatus = codexHttpStatus(input.failureErrorInfo);
+              const completionCategory = codexFailureCategory(
+                failureCode ?? null,
+                input.failureErrorInfo,
+              );
               const failure =
                 previousFailure !== undefined &&
                 (input.failureMessage === undefined ||
                   input.failureMessage === previousFailure.nativeMessage) &&
                 (failureCode === undefined || failureCode === previousFailure.failure.code) &&
-                (exhaustionStatus === null || previousFailure.failure.class === failureClass)
-                  ? previousFailure.failure
+                (completionStatus === null || previousFailure.failure.class === failureClass)
+                  ? completionStatus !== null &&
+                    previousFailure.failure.category !== completionCategory
+                    ? { ...previousFailure.failure, category: completionCategory }
+                    : previousFailure.failure
                   : makeProviderFailure({
                       message: input.failureMessage,
                       code: failureCode,
                       class: failureClass,
+                      category: completionCategory,
                     });
               return {
                 type: "turn.terminal",
@@ -6244,6 +6363,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             context,
             { id: nativeId, text: reply },
             true,
+            "answer",
           );
           yield* emitProviderEvent({
             type: "node.updated",
@@ -6660,6 +6780,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   "thread/start",
                   codexThreadRuntimeParams({
                     mcpSession,
+                    recall: recallForThread(threadInput.threadId),
                     modelSelection: threadInput.modelSelection,
                     runtimePolicy: threadInput.runtimePolicy,
                   }),
@@ -6693,6 +6814,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
                   mcpSession: yield* readMcpSession(
+                    threadInput.threadId ?? threadInput.providerThread.appThreadId,
+                  ),
+                  recall: recallForThread(
                     threadInput.threadId ?? threadInput.providerThread.appThreadId,
                   ),
                   ...(threadInput.modelSelection === undefined
@@ -7433,6 +7557,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
                     mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
+                    recall: recallForThread(threadInput.providerThread.appThreadId),
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
                   }),
@@ -7485,6 +7610,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : { lastTurnId: boundary.lastTurnId }),
                     ...codexThreadRuntimeParams({
                       mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                      recall: recallForThread(threadInput.targetThreadId),
                       ...(threadInput.modelSelection === undefined
                         ? {}
                         : { modelSelection: threadInput.modelSelection }),

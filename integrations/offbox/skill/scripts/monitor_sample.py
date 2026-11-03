@@ -10,6 +10,33 @@ from classify import classify
 from monitor_support import run
 
 SESSION = re.compile(r"(?:^|\s)OPENCODE_SESSION_ID=(ses_[A-Za-z0-9_-]+)(?=\s|$)")
+# Claude and Codex shells carry their native id instead. CODEX_THREAD_ID is the concrete thread;
+# CODEX_SESSION_ID is shared by a session's children, so it never names one execution.
+NATIVE_SESSION = re.compile(
+    r"(?:^|\s)(?:CLAUDE_CODE_SESSION_ID|CODEX_THREAD_ID)="
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=\s|$)")
+
+
+NATIVE_DRIVER = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "codex"}
+
+
+def session_in(env):
+    """The native id this process env names: a Claude/Codex UUID when the env carries one, else the OpenCode
+    ses_ id, else None. A concrete native id wins over OPENCODE_SESSION_ID, which an inherited shell can leave
+    behind as a stale parent value."""
+    found = NATIVE_SESSION.search(env) or SESSION.search(env)
+    return found[1] if found else None
+
+
+def driver_in(env, session):
+    """Which harness a native id belongs to. The same UUID can name two homes, so the env var that
+    carried it decides the driver, not the id's shape."""
+    if session and session.startswith("ses_"):
+        return "opencode"
+    for name, driver in NATIVE_DRIVER.items():
+        if re.search(r"(?:^|\s)" + name + "=" + re.escape(session or "") + r"(?=\s|$)", env):
+            return driver
+    return None
 PWD = re.compile(r"(?:^|\s)PWD=(.*?)(?=\s[A-Za-z_][A-Za-z0-9_]*=|$)")
 FIELDS = "pid=,ppid=,pcpu=,rss=,command="
 LOCAL_RUN = re.compile(r"\boffbox-local:run-")
@@ -48,9 +75,10 @@ def sample_processes(previous, now, raw=None, plain=None):
             row.update(cmd="", session=None, cwd=None, heavy=False, remote=False)
             continue
         env = row["cmd"][len(command):]
-        session, cwd = SESSION.search(env), PWD.search(env)
-        row.update(cmd=command, session=session[1] if session else None,
-                   cwd=cwd[1] if cwd else None)
+        cwd = PWD.search(env)
+        session = session_in(env)
+        row.update(cmd=command, session=session, cwd=cwd[1] if cwd else None,
+                   driver=driver_in(env, session))
         row["remote"] = bool(OFFBOX.search(command))
         row["app"] = APP.search(env) is not None
         # Local-first runs execute here (their env carries OFFBOX_LOCAL_RUN): real Mac load the monitor must see.
@@ -72,12 +100,14 @@ def sample_processes(previous, now, raw=None, plain=None):
             seen.add(current["ppid"])
             current = rows[current["ppid"]]
             row["session"] = current["session"]
+            row["driver"] = current.get("driver")
             row["cwd"] = row["cwd"] or current["cwd"]
-    # Exact cwd fallback only when that directory has one known owner.
+    # Exact cwd fallback only when that directory has one known owner. The owner keeps its driver: the
+    # same UUID under two drivers is two owners, so a cwd that names both is ambiguous.
     owners = {}
     for row in rows.values():
         if row["session"] and row["cwd"]:
-            owners.setdefault(row["cwd"], set()).add(row["session"])
+            owners.setdefault(row["cwd"], set()).add((row["session"], row.get("driver")))
     for row in rows.values():
         pid = row["pid"]
         if pid == os.getpid() or not row["cmd"]:
@@ -119,10 +149,15 @@ def sample_processes(previous, now, raw=None, plain=None):
                 cwd = next((s[1:] for s in output.splitlines() if s.startswith("n")), None)
             candidates = owners.get(cwd, set())
             if len(candidates) == 1:
-                row["session"] = next(iter(candidates))
+                row["session"], row["driver"] = next(iter(candidates))
         if not row["session"]:
             continue
-        group = groups.setdefault(row["session"], {"cpu": 0.0, "rss": 0, "pids": [], "keys": []})
+        # A native UUID is keyed by its driver as well: the same UUID under two drivers is two executions.
+        # OpenCode ids keep their bare key (one driver, and the ladder's stored records use it).
+        group_key = row["session"] if row["session"].startswith("ses_") or not row.get("driver") \
+            else f"{row['driver']}:{row['session']}"
+        group = groups.setdefault(group_key, {"cpu": 0.0, "rss": 0, "pids": [], "keys": [],
+                                              "driver": row.get("driver"), "session": row["session"]})
         group["cpu"] += row["cpu"]
         group["rss"] += row["rss"]
         group["pids"].append(pid)

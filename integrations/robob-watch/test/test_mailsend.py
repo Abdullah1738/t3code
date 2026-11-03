@@ -476,22 +476,56 @@ class MailsendTest(unittest.TestCase):
             self.assertLessEqual(self.card_h_of(p), 2000)
 
     def test_real_chrome_card_renders_when_chrome_is_present(self):
-        cp = os.path.expanduser("~/Library/Caches/ms-playwright/chromium_headless_shell-1223/"
-                                "chrome-headless-shell-mac-arm64/chrome-headless-shell")
-        if not os.path.isfile(cp):
-            self.skipTest("headless Chrome shell not installed")
+        import importlib.util
+        lib = os.path.abspath(os.path.join(HERE, "../../local-helpers/libexec/card-preview"))
+        spec = importlib.util.spec_from_file_location("cardpreview_test", os.path.join(lib, "cardpreview.py"))
+        cp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cp)
+        try:
+            chrome = cp.chrome()
+        except FileNotFoundError as e:
+            self.skipTest(str(e))
         i, _ = self.draft("--attach", self.file, body="Real render check: 这是中文和 English 混合的一行。")
         # No renderer override here: the real Chrome path draws the PNG and checks the layout.
         env = {k: v for k, v in self.env.items()}
         env.pop("MAILSEND_CARD_RENDERER", None)
-        env["HOME"] = os.path.expanduser("~")
         env["MAILSEND_DRAFT_DIR"] = self.drafts
-        env["MAILSEND_CARD_LIB"] = os.path.expanduser("~/.local/libexec/card-preview")
+        env["MAILSEND_CARD_LIB"] = lib
+        env["CARD_PREVIEW_CHROME"] = chrome
         r = subprocess.run(["/usr/bin/python3", HELPER, "card", i], env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr)
         png = r.stdout.strip()
         self.assertTrue(os.path.isfile(png))
         self.assertGreater(os.path.getsize(png), 1000)
+
+    def test_legacy_mailsend_can_render_with_new_preview_module(self):
+        import importlib.util
+        lib = os.path.abspath(os.path.join(HERE, "../../local-helpers/libexec/card-preview"))
+        spec = importlib.util.spec_from_file_location("cardpreview_compat_test", os.path.join(lib, "cardpreview.py"))
+        cp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cp)
+        try:
+            chrome = cp.chrome()
+        except FileNotFoundError as e:
+            self.skipTest(str(e))
+        legacy = os.path.join(self.tmp.name, "legacy-mailsend")
+        with open(HELPER) as src, open(legacy, "w") as dst:
+            dst.write(src.read().replace("cp.chrome()", "cp.CHROME"))
+        i, _ = self.draft()
+        env = {**self.env, "MAILSEND_CARD_LIB": lib, "CARD_PREVIEW_CHROME": chrome}
+        r = subprocess.run(["/usr/bin/python3", legacy, "card", i], env=env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(os.path.getsize(r.stdout.strip()), 1000)
+        self.assertEqual(self.calls("send"), [])
+
+    def test_missing_chrome_refuses_to_render_without_sending(self):
+        i, _ = self.draft()
+        lib = os.path.abspath(os.path.join(HERE, "../../local-helpers/libexec/card-preview"))
+        code, _, err = self.ms("card", i, MAILSEND_CARD_LIB=lib)
+        self.assertEqual(code, 1)
+        self.assertIn("headless Chrome not found", err)
+        self.assertEqual(self.calls("send"), [])
 
     def test_card_writes_a_png_named_for_the_draft_and_sends_nothing(self):
         i, _ = self.draft("--cc", "moni@example.com", "--attach", self.file)
