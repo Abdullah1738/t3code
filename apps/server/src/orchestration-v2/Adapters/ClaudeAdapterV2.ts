@@ -67,6 +67,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
+  type OrchestrationV2ProviderFailureCategory,
   OrchestrationV2ProviderGoal,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2PlanStep,
@@ -74,6 +75,7 @@ import {
   type OrchestrationV2ProviderRetry,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2AssistantPhase,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2UserInputQuestion,
@@ -154,6 +156,10 @@ import {
 import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  t3ToolInstructions,
+  type T3CodeToolAvailability,
+} from "../../provider/T3ToolInstructions.ts";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import {
   mcpToolPresentation,
@@ -1196,6 +1202,8 @@ export function makeClaudeQueryOptions(input: {
   readonly sdkSettings?: string | ClaudeSdkSettings;
   readonly environment?: NodeJS.ProcessEnv;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
+  /** Which preview/device tools the MCP credential grants; gates the guidance text. */
+  readonly t3ToolAvailability?: T3CodeToolAvailability;
   readonly tools?: ClaudeAgentSdkQueryTools;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly disallowedTools?: ReadonlyArray<string>;
@@ -1288,7 +1296,12 @@ export function makeClaudeQueryOptions(input: {
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
+        (input.mcpServers === undefined
+          ? ""
+          : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
+            t3ToolInstructionsSuffix(
+              input.t3ToolAvailability ?? { browser: false, device: false },
+            )),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -1299,6 +1312,24 @@ export function makeClaudeQueryOptions(input: {
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+}
+
+/**
+ * Mirrors Codex's `toolInstructions`: the same capability-gated text for the same
+ * MCP credential, so Claude sessions learn about preview/device tools on the same terms.
+ */
+export function claudeT3ToolAvailability(
+  session: McpProviderSession.McpProviderSessionConfig | undefined,
+): T3CodeToolAvailability {
+  return {
+    browser: session?.browserToolsAvailable ?? true,
+    device: session?.capabilities?.has("device") ?? false,
+  };
+}
+
+function t3ToolInstructionsSuffix(availability: T3CodeToolAvailability): string {
+  const text = t3ToolInstructions(availability);
+  return text === "" ? "" : `\n\n${text}`;
 }
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
@@ -2944,6 +2975,64 @@ function claudeUsageLimitResetAt(resetsAt: unknown): string | null {
     : null;
 }
 
+/**
+ * What a Claude failure means for the next attempt. Decided from the SDK's own
+ * status and reason fields first; the message text is only the fallback for
+ * failures that carry neither.
+ */
+// A 400 whose text names a model or effort the request can't use: a config fault, not a bad prompt.
+const CLAUDE_MODEL_CONFIG_TEXT =
+  /\b(?:invalid|unknown|unsupported)\s+(?:model|effort)\b|\bmodel\s+(?:not found|does not exist|is not available)\b|\beffort\s+(?:level\s+)?(?:is\s+)?(?:invalid|not supported)\b/i;
+
+export function claudeFailureCategory(input: {
+  readonly apiErrorStatus?: number | null | undefined;
+  readonly terminalReason?: string | null | undefined;
+  readonly retryError?: string | null | undefined;
+  readonly retryStatus?: number | null | undefined;
+  readonly noResponse?: boolean | undefined;
+  /** Rate-limit evidence on the turn: a usage limit even when the CLI ends it as blocking_limit. */
+  readonly usageLimited?: boolean | undefined;
+  readonly text?: string | undefined;
+}): OrchestrationV2ProviderFailureCategory {
+  if (input.usageLimited === true) return "quota";
+  const status = input.apiErrorStatus ?? input.retryStatus ?? null;
+  if (status === 429) return "quota";
+  if (status !== null && status >= 500 && status < 600) return "transient";
+  if (status === 401) return "auth_expired";
+  switch (input.retryError) {
+    case "rate_limit":
+      return "quota";
+    case "overloaded":
+    case "server_error":
+      return "transient";
+    case "authentication_failed":
+      return "auth_expired";
+    // Account state a retry can't change: pausing would loop, so these fail the card.
+    case "billing_error":
+    case "account_on_hold":
+    case "oauth_org_not_allowed":
+    case "verification_required":
+      return "config";
+    // A bare invalid_request is also how the API refuses an over-long prompt, so it
+    // is not called a config error here; the text check below decides it.
+    case "model_not_found":
+      return "model_invalid";
+    default:
+      break;
+  }
+  // No HTTP response at all, or the first byte never came: a timeout or a reset.
+  if (input.noResponse === true || (input.retryStatus === null && input.retryError === "unknown")) {
+    return "transient";
+  }
+  if (input.terminalReason === "prompt_too_long" || input.terminalReason === "blocking_limit") {
+    return "context_exhausted";
+  }
+  if (status === 400 && input.text !== undefined && CLAUDE_MODEL_CONFIG_TEXT.test(input.text)) {
+    return "model_invalid";
+  }
+  return "unknown";
+}
+
 function providerFailureFromResult(
   message: SDKResultMessage,
   completedAt: DateTime.Utc,
@@ -2969,6 +3058,7 @@ function providerFailureFromResult(
     if (seconds > 0 && resetMs < 8.64e15) {
       return makeProviderFailure({
         class: "usage_limit",
+        category: "quota",
         message: "Claude API rate limit reached. Try again later.",
         code: "api_error_429",
         retryable: true,
@@ -2997,6 +3087,11 @@ function providerFailureFromResult(
       message: listedError ?? structuredError ?? message.errors.join("\n"),
       code: message.subtype,
       class: failureClass,
+      category: claudeFailureCategory({
+        terminalReason: message.terminal_reason,
+        usageLimited,
+        text: listedError ?? structuredError ?? message.errors.join("\n"),
+      }),
     });
   }
   if (!message.is_error && structuredError === undefined) {
@@ -3010,6 +3105,12 @@ function providerFailureFromResult(
         ? (message.terminal_reason ?? "sdk_result_error")
         : `api_error_${apiErrorStatus}`,
     class: failureClass,
+    category: claudeFailureCategory({
+      apiErrorStatus,
+      terminalReason: message.terminal_reason,
+      usageLimited,
+      text: listedError ?? structuredError ?? failureHint ?? message.result,
+    }),
     retryable: apiErrorStatus === 429 || apiErrorStatus === 529 ? true : null,
   });
 }
@@ -3018,6 +3119,11 @@ function providerFailureFromApiRetry(message: SDKAPIRetryMessage): Orchestration
   const errorName = message.error.replaceAll("_", " ");
   return makeProviderFailure({
     message: `Claude API ${errorName}.`,
+    category: claudeFailureCategory({
+      retryError: message.error,
+      retryStatus: message.error_status,
+      noResponse: message.no_response !== undefined,
+    }),
     code:
       message.error_status === null
         ? message.error
@@ -3041,6 +3147,7 @@ function buildAssistantArtifacts(input: {
   readonly ordinal: number;
   readonly startedAt: DateTime.Utc;
   readonly completedAt: DateTime.Utc;
+  readonly phase?: OrchestrationV2AssistantPhase;
 }): {
   readonly node: OrchestrationV2ExecutionNode;
   readonly message: OrchestrationV2ConversationMessage;
@@ -3091,6 +3198,7 @@ function buildAssistantArtifacts(input: {
       nodeId,
       role: "assistant",
       text: input.text,
+      phase: input.phase ?? "unknown",
       attachments: [],
       streaming: false,
       createdAt: input.completedAt,
@@ -3114,9 +3222,22 @@ function buildAssistantArtifacts(input: {
       type: "assistant_message",
       messageId,
       text: input.text,
+      phase: input.phase ?? "unknown",
       streaming: false,
     },
   };
+}
+
+/**
+ * Claude writes text before a tool call as its own assistant line, so the stop
+ * reason of that line tells narration from the reply. Only `end_turn` proves the
+ * reply; anything else (missing, `max_tokens`, unknown) stays unknown.
+ */
+export function claudeAssistantPhase(message: SDKMessage): OrchestrationV2AssistantPhase {
+  if (message.type !== "assistant") return "unknown";
+  const content = message.message.content;
+  if (content.some((block) => block.type === "tool_use")) return "narration";
+  return message.message.stop_reason === "end_turn" ? "answer" : "unknown";
 }
 
 const CLAUDE_USAGE_LIMIT_WINDOWS = {
@@ -3176,6 +3297,22 @@ interface ActiveClaudeTurnContext {
     emittedNativeItemIds: Set<string>;
     // The CLI repeats a notice that ends a prompt as the turn's result text.
     noticeTexts: Set<string>;
+    /**
+     * Each emitted text, with the SDK message it came from. The CLI writes one message per content
+     * block, so a text and the tool call after it can be separate messages that share `message.id`.
+     * A group that later calls a tool makes its texts narration; the turn's result settles the rest.
+     */
+    readonly textGroups: Map<
+      string,
+      { readonly nativeItemId: string; readonly text: string; readonly groupId: string | null }
+    >;
+    /** SDK message groups (by `message.id`) that contained a tool call. */
+    readonly toolGroups: Set<string>;
+    /**
+     * SDK message groups whose stream reported `stop_reason: end_turn`. That proves the reply even when
+     * a steer keeps the run going, so the turn's final result is not the only answer.
+     */
+    readonly endedGroups: Set<string>;
   };
   readonly reasoning: {
     messageId: string | null;
@@ -3205,6 +3342,10 @@ interface ActiveClaudeTurnContext {
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
+  // Latest root API error, cleared when an error-free root assistant response recovers.
+  latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
+  /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
+  refusalMessage: string | undefined;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimit: {
@@ -4464,6 +4605,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly status: OrchestrationV2ProviderTurn["status"];
           readonly completedAt: DateTime.Utc | null;
+          /** The CLI's terminal stop reason (`end_turn`, `max_tokens`, ...); absent until the turn ends. */
+          readonly finish?: string | null;
         }): OrchestrationV2ProviderTurn => ({
           id: input.context.providerTurnId,
           providerThreadId: input.context.input.providerThread.id,
@@ -4478,6 +4621,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           status: input.status,
           startedAt: input.context.startedAt,
           completedAt: input.completedAt,
+          ...(input.finish === undefined ? {} : { finish: input.finish }),
         });
 
         const buildToolCallArtifacts = (input: {
@@ -6453,6 +6597,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context: input.context,
                     status: input.status,
                     completedAt: input.completedAt,
+                    // The terminal result reports the stop reason; a turn that ended with no result has none.
+                    finish: input.result?.stop_reason ?? null,
                   }),
                   turnTokenUsage: normalizeClaudeTurnTokenUsage(
                     input.result,
@@ -6559,11 +6705,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly nativeItemId: string;
           readonly text: string;
+          readonly phase?: OrchestrationV2AssistantPhase;
+          /** The SDK message this text came from (`message.id`), which later tool or end evidence can name. */
+          readonly groupId?: string | null;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
           }
           input.context.assistant.emittedNativeItemIds.add(input.nativeItemId);
+          input.context.assistant.textGroups.set(input.nativeItemId, {
+            nativeItemId: input.nativeItemId,
+            text: input.text,
+            groupId: input.groupId ?? null,
+          });
           const now = yield* DateTime.now;
           const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
           const artifacts = buildAssistantArtifacts({
@@ -6575,6 +6729,53 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ordinal,
             startedAt: now,
             completedAt: now,
+            ...(input.phase === undefined ? {} : { phase: input.phase }),
+          });
+          yield* Effect.all(
+            [
+              emitProviderEvent({
+                type: "node.updated",
+                driver: CLAUDE_PROVIDER,
+                node: artifacts.node,
+              }),
+              emitProviderEvent({
+                type: "message.updated",
+                driver: CLAUDE_PROVIDER,
+                message: artifacts.message,
+              }),
+              emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: artifacts.turnItem,
+              }),
+            ],
+            { concurrency: 1 },
+          );
+        });
+
+        /**
+         * Corrects the phase of a text already emitted, once later evidence settles it. The ids are
+         * derived from the native item, so the projection updates the same message in place.
+         */
+        const reemitAssistantPhase = Effect.fnUntraced(function* (input: {
+          readonly context: ActiveClaudeTurnContext;
+          readonly nativeItemId: string;
+          readonly phase: OrchestrationV2AssistantPhase;
+        }) {
+          const recorded = input.context.assistant.textGroups.get(input.nativeItemId);
+          if (recorded === undefined) return;
+          const now = yield* DateTime.now;
+          const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+          const artifacts = buildAssistantArtifacts({
+            idAllocator,
+            turnInput: input.context.input,
+            providerTurnId: input.context.providerTurnId,
+            nativeItemId: input.nativeItemId,
+            text: recorded.text,
+            ordinal,
+            startedAt: now,
+            completedAt: now,
+            phase: input.phase,
           });
           yield* Effect.all(
             [
@@ -7250,6 +7451,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 usage === undefined ? null : { messageId: event.message.id, usage };
               if (usage !== undefined) yield* emitContextUsage(context, usage);
             } else if (event.type === "message_delta") {
+              const endedGroup = reasoning.messageId;
+              if (event.delta.stop_reason === "end_turn" && endedGroup !== null) {
+                context.assistant.endedGroups.add(endedGroup);
+                if (!context.assistant.toolGroups.has(endedGroup)) {
+                  for (const recorded of context.assistant.textGroups.values()) {
+                    if (recorded.groupId === endedGroup) {
+                      yield* reemitAssistantPhase({
+                        context,
+                        nativeItemId: recorded.nativeItemId,
+                        phase: "answer",
+                      });
+                    }
+                  }
+                }
+              }
               const usage: typeof event.usage | undefined = event.usage;
               const stream = context.streamUsage;
               if (stream?.usage && usage !== undefined) {
@@ -7514,6 +7730,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
 
+          if (message.type === "system" && message.subtype === "model_refusal_no_fallback") {
+            // The turn ends refused. The result frame then fails it; the refusal text
+            // is kept so that failure can name it.
+            context.refusalMessage = message.content;
+            return;
+          }
+
           if (
             message.type === "system" &&
             (message.subtype === "model_refusal_fallback" ||
@@ -7563,6 +7786,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               retryDelayMs: Math.max(0, Math.trunc(message.retry_delay_ms)),
             };
             const failure = providerFailureFromApiRetry(message);
+            context.latestApiFailureCategory = failure.category;
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -7600,7 +7824,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
           if (message.type === "assistant" && input.replayed !== true) {
             const now = yield* DateTime.now;
-            yield* completeProviderRetry(context, now);
+            if (message.parent_tool_use_id === null) {
+              if (message.error === undefined) {
+                context.latestApiFailureCategory = undefined;
+                yield* completeProviderRetry(context, now);
+              } else {
+                context.latestApiFailureCategory = claudeFailureCategory({
+                  retryError: message.error,
+                });
+              }
+            }
             // `<synthetic>` frames (usage limits, sign-in errors, /goal status)
             // are generated by the CLI and report zero usage, not the context.
             if (
@@ -8109,11 +8342,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
             return;
           }
+          if (message.type === "assistant") {
+            const groupId = typeof message.message.id === "string" ? message.message.id : null;
+            // A tool call in this message makes the message's texts narration, and so does an earlier
+            // text from the same message group that the CLI split out before the tool call.
+            if (
+              groupId !== null &&
+              message.message.content.some((block) => block.type === "tool_use")
+            ) {
+              context.assistant.toolGroups.add(groupId);
+              for (const recorded of context.assistant.textGroups.values()) {
+                if (recorded.groupId === groupId) {
+                  yield* reemitAssistantPhase({
+                    context,
+                    nativeItemId: recorded.nativeItemId,
+                    phase: "narration",
+                  });
+                }
+              }
+            }
+          }
           if (assistantText !== null && assistantText.text.length > 0) {
+            const textGroupId =
+              message.type === "assistant" && typeof message.message.id === "string"
+                ? message.message.id
+                : null;
+            const nativePhase = claudeAssistantPhase(message);
+            // The stream can report the group's end_turn before the CLI writes its text line.
+            const endedReply =
+              nativePhase === "unknown" &&
+              textGroupId !== null &&
+              context.assistant.endedGroups.has(textGroupId) &&
+              !context.assistant.toolGroups.has(textGroupId);
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
+              phase: endedReply ? "answer" : nativePhase,
+              groupId: textGroupId,
             });
             return;
           }
@@ -8222,6 +8488,27 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               resetTimes.length > 0 && resetTimes.every((time) => time !== null)
                 ? resetTimes.reduce((latest, time) => (time! > latest ? time! : latest), "")
                 : null;
+            const refusal = context.refusalMessage;
+            const turnFailure = interrupted
+              ? null
+              : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
+            // A generic api_error result without a status repeats the latest SDK
+            // failure; an explicit terminal cause always takes precedence.
+            const latestApiFailureCategory = context.latestApiFailureCategory;
+            const failureWithRetryCause =
+              turnFailure !== null &&
+              turnFailure.category === "unknown" &&
+              message.terminal_reason === "api_error" &&
+              (message.subtype !== "success" || message.api_error_status == null) &&
+              latestApiFailureCategory !== undefined
+                ? {
+                    ...turnFailure,
+                    category: latestApiFailureCategory,
+                    ...(latestApiFailureCategory === "quota"
+                      ? { class: "usage_limit" as const }
+                      : {}),
+                  }
+                : turnFailure;
             const resultFailure = interrupted
               ? null
               : limitedCompaction !== null
@@ -8230,11 +8517,36 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     message: limitedCompaction.message ?? failureHint,
                     code: "compaction_failed",
                   })
-                : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
+                : refusal !== undefined && turnFailure !== null
+                  ? makeProviderFailure({
+                      class: "provider_error",
+                      message: refusal,
+                      code: "model_refusal",
+                      category: "content_filter",
+                    })
+                  : failureWithRetryCause;
             const terminalFailure =
               resultFailure?.class === "usage_limit"
                 ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
                 : resultFailure;
+            // The result is the only place the turn's stop reason is reported. A text with no tool call
+            // in its message group is the reply when the turn ended with end_turn: settle its phase now.
+            if (message.stop_reason === "end_turn") {
+              // Only the last tool-free text is the reply. An earlier one that no tool call followed is
+              // still an aside, so it stays unknown rather than being presented as the answer.
+              const tailFree = [...context.assistant.textGroups.values()].filter(
+                (recorded) =>
+                  recorded.groupId === null || !context.assistant.toolGroups.has(recorded.groupId),
+              );
+              const reply = tailFree.at(-1);
+              if (reply !== undefined) {
+                yield* reemitAssistantPhase({
+                  context,
+                  nativeItemId: reply.nativeItemId,
+                  phase: "answer",
+                });
+              }
+            }
             yield* finalizeActiveTurn({
               context,
               status: interrupted
@@ -8798,8 +9110,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           nativeThreadId: string,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({
-            mcpSession: yield* mcpSessions.read(turnInput.threadId),
+            mcpSession,
             readOnlySandbox:
               sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly",
             ...(queryPolicy.allowedTools === undefined
@@ -8904,6 +9217,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(mcpOverrides.mcpServers === undefined
               ? {}
               : { mcpServers: mcpOverrides.mcpServers }),
+            t3ToolAvailability: claudeT3ToolAvailability(mcpSession),
             permissionMode: queryPolicy.permissionMode,
             ...(queryPolicy.allowDangerouslySkipPermissions === undefined
               ? {}
@@ -9083,6 +9397,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 fallbackNativeItemId: `assistant:${turnInput.runId}`,
                 emittedNativeItemIds: new Set(),
                 noticeTexts: new Set(),
+                textGroups: new Map(),
+                toolGroups: new Set(),
+                endedGroups: new Set(),
               },
               reasoning: {
                 messageId: null,
@@ -9099,6 +9416,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ignoredTaskIds: new Set(),
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,
+              latestApiFailureCategory: undefined,
+              refusalMessage: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimit: null,

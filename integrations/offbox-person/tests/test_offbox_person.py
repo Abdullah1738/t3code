@@ -197,7 +197,7 @@ class OffboxPersonTest(unittest.TestCase):
         self.assertIn("cd ~/person/work && echo hi", runs[-1]["args"][-1])
 
     def test_wa_read_retries_box_start_once_and_returns_second_output(self):
-        for command in ((), ("status",), ("link-status",), ("chats",), ("find", "Ana's $name"),
+        for command in ((), ("",), ("status",), ("link-status",), ("chats",), ("find", "Ana's $name"),
                         ("read",), ("search",), ("ids",), ("events",)):
             for code in (90, 92):
                 with self.subTest(command=command, code=code):
@@ -212,6 +212,16 @@ class OffboxPersonTest(unittest.TestCase):
                     self.assertEqual(calls[0]["args"], calls[1]["args"])
                     self.assertEqual(calls[0]["thread"], "person:moni")
                     self.assertEqual(calls[0]["pool"], "1")
+
+    def test_wa_empty_subcommand_and_trailing_args_are_forwarded_unchanged_on_retry(self):
+        for code in (90, 92):
+            with self.subTest(code=code):
+                self.ssh_responses({"exit": code}, {"exit": 0})
+                self.tool("wa", "moni", "", "extra", "tail with space")
+                calls = self.ssh_calls()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[0]["args"], calls[1]["args"])
+                self.assertEqual(calls[0]["args"][-1], "~/person/bin/wa '' 'extra' 'tail with space'")
 
     def test_wa_read_reports_last_box_failure_after_one_retry(self):
         for first, second in ((90, 90), (90, 92), (92, 90), (92, 92)):

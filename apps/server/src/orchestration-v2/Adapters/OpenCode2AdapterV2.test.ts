@@ -569,10 +569,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
   );
 
   it.effect.each([
-    ["provider.quota", "usage_limit"],
-    ["provider.rate-limit", "usage_limit"],
-    ["provider", "provider_error"],
-  ] as const)("classifies a %s execution failure as %s", ([code, failureClass]) =>
+    ["provider.quota", "usage_limit", "quota"],
+    ["provider.rate-limit", "usage_limit", "quota"],
+    ["provider", "provider_error", null],
+  ] as const)("classifies a %s execution failure as %s", ([code, failureClass, category]) =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
@@ -586,11 +586,14 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(turnInput(thread));
       const ended = yield* Fiber.join(terminal);
       assert.equal(ended?.status, "failed");
+      // Only quota/rate-limit carries a category; other OpenCode failures keep their
+      // original record shape.
       assert.deepEqual(ended?.failure, {
         class: failureClass,
         code,
         message: "Provider rejected the request",
         retryable: null,
+        ...(category === null ? {} : { category }),
       });
     }).pipe(Effect.scoped),
   );
@@ -659,6 +662,191 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
             event.turnItem.text === "DONE",
         ),
       );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "marks a text whose step finished with stop as the answer, and a tool-call step as narration",
+    () =>
+      Effect.gen(function* () {
+        const answer = "msg_answer0000000000000000000";
+        const narration = "msg_narration000000000000000000";
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.text.started", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            ordinal: 0,
+          }),
+          event("session.text.ended", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            ordinal: 0,
+            text: "Checking.",
+          }),
+          event("session.step.ended", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            finish: "tool-calls",
+            cost: 0,
+            tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+          }),
+          event("session.text.started", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            ordinal: 0,
+          }),
+          event("session.text.ended", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            ordinal: 0,
+            text: "DONE",
+          }),
+          event("session.step.ended", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            finish: "stop",
+            cost: 0,
+            tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ]);
+        const collected = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread));
+        const seen = yield* Fiber.join(collected);
+        const phases = new Map(
+          seen.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? [[event.turnItem.text, event.turnItem.phase] as const]
+              : [],
+          ),
+        );
+        assert.strictEqual(phases.get("Checking."), "narration");
+        assert.strictEqual(phases.get("DONE"), "answer");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a reconnect backfill gives a listed text the phase of its message's finish", () =>
+    Effect.gen(function* () {
+      const narration = "msg_backfill_narration0000000";
+      const answer = "msg_backfill_answer00000000000";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        // The stream drops while the run goes on, and the run finishes unseen: the reconnect finds the
+        // session no longer active, so it reads back what the run wrote.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {}),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            {
+              id: answer,
+              time: { created: 4 },
+              type: "assistant",
+              agent: "build",
+              model: { id: "space-bunny-free", providerID: "opencode", variant: "high" },
+              content: [{ type: "text", text: "DONE" }],
+              finish: "stop",
+              cost: 0,
+              tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+            },
+            {
+              id: narration,
+              time: { created: 3 },
+              type: "assistant",
+              agent: "build",
+              model: { id: "space-bunny-free", providerID: "opencode", variant: "high" },
+              content: [{ type: "text", text: "Checking." }],
+              finish: "tool-calls",
+              cost: 0,
+              tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+            },
+            // The turn's own prompt is the history's start. The adapter sends it under its derived
+            // `msg_t3_turn_<session>:<attempt>` id, which is what the backfill matches against.
+            {
+              id: `msg_t3_turn_${SESSION}:attempt:opencode2-adapter`,
+              time: { created: 1 },
+              type: "user",
+              text: "hi",
+            },
+            // A finished run ends its history with the idle record that carries its outcome.
+            {
+              id: "msg_backfill_idle0000000000000",
+              time: { created: 5 },
+              type: "idle",
+              outcome: "succeeded",
+            },
+          ],
+          cursor: {},
+        }),
+      ]);
+      const collected = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      const seen = yield* Fiber.join(collected);
+      const phases = new Map(
+        seen.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [[event.turnItem.text, event.turnItem.phase] as const]
+            : [],
+        ),
+      );
+      // Narration written before a tool call is never the answer; the answer is the text its stop finished.
+      assert.strictEqual(phases.get("Checking."), "narration");
+      assert.strictEqual(phases.get("DONE"), "answer");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("records the native finish of the last step on the provider turn", () =>
+    Effect.gen(function* () {
+      const message = "msg_0eb735d5b001oAFVeY5jz3WD4Z";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.text.started", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          ordinal: 0,
+        }),
+        event("session.text.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          ordinal: 0,
+          text: "DONE",
+        }),
+        event("session.step.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const collected = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      const seen = yield* Fiber.join(collected);
+      const finishes = seen.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status === "completed"
+          ? [event.providerTurn.finish]
+          : [],
+      );
+      assert.deepEqual(finishes, ["stop"]);
     }).pipe(Effect.scoped),
   );
 
@@ -891,6 +1079,50 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       });
       assert.equal((yield* watch.terminal)?.status, "interrupted");
       assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a stale Stop leaves the newer turn and its background subagent running", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        ...backgroundLaunch(CHILD),
+      ]);
+      const first = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(withLineage(thread));
+      assert.equal((yield* Fiber.join(first))?.status, "completed");
+      const attached = yield* Deferred.make<void>();
+      const newerEnded = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.tap((event) => {
+          if (event.type === "subagent.updated" && event.subagent.childThreadId !== null) {
+            return Deferred.succeed(attached, undefined);
+          }
+          return event.type === "turn.terminal"
+            ? Deferred.succeed(newerEnded, undefined)
+            : Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn({
+        ...withLineage(thread),
+        runId: RunId.make("run:opencode2-adapter:new"),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+        attemptId: RunAttemptId.make("attempt:opencode2-adapter:new"),
+      });
+      yield* Deferred.await(attached);
+      yield* runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: yield* providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      assert.isFalse(yield* Deferred.isDone(newerEnded));
     }).pipe(Effect.scoped),
   );
 
@@ -1135,26 +1367,28 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("keeps a turn OpenCode started on its own pending while its continuation is set up", () =>
-    Effect.gen(function* () {
-      const reached = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const offered = yield* Deferred.make<void>();
-      const { runtime, thread } = yield* resumed(
-        [event("session.execution.started", { sessionID: SESSION })],
-        { idAllocator: gatedIds(reached, release) },
-      ).pipe(
-        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
-          offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
-          take: Effect.never,
-        }),
-      );
-      yield* Deferred.await(reached);
-      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
-      yield* Deferred.succeed(release, undefined);
-      yield* Deferred.await(offered);
-      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
-    }).pipe(Effect.scoped),
+  it.effect(
+    "keeps a turn OpenCode started on its own pending while its continuation is set up",
+    () =>
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const offered = yield* Deferred.make<void>();
+        const { runtime, thread } = yield* resumed(
+          [event("session.execution.started", { sessionID: SESSION })],
+          { idAllocator: gatedIds(reached, release) },
+        ).pipe(
+          Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+            offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
+            take: Effect.never,
+          }),
+        );
+        yield* Deferred.await(reached);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(offered);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      }).pipe(Effect.scoped),
   );
 
   /** Another call in the same turn that resumes `child`, by default a background one. */
@@ -4072,6 +4306,23 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         "assistant_message:completed",
         "command_execution:completed",
       ]);
+      const phases = collected.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+          ? [event.turnItem.phase]
+          : [],
+      );
+      const finished = collected.findLast(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "completed",
+      );
+      assert.deepEqual(
+        {
+          phase: phases.at(-1),
+          finish:
+            finished?.type === "provider_turn.updated" ? finished.providerTurn.finish : undefined,
+        },
+        { phase: "narration", finish: "stop" },
+      );
       assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
     }).pipe(Effect.scoped),
   );

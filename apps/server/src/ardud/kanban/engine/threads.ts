@@ -27,12 +27,13 @@ import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/or
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as OrchestrationCommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import { type ControlThreadState, stateFromRunStatus } from "../../control/model.ts";
 
 export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
   "KanbanThreadError",
-  { operation: Schema.String, detail: Schema.String },
+  { operation: Schema.String, detail: Schema.String, rejected: Schema.optional(Schema.Boolean) },
 ) {}
 
 const isKanbanThreadError = Schema.is(KanbanThreadError);
@@ -113,6 +114,14 @@ export interface KanbanThreadsShape {
       readonly status: string;
       readonly message: string | null;
     } | null,
+    KanbanThreadError
+  >;
+  readonly findLastFailure: (threadId: ThreadId) => Effect.Effect<
+    | (OrchestrationV2ProviderFailure & {
+        readonly runId?: string | null;
+        readonly model?: ModelSelection | null;
+      })
+    | null,
     KanbanThreadError
   >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
@@ -211,7 +220,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
-  const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
+  const findLastFailure: KanbanThreadsShape["findLastFailure"] = (threadId) =>
     threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
       Effect.map((records) => {
         const run = latestExecutedRun(records.runs);
@@ -234,8 +243,10 @@ const make = Effect.gen(function* () {
           ? null
           : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
       }),
-      Effect.catchCause(() => Effect.succeed(null)),
+      Effect.mapError((error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) })),
     );
+  const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
+    findLastFailure(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
 
   const latestRun: KanbanThreadsShape["latestRun"] = (threadId) =>
     threads.getThreadRecords(threadId, ["runs"]).pipe(
@@ -347,7 +358,11 @@ const make = Effect.gen(function* () {
     Effect.mapError((error) =>
       isKanbanThreadError(error)
         ? error
-        : new KanbanThreadError({ operation: "send", detail: detailOf(error) }),
+        : new KanbanThreadError({
+            operation: "send",
+            detail: detailOf(error),
+            rejected: Schema.is(Orchestrator.OrchestratorCommandPreviouslyRejectedError)(error),
+          }),
     ),
   );
 
@@ -391,6 +406,7 @@ const make = Effect.gen(function* () {
     find,
     model,
     lastFailure,
+    findLastFailure,
     latestRun,
     compactRun,
     launch,

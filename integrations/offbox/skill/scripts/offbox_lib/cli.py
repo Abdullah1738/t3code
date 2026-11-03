@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         elif a.sub == "list":
             misc.list_leases(me, a.all, a.json)
         elif a.sub == "kill":
-            return misc.kill_run(a.run_id)
+            return misc.kill_run(a.run_id, me)
         elif a.sub == "release":
             misc.release(me, a.box_id, a.mine, a.delete)
         elif a.sub == "ssh":

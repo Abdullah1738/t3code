@@ -1,4 +1,4 @@
-import { ThreadId } from "@t3tools/contracts";
+import { OrchestrationV2TurnItemJson, ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -8,6 +8,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -29,6 +30,10 @@ export interface CompactionResult {
   readonly deletedEventCount: number;
   readonly deletedReceiptCount: number;
   readonly reclaimableBytes: number;
+  readonly consideredTextEventCount: number;
+  readonly deletedTextEventCount: number;
+  readonly retainedTextEventCount: number;
+  readonly deletedTextPayloadBytes: number;
 }
 
 export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMaintenanceError>()(
@@ -60,6 +65,9 @@ type ProjectionMetadataRow = {
 
 const encodeEntityKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.NullOr(Schema.String)])),
+);
+const decodeTurnItemJson = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OrchestrationV2TurnItemJson),
 );
 
 export const layer: Layer.Layer<
@@ -232,7 +240,7 @@ export const layer: Layer.Layer<
 
     const supersedableThreadEventTypes = new Set(SUPERSEDABLE_THREAD_EVENT_TYPES);
     const readStateThreadEventTypes = new Set(READ_STATE_THREAD_EVENT_TYPES);
-    // Keep subagent.updated and turn-item.updated rows: slimmed payloads reference their prompts.
+    // Subagent updates and their prompt anchors are never candidates.
     // Small pages bound work on the reader worker and synchronous fallback.
     const COMPACTION_PAGE_SIZE = 50;
 
@@ -244,7 +252,7 @@ export const layer: Layer.Layer<
      * present. Only the events in between are deleted.
      * Page every event, including non-candidates: filtering before LIMIT could
      * still scan the entire history when superseded events are sparse.
-     * turn-item.updated stays intact because replay assigns positions on first write.
+     * Text turn items follow the same rule because replay assigns positions on first write.
      */
     const compactEventStoreWith = ({ minPageIntervalMs }: { readonly minPageIntervalMs: number }) =>
       Effect.suspend(() => {
@@ -255,6 +263,9 @@ export const layer: Layer.Layer<
         let rowsScanned = 0;
         let deletedEventCount = 0;
         let deletedReceiptCount = 0;
+        let consideredTextEventCount = 0;
+        let deletedTextEventCount = 0;
+        let deletedTextPayloadBytes = 0;
         // Both loops share the same clock, including the transition between them.
         const startPage = Effect.gen(function* () {
           let now = yield* Clock.monotonicTimeNanos;
@@ -292,7 +303,10 @@ export const layer: Layer.Layer<
       const retainedReadStateThreadIds = new Set<string>();
       // Per key: the lowest sequence seen so far after the newest. It is
       // deleted once an even older event turns up and kept otherwise.
-      const oldestCandidateByEntityKey = new Map<string, number | null>();
+      const oldestCandidateByEntityKey = new Map<
+        string,
+        { readonly sequence: number; readonly textPayloadBytes: number | null } | null
+      >();
       while (throughSequence > 0) {
         yield* startPage;
         const rows = yield* sql<{
@@ -302,6 +316,7 @@ export const layer: Layer.Layer<
           readonly stream_id: string;
           readonly event_type: string;
           readonly entity_id: string | null;
+          readonly text_item_payload_json: string | null;
           readonly imported_legacy_thread: number;
         }>`
           SELECT
@@ -322,6 +337,19 @@ export const layer: Layer.Layer<
               ELSE NULL
             END AS entity_id,
             CASE
+              WHEN event.application_event_version = 2
+                AND event.aggregate_kind = 'thread'
+                AND event.event_type = 'turn-item.updated'
+                AND json_valid(event.payload_json)
+              THEN CASE
+                WHEN json_extract(event.payload_json, '$.type') IN ('reasoning', 'assistant_message')
+                  AND json_type(event.payload_json, '$.promptSequence') IS NULL
+                THEN event.payload_json
+                ELSE NULL
+              END
+              ELSE NULL
+            END AS text_item_payload_json,
+            CASE
               WHEN event.application_event_version = 1 AND event.aggregate_kind = 'thread'
               THEN EXISTS (
                 SELECT 1 FROM orchestration_v2_legacy_imports AS legacy_import
@@ -337,6 +365,8 @@ export const layer: Layer.Layer<
         `.pipe(NodeSqliteClient.readOnly);
         rowsScanned += rows.length;
         const obsolete: number[] = [];
+        let pageDeletedTextEventCount = 0;
+        let pageDeletedTextPayloadBytes = 0;
         for (const row of rows) {
           if (row.imported_legacy_thread === 1) {
             obsolete.push(row.sequence);
@@ -366,14 +396,36 @@ export const layer: Layer.Layer<
             } else if (
               row.event_type === "thread.pull-request-link-updated" ||
               row.event_type === "message.updated" ||
-              row.event_type === "node.updated"
+              row.event_type === "node.updated" ||
+              row.text_item_payload_json !== null
             ) {
-              const key = encodeEntityKey([row.event_type, row.stream_id, row.entity_id]);
+              let entityId = row.entity_id;
+              let textPayloadBytes: number | null = null;
+              if (row.text_item_payload_json !== null) {
+                const decoded = decodeTurnItemJson(row.text_item_payload_json);
+                if (
+                  Option.isNone(decoded) ||
+                  (decoded.value.type !== "reasoning" &&
+                    decoded.value.type !== "assistant_message") ||
+                  decoded.value.threadId !== row.stream_id
+                )
+                  continue;
+                entityId = decoded.value.id;
+                textPayloadBytes = Buffer.byteLength(row.text_item_payload_json, "utf8");
+                consideredTextEventCount++;
+              }
+              const key = encodeEntityKey([row.event_type, row.stream_id, entityId]);
               const candidate = oldestCandidateByEntityKey.get(key);
               if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
               else {
-                if (candidate !== null) obsolete.push(candidate);
-                oldestCandidateByEntityKey.set(key, row.sequence);
+                if (candidate !== null) {
+                  obsolete.push(candidate.sequence);
+                  if (candidate.textPayloadBytes !== null) {
+                    pageDeletedTextEventCount++;
+                    pageDeletedTextPayloadBytes += candidate.textPayloadBytes;
+                  }
+                }
+                oldestCandidateByEntityKey.set(key, { sequence: row.sequence, textPayloadBytes });
               }
             }
           }
@@ -383,6 +435,8 @@ export const layer: Layer.Layer<
         if (obsolete.length > 0) {
           yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
           deletedEventCount += obsolete.length;
+          deletedTextEventCount += pageDeletedTextEventCount;
+          deletedTextPayloadBytes += pageDeletedTextPayloadBytes;
           yield* Effect.yieldNow;
         }
         throughSequence = (rows.at(-1)?.sequence ?? 1) - 1;
@@ -432,7 +486,15 @@ export const layer: Layer.Layer<
       const reclaimableBytes =
         (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
-      return { deletedEventCount, deletedReceiptCount, reclaimableBytes };
+      return {
+        deletedEventCount,
+        deletedReceiptCount,
+        reclaimableBytes,
+        consideredTextEventCount,
+        deletedTextEventCount,
+        retainedTextEventCount: consideredTextEventCount - deletedTextEventCount,
+        deletedTextPayloadBytes,
+      };
         });
 
         if (intervalNanos === 0n) return scan;

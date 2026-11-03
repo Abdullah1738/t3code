@@ -1,8 +1,8 @@
-// Restart watch: Robob's startup recovery cancels every native subagent it
-// still had open, with no result and no wake-up for the parent. Spot those
-// cancels, tell each parent thread what it lost (once), and send one Telegram
-// summary per restart. The caller loads and saves state.
+// Restart watch: spot interrupted native subagents, delegated tasks and turns,
+// tell each parent thread what it lost (once), and send one summary per restart.
+// The caller loads and saves state.
 import * as realIo from "./io.mjs";
+import { createHash } from 'node:crypto';
 import {
   buildRestartNote, buildRestartSummary, childOutcome, findRedispatch, findRestartIncidents, hhmm,
   isNestedThreadId, planRestartThread, providerThreadFor, resultInHistory, sessionFromProviderThread, toMs,
@@ -38,6 +38,19 @@ function topParent(io, db, threadId) {
 }
 
 async function lostSubagent({ io, db, sub, active, incident }) {
+  if (sub.kind === 'delegated') {
+    const base = {
+      kind: 'delegated', subagentId: sub.subagent_id, title: sub.title ?? null, model: sub.model ?? null,
+      prompt: sub.prompt ?? null, startedAt: sub.started_at ?? null, cancelledAt: sub.completed_at,
+      childThreadId: sub.childThreadId, taskRef: sub.taskRef,
+    };
+    const outcome = io.childRunOutcomeSince(db, sub.childThreadId, sub.taskRef, sub.completed_at);
+    if (!outcome) return { ...base, status: 'cut' };
+    if (outcome.status === 'running') return { ...base, status: 'running' };
+    const messages = await safe(() => io.runMessages(db, outcome.run_id), []);
+    const text = messages.findLast((m) => m.role === 'assistant' && m.text)?.text;
+    return { ...base, status: 'finished', finishedMs: toMs(outcome.completed_at), excerpt: text ? truncate(text, 600) : null };
+  }
   const sessionId = sessionFromProviderThread(sub.provider_thread_id);
   const base = {
     subagentId: sub.subagent_id, sessionId, title: sub.title ?? null, model: sub.model ?? null,
@@ -80,6 +93,53 @@ const threadBusy = (thread, active) => Boolean(thread.activeRunId || thread.pend
   || ['preparing', 'starting', 'running', 'waiting'].includes(thread.status)
   || active.has(thread.nativeSessionId));
 
+const incrementalId = (incidentId, taskId) =>
+  `${incidentId}:delegated:${createHash('sha256').update(taskId).digest('hex')}`;
+
+// One stable receipt per task avoids duplicates if a send succeeds but state
+// saving fails, or more task rows arrive before the retry.
+async function handleLateDelegated({ io, db, incident, threadId, sub, active, dryRun, progress, save }) {
+  const requestId = incrementalId(incident.id, sub.subagent_id);
+  const delivered = [...(progress.deliveredDelegated ?? [])];
+  const previous = progress.result
+    ? { ...progress.result, lostSubs: [...(progress.result.lostSubs ?? [])] }
+    : { plan: { threadId, title: threadId, action: 'skip', reason: 'handled earlier' }, ok: true, lostSubs: [] };
+  const mark = (lost) => {
+    if (!delivered.includes(sub.subagent_id)) delivered.push(sub.subagent_id);
+    if (lost && !(previous.lostSubs ?? []).some((s) => s.subagentId === sub.subagent_id)) {
+      previous.lostSubs = [...(previous.lostSubs ?? []), { ...lost, prompt: undefined }];
+    }
+    if (!dryRun) { progress.deliveredDelegated = delivered; progress.result = previous; save(); }
+  };
+  if (io.restartNoteRun(db, threadId, requestId) != null) {
+    const lost = io.delegatedStoppedSince(db, sub) ? null : await lostSubagent({ io, db, sub, active, incident });
+    mark(lost);
+    return;
+  }
+  const thread = await io.getThread(threadId);
+  if (thread?.origin === 'imessage' && !thread.archived && !io.stoppedSince(db, threadId, isoOf(incident.startMs))
+    && !io.delegatedStoppedSince(db, sub)) {
+    mark(await lostSubagent({ io, db, sub, active, incident }));
+    return;
+  }
+  if (!thread || thread.archived || thread.origin === 'imessage'
+    || io.stoppedSince(db, threadId, isoOf(incident.startMs)) || io.delegatedStoppedSince(db, sub)) {
+    mark(null);
+    return;
+  }
+  const lost = await lostSubagent({ io, db, sub, active, incident });
+  const note = buildRestartNote({ incident, lost: [lost], ocUrl: io.OC_URL, incremental: true });
+  if (dryRun) return;
+  const fresh = await io.getThread(threadId);
+  if (!fresh || fresh.archived || fresh.origin === 'imessage'
+    || io.stoppedSince(db, threadId, isoOf(incident.startMs)) || io.delegatedStoppedSince(db, sub)) {
+    mark(null);
+    return;
+  }
+  await io.sendToThread(threadId, note, { clientRequestId: requestId, mode: 'queue' });
+  mark(lost);
+}
+
 async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, windowStart, progress, save }) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
@@ -97,8 +157,9 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   const turnCut = cuts.length > 0;
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held)
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
+  const candidates = subs.filter((sub) => sub.kind !== 'delegated' || !io.delegatedStoppedSince(db, sub));
   const lost = [];
-  for (const sub of subs) lost.push(await lostSubagent({ io, db, sub, active, incident }));
+  for (const sub of candidates) lost.push(await lostSubagent({ io, db, sub, active, incident }));
   // Past the hold-back window a thread that is busy, or ran again after its
   // cut, has moved on; a late "carry on" note would only confuse it.
   const windowOver = now - windowStart >= RESTART_RESUME_WINDOW_MS;
@@ -144,7 +205,13 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
       res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'stopped after the restart' };
       return res;
     }
+    if (sending && candidates.some((s) => s.kind === 'delegated' && io.delegatedStoppedSince(db, s))) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'delegated task stopped during recovery' };
+      res.deferred = true;
+      return res;
+    }
     progress.staleHeld = staleHeld;
+    if (sending) progress.initialDelegated = lost.filter((l) => l.kind === 'delegated').map((l) => l.subagentId);
     save();
     for (const r of staleHeld.filter((s) => queued.some((q) => q.run_id === s.run_id))) {
       await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId, runId: r.run_id });
@@ -154,6 +221,8 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
       // unlike auto it cannot steer or interrupt that turn.
       await io.sendToThread(threadId, res.note, { clientRequestId: incident.id, mode: 'queue' });
       progress.noteSent = true;
+      progress.deliveredDelegated = [...new Set([...(progress.deliveredDelegated ?? []),
+        ...lost.filter((l) => l.kind === 'delegated').map((l) => l.subagentId)])];
       save();
     }
     if (queued.length && !progress.queueOk) {
@@ -173,7 +242,8 @@ const summaryResult = (r) => ({
   plan: { threadId: r.plan.threadId, title: r.plan.title ?? null, action: r.plan.action, reason: r.plan.reason },
   ok: r.ok, error: r.error ?? null, turnCut: Boolean(r.turnCut), held: r.held ?? 0, queueOk: r.queueOk ?? null,
   staleHeld: (r.staleHeld ?? []).map((s) => ({ run_id: s.run_id })),
-  lostSubs: (r.lostSubs ?? []).map((l) => ({ status: l.status, title: l.title ?? null, sessionId: l.sessionId ?? null })),
+  lostSubs: (r.lostSubs ?? []).map((l) => ({ status: l.status, title: l.title ?? null, sessionId: l.sessionId ?? null, subagentId: l.subagentId,
+    kind: l.kind, childThreadId: l.childThreadId ?? null, taskRef: l.taskRef ?? null })),
 });
 
 // A finished incident keeps only what idempotency needs (per-thread done and
@@ -190,17 +260,21 @@ const counts = (lost) => {
 };
 
 // Sessions the stall watch interrupted itself; their cancels are not a restart.
-function stallInterrupted(state, ses, cancelMs) {
+function stallInterrupted(state, ses, cancelMs, threadId = null) {
   return Object.values(state.stalls ?? {}).some(
-    (s) => s.ses === ses && (s.action === "opencode" || s.action === "robob") && Math.abs(cancelMs - s.interruptedAt) < 15 * 60_000,
+    (s) => ((ses && s.ses === ses) || (threadId && s.threadId === threadId))
+      && (s.action === "opencode" || s.action === "robob") && Math.abs(cancelMs - s.interruptedAt) < 15 * 60_000,
   );
 }
 
 export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
-  const subs = io.cancelledSubagentsSince(db, sinceIso)
+  const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
     .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
+  const delegatedSubs = io.cancelledDelegatedTasksSince(db, sinceIso)
+    .filter((s) => !stallInterrupted(state, io.childNativeSession(db, s.childThreadId), toMs(s.completed_at), s.childThreadId));
+  const subs = [...nativeSubs, ...delegatedSubs];
   for (const s of subs) {
     s.parentThreadId = topParent(io, db, s.thread_id) ?? s.thread_id;
     s.rootThreadId = io.threadRoot(db, s.parentThreadId) ?? s.parentThreadId;
@@ -271,9 +345,58 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       }
     };
     for (const [threadId, list] of byThread) {
-      if (entry.threads[threadId]?.done) {
+      if (entry.threads[threadId]?.done || entry.threads[threadId]?.lateOnly) {
+        const progress = entry.threads[threadId];
+        if (progress.lateExhausted) {
+          all.push(progress.result);
+          continue;
+        }
+        const seen = new Set(progress.deliveredDelegated ?? []);
+        // State written by the previous version did not record delivered IDs.
+        if (!progress.deliveredDelegated) {
+          for (const s of prev?.incident?.subagents ?? []) {
+            if (s.kind === 'delegated' && s.parentThreadId === threadId) seen.add(s.subagent_id);
+          }
+          if (!dryRun) progress.deliveredDelegated = [...seen];
+        }
+        const pendingTasks = list.filter((s) => s.kind === 'delegated' && !seen.has(s.subagent_id));
+        let failed = null;
+        let failedTask = null;
+        for (const sub of pendingTasks) {
+          try {
+            await handleLateDelegated({ io, db, incident, threadId, sub, active, dryRun, progress, save });
+            if (!dryRun) progress.lateFailures = 0;
+          } catch (err) {
+            failed = errText(err);
+            failedTask = sub;
+            break;
+          }
+        }
+        if (failed) {
+          if (!dryRun) {
+            progress.done = false;
+            progress.lateOnly = true;
+            progress.lateFailures = (progress.lateFailures ?? 0) + 1;
+            if (progress.lateFailures >= MAX_ATTEMPTS) {
+              progress.done = true;
+              progress.lateExhausted = true;
+              progress.result = { plan: { threadId, title: progress.result?.plan?.title ?? threadId, action: 'skip', reason: 'error' },
+                ok: false, error: `delegated task ${failedTask.taskRef} not noted: ${failed}`, lostSubs: [] };
+            }
+            save();
+          }
+          const res = progress.lateExhausted ? progress.result
+            : { plan: { threadId, title: progress.result?.plan?.title ?? threadId, action: 'skip', reason: 'error' }, ok: false, error: failed, lostSubs: [] };
+          results.push(res); all.push(res);
+          continue;
+        }
+        if (!dryRun) {
+          progress.done = true;
+          progress.lateOnly = false;
+          save();
+        }
         // Threads settled by an older version carry no stored result.
-        all.push(entry.threads[threadId].result
+        all.push(progress.result
           ?? { plan: { threadId, title: threadId, action: "skip", reason: "handled earlier" }, ok: true, lostSubs: [], error: null });
         continue;
       }
@@ -281,9 +404,23 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       const progress = entry.threads[threadId] ??= {};
       try {
         res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, windowStart, progress, save });
-        if (res?.ok && !res.deferred && !dryRun) progress.done = true;
+        if (res?.ok && !res.deferred && !dryRun) {
+          progress.done = true;
+          if (!progress.initialDelegated) {
+            progress.deliveredDelegated ??= list.filter((s) => s.kind === 'delegated').map((s) => s.subagent_id);
+          }
+        }
       } catch (err) {
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };
+      }
+      // A sent initial note can be recovered from its receipt even when the
+      // state write was lost. Only the IDs captured before that send belong to
+      // it; anything discovered since must take the incremental path.
+      if (!dryRun && res?.ok && !res.deferred && progress.done && progress.initialDelegated) {
+        progress.deliveredDelegated ??= [...progress.initialDelegated];
+        const seen = new Set(progress.deliveredDelegated);
+        const late = list.some((s) => s.kind === 'delegated' && !seen.has(s.subagent_id));
+        if (late) { progress.done = false; progress.lateOnly = true; }
       }
       if (!res) {
         if (verbose) log(`  ${threadId}: not found in Robob`);

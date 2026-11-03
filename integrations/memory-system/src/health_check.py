@@ -485,7 +485,8 @@ def check_backup_lock():
         return False, f"backup run {pid or '?'} died without releasing logs/backup.lock ({int(age/60)} min old)"
     if age > BACKUP_LOCK_MAX_AGE:
         return False, (f"backup run PID {pid} still running after {age/3600:.1f} h; later runs are blocked "
-                       f"until it exits (not killed automatically)")
+                       f"until it exits; a stuck replica or restic backup should have timed out by itself; "
+                       f"check logs/backup-YYYYMM.log")
     return True, f"backup PID {pid} running for {int(age/60)} min"
 
 

@@ -38,6 +38,8 @@ export type MessageRecord =
        * OpenCode's step finish). `unknown` means the backend can't prove either way.
        */
       toolEvidence?: "ran" | "none" | "unknown";
+      /** The Robob run this step belongs to; the run-evidence route is read per run. */
+      runId?: string;
       error?: unknown;
       retry?: unknown;
       time: { created: number; completed?: number };

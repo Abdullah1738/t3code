@@ -103,7 +103,7 @@ const PoolCommand = Schema.Struct({
   variant: Schema.optional(Schema.String),
   effort: Schema.optional(Schema.String),
   options: Schema.optional(ProviderOptionSelections),
-  slots: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 50 })),
+  slots: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 });
 
 /** Marks a subtask this script owns done, or skipped with a note. */

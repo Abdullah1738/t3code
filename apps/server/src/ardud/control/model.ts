@@ -302,6 +302,7 @@ export function messageSummary(message: OrchestrationV2ConversationMessage) {
     runId: message.runId,
     role: message.role,
     text: message.text,
+    phase: message.phase,
     streaming: message.streaming,
     createdBy: message.createdBy,
     creationSource: message.creationSource,

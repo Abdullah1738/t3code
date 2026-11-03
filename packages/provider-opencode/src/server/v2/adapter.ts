@@ -18,6 +18,7 @@ import {
   isOrchestrationV2WorkActive,
   type ChatAttachment,
   type OrchestrationV2AppThread,
+  type OrchestrationV2AssistantPhase,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
@@ -209,6 +210,17 @@ interface ActiveTurn {
   };
   steps: number;
   lastStep: Tokens | undefined;
+  /** The turn's last step's native finish (session.step.ended); null until one ends. */
+  lastFinish: string | null;
+  /** Native finish per assistant message: a text's phase comes from its step. */
+  readonly finishByMessage: Map<string, string>;
+  /** Texts a recovered message shows a tool call after: narration whatever the step's finish says. */
+  readonly narrationTexts: Set<string>;
+  /** Completed texts whose step has not ended yet; they are re-emitted with their phase then. */
+  readonly awaitingFinish: Map<
+    string,
+    { readonly block: OpenBlock["block"]; readonly text: string }
+  >;
   before: string | null | undefined;
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -360,6 +372,13 @@ interface ThreadState {
     | undefined;
   instructions: string | undefined;
 }
+
+/**
+ * A text's phase from its step's native finish. `stop` ends the reply, `tool-calls` means the
+ * text came before a tool call. Any other finish (length, error, content-filter) is not proven.
+ */
+const phaseFromFinish = (finish: string | undefined): OrchestrationV2AssistantPhase =>
+  finish === "stop" ? "answer" : finish === "tool-calls" ? "narration" : "unknown";
 
 /** The thread's turn that owns its session's executions; a parked one does not yet. */
 const runningTurn = (state: ThreadState | undefined) =>
@@ -1058,8 +1077,16 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         text: "",
       };
       entry.text = update(entry.text);
-      if (completed) turn.texts.delete(nativeId);
-      else turn.texts.set(nativeId, entry);
+      if (completed) {
+        turn.texts.delete(nativeId);
+        if (
+          kind === "text" &&
+          entry.text.length > 0 &&
+          !turn.finishByMessage.has(data.assistantMessageID)
+        ) {
+          turn.awaitingFinish.set(nativeId, { block: entry.block, text: entry.text });
+        }
+      } else turn.texts.set(nativeId, entry);
       if (entry.text.length === 0) return;
       const status = completed ? "completed" : "running";
       const completedAt = completed ? updatedAt : null;
@@ -1078,6 +1105,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         driver,
         nativeItemId: nativeId,
       });
+      const phase = turn.narrationTexts.has(nativeId)
+        ? "narration"
+        : phaseFromFinish(turn.finishByMessage.get(data.assistantMessageID));
       const message: OrchestrationV2ConversationMessage = {
         createdBy: "agent",
         creationSource: "provider",
@@ -1087,6 +1117,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         nodeId: base.nodeId,
         role: "assistant",
         text: entry.text,
+        phase,
         attachments: [],
         streaming: !completed,
         createdAt: entry.startedAt,
@@ -1101,6 +1132,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           type: "assistant_message",
           messageId,
           text: entry.text,
+          phase,
           streaming: !completed,
         },
       });
@@ -1205,6 +1237,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       usage: { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0 },
       steps: 0,
       lastStep: undefined,
+      lastFinish: null,
+      finishByMessage: new Map(),
+      narrationTexts: new Set(),
+      awaitingFinish: new Map(),
       before: undefined,
       compaction: undefined,
       compactions: 0,
@@ -1671,6 +1707,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         ...turn.providerTurn,
         status: terminal.status,
         completedAt,
+        finish: turn.lastFinish,
         turnTokenUsage: turnTokenUsage(turn, terminal.status),
         ...(lastStep === undefined
           ? {}
@@ -2208,6 +2245,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           return yield* emitCompaction(state, turn, "failed");
         case "session.step.ended":
         case "session.step.failed": {
+          if (event.type === "session.step.ended") {
+            const messageID = event.data.assistantMessageID;
+            turn.finishByMessage.set(messageID, event.data.finish);
+            turn.lastFinish = event.data.finish;
+            // Snapshot: re-emitting stores the text again while it awaits a finish, and a live iterator would revisit it forever.
+            for (const [nativeId, waiting] of [...turn.awaitingFinish]) {
+              if (waiting.block.assistantMessageID !== messageID) continue;
+              turn.awaitingFinish.delete(nativeId);
+              yield* emitText(state, turn, waiting.block, "text", () => waiting.text, true);
+            }
+          }
           const tokens = event.data.tokens;
           if (tokens === undefined) return;
           turn.steps += 1;
@@ -2239,6 +2287,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 event.data.error.type === "provider.rate-limit"
                   ? "usage_limit"
                   : "provider_error",
+              ...(event.data.error.type === "provider.quota" ||
+              event.data.error.type === "provider.rate-limit"
+                ? { category: "quota" as const }
+                : {}),
             }),
           });
         default:
@@ -2750,10 +2802,22 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const idle = recent.find((message) => message.type === "idle");
       for (const message of recent.toReversed()) {
         if (message.type !== "assistant" || state.active !== turn) continue;
+        // The listed message carries its step's native finish, as the live step-ended event does. Record
+        // it before its texts are emitted, so each text gets the same phase the live path would give it.
+        if (typeof message.finish === "string") {
+          if (!turn.finishByMessage.has(message.id))
+            turn.finishByMessage.set(message.id, message.finish);
+          // History runs oldest first, so the turn ends on its newest step's finish, as live.
+          turn.lastFinish = message.finish;
+        }
+        const lastTool = message.content.findLastIndex((part) => part.type === "tool");
         const ordinals = { text: 0, reasoning: 0 };
-        for (const part of message.content) {
+        for (const [index, part] of message.content.entries()) {
           if (part.type === "text" || part.type === "reasoning") {
             const block = { assistantMessageID: message.id, ordinal: ordinals[part.type]++ };
+            if (part.type === "text" && index < lastTool) {
+              turn.narrationTexts.add(`${message.id}:text:${block.ordinal}`);
+            }
             yield* emitText(state, turn, block, part.type, () => part.text, true);
             continue;
           }
@@ -4317,14 +4381,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const state = threads.get(sessionId);
           if (state === undefined) return;
           const turn = state.active;
-          // OpenCode stops a foreground subagent with its parent, but not a
-          // background one: a user Stop (`requestRuntimeRestart`) stops those
-          // too, and the execution OpenCode starts to report them. A turn
-          // interrupted to restart it with new input leaves them running.
+          // A delayed Stop must not reach the new turn's background work.
+          if (turn !== undefined && turn.providerTurn.id !== interruptInput.providerTurnId) return;
+          // User Stop also stops background work on a settled thread. A turn
+          // interrupted to restart with new input leaves it running.
           if (interruptInput.requestRuntimeRestart === true) yield* stopBackground(state);
-          if (turn === undefined || turn.providerTurn.id !== interruptInput.providerTurnId) {
-            return;
-          }
+          if (turn === undefined) return;
           // A turn held for a reconnect sent nothing, and the server may not
           // answer yet: it ends here, and never sends its request.
           if (turn.parked) {

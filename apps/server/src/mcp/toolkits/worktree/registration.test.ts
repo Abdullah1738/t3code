@@ -37,6 +37,7 @@ import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
 import { KanbanService } from "../../../ardud/kanban/engine/KanbanService.ts";
 // ardud schedules: blocked-run retry tool
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
+import * as CredentialStore from "../../../ardud/mcp/CredentialStore.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -90,7 +91,9 @@ const decodeToolsListPayload = Schema.decodeUnknownEffect(ToolsListPayload);
 it.effect("production mcp layer lists worktree tools over http", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const layerRoutes = McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer));
+      const layerRoutes = McpHttpServer.layer.pipe(
+        Layer.provide(McpSessionRegistry.layer.pipe(Layer.provide(CredentialStore.layer))),
+      );
       yield* HttpRouter.serve(layerRoutes, {
         disableListenLog: true,
         disableLogger: true,

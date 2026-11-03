@@ -44,6 +44,14 @@ import { BOARD_ICONS, BoardIcon } from "./boardIcon";
 import { kanban, runAction, useKanbanPermission } from "./kanbanStore";
 import { toastManager } from "../../components/ui/toast";
 import { Chip } from "./parts";
+import {
+  currentSlots,
+  editedSlots,
+  failedSlot,
+  observeSlots,
+  sentSlots,
+  type SlotWrites,
+} from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../../components/chat/TraitsPicker";
 import {
@@ -57,8 +65,6 @@ import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { getProviderModelCapabilities } from "../../providerModels";
-
-const MAX_SLOTS = 8;
 
 type SelectionResult = ReturnType<typeof mergeSelection>;
 type ModelCatalog = ReadonlyArray<Pick<ProviderInstanceEntry, "instanceId" | "models">>;
@@ -240,6 +246,9 @@ function reportSelectionConflict(result: SelectionResult): ModelSelection | null
   return null;
 }
 
+// Past this many slots the row shows "busy of slots" as text instead of squares.
+const SLOT_SQUARES_MAX = 16;
+
 export function SettingsView(props: { state: KanbanBoardState }) {
   const environmentId = usePrimaryEnvironmentId();
   if (environmentId === null) return null;
@@ -343,25 +352,31 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 role="img"
                 aria-label={`${pool.busy} of ${pool.slots} busy`}
               >
-                {Array.from({ length: pool.slots }, (_, index) => (
-                  <i
-                    key={index}
-                    className={cn(
-                      "size-3.5 rounded-sm",
-                      index < pool.busy ? "bg-(--m-accent)" : "bg-(--m-bar-4)",
-                    )}
-                  />
-                ))}
+                {pool.slots > SLOT_SQUARES_MAX ? (
+                  <span className="text-xs text-(--m-muted) tabular-nums">
+                    {pool.busy} of {pool.slots} busy
+                  </span>
+                ) : (
+                  Array.from({ length: pool.slots }, (_, index) => (
+                    <i
+                      key={index}
+                      className={cn(
+                        "size-3.5 rounded-sm",
+                        index < pool.busy ? "bg-(--m-accent)" : "bg-(--m-bar-4)",
+                      )}
+                    />
+                  ))
+                )}
               </span>
               <Stepper
                 label={`${pool.name} slots`}
                 value={pool.slots}
                 min={0}
-                max={unlisted ? 0 : MAX_SLOTS}
+                max={unlisted ? 0 : undefined}
                 disabled={blocked}
                 disabledReason={blockedReason}
                 onChange={(slots) =>
-                  void runAction("Couldn't change the pool", () =>
+                  runAction("Couldn't change the pool", () =>
                     kanban.setPool(board.id, pool.model, slots, { replaces: pool.key }),
                   )
                 }
@@ -720,11 +735,43 @@ function Stepper(props: {
   label: string;
   value: number;
   min: number;
-  max: number;
+  max?: number | undefined;
   disabled?: boolean;
   disabledReason?: string | undefined;
-  onChange: (value: number) => void;
+  onChange: (value: number) => Promise<boolean> | void;
 }) {
+  // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [writes, setWrites] = useState<SlotWrites>(() => ({ feed: props.value, sent: [] }));
+  const observed = observeSlots(writes, props.value);
+  if (observed !== writes) setWrites(observed);
+  const nextId = useRef(0);
+  const edited = useRef(false);
+  const cancelled = useRef(false);
+  const current = currentSlots(observed);
+  const typed = draft !== null && /^\d+$/.test(draft.trim()) ? Number(draft.trim()) : current;
+  const base = Number.isSafeInteger(typed) ? typed : current;
+  const atMax = base >= (props.max ?? Number.MAX_SAFE_INTEGER);
+  const send = (next: number) => {
+    const id = ++nextId.current;
+    setWrites((state) => sentSlots(observeSlots(state, props.value), { id, value: next }));
+    void Promise.resolve(props.onChange(next)).then((ok) => {
+      if (ok === false) setWrites((state) => failedSlot(state, id));
+    });
+  };
+  // While typing, the buttons step the draft, so a click never races the typed number.
+  const step = (by: number) => {
+    const next = Math.max(
+      props.min,
+      props.max === undefined ? base + by : Math.min(props.max, base + by),
+    );
+    if (!Number.isSafeInteger(next)) return;
+    if (draft === null) send(next);
+    else {
+      edited.current = true;
+      setDraft(String(next));
+    }
+  };
   return (
     <span
       role="group"
@@ -735,18 +782,54 @@ function Stepper(props: {
       <button
         type="button"
         aria-label="Fewer"
-        disabled={props.disabled || props.value <= props.min}
-        onClick={() => props.onChange(props.value - 1)}
+        disabled={props.disabled || base <= props.min}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => step(-1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
         <MinusIcon className="size-3.5" />
       </button>
-      <span className="w-5 text-center text-sm font-medium tabular-nums">{props.value}</span>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        aria-label={`${props.label} count`}
+        value={draft ?? String(current)}
+        disabled={props.disabled}
+        onFocus={(event) => {
+          edited.current = false;
+          setDraft(String(current));
+          event.currentTarget.select();
+        }}
+        onChange={(event) => {
+          edited.current = true;
+          setDraft(event.currentTarget.value);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+          if (event.key === "Escape") {
+            cancelled.current = true;
+            event.currentTarget.blur();
+          }
+        }}
+        onBlur={() => {
+          const next =
+            cancelled.current || draft === null
+              ? null
+              : editedSlots(draft, edited.current, current, props.min, props.max);
+          cancelled.current = false;
+          edited.current = false;
+          setDraft(null);
+          if (next !== null) send(next);
+        }}
+        className="w-9 rounded-md bg-transparent text-center text-sm font-medium tabular-nums text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      />
       <button
         type="button"
         aria-label="More"
-        disabled={props.disabled || props.value >= props.max}
-        onClick={() => props.onChange(props.value + 1)}
+        disabled={props.disabled || atMax}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => step(1)}
         className="grid size-6.5 place-items-center rounded-full text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-35"
       >
         <PlusIcon className="size-3.5" />

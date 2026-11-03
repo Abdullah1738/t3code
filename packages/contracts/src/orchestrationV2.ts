@@ -1006,6 +1006,10 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
+  /** The provider's native finish reason (e.g. Claude stop_reason); null when not reported. */
+  finish: Schema.optional(Schema.NullOr(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
 
@@ -1106,6 +1110,18 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+/**
+ * Whether an assistant message is the turn's answer or narration that came before a tool call.
+ * Rows written before this field existed have none, so they decode as "unknown" and never count
+ * as an answer.
+ */
+export const OrchestrationV2AssistantPhase = Schema.Literals(["answer", "narration", "unknown"]);
+export type OrchestrationV2AssistantPhase = typeof OrchestrationV2AssistantPhase.Type;
+
+const assistantPhaseField = Schema.optional(OrchestrationV2AssistantPhase).pipe(
+  Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
+);
+
 export const OrchestrationV2ConversationMessage = Schema.Struct({
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
@@ -1122,6 +1138,7 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   nodeId: Schema.NullOr(NodeId),
   role: Schema.Literals(["user", "assistant", "system"]),
   text: Schema.String,
+  phase: assistantPhaseField,
   context: Schema.optional(OrchestrationMessageContext),
   attachments: Schema.Array(ChatAttachment),
   streaming: Schema.Boolean,
@@ -1271,6 +1288,25 @@ const OrchestrationV2ProviderFailureMessage = TrimmedNonEmptyString.check(
 const OrchestrationV2ProviderFailureCode = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 
 /**
+ * What a failure means for the next attempt, normalized across drivers. The
+ * board and schedules decide from this, not from driver codes or message text.
+ * `unknown` is the decoding default, so records written before this field existed
+ * still decode.
+ */
+export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
+  "quota",
+  "transient",
+  "auth_expired",
+  "config",
+  "model_invalid",
+  "context_exhausted",
+  "content_filter",
+  "unknown",
+]);
+export type OrchestrationV2ProviderFailureCategory =
+  typeof OrchestrationV2ProviderFailureCategory.Type;
+
+/**
  * Producers must redact credentials before constructing this value.
  */
 export const OrchestrationV2ProviderFailure = Schema.Struct({
@@ -1279,6 +1315,9 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  category: Schema.optional(OrchestrationV2ProviderFailureCategory).pipe(
+    Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
+  ),
 });
 export type OrchestrationV2ProviderFailure = typeof OrchestrationV2ProviderFailure.Type;
 
@@ -1401,6 +1440,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
@@ -2168,6 +2208,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
@@ -2513,7 +2554,9 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     type: Schema.Literal("run.background-work-cancelled"),
     payload: Schema.Struct({
       runId: RunId,
-      restartCancelledBackgroundWork: Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),
+      restartCancelledBackgroundWork: Schema.Array(
+        OrchestrationV2RestartCancelledBackgroundWorkJson,
+      ),
     }),
   }),
   Schema.Struct({
@@ -2934,6 +2977,8 @@ export const OrchestrationV2Command = Schema.Union([
     runId: RunId,
     reason: Schema.optional(Schema.String),
     holdQueue: Schema.optional(Schema.Boolean),
+    expectedAttemptId: Schema.optional(RunAttemptId),
+    fenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("queued-message.promote-to-steer"),

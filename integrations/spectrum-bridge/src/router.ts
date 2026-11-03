@@ -2797,7 +2797,9 @@ export class Router {
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
       for (const m of scope) {
-        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
+        // A run's last word goes out ahead of the final one unless it is proven narration (answer false),
+        // which never goes to the chat. An unknown last word is forwarded, as the final one is.
+        if (m.type === "idle" && last?.type === "assistant" && last.answer !== false && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
         if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
@@ -2853,8 +2855,12 @@ export class Router {
       // An active session is still working even after an idle marker.
       if (turn.phase !== "running" || live.size || statuses[turn.id] !== undefined) return;
       if (runningTools || !idle) return;
-      if (final && (final.time.completed === undefined || !final.finish || final.finish === "tool-calls")) return;
-      const text = final ? replyText(assistantText(final)) : "";
+      // A final that has not completed, or that stopped to call tools, keeps the turn open. Narration
+      // is the last word only when nothing follows it, so it closes here once the run is idle.
+      if (final && (final.time.completed === undefined || final.finish === "tool-calls")) return;
+      // Narration (text before a tool call, `answer` false) never goes to the chat. A final whose phase
+      // is unknown still does, as before: the owner chose to keep forwarding unknown finals.
+      const text = final && final.answer !== false ? replyText(assistantText(final)) : "";
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.

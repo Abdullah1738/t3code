@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -140,7 +141,7 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["features"]["chronicle"], False)
         self.assertEqual(cfg["memories"], {"generate_memories": False, "use_memories": False})
         self.assertEqual(cfg["model_providers"]["ninerouter"]["http_headers"],
-                         {"x-9router-token-saver": "off"})
+                         {"x-9router-token-saver": "off", "x-openai-actor-authorization": "robob-9router-local"})
         self.assertEqual(cfg["mcp_servers"]["cua-driver"]["args"], ["mcp"])
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
@@ -179,13 +180,15 @@ class GenerateTests(HarnessTestCase):
                 provider = cfg["model_providers"]["ninerouter"]
                 self.assertEqual(provider["name"], "OpenAI")
                 self.assertEqual(provider["base_url"], "http://127.0.0.1:20128/v1")
+                self.assertIs(provider["requires_openai_auth"], False)
+                self.assertEqual(provider["http_headers"]["x-openai-actor-authorization"], "robob-9router-local")
                 self.assertNotIn("capabilities", provider)
                 self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
                 self.assertEqual(cfg["model_auto_compact_token_limit_scope"], "total")
                 self.assertIs(cfg["features"]["output_token_replay"], True)
                 self.assertIs(cfg["features"]["concurrent_reasoning_summaries"], True)
                 self.assertNotIn("async_compaction", cfg["features"])
-                self.assertNotIn("image_generation", cfg["features"])
+                self.assertIs(cfg["features"]["image_generation"], True)
 
     def test_check_detects_compaction_setting_drift(self) -> None:
         self.run_gen()
@@ -202,6 +205,28 @@ class GenerateTests(HarnessTestCase):
         rc, out = self.run_check()
         self.assertEqual(rc, 1)
         self.assertIn("codex-cu/config.toml", out)
+
+    def test_check_detects_image_generation_setting_drift(self) -> None:
+        self.run_gen()
+        p = self.codex_cu / "config.toml"
+        cfg = tomllib.loads(p.read_text())
+        del cfg["features"]["image_generation"]
+        p.write_text(gh.toml_dump(cfg))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("codex-cu/config.toml", out)
+
+    def test_check_detects_actor_header_drift_in_both_codex_homes(self) -> None:
+        for home in (self.codex, self.codex_cu):
+            with self.subTest(home=home.name):
+                self.run_gen()
+                p = home / "config.toml"
+                cfg = tomllib.loads(p.read_text())
+                del cfg["model_providers"]["ninerouter"]["http_headers"]["x-openai-actor-authorization"]
+                p.write_text(gh.toml_dump(cfg))
+                rc, out = self.run_check()
+                self.assertEqual(rc, 1)
+                self.assertIn(f"{home.name}/config.toml", out)
 
     def test_existing_idle_compaction_override_is_detected_and_removed(self) -> None:
         self.run_gen()
@@ -283,6 +308,125 @@ class GenerateTests(HarnessTestCase):
         self.assertFalse(os.path.lexists(self.claude / "skills/alpha"))
         self.assertTrue(os.path.islink(self.claude / "skills/foreign"))
         self.assertTrue(os.path.islink(self.claude / "skills/beta"))
+
+    def test_unreadable_symlinked_skill_keeps_farm_links(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(source):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path)
+
+        errors = io.StringIO()
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(errors):
+                output = self.run_gen()
+                rc, check_output = self.run_check()
+        for home in (self.claude, self.codex, self.codex_cu):
+            link = home / "skills/privacy-guard"
+            self.assertTrue(link.is_symlink(), str(link))
+            self.assertEqual(os.readlink(link), str(source))
+            self.assertNotIn(f"unlink {link}", output)
+        self.assertEqual(rc, 1, check_output)
+        self.assertIn("could not inspect", check_output)
+        self.assertEqual(len(errors.getvalue().splitlines()), 2)  # one per invocation
+        self.assertIn(str(source), errors.getvalue())
+
+    def test_dangling_symlinked_skill_is_unlinked(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        shutil.rmtree(target)
+        self.assertTrue(source.is_symlink())
+        self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertFalse(os.path.lexists(home / "skills/privacy-guard"))
+
+    def test_entry_stat_error_preserves_existing_link(self) -> None:
+        target = self.tmp / "external-skill"
+        write(target / "SKILL.md", "---\nname: privacy-guard\n---\nbody\n")
+        source = self.skill_root / "external"
+        source.symlink_to(target, target_is_directory=True)
+        self.run_gen()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            entries = real_scandir(path)
+            if os.fspath(path) != str(self.skill_root):
+                return entries
+            class UnreadableEntry:
+                name = "external"
+                path = str(source)
+                def is_dir(self, *, follow_symlinks=True):
+                    raise OSError(errno.EIO, "I/O error", self.path)
+            with entries:
+                return [UnreadableEntry() if entry.name == "external" else entry for entry in entries]
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.run_gen()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertEqual(os.readlink(home / "skills/privacy-guard"), str(source))
+
+    def test_unreadable_directory_protects_nested_farm_links_only(self) -> None:
+        self.run_gen()
+        shutil.rmtree(self.skill_root / "alpha")
+        real_scandir = os.scandir
+        parent = self.skill_root / "cat"
+
+        def scandir(path):
+            if os.fspath(path) == str(parent):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.run_gen()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertTrue((home / "skills/beta").is_symlink())
+            self.assertTrue((home / "skills/gamma").is_symlink())
+            self.assertFalse(os.path.lexists(home / "skills/alpha"))
+
+    def test_unreadable_skill_keeps_link_even_when_name_is_reused(self) -> None:
+        self.run_gen()
+        self.make_skill("cat/other", None, name="alpha")
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(self.skill_root / "alpha"):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(gh.os, "scandir", side_effect=scandir):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertEqual(os.readlink(home / "skills/alpha"), str(self.skill_root / "alpha"))
+
+    def test_skill_name_read_errors_do_not_hide_discoverable_children(self) -> None:
+        self.make_skill("alpha/child", None)
+        self.run_gen()
+        real_skill_name = gh.skill_name
+
+        def skill_name(path):
+            if path == self.skill_root / "alpha/SKILL.md":
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_skill_name(path)
+
+        with mock.patch.object(gh, "skill_name", side_effect=skill_name):
+            self.run_gen()
+        for home in (self.claude, self.codex, self.codex_cu):
+            self.assertFalse(os.path.lexists(home / "skills/alpha"))
+            self.assertTrue((home / "skills/child").is_symlink())
 
     def test_real_directory_in_skills_is_never_removed(self) -> None:
         self.run_gen()
@@ -428,18 +572,38 @@ class GenerateTests(HarnessTestCase):
         self.run_gen(m)
         claude_hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
         codex_hooks = json.loads((self.codex / "hooks.json").read_text())["hooks"]
-        self.assertEqual(set(claude_hooks), {"PreToolUse", "SessionStart"})
-        self.assertEqual(set(codex_hooks), {"PreToolUse"})
-        for group in claude_hooks["PreToolUse"] + claude_hooks["SessionStart"]:
-            self.assertTrue(group["hooks"][0]["command"].endswith("/claude.py"))
-        for group in codex_hooks["PreToolUse"]:
-            self.assertTrue(group["hooks"][0]["command"].endswith("/codex.py"))
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
+        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse"})
+        self.assertEqual(codex_hooks, json.loads((self.codex_cu / "hooks.json").read_text())["hooks"])
+        for groups in claude_hooks.values():
+            for group in groups:
+                self.assertIn("/claude.py", group["hooks"][0]["command"])
+        for groups in codex_hooks.values():
+            for group in groups:
+                self.assertIn("/codex.py", group["hooks"][0]["command"])
         for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
             patterns = [re.compile(group["matcher"]) for group in groups]
             for tool in ("Bash", "mcp__betterstack__monitor", "mcp__example__exec_command",
                          "mcp__example__shell_command"):
                 self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
             self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))
+        for hooks in (claude_hooks, codex_hooks):
+            for event in ("PreToolUse", "PostToolUse"):
+                patterns = [re.compile(group["matcher"]) for group in hooks[event]]
+                for tool in ("mcp__cua-driver__click", "mcp__cua_driver__click", "mcp__node_repl__js"):
+                    self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), (event, tool))
+        self.assertEqual(claude_hooks["PostToolUseFailure"][0]["matcher"],
+                         codex_hooks["PostToolUse"][0]["matcher"])
+
+    def test_post_tool_use_failure_rejects_codex_and_unscoped_hooks(self) -> None:
+        m = self.manifest()
+        for harness in ("codex", None):
+            hook = {"event": "PostToolUseFailure", "command": "/bin/echo", "timeoutSec": 3}
+            if harness:
+                hook["harness"] = harness
+            m["hooks"] = [hook]
+            with self.assertRaises(gh.HomeError):
+                gh.validate_manifest(m)
 
     def test_home_root_pointing_at_personal_claude_is_refused(self) -> None:
         personal = self.home / ".claude"
@@ -458,9 +622,9 @@ class GenerateTests(HarnessTestCase):
 
     def test_skills_dir_is_never_a_real_directory_target_for_foreign_links(self) -> None:
         self.run_gen()
+        skills, unreadable = gh.discover_skills([str(self.skill_root)])
         self.assertEqual(gh.skill_ops(str(self.claude / "skills"),
-                                      gh.discover_skills([str(self.skill_root)]),
-                                      [str(self.skill_root)]), [])
+                                      skills, [str(self.skill_root)], unreadable), [])
 
     def test_codex_config_keeps_existing_hook_trust_state(self) -> None:
         m = self.manifest()

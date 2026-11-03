@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
-import { MessageId, NodeId, ProviderDriverKind, ThreadId, TurnItemId } from "@t3tools/contracts";
+import {
+  MessageId,
+  NodeId,
+  ProviderDriverKind,
+  ProviderThreadId,
+  ProviderTurnId,
+  ThreadId,
+  TurnItemId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { makeAssistantStreamingFilter, splitBufferedAssistantText } from "./assistantStreaming.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -27,11 +35,13 @@ const turnItem = (
   text: string,
   streaming = true,
   type: "assistant_message" | "reasoning" = "assistant_message",
+  id = "item",
+  driver = "codex",
 ): ProviderAdapter.ProviderAdapterV2Event => ({
   type: "turn_item.updated",
-  driver: ProviderDriverKind.make("codex"),
+  driver: ProviderDriverKind.make(driver),
   turnItem: {
-    id: TurnItemId.make("item"),
+    id: TurnItemId.make(id),
     threadId: ThreadId.make("thread"),
     runId: null,
     nodeId: null,
@@ -82,25 +92,128 @@ describe("V2 assistant streaming", () => {
     expect(buffered(final, 501)).toBe(final);
   });
 
-  it.each(["assistant_message", "reasoning"] as const)(
-    "buffers %s at paragraph boundaries and flushes the final item",
-    (type) => {
-      const item = (text: string, streaming = true) => turnItem(text, streaming, type);
+  it("keeps assistant items at the existing 400 ms cadence", () => {
+    const type = "assistant_message";
+    const item = (text: string, streaming = true) => turnItem(text, streaming, type);
+    const filter = makeAssistantStreamingFilter("paragraph");
+    expect(filter(item("First"), 0)).toBeNull();
+    expect(filter(item("First\n\nSec"), 10)).toMatchObject({
+      turnItem: { text: "First\n\n", streaming: true, type },
+    });
+    expect(filter(item("First\n\nSecond\n\nThi"), 100)).toBeNull();
+    expect(filter(item("First\n\nSecond\n\nThi"), 410)).toMatchObject({
+      turnItem: { text: "First\n\nSecond\n\n", streaming: true },
+    });
+    const final = item("First\n\nSecond\n\nThird", false);
+    expect(filter(final, 420)).toBe(final);
+
+    const buffered = makeAssistantStreamingFilter("turn");
+    expect(buffered(item("First\n\nSecond"), 0)).toBeNull();
+    expect(buffered(final, 1)).toBe(final);
+  });
+
+  it.each(["opencode", "claude", "codex"])(
+    "checkpoints %s reasoning per item every two seconds",
+    (driver) => {
+      const item = (text: string, streaming = true, id = "item") =>
+        turnItem(text, streaming, "reasoning", id, driver);
       const filter = makeAssistantStreamingFilter("paragraph");
-      expect(filter(item("First"), 0)).toBeNull();
-      expect(filter(item("First\n\nSec"), 10)).toMatchObject({
-        turnItem: { text: "First\n\n", streaming: true, type },
+      expect(filter(item("partial"), -1)).toBeNull();
+      expect(filter(item("First\n\npartial"), 0)).toMatchObject({
+        turnItem: { text: "First\n\n", streaming: true },
       });
-      expect(filter(item("First\n\nSecond\n\nThi"), 100)).toBeNull();
-      expect(filter(item("First\n\nSecond\n\nThi"), 410)).toMatchObject({
+      expect(filter(item("First\n\nSecond\n\npartial"), 400)).toBeNull();
+      expect(filter(item("First\n\nSecond\n\npartial"), 1999)).toBeNull();
+      expect(filter(item("First\n\nSecond\n\npartial"), 2000)).toMatchObject({
         turnItem: { text: "First\n\nSecond\n\n", streaming: true },
       });
-      const final = item("First\n\nSecond\n\nThird", false);
-      expect(filter(final, 420)).toBe(final);
+      expect(filter(item("other\n\ntail", true, "other"), 2001)).toMatchObject({
+        turnItem: { id: "other", text: "other\n\n" },
+      });
+      expect(filter(item("changed\n\nmore\n\n", true, "other"), 2002)).toBeNull();
+    },
+  );
 
-      const buffered = makeAssistantStreamingFilter("turn");
-      expect(buffered(item("First\n\nSecond"), 0)).toBeNull();
-      expect(buffered(final, 1)).toBe(final);
+  it("delivers replacements at the next checkpoint and a terminal snapshot immediately", () => {
+    const item = (text: string, streaming = true) => turnItem(text, streaming, "reasoning");
+    const filter = makeAssistantStreamingFilter("paragraph");
+    expect(filter(item("Original 🐕\n\npartial"), 0)).toMatchObject({
+      turnItem: { text: "Original 🐕\n\n" },
+    });
+    expect(filter(item("Replaced 🐈\n\npartial"), 400)).toBeNull();
+    expect(filter(item("Replaced 🐈\n\npartial"), 2000)).toMatchObject({
+      turnItem: { text: "Replaced 🐈\n\n" },
+    });
+    const final = item("最終 🐈‍⬛\npartial", false);
+    expect(filter(final, 2500)).toBe(final);
+    // A final event discards its checkpoint state, even when its ID is reused.
+    expect(filter(item("Fresh\n\npartial"), 2501)).toMatchObject({
+      turnItem: { text: "Fresh\n\n" },
+    });
+  });
+
+  it("flushes an exact terminal snapshot at 500 ms and isolates run filters", () => {
+    const item = (text: string, streaming = true) => turnItem(text, streaming, "reasoning");
+    const firstRun = makeAssistantStreamingFilter("paragraph");
+    const secondRun = makeAssistantStreamingFilter("paragraph");
+    expect(firstRun(item("First\n\npartial"), 0)).toMatchObject({
+      turnItem: { text: "First\n\n" },
+    });
+    expect(secondRun(item("Second run\n\npartial"), 1)).toMatchObject({
+      turnItem: { text: "Second run\n\n" },
+    });
+    const final = item("replacement 🦊 with no paragraph boundary", false);
+    expect(firstRun(final, 500)).toBe(final);
+  });
+
+  it("still holds all streaming reasoning in turn mode", () => {
+    const filter = makeAssistantStreamingFilter("turn");
+    const item = (text: string, streaming = true) => turnItem(text, streaming, "reasoning");
+    expect(filter(item("one\n\npartial"), 0)).toBeNull();
+    expect(filter(item("one\n\ntwo\n\npartial"), 2000)).toBeNull();
+    const final = item("one\n\ntwo\n\nfinal", false);
+    expect(filter(final, 2001)).toBe(final);
+  });
+
+  it.each(["turn", "paragraph"] as const)(
+    "passes command output, tool snapshots and turn terminals immediately in %s mode",
+    (mode) => {
+      const filter = makeAssistantStreamingFilter(mode);
+      const reasoning = turnItem("Start\n\npartial", true, "reasoning");
+      filter(reasoning, 0);
+      const output: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "command_output.delta",
+        driver: ProviderDriverKind.make("opencode"),
+        threadId: ThreadId.make("thread"),
+        itemId: TurnItemId.make("tool"),
+        chunk: "actual output",
+      };
+      expect(filter(output, 1)).toBe(output);
+      if (reasoning.type !== "turn_item.updated" || reasoning.turnItem.type !== "reasoning") {
+        throw new Error("unexpected fixture");
+      }
+      const tool: ProviderAdapter.ProviderAdapterV2Event = {
+        ...reasoning,
+        turnItem: {
+          ...reasoning.turnItem,
+          id: TurnItemId.make("tool"),
+          type: "command_execution",
+          input: "pwd",
+          output: "actual output",
+        },
+      };
+      expect(filter(tool, 2)).toBe(tool);
+      const terminal: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "turn.terminal",
+        driver: ProviderDriverKind.make("opencode"),
+        providerThreadId: ProviderThreadId.make("provider-thread"),
+        providerTurnId: ProviderTurnId.make("provider-turn"),
+        runOrdinal: 1,
+        status: "completed",
+        failure: null,
+        threadDisposition: "reusable",
+      };
+      expect(filter(terminal, 3)).toBe(terminal);
     },
   );
 

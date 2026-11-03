@@ -4704,6 +4704,73 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("marks commentary as narration and the final message as the answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const transcript = finalAnswerTranscript("codex-phase-commentary-then-final", [
+          { id: "answer-commentary", text: "Looking at the repo.", phase: "commentary" },
+          { id: "answer-final", text: "All set.", phase: "final_answer" },
+        ]);
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-phase-commentary-then-final"),
+            text: "Reply with the requested recovery marker.",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+
+        const phases = new Map(
+          assistantMessages(harness.events).map((event) => [
+            event.message.text,
+            event.message.phase,
+          ]),
+        );
+        assert.strictEqual(phases.get("Looking at the repo."), "narration");
+        assert.strictEqual(phases.get("All set."), "answer");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps a text with no explicit Codex phase unknown, never an answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const transcript = finalAnswerTranscript("codex-null-phase-is-unknown", [
+          { id: "answer-null", text: "CODEX_RECOVERY_OK", phase: null },
+        ]);
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-null-phase-is-unknown"),
+            text: "Reply with the requested recovery marker.",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+
+        const phases = assistantMessages(harness.events).map((event) => event.message.phase);
+        assert.deepStrictEqual(phases, ["unknown"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("preserves an empty final answer when only commentary preceded it", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -7186,6 +7253,102 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it("maps each Codex app-server failure code to one normalized category", () => {
+    const cases: ReadonlyArray<readonly [string, string | null, unknown, string]> = [
+      ["usageLimitExceeded is quota", "usageLimitExceeded", undefined, "quota"],
+      ["rateLimitExceeded is quota", "rateLimitExceeded", undefined, "quota"],
+      [
+        "exhausted 429 is quota",
+        "responseTooManyFailedAttempts",
+        { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+        "quota",
+      ],
+      [
+        "exhausted 503 is transient",
+        "responseTooManyFailedAttempts",
+        { responseTooManyFailedAttempts: { httpStatusCode: 503 } },
+        "transient",
+      ],
+      ["serverOverloaded is transient", "serverOverloaded", undefined, "transient"],
+      ["flexUnavailable is transient", "flexUnavailable", undefined, "transient"],
+      ["httpConnectionFailed is transient", "httpConnectionFailed", undefined, "transient"],
+      [
+        "responseStreamConnectionFailed is transient",
+        "responseStreamConnectionFailed",
+        undefined,
+        "transient",
+      ],
+      [
+        "responseStreamDisconnected is transient",
+        "responseStreamDisconnected",
+        undefined,
+        "transient",
+      ],
+      ["unauthorized is expired auth", "unauthorized", undefined, "auth_expired"],
+      [
+        "contextWindowExceeded is context exhaustion",
+        "contextWindowExceeded",
+        undefined,
+        "context_exhausted",
+      ],
+      ["cyberPolicy is a content filter", "cyberPolicy", undefined, "content_filter"],
+      [
+        "misalignmentPolicyViolation is a content filter",
+        "misalignmentPolicyViolation",
+        undefined,
+        "content_filter",
+      ],
+      ["badRequest stays unknown (no stated meaning)", "badRequest", undefined, "unknown"],
+      ["internalServerError stays unknown", "internalServerError", undefined, "unknown"],
+      ["a missing code is unknown", null, undefined, "unknown"],
+    ];
+    for (const [name, code, errorInfo, expected] of cases) {
+      assert.strictEqual(
+        CodexAdapterV2.codexFailureCategory(code, errorInfo as never),
+        expected,
+        name,
+      );
+    }
+  });
+
+  it("classifies the HTTP status on every connection, stream and exhaustion error", () => {
+    const codes = [
+      "httpConnectionFailed",
+      "responseStreamConnectionFailed",
+      "responseStreamDisconnected",
+      "responseTooManyFailedAttempts",
+    ];
+    const statuses = [
+      [400, "config"],
+      [401, "auth_expired"],
+      [404, "config"],
+      [408, "transient"],
+      [429, "quota"],
+      [500, "transient"],
+      [502, "transient"],
+      [503, "transient"],
+      [302, "unknown"],
+    ] as const;
+    for (const code of codes) {
+      for (const [status, expected] of statuses) {
+        assert.equal(
+          CodexAdapterV2.codexFailureCategory(code, {
+            [code]: { httpStatusCode: status },
+          } as never),
+          expected,
+          `${code} HTTP ${status}`,
+        );
+      }
+      assert.equal(
+        CodexAdapterV2.codexFailureCategory(code, {
+          [code]: { httpStatusCode: null },
+        } as never),
+        code === "responseTooManyFailedAttempts" ? "unknown" : "transient",
+        `${code} without an HTTP status`,
+      );
+    }
+  });
+
   it.effect.each([
     {
       name: "usage",
@@ -7250,6 +7413,31 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       errorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 500 } },
       notification: false,
       expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "exhausted-502",
+      code: "responseTooManyFailedAttempts",
+      errorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 502 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      name: "connection-400",
+      code: "httpConnectionFailed",
+      errorInfo: { httpConnectionFailed: { httpStatusCode: 400 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
+    },
+    {
+      name: "stream-404",
+      code: "responseStreamConnectionFailed",
+      errorInfo: { responseStreamConnectionFailed: { httpStatusCode: 404 } },
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
     },
   ] as const)("classifies Codex terminal failures from $name evidence", (scenario) =>
     Effect.scoped(
@@ -7417,6 +7605,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(terminal?.status, "failed");
         if (terminal?.status !== "failed") return;
         assert.equal(terminal.failure.class, scenario.expectedClass);
+        if ("expectedCategory" in scenario) {
+          assert.equal(terminal.failure.category, scenario.expectedCategory);
+        }
         assert.equal(terminal.threadDisposition, "reusable");
         if (scenario.name === "known-reset" || scenario.name === "deferred-reset")
           assert.equal(terminal.failure.resetAt, resetAt);
@@ -7465,12 +7656,42 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       completionStatus: null,
       willRetry: true,
       expectedClass: "usage_limit",
+      expectedCategory: "quota",
+    },
+    {
+      notificationStatus: 400,
+      completionStatus: 503,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      notificationStatus: 500,
+      completionStatus: 503,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
+    },
+    {
+      notificationStatus: 503,
+      completionStatus: 400,
+      willRetry: true,
+      expectedClass: "provider_error",
+      expectedCategory: "config",
+    },
+    {
+      notificationStatus: 503,
+      completionStatus: null,
+      willRetry: false,
+      expectedClass: "provider_error",
+      expectedCategory: "transient",
     },
   ] as const)(
     "honors completion HTTP status from $notificationStatus to $completionStatus (retry: $willRetry)",
-    ({ notificationStatus, completionStatus, expectedClass, willRetry }) =>
+    (scenario) =>
       Effect.scoped(
         Effect.gen(function* () {
+          const { notificationStatus, completionStatus, expectedClass, willRetry } = scenario;
           const name = `${notificationStatus}-${completionStatus}-${willRetry}`;
           const nativeThreadId = `native-exhaustion-status-${name}`;
           const nativeTurnId = `turn-exhaustion-status-${name}`;
@@ -7535,6 +7756,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(terminal?.status, "failed");
           if (terminal?.status !== "failed") return;
           assert.equal(terminal.failure.class, expectedClass);
+          if ("expectedCategory" in scenario) {
+            assert.equal(terminal.failure.category, scenario.expectedCategory);
+          }
           assert.equal(terminal.failure.code, "responseTooManyFailedAttempts");
           assert.equal(terminal.threadDisposition, "reusable");
           const notificationClass = notificationStatus === 429 ? "usage_limit" : "provider_error";

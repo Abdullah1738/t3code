@@ -20,15 +20,20 @@ def response(event, result):
 
 
 def main():
+    event = {}
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
             raise ValueError("invalid-event")
+        if sys.argv[1:] == ["--shell-mcp"] and engine.desktop_lease.matches(event.get("tool_name")):
+            return
         output = response(event, engine.decide(event, "codex"))
         if output is not None:
             print(json.dumps(output))
     except Exception as error:
         engine.log_event_error("codex", None, "adapter-error", type(error).__name__)
+        if isinstance(event, dict) and event.get("hook_event_name") == "PreToolUse" and engine.desktop_lease.matches(event.get("tool_name")):
+            print(json.dumps(response(event, {"decision": "deny", "reason": engine.desktop_lease.UNAVAILABLE, "context": {}})))
 
 
 if __name__ == "__main__":

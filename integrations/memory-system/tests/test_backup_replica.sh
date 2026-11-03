@@ -32,7 +32,7 @@ setup() { # fake-or-real sqlite3_rsync
   echo x > "$T/repo/live/config"
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
   # the live install ships src/ (incl. the transcript manifest tool) next to the script
-  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$R/src/"
+  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$R/src/"
   # Never invoke the Dropbox API in this test, even when restic succeeds.
   printf 'print("{\\"test\\": true}")\n' > "$R/src/dropbox_mirror.py"
   old=$(( $(date +%s) - 3 * 86400 ))
@@ -48,10 +48,11 @@ setup() { # fake-or-real sqlite3_rsync
   fi
 }
 run() {
-  env -u RESTIC_PASSWORD -u RESTIC_PASSWORD_FILE HOME="$T" XDG_DATA_HOME="$T/.local/share" \
-    ROBOB_STATE_DB="${ROBOB_STATE_DB:-$T/no-robob.sqlite}" \
+  env -i PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$T" XDG_DATA_HOME="$T/.local/share" \
+    ROBOB_STATE_DB="${1:-$T/no-robob.sqlite}" \
     ROBOB_HARNESS_HOMES="$T/.robob/harness-homes" \
     MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
+    MEMORY_BACKUP_REPLICA_TIMEOUT_S="${MEMORY_BACKUP_REPLICA_TIMEOUT_S:-5400}" \
     MEMORY_BACKUP_PASSWORD_COMMAND='printf fixture-password' MEMORY_BACKUP_CACHE_DIR="$T/cache" \
     MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
 }
@@ -68,6 +69,27 @@ grep -q "replica not updated by sqlite3_rsync: replica=2 live>=3" "$R/logs/backu
 [ "$(grep -c 'behind after sync' "$R"/logs/backup-*.log)" = 1 ] && pass "retried once before failing" || fail "retry count"
 rm -rf "$T"
 
+# A stalled sync must fail the run, release the lock and not leave its process.
+setup fake
+cat > "$R/bin/sqlite3_rsync" <<'SH'
+#!/bin/bash
+echo "$$" > "$HOME/sync-pid"
+exec /bin/sleep 120
+SH
+rc=0
+MEMORY_BACKUP_REPLICA_TIMEOUT_S=3 run || rc=$?
+[ "$rc" -ne 0 ] && [ "$(st)" = "replica False" ] && grep -q 'sqlite3_rsync timed out after 3 s' "$R/logs/backup_last.json" \
+  && pass "stalled sync fails at replica with timeout status" || fail "stalled sync did not report timeout: rc=$rc $(cat "$R/logs/backup_last.json")"
+grep -q 'sqlite3_rsync timed out after 3 s' "$R"/logs/backup-*.log \
+  && pass "stalled sync timeout logged" || fail "stalled sync timeout not logged: $(cat "$R"/logs/backup-*.log)"
+[ ! -e "$R/logs/backup.lock" ] && pass "stalled sync releases lock" || fail "stalled sync left lock"
+if [ -s "$T/sync-pid" ] && ! kill -0 "$(cat "$T/sync-pid")" 2>/dev/null; then
+  pass "stalled sync process exited"
+else
+  fail "stalled sync process still alive or did not start"
+fi
+rm -rf "$T"
+
 # 2. SQLite backup stand-in -> replica stage passes (then fake repo fails).
 if [ -x "$REAL_RSYNC" ]; then
   setup real
@@ -75,6 +97,8 @@ if [ -x "$REAL_RSYNC" ]; then
   "$SQLITE" "$R/data/memory.db" "INSERT INTO episodic_events VALUES (3,$(date +%s));"
   run
   [ "$(st)" = "restic False" ] && pass "SQLite sync passes replica+verify" || fail "SQLite sync gave: $(st) $(cat "$R/logs/backup_last.json")"
+  grep -q 'replica memory.db try1: elapsed_s=[0-9]' "$R"/logs/backup-*.log \
+    && pass "replica duration logged" || fail "replica duration missing from log"
   [ "$("$SQLITE" -readonly "$T/stage/memory.db" 'SELECT max(id) FROM episodic_events')" = 3 ] \
     && pass "replica caught up" || fail "replica not caught up"
   rm -rf "$T"
@@ -111,7 +135,7 @@ if [ -x "$REAL_RSYNC" ]; then
     CREATE TABLE ardud_mission_events(id TEXT); INSERT INTO ardud_mission_events VALUES ('m');
     CREATE TABLE orchestration_v2_events(x); INSERT INTO orchestration_v2_events VALUES ('big');" >/dev/null
   echo old > "$T/stage/robob-state.sqlite"; echo old > "$T/stage/robob-state.sqlite-wal"
-  ROBOB_STATE_DB="$T/robob.sqlite" run
+  run "$T/robob.sqlite"
   [ "$(st)" = "restic False" ] && pass "robob state dump passes" || fail "robob gave: $(st) $(cat "$R/logs/backup_last.json")"
   [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT name FROM scheduled_tasks')" = "it's 7" ] \
     && pass "robob state dump restores" || fail "robob state dump missing or unreadable"

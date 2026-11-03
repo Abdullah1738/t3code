@@ -11,10 +11,12 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Scope from "effect/Scope";
@@ -72,6 +74,7 @@ const configWithObservability: DesktopBackendBootstrapValue = {
 };
 
 function makeProcess(options?: {
+  readonly pid?: number;
   readonly stdout?: Stream.Stream<Uint8Array, PlatformError.PlatformError>;
   readonly stderr?: Stream.Stream<Uint8Array, PlatformError.PlatformError>;
   readonly exitCode?: Effect.Effect<ChildProcessSpawner.ExitCode, PlatformError.PlatformError>;
@@ -79,7 +82,7 @@ function makeProcess(options?: {
   readonly getOutputFd?: ChildProcessSpawner.ChildProcessHandle["getOutputFd"];
 }): ChildProcessSpawner.ChildProcessHandle {
   return ChildProcessSpawner.makeHandle({
-    pid: ChildProcessSpawner.ProcessId(123),
+    pid: ChildProcessSpawner.ProcessId(options?.pid ?? 123),
     stdout: options?.stdout ?? Stream.empty,
     stderr: options?.stderr ?? Stream.empty,
     all: Stream.merge(options?.stdout ?? Stream.empty, options?.stderr ?? Stream.empty),
@@ -818,6 +821,174 @@ describe("DesktopBackendManager", () => {
           assert.equal((yield* Fiber.join(runFiber)).code.pipe(Option.getOrUndefined), 0);
         }).pipe(Effect.provide(TestClock.layer())),
       ),
+  );
+
+  it.effect(
+    "snapshots only the first readiness timeout per child and preserves exit output",
+    () => {
+      const logs: Array<{
+        readonly message: unknown;
+        readonly annotations: Readonly<Record<string, unknown>>;
+      }> = [];
+      const logger = Logger.make(({ fiber, message }) => {
+        logs.push({ message, annotations: { ...fiber.getRef(References.CurrentLogAnnotations) } });
+      });
+      const logged = (message: string) =>
+        logs.filter((record) => Array.isArray(record.message) && record.message[0] === message);
+
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const firstProbe = yield* Deferred.make<void>();
+          const secondChildProbe = yield* Deferred.make<void>();
+          const backendReady = yield* Deferred.make<void>();
+          const childExit = yield* Deferred.make<void>();
+          const trailingOutput = yield* Deferred.make<void>();
+          const exitOutputStarted = yield* Deferred.make<void>();
+          const finishExitOutput = yield* Deferred.make<void>();
+          const starts = yield* Queue.unbounded<string>();
+          const outputWrites = yield* Queue.unbounded<string>();
+          const snapshots = yield* Queue.unbounded<{
+            readonly details: string;
+            readonly chunks: ReadonlyArray<string>;
+          }>();
+          const exits = yield* Queue.unbounded<{
+            readonly details: string;
+            readonly chunks: ReadonlyArray<string>;
+          }>();
+          let spawnCount = 0;
+          let allowReady = false;
+          let output: string[] = [];
+
+          const layerSpawner = Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.sync(() => {
+                spawnCount += 1;
+                const firstChild = spawnCount === 1;
+                return makeProcess({
+                  pid: firstChild ? 123 : 456,
+                  stdout: firstChild
+                    ? Stream.concat(
+                        Stream.make(new TextEncoder().encode("before timeout\n")),
+                        Stream.fromEffect(
+                          Deferred.await(trailingOutput).pipe(
+                            Effect.as(new TextEncoder().encode("after timeout\n")),
+                          ),
+                        ),
+                      ).pipe(
+                        Stream.concat(
+                          Stream.fromEffect(
+                            Deferred.await(childExit).pipe(
+                              Effect.andThen(Deferred.succeed(exitOutputStarted, void 0)),
+                              Effect.andThen(Deferred.await(finishExitOutput)),
+                              Effect.as(new TextEncoder().encode("trailing exit output\n")),
+                            ),
+                          ),
+                        ),
+                      )
+                    : Stream.empty,
+                  exitCode: firstChild
+                    ? Deferred.await(childExit).pipe(Effect.as(ChildProcessSpawner.ExitCode(7)))
+                    : Effect.never,
+                });
+              }),
+            ),
+          );
+          const instance = yield* makeTestInstance({
+            spawnerLayer: layerSpawner,
+            httpClientLayer: layerHttpClient((request) =>
+              Effect.gen(function* () {
+                if (spawnCount === 1) {
+                  yield* Deferred.succeed(firstProbe, void 0);
+                  if (allowReady) return responseForRequest(request, 200);
+                } else {
+                  yield* Deferred.succeed(secondChildProbe, void 0);
+                }
+                return yield* Effect.never;
+              }),
+            ),
+            onReady: Deferred.succeed(backendReady, void 0).pipe(Effect.asVoid),
+            backendOutputLog: {
+              beginSession: ({ details }) =>
+                Effect.sync(() => {
+                  output = [];
+                }).pipe(Effect.andThen(Queue.offer(starts, details)), Effect.asVoid),
+              writeOutputChunk: (_streamName, chunk) => {
+                const text = new TextDecoder().decode(chunk);
+                return Effect.sync(() => output.push(text)).pipe(
+                  Effect.andThen(Queue.offer(outputWrites, text)),
+                  Effect.asVoid,
+                );
+              },
+              persistFailureSnapshot: ({ details }) =>
+                Queue.offer(snapshots, { details, chunks: [...output] }).pipe(Effect.asVoid),
+              persistFailure: ({ details }) =>
+                Queue.offer(exits, { details, chunks: [...output] }).pipe(Effect.asVoid),
+            },
+          });
+
+          yield* instance.start;
+          assert.include(yield* Queue.take(starts), "pid=123");
+          assert.equal(yield* Queue.take(outputWrites), "before timeout\n");
+          yield* Deferred.await(firstProbe);
+          yield* TestClock.adjust(Duration.minutes(1));
+
+          const firstSnapshot = yield* Queue.take(snapshots);
+          assert.include(firstSnapshot.details, "Timed out after 60000ms");
+          assert.deepEqual(firstSnapshot.chunks, ["before timeout\n"]);
+          assert.equal(logged("httpReadiness.timedOut").length, 1);
+
+          yield* TestClock.adjust(Duration.minutes(1));
+          assert.equal(yield* Queue.size(snapshots), 0);
+          assert.equal(logged("httpReadiness.timedOut").length, 1);
+          assert.equal(logged("backend readiness check failed during bootstrap").length, 1);
+          const stillStarting = logged("backend still starting");
+          assert.equal(stillStarting.length, 1);
+          assert.deepEqual(stillStarting[0]?.annotations, {
+            component: `desktop-backend-instance:${DesktopBackendManager.PRIMARY_INSTANCE_ID}`,
+            pid: 123,
+            elapsedMs: 120_000,
+          });
+          assert.equal(spawnCount, 1);
+          assert.isFalse((yield* instance.snapshot).ready);
+
+          allowReady = true;
+          yield* TestClock.adjust(Duration.seconds(2));
+          yield* Deferred.await(backendReady);
+          assert.isTrue((yield* instance.snapshot).ready);
+          assert.equal(spawnCount, 1);
+
+          yield* Deferred.succeed(trailingOutput, void 0);
+          assert.equal(yield* Queue.take(outputWrites), "after timeout\n");
+          yield* Deferred.succeed(childExit, void 0);
+          yield* Deferred.await(exitOutputStarted);
+          assert.equal(yield* Queue.size(exits), 0);
+          yield* Deferred.succeed(finishExitOutput, void 0);
+          assert.deepEqual(yield* Queue.take(exits), {
+            details: "pid=123 code=7",
+            chunks: ["before timeout\n", "after timeout\n", "trailing exit output\n"],
+          });
+
+          yield* instance.stop();
+          yield* instance.start;
+          assert.include(yield* Queue.take(starts), "pid=456");
+          yield* Deferred.await(secondChildProbe);
+          yield* TestClock.adjust(Duration.minutes(1));
+
+          const nextSnapshot = yield* Queue.take(snapshots);
+          assert.include(nextSnapshot.details, "Timed out after 60000ms");
+          assert.deepEqual(nextSnapshot.chunks, []);
+          assert.equal(spawnCount, 2);
+          assert.equal(logged("httpReadiness.timedOut").length, 2);
+          assert.equal(logged("backend readiness check failed during bootstrap").length, 2);
+          assert.equal(logged("backend still starting").length, 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(TestClock.layer(), Logger.layer([logger], { mergeWithExisting: false })),
+          ),
+        ),
+      );
+    },
   );
 
   it.effect("starts the configured backend and closes the scoped process on stop", () =>

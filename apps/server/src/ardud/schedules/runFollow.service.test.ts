@@ -34,7 +34,17 @@ interface RunState {
   readonly status: string;
   readonly endsAt?: number;
   readonly blocked?: boolean;
+  /** A blocked run whose failure carries only the content_filter category, with no legacy code. */
+  readonly blockedByCategory?: boolean;
 }
+
+const BLOCKED_BY_CATEGORY = {
+  class: "provider_error",
+  code: "model_refusal",
+  message: "Claude declined to continue this request.",
+  retryable: null,
+  category: "content_filter",
+};
 
 type Threads = ReadonlyMap<string, ReadonlyArray<RunState>>;
 
@@ -61,7 +71,7 @@ const records = (threadId: string, runs: ReadonlyArray<RunState>) => ({
   providerTurns: [],
   runtimeRequests: [],
   turnItems: runs
-    .filter((run) => run.blocked === true)
+    .filter((run) => run.blocked === true || run.blockedByCategory === true)
     .map((run, index) => ({
       id: `error-${run.id}`,
       type: "error",
@@ -70,7 +80,7 @@ const records = (threadId: string, runs: ReadonlyArray<RunState>) => ({
       runId: run.id,
       nodeId: `node-${run.id}`,
       updatedAt: DateTime.makeUnsafe(run.endsAt ?? T0),
-      failure: BLOCKED,
+      failure: run.blockedByCategory === true ? BLOCKED_BY_CATEGORY : BLOCKED,
     })),
 });
 
@@ -183,6 +193,12 @@ const blockAfterWake = (harness: Harness, threadId: string, at: number) =>
     { id: `${threadId}-wake`, status: "failed", endsAt: at, blocked: true },
   ]);
 
+const blockAfterWakeWithCategory = (harness: Harness, threadId: string, at: number) =>
+  setRuns(harness, threadId, [
+    { id: `${threadId}-run`, status: "completed", endsAt: at - minute },
+    { id: `${threadId}-wake`, status: "failed", endsAt: at, blockedByCategory: true },
+  ]);
+
 it.effect("keeps a run running until its thread settles, then records the provider error", () =>
   Effect.gen(function* () {
     yield* TestClock.setTime(T0);
@@ -288,6 +304,32 @@ it.effect("retries a blocked run once on the first fallback model and follows th
         const settled = yield* currentTask;
         assert.equal(settled.lastRunStatus, "succeeded");
         assert.equal((yield* Ref.get(harness.launches)).length, 2);
+      }),
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("retries a content_filter category once even without the legacy code", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(T0);
+    const harness = yield* makeHarness;
+    yield* withService(
+      harness,
+      Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const sql = yield* SqlClient.SqlClient;
+        const task = yield* createTask;
+        const fallback = { instanceId: "opencode", model: "opus/gpt-6-astra" } as never;
+        yield* writeBlockRetry(sql, task, { fallbacks: [fallback], limits: FULL });
+        yield* service.runNow({ id: task.id });
+
+        yield* blockAfterWakeWithCategory(harness, "thread-1", T0 + 2 * minute);
+        yield* TestClock.adjust(FOLLOW_QUIET_MS + 3 * minute);
+
+        const launches = yield* Ref.get(harness.launches);
+        assert.equal(launches.length, 2);
+        assert.isTrue(launches[1]!.commandId.endsWith(":retry:0"));
+        assert.equal(launches[1]!.modelSelection.model, "opus/gpt-6-astra");
       }),
     );
   }).pipe(Effect.provide(Sqlite.layerMemory)),

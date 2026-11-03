@@ -38,6 +38,7 @@ interface Fixture {
     readonly runId: string;
     readonly code: string | null;
     readonly message: string;
+    readonly category?: string;
   }>;
   readonly deleted?: boolean;
   readonly autoResume?: boolean;
@@ -86,6 +87,7 @@ const projection = (fixture: Fixture): FollowedThread =>
         code: error.code,
         message: error.message,
         retryable: null,
+        ...(error.category === undefined ? {} : { category: error.category }),
       },
     })),
     messages: fixture.messages ?? [],
@@ -185,6 +187,58 @@ describe("threadVerdict", () => {
       status: "failed",
       error: "Provider blocked the response",
       blocked: true,
+    });
+  });
+
+  it("counts a content_filter category as blocked even without the legacy code", () => {
+    const verdict = settledAfterQuiet(
+      {
+        runs: [
+          { id: "scheduled", status: "completed", endsAt: 1 },
+          { id: "wake-1", status: "failed", endsAt: 2 },
+        ],
+        errors: [
+          {
+            runId: "wake-1",
+            code: "model_refusal",
+            message: "Claude declined to continue this request.",
+            category: "content_filter",
+          },
+        ],
+      },
+      2,
+    );
+    expect(verdict).toEqual({
+      _tag: "settled",
+      status: "failed",
+      error: "Claude declined to continue this request.",
+      blocked: true,
+    });
+  });
+
+  it("does not call a quota failure blocked", () => {
+    const verdict = settledAfterQuiet(
+      {
+        runs: [
+          { id: "scheduled", status: "completed", endsAt: 1 },
+          { id: "wake-1", status: "failed", endsAt: 2 },
+        ],
+        errors: [
+          {
+            runId: "wake-1",
+            code: "api_error_429",
+            message: "Claude API rate limit reached. Try again later.",
+            category: "quota",
+          },
+        ],
+      },
+      2,
+    );
+    expect(verdict).toEqual({
+      _tag: "settled",
+      status: "failed",
+      error: "Claude API rate limit reached. Try again later.",
+      blocked: false,
     });
   });
 

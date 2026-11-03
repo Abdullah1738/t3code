@@ -119,15 +119,27 @@ class SendApprovalTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def env(self):
+        # Only the variables a test sets may name the caller: a real shell's Claude or Codex id must not leak in.
         return {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "ROBOB_TEST": "1", "SEND_APPROVAL_LOG": self.log,
                 "SEND_APPROVAL_FORMATTER": FORMATTER, "SEND_APPROVAL_BUN": BUN}
 
-    def run_check(self, *args, judge=None, session=None, drafted=DRAFTED):
+    def run_check(self, *args, judge=None, session=None, drafted=DRAFTED, identity=None, native_env=None):
         env = {**self.env(), "SEND_APPROVAL_BRIDGE_DIR": self.root, "SEND_APPROVAL_STATE_DB": self.state_db,
                "SEND_APPROVAL_JUDGE": self.judge if judge is None else judge,
                "SEND_APPROVAL_DELIVERY": "/usr/bin/python3 " + self.delivery, "FAKE_STATUS": self.status}
         if session:
             env["OPENCODE_SESSION_ID"] = session
+        # The C1 answer for each caller: ses_main is a resolved top-level OpenCode thread (the app cases below);
+        # any other session is unresolved and so refused. `identity` overrides it for the new cases.
+        answers = {"opencode:ses_main": {"resolution": "resolved", "robobThreadId": "t1",
+                                         "parentThreadId": None, "executionKind": "top-level",
+                                         "acceptsMessages": True}}
+        answers.update(identity or {})
+        seam = os.path.join(self.tmp.name, "identity.json")
+        with open(seam, "w") as fh:
+            json.dump(answers, fh)
+        env["SEND_APPROVAL_IDENTITY"] = seam
+        env.update(native_env or {})
         r = subprocess.run(["/usr/bin/python3", HELPER, "check", *args, "--drafted-at", str(drafted)],
                            capture_output=True, text=True, env=env)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -915,6 +927,216 @@ class SendApprovalTest(unittest.TestCase):
         self.assertEqual(self.app()[0], 2)
         self.assertEqual(self.app(session="ses_child")[0], 2)
         self.assertEqual(self.run_check("--app", "--preview", PREVIEW)[0], 2)
+
+    # ---- identity (card #236): Claude/Codex callers resolve through the control identity map
+
+    CLAUDE_UUID = "11111111-2222-3333-4444-555555555555"
+    CODEX_UUID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+    def claude_top(self, native_env, identity_native, driver="claudeAgent"):
+        """Seeds a Claude (or Codex) thread "t-native" with the preview and his OK, the thread C1 resolves to.
+
+        The messages must sit on the resolved thread: the helper reads the history of the thread C1 names.
+        """
+        con = sqlite3.connect(self.state_db)
+        con.executescript(
+            "create table orchestration_v2_projection_provider_threads(provider_thread_id text primary key, thread_id"
+            " text, updated_at text, payload_json text);"
+            "create table orchestration_v2_projection_messages(message_id text primary key, thread_id text, role text,"
+            " streaming integer, created_at text, updated_at text, payload_json text);")
+        con.execute("insert into orchestration_v2_projection_provider_threads values (?,?,?,?)",
+                    ("p2", "t-native", iso(NOW), json.dumps({"nativeThreadRef": {"driver": driver,
+                                                                              "nativeId": identity_native}})))
+        rows = [("assistant", NOW - 60_000, "Draft:\n\n" + fenced(PREVIEW), "agent", "provider"),
+                ("user", NOW - 30_000, "go ahead", "user", "mobile")]
+        for i, (role, at, text, by, src) in enumerate(rows):
+            con.execute("insert into orchestration_v2_projection_messages values (?,?,?,?,?,?,?)",
+                        ("c%d" % i, "t-native", role, 0, iso(at), iso(at),
+                         json.dumps({"text": text, "createdBy": by, "creationSource": src, "streaming": False})))
+        con.commit()
+        con.close()
+        return native_env
+
+    def test_provider_native_child_is_refused_by_its_execution_kind(self):
+        # The child rule itself: C1 answers "provider-native-child" for a caller it can prove is a child (a Codex
+        # thread id). Refused on the execution kind, not on the Claude rule.
+        self.claude_top(None, self.CLAUDE_UUID)
+        child = {"resolution": "resolved", "robobThreadId": "t-child", "parentThreadId": "t1",
+                 "executionKind": "provider-native-child", "acceptsMessages": False}
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"codex:" + self.CLAUDE_UUID: child},
+                                      native_env={"CODEX_THREAD_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+        self.assertIn("subagent or child", err)
+
+    def test_app_managed_child_is_refused(self):
+        # An app-managed child is refused by its execution kind. Use a Codex caller (provable) so the Claude rule
+        # can't be the reason.
+        self.claude_top(None, self.CLAUDE_UUID)
+        child = {"resolution": "resolved", "robobThreadId": "t-child", "parentThreadId": "t1",
+                 "executionKind": "app-managed-child", "acceptsMessages": True}
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"codex:" + self.CLAUDE_UUID: child},
+                                      native_env={"CODEX_THREAD_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+        self.assertIn("subagent or child", err)
+
+    def test_top_level_claude_thread_is_not_accepted_on_a_shared_session_id(self):
+        # Acceptance needs a per-agent proof the shell env doesn't carry, so a top-level answer alone is refused.
+        self.claude_top(None, self.CLAUDE_UUID)
+        top = {"resolution": "resolved", "robobThreadId": "t-native", "parentThreadId": None,
+               "executionKind": "top-level", "acceptsMessages": True}
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={"claudeAgent:" + self.CLAUDE_UUID: top},
+                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+
+    def test_claude_shell_is_refused_even_when_c1_says_top_level(self):
+        # A Claude child's shell carries its parent's session id, and C1 answers a bare Claude id with the
+        # parent's top-level identity. So C1's "top-level" can't prove the caller is not a child: refuse.
+        self.claude_top(None, self.CLAUDE_UUID)
+        top = {"resolution": "resolved", "robobThreadId": "t-native", "parentThreadId": None,
+               "executionKind": "top-level", "acceptsMessages": True}
+        code, _, err = self.run_check("--app", "--preview", PREVIEW,
+                                      identity={"claudeAgent:" + self.CLAUDE_UUID: top},
+                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+        self.assertIn("can't prove", err)
+
+    def test_same_uuid_under_a_different_driver_never_crosses(self):
+        # The same UUID is a Claude thread in one home and a Codex thread in another. A Codex caller resolved
+        # with driver=codex must not take the Claude thread's approval, and the other way round.
+        self.claude_top(None, self.CLAUDE_UUID)
+        claude_top = {"resolution": "resolved", "robobThreadId": "t-native", "parentThreadId": None,
+                      "executionKind": "top-level", "acceptsMessages": True}
+        # Only the Claude key is answered. The Codex lookup for the same UUID is unresolved and must be refused.
+        code, _, err = self.run_check("--app", "--preview", PREVIEW,
+                                      identity={"claudeAgent:" + self.CLAUDE_UUID: claude_top},
+                                      native_env={"CODEX_THREAD_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+        self.assertIn("isn't resolved", err)
+        # And the reverse: a Claude caller is not approved by a Codex-keyed answer for the same UUID.
+        code, _, err = self.run_check("--app", "--preview", PREVIEW,
+                                      identity={"codex:" + self.CLAUDE_UUID: claude_top},
+                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+
+    def test_control_api_down_refuses_and_approves_nothing(self):
+        # No seam answer and no control credential: the helper must refuse, never approve on a guess.
+        self.claude_top(None, self.CLAUDE_UUID)
+        code, _, err = self.run_check("--app", "--preview", PREVIEW, identity={},
+                                      native_env={"CLAUDE_CODE_SESSION_ID": self.CLAUDE_UUID})
+        self.assertEqual(code, 2, err)
+
+
+# ---- live request path: shared Claude session id, parent and two children, no identity seam
+
+class SharedSessionControlStub:
+    """A Robob control API on a real socket that answers the way C1 does for a shared Claude session.
+
+    Claude children share the parent's session id, and a bare Claude id has no agent id, so C1 answers the parent's
+    top-level identity for every caller that presents that id. The stub records each request it receives.
+    """
+
+    SHARED = "11111111-2222-3333-4444-555555555555"
+    PARENT = "t-parent"
+
+    def __init__(self):
+        import http.server
+        import threading
+        self.requests = []
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                from urllib.parse import urlparse, parse_qs
+                url = urlparse(self.path)
+                stub.requests.append((url.path, parse_qs(url.query)))
+                if self.headers.get("Authorization") != "Bearer stub-token":
+                    body = {"ok": False}
+                    code = 401
+                elif url.path == "/api/ardud/control/identity/resolve":
+                    q = parse_qs(url.query)
+                    if q.get("driver", [""])[0] == "claudeAgent" and q.get("nativeId", [""])[0] == stub.SHARED:
+                        body = {"ok": True, "identity": {
+                            "resolution": "resolved", "robobThreadId": stub.PARENT, "parentThreadId": None,
+                            "executionKind": "top-level", "acceptsMessages": True, "candidates": []}}
+                    else:
+                        body = {"ok": True, "identity": {
+                            "resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                            "executionKind": None, "acceptsMessages": False, "candidates": []}}
+                    code = 200
+                else:
+                    body, code = {"ok": False}, 404
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class SharedSessionRequestPathTest(unittest.TestCase):
+    """Parent and two children all present the shared Claude session id through the real request path.
+
+    No identity seam is set, so the helper calls the control API exactly as it does in production. Every caller
+    must be refused, and none may approve on the parent's stream.
+    """
+
+    def setUp(self):
+        self.stub = SharedSessionControlStub()
+        self.addCleanup(self.stub.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        creds = os.path.join(self.tmp.name, ".robob", "components")
+        os.makedirs(creds)
+        cred = os.path.join(creds, "watchers.json")
+        with open(cred, "w") as fh:
+            json.dump({"url": self.stub.url, "token": "stub-token"}, fh)
+        os.chmod(cred, 0o600)
+        self.draft = os.path.join(self.tmp.name, "draft.txt")
+        with open(self.draft, "w") as fh:
+            fh.write(PREVIEW)
+
+    def check_as(self, env_extra):
+        env = {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "ROBOB_TEST": "1",
+               "SEND_APPROVAL_LOG": os.path.join(self.tmp.name, "decisions.jsonl"),
+               "SEND_APPROVAL_STATE_DB": os.path.join(self.tmp.name, "missing.sqlite"),
+               "SEND_APPROVAL_BRIDGE_DIR": self.tmp.name, "SEND_APPROVAL_FORMATTER": FORMATTER,
+               "SEND_APPROVAL_BUN": BUN, **env_extra}
+        r = subprocess.run(["/usr/bin/python3", HELPER, "check", "--app", "--preview", PREVIEW,
+                            "--drafted-at", str(DRAFTED)],
+                           capture_output=True, text=True, env=env)
+        return r.returncode, r.stderr.strip()
+
+    def test_parent_and_two_children_on_a_shared_session_are_all_refused(self):
+        shared = self.stub.SHARED
+        # The parent, and two in-process children, all present the same CLAUDE_CODE_SESSION_ID.
+        for who in ("parent", "child-a", "child-b"):
+            code, err = self.check_as({"CLAUDE_CODE_SESSION_ID": shared})
+            self.assertEqual(code, 2, f"{who} must be refused, got: {err}")
+            self.assertIn("can't prove", err, f"{who} refused for the wrong reason: {err}")
+        # The request path really ran: every call asked C1 with driver=claudeAgent and the shared id.
+        resolves = [q for path, q in self.stub.requests if path.endswith("/identity/resolve")]
+        self.assertEqual(len(resolves), 3)
+        for q in resolves:
+            self.assertEqual(q["driver"], ["claudeAgent"])
+            self.assertEqual(q["nativeId"], [shared])
+
+    def test_codex_child_of_a_shared_session_is_refused_as_a_child_not_as_the_parent(self):
+        # A Codex child with a concrete thread id is provably a child: refused on its execution kind.
+        self.stub.requests.clear()
+        code, err = self.check_as({"CODEX_THREAD_ID": self.stub.SHARED})
+        self.assertEqual(code, 2, err)
+        self.assertNotIn("can't prove", err)
 
 
 if __name__ == "__main__":

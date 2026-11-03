@@ -99,11 +99,18 @@ const make = Effect.gen(function* () {
   // so restarting does not trigger another scan before the daily interval.
   const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at");
   const compact = Effect.gen(function* () {
-    yield* maintenance.compactEventStoreWith({
+    const result = yield* maintenance.compactEventStoreWith({
       minPageIntervalMs: COMPACTION_MIN_PAGE_INTERVAL_MS,
     });
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
+    if (
+      result.deletedEventCount > 0 ||
+      result.deletedReceiptCount > 0 ||
+      result.consideredTextEventCount > 0
+    ) {
+      yield* Effect.logInfo("Compacted orchestration history", result);
+    }
   }).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Orchestration history compaction failed", { cause }),

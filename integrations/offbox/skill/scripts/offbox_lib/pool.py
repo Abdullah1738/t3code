@@ -168,6 +168,9 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None):
 
 def _acquire(con, me, size, template, base, fresh, run_id):
     from . import api, lease
+    from .identity import require_proven
+    # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
+    require_proven(me, "run")
     lease.cap_check()
     capacity.schema(con)
     key = me["repo_key"]
