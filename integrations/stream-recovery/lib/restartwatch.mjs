@@ -109,8 +109,9 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   const turnCut = cuts.length > 0;
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held)
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
+  const candidates = subs.filter((sub) => sub.kind !== 'delegated' || !io.delegatedStoppedSince(db, sub));
   const lost = [];
-  for (const sub of subs) lost.push(await lostSubagent({ io, db, sub, active, incident }));
+  for (const sub of candidates) lost.push(await lostSubagent({ io, db, sub, active, incident }));
   // Past the hold-back window a thread that is busy, or ran again after its
   // cut, has moved on; a late "carry on" note would only confuse it.
   const windowOver = now - windowStart >= RESTART_RESUME_WINDOW_MS;
@@ -154,6 +155,11 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
     }
     if (io.stoppedSince(db, threadId, isoOf(incident.startMs))) {
       res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'stopped after the restart' };
+      return res;
+    }
+    if (sending && candidates.some((s) => s.kind === 'delegated' && io.delegatedStoppedSince(db, s))) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'delegated task stopped during recovery' };
+      res.deferred = true;
       return res;
     }
     progress.staleHeld = staleHeld;

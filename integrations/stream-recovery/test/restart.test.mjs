@@ -166,6 +166,7 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
     cancelledDelegatedTasksSince: () => delegated.map((s) => ({ ...s })),
     childRunOutcomeSince: () => null,
     childNativeSession: () => null,
+    delegatedStoppedSince: () => false,
     runMessages: () => [],
     subagentParent: () => null,
     threadRoot: () => null,
@@ -352,6 +353,44 @@ test('stall-watch interrupts are not treated as lost delegated tasks', async () 
       assert.equal(report.length, 0);
     }
     assert.equal(calls.send.length + calls.telegram.length, 0);
+  } finally { db.close(); }
+});
+
+test('a child Stop during deferred recovery removes its saved delegated row', async () => {
+  const { db, task, stop } = delegatedFixture();
+  try {
+    const row = task('late-stop');
+    const thread = { title: 'Batch', activeRunId: 'fresh', status: 'running' };
+    const { io, calls } = fakeIo({ threads: { batch: thread } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.delegatedStoppedSince = dbIo.delegatedStoppedSince;
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state, { db }), io);
+    assert.equal(calls.send.length, 0);
+    stop('later-child-run', row.child_thread_id, T0 + 10_000);
+    thread.activeRunId = null;
+    thread.status = 'completed';
+    await restartScan(scanArgs(state, { db }), io);
+    assert.equal(calls.send.length, 0);
+  } finally { db.close(); }
+});
+
+test('an old parent Stop does not suppress a newer delegated task', () => {
+  const { db, task, stop } = delegatedFixture();
+  try {
+    const row = task('after-stop');
+    stop(row.run_id, 'batch', T0 - 120_000);
+    assert.equal(dbIo.cancelledDelegatedTasksSince(db, iso(T0)).length, 1);
+  } finally { db.close(); }
+});
+
+test('a completed run with restart-cancelled awaited work is not called finished', () => {
+  const { db, task, addRun } = delegatedFixture();
+  try {
+    const row = task('background-cut');
+    addRun('background-cut-run', row.child_thread_id, 1, 'completed', T0 - 50_000, T0 + 2_000,
+      { restartCancelledBackgroundWork: [{ kind: 'subagent' }] });
+    assert.equal(dbIo.childRunOutcomeSince(db, row.child_thread_id, row.subagent_id, row.completed_at), null);
   } finally { db.close(); }
 });
 
