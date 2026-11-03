@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
   KanbanCardId,
+  KanbanError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -78,7 +79,7 @@ const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =
   );
 
 // Threads launch idle; `running` keeps a work thread's slot between cards.
-const fakeThreads = (dbPath?: string) => {
+const fakeThreads = (dbPath?: string, editCardError?: KanbanError, postToCardError?: KanbanError) => {
   const running = new Set<string>();
   const parents = new Map<ThreadId, ThreadId>();
   let launched = 0;
@@ -122,6 +123,18 @@ const fakeThreads = (dbPath?: string) => {
   const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-kanban-tools-test-",
   }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
+  const serviceLayer = editCardError || postToCardError
+    ? Layer.effect(
+        KanbanService.KanbanService,
+        Effect.map(KanbanService.KanbanService, (service) =>
+          KanbanService.KanbanService.of({
+            ...service,
+            editCard: (...args) => editCardError ? Effect.fail(editCardError) : service.editCard(...args),
+            postToCard: (...args) => postToCardError ? Effect.fail(postToCardError) : service.postToCard(...args),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanService.layer))
+    : KanbanService.layer;
   const layer = McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
@@ -140,7 +153,7 @@ const fakeThreads = (dbPath?: string) => {
         },
       }),
     ),
-    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(serviceLayer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
     Layer.provideMerge(KanbanStore.layer),
@@ -194,6 +207,48 @@ it.effect("a work thread with nothing active defaults to the cards still its own
     assert.isFalse(read.isError, read.text);
     const discussion = yield* kanban.cardDiscussion(second.id);
     assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("card_update preserves the not-written error from the board service", () => {
+  const error = new KanbanError({
+    code: "failed",
+    detail: "Board busy: not written. Safe to retry once.",
+  });
+  const { layer } = fakeThreads(undefined, error);
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({ slug: "busy", name: "Busy", defaultProjectId: null });
+    const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A", description: "A" }, owner);
+    const result = yield* call(ThreadId.make("thread-busy-test"), "card_update", {
+      card: card.id,
+      description: "New",
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, error.message);
+    assert.strictEqual((yield* kanban.card(card.id)).card.description, "A");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion_post to a card leaves no discussion when the write is refused", () => {
+  const error = new KanbanError({
+    code: "failed",
+    detail: "Board busy: not written. Safe to retry once.",
+  });
+  const { layer } = fakeThreads(undefined, undefined, error);
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({ slug: "post-busy", name: "Busy", defaultProjectId: null });
+    const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A", description: "A" }, owner);
+    const before = yield* kanban.card(card.id);
+    const result = yield* call(ThreadId.make("thread-busy-test"), "discussion_post", {
+      card: card.id,
+      text: "Must not post",
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, error.message);
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+    assert.lengthOf(yield* kanban.discussions(board.id), 0);
   }).pipe(Effect.provide(layer));
 });
 

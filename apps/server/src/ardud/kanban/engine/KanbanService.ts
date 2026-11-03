@@ -47,6 +47,7 @@ import {
 import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -83,6 +84,7 @@ import { selectionRoutingEnabled } from "./selectionSettings.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
+export const BOARD_WRITE_START_DEADLINE_MS = 20_000;
 
 const wakeKey = (threadId: string, at: string) =>
   `wake:${NodeCrypto.createHash("sha256").update(`${threadId}|${at}`).digest("hex").slice(0, 32)}`;
@@ -391,6 +393,11 @@ export interface KanbanServiceShape {
   readonly attachmentPath: (attachment: ChatAttachment) => string | null;
   readonly post: (
     discussionId: KanbanDiscussion["id"],
+    author: KanbanActor,
+    blocks: ReadonlyArray<KanbanBlock>,
+  ) => Effect.Effect<KanbanMessage, KanbanError>;
+  readonly postToCard: (
+    cardId: KanbanCard["id"],
     author: KanbanActor,
     blocks: ReadonlyArray<KanbanBlock>,
   ) => Effect.Effect<KanbanMessage, KanbanError>;
@@ -4167,7 +4174,44 @@ const make = Effect.gen(function* () {
   });
 
   const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    lock.withPermits(1)(effect).pipe(Effect.mapError(toKanbanError));
+    Clock.clockWith((clock) =>
+      Effect.suspend(() => {
+        let started = false;
+        let expired = false;
+        const start = clock.monotonicTimeNanosUnsafe();
+        const busy = () => failWith("failed", "Board busy: not written. Safe to retry once.");
+        const write = lock.withPermits(1)(
+          Effect.uninterruptible(
+            Effect.suspend<A, E | KanbanError, R>(() => {
+              // The timer can be delayed by a stalled event loop; check again at the permit.
+              if (
+                expired ||
+                clock.monotonicTimeNanosUnsafe() - start >=
+                  BigInt(BOARD_WRITE_START_DEADLINE_MS) * 1_000_000n
+              ) {
+                return busy();
+              }
+              started = true;
+              return effect;
+            }),
+          ),
+        );
+        const deadline = Effect.sleep(BOARD_WRITE_START_DEADLINE_MS).pipe(
+          Effect.flatMap(() =>
+            Effect.suspend(() => {
+              if (started) return Effect.never;
+              expired = true;
+              return busy();
+            }),
+          ),
+        );
+        // The winner sets the state synchronously, before a late permit can start a write.
+        return Effect.raceFirst(write, deadline).pipe(
+          Effect.onInterrupt(() => Effect.sync(() => { expired = true; })),
+          Effect.mapError(toKanbanError),
+        );
+      }),
+    );
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(toKanbanError));
   // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
@@ -6162,6 +6206,13 @@ const make = Effect.gen(function* () {
     }),
     messages: (id, options) => readDb(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
+    postToCard: (cardId, author, blocks) =>
+      guard(
+        Effect.gen(function* () {
+          const discussion = yield* cardDiscussionUnlocked(cardId);
+          return yield* postUnlocked(discussion.id, author, blocks);
+        }),
+      ),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,

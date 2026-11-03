@@ -273,6 +273,34 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   return yield* invalid("Pass discussionId: this thread has no discussion of its own.");
 });
 
+/** A post to a card must create its discussion and message under one write guard. */
+const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
+  service: KanbanService["Service"],
+  caller: Caller,
+  explicit: string | undefined,
+  cardRef: string | undefined,
+) {
+  if (explicit?.trim()) return { kind: "discussion" as const, id: KanbanDiscussionId.make(explicit.trim()) };
+  if (cardRef?.trim()) {
+    const card = yield* cardFor(service, caller, cardRef);
+    yield* ownCard(caller, card);
+    return { kind: "card" as const, id: card.id };
+  }
+  if (caller.link?.discussionId) return { kind: "discussion" as const, id: caller.link.discussionId };
+  if (caller.link?.role === "work") {
+    const cards = yield* workCards(service, caller);
+    const [only] = cards;
+    if (cards.length === 1 && only) return { kind: "card" as const, id: only.id };
+    return yield* invalid(
+      cards.length > 1
+        ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
+        : "Pass discussionId: this thread has no card of its own.",
+    );
+  }
+  if (isCardThread(caller)) return { kind: "card" as const, id: (yield* defaultCard(service, caller)).id };
+  return yield* invalid("Pass discussionId: this thread has no discussion of its own.");
+});
+
 const cardIds = (
   service: KanbanService["Service"],
   caller: Caller,
@@ -493,8 +521,12 @@ const handlers = {
       Effect.gen(function* () {
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
-        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
-        return { message: yield* service.post(discussion.id, caller.actor, blocks) };
+        const target = yield* postTargetFor(service, caller, input.discussionId, input.card);
+        return {
+          message: yield* (target.kind === "card"
+            ? service.postToCard(target.id, caller.actor, blocks)
+            : service.post(target.id, caller.actor, blocks)),
+        };
       }),
     ),
   ),
