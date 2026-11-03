@@ -203,9 +203,10 @@ const counts = (lost) => {
 };
 
 // Sessions the stall watch interrupted itself; their cancels are not a restart.
-function stallInterrupted(state, ses, cancelMs) {
+function stallInterrupted(state, ses, cancelMs, threadId = null) {
   return Object.values(state.stalls ?? {}).some(
-    (s) => s.ses === ses && (s.action === "opencode" || s.action === "robob") && Math.abs(cancelMs - s.interruptedAt) < 15 * 60_000,
+    (s) => ((ses && s.ses === ses) || (threadId && s.threadId === threadId))
+      && (s.action === "opencode" || s.action === "robob") && Math.abs(cancelMs - s.interruptedAt) < 15 * 60_000,
   );
 }
 
@@ -214,7 +215,9 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
   const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
     .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
-  const subs = [...nativeSubs, ...io.cancelledDelegatedTasksSince(db, sinceIso)];
+  const delegatedSubs = io.cancelledDelegatedTasksSince(db, sinceIso)
+    .filter((s) => !stallInterrupted(state, io.childNativeSession(db, s.childThreadId), toMs(s.completed_at), s.childThreadId));
+  const subs = [...nativeSubs, ...delegatedSubs];
   for (const s of subs) {
     s.parentThreadId = topParent(io, db, s.thread_id) ?? s.thread_id;
     s.rootThreadId = io.threadRoot(db, s.parentThreadId) ?? s.parentThreadId;

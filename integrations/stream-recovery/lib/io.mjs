@@ -132,6 +132,15 @@ export function childRunOutcomeSince(db, childThreadId, taskRef, sinceIso) {
   return completed ? { status: 'finished', run_id: completed.run_id, completed_at: completed.completed_at } : null;
 }
 
+export function childNativeSession(db, childThreadId) {
+  if (!childThreadId) return null;
+  const providerThread = db.prepare(
+    `select provider_thread_id from orchestration_v2_projection_runs
+      where thread_id=? and provider_thread_id is not null order by ordinal desc limit 1`,
+  ).get(childThreadId)?.provider_thread_id;
+  return /native-thread:(ses_[A-Za-z0-9]+)/.exec(providerThread ?? '')?.[1] ?? null;
+}
+
 // A user_message turn item materializes when a queued turn starts, before
 // startedAt is set. It distinguishes cancelled starts from cancelled queues.
 // An OpenCode crash leaves Robob's turns 'interrupted' with no

@@ -165,6 +165,7 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
     cancelledSubagentsSince: () => subs.map((s) => ({ ...s })),
     cancelledDelegatedTasksSince: () => delegated.map((s) => ({ ...s })),
     childRunOutcomeSince: () => null,
+    childNativeSession: () => null,
     runMessages: () => [],
     subagentParent: () => null,
     threadRoot: () => null,
@@ -283,6 +284,7 @@ test('mixed native and delegated tasks share the prompt budget and use separate 
     assert.match(note, /session ses_native.*cut off/);
     assert.match(note, /delegated task "Task mixed".*task_status node:delegated-task:mixed/);
     assert.match(note, /pass its session id as the session to continue/);
+    assert.match(note, /Robob will not deliver the native subagents' results, so nothing will wake you for them/);
     assert.match(note, /Read a subagent's output with: curl/);
     assert.equal((note.match(/Original prompt \(start\)/g) ?? []).length, 2);
     assert.doesNotMatch(note, /n{1201}|d{1201}/);
@@ -332,6 +334,24 @@ test('delegated tasks follow their restart continuation, not unrelated child run
     assert.match(calls.send[0].text, /Task running.*a continuation is running or queued.*don't relaunch/);
     assert.match(calls.send[0].text, /Task continued.*: finished/);
     assert.match(calls.send[0].text, /Task unrelated.*: cut off by the restart/);
+  } finally { db.close(); }
+});
+
+test('stall-watch interrupts are not treated as lost delegated tasks', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    const row = task('stall');
+    const { io, calls } = fakeIo({ threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childNativeSession = () => 'ses_stalled';
+    for (const stall of [
+      { ses: 'ses_stalled', action: 'opencode', interruptedAt: T0 },
+      { threadId: row.child_thread_id, action: 'robob', interruptedAt: T0 },
+    ]) {
+      const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls: { stall } }, { db }), io);
+      assert.equal(report.length, 0);
+    }
+    assert.equal(calls.send.length + calls.telegram.length, 0);
   } finally { db.close(); }
 });
 

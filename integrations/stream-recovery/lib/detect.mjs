@@ -479,7 +479,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
   const parts = [
     `[stream-recovery] ${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restarted at ${at}` +
       (delegated.length
-        ? ` and affected ${[native.length ? `${native.length} background subagent(s)` : '', `${delegated.length} delegated task(s)`].filter(Boolean).join(' and ')} this thread had running. Check their status before resuming them.`
+        ? ` and affected ${[native.length ? `${native.length} background subagent(s)` : '', `${delegated.length} delegated task(s)`].filter(Boolean).join(' and ')} this thread had running. Check their status before resuming them.${native.length ? " Robob will not deliver the native subagents' results, so nothing will wake you for them." : ''}`
         : needs.length ? ` and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` : '.') +
       (turnCut ? ` Your own turn was cut off by the same restart; carry on from where you were.` : ""),
     `On every macOS boot, dirhelper -machineBoot fully wipes $TMPDIR. Scratch files under $TMPDIR/opencode are gone after a Mac reboot; reconstruct missing briefs and reports from durable files or session history before resuming work.`,
