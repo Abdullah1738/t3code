@@ -100,11 +100,19 @@ class FakeCliTestCase(unittest.TestCase):
             keychain.touch()
         self.home_patch = mock.patch.object(hc, "prepare_isolated_home", side_effect=fake_home)
         self.home_patch.start()
+        # Fake scripts use an interpreter; real-binary containment is tested separately.
+        def fake_run_cli(binary, args, *, env, timeout=300, cwd=None, **_):
+            hc.require_isolated_home(env)
+            return subprocess.run([str(binary), *args], env=env, cwd=cwd, capture_output=True,
+                                  text=True, timeout=timeout)
+        self.run_patch = mock.patch.object(hc, "run_cli", side_effect=fake_run_cli)
+        self.run_patch.start()
         self.write_fake_npm()
         self.write_notify_stub()
         self.write_plist()
 
     def tearDown(self) -> None:
+        self.run_patch.stop()
         self.home_patch.stop()
         self.env_patch.stop()
         # Staged version trees are read-only; restore write bits so the sandbox always goes.
@@ -185,21 +193,25 @@ print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
 
     def fake_codex_binary(self, version: str, body_extra: str = "", *, leak_read: bool = False) -> bytes:
         script = r'''#!/opt/homebrew/bin/python3
-import json, os, sys, tomllib, urllib.request
+import json, os, sys, tomllib, urllib.request, sqlite3
 from pathlib import Path
 if "--version" in sys.argv:
     print("codex-cli VERSION"); sys.exit(0)
 home = Path(os.environ["CODEX_HOME"])
 config = tomllib.loads((home / "config.toml").read_text())
 assert "--ephemeral" not in sys.argv
-assert list((home / "sessions").rglob("rollout-*.jsonl"))
 if "gpt-6.1-terra" in sys.argv:
     assert config.get("model") == "gpt-6.1-terra"
     assert config.get("features", {}).get("computer_use") is True
     assert config.get("model_context_window") == 1050000
     assert (home / "models.json").is_file() and (home / "AGENTS.md").is_file()
-if config.get("features", {}).get("memories") or LEAK:
+if (config.get("features", {}).get("memories") and (home / "fixture-id").exists()) or LEAK:
     (home / "memories" / "phase2-output").write_text("pipeline ran")
+    conn = sqlite3.connect(home / "memories_1.sqlite")
+    conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)")
+    conn.execute("INSERT INTO stage1_outputs VALUES (?, 'extracted preference', '')", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.commit(); conn.close()
 enabled = config.get("features", {}).get("memories")
 input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"
 if LEAK_READ:
@@ -567,6 +579,12 @@ class CanaryTests(FakeCliTestCase):
         self.router_patch = mock.patch.dict(os.environ, {"HARNESS_CLI_9ROUTER": f"http://127.0.0.1:{self.upstream.server_address[1]}"})
         self.router_patch.start()
         self.addCleanup(self.router_patch.stop)
+        def fake_seed(chome, work, version):
+            (chome / "fixture-id").write_text("fixture")
+            return "fixture"
+        self.seed_patch = mock.patch.object(hc, "seed_codex_rollout", side_effect=fake_seed)
+        self.seed_patch.start()
+        self.addCleanup(self.seed_patch.stop)
 
     def install_binary(self, tool: str, version: str, body: bytes) -> Path:
         bin_dir = self.root / tool / version / "bin"
@@ -615,7 +633,7 @@ class CanaryTests(FakeCliTestCase):
 
     def test_nested_tool_input_is_not_transformation_evidence(self) -> None:
         record = {}
-        hc.Recorder("http://127.0.0.1", "dummy").capture_response(
+        hc.Recorder("http://127.0.0.1:20128", "dummy").capture_response(
             b'{"content":[{"type":"tool_use","input":{"input_transformations":[]}}]}', record)
         self.assertEqual(record["response_transformations"], [])
 
@@ -674,6 +692,71 @@ class CanaryTests(FakeCliTestCase):
         (home / "raw_memories.md").write_text("new")
         after = hc.codex_memory_snapshot(home)
         self.assertEqual(set(after) - set(before), {"phase2-output", "raw_memories.md"})
+
+    def test_empty_codex_database_does_not_count_as_pipeline_work(self) -> None:
+        body = self.fake_codex_binary("0.166.0")
+        start = body.index(b'    (home / "memories" / "phase2-output").write_text')
+        end = body.index(b'enabled = config.get', start)
+        body = body[:start] + b'    (home / "memories_1.sqlite").touch()\n' + body[end:]
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertFalse(verdict["result"]["positiveControlFired"])
+        self.assertFalse(verdict["result"]["cu"]["positiveControlFired"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_initialized_codex_database_is_not_memory_pipeline_work(self) -> None:
+        import sqlite3
+        home = self.tmp / "codex-memory-init"
+        home.mkdir()
+        before = hc.codex_memory_snapshot(home)
+        from contextlib import closing
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("CREATE TABLE stage1_outputs (raw_memory TEXT)")
+            conn.execute("CREATE TABLE jobs (status TEXT)")
+            conn.execute("CREATE TABLE consolidation_progress (singleton INTEGER)")
+            conn.execute("INSERT INTO consolidation_progress VALUES (1)")
+            conn.commit()
+        after = hc.codex_memory_snapshot(home)
+        self.assertEqual(hc.codex_memory_pipeline_evidence(home, before, after), [])
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("INSERT INTO stage1_outputs VALUES ('content')")
+            conn.commit()
+        after = hc.codex_memory_snapshot(home)
+        self.assertIn("memories_1.sqlite:stage1_outputs", hc.codex_memory_pipeline_evidence(home, before, after))
+
+    def test_jobs_or_consolidation_initialization_is_not_positive_extraction(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        home = self.tmp / "codex-no-extraction"
+        home.mkdir()
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("CREATE TABLE stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
+            conn.execute("CREATE TABLE jobs (status TEXT)")
+            conn.execute("INSERT INTO jobs VALUES ('pending')")
+            conn.commit()
+        self.assertEqual(hc.codex_memory_positive_evidence(home, "fixture"), [])
+
+    def test_codex_memory_fixture_is_indexed_and_old_enough(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        home = self.tmp / "indexed"
+        home.mkdir()
+        with closing(sqlite3.connect(home / "state_5.sqlite")) as conn:
+            conn.execute('''CREATE TABLE threads (id TEXT, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+                source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT,
+                preview TEXT, memory_mode TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, recency_at INTEGER,
+                recency_at_ms INTEGER, first_user_message TEXT, cli_version TEXT)''')
+            conn.commit()
+        self.seed_patch.stop()
+        fixture = hc.seed_codex_rollout(home, self.tmp, "0.166.0")
+        with closing(sqlite3.connect(home / "state_5.sqlite")) as conn:
+            row = conn.execute("SELECT rollout_path, source, preview, memory_mode, updated_at FROM threads WHERE id=?", (fixture,)).fetchone()
+        self.assertTrue(Path(row[0]).is_file())
+        self.assertEqual((row[1], row[3]), ("cli", "enabled"))
+        self.assertTrue(row[2])
+        self.assertGreaterEqual(__import__("time").time() - row[4], 7200)
 
     def test_canary_fails_when_claude_request_body_contains_memory_canary(self) -> None:
         # A fake CLI that echoes the memory canary into its outgoing request body, as built-in memory would.
@@ -1079,6 +1162,84 @@ class StatusAndNotifyTests(FakeCliTestCase):
         with mock.patch.object(hc.sys, "platform", "darwin"):
             with self.assertRaises(hc.HarnessError):
                 hc.run_cli(Path("/not/executed"), [], env={"HOME": str(self.tmp / "missing")})
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_cli_fences_second_loopback_subprocess_and_outside_writes(self) -> None:
+        self.run_patch.stop()
+        import http.server
+        import threading
+        class Sink(http.server.BaseHTTPRequestHandler):
+            hits = 0
+            def log_message(self, *args): pass
+            def do_POST(self):
+                type(self).hits += 1
+                self.send_response(200)
+                self.send_header("content-length", "0")
+                self.end_headers()
+        allowed = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        self.addCleanup(allowed.server_close)
+        self.addCleanup(other.server_close)
+        self.addCleanup(allowed.shutdown)
+        self.addCleanup(other.shutdown)
+        for server in (allowed, other):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        work = self.tmp / "sandbox"
+        home = work / "home"
+        hc.prepare_isolated_home(home)
+        outside = self.tmp / "outside"
+        code = '''import os,sys,urllib.request,subprocess,socket
+def post(url):
+ try: urllib.request.urlopen(urllib.request.Request(url,data=b'x'),timeout=3).read(); return 'allowed'
+ except Exception: return 'denied'
+print('recorder',post(sys.argv[1]))
+print('bypass',post(sys.argv[2]))
+try: open(sys.argv[3],'w').write('bad'); print('write allowed')
+except OSError: print('write denied')
+try: subprocess.run(['/bin/echo','bad'],check=True); print('exec allowed')
+except (OSError,subprocess.SubprocessError): print('exec denied')
+try: socket.socket(socket.AF_UNIX).connect(sys.argv[4]); print('unix allowed')
+except OSError: print('unix denied')
+'''
+        base = f"http://127.0.0.1:{allowed.server_port}"
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "ANTHROPIC_BASE_URL": base}
+        py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        sockpath = str(self.tmp / 'local-sock')
+        listener = __import__('socket').socket(__import__('socket').AF_UNIX)
+        listener.bind(sockpath); listener.listen()
+        self.addCleanup(listener.close)
+        result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath],
+                            env=env, cwd=work, sandbox_root=work, recorder_url=base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recorder allowed", result.stdout)
+        self.assertIn("bypass denied", result.stdout)
+        self.assertIn("write denied", result.stdout)
+        self.assertIn("exec denied", result.stdout)
+        self.assertIn("unix denied", result.stdout)
+        self.assertEqual(Sink.hits, 1)
+        self.assertFalse(outside.exists())
+
+    def test_cli_rejects_missing_or_untrusted_recorder(self) -> None:
+        self.run_patch.stop()
+        work = self.tmp / "isolated"
+        home = work / "home"
+        hc.prepare_isolated_home(home)
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+        for url in ("http://127.0.0.1:22/other", "http://localhost:22", "http://example.com:22", "http://127.0.0.1:22@evil.com"):
+            with self.subTest(url=url), self.assertRaises(hc.HarnessError):
+                hc.run_cli(Path("/bin/echo"), [], env=env, cwd=work, sandbox_root=work, recorder_url=url)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_version_probe_is_offline(self) -> None:
+        self.run_patch.stop()
+        home = self.tmp / "version" / "home"
+        hc.prepare_isolated_home(home)
+        work = home.parent
+        py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        code = "import socket; s=socket.socket(); print(s.connect_ex(('127.0.0.1',20128)))"
+        proc = hc.run_cli(py, ["-c", code], env={"HOME": str(home)}, cwd=work, sandbox_root=work)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "1")
 
     def test_prepare_home_creates_keychain_before_spawn(self) -> None:
         self.home_patch.stop()

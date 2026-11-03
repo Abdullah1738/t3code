@@ -486,9 +486,10 @@ def binary_version(binary: Path, tool: str) -> str:
         home = Path(work) / "home"
         prepare_isolated_home(home)
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "en_US.UTF-8"}
-        require_isolated_home(env)
-        proc = subprocess.run([str(binary), *TOOLS[tool]["version_flag"]], env=env, capture_output=True,
-                              text=True, timeout=60)
+        proc = run_cli(binary, TOOLS[tool]["version_flag"], env=env, timeout=60,
+                       cwd=Path(work), sandbox_root=Path(work), recorder_url=None)
+    if proc.returncode != 0:
+        raise HarnessError(f"{tool} --version failed under isolation")
     m = re.search(TOOLS[tool]["version_regex"], proc.stdout + proc.stderr, re.M)
     if not m:
         raise HarnessError(f"{tool} --version printed no version")
@@ -508,7 +509,7 @@ class Recorder:
     SECRET_HEADERS = ("authorization", "x-api-key", "cookie")
 
     def __init__(self, upstream: str, key: str):
-        if not re.match(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", upstream):
+        if not re.fullmatch(r"http://127\.0\.0\.1:\d+", upstream):
             raise HarnessError("canary proxy may only forward to a loopback 9router address")
         self.upstream = upstream
         self.key = key
@@ -531,6 +532,9 @@ class Recorder:
                 pass
 
             def do_POST(self):
+                if self.path.startswith("http:") or self.path.startswith("https:") or not self.path.startswith("/") or self.path.startswith("//"):
+                    self.send_error(400)
+                    return
                 length = int(self.headers.get("content-length", "0"))
                 body = self.rfile.read(length)
                 recorder.bodies.append(body)
@@ -556,12 +560,16 @@ class Recorder:
                         values.append("thinking-binding-controls-2026-08-01")
                     headers[beta] = ",".join(values)
                     record["headers"]["anthropic-beta"] = headers[beta]
+                headers = {k: v for k, v in headers.items() if k.lower() not in ("proxy-connection", "proxy-authorization")}
                 headers["x-api-key"] = recorder.key
                 headers["authorization"] = f"Bearer {recorder.key}"
                 req = urllib.request.Request(recorder.upstream + self.path, data=body, headers=headers,
                                              method="POST")
                 try:
-                    with urllib.request.urlopen(req, timeout=300) as resp:
+                    class NoRedirect(urllib.request.HTTPRedirectHandler):
+                        def redirect_request(self, req, fp, code, msg, headers, newurl):
+                            return None
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(req, timeout=300) as resp:
                         payload = resp.read()
                         recorder.capture_response(payload, record)
                         self.send_response(resp.status)
@@ -571,12 +579,17 @@ class Recorder:
                         self.send_header("content-length", str(len(payload)))
                         self.end_headers()
                         self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
                 except Exception as exc:  # report, do not leak the key
                     msg = f"proxy upstream error: {type(exc).__name__}".encode()
-                    self.send_response(502)
-                    self.send_header("content-length", str(len(msg)))
-                    self.end_headers()
-                    self.wfile.write(msg)
+                    try:
+                        self.send_response(502)
+                        self.send_header("content-length", str(len(msg)))
+                        self.end_headers()
+                        self.wfile.write(msg)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -587,6 +600,8 @@ class Recorder:
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+            if self.thread:
+                self.thread.join(timeout=5)
 
     @staticmethod
     def thinking_blocks_from(payload: bytes) -> list[dict]:
@@ -660,11 +675,52 @@ def nine_router_key() -> str:
 
 
 def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
-            cwd: Path | None = None) -> subprocess.CompletedProcess:
-    """Run a CLI with an explicit cwd, so per-project state (memory) is the one the canary seeded."""
+            cwd: Path | None = None, sandbox_root: Path | None = None,
+            recorder_url: str | None = None) -> subprocess.CompletedProcess:
+    """Run only the selected binary, with writes and network confined to the probe."""
     require_isolated_home(env)
-    return subprocess.run([str(binary), *args], env=env, capture_output=True, text=True,
-                          timeout=timeout, cwd=str(cwd) if cwd else None)
+    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        raise HarnessError("CLI isolation requires macOS sandbox-exec")
+    if sandbox_root is None or cwd is None:
+        raise HarnessError("CLI isolation requires an explicit scratch root and cwd")
+    scratch = sandbox_root.resolve(strict=True)
+    try:
+        Path(env["HOME"]).resolve(strict=True).relative_to(scratch)
+        cwd.resolve(strict=True).relative_to(scratch)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HarnessError("CLI home and cwd must be inside the scratch root") from exc
+    if not scratch.is_relative_to(Path(tempfile.gettempdir()).resolve()) or scratch == Path(tempfile.gettempdir()).resolve():
+        raise HarnessError("CLI scratch root must be a private temporary directory")
+    binary = binary.resolve(strict=True)
+    # These paths come from the account database rather than the disposable HOME.
+    import pwd
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    sb = lambda value: json.dumps(str(value))
+    rules = ["(version 1)", "(allow default)", "(deny process-exec)",
+             f"(allow process-exec (literal {sb(binary)}))", "(deny network-outbound)",
+             "(deny file-write*)", f"(allow file-write* (subpath {sb(scratch)}) (literal \"/dev/null\"))",
+             f"(deny file-read* (subpath {sb(real_home / 'Library' / 'Keychains')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.claude')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.codex')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.robob')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.9router')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.config')}))",
+             f"(deny file-read* (subpath {sb(real_home / '.local')}))",
+             f"(deny file-read* (subpath {sb('/Volumes/ExternalSSD/codex')}))",
+             '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc"))']
+    if recorder_url is not None:
+        from urllib.parse import urlsplit
+        try:
+            parsed = urlsplit(recorder_url)
+            port = parsed.port
+        except ValueError as exc:
+            raise HarnessError("invalid recorder URL") from exc
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not port or parsed.path or parsed.query or parsed.fragment or parsed.username:
+            raise HarnessError("CLI recorder must be an exact loopback HTTP port")
+        rules.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
+    profile = "".join(rules)
+    return subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(binary), *args], env=env, capture_output=True, text=True,
+                           timeout=timeout, cwd=str(cwd) if cwd else None)
 
 
 def make_throwaway_homes(work: Path) -> tuple[Path, Path]:
@@ -798,13 +854,14 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         turn1 = run_cli(binary, ["-p", f"Remember the code {THINKING_CANARY_WORD}. Think it through briefly, "
                                  "then reply with the single word OK.", "--model", routed,
                                  "--effort", "high", "--session-id", session_id, "--output-format", "text"],
-                        env=env, timeout=240, cwd=project)
+                        env=env, timeout=240, cwd=project, sandbox_root=work, recorder_url=base)
         turn1_ok = turn1.returncode == 0 and "OK" in turn1.stdout
         first_turn = list(recorder.requests)
         boundary = len(first_turn)
         turn2 = run_cli(binary, ["-p", "What code did I ask you to remember? Reply with the code only.",
                                  "--model", routed, "--effort", "high", "--resume", session_id,
-                                 "--output-format", "text"], env=env, timeout=240, cwd=project)
+                                 "--output-format", "text"], env=env, timeout=240, cwd=project,
+                        sandbox_root=work, recorder_url=base)
         turn2_ok = turn2.returncode == 0 and THINKING_CANARY_WORD in turn2.stdout
         results[model] = {"ok": turn1_ok and turn2_ok, "turn1Ok": turn1_ok, "turn2Ok": turn2_ok}
         # The recorder keeps every upstream request and the thinking blocks each reply returned.
@@ -814,7 +871,8 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         results["thinkingReplayed"] = preserved["thinkingReplayed"]
         results["inputTransformationsEmpty"] = preserved["inputTransformationsEmpty"]
         haiku = run_cli(binary, ["-p", "Reply exactly OK.", "--model", CLAUDE_MODEL_IDS["claude-haiku-5-5"],
-                                  "--effort", "low", "--output-format", "text"], env=env, timeout=240, cwd=project)
+                                  "--effort", "low", "--output-format", "text"], env=env, timeout=240, cwd=project,
+                        sandbox_root=work, recorder_url=base)
         results["claude-haiku-5-5"] = {"ok": haiku.returncode == 0 and "OK" in haiku.stdout}
         # Informational diagnostics for the record (never promotion failures).
         results["diagnostics"] = {
@@ -880,6 +938,86 @@ def codex_memory_snapshot(chome: Path) -> dict[str, str]:
     return snapshot
 
 
+def seed_codex_rollout(chome: Path, work: Path, version: str) -> str:
+    """Add an eligible old interactive rollout to the candidate's existing state schema."""
+    import sqlite3
+    from contextlib import closing
+    dbs = sorted(chome.glob("state_*.sqlite"))
+    if len(dbs) != 1:
+        raise HarnessError("Codex did not initialize its session index offline")
+    thread_id = str(uuid.uuid4())
+    old = int(time.time()) - 7200
+    created = dt.datetime.fromtimestamp(old, dt.timezone.utc)
+    stamp = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+    roll = chome / "sessions" / created.strftime("%Y/%m/%d") / f"rollout-{created.strftime('%Y-%m-%dT%H-%M-%S')}-{thread_id}.jsonl"
+    roll.parent.mkdir(parents=True, exist_ok=True)
+    text = "The canary fixture preference is cobalt blue."
+    fixture = [
+        {"timestamp": stamp, "type": "session_meta", "payload": {"id": thread_id, "timestamp": stamp,
+         "cwd": str(work), "originator": "codex_cli_rs", "cli_version": version, "source": "cli"}},
+        {"timestamp": stamp, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}},
+        {"timestamp": stamp, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The fixture preference is cobalt blue."}]}}
+    ]
+    roll.write_text("".join(json.dumps(event) + "\n" for event in fixture), encoding="utf-8")
+    try:
+        with closing(sqlite3.connect(dbs[0])) as conn:
+            conn.execute('''INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider,
+                cwd, title, sandbox_policy, approval_mode, preview, memory_mode, created_at_ms, updated_at_ms,
+                recency_at, recency_at_ms, first_user_message, cli_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (thread_id, str(roll), old, old, "cli", "ninerouter", str(work), "canary fixture", '{"type":"read-only"}',
+                 "never", text, "enabled", old * 1000, old * 1000, old, old * 1000, text, version))
+            conn.commit()
+    except sqlite3.Error as exc:
+        raise HarnessError("Codex session index schema is unsupported; refusing canary") from exc
+    return thread_id
+
+
+def codex_memory_pipeline_evidence(chome: Path, baseline: dict[str, str], after: dict[str, str]) -> list[str]:
+    """Distinguish extracted content/jobs from an initialized, empty memory database."""
+    import sqlite3
+    from contextlib import closing
+    changed = [p for p in set(baseline) | set(after) if baseline.get(p) != after.get(p)]
+    evidence = []
+    # An unknown memory artifact is not silently classified as harmless initialization.
+    inert = re.compile(r"^(memories_1\.sqlite(?:-wal|-shm)?|memories)$")
+    for relative in changed:
+        name = Path(relative).name
+        if not inert.fullmatch(relative) and not relative.startswith("memories/"):
+            evidence.append(relative)
+        if relative in ("memories/MEMORY.md", "memories/memory_summary.md", "memories/raw_memories.md") \
+                or name.startswith(("phase2", "raw_memories")):
+            evidence.append(relative)
+        if relative.startswith("memories/rollout_summaries/") and after.get(relative) not in (None, "directory"):
+            evidence.append(relative)
+        if relative.startswith("memories/") and not relative.startswith(("memories/.git/", "memories/.codex-baseline/", "memories/extensions/")) and after.get(relative) not in (None, "directory"):
+            evidence.append(relative)
+    db = chome / "memories_1.sqlite"
+    if db.is_file() and db.stat().st_size:
+        try:
+            with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as conn:
+                for table in ("stage1_outputs", "jobs"):
+                    if conn.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()[0]:
+                        evidence.append("memories_1.sqlite:" + table)
+        except sqlite3.Error as exc:
+            raise HarnessError("cannot inspect Codex memory database; refusing canary") from exc
+    return sorted(set(evidence))
+
+
+def codex_memory_positive_evidence(chome: Path, fixture_id: str) -> list[str]:
+    """Require a successful extraction with content, not initialization or a queued job."""
+    import sqlite3
+    from contextlib import closing
+    db = chome / "memories_1.sqlite"
+    if not db.is_file() or not db.stat().st_size:
+        return []
+    try:
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as conn:
+            rows = conn.execute("SELECT EXISTS(SELECT 1 FROM stage1_outputs WHERE thread_id = ? AND (length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0))", (fixture_id,)).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise HarnessError("cannot inspect Codex extraction output; refusing canary") from exc
+    return ["memories_1.sqlite:stage1_outputs:content"] if rows else []
+
+
 def codex_memory_in_body(body, sentinel: str, instruction_text: str | None = None) -> tuple[bool, bool]:
     """Inspect decoded JSON strings, including nested Responses API input/content items."""
     sentinel_seen = False
@@ -903,7 +1041,7 @@ def codex_memory_in_body(body, sentinel: str, instruction_text: str | None = Non
 
 
 def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, models: list[str],
-                           *, enable_memory: bool) -> dict:
+                           *, enable_memory: bool, version: str) -> dict:
     """Run Codex against a disposable copy of a generated home, with the memory check.
 
     Not ephemeral: Codex 0.166.0 disables the memory pipeline for ephemeral sessions, so an
@@ -922,28 +1060,13 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         text = text.replace("use_memories = false", "use_memories = true")
         text = text.replace("memories = false", "memories = true")
         cfg_path.write_text(text, encoding="utf-8")
-    # Seed both read-memory files and a completed, non-ephemeral rollout in the disposable home.
+    # Seed read-memory files; the indexed rollout is added after the first startup below.
     sentinel = "ROBOB-CODEX-MEMORY-" + uuid.uuid4().hex
     memory_dir = chome / "memories"
     memory_dir.mkdir(parents=True, exist_ok=True)
     for name in ("MEMORY.md", "memory_summary.md", "raw_memories.md"):
         (memory_dir / name).write_text(f"Canary preference: {sentinel}\n", encoding="utf-8")
     baseline = codex_memory_snapshot(chome)
-    # If the installed
-    # Codex release does not process it, the enabled positive control fails closed.
-    sessions = chome / "sessions" / "2025" / "01" / "01"
-    sessions.mkdir(parents=True, exist_ok=True)
-    rollout = sessions / "rollout-2025-01-01T00-00-00-00000000-0000-4000-8000-000000000001.jsonl"
-    fixture = [
-        {"timestamp": "2025-01-01T00:00:00Z", "type": "session_meta",
-         "payload": {"id": "00000000-0000-4000-8000-000000000001", "timestamp": "2025-01-01T00:00:00Z",
-                     "cwd": str(work), "originator": "codex_cli_rs", "cli_version": "0.166.0", "source": "cli"}},
-        {"timestamp": "2025-01-01T00:00:01Z", "type": "response_item",
-         "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Remember the fixture preference: blue."}]}},
-        {"timestamp": "2025-01-01T00:00:02Z", "type": "response_item",
-         "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The fixture preference is blue."}]}},
-    ]
-    rollout.write_text("".join(json.dumps(event) + "\n" for event in fixture), encoding="utf-8")
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
     results: dict = {"positiveControl": enable_memory, "models": {}}
@@ -956,12 +1079,18 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
         if enable_memory:
-            cfg += ["-c", "memories.min_rollout_idle_hours=0", "-c", "memories.max_rollouts_per_startup=1"]
+            cfg += ["-c", "memories.min_rollout_idle_hours=1", "-c", "memories.max_rollouts_per_startup=1"]
+            bootstrap = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
+                                        "-m", models[0], *cfg, "Reply exactly OK."], env=env, timeout=240,
+                                cwd=work, sandbox_root=work, recorder_url=base)
+            if bootstrap.returncode or not recorder.requests:
+                raise HarnessError("Codex positive-control bootstrap failed")
+            fixture_id = seed_codex_rollout(chome, work, version)
         for model in models:
             before = len(recorder.requests)
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
                                     "-m", model, *cfg, "Reply exactly OK."], env=env, timeout=240,
-                           cwd=work)
+                           cwd=work, sandbox_root=work, recorder_url=base)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
             observations = [codex_memory_in_body(r.get("body"), sentinel, instructions) for r in records]
@@ -975,7 +1104,9 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         artifacts = sorted(path for path in set(baseline) | set(after) if baseline.get(path) != after.get(path))
         results["memoryBaseline"] = baseline
         results["memoryArtifacts"] = artifacts
-        results["memoryPipelineRan"] = bool(artifacts)
+        results["memoryPipelineEvidence"] = codex_memory_pipeline_evidence(chome, baseline, after)
+        results["memoryPipelineRan"] = bool(results["memoryPipelineEvidence"])
+        results["memoryPositiveEvidence"] = codex_memory_positive_evidence(chome, fixture_id) if enable_memory else []
         results["memorySentinelSeen"] = any(m.get("memorySentinelInRequest") for m in results["models"].values())
         results["memoryPromptSeen"] = any(m.get("memorySectionInRequest") for m in results["models"].values())
         results["requests"] = len(recorder.requests)
@@ -996,16 +1127,18 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
         _, generated_home = make_throwaway_homes(work / "gen")
     control_work = work / "control"
     control_work.mkdir(parents=True, exist_ok=True)
-    control = run_codex_memory_probe(binary, generated_home, control_work, models[:1], enable_memory=True)
-    detector_fires = control["memoryPipelineRan"] is True
+    control = run_codex_memory_probe(binary, generated_home, control_work, models[:1], enable_memory=True, version=version)
+    detector_fires = bool(control["memoryPositiveEvidence"])
     read_control_fires = control["memorySentinelSeen"] is True
     real_work = work / "real"
     real_work.mkdir(parents=True, exist_ok=True)
-    real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False)
+    real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False, version=version)
     results = {
         "positiveControlFired": detector_fires,
+        "positiveControlEvidence": control["memoryPositiveEvidence"],
         "readControlFired": read_control_fires,
         "positiveControlArtifacts": control["memoryArtifacts"],
+        "memoryPipelineEvidence": real["memoryPipelineEvidence"],
         "models": real["models"],
         "memoryBaseline": real["memoryBaseline"],
         "memoryArtifacts": real["memoryArtifacts"],
