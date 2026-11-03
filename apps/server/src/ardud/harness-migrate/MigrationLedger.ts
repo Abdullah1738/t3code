@@ -53,14 +53,18 @@ export const fallbackAllowed = (row: LedgerRow | null): boolean =>
   row === null || (row.state !== "committed" && row.state !== "staged");
 
 /** Rollback is allowed only before the first target turn confirmed. */
-export const rollbackTransition = (row: LedgerRow, options: { readonly force: boolean }): LedgerTransition => {
+export const rollbackTransition = (
+  row: LedgerRow,
+  options: { readonly force: boolean },
+): LedgerTransition => {
   if (row.state === "rolled_back") return { kind: "refused", reason: "already rolled back" };
   // A confirmed migration has target turns behind it, so the rule for it is the
   // lossless one: refuse unless forced, and say why.
-  if (row.firstResumeConfirmedAt !== null && !options.force) {
+  if ((row.state === "confirmed" || row.firstResumeConfirmedAt !== null) && !options.force) {
     return {
       kind: "refused",
-      reason: "the target has already run a turn; this is not lossless. Pass force to roll back anyway.",
+      reason:
+        "the target has already run a turn; this is not lossless. Pass force to roll back anyway.",
     };
   }
   if (row.state !== "committed" && row.state !== "staged" && row.state !== "confirmed") {

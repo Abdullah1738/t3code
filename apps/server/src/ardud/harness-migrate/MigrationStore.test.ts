@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
+import { rollbackTransition } from "./MigrationLedger.ts";
 import { MigrationStore, layer, type LedgerEntry } from "./MigrationStore.ts";
 
 const entry = (overrides: Partial<LedgerEntry> = {}): LedgerEntry => ({
@@ -47,7 +48,11 @@ it.effect("moves a row through committed and then confirmed, keeping the first-r
   Effect.gen(function* () {
     const store = yield* MigrationStore;
     yield* store.insert(entry());
-    yield* store.setState({ threadId: "thread-1", state: "committed", updatedAt: "2026-11-02T05:01:00.000Z" });
+    yield* store.setState({
+      threadId: "thread-1",
+      state: "committed",
+      updatedAt: "2026-11-02T05:01:00.000Z",
+    });
     yield* store.setState({
       threadId: "thread-1",
       state: "confirmed",
@@ -55,10 +60,35 @@ it.effect("moves a row through committed and then confirmed, keeping the first-r
       firstResumeConfirmedAt: "2026-11-02T05:02:00.000Z",
     });
     // A later state change without a confirmation time must not erase the first one.
-    yield* store.setState({ threadId: "thread-1", state: "confirmed", updatedAt: "2026-11-02T05:03:00.000Z" });
+    yield* store.setState({
+      threadId: "thread-1",
+      state: "confirmed",
+      updatedAt: "2026-11-02T05:03:00.000Z",
+    });
     const read = yield* store.get("thread-1");
     assert.strictEqual(read?.state, "confirmed");
     assert.strictEqual(read?.firstResumeConfirmedAt, "2026-11-02T05:02:00.000Z");
+  }).pipe(Effect.provide(storeLayer)),
+);
+
+it.effect("does not allow an unforced rollback of a confirmed row with no timestamp", () =>
+  Effect.gen(function* () {
+    const store = yield* MigrationStore;
+    yield* store.insert(entry());
+    yield* store.setState({
+      threadId: "thread-1",
+      state: "confirmed",
+      updatedAt: "2026-11-02T05:02:00.000Z",
+    });
+    const read = yield* store.get("thread-1");
+    assert.isNotNull(read);
+    if (read === null) return;
+    assert.strictEqual(read.firstResumeConfirmedAt, null);
+    assert.strictEqual(rollbackTransition(read, { force: false }).kind, "refused");
+    assert.deepStrictEqual(rollbackTransition(read, { force: true }), {
+      kind: "allowed",
+      to: "rolled_back",
+    });
   }).pipe(Effect.provide(storeLayer)),
 );
 

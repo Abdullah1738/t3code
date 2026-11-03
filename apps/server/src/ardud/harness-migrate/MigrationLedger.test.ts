@@ -48,7 +48,10 @@ describe("MigrationLedger rules", () => {
   });
 
   it("rolls back before the first target turn", () => {
-    expect(rollbackTransition(row(), { force: false })).toEqual({ kind: "allowed", to: "rolled_back" });
+    expect(rollbackTransition(row(), { force: false })).toEqual({
+      kind: "allowed",
+      to: "rolled_back",
+    });
   });
 
   it("refuses a rollback after the target confirmed, unless forced", () => {
@@ -56,10 +59,28 @@ describe("MigrationLedger rules", () => {
     const refused = rollbackTransition(confirmed, { force: false });
     expect(refused.kind).toBe("refused");
     if (refused.kind === "refused") expect(refused.reason).toContain("not lossless");
+    expect(rollbackTransition(confirmed, { force: true })).toEqual({
+      kind: "allowed",
+      to: "rolled_back",
+    });
+  });
+
+  it("fails closed on confirmed state even when the confirmation timestamp is missing", () => {
+    const inconsistent = row({ state: "confirmed", firstResumeConfirmedAt: null });
+    expect(rollbackTransition(inconsistent, { force: false })).toMatchObject({ kind: "refused" });
+    expect(rollbackTransition(inconsistent, { force: true })).toEqual({
+      kind: "allowed",
+      to: "rolled_back",
+    });
+    expect(
+      rollbackTransition(row({ firstResumeConfirmedAt: "2026-11-02T04:00:00Z" }), { force: false }),
+    ).toMatchObject({ kind: "refused" });
   });
 
   it("refuses to roll back twice", () => {
-    expect(rollbackTransition(row({ state: "rolled_back" }), { force: false }).kind).toBe("refused");
+    expect(rollbackTransition(row({ state: "rolled_back" }), { force: false }).kind).toBe(
+      "refused",
+    );
   });
 
   it("confirms a committed migration once and only once", () => {

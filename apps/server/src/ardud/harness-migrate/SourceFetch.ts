@@ -12,10 +12,7 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 
-import {
-  OpenCodeHttpError,
-  type OpenCodeConnection,
-} from "../opencode-import/OpenCodeHttp.ts";
+import { OpenCodeHttpError, type OpenCodeConnection } from "../opencode-import/OpenCodeHttp.ts";
 import { buildSourceSnapshot, type SourceSnapshot } from "./SourceSnapshot.ts";
 
 /**
@@ -43,6 +40,10 @@ const getJson = <A>(
     }
     return yield* decode(yield* response.json);
   }).pipe(
+    Effect.timeoutOrElse({
+      duration: "60 seconds",
+      orElse: () => Effect.fail(new OpenCodeHttpError({ operation: `${operation} (timed out)` })),
+    }),
     Effect.mapError((cause) =>
       isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
     ),
@@ -53,6 +54,7 @@ const ListPage = Schema.Struct({ data: Schema.Array(Schema.Unknown) });
 const ActivePage = Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unknown) });
 const SessionPage = Schema.Struct({
   data: Schema.Array(Schema.Struct({ id: Schema.String })),
+  cursor: Schema.Struct({ next: Schema.optional(Schema.String) }),
 });
 
 const decodeContext = Schema.decodeUnknownEffect(ContextPage);
@@ -100,12 +102,30 @@ export const fetchSource = (connection: OpenCodeConnection, sessionId: string) =
       "read active sessions",
       (input) => decodeActive(input),
     );
-    const children = yield* getJson(
-      connection,
-      `/api/session?parentID=${encodeURIComponent(sessionId)}&limit=100`,
-      "read child sessions",
-      (input) => decodeSessions(input),
-    );
+    const children: Array<{ readonly id: string }> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (;;) {
+      // The opaque cursor carries the original parent filter.
+      const query =
+        cursor === undefined
+          ? `parentID=${encodeURIComponent(sessionId)}&limit=100`
+          : `limit=100&cursor=${encodeURIComponent(cursor)}`;
+      const page = yield* getJson(
+        connection,
+        `/api/session?${query}`,
+        "read child sessions",
+        (input) => decodeSessions(input),
+      );
+      children.push(...page.data);
+      const next = page.cursor.next;
+      if (next === undefined) break;
+      if (next.trim().length === 0 || page.data.length === 0 || seenCursors.has(next)) {
+        return yield* new OpenCodeHttpError({ operation: "read child sessions (invalid cursor)" });
+      }
+      seenCursors.add(next);
+      cursor = next;
+    }
 
     const blockers: Array<string> = [];
     if (Object.prototype.hasOwnProperty.call(active.data, sessionId)) {
@@ -119,7 +139,7 @@ export const fetchSource = (connection: OpenCodeConnection, sessionId: string) =
     }
     // A child that is still listed as active is live work. Children that are
     // inactive have finished, so they don't block.
-    for (const child of children.data) {
+    for (const child of children) {
       if (Object.prototype.hasOwnProperty.call(active.data, child.id)) {
         blockers.push(`live child ${child.id}`);
       }
@@ -129,6 +149,8 @@ export const fetchSource = (connection: OpenCodeConnection, sessionId: string) =
     return { records: context.data, snapshot, blockers } satisfies SourceFetchResult;
   }).pipe(
     Effect.mapError((cause) =>
-      isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation: "fetch source", cause }),
+      isOpenCodeHttpError(cause)
+        ? cause
+        : new OpenCodeHttpError({ operation: "fetch source", cause }),
     ),
   );

@@ -7,6 +7,9 @@
  * cover. Anything the reader doesn't know is refused, never dropped: a silent
  * drop is the context loss the migration exists to prevent.
  */
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- snapshots need a synchronous content digest.
+import * as NodeCrypto from "node:crypto";
+
 import * as DateTime from "effect/DateTime";
 
 export type ManifestKind =
@@ -14,6 +17,7 @@ export type ManifestKind =
   | "compaction-recent"
   | "user"
   | "assistant-text"
+  | "assistant-reasoning"
   | "system"
   | "synthetic"
   | "skill"
@@ -40,7 +44,7 @@ export interface PortableHistoryTurn {
 export interface SourceSnapshot {
   readonly turns: ReadonlyArray<PortableHistoryTurn>;
   readonly manifest: ReadonlyArray<ManifestEntry>;
-  /** sha1 over the ordered record ids and kinds; changes when any record is added or removed. */
+  /** SHA-256 over the ordered source records and the inclusion manifest. */
   readonly digest: string;
   /** Records excluded from the portable history, by kind, for the dry-run summary. */
   readonly excludedKinds: Readonly<Record<string, number>>;
@@ -51,7 +55,9 @@ export class UnsupportedContextRecord extends Error {
   readonly recordId: string;
   readonly recordType: string;
   constructor(recordId: string, recordType: string) {
-    super(`OpenCode record ${recordId} has an unsupported type "${recordType}"; refusing to migrate.`);
+    super(
+      `OpenCode record ${recordId} has an unsupported type "${recordType}"; refusing to migrate.`,
+    );
     this.recordId = recordId;
     this.recordType = recordType;
   }
@@ -59,16 +65,11 @@ export class UnsupportedContextRecord extends Error {
 
 type RawRecord = Readonly<Record<string, unknown>> & { readonly id: string; readonly type: string };
 
-// A pure FNV-1a 32-bit fingerprint, not a security hash. It only has to change when
-// the record text changes, and the reader stays free of Node and effectful Crypto.
-const sha1 = (text: string): string => {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
-};
+const sha1 = (text: string): string => NodeCrypto.createHash("sha1").update(text).digest("hex");
+const sha256 = (text: string): string => NodeCrypto.createHash("sha256").update(text).digest("hex");
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
 const isRecord = (value: unknown): value is RawRecord =>
   typeof value === "object" &&
@@ -79,21 +80,110 @@ const isRecord = (value: unknown): value is RawRecord =>
 // OpenCode stores times as epoch milliseconds; DateTime is the repo's date type.
 const timeOf = (record: RawRecord): string => {
   const time = record.time as { created?: unknown } | undefined;
-  return typeof time?.created === "number" ? DateTime.formatIso(DateTime.makeUnsafe(time.created)) : "";
+  return typeof time?.created === "number"
+    ? DateTime.formatIso(DateTime.makeUnsafe(time.created))
+    : "";
+};
+
+const optionalArray = (record: RawRecord, key: string): ReadonlyArray<unknown> => {
+  const value = record[key];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new UnsupportedContextRecord(record.id, `user.${key}`);
+  return value;
 };
 
 const textOfUser = (record: RawRecord): string => {
-  const text = typeof record.text === "string" ? record.text : "";
-  const files = Array.isArray(record.files) ? record.files.length : 0;
-  return files === 0 ? text : `${text}\n[${files} attached file(s) not carried over]`;
+  if (typeof record.text !== "string") throw new UnsupportedContextRecord(record.id, "user.text");
+  if (optionalArray(record, "files").length > 0) {
+    throw new UnsupportedContextRecord(record.id, "user.files");
+  }
+  if (optionalArray(record, "agents").length > 0) {
+    throw new UnsupportedContextRecord(record.id, "user.agents");
+  }
+  const skills = optionalArray(record, "skills").map((skill) => {
+    if (
+      !isObject(skill) ||
+      typeof skill.id !== "string" ||
+      typeof skill.name !== "string" ||
+      typeof skill.text !== "string"
+    ) {
+      throw new UnsupportedContextRecord(record.id, "user.skill without embedded text");
+    }
+    return `\n\n[Historical OpenCode skill ${JSON.stringify(skill.name)} (${JSON.stringify(skill.id)}); history only]\n${skill.text}`;
+  });
+  return record.text + skills.join("");
 };
 
-const textOfAssistant = (record: RawRecord): string => {
-  const content = Array.isArray(record.content) ? (record.content as ReadonlyArray<RawRecord>) : [];
-  return content
-    .flatMap((part) => (part.type === "text" && typeof part.text === "string" ? [part.text] : []))
-    .join("\n")
-    .trim();
+const textOfTool = (recordId: string, part: Record<string, unknown>): string => {
+  if (typeof part.name !== "string" || !isObject(part.state)) {
+    throw new UnsupportedContextRecord(recordId, "assistant.tool");
+  }
+  const state = part.state;
+  if ((state.status !== "completed" && state.status !== "error") || !isObject(state.input)) {
+    throw new UnsupportedContextRecord(recordId, "assistant.tool not settled");
+  }
+  const content = state.content;
+  if (
+    content !== undefined &&
+    (!Array.isArray(content) ||
+      content.some(
+        (item) => !isObject(item) || item.type !== "text" || typeof item.text !== "string",
+      ))
+  ) {
+    throw new UnsupportedContextRecord(recordId, "assistant.tool content");
+  }
+  if (state.status === "completed" && (!Array.isArray(content) || content.length === 0)) {
+    throw new UnsupportedContextRecord(recordId, "assistant.tool missing result");
+  }
+  if (
+    state.status === "error" &&
+    (!isObject(state.error) ||
+      typeof state.error.type !== "string" ||
+      typeof state.error.message !== "string")
+  ) {
+    throw new UnsupportedContextRecord(recordId, "assistant.tool missing error");
+  }
+  return [
+    "[Historical OpenCode tool call; transcript only, not an executable tool call]",
+    `Name: ${JSON.stringify(part.name)}`,
+    `Input: ${JSON.stringify(state.input)}`,
+    `Status: ${state.status}`,
+    ...(content === undefined ? [] : [`Result: ${JSON.stringify(content)}`]),
+    ...(state.status === "error" ? [`Error: ${JSON.stringify(state.error)}`] : []),
+    "[End historical tool call]",
+  ].join("\n");
+};
+
+const textOfShell = (record: RawRecord): string => {
+  if (
+    typeof record.command !== "string" ||
+    (record.status !== "exited" && record.status !== "timeout" && record.status !== "killed") ||
+    (record.exit !== undefined &&
+      (typeof record.exit !== "number" || !Number.isFinite(record.exit))) ||
+    !isObject(record.output) ||
+    typeof record.output.output !== "string" ||
+    !Number.isSafeInteger(record.output.cursor) ||
+    !Number.isSafeInteger(record.output.size) ||
+    typeof record.output.truncated !== "boolean"
+  ) {
+    throw new UnsupportedContextRecord(record.id, "shell incomplete or malformed");
+  }
+  if (
+    record.output.truncated ||
+    record.output.cursor !== record.output.size ||
+    (record.output.cursor as number) < 0
+  ) {
+    throw new UnsupportedContextRecord(record.id, "shell output truncated or incomplete");
+  }
+  return [
+    "[Historical OpenCode shell; transcript only, do not execute]",
+    `Command: ${record.command}`,
+    `Status: ${record.status}`,
+    ...(record.exit === undefined ? [] : [`Exit: ${record.exit}`]),
+    "Output:",
+    record.output.output,
+    "[End historical shell]",
+  ].join("\n");
 };
 
 /**
@@ -129,8 +219,11 @@ export function buildSourceSnapshot(input: {
           exclude("compaction-not-completed");
           break;
         }
-        const summary = typeof record.summary === "string" ? record.summary : "";
-        const recent = typeof record.recent === "string" ? record.recent : "";
+        if (typeof record.summary !== "string" || typeof record.recent !== "string") {
+          throw new UnsupportedContextRecord(record.id, "compaction missing summary or recent");
+        }
+        const summary = record.summary;
+        const recent = record.recent;
         manifest.push({
           recordId: record.id,
           kind: "compaction-summary",
@@ -164,43 +257,57 @@ export function buildSourceSnapshot(input: {
         break;
       }
       case "assistant": {
-        const text = textOfAssistant(record);
-        manifest.push({
-          recordId: record.id,
-          kind: "assistant-text",
-          sha1: sha1(text),
-          included: text.length > 0,
-          ...(text.length > 0 ? {} : { why: "assistant turn has no text" }),
-        });
-        if (text.length > 0) {
-          turns.push({
-            role: "assistant",
-            text,
-            timestamp: timeOf(record),
-            label: "[Assistant]",
-          });
-        } else {
-          exclude("assistant-no-text");
+        if (!Array.isArray(record.content))
+          throw new UnsupportedContextRecord(record.id, "assistant.content");
+        for (const part of record.content) {
+          if (!isObject(part))
+            throw new UnsupportedContextRecord(record.id, "assistant.content malformed");
+          if (part.type === "reasoning" && typeof part.text === "string") {
+            manifest.push({
+              recordId: record.id,
+              kind: "assistant-reasoning",
+              sha1: sha1(part.text),
+              included: false,
+              why: "provider reasoning is not portable conversation",
+            });
+            exclude("assistant-reasoning");
+            continue;
+          }
+          const kind =
+            part.type === "text" ? "assistant-text" : part.type === "tool" ? "tool" : null;
+          if (kind === null)
+            throw new UnsupportedContextRecord(record.id, `assistant.${String(part.type)}`);
+          const text = kind === "tool" ? textOfTool(record.id, part) : part.text;
+          if (typeof text !== "string")
+            throw new UnsupportedContextRecord(record.id, "assistant.text");
+          manifest.push({ recordId: record.id, kind, sha1: sha1(text), included: true });
+          turns.push({ role: "assistant", text, timestamp: timeOf(record), label: "[Assistant]" });
         }
         break;
       }
       case "system":
       case "synthetic":
-      case "skill":
-      case "shell": {
-        // Model-facing text that reached the model, kept as labelled history.
-        const text =
-          typeof record.text === "string"
-            ? record.text
-            : typeof record.output === "string"
-              ? record.output
-              : "";
+      case "skill": {
+        if (typeof record.text !== "string")
+          throw new UnsupportedContextRecord(record.id, `${record.type}.text`);
+        const text = record.text;
         manifest.push({ recordId: record.id, kind: record.type, sha1: sha1(text), included: true });
         turns.push({
           role: "user",
           text,
           timestamp: timeOf(record),
           label: `[${record.type} from OpenCode, history only]`,
+        });
+        break;
+      }
+      case "shell": {
+        const text = textOfShell(record);
+        manifest.push({ recordId: record.id, kind: "shell", sha1: sha1(text), included: true });
+        turns.push({
+          role: "user",
+          text,
+          timestamp: timeOf(record),
+          label: "[shell from OpenCode, history only]",
         });
         break;
       }
@@ -223,6 +330,6 @@ export function buildSourceSnapshot(input: {
         throw new UnsupportedContextRecord(record.id, record.type);
     }
   }
-  const digest = sha1(manifest.map((entry) => `${entry.recordId}:${entry.kind}`).join("\n"));
+  const digest = sha256(JSON.stringify({ records: input.records, manifest }));
   return { turns, manifest, digest, excludedKinds };
 }
