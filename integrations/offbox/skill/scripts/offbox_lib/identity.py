@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .common import HOME, db, kv_get, kv_set, log
+from .common import HOME, OffboxError, db, kv_get, kv_set, log, now
 
 # offbox's own component credential first, the old shared file last.
 CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
@@ -92,8 +92,69 @@ def telegram(text: str, key: str, severity: str = "info") -> bool:
     return ok
 
 
+# Robob's execution identity for a native id (C1, apps/server/src/ardud/identity). The caller's
+# driver comes from the shell env the harness sets; OpenCode keeps its own path.
+ENV_DRIVERS = (
+    ("CLAUDE_CODE_SESSION_ID", "claudeAgent"),
+    ("CODEX_THREAD_ID", "codex"),  # the concrete thread; CODEX_SESSION_ID is shared by children
+    ("OPENCODE_SESSION_ID", "opencode"),
+)
+# A resolved answer is stable for an hour. An unresolved one (a new provider thread still pending its
+# native id, or a control outage) is held only for a short burst, so the next attempt asks C1 again
+# and picks the mapping up as soon as it lands (well inside the 60 s the card requires).
+RESOLVED_TTL = 3600
+UNRESOLVED_TTL = 5
+
+
+def caller_native() -> tuple[str | None, str | None]:
+    """(native id, driver) from the harness env, or (None, None).
+
+    Claude in-process children share their parent's session id and the shell env
+    carries no agent id (validation-integrations B8), so a Claude shell always
+    resolves to the session's execution, never to a child.
+    """
+    for var, driver in ENV_DRIVERS:
+        value = os.environ.get(var) or None
+        if value:
+            return value, driver
+    return None, None
+
+
+def identity_for(native: str, driver: str) -> dict:
+    """C1's resolution for one native id. Resolved answers last an hour; anything else, a minute.
+
+    A pending or unavailable answer is never reported as unowned: callers treat it as "not yet".
+    """
+    con = db()
+    key = f"identity:{driver}:{native}"
+    row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+    if row:
+        try:
+            cached = json.loads(row["v"])
+        except Exception:  # noqa: BLE001
+            cached = None
+        age = now() - (row["ts"] or 0)
+        if isinstance(cached, dict):
+            if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
+                return cached
+            if cached.get("resolution") != "resolved" and age <= UNRESOLVED_TTL:
+                return cached
+    st, d = ctl("GET", f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}")
+    if st == 200 and isinstance(d.get("identity"), dict):
+        ident = dict(d["identity"])
+    else:
+        ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                 "executionKind": None, "acceptsMessages": False, "candidates": []}
+    ident.update(driver=driver, nativeId=native)
+    kv_set(con, key, ident)
+    return ident
+
+
 def _lookup_thread(ses: str) -> dict:
-    """Session -> thread info, cached 1 h in kv (whoami costs ~1.5 s otherwise)."""
+    """OpenCode session -> thread info, cached 1 h in kv (whoami costs ~1.5 s otherwise).
+
+    OpenCode keeps its own parent lookup: C1 knows only Robob's native bindings.
+    """
     con = db()
     ck = f"whoami:{ses}"
     cached = kv_get(con, ck, max_age=3600)
@@ -145,15 +206,111 @@ def repo_key(root: Path) -> str:
     return name
 
 
+def _ancestors(thread_id: str) -> set[str]:
+    """Every Robob thread above `thread_id`. The visited set stops a cycle; each hop is one read."""
+    above: set[str] = set()
+    visited = {thread_id}
+    current = thread_id
+    while True:
+        status, data = thread_get(current)
+        if status != "ok" or not data:
+            break
+        parent = data.get("parentThreadId")
+        if not parent or parent in visited:
+            break
+        above.add(parent)
+        visited.add(parent)
+        current = parent
+    return above
+
+
+# offbox-person sets OFFBOX_THREAD=person:<slug> on purpose: a fixed owner for one person's leases, not a
+# Robob thread. It comes from the wrapper, never from an agent shell, so it is not subject to the check.
+PERSON_OWNER_PREFIX = "person:"
+
+
+def _explicit_thread(resolved_thread: str | None) -> str | None:
+    """OFFBOX_THREAD is an inherited shell value, so it only counts when it names the caller's
+    own execution or one of its ancestors. An unrelated parent's value is ignored and logged."""
+    explicit = os.environ.get("OFFBOX_THREAD") or None
+    if explicit is None:
+        return None
+    if explicit.startswith(PERSON_OWNER_PREFIX):
+        return explicit
+    if resolved_thread is None:
+        log("OFFBOX_THREAD ignored: the caller has no resolved Robob thread")
+        return None
+    if explicit == resolved_thread or explicit in _ancestors(resolved_thread):
+        return explicit
+    log(f"OFFBOX_THREAD ignored: {explicit} is not this execution or an ancestor")
+    return None
+
+
 def whoami(cwd: str | None = None) -> dict:
-    ses = os.environ.get("OPENCODE_SESSION_ID") or None
     root = repo_root(cwd)
-    me = {"session": ses, "thread": os.environ.get("OFFBOX_THREAD") or None, "title": None, "manager": None,
-          "repo_root": str(root), "repo_key": repo_key(root)}
-    if not me["thread"] and ses:
-        me.update({k: v for k, v in _lookup_thread(ses).items() if v})
+    native, driver = caller_native()
+    me = {"session": None, "thread": None, "title": None, "manager": None,
+          "repo_root": str(root), "repo_key": repo_key(root), "driver": driver,
+          "resolution": None, "executionKind": None, "acceptsMessages": None, "parent": None}
+    if driver == "opencode":
+        # OpenCode path, unchanged: the shell's session id names the thread.
+        me["session"] = native
+        me["thread"] = os.environ.get("OFFBOX_THREAD") or None
+        if not me["thread"] and native:
+            me.update({k: v for k, v in _lookup_thread(native).items() if v})
+        me["resolution"] = "resolved" if me["thread"] else None
+    elif native is None:
+        # No native id at all (a wrapper or a plain shell): an explicit owner is still honoured as before.
+        me["thread"] = os.environ.get("OFFBOX_THREAD") or None
+    else:
+        me["session"] = native
+        ident = identity_for(native, driver)
+        me["resolution"] = ident.get("resolution")
+        me["executionKind"] = ident.get("executionKind")
+        me["acceptsMessages"] = ident.get("acceptsMessages")
+        # A Claude shell carries only its session id, which a native child shares with its parent. C1 answers a
+        # bare Claude id with the parent's identity, so taking that answer would let a child own the parent's
+        # leases. Claude callers therefore never take a resolved owner; they keep their own unresolved owner.
+        if driver == "claudeAgent":
+            log(f"claude caller {native[:8]}: no per-agent id in the shell, so no resolved owner is taken")
+            me["resolution"] = "unresolved"
+        elif ident.get("resolution") == "resolved":
+            me["thread"] = ident.get("robobThreadId")
+            me["manager"] = ident.get("parentThreadId")
+            me["parent"] = ident.get("parentThreadId")
+        else:
+            # Not yet (pending), ambiguous or unavailable: never the unowned local owner.
+            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}")
+        explicit = _explicit_thread(me["thread"])
+        if explicit is not None:
+            me["thread"] = explicit
     me["owner"] = me["thread"] or f"local:{root}"
+    # `proven` says whether this call may take or change leases. An unresolved native caller is not proven: its
+    # owner string is shared by every process on its session (a Claude parent and its children), so acting under
+    # it could select or release a sibling's lease. OpenCode, plain shells and an explicit person owner are proven:
+    # the person owner is set by the wrapper on purpose, not by the agent's shell.
+    unproven_native = driver not in (None, "opencode") and me["resolution"] != "resolved"
+    explicit_person = (me["thread"] or "").startswith(PERSON_OWNER_PREFIX)
+    me["proven"] = not unproven_native or explicit_person
+    if unproven_native and not explicit_person:
+        # The owner string is kept for display only; nothing selects or writes by it (see require_proven).
+        me["owner"] = f"unresolved:{driver}:{native}"
     return me
+
+
+def require_proven(me: dict, action: str) -> None:
+    """Refuse an identity-dependent action for a caller that isn't proven to be one execution.
+
+    The shared Claude session and a pending Codex thread can't be told apart from their siblings, so a lease they
+    would acquire, reuse, release or exempt is not theirs to act on. The refusal is explicit: a null or shared owner
+    must never reach a selector, where it would silently match nothing or the wrong caller's rows.
+    """
+    if not me.get("proven", True):
+        raise OffboxError(
+            f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
+            f"(resolution={me.get('resolution') or 'none'}). A Claude shell shares its session id with its native "
+            f"children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
+            f"a few seconds. Nothing was changed.", code=2)
 
 
 def remote_dir_for(root: Path | str) -> str:

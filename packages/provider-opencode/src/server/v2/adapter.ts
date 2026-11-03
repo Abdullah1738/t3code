@@ -4317,14 +4317,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const state = threads.get(sessionId);
           if (state === undefined) return;
           const turn = state.active;
-          // OpenCode stops a foreground subagent with its parent, but not a
-          // background one: a user Stop (`requestRuntimeRestart`) stops those
-          // too, and the execution OpenCode starts to report them. A turn
-          // interrupted to restart it with new input leaves them running.
+          // A delayed Stop must not reach the new turn's background work.
+          if (turn !== undefined && turn.providerTurn.id !== interruptInput.providerTurnId) return;
+          // User Stop also stops background work on a settled thread. A turn
+          // interrupted to restart with new input leaves it running.
           if (interruptInput.requestRuntimeRestart === true) yield* stopBackground(state);
-          if (turn === undefined || turn.providerTurn.id !== interruptInput.providerTurnId) {
-            return;
-          }
+          if (turn === undefined) return;
           // A turn held for a reconnect sent nothing, and the server may not
           // answer yet: it ends here, and never sends its request.
           if (turn.parked) {

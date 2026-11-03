@@ -17,6 +17,7 @@ import {
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -307,6 +308,127 @@ const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettin
     Layer.provide(settingsLayer),
     Layer.provide(layerReceiptsTest),
   );
+
+it.effect("fences explicit run interrupts and forwards the expected attempt only for them", () => {
+  const projectId = ProjectId.make("project:interrupt-fence");
+  const threadId = ThreadId.make("thread:interrupt-fence");
+  const runId = RunId.make("run:interrupt-fence");
+  const attemptId = RunAttemptId.make("attempt:interrupt-fence");
+  const commandId = CommandId.make("command:interrupt-fence");
+  const dispatched: Array<OrchestrationV2ServerCommand> = [];
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () =>
+          Effect.succeed({
+            thread: { id: threadId, projectId, deletedAt: null },
+            runs: [{ id: runId, status: "running", ordinal: 1 }],
+          } as unknown as OrchestrationV2ThreadProjection),
+        dispatch: (command) =>
+          Effect.sync(() => {
+            dispatched.push(command);
+            return { sequence: 1, storedEvents: [] };
+          }),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    yield* service.interruptThread({ projectId, threadId, commandId, runId, attemptId });
+    yield* service.interruptThread({ projectId, threadId, commandId, runId });
+    yield* service.interruptThread({ projectId, threadId, commandId });
+    expect(dispatched).toEqual([
+      {
+        type: "run.interrupt",
+        commandId,
+        threadId,
+        runId,
+        fenced: true,
+        expectedAttemptId: attemptId,
+      },
+      { type: "run.interrupt", commandId, threadId, runId, fenced: true },
+      { type: "run.interrupt", commandId, threadId, runId },
+    ]);
+  }).pipe(Effect.provide(layerTest));
+});
+
+it.effect("maps a refused fenced interrupt to thread-not-interruptible", () => {
+  const projectId = ProjectId.make("project:interrupt-refused");
+  const threadId = ThreadId.make("thread:interrupt-refused");
+  const runId = RunId.make("run:interrupt-refused");
+  const commandId = CommandId.make("command:interrupt-refused");
+  const cause = new Orchestrator.OrchestratorDispatchError({
+    commandId,
+    commandType: "run.interrupt",
+    cause: "changed while dispatching",
+  });
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () =>
+          Effect.succeed({
+            thread: { id: threadId, projectId, deletedAt: null },
+            runs: [{ id: runId, status: "running", ordinal: 1 }],
+          } as unknown as OrchestrationV2ThreadProjection),
+        dispatch: () => Effect.fail(cause),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(
+      service.interruptThread({ projectId, threadId, commandId, runId }),
+    );
+    expect(error).toBeInstanceOf(
+      ThreadManagementService.ThreadManagementThreadNotInterruptibleError,
+    );
+    expect(error).toMatchObject({ threadId, runId });
+    const unguarded = yield* Effect.flip(
+      service.interruptThread({ projectId, threadId, commandId }),
+    );
+    expect(unguarded).toBe(cause);
+  }).pipe(Effect.provide(layerTest));
+});
+
+it.effect("preserves an infrastructure failure from a fenced interrupt", () => {
+  const projectId = ProjectId.make("project:interrupt-failure");
+  const threadId = ThreadId.make("thread:interrupt-failure");
+  const runId = RunId.make("run:interrupt-failure");
+  const commandId = CommandId.make("command:interrupt-failure");
+  const cause = new Orchestrator.OrchestratorDispatchError({
+    commandId,
+    commandType: "run.interrupt",
+    cause: new Error("database unavailable"),
+  });
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () =>
+          Effect.succeed({
+            thread: { id: threadId, projectId, deletedAt: null },
+            runs: [{ id: runId, status: "running", ordinal: 1 }],
+          } as unknown as OrchestrationV2ThreadProjection),
+        dispatch: () => Effect.fail(cause),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(
+      service.interruptThread({ projectId, threadId, commandId, runId }),
+    );
+    expect(error).toBe(cause);
+  }).pipe(Effect.provide(layerTest));
+});
 
 it.effect("refuses a new turn when the project effectively disables the instance", () => {
   const projectId = ProjectId.make("project:thread-management:gate-disabled");

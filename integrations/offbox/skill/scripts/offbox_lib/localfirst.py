@@ -56,6 +56,9 @@ ENV_DENY = re.compile(r"^(GO|CGO_|LD_|DYLD_|GIT_|AWS_|FDB_|DOCKER_|SSH_|OFFBOX_)
 # Kept from the caller's environment for a local run (plus runs.build_env's CI=1 and allowlist).
 KEEP_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "GOPRIVATE", "GONOSUMDB", "GONOPROXY",
             "GOPROXY", "OPENCODE_SESSION_ID"}
+# Identity a local-first run is attributed to: the resolved Robob thread and the driver that resolved it. Set
+# from the identity map, never copied from the caller's shell, so a stale inherited id can't name the run.
+IDENTITY_ENV = ("OFFBOX_ROBOB_THREAD", "OFFBOX_NATIVE_DRIVER")
 
 SIMPLE = {"true", "false", ":", "echo", "printf", "pwd", "exit", "test", "[", "[["}
 FILTERS = {"head", "tail", "grep", "egrep", "fgrep", "sort", "uniq", "wc", "cut", "tr", "cat", "sed"}
@@ -788,7 +791,7 @@ def _go_paths() -> dict:
     return _GO_PATHS
 
 
-def local_env(a, rid: str, rundir: str, root: str | None = None) -> dict:
+def local_env(a, rid: str, rundir: str, root: str | None = None, identity: dict | None = None) -> dict:
     """Allowlisted environment: no cloud credentials, no Docker daemon, no local FoundationDB, box's Go version."""
     from .runs import build_env
     env = {k: v for k, v in os.environ.items() if k in KEEP_ENV or k.startswith("LC_")}
@@ -801,6 +804,12 @@ def local_env(a, rid: str, rundir: str, root: str | None = None) -> dict:
                AWS_CONFIG_FILE="/dev/null", AWS_SHARED_CREDENTIALS_FILE="/dev/null", AWS_EC2_METADATA_DISABLED="true",
                FDB_CLUSTER_FILE="/nonexistent/offbox-local.cluster",
                FDB_CLUSTER_FILE_PATH="/nonexistent/offbox-local.cluster", OFFBOX_LOCAL_RUN=rid)
+    # The run is attributed to the resolved execution, not to whatever the caller's shell carried.
+    for name in IDENTITY_ENV:
+        env.pop(name, None)
+    if identity and identity.get("robobThreadId"):
+        env["OFFBOX_ROBOB_THREAD"] = identity["robobThreadId"]
+        env["OFFBOX_NATIVE_DRIVER"] = identity.get("driver") or ""
     if os.path.isdir(GNU_GREP):
         env["PATH"] = GNU_GREP + os.pathsep + env.get("PATH", "/usr/bin:/bin")
     v = _box_go_version()
@@ -1067,7 +1076,9 @@ def run(a, me, steps: list[str]) -> int | None:
             cmd = TMP_REF.sub(rundir + "/t/", shown)
             if not steps:
                 cmd = command_block(cmd)
-            env = local_env(a, rid, os.path.join(rundir, "tmp"), me["repo_root"])
+            identity = {"robobThreadId": me.get("thread") if me.get("resolution") == "resolved" else None,
+                        "driver": me.get("driver")}
+            env = local_env(a, rid, os.path.join(rundir, "tmp"), me["repo_root"], identity)
             prof = profile(os.path.realpath(me["repo_root"]), rundir, env, list(a.include or []))
             chk = subprocess.run([SANDBOX, "-p", prof, "/usr/bin/true"], capture_output=True, timeout=30)
             if chk.returncode != 0:

@@ -18,6 +18,7 @@ import {
   ProviderApprovalDecision,
   ProviderInteractionMode,
   ProviderOptionSelection,
+  RunAttemptId,
   RunId,
   RuntimeMode,
   RuntimeRequestId,
@@ -1116,6 +1117,9 @@ const makeRoutes = Effect.gen(function* () {
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
           ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
+          ...(body.expectedAttemptId === undefined
+            ? {}
+            : { attemptId: RunAttemptId.make(body.expectedAttemptId) }),
         }),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));

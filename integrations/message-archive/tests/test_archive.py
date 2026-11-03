@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = tempfile.mkdtemp(prefix="msgs-test-")
 os.environ["MSGS_ROOT"] = ROOT
@@ -211,6 +212,145 @@ class StoreSearchTest(unittest.TestCase):
         self.assertEqual(set(self.ids("tonight OR plans")), {"old", "new"})
         self.assertEqual(self.ids("dinner before:2026-01-01" if now > 1767225600 + 86400 else "dinner older_than:1y"), ["old"])
         self.assertEqual(self.ids("dinn*", sort="date")[0], "me")
+
+    def test_recent_window_uses_rowid_floor(self):
+        now = int(time.time())
+        store.upsert(self.db, item(ext_id="old-first", body="words", ts=now - 400 * 86400))
+        store.upsert(self.db, item(ext_id="new", body="words", ts=now - 86400))
+        store.upsert(self.db, item(ext_id="old-last", body="words", ts=now - 400 * 86400))
+        new_id = self.db.execute("SELECT id FROM items WHERE ext_id = ?", ("new",)).fetchone()[0]
+        statements = []
+        self.db.set_trace_callback(statements.append)
+        try:
+            unbounded = self.ids("words")
+            self.assertEqual(set(unbounded), {"old-first", "new", "old-last"})
+            self.assertFalse(any("INDEXED BY items_ts" in s or "items_fts.rowid >= " in s for s in statements))
+
+            statements.clear()
+            self.assertEqual(self.ids("words newer_than:30d"), ["new"])
+            self.assertTrue(any("SELECT min(id) FROM items INDEXED BY items_ts WHERE ts >= " in s for s in statements))
+            self.assertTrue(any(f"items_fts.rowid >= {new_id}" in s and "items.ts >= " in s for s in statements))
+            self.assertTrue(self.db.in_transaction)  # do not end a caller's transaction
+            self.assertEqual(set(self.ids("words after:1970-01-01")), {"old-first", "new", "old-last"})
+            self.assertEqual(self.ids("words"), unbounded)
+
+            statements.clear()
+            self.assertEqual(self.ids("words after:2999-01-01"), [])
+            self.assertTrue(any("SELECT min(id) FROM items INDEXED BY items_ts" in s for s in statements))
+            self.assertFalse(any("items_fts MATCH" in s for s in statements))
+
+            store.upsert(self.db, item(ext_id="recent-backfill", body="words", ts=now - 20 * 86400))
+            self.assertEqual(set(self.ids("words newer_than:30d")), {"new", "recent-backfill"})
+
+            store.upsert(self.db, item(ext_id="old-first", body="words", ts=now - 10 * 86400))
+            old_first_id = self.db.execute("SELECT id FROM items WHERE ext_id = ?", ("old-first",)).fetchone()[0]
+            statements.clear()
+            self.assertEqual(set(self.ids("words newer_than:30d")), {"old-first", "new", "recent-backfill"})
+            self.assertTrue(any(f"items_fts.rowid >= {old_first_id}" in s for s in statements))
+        finally:
+            self.db.set_trace_callback(None)
+
+        with patch("search.time.time", return_value=now):
+            _, where, params, flags = search.parse("words newer_than:30d after:2000-01-01 newer_than:60d")
+        self.assertEqual(where, ["items.ts >= ?"] * 3)
+        self.assertEqual(params, [now - 30 * 86400, search._date("2000-01-01"), now - 60 * 86400])
+        self.assertEqual(flags["min_ts"], max(params))
+
+        statements.clear()
+        self.db.set_trace_callback(statements.append)
+        try:
+            self.ids("newer_than:30d")
+            self.assertFalse(any("INDEXED BY items_ts" in s for s in statements))
+            with patch("search.time.time", return_value=0):
+                self.assertEqual(set(self.ids("words newer_than:0d")),
+                                 {"old-first", "new", "old-last", "recent-backfill"})
+            self.assertTrue(any("SELECT min(id) FROM items INDEXED BY items_ts" in s for s in statements))
+        finally:
+            self.db.set_trace_callback(None)
+
+    def test_recent_window_keeps_ranking_and_dedupe(self):
+        now = int(time.time())
+        store.upsert(self.db, item(ext_id="old-first", body="words", ts=now - 400 * 86400))
+        store.upsert(self.db, item(ext_id="old-duplicate", body="words", msgid="duplicate", ts=now - 400 * 86400))
+        store.upsert(self.db, item(ext_id="newer", body="words words", msgid="duplicate", ts=now - 86400))
+        store.upsert(self.db, item(ext_id="recent-duplicate", body="words", msgid="DUPLICATE", ts=now - 10 * 86400))
+        store.upsert(self.db, item(ext_id="recent", subject="words words", body="words", ts=now - 20 * 86400))
+        store.upsert(self.db, item(ext_id="old-last", body="words", ts=now - 400 * 86400))
+
+        with patch("search.time.time", return_value=now):
+            for sort in ("rank", "date"):
+                for dedupe in (True, False):
+                    baseline = search.run(self.db, "words", sort=sort, dedupe=False, limit=100)
+                    expected = [r for r in baseline if r["ts"] >= now - 30 * 86400]
+                    if dedupe:
+                        unique = []
+                        seen = set()
+                        for row in expected:
+                            key = (row["msgid"] or "").lower()
+                            if key and key in seen:
+                                continue
+                            if key:
+                                seen.add(key)
+                            unique.append(row)
+                        expected = unique
+                    actual = search.run(self.db, "words newer_than:30d", sort=sort, dedupe=dedupe)
+                    self.assertEqual([dict(r) for r in actual], [dict(r) for r in expected])
+
+    def test_recent_window_snapshot_survives_timestamp_update(self):
+        now = int(time.time())
+        store.upsert(self.db, item(ext_id="old", body="words", ts=now - 400 * 86400))
+        store.upsert(self.db, item(ext_id="new", body="words", ts=now - 86400))
+        self.db.commit()
+        writer = sqlite3.connect(store.common.DB_PATH)
+        reader = self.db
+
+        class InterleavedReader:
+            @property
+            def in_transaction(self):
+                return reader.in_transaction
+
+            def execute(self, sql, args=()):
+                cursor = reader.execute(sql, args)
+                if sql.startswith("SELECT min(id) FROM items INDEXED BY items_ts"):
+                    return FloorCursor(cursor)
+                return cursor
+
+            def rollback(self):
+                reader.rollback()
+
+        class FloorCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchone(self):
+                row = self.cursor.fetchone()
+                self.cursor.close()
+                if row[0] is not None:
+                    writer.execute("UPDATE items SET ts = ? WHERE ext_id = ?", (now - 2 * 86400, "old"))
+                    writer.commit()
+                return row
+
+        try:
+            self.assertEqual([r["ext_id"] for r in search.run(InterleavedReader(), "words newer_than:30d")], ["new"])
+            self.assertFalse(self.db.in_transaction)
+            self.assertEqual(set(self.ids("words newer_than:30d")), {"old", "new"})
+        finally:
+            writer.close()
+
+    def test_recent_window_from_readonly_connection(self):
+        now = int(time.time())
+        store.upsert(self.db, item(ext_id="new", body="words", ts=now - 86400))
+        self.db.commit()
+        db = store.connect(readonly=True)
+        try:
+            self.assertEqual([r["ext_id"] for r in search.run(db, "words newer_than:30d")], ["new"])
+            self.assertFalse(db.in_transaction)
+            self.assertEqual(search.run(db, "words after:2999-01-01"), [])
+            self.assertFalse(db.in_transaction)
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("DELETE FROM items")
+        finally:
+            db.close()
 
     def test_dedupe_by_msgid(self):
         store.upsert(self.db, item(ext_id="INBOX:1:1", msgid="m1", account="icloud", body="ticket"))

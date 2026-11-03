@@ -30,11 +30,16 @@
   "hooks": [
     {"harness": "claude", "event": "PreToolUse", "matcher": "Bash", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__betterstack__.*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
-    {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py --shell-mcp", "timeoutSec": 10},
+    {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "PostToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "PostToolUseFailure", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "SessionStart", "matcher": null, "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PreToolUse", "matcher": "Bash", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__betterstack__.*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
-    {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10}
+    {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py --shell-mcp", "timeoutSec": 10},
+    {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
+    {"harness": "codex", "event": "PostToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10}
   ],
   "codexModels": {
     "catalogSource": "vendor/codex-models-0.166.0.json",

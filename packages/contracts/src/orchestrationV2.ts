@@ -2513,7 +2513,9 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     type: Schema.Literal("run.background-work-cancelled"),
     payload: Schema.Struct({
       runId: RunId,
-      restartCancelledBackgroundWork: Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),
+      restartCancelledBackgroundWork: Schema.Array(
+        OrchestrationV2RestartCancelledBackgroundWorkJson,
+      ),
     }),
   }),
   Schema.Struct({
@@ -2934,6 +2936,8 @@ export const OrchestrationV2Command = Schema.Union([
     runId: RunId,
     reason: Schema.optional(Schema.String),
     holdQueue: Schema.optional(Schema.Boolean),
+    expectedAttemptId: Schema.optional(RunAttemptId),
+    fenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("queued-message.promote-to-steer"),
