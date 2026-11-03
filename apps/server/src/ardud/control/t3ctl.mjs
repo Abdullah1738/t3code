@@ -41,6 +41,7 @@ const HELP = `t3ctl <command> [options]
 Global: --request-timeout SECONDS      HTTP request deadline (default 30s for ordinary requests)
 Send uses a new request ID unless --request-id is supplied. On a send timeout or
 abort it exits 4 and prints a safe retry with the same ID and send options.
+It also prints that retry after a connection drops before the response.
 Keep the same credentials when retrying; an explicit --token is never printed.
 For a URL containing credentials or a query, set T3CTL_RETRY_URL before retrying.
 Use -- before a thread or text beginning with -.
@@ -168,6 +169,13 @@ function transportRetry(error) {
     ) {
       return true;
     }
+  }
+  return false;
+}
+
+function transportDisconnected(error) {
+  for (let cause = error; cause; cause = cause.cause) {
+    if (["ECONNRESET", "EPIPE", "UND_ERR_SOCKET"].includes(cause.code)) return true;
   }
   return false;
 }
@@ -366,9 +374,10 @@ async function main() {
           clientRequestId: requestId,
         });
       } catch (error) {
-        if (controller.signal.aborted || transportRetry(error)) {
+        const timedOut = controller.signal.aborted || transportRetry(error);
+        if (timedOut || transportDisconnected(error)) {
           console.error(
-            `send timed out; it may or may not have been delivered. Retry safely with: ${sendRetry(threadId, text, requestId, client.token)}`,
+            `send ${timedOut ? "timed out" : "connection dropped"}; it may or may not have been delivered. Retry safely with: ${sendRetry(threadId, text, requestId, client.token)}`,
           );
           process.exitCode = 4;
           return;

@@ -255,6 +255,25 @@ describe("ControlClient", () => {
     expect(result.stderr).toMatch(/^send timed out; it may or may not have been delivered/);
   });
 
+  it("keeps the request id when the server drops a send response", async () => {
+    let accepted: Record<string, unknown> | undefined;
+    const url = await listen((request) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        accepted = JSON.parse(body) as Record<string, unknown>;
+        request.socket.destroy();
+      });
+    });
+    const result = await runCli(url, ["send", "t", "hello"]);
+    expect(result.code).toBe(4);
+    expect(accepted?.clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(result.stderr).toContain(
+      "send connection dropped; it may or may not have been delivered. Retry safely with:",
+    );
+    expect(result.stderr).toContain(`--request-id '${accepted?.clientRequestId}'`);
+  });
+
   it("omits explicit credentials from the retry while retaining the explicit URL", async () => {
     const seen: Array<{ path: string | undefined; body: unknown }> = [];
     const url = await listen((request) => {
