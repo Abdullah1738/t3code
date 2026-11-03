@@ -204,10 +204,15 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
         type: "provider-session.detach",
         providerSessionId: session.id,
         detail: "Thread deleted.",
-        revokeMcpCredential: true,
       },
     });
   }
+  effects.push({
+    id: `effect:${command.commandId}:mcp-credential.revoke-thread`,
+    commandId: command.commandId,
+    threadId: command.threadId,
+    request: { type: "mcp-credential.revoke-thread" },
+  });
   effects.push({
     id: `effect:${command.commandId}:scheduled-tasks.cleanup`,
     commandId: command.commandId,

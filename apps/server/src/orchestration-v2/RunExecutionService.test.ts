@@ -46,6 +46,8 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
@@ -1109,6 +1111,7 @@ it.effect(
 );
 
 const layerMcpSessionRegistryTest = McpSessionRegistry.layer.pipe(
+  Layer.provide(CredentialStore.layer.pipe(Layer.provide(Sqlite.layerMemory))),
   Layer.provide(
     Layer.mergeAll(
       NodeServices.layer,

@@ -40,6 +40,9 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     revokeMcpCredential: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
+    type: Schema.Literal("mcp-credential.revoke-thread"),
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-turn.start"),
     runId: RunId,
   }),
@@ -123,6 +126,7 @@ export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.T
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
+  "mcp-credential.revoke-thread",
   "provider-thread.rollback",
   "checkpoint.capture",
   "scheduled-tasks.cleanup",

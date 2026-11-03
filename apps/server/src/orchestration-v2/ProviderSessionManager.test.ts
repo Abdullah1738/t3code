@@ -45,6 +45,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -529,6 +530,7 @@ function layerTest(input: {
     readonly armed: Ref.Ref<boolean>;
     readonly paused: Deferred.Deferred<void>;
   };
+  readonly mcpRegistryLayer?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly backgroundTasksEndWithProcess?: boolean;
@@ -592,9 +594,10 @@ function layerTest(input: {
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
-    input.pauseResolve === undefined
+    input.mcpRegistryLayer ??
+    (input.pauseResolve === undefined
       ? layerTestMcpRegistry
-      : layerPausingMcpRegistry(input.pauseResolve);
+      : layerPausingMcpRegistry(input.pauseResolve));
   const layerProviderEventIngestorTest = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -648,12 +651,20 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getDescriptor: Effect.die("unused"),
 });
 
-const layerTestMcpRegistry = Layer.effect(
+const layerTestMcpCredentialStore = CredentialStore.layer.pipe(
+  Layer.provide(Layer.fresh(SqlitePersistence.layerMemory)),
+);
+
+const layerTestMcpRegistryWithStore = Layer.effect(
   McpSessionRegistry.McpSessionRegistry,
   McpSessionRegistry.__testing.make(),
 ).pipe(
   Layer.provide(Layer.succeed(HttpServer.HttpServer, fakeHttpServer)),
   Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+);
+
+const layerTestMcpRegistry = layerTestMcpRegistryWithStore.pipe(
+  Layer.provide(layerTestMcpCredentialStore),
   Layer.provide(NodeServices.layer),
 );
 
@@ -3086,6 +3097,106 @@ it.effect("ProviderSessionManagerV2 releases live sessions when its layer shuts 
 
     assert.equal((yield* Ref.get(state)).closeCount, 1);
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 preserves live MCP credentials through its shutdown finalizer",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const threadIds = [
+        ThreadId.make("thread-provider-session-manager-shutdown-mcp-attached"),
+        ThreadId.make("thread-provider-session-manager-shutdown-mcp-detached"),
+        ThreadId.make("thread-provider-session-manager-shutdown-mcp-manual-close"),
+      ] as const;
+      // Keep the in-memory database alive across two independently scoped registries.
+      const layerOuterRegistry = layerTestMcpRegistryWithStore.pipe(
+        Layer.provideMerge(layerTestMcpCredentialStore),
+        Layer.provide(NodeServices.layer),
+      );
+      yield* Effect.gen(function* () {
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const store = yield* CredentialStore.CredentialStore;
+        const mcpConfigs = yield* Effect.gen(function* () {
+          const eventSink = yield* EventSink.EventSinkV2;
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+          const now = yield* DateTime.now;
+          const providerSessionId = yield* idAllocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId: threadIds[0],
+          });
+          const closingSessionId = yield* idAllocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId: threadIds[2],
+          });
+          yield* eventSink.write({
+            events: yield* Effect.forEach(threadIds, (threadId) =>
+              makeThreadCreatedEvent({ idAllocator, threadId, now }),
+            ),
+          });
+          for (const threadId of threadIds.slice(0, 2)) {
+            yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+          }
+          yield* manager.open({
+            threadId: threadIds[2],
+            providerSessionId: closingSessionId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const configs = yield* Effect.forEach(threadIds, (threadId) =>
+            mcpSessions.read(threadId),
+          );
+          for (const [index, config] of configs.entries()) {
+            assert.isDefined(config);
+            const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
+            assert.equal((yield* registry.resolve(token))?.thread.threadId, threadIds[index]);
+          }
+
+          // A shared provider may still hold the detached thread's credential.
+          yield* manager.detach({ providerSessionId, threadId: threadIds[1] });
+          yield* manager.close(closingSessionId);
+          assert.isUndefined(yield* mcpSessions.read(threadIds[2]));
+          assert.isUndefined(
+            yield* registry.resolve(configs[2]!.authorizationHeader.replace(/^Bearer\s+/, "")),
+          );
+          assert.equal((yield* Ref.get(state)).closeCount, 1);
+          return configs;
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              state,
+              idleTimeoutMs: 60_000,
+              mcpRegistryLayer: Layer.succeed(McpSessionRegistry.McpSessionRegistry, registry),
+            }),
+          ),
+        );
+
+        // The manager layer has closed, not merely the registry's scope.
+        assert.equal((yield* Ref.get(state)).openCount, 2);
+        assert.equal((yield* Ref.get(state)).closeCount, 2);
+        const restoredRegistry = yield* McpSessionRegistry.__testing
+          .make()
+          .pipe(
+            Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+            Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+            Effect.provideService(CredentialStore.CredentialStore, store),
+            Effect.provide(NodeServices.layer),
+          );
+        for (const [index, config] of mcpConfigs.slice(0, 2).entries()) {
+          const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
+          const original = yield* registry.resolve(token);
+          assert.equal(original?.thread.threadId, threadIds[index]);
+          assert.deepEqual(yield* restoredRegistry.resolve(token), original);
+        }
+        assert.isUndefined(
+          yield* restoredRegistry.resolve(
+            mcpConfigs[2]!.authorizationHeader.replace(/^Bearer\s+/, ""),
+          ),
+        );
+      }).pipe(Effect.provide(layerOuterRegistry));
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 releases sessions in parallel on server shutdown", () =>

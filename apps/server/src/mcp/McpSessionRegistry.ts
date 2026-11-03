@@ -9,6 +9,7 @@ import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 
@@ -44,10 +45,8 @@ export class McpSessionRegistry extends Context.Service<
   McpSessionRegistryShape
 >()("t3/mcp/McpSessionRegistry") {}
 
-interface CredentialRecord {
-  readonly tokenHash: string;
-  readonly scope: McpInvocationContext.McpThreadInvocationScope;
-  readonly lastAliveAt: number;
+interface CredentialRecord extends CredentialStore.CredentialRecord {
+  readonly persistedAliveAt: number;
 }
 
 interface RegistryState {
@@ -65,6 +64,7 @@ export interface McpSessionRegistryOptions {
  * refresh the token its subprocess still holds; MCP requests cannot.
  */
 const DEFAULT_LIVENESS_WINDOW_MS = 24 * 60 * 60 * 1_000;
+const LIVENESS_WRITE_INTERVAL_MS = 60_000;
 
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -82,8 +82,17 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const crypto = yield* Crypto.Crypto;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const environmentId = yield* environment.getEnvironmentId;
+  const store = yield* CredentialStore.CredentialStore;
   const httpServer = yield* HttpServer.HttpServer;
-  const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
+  const loaded = yield* store.load(environmentId).pipe(Effect.orDie);
+  const state = yield* SynchronizedRef.make<RegistryState>({
+    records: new Map(
+      loaded.map((record) => [
+        record.tokenHash,
+        { ...record, persistedAliveAt: record.lastAliveAt },
+      ]),
+    ),
+  });
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const livenessWindowMs = options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
   const endpoint = NetAddress.isInetAddress(httpServer.address)
@@ -119,11 +128,15 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         ]),
         issuedAt,
       };
-      yield* SynchronizedRef.update(state, ({ records }) => {
-        const next = new Map(records);
-        next.set(tokenHash, { tokenHash, scope, lastAliveAt: issuedAt });
-        return { records: next };
-      });
+      yield* SynchronizedRef.updateEffect(state, ({ records }) =>
+        Effect.gen(function* () {
+          const record = { tokenHash, scope, lastAliveAt: issuedAt, persistedAliveAt: issuedAt };
+          yield* store.insert(record).pipe(Effect.orDie);
+          const next = new Map(records);
+          next.set(tokenHash, record);
+          return { records: next };
+        }),
+      ).pipe(Effect.uninterruptible);
       return {
         config: {
           environmentId,
@@ -143,38 +156,61 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     function* (rawToken) {
       if (rawToken.length === 0) return undefined;
       const tokenHash = yield* hashToken(rawToken);
-      const timestamp = yield* currentTimeMillis;
-      return yield* SynchronizedRef.modify(state, ({ records }) => {
-        const record = records.get(tokenHash);
-        if (!record || timestamp - record.lastAliveAt > livenessWindowMs) {
-          return [undefined, { records }] as const;
-        }
-        const next = new Map(records);
-        next.set(tokenHash, { ...record, lastAliveAt: timestamp });
-        return [record.scope, { records: next }] as const;
-      });
+      return yield* SynchronizedRef.modifyEffect(state, ({ records }) =>
+        Effect.gen(function* () {
+          const timestamp = yield* currentTimeMillis;
+          const record = records.get(tokenHash);
+          if (!record || timestamp - record.lastAliveAt > livenessWindowMs) {
+            return [undefined, { records }] as const;
+          }
+          const lastAliveAt = Math.max(timestamp, record.lastAliveAt);
+          const persist = lastAliveAt - record.persistedAliveAt >= LIVENESS_WRITE_INTERVAL_MS;
+          if (persist)
+            yield* store.updateLiveness(environmentId, tokenHash, lastAliveAt).pipe(Effect.orDie);
+          const next = new Map(records);
+          next.set(tokenHash, {
+            ...record,
+            lastAliveAt,
+            persistedAliveAt: persist ? lastAliveAt : record.persistedAliveAt,
+          });
+          return [record.scope, { records: next }] as const;
+        }),
+      ).pipe(Effect.uninterruptible);
     },
   );
 
   const touch: McpSessionRegistryShape["touch"] = Effect.fn("McpSessionRegistry.touch")(
     function* (threadId) {
-      const timestamp = yield* currentTimeMillis;
-      yield* SynchronizedRef.update(state, ({ records }) => {
-        const next = new Map(records);
-        for (const [tokenHash, record] of records) {
-          if (record.scope.thread.threadId === threadId) {
-            next.set(tokenHash, { ...record, lastAliveAt: timestamp });
-          }
-        }
-        return { records: next };
-      });
+      yield* SynchronizedRef.updateEffect(state, ({ records }) =>
+        Effect.gen(function* () {
+          const timestamp = yield* currentTimeMillis;
+          const matching = Array.from(records.values()).filter(
+            (record) => record.scope.thread.threadId === threadId,
+          );
+          if (matching.length === 0) return { records };
+          const lastAliveAt = Math.max(timestamp, ...matching.map((record) => record.lastAliveAt));
+          yield* store.touchThread(environmentId, threadId, lastAliveAt).pipe(Effect.orDie);
+          const next = new Map(records);
+          for (const record of matching)
+            next.set(record.tokenHash, { ...record, lastAliveAt, persistedAliveAt: lastAliveAt });
+          return { records: next };
+        }),
+      ).pipe(Effect.uninterruptible);
     },
   );
 
-  const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
-    SynchronizedRef.update(state, ({ records }) => ({
-      records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
-    }));
+  const revokeWhere = (
+    predicate: (record: CredentialRecord) => boolean,
+    persist: Effect.Effect<void, CredentialStore.CredentialStoreError>,
+  ) =>
+    SynchronizedRef.updateEffect(state, ({ records }) =>
+      persist.pipe(
+        Effect.orDie,
+        Effect.as({
+          records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
+        }),
+      ),
+    ).pipe(Effect.uninterruptible);
 
   return McpSessionRegistry.of({
     issue,
@@ -182,13 +218,19 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     touch,
     revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
       function* (providerSessionId) {
-        yield* revokeWhere((record) => record.scope.thread.providerSessionId === providerSessionId);
+        yield* revokeWhere(
+          (record) => record.scope.thread.providerSessionId === providerSessionId,
+          store.revokeProviderSession(environmentId, providerSessionId),
+        );
       },
     ),
     revokeThread: Effect.fn("McpSessionRegistry.revokeThread")(function* (threadId) {
-      yield* revokeWhere((record) => record.scope.thread.threadId === threadId);
+      yield* revokeWhere(
+        (record) => record.scope.thread.threadId === threadId,
+        store.revokeThread(environmentId, threadId),
+      );
     }),
-    revokeAll: SynchronizedRef.set(state, { records: new Map() }),
+    revokeAll: revokeWhere(() => true, store.revokeAll(environmentId)),
   });
 });
 

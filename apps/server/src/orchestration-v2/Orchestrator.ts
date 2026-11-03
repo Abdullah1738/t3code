@@ -3677,10 +3677,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                         : command.type === "thread.runtime-mode.set"
                           ? "Runtime mode changed."
                           : "Provider or model selection changed.",
-                // Terminal detaches revoke the thread's MCP credentials; other
-                // detach reasons keep them so a re-attaching provider process
-                // stays authorized.
-                ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
               },
             } satisfies PendingOrchestrationEffectV2;
             yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
@@ -3692,6 +3688,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (command.type === "thread.archive") {
       yield* Ref.update(effects, (existing) => [
         ...existing,
+        {
+          id: `effect:${command.commandId}:mcp-credential.revoke-thread`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: { type: "mcp-credential.revoke-thread" },
+        } satisfies PendingOrchestrationEffectV2,
         {
           id: `effect:${command.commandId}:terminal.cleanup`,
           commandId: command.commandId,
