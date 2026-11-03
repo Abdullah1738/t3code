@@ -24,7 +24,7 @@ class Stub:
     """Serves the control API (`threads`, `total`) and the OpenCode active list on one loopback port."""
 
     def __init__(self, threads, total=None, control_ok=True, opencode=None, opencode_ok=True, projects=None,
-                 projects_ok=True):
+                 projects_ok=True, honor_filters=False):
         self.projects = projects or []
         self.projects_ok = projects_ok
         self.threads = threads
@@ -32,6 +32,16 @@ class Stub:
         self.control_ok = control_ok
         self.opencode = opencode or {}
         self.opencode_ok = opencode_ok
+        # honor_filters: answer the thread query the way the server does (active, creationSource, updatedSince
+        # narrow the list). Otherwise every query gets the same list, which is what the older tests were written for.
+        self.honor_filters = honor_filters
+        # Per-query failures: a 503 on just the native (creationSource) or just the active (active=true) query.
+        self.native_fail = False
+        self.active_fail = False
+        # Report this total instead of the matched count, to simulate a truncated result (more than one page).
+        # override_kind picks which query it applies to: "native" (creationSource) or "active" (active=true).
+        self.total_override = None
+        self.override_kind = None
         self.requests = []
         stub = self
 
@@ -57,6 +67,17 @@ class Stub:
                         return self._send(401, {"ok": False})
                     q = parse_qs(url.query)
                     limit = int(q.get("limit", ["50"])[0])
+                    if stub.native_fail and "creationSource" in q:
+                        return self._send(503, {"ok": False})
+                    if stub.active_fail and q.get("active", [""])[0] == "true":
+                        return self._send(503, {"ok": False})
+                    if stub.honor_filters:
+                        matched = stub.filtered(q)
+                        total = len(matched)
+                        # total_override is scoped to one query kind, so a test can truncate (a) or (b) alone.
+                        if stub.total_override is not None and stub.override_for(q):
+                            total = stub.total_override
+                        return self._send(200, {"ok": True, "total": total, "threads": matched[:limit]})
                     return self._send(200, {"ok": True, "total": stub.total,
                                             "threads": stub.threads[:limit]})
                 if url.path == "/api/ardud/control/projects":
@@ -72,6 +93,29 @@ class Stub:
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def override_for(self, q):
+        """Whether total_override applies to this query: the native one carries creationSource, the active one
+        carries active=true."""
+        if self.override_kind == "native":
+            return "creationSource" in q
+        if self.override_kind == "active":
+            return q.get("active", [""])[0] == "true"
+        return False
+
+    def filtered(self, q):
+        """The threads the server would list for these query params: the server's filters, applied in order."""
+        out = list(self.threads)
+        if q.get("active", [""])[0] == "true":
+            out = [t for t in out if t.get("state") not in (None, "idle")]
+        cs = q.get("creationSource", [""])[0]
+        if cs:
+            wanted = cs.split(",")
+            out = [t for t in out if t.get("creationSource") in wanted]
+        since = q.get("updatedSince", [""])[0]
+        if since:
+            out = [t for t in out if t.get("updatedAtMs", 0) > int(since)]
+        return out
 
     def close(self):
         self.server.shutdown()
@@ -99,6 +143,7 @@ class ActiveSetTests(unittest.TestCase):
     def serve(self, **kwargs):
         stub = Stub(**kwargs)
         self.addCleanup(stub.close)
+        self.stub = stub
         # Point both clients at the stub, and write the control credential with the stub's URL.
         self.cfg.write_text(json.dumps({"url": stub.base, "token": "test-token"}))
         self.cfg.chmod(0o600)
@@ -129,14 +174,15 @@ class ActiveSetTests(unittest.TestCase):
         active.snapshot()
         self.assertTrue(any("includeSubagents=true" in r for r in stub.requests), stub.requests)
 
-    def test_active_query_reads_the_full_list_so_runless_native_threads_are_covered(self):
+    def test_runless_native_children_are_read_by_their_own_query_not_the_active_one(self):
         # `active=true` is built from runs and pending requests, so a native child with neither is missing from it.
-        # The janitor reads the full thread list instead and decides activity itself.
+        # The janitor reads those children with a second query (creationSource=provider, inside the native window).
         stub = self.serve(threads=[thread(1)], opencode={"ses_a": True})
         active.snapshot()
         queries = [r for r in stub.requests if "/threads" in r]
-        self.assertTrue(queries, stub.requests)
-        self.assertFalse(any("active=true" in r for r in queries), queries)
+        self.assertEqual(len(queries), 2, queries)
+        self.assertTrue(any("active=true" in r for r in queries), queries)
+        self.assertTrue(any("creationSource=provider" in r for r in queries), queries)
 
     def test_runless_native_child_is_kept_as_in_use(self):
         # A native child that is idle (no run, no pending request) can still own a worktree: it counts as in use.
@@ -184,6 +230,135 @@ class ActiveSetTests(unittest.TestCase):
         ids, err = active.active_session_ids()
         self.assertIsNone(err)
         self.assertEqual(ids, {"ses_x"})
+
+
+NOW_MS = 1_800_000_000_000  # a fixed clock, so the native window's cut is exact
+
+
+class TwoQueryActiveSetTests(unittest.TestCase):
+    """The active set is the union of two complete queries: (a) every non-idle thread, (b) the provider-native
+    children updated inside the 48 h window. Each must be complete on its own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "rcsim.json"
+        self.cfg.write_text(json.dumps({"url": "", "token": "test-token"}))
+        self.cfg.chmod(0o600)
+        self.patches = [patch.object(active, "CONTROL_CFGS", (str(self.cfg),)),
+                        patch.object(active, "PASSWORD_FILE", os.path.join(self.tmp.name, "no-password"))]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def serve(self, **kwargs):
+        stub = Stub(**kwargs)
+        self.addCleanup(stub.close)
+        self.stub = stub
+        self.cfg.write_text(json.dumps({"url": stub.base, "token": "test-token"}))
+        self.cfg.chmod(0o600)
+        patch.object(active, "OC_SERVICE_URL", stub.base).start()
+        self.addCleanup(patch.stopall)
+        return stub
+
+    def read_snapshot(self):
+        # The real snapshot, with the clock pinned so the native window is exact.
+        with patch.object(active.time, "time", return_value=NOW_MS / 1000):
+            return active.snapshot()
+
+    def test_both_queries_send_the_exact_params(self):
+        stub = self.serve(threads=[], honor_filters=True)
+        self.read_snapshot()
+        active_q = [r for r in stub.requests if "active=true" in r]
+        native_q = [r for r in stub.requests if "creationSource=provider" in r]
+        self.assertEqual(len(active_q), 1, stub.requests)
+        self.assertEqual(len(native_q), 1, stub.requests)
+        self.assertIn("includeSubagents=true", active_q[0])
+        self.assertIn("limit=500", active_q[0])
+        self.assertIn("includeSubagents=true", native_q[0])
+        self.assertIn("limit=500", native_q[0])
+        # The window: updatedSince = now - 48 h, to within a minute (the test pins the clock, so it is exact).
+        from urllib.parse import parse_qs as pq, urlparse as up
+        since = int(pq(up(native_q[0]).query)["updatedSince"][0])
+        self.assertAlmostEqual(since, NOW_MS - 48 * 3600 * 1000, delta=60_000)
+
+    def test_native_window_is_forty_eight_hours(self):
+        self.assertEqual(active.NATIVE_WINDOW_MS, 48 * 3600 * 1000)
+        self.assertEqual(active.NATIVE_TIMEOUT, 60)
+
+    def test_running_app_thread_and_idle_native_child_are_both_in_use(self):
+        running = {"threadId": "thread-app-run", "state": "running", "worktreePath": "/work/app",
+                   "creationSource": "web", "updatedAtMs": NOW_MS}
+        idle_native = {"threadId": "thread-native-idle", "state": "idle", "worktreePath": "/work/native",
+                       "creationSource": "provider", "relationshipToParent": "subagent",
+                       "updatedAtMs": NOW_MS - 3600_000}
+        self.serve(threads=[running, idle_native], honor_filters=True, opencode={})
+        snap = self.read_snapshot()
+        self.assertTrue(snap["complete"], snap["problems"])
+        self.assertEqual(set(snap["threads"]), {"thread-app-run", "thread-native-idle"})
+        self.assertTrue(active.in_use(snap["threads"]["thread-app-run"]))
+        self.assertTrue(active.in_use(snap["threads"]["thread-native-idle"]))
+
+    def test_twenty_six_thousand_thread_server_is_complete(self):
+        # The bug: the old single full-list query said "26140 threads, only 500 returned" and kept everything. Here
+        # 26,000 threads exist, 95 are non-idle, and 40 provider-native children were updated in the window. Each
+        # query is complete on its own, so the snapshot is complete, and it covers exactly the 135 that matter.
+        live = [{"threadId": f"live-{i}", "state": "running", "worktreePath": f"/work/live{i}",
+                 "creationSource": "web", "updatedAtMs": NOW_MS} for i in range(95)]
+        native = [{"threadId": f"native-{i}", "state": "idle", "worktreePath": f"/work/native{i}",
+                   "creationSource": "provider", "relationshipToParent": "subagent",
+                   "updatedAtMs": NOW_MS - 3600_000} for i in range(40)]
+        # 25,865 old idle app threads that neither query returns (they are idle, and outside the native window).
+        old_idle = [{"threadId": f"old-{i}", "state": "idle", "worktreePath": f"/work/old{i}",
+                     "creationSource": "web", "updatedAtMs": NOW_MS - 10 * 24 * 3600 * 1000}
+                    for i in range(25_865)]
+        self.serve(threads=live + native + old_idle, honor_filters=True, opencode={})
+        snap = self.read_snapshot()
+        self.assertTrue(snap["complete"], snap["problems"])
+        self.assertEqual(len(snap["threads"]), 135)
+        self.assertEqual(len(snap["workspaces"]), 135)
+
+    def test_truncated_native_query_is_incomplete(self):
+        # (b) has more threads in the window than one page holds: incomplete, not a partial list.
+        native = [{"threadId": f"native-{i}", "state": "idle", "creationSource": "provider",
+                   "relationshipToParent": "subagent", "worktreePath": f"/w/{i}",
+                   "updatedAtMs": NOW_MS - 1000} for i in range(500)]
+        self.serve(threads=native, honor_filters=True, opencode={})
+        # The native window holds more than one page: the native query reports 620 and returns 500.
+        self.stub.total_override = 620
+        self.stub.override_kind = "native"
+        snap = self.read_snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("native" in p and "truncated" in p for p in snap["problems"]), snap["problems"])
+
+    def test_truncated_active_query_is_incomplete(self):
+        live = [{"threadId": f"live-{i}", "state": "running", "worktreePath": f"/w/{i}",
+                 "creationSource": "web", "updatedAtMs": NOW_MS} for i in range(500)]
+        self.serve(threads=live, honor_filters=True, opencode={})
+        self.stub.total_override = 620
+        self.stub.override_kind = "active"
+        snap = self.read_snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("active" in p and "truncated" in p for p in snap["problems"]), snap["problems"])
+
+    def test_native_query_error_is_incomplete(self):
+        live = [{"threadId": "live-1", "state": "running", "worktreePath": "/w/1",
+                 "creationSource": "web", "updatedAtMs": NOW_MS}]
+        self.serve(threads=live, honor_filters=True, opencode={}, control_ok=True)
+        self.stub.native_fail = True
+        snap = self.read_snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("native" in p for p in snap["problems"]), snap["problems"])
+
+    def test_active_query_error_is_incomplete(self):
+        native = [{"threadId": "native-1", "state": "idle", "worktreePath": "/w/n",
+                   "creationSource": "provider", "relationshipToParent": "subagent",
+                   "updatedAtMs": NOW_MS}]
+        self.serve(threads=native, honor_filters=True, opencode={})
+        self.stub.active_fail = True
+        snap = self.read_snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("active" in p for p in snap["problems"]), snap["problems"])
 
 
 class RootWorkspaceTests(unittest.TestCase):

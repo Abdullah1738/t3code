@@ -196,8 +196,8 @@ const seedRows = Effect.gen(function* () {
 
 // Shaped like the real snapshot: the location picks which threads are read,
 // and archived ones always come back under archivedThreads.
-const snapshotFor = (location: "active" | "archive") => {
-  const read = shells.filter(
+const snapshotFor = (location: "active" | "archive", extra: ReadonlyArray<OrchestrationV2ThreadShell>) => {
+  const read = [...shells, ...extra].filter(
     (candidate) => (candidate.archivedAt !== null) === (location === "archive"),
   );
   return {
@@ -208,7 +208,7 @@ const snapshotFor = (location: "active" | "archive") => {
   };
 };
 
-const makeHarness = (buildCommit?: string) =>
+const makeHarness = (buildCommit?: string, extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = []) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
@@ -224,10 +224,12 @@ const makeHarness = (buildCommit?: string) =>
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
       getShellSnapshot: (options) =>
         Ref.update(snapshotReads, (count) => count + 1).pipe(
-          Effect.as(snapshotFor(options?.location ?? "active")),
+          Effect.as(snapshotFor(options?.location ?? "active", extraShells)),
         ),
       getThreadShell: (threadId) =>
-        Effect.succeed(shells.find((candidate) => candidate.id === threadId) ?? null),
+        Effect.succeed(
+          [...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null,
+        ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
     const web = yield* Effect.acquireRelease(
@@ -314,11 +316,15 @@ const makeHarness = (buildCommit?: string) =>
     return { get, threadIds, snapshotReads };
   });
 
+type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
+
+// `buildCommit` is main's startup-commit fixture; `extraShells` adds threads to the snapshot for one test.
 const run = <A, E>(
-  body: (h: Effect.Success<ReturnType<typeof makeHarness>>) => Effect.Effect<A, E>,
+  body: (h: Harness) => Effect.Effect<A, E>,
   buildCommit?: string,
+  extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(buildCommit), body)).pipe(
+  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells), body)).pipe(
     Effect.provide(Sqlite.layerMemory),
   );
 
@@ -438,6 +444,77 @@ describe("control listings", () => {
       }),
     ),
   );
+
+  it.effect("filters /threads by creationSource, with includeSubagents and updatedSince", () => {
+    // A provider-native child (idle, subagent lineage) and an app thread. Their updatedAt values differ so
+    // updatedSince actually splits them.
+    const nativeChild = shell("native-child", {
+      creationSource: "provider",
+      createdBy: "agent",
+      updatedAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
+      lineage: {
+        rootThreadId: ThreadId.make("live-running"),
+        parentThreadId: ThreadId.make("live-running"),
+        relationshipToParent: "subagent",
+      },
+      ...idle,
+    });
+    // Not web: every harness shell defaults to web, so a mobile match is this thread alone.
+    const appThread = shell("app-thread", {
+      creationSource: "mobile",
+      updatedAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
+      ...idle,
+    });
+    const oldNative = shell("old-native-child", {
+      creationSource: "provider",
+      createdBy: "agent",
+      updatedAt: DateTime.makeUnsafe("2025-12-01T00:00:00.000Z"),
+      lineage: {
+        rootThreadId: ThreadId.make("live-running"),
+        parentThreadId: ThreadId.make("live-running"),
+        relationshipToParent: "subagent",
+      },
+      ...idle,
+    });
+    return run(
+      ({ threadIds }) =>
+        Effect.gen(function* () {
+          // Only the provider-native children, whatever the lineage.
+          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=provider&includeSubagents=true&limit=500"), [
+            "native-child",
+            "old-native-child",
+          ]);
+          // Exact match on the one non-web thread.
+          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=mobile&includeSubagents=true&limit=500"), [
+            "app-thread",
+          ]);
+          // A comma list matches any of its values.
+          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=mobile,provider&includeSubagents=true&limit=500"), [
+            "app-thread",
+            "native-child",
+            "old-native-child",
+          ]);
+          // updatedSince narrows the same filter: the 2025 child drops out, the 2026 child stays.
+          assert.deepStrictEqual(
+            yield* threadIds(
+              `/threads?creationSource=provider&includeSubagents=true&updatedSince=${Date.parse("2025-12-31T00:00:00.000Z")}&limit=500`,
+            ),
+            ["native-child"],
+          );
+          // Without includeSubagents the child is hidden even when it matches creationSource.
+          assert.deepStrictEqual(yield* threadIds("/threads?creationSource=provider&limit=500"), []);
+          // The active=true fast path is untouched: an idle child is not active.
+          assert.deepStrictEqual(yield* threadIds("/threads?active=true&includeSubagents=true&limit=500"), [
+            "asks-waiting",
+            "live-queued",
+            "live-running",
+            "live-subagent",
+          ]);
+        }),
+      undefined,
+      [nativeChild, appThread, oldNative],
+    );
+  });
 
   it.effect("lists pending requests from pending rows without the shell snapshot", () =>
     run(({ get, snapshotReads }) =>

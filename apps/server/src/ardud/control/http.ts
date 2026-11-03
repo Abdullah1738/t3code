@@ -930,6 +930,9 @@ const makeRoutes = Effect.gen(function* () {
     const includeSubagents = boolParam(params.get("includeSubagents")) ?? false;
     const ids = params.get("ids")?.split(",").filter(Boolean);
     const parentThreadId = params.get("parentThreadId");
+    // Comma list of shell.creationSource values ("provider" for provider-native children). Exact match; an empty
+    // value matches nothing, as ids does.
+    const creationSources = params.get("creationSource")?.split(",").filter(Boolean);
     // Only live threads can be non-idle, so those lists start from the few
     // live ids instead of every thread's shell. The exact filters below
     // still decide.
@@ -955,6 +958,7 @@ const makeRoutes = Effect.gen(function* () {
           shell.lineage.relationshipToParent !== "subagent") &&
         (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
         (projectId === null || shell.projectId === projectId) &&
+        (creationSources === undefined || creationSources.includes(shell.creationSource)) &&
         (ids === undefined || ids.includes(shell.id)) &&
         (since === undefined || DateTime.toEpochMillis(shell.updatedAt) > since),
     );

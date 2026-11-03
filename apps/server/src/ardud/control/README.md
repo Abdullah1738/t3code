@@ -149,7 +149,8 @@ JSON object with all `items` and `nextCursor: null`.
 
 Query: `origin` (a value, or `none` for threads without one), `active=true|false`
 (not idle / idle), `state=running,needs-input,...`, `updatedSince` (ISO time or
-epoch ms), `projectId`, `parentThreadId`, `ids=a,b`, `includeSubagents=true`,
+epoch ms), `projectId`, `creationSource=provider,web,...` (exact match on the thread's creation source;
+`provider` is a provider-native child), `parentThreadId`, `ids=a,b`, `includeSubagents=true`,
 `archived=true` (the archive instead of active threads), `limit` (default 50,
 max 500). Newest first. Each item is a thread summary: `threadId`, `projectId`,
 `title`, `state`, `status`, `origin`, `nativeSessionId`, `model`, `runtimeMode`,

@@ -170,7 +170,7 @@ export class ControlClient {
 
   /**
    * @param {{ origin?: string, active?: boolean, state?: string, updatedSince?: string | number,
-   *   projectId?: string, parentThreadId?: string, includeSubagents?: boolean, archived?: boolean, limit?: number,
+   *   projectId?: string, creationSource?: string, parentThreadId?: string, includeSubagents?: boolean, archived?: boolean, limit?: number,
    *   ids?: string[] }} [filters]
    * @returns {Promise<{ total: number, threads: ThreadSummary[] }>}
    */
