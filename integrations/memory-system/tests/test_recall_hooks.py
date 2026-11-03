@@ -583,8 +583,78 @@ class RecallHookTests(unittest.TestCase):
                                                 "robobThreadId": "root", "_agent": None})["invalidated"])
                     fresh = self.event(harness=harness, session_id=session, prompt="Investigate the next task",
                                        **{turn_field: "fresh"})
-                self.call(fresh, harness, now=1150 + i * 1000)
-                self.assertEqual(len(self.server.requests), request_count + 1)
+                    self.call(fresh, harness, now=1150 + i * 1000)
+                    self.assertEqual(len(self.server.requests), request_count + 1)
+
+    def test_suppressed_child_start_retires_old_execution(self):
+        for harness in ("claude", "codex"):
+            for i, restricted in enumerate(({"mode": "off"}, {"mode": "on", "only_dirs": ["/other"]})):
+                with self.subTest(harness=harness, restricted=restricted):
+                    session = f"suppressed-{harness}-{i}"
+                    agent = "agent-suppressed" if harness == "claude" else "codex-child"
+                    transcript = self.tmp / f"{session}.jsonl"
+                    transcript.write_text("")
+                    common = {"session_id": session, "agent_id": agent, "transcript_path": str(transcript)}
+                    self.config_file.write_text("{}")
+                    self.call(self.event("SubagentStart", harness, **common), harness, now=1000)
+                    row = ({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent",
+                            "input": {"resume": agent, "prompt": "Old task"}}]}} if harness == "claude" else
+                           {"type": "event_msg", "payload": {"type": "user_message", "message": "Old task"}})
+                    transcript.write_text(json.dumps(row) + "\n")
+                    self.work(8, harness=harness, start=1100, **common)
+                    hook.worker(self.jobs.pop())
+                    self.config_file.write_text(json.dumps(restricted))
+                    requests, queries = len(self.server.requests), len(self.server.queries)
+                    self.call(self.event("SubagentStart", harness, **common), harness, now=1140)
+                    self.assertEqual((len(self.server.requests), len(self.server.queries)), (requests, queries))
+                    self.config_file.write_text("{}")
+                    self.assertIsNone(self.call(self.event("PostToolUse", harness, **common, tool_use_id="after"), harness, now=1150))
+
+    def test_consumed_note_is_not_printed_after_new_boundary(self):
+        for harness in ("claude", "codex"):
+            for child in (False, True):
+                with self.subTest(harness=harness, child=child):
+                    session = f"delivery-{harness}-{child}"
+                    agent = "agent-delivery" if harness == "claude" else "codex-child"
+                    common = {"session_id": session}
+                    if child:
+                        transcript = self.tmp / f"{session}.jsonl"
+                        transcript.write_text("")
+                        common.update(agent_id=agent, transcript_path=str(transcript))
+                        self.call(self.event("SubagentStart", harness, **common), harness, now=1000)
+                        row = ({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent",
+                                "input": {"resume": agent, "prompt": "First task"}}]}} if harness == "claude" else
+                               {"type": "event_msg", "payload": {"type": "user_message", "message": "First task"}})
+                        transcript.write_text(json.dumps(row) + "\n")
+                    else:
+                        self.call(self.event(harness=harness, **common), harness, now=1000)
+                    self.work(8, harness=harness, start=1100, **common)
+                    hook.worker(self.jobs.pop())
+                    # A unique error triggers the next work launch after consuming
+                    # the queued note; start a replacement exactly in that gap.
+                    self.call(self.event("PostToolUse", harness, **common, tool_use_id="error",
+                                         tool_name="Bash", tool_response="fatal: failure"), harness, now=1300)
+                    self.work(7, harness=harness, start=1303, **common)
+                    # Arrange a pending note and immediate eligible work on one call.
+                    if self.jobs:
+                        hook.worker(self.jobs.pop())
+                    def launch_during_boundary(job, kind="work"):
+                        db = Store(str(self.state_file))
+                        try:
+                            self.assertEqual(db.db.execute("SELECT count(*) FROM mailbox").fetchone()[0], 0)
+                        finally:
+                            db.close()
+                        boundary = (self.event("SubagentStart", harness, **common) if child else
+                                    self.event(harness=harness, **common, prompt="A different new task",
+                                               **({"prompt_id": "turn-2"} if harness == "claude" else {"turn_id": "turn-2"})))
+                        with mock.patch.object(hook, "launch", side_effect=lambda *_args: None):
+                            hook.handle(harness, boundary)
+                    with mock.patch.object(hook, "launch", side_effect=launch_during_boundary), \
+                         mock.patch.object(hook, "prepare_work", return_value=True), \
+                         mock.patch.object(hook.time, "time", return_value=1400), \
+                         contextlib.redirect_stdout(io.StringIO()) as out:
+                        hook.handle(harness, self.event("PostToolUse", harness, **common, tool_use_id="race"))
+                    self.assertEqual(out.getvalue(), "")
 
     def test_resumed_child_requires_new_turn_and_fresh_task(self):
         for harness in ("claude", "codex"):

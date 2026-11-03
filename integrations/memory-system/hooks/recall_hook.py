@@ -411,7 +411,7 @@ def wrapped(note: str) -> str:
 def output(event: str, note: str | None):
     if note and event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure"):
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-                                                "additionalContext": wrapped(note)}}))
+                                                "additionalContext": wrapped(note)}}), flush=True)
 
 
 def add_activity(state: dict, event: dict, now: float):
@@ -535,8 +535,8 @@ def handle(harness: str, event: dict):
     enabled = (cfg["mode"] in ("on", "observe") and not (
         isinstance(dirs, list) and dirs and not any(isinstance(d, str) and d and cwd.startswith(d) for d in dirs)))
     if not enabled:
-        if name == "UserPromptSubmit" and native and os.path.exists(state_path()):
-            # Even a suppressed prompt is a turn boundary. Quarantine its old
+        if name in ("UserPromptSubmit", "SubagentStart") and native and os.path.exists(state_path()):
+            # Even a suppressed prompt or child start is a turn boundary. Quarantine its old
             # state and supersede any earlier identity lookup without network I/O.
             db = Store(state_path(), cfg["note_ttl_days"])
             try:
@@ -607,7 +607,7 @@ def handle(harness: str, event: dict):
     db = Store(state_path(), cfg["note_ttl_days"])
     key = key_of(identity)
     now = time.time()
-    pending, job, prompt_job = None, None, None
+    pending, pending_generation, job, prompt_job = None, None, None, None
     try:
         if name == "SubagentStart":
             if seed and is_child:
@@ -712,6 +712,8 @@ def handle(harness: str, event: dict):
                     return
                 if not db.prompt_guarded(native):
                     pending = db.consume(key, tid, cfg["mode"])
+                    if pending:
+                        pending_generation = (state.get("generation"), state.get("execution_generation", 0))
                 if not state["prompt_checked"]:
                     state["prompt_checked"] = True
                     prompt_body = {**body_base(identity, event, cfg), "mode": "prompt", "prompt": prompt,
@@ -729,6 +731,8 @@ def handle(harness: str, event: dict):
                     if not db.adopt_turn(key, state, tid):
                         return
                 pending = db.consume(key, state["turn"], cfg["mode"])
+                if pending:
+                    pending_generation = (state.get("generation"), state.get("execution_generation", 0))
                 if cfg["work"]:
                     add_activity(state, event, now)
                     if state.get("inflight"):
@@ -765,6 +769,8 @@ def handle(harness: str, event: dict):
                             break
                         if current.get("prompt_inflight") != prompt_job:
                             note = db.consume(key, current["turn"], config()["mode"])
+                            if note:
+                                pending_generation = (current.get("generation"), current.get("execution_generation", 0))
                             pending = "\n".join(x for x in (pending, note) if x)
                             break
                     time.sleep(min(0.02, max(0, deadline - time.monotonic())))
@@ -776,7 +782,20 @@ def handle(harness: str, event: dict):
                     if current and current.get("prompt_inflight") == prompt_job:
                         current["prompt_inflight"] = None
                         db.save(key, current, time.time())
-        output(name, pending)
+        if pending:
+            # The same lock protects the boundary and the final write: consuming
+            # a note does not reserve delivery across a newer execution.
+            with db.transaction():
+                current = db.get(key)
+                latest = config()
+                dirs = latest.get("only_dirs")
+                allowed = not (isinstance(dirs, list) and dirs and
+                               not any(isinstance(d, str) and d and cwd.startswith(d) for d in dirs))
+                if (current and not current.get("invalidated") and not db.prompt_guarded(native)
+                    and current.get("_native_key") == native and latest["mode"] == "on" and allowed
+                    and pending_generation == (current.get("generation"), current.get("execution_generation", 0))
+                    and db._current_generation(key, current) == pending_generation[1]):
+                    output(name, pending)
     finally:
         db.close()
 
