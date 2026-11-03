@@ -662,7 +662,10 @@ it.effect("ignores a repeated clear with the same normalized head", () =>
       assert.strictEqual(after.card.stage, first.stage);
       assert.strictEqual(after.card.reviewStep, first.reviewStep);
       assert.strictEqual(after.card.reviewRound, first.reviewRound);
-      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 1);
+      assert.lengthOf(
+        after.events.filter((event) => event.kind === "review"),
+        1,
+      );
       assert.strictEqual(fake.sends.length, sends);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -673,15 +676,28 @@ it.effect("ignores repeated findings without bumping the review round", () =>
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, card, reviewThread } = yield* startReplayReview;
-      const first = yield* kanban.reviewResult(reviewThread, "findings", ["Fee is wrong"], "abc1234");
+      const first = yield* kanban.reviewResult(
+        reviewThread,
+        "findings",
+        ["Fee is wrong"],
+        "abc1234",
+      );
       const before = yield* kanban.card(card.id);
-      const replay = yield* kanban.reviewResult(reviewThread, "findings", [" Fee is wrong "], "abc1234");
+      const replay = yield* kanban.reviewResult(
+        reviewThread,
+        "findings",
+        [" Fee is wrong "],
+        "abc1234",
+      );
       const after = yield* kanban.card(card.id);
       assert.strictEqual(first.reviewRound, 1);
       assert.deepStrictEqual(replay, first);
       assert.deepStrictEqual(after.card, before.card);
       assert.deepStrictEqual(after.events, before.events);
-      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 1);
+      assert.lengthOf(
+        after.events.filter((event) => event.kind === "review"),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -742,7 +758,10 @@ it.effect("rejects an old reviewer's replay after another thread records a revie
       const after = yield* kanban.card(card.id);
       assert.deepStrictEqual(after.card, before.card);
       assert.deepStrictEqual(after.events, before.events);
-      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 2);
+      assert.lengthOf(
+        after.events.filter((event) => event.kind === "review"),
+        2,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -770,7 +789,10 @@ it.effect("records the same verdict normally when the review thread is live or l
       const after = yield* kanban.card(card.id);
       assert.strictEqual(after.card.reviewRound, 3);
       assert.strictEqual(after.card.stalled?.reason, "Needs attention");
-      assert.lengthOf(after.events.filter((event) => event.kind === "review"), 3);
+      assert.lengthOf(
+        after.events.filter((event) => event.kind === "review"),
+        3,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
