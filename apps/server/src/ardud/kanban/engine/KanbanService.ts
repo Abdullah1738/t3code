@@ -702,7 +702,7 @@ const make = Effect.gen(function* () {
       }
     >
   >(new Map());
-  // A healthy model can serve kept cards while individual outage wakes remain held.
+  // Remember recovered runs so their late events cannot reopen an outage.
   const recoveredThreads = yield* Ref.make<ReadonlyMap<string, string | null>>(new Map());
   // Invalidates a probe when another failed run arrives while it is in flight.
   const outageGeneration = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
@@ -2789,6 +2789,9 @@ const make = Effect.gen(function* () {
         failed = true;
         continue;
       }
+      yield* Ref.update(recoveredThreads, (map) =>
+        new Map(map).set(link.threadId, link.paused?.runId ?? null),
+      );
       yield* store.putThreadLink({ ...link, paused: null });
     }
     if (failed) return;
@@ -2827,11 +2830,6 @@ const make = Effect.gen(function* () {
         if (!sent) continue;
       }
       yield* store.putThreadLink({ ...link, paused: null });
-      yield* Ref.update(recoveredThreads, (map) => {
-        const next = new Map(map);
-        next.delete(link.threadId);
-        return next;
-      });
     }
   });
 
@@ -2939,7 +2937,7 @@ const make = Effect.gen(function* () {
         continue;
       }
       if (foundFailure.success !== null) {
-        if (!Rules.isOutage(foundFailure.success)) yield* turnEndedUnlocked(threadId);
+        yield* turnEndedUnlocked(threadId);
         continue;
       }
       const view = yield* threads.view(threadId);
@@ -2986,6 +2984,7 @@ const make = Effect.gen(function* () {
           continue;
         const failure = yield* Effect.result(threads.findLastFailure(threadId));
         if (Result.isFailure(failure) || failure.success !== null) {
+          if (Result.isSuccess(failure)) yield* turnEndedUnlocked(threadId);
           wakes.add(threadId);
           continue;
         }
@@ -3538,7 +3537,7 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
-          if (!Rules.isOutage(foundFailure.success)) yield* turnEndedUnlocked(threadId);
+          yield* turnEndedUnlocked(threadId);
           continue;
         }
         const view = yield* threads.view(threadId);
@@ -3575,7 +3574,7 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
-          if (!Rules.isOutage(foundFailure.success)) yield* turnEndedUnlocked(threadId);
+          yield* turnEndedUnlocked(threadId);
           continue;
         }
         const view = yield* threads.view(threadId);

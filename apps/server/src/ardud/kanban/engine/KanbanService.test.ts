@@ -4897,6 +4897,87 @@ const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
 const probeLayer = (fake: Layer.Layer<KanbanThreads>) =>
   KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake)));
 
+it.effect("review259r3: the quiet backstop records a missed outage so probes can recover it", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      fake.failures.set(thread, outage);
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.caller(thread))?.paused ?? null);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isTrue(probe.calls > 0);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("review259r3: a deferred question must not hide a missed failed turn from the backstop", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+      fake.failures.set(thread, {
+        class: "provider_error", code: "provider.internal", message: "failed", retryable: false,
+      });
+      yield* kanban.pauseBoard(board.id, null, owner);
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      yield* kanban.tick;
+      const failed = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(failed.stage, "todo");
+      assert.include(failed.stalled?.reason ?? "", "Run failed");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a missed outage during a board pause is handled on lift and its deferred question waits for recovery", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const talk = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+      fake.failures.set(thread, outage);
+      yield* kanban.pauseBoard(board.id, null, owner);
+      yield* kanban.tick;
+      assert.isNotNull((yield* kanban.caller(thread))?.paused ?? null);
+      assert.isTrue((yield* kanban.discussion(talk.id)).participants.some(
+        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread &&
+          entry.deferred && entry.owes === "asked",
+      ));
+      const reminders = () => (Ref.get(fake.threads)).pipe(Effect.map((all) =>
+        all.get(thread)!.messages.filter((text) => text.includes("The owner is waiting for your reply")),
+      ));
+      assert.lengthOf(yield* reminders(), 0);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      assert.isTrue(probe.calls > 0);
+      fake.failures.delete(thread); // The recovery run is now eligible to answer.
+      yield* kanban.tick;
+      assert.lengthOf(yield* reminders(), 1);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
 it.effect("a stale successful probe cannot clear an outage reported during the probe", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
