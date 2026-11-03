@@ -1412,7 +1412,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           .reduce(
             (state, next) =>
               client
-                ? applyOrchestrationV2ProjectionEvent(state, next.event)
+                ? (applyOrchestrationV2ProjectionEvent(state, next.event) ?? state)
                 : ProjectionStore.applyToProjection(state, next.event),
             ProjectionStore.emptyProjection(created),
           );
