@@ -294,6 +294,40 @@ describe("RecoverySnapshot", () => {
     }),
   );
 
+  it.effect("checks thread-specific work probes in order without falling back to the session", () =>
+    Effect.gen(function* () {
+      const fixture: Fixture = {
+        ...liveFixture(1),
+        providerThreads: new Map([
+          ["thread-0000", [providerThreadFor("thread-0000", "session-a")]],
+        ]),
+      };
+      const calls: Array<string> = [];
+      const runtime = {
+        hasPendingBackgroundWork: Effect.die("session-wide fallback must not run"),
+        hasPendingBackgroundWorkForThread: () =>
+          Effect.sync(() => {
+            calls.push("running");
+            return false;
+          }),
+        holdsWorkForThread: () =>
+          Effect.sync(() => {
+            calls.push("holding");
+            return true;
+          }),
+      };
+      const layer = layerFor(
+        fixture,
+        sessionsWith(() => Effect.succeed(Option.some(runtime as never))),
+      );
+      const page = yield* snapshotOf(layer, (snapshot) =>
+        snapshot.page({ active: true, cursor: null, limit: 10 }),
+      );
+      assert.strictEqual(page.threads[0]?.heldWork, true);
+      assert.deepStrictEqual(calls, ["running", "holding"]);
+    }),
+  );
+
   it.effect("never loads or touches an idle session", () =>
     Effect.gen(function* () {
       // get, open and isLive die if called (see idleSession). A present session
