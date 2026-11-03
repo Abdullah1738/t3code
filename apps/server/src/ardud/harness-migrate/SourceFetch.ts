@@ -15,19 +15,21 @@ import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import { OpenCodeHttpError, type OpenCodeConnection } from "../opencode-import/OpenCodeHttp.ts";
 import { buildSourceSnapshot, type SourceSnapshot } from "./SourceSnapshot.ts";
 
+const isOpenCodeHttpError = Schema.is(OpenCodeHttpError);
+
 /**
  * One authenticated GET, typed by the caller's decoder. Kept here instead of
  * `getJson` in OpenCodeHttp.ts because that helper always provides the real fetch
  * client, so a test couldn't substitute the transport. Same status and error
  * behaviour: any non-2xx is an OpenCodeHttpError.
  */
-const getJson = <A>(
-  connection: OpenCodeConnection,
-  path: string,
-  operation: string,
-  decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
-) =>
-  Effect.gen(function* () {
+const getJson = Effect.fn("SourceFetch.getJson")(
+  function* <A>(
+    connection: OpenCodeConnection,
+    path: string,
+    operation: string,
+    decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+  ) {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
       HttpClientRequest.get(`${connection.baseUrl}${path}`).pipe(
@@ -39,15 +41,18 @@ const getJson = <A>(
       return yield* new OpenCodeHttpError({ operation, status: response.status });
     }
     return yield* decode(yield* response.json);
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "60 seconds",
-      orElse: () => Effect.fail(new OpenCodeHttpError({ operation: `${operation} (timed out)` })),
-    }),
-    Effect.mapError((cause) =>
-      isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+  },
+  (effect, _connection, _path, operation) =>
+    effect.pipe(
+      Effect.timeoutOrElse({
+        duration: "60 seconds",
+        orElse: () => Effect.fail(new OpenCodeHttpError({ operation: `${operation} (timed out)` })),
+      }),
+      Effect.mapError((cause) =>
+        isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+      ),
     ),
-  );
+);
 
 const ContextPage = Schema.Struct({ data: Schema.Array(Schema.Unknown) });
 const ListPage = Schema.Struct({ data: Schema.Array(Schema.Unknown) });
@@ -73,10 +78,8 @@ export interface SourceFetchResult {
  * Fetches a session's context and the state that would block its migration.
  * Fails with OpenCodeHttpError if any read fails; never returns a partial result.
  */
-const isOpenCodeHttpError = Schema.is(OpenCodeHttpError);
-
-export const fetchSource = (connection: OpenCodeConnection, sessionId: string) =>
-  Effect.gen(function* () {
+export const fetchSource = Effect.fn("SourceFetch.fetchSource")(
+  function* (connection: OpenCodeConnection, sessionId: string) {
     const session = encodeURIComponent(sessionId);
     const context = yield* getJson(
       connection,
@@ -147,10 +150,13 @@ export const fetchSource = (connection: OpenCodeConnection, sessionId: string) =
 
     const snapshot = buildSourceSnapshot({ records: context.data });
     return { records: context.data, snapshot, blockers } satisfies SourceFetchResult;
-  }).pipe(
-    Effect.mapError((cause) =>
-      isOpenCodeHttpError(cause)
-        ? cause
-        : new OpenCodeHttpError({ operation: "fetch source", cause }),
+  },
+  (effect) =>
+    effect.pipe(
+      Effect.mapError((cause) =>
+        isOpenCodeHttpError(cause)
+          ? cause
+          : new OpenCodeHttpError({ operation: "fetch source", cause }),
+      ),
     ),
-  );
+);

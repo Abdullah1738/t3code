@@ -88,7 +88,8 @@ export class MigrationStore extends Context.Service<MigrationStore, MigrationSto
 
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const fail = (operation: string) => (cause: unknown) => new MigrationStoreError({ operation, cause });
+  const fail = (operation: string) => (cause: unknown) =>
+    new MigrationStoreError({ operation, cause });
 
   yield* sql.unsafe(LEDGER_DDL).pipe(Effect.mapError(fail("ensure-ledger")));
 
