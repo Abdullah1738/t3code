@@ -2797,7 +2797,9 @@ export class Router {
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
       for (const m of scope) {
-        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
+        // A run's last word goes out ahead of the final one unless it is proven narration (answer false),
+        // which never goes to the chat. An unknown last word is forwarded, as the final one is.
+        if (m.type === "idle" && last?.type === "assistant" && last.answer !== false && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
         if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }

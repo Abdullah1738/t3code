@@ -357,6 +357,27 @@ test("a text sent mid-turn is steered into the running turn, never re-sent, and 
   expect(h.store.pendingInbound()).toEqual([]);
 });
 
+test("a run that ends on narration before a queued steer never sends that narration", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async () => "queued");
+  h.input("in_1", "First question");
+  await h.router.tick();
+  h.input("in_2", "Sending it now");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  // The first run's last word is proven narration, written before a tool call.
+  const narration = h.backend.step("Sending it now to the clinic", "stop", "msg_narration");
+  narration.answer = false;
+  h.backend.settle();
+  await h.router.tick();
+  h.backend.records.push({ id: messageId("in_2"), type: "user", text: "Sending it now", time: { created: Date.now() } });
+  const answer = h.backend.final("Sent.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${answer.id}`, "Sent."]]);
+  expect(h.conversations().some(op => op.text.includes("Sending it now to the clinic"))).toBe(false);
+});
+
 test("a steer that lands after the run ended is delivered once and both answers go out", async () => {
   const h = setup();
   const steers = steering(h.backend, async () => "queued");
