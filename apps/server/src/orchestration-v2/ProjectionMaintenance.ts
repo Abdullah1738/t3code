@@ -1,8 +1,12 @@
 import { ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -21,6 +25,12 @@ export interface ProjectionVerificationV2 {
   readonly unexpectedThreadIds: ReadonlyArray<ThreadId>;
 }
 
+export interface CompactionResult {
+  readonly deletedEventCount: number;
+  readonly deletedReceiptCount: number;
+  readonly reclaimableBytes: number;
+}
+
 export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMaintenanceError>()(
   "ProjectionMaintenanceError",
   {
@@ -32,14 +42,10 @@ export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMai
 export interface ProjectionMaintenanceV2Shape {
   readonly verify: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
   readonly rebuild: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
-  readonly compactEventStore: Effect.Effect<
-    {
-      readonly deletedEventCount: number;
-      readonly deletedReceiptCount: number;
-      readonly reclaimableBytes: number;
-    },
-    ProjectionMaintenanceError
-  >;
+  readonly compactEventStore: Effect.Effect<CompactionResult, ProjectionMaintenanceError>;
+  readonly compactEventStoreWith: (options: {
+    readonly minPageIntervalMs: number;
+  }) => Effect.Effect<CompactionResult, ProjectionMaintenanceError>;
 }
 
 export class ProjectionMaintenanceV2 extends Context.Service<
@@ -240,7 +246,35 @@ export const layer: Layer.Layer<
      * still scan the entire history when superseded events are sparse.
      * turn-item.updated stays intact because replay assigns positions on first write.
      */
-    const compactEventStore = Effect.gen(function* () {
+    const compactEventStoreWith = ({ minPageIntervalMs }: { readonly minPageIntervalMs: number }) =>
+      Effect.suspend(() => {
+        const intervalNanos = BigInt(Math.max(0, Math.ceil(minPageIntervalMs * 1_000_000)));
+        let lastPageStart: bigint | undefined;
+        let pacedWaitNanos = 0n;
+        let pages = 0;
+        let rowsScanned = 0;
+        let deletedEventCount = 0;
+        let deletedReceiptCount = 0;
+        // Both loops share the same clock, including the transition between them.
+        const startPage = Effect.gen(function* () {
+          const now = yield* Clock.monotonicTimeNanos;
+          if (lastPageStart !== undefined && intervalNanos > 0n) {
+            const remaining = intervalNanos - (now - lastPageStart);
+            if (remaining > 0n) {
+              yield* Effect.sleep(Duration.nanos(remaining)).pipe(
+                Effect.ensuring(
+                  Clock.monotonicTimeNanos.pipe(
+                    Effect.tap((end) => Effect.sync(() => { pacedWaitNanos += end - now; })),
+                  ),
+                ),
+              );
+            }
+          }
+          lastPageStart = yield* Clock.monotonicTimeNanos;
+          pages += 1;
+        });
+
+        const scan = Effect.gen(function* () {
       const bounds = yield* sql<{
         readonly event_sequence: number;
         readonly receipt_row_id: number;
@@ -256,10 +290,8 @@ export const layer: Layer.Layer<
       // Per key: the lowest sequence seen so far after the newest. It is
       // deleted once an even older event turns up and kept otherwise.
       const oldestCandidateByEntityKey = new Map<string, number | null>();
-      let deletedEventCount = 0;
-      let deletedReceiptCount = 0;
-
       while (throughSequence > 0) {
+        yield* startPage;
         const rows = yield* sql<{
           readonly sequence: number;
           readonly application_event_version: number;
@@ -300,6 +332,7 @@ export const layer: Layer.Layer<
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
         `.pipe(NodeSqliteClient.readOnly);
+        rowsScanned += rows.length;
         const obsolete: number[] = [];
         for (const row of rows) {
           if (row.imported_legacy_thread === 1) {
@@ -354,6 +387,7 @@ export const layer: Layer.Layer<
       }
 
       while (throughReceiptRowId > 0) {
+        yield* startPage;
         const rows = yield* sql<{
           readonly row_id: number;
           readonly command_id: string;
@@ -376,6 +410,7 @@ export const layer: Layer.Layer<
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
         `.pipe(NodeSqliteClient.readOnly);
+        rowsScanned += rows.length;
         const obsolete = rows
           .filter((row) => row.imported_legacy_thread === 1)
           .map((row) => row.command_id);
@@ -395,12 +430,44 @@ export const layer: Layer.Layer<
         (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
       return { deletedEventCount, deletedReceiptCount, reclaimableBytes };
-    });
+        });
+
+        if (intervalNanos === 0n) return scan;
+        const log = (message: string, metadata: Record<string, unknown>) =>
+          Effect.suspend(() => Effect.logInfo(message, metadata)).pipe(
+            Effect.ignoreCause({ log: false }),
+          );
+        return Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const started = yield* Clock.monotonicTimeNanos;
+            yield* log("Orchestration history compaction started", {
+              pages, rowsScanned, deletedEventCount, deletedReceiptCount,
+              elapsedMs: 0, pacedWaitMs: 0, outcome: "started",
+            });
+            return yield* restore(scan).pipe(
+              Effect.onExit((exit) =>
+                Effect.gen(function* () {
+                  const ended = yield* Clock.monotonicTimeNanos;
+                  yield* log("Orchestration history compaction ended", {
+                    pages, rowsScanned, deletedEventCount, deletedReceiptCount,
+                    elapsedMs: Number(ended - started) / 1_000_000,
+                    pacedWaitMs: Number(pacedWaitNanos) / 1_000_000,
+                    outcome: Exit.isSuccess(exit)
+                      ? "success"
+                      : Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failure",
+                  });
+                }).pipe(Effect.ignoreCause({ log: false })),
+              ),
+            );
+          }),
+        );
+      });
 
     return ProjectionMaintenanceV2.of({
       verify: mapError("verify")(verify),
       rebuild: mapError("rebuild")(rebuild),
-      compactEventStore: mapError("compact event store")(compactEventStore),
+      compactEventStore: mapError("compact event store")(compactEventStoreWith({ minPageIntervalMs: 0 })),
+      compactEventStoreWith: (options) => mapError("compact event store")(compactEventStoreWith(options)),
     });
   }),
 );

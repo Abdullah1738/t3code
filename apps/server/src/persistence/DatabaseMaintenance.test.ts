@@ -6,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import * as Sqlite from "./Sqlite.ts";
@@ -98,6 +99,20 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           yield* sql`CREATE TABLE discarded_data (value BLOB)`;
           yield* sql`INSERT INTO discarded_data VALUES (zeroblob(4194304))`;
           yield* sql`DROP TABLE discarded_data`;
+          yield* sql`
+            WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 101)
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+            )
+            SELECT 'doctor:' || n, 'thread', 'thread:doctor', n, 'provider-session.detached',
+              '2026-01-01T00:00:00.000Z', 'server', '{}', '{}', 2 FROM history
+          `;
+          yield* sql`
+            UPDATE orchestration_v2_projection_metadata
+            SET last_sequence = (SELECT MAX(sequence) FROM orchestration_events)
+            WHERE projection_name = 'thread-projections'
+          `;
           yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
 
@@ -111,13 +126,23 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         assert.equal(refused._tag, "DatabaseInUseError");
         assert.equal((yield* fs.stat(dbPath)).size, sizeBefore);
 
-        const result = yield* maintenance.compact(dbPath);
+        let pageStarts = 0;
+        const observePages: Statement.Transformer = (statement) => {
+          if (/^\s*SELECT\s+event\.sequence/.test(statement.compile()[0])) pageStarts += 1;
+          return Effect.succeed(statement);
+        };
+        const result = yield* maintenance.compact(dbPath).pipe(
+          Effect.provideService(Statement.CurrentTransformer, observePages),
+        );
+        // This test's clock is never advanced: a paced doctor would not finish.
+        assert.equal(pageStarts, 3);
         // The 4 MiB of free pages are returned to the filesystem.
         assert.isBelow(result.afterBytes, result.beforeBytes - 3 * 1024 * 1024);
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           assert.deepEqual(yield* sql`PRAGMA auto_vacuum`, [{ auto_vacuum: 2 }]);
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
+          assert.deepEqual(yield* sql`SELECT count(*) AS count FROM orchestration_events`, [{ count: 101 }]);
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
       }).pipe(Effect.scoped),
     );
