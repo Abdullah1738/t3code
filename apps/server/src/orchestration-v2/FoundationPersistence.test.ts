@@ -358,29 +358,31 @@ it.effect("keeps other database work runnable while discovering compaction candi
   ).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("paces both compaction scans without holding the reader and preserves the deleted set", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "compaction-pacing-" });
-      const database = SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"));
-      const maintenanceLayer = ProjectionMaintenance.layer.pipe(
-        Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
-        Layer.provideMerge(database),
-      );
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-        const now = DateTime.formatIso(yield* DateTime.now);
-        yield* sql`
+it.effect(
+  "paces both compaction scans without holding the reader and preserves the deleted set",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "compaction-pacing-" });
+        const database = SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"));
+        const maintenanceLayer = ProjectionMaintenance.layer.pipe(
+          Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+          Layer.provideMerge(database),
+        );
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+          const now = DateTime.formatIso(yield* DateTime.now);
+          yield* sql`
           INSERT INTO orchestration_v2_legacy_imports (
             thread_id, source_updated_at, shell_imported_at, transcript_imported_at,
             imported_message_count, last_error
           ) VALUES ('imported', ${now}, ${now}, ${now}, 1, NULL)
         `;
-        const seed = Effect.gen(function* () {
-          yield* sql`
+          const seed = Effect.gen(function* () {
+            yield* sql`
             WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 121)
             INSERT INTO orchestration_events (
               event_id, aggregate_kind, stream_id, stream_version, event_type,
@@ -391,7 +393,7 @@ it.effect("paces both compaction scans without holding the reader and preserves 
               ${now}, 'server', '{}', '{}', CASE WHEN n % 3 = 0 THEN 1 ELSE 2 END
             FROM history
           `;
-          yield* sql`
+            yield* sql`
             WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 121)
             INSERT INTO orchestration_command_receipts (
               command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, command_type
@@ -399,90 +401,111 @@ it.effect("paces both compaction scans without holding the reader and preserves 
             SELECT 'receipt:' || n, 'thread', CASE WHEN n % 3 = 0 THEN 'imported' ELSE 'pending' END,
               ${now}, n, 'accepted', 'legacy' FROM history
           `;
-        });
-        const retained = Effect.gen(function* () {
-          const events = yield* sql<{ readonly event_id: string }>`SELECT event_id FROM orchestration_events ORDER BY event_id`;
-          const receipts = yield* sql<{ readonly command_id: string }>`SELECT command_id FROM orchestration_command_receipts ORDER BY command_id`;
-          return { events, receipts };
-        });
-        yield* seed;
-        const unpaced = yield* maintenance.compactEventStore;
-        const expected = yield* retained;
-        yield* sql`DELETE FROM orchestration_events`;
-        yield* sql`DELETE FROM orchestration_command_receipts`;
-        yield* seed;
+          });
+          const retained = Effect.gen(function* () {
+            const events = yield* sql<{
+              readonly event_id: string;
+            }>`SELECT event_id FROM orchestration_events ORDER BY event_id`;
+            const receipts = yield* sql<{
+              readonly command_id: string;
+            }>`SELECT command_id FROM orchestration_command_receipts ORDER BY command_id`;
+            return { events, receipts };
+          });
+          yield* seed;
+          const unpaced = yield* maintenance.compactEventStore;
+          const expected = yield* retained;
+          yield* sql`DELETE FROM orchestration_events`;
+          yield* sql`DELETE FROM orchestration_command_receipts`;
+          yield* seed;
 
-        const starts = yield* Queue.unbounded<{ kind: "events" | "receipts"; time: number; span: Tracer.Span }>();
-        const logs: Array<unknown> = [];
-        const logger = Logger.make(({ message }) => { logs.push(message); });
-        const sleeping = yield* Queue.unbounded<number>();
-        const clock = yield* Clock.Clock;
-        const observedClock: Clock.Clock = {
-          ...clock,
-          sleep: (duration) => (
-            Duration.toMillis(duration) <= 25
-              ? Queue.offer(sleeping, Duration.toMillis(duration))
-              : Effect.void
-          ).pipe(Effect.andThen(clock.sleep(duration))),
-        };
-        const observePage: Statement.Transformer = (statement, _sql, _fiber, span) => {
-          const [query] = statement.compile();
-          const kind = /^\s*SELECT\s+event\.sequence/.test(query)
-            ? "events"
-            : /^\s*SELECT\s+receipt\.rowid/.test(query) ? "receipts" : undefined;
-          return kind === undefined ? Effect.succeed(statement) : Clock.currentTimeMillis.pipe(
-            Effect.flatMap((time) => Queue.offer(starts, { kind, time, span })),
-            Effect.as(statement),
+          const starts = yield* Queue.unbounded<{
+            kind: "events" | "receipts";
+            time: number;
+            span: Tracer.Span;
+          }>();
+          const logs: Array<unknown> = [];
+          const logger = Logger.make(({ message }) => {
+            logs.push(message);
+          });
+          const sleeping = yield* Queue.unbounded<number>();
+          const clock = yield* Clock.Clock;
+          const observedClock: Clock.Clock = {
+            ...clock,
+            sleep: (duration) =>
+              (Duration.toMillis(duration) <= 25
+                ? Queue.offer(sleeping, Duration.toMillis(duration))
+                : Effect.void
+              ).pipe(Effect.andThen(clock.sleep(duration))),
+          };
+          const observePage: Statement.Transformer = (statement, _sql, _fiber, span) => {
+            const [query] = statement.compile();
+            const kind = /^\s*SELECT\s+event\.sequence/.test(query)
+              ? "events"
+              : /^\s*SELECT\s+receipt\.rowid/.test(query)
+                ? "receipts"
+                : undefined;
+            return kind === undefined
+              ? Effect.succeed(statement)
+              : Clock.currentTimeMillis.pipe(
+                  Effect.flatMap((time) => Queue.offer(starts, { kind, time, span })),
+                  Effect.as(statement),
+                );
+          };
+          const fiber = yield* maintenance
+            .compactEventStoreWith({ minPageIntervalMs: 25 })
+            .pipe(
+              Effect.provideService(Statement.CurrentTransformer, observePage),
+              Effect.provideService(Statement.SpanPropagationEnabled, true),
+              Effect.provideService(Clock.Clock, observedClock),
+              Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+              Effect.forkChild,
+            );
+          const first = yield* Queue.take(starts);
+          assert.equal(first.kind, "events");
+          const pages = [first];
+          for (let i = 0; i < 5; i++) {
+            assert.equal(yield* Queue.take(sleeping), 25);
+            assert.equal(yield* Queue.size(starts), 0);
+            // Querying during the sleep proves the reader permit was released.
+            assert.deepEqual(yield* sql`SELECT 1 AS responsive`.pipe(NodeSqliteClient.readOnly), [
+              { responsive: 1 },
+            ]);
+            yield* TestClock.adjust("24 millis");
+            assert.equal(yield* Queue.size(starts), 0);
+            yield* TestClock.adjust("1 millis");
+            pages.push(yield* Queue.take(starts));
+          }
+          const paced = yield* Fiber.join(fiber);
+          assert.deepEqual(
+            pages.map((page) => page.kind),
+            ["events", "events", "events", "receipts", "receipts", "receipts"],
           );
-        };
-        const fiber = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
-          Effect.provideService(Statement.CurrentTransformer, observePage),
-          Effect.provideService(Statement.SpanPropagationEnabled, true),
-          Effect.provideService(Clock.Clock, observedClock),
-          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
-          Effect.forkChild,
-        );
-        const first = yield* Queue.take(starts);
-        assert.equal(first.kind, "events");
-        const pages = [first];
-        for (let i = 0; i < 5; i++) {
-          assert.equal(yield* Queue.take(sleeping), 25);
-          assert.equal(yield* Queue.size(starts), 0);
-          // Querying during the sleep proves the reader permit was released.
-          assert.deepEqual(yield* sql`SELECT 1 AS responsive`.pipe(NodeSqliteClient.readOnly), [
-            { responsive: 1 },
-          ]);
-          yield* TestClock.adjust("24 millis");
-          assert.equal(yield* Queue.size(starts), 0);
-          yield* TestClock.adjust("1 millis");
-          pages.push(yield* Queue.take(starts));
-        }
-        const paced = yield* Fiber.join(fiber);
-        assert.deepEqual(pages.map((page) => page.kind), [
-          "events", "events", "events", "receipts", "receipts", "receipts",
-        ]);
-        for (let i = 1; i < pages.length; i++) {
-          assert.isAtLeast(pages[i]!.time - pages[i - 1]!.time, 25);
-        }
-        for (const page of pages) assert.equal(page.span.attributes.get("db.connection"), "reader");
-        assert.equal(paced.deletedEventCount, unpaced.deletedEventCount);
-        assert.equal(paced.deletedReceiptCount, unpaced.deletedReceiptCount);
-        assert.deepEqual(yield* retained, expected);
-        assert.equal(logs.length, 2);
-        const [startMessage, startMetadata] = logs[0] as [string, Record<string, unknown>];
-        const [endMessage, endMetadata] = logs[1] as [string, Record<string, unknown>];
-        assert.equal(startMessage, "Orchestration history compaction started");
-        assert.equal(startMetadata.outcome, "started");
-        assert.equal(endMessage, "Orchestration history compaction ended");
-        assert.deepEqual(endMetadata, {
-          pages: 6, rowsScanned: 242,
-          deletedEventCount: unpaced.deletedEventCount,
-          deletedReceiptCount: unpaced.deletedReceiptCount,
-          elapsedMs: 125, pacedWaitMs: 125, outcome: "success",
-        });
-      }).pipe(Effect.provide(maintenanceLayer));
-    }),
-  ).pipe(Effect.provide(NodeServices.layer)),
+          for (let i = 1; i < pages.length; i++) {
+            assert.isAtLeast(pages[i]!.time - pages[i - 1]!.time, 25);
+          }
+          for (const page of pages)
+            assert.equal(page.span.attributes.get("db.connection"), "reader");
+          assert.equal(paced.deletedEventCount, unpaced.deletedEventCount);
+          assert.equal(paced.deletedReceiptCount, unpaced.deletedReceiptCount);
+          assert.deepEqual(yield* retained, expected);
+          assert.equal(logs.length, 2);
+          const [startMessage, startMetadata] = logs[0] as [string, Record<string, unknown>];
+          const [endMessage, endMetadata] = logs[1] as [string, Record<string, unknown>];
+          assert.equal(startMessage, "Orchestration history compaction started");
+          assert.equal(startMetadata.outcome, "started");
+          assert.equal(endMessage, "Orchestration history compaction ended");
+          assert.deepEqual(endMetadata, {
+            pages: 6,
+            rowsScanned: 242,
+            deletedEventCount: unpaced.deletedEventCount,
+            deletedReceiptCount: unpaced.deletedReceiptCount,
+            elapsedMs: 125,
+            pacedWaitMs: 125,
+            outcome: "success",
+          });
+        }).pipe(Effect.provide(maintenanceLayer));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("rechecks the page deadline when the clock wakes a sleep early", () =>
@@ -524,11 +547,13 @@ it.effect("rechecks the page deadline when the clock wakes a sleep early", () =>
           Effect.as(statement),
         );
       };
-      const fiber = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
-        Effect.provideService(Statement.CurrentTransformer, observePage),
-        Effect.provideService(Clock.Clock, observedClock),
-        Effect.forkChild,
-      );
+      const fiber = yield* maintenance
+        .compactEventStoreWith({ minPageIntervalMs: 25 })
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, observePage),
+          Effect.provideService(Clock.Clock, observedClock),
+          Effect.forkChild,
+        );
       const first = yield* Queue.take(starts);
       // The first sleep is shortened once to simulate a fractional timeout waking early.
       assert.equal(yield* Queue.take(sleeps), 25);
@@ -560,15 +585,18 @@ it.effect("a slow page consumes its pacing interval and a sleeping scan is inter
       `;
       const starts = yield* Queue.unbounded<number>();
       const logs: Array<unknown> = [];
-      const logger = Logger.make(({ message }) => { logs.push(message); });
+      const logger = Logger.make(({ message }) => {
+        logs.push(message);
+      });
       const sleeping = yield* Queue.unbounded<number>();
       const releaseFirstPage = yield* Deferred.make<void>();
       const clock = yield* Clock.Clock;
       const observedClock: Clock.Clock = {
         ...clock,
-        sleep: (duration) => Queue.offer(sleeping, Duration.toMillis(duration)).pipe(
-          Effect.andThen(clock.sleep(duration)),
-        ),
+        sleep: (duration) =>
+          Queue.offer(sleeping, Duration.toMillis(duration)).pipe(
+            Effect.andThen(clock.sleep(duration)),
+          ),
       };
       let pageCount = 0;
       const slowPage: Statement.Transformer = (statement) => {
@@ -581,12 +609,14 @@ it.effect("a slow page consumes its pacing interval and a sleeping scan is inter
           Effect.as(statement),
         );
       };
-      const fiber = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
-        Effect.provideService(Statement.CurrentTransformer, slowPage),
-        Effect.provideService(Clock.Clock, observedClock),
-        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
-        Effect.forkChild,
-      );
+      const fiber = yield* maintenance
+        .compactEventStoreWith({ minPageIntervalMs: 25 })
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, slowPage),
+          Effect.provideService(Clock.Clock, observedClock),
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
       const first = yield* Queue.take(starts);
       yield* TestClock.adjust("30 millis");
       yield* Deferred.succeed(releaseFirstPage, undefined);
@@ -609,7 +639,9 @@ it.effect("logs failed scans without leaking SQL and ignores logger defects", ()
   Effect.gen(function* () {
     const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
     const logs: Array<unknown> = [];
-    const logger = Logger.make(({ message }) => { logs.push(message); });
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
     const failPage: Statement.Transformer = (statement) => {
       if (/^\s*SELECT\s+event\.sequence/.test(statement.compile()[0])) {
         return Effect.die("test-only private query content");
@@ -624,11 +656,13 @@ it.effect("logs failed scans without leaking SQL and ignores logger defects", ()
       ) VALUES ('private-event', 'thread', 'private-thread', 1, 'provider-session.detached',
         '2026-01-01T00:00:00.000Z', 'server', '{}', '{}', 2)
     `;
-    const failed = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
-      Effect.provideService(Statement.CurrentTransformer, failPage),
-      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
-      Effect.exit,
-    );
+    const failed = yield* maintenance
+      .compactEventStoreWith({ minPageIntervalMs: 25 })
+      .pipe(
+        Effect.provideService(Statement.CurrentTransformer, failPage),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.exit,
+      );
     assert.isTrue(Exit.isFailure(failed));
     assert.equal(logs.length, 2);
     const [, endMetadata] = logs[1] as [string, Record<string, unknown>];
@@ -636,10 +670,12 @@ it.effect("logs failed scans without leaking SQL and ignores logger defects", ()
     assert.equal(endMetadata.pages, 1);
     assert.notInclude(JSON.stringify(logs), "private");
 
-    const brokenLogger = Logger.make(() => { throw new Error("logger unavailable"); });
-    const result = yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 25 }).pipe(
-      Effect.provide(Logger.layer([brokenLogger], { mergeWithExisting: false })),
-    );
+    const brokenLogger = Logger.make(() => {
+      throw new Error("logger unavailable");
+    });
+    const result = yield* maintenance
+      .compactEventStoreWith({ minPageIntervalMs: 25 })
+      .pipe(Effect.provide(Logger.layer([brokenLogger], { mergeWithExisting: false })));
     assert.equal(result.deletedEventCount, 0);
   }).pipe(Effect.provide(layerTest)),
 );

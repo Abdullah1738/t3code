@@ -131,9 +131,9 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           if (/^\s*SELECT\s+event\.sequence/.test(statement.compile()[0])) pageStarts += 1;
           return Effect.succeed(statement);
         };
-        const result = yield* maintenance.compact(dbPath).pipe(
-          Effect.provideService(Statement.CurrentTransformer, observePages),
-        );
+        const result = yield* maintenance
+          .compact(dbPath)
+          .pipe(Effect.provideService(Statement.CurrentTransformer, observePages));
         // This test's clock is never advanced: a paced doctor would not finish.
         assert.equal(pageStarts, 3);
         // The 4 MiB of free pages are returned to the filesystem.
@@ -142,7 +142,9 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           const sql = yield* SqlClient.SqlClient;
           assert.deepEqual(yield* sql`PRAGMA auto_vacuum`, [{ auto_vacuum: 2 }]);
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
-          assert.deepEqual(yield* sql`SELECT count(*) AS count FROM orchestration_events`, [{ count: 101 }]);
+          assert.deepEqual(yield* sql`SELECT count(*) AS count FROM orchestration_events`, [
+            { count: 101 },
+          ]);
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
       }).pipe(Effect.scoped),
     );

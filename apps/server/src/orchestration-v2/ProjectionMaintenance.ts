@@ -277,7 +277,11 @@ export const layer: Layer.Layer<
               yield* Effect.sleep(Duration.nanos(deadline - now)).pipe(
                 Effect.ensuring(
                   Clock.monotonicTimeNanos.pipe(
-                    Effect.tap((end) => Effect.sync(() => { pacedWaitNanos += end - waitStarted; })),
+                    Effect.tap((end) =>
+                      Effect.sync(() => {
+                        pacedWaitNanos += end - waitStarted;
+                      }),
+                    ),
                   ),
                 ),
               );
@@ -289,36 +293,36 @@ export const layer: Layer.Layer<
         });
 
         const scan = Effect.gen(function* () {
-      const bounds = yield* sql<{
-        readonly event_sequence: number;
-        readonly receipt_row_id: number;
-      }>`
+          const bounds = yield* sql<{
+            readonly event_sequence: number;
+            readonly receipt_row_id: number;
+          }>`
         SELECT
           COALESCE((SELECT MAX(sequence) FROM orchestration_events), 0) AS event_sequence,
           COALESCE((SELECT MAX(rowid) FROM orchestration_command_receipts), 0) AS receipt_row_id
       `;
-      let throughSequence = bounds[0]?.event_sequence ?? 0;
-      let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
-      const retainedThreadIds = new Set<string>();
-      const retainedReadStateThreadIds = new Set<string>();
-      // Per key: the lowest sequence seen so far after the newest. It is
-      // deleted once an even older event turns up and kept otherwise.
-      const oldestCandidateByEntityKey = new Map<
-        string,
-        { readonly sequence: number; readonly textPayloadBytes: number | null } | null
-      >();
-      while (throughSequence > 0) {
-        yield* startPage;
-        const rows = yield* sql<{
-          readonly sequence: number;
-          readonly application_event_version: number;
-          readonly aggregate_kind: string;
-          readonly stream_id: string;
-          readonly event_type: string;
-          readonly entity_id: string | null;
-          readonly text_item_payload_json: string | null;
-          readonly imported_legacy_thread: number;
-        }>`
+          let throughSequence = bounds[0]?.event_sequence ?? 0;
+          let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
+          const retainedThreadIds = new Set<string>();
+          const retainedReadStateThreadIds = new Set<string>();
+          // Per key: the lowest sequence seen so far after the newest. It is
+          // deleted once an even older event turns up and kept otherwise.
+          const oldestCandidateByEntityKey = new Map<
+            string,
+            { readonly sequence: number; readonly textPayloadBytes: number | null } | null
+          >();
+          while (throughSequence > 0) {
+            yield* startPage;
+            const rows = yield* sql<{
+              readonly sequence: number;
+              readonly application_event_version: number;
+              readonly aggregate_kind: string;
+              readonly stream_id: string;
+              readonly event_type: string;
+              readonly entity_id: string | null;
+              readonly text_item_payload_json: string | null;
+              readonly imported_legacy_thread: number;
+            }>`
           SELECT
             event.sequence,
             event.application_event_version,
@@ -363,93 +367,96 @@ export const layer: Layer.Layer<
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
         `.pipe(NodeSqliteClient.readOnly);
-        rowsScanned += rows.length;
-        const obsolete: number[] = [];
-        let pageDeletedTextEventCount = 0;
-        let pageDeletedTextPayloadBytes = 0;
-        for (const row of rows) {
-          if (row.imported_legacy_thread === 1) {
-            obsolete.push(row.sequence);
-          } else if (row.application_event_version === 2) {
-            if (
-              row.aggregate_kind === "thread" &&
-              supersedableThreadEventTypes.has(row.event_type)
-            ) {
-              if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
-              else retainedThreadIds.add(row.stream_id);
-            } else if (
-              row.aggregate_kind === "thread" &&
-              readStateThreadEventTypes.has(row.event_type)
-            ) {
-              if (
-                retainedThreadIds.has(row.stream_id) ||
-                retainedReadStateThreadIds.has(row.stream_id)
-              ) {
+            rowsScanned += rows.length;
+            const obsolete: number[] = [];
+            let pageDeletedTextEventCount = 0;
+            let pageDeletedTextPayloadBytes = 0;
+            for (const row of rows) {
+              if (row.imported_legacy_thread === 1) {
                 obsolete.push(row.sequence);
-              } else retainedReadStateThreadIds.add(row.stream_id);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" &&
-              retainedThreadIds.has(row.stream_id)
-            ) {
-              // A newer whole-thread payload already carries this link's state.
-              obsolete.push(row.sequence);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" ||
-              row.event_type === "message.updated" ||
-              row.event_type === "node.updated" ||
-              row.text_item_payload_json !== null
-            ) {
-              let entityId = row.entity_id;
-              let textPayloadBytes: number | null = null;
-              if (row.text_item_payload_json !== null) {
-                const decoded = decodeTurnItemJson(row.text_item_payload_json);
+              } else if (row.application_event_version === 2) {
                 if (
-                  Option.isNone(decoded) ||
-                  (decoded.value.type !== "reasoning" &&
-                    decoded.value.type !== "assistant_message") ||
-                  decoded.value.threadId !== row.stream_id
-                )
-                  continue;
-                entityId = decoded.value.id;
-                textPayloadBytes = Buffer.byteLength(row.text_item_payload_json, "utf8");
-                consideredTextEventCount++;
-              }
-              const key = encodeEntityKey([row.event_type, row.stream_id, entityId]);
-              const candidate = oldestCandidateByEntityKey.get(key);
-              if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
-              else {
-                if (candidate !== null) {
-                  obsolete.push(candidate.sequence);
-                  if (candidate.textPayloadBytes !== null) {
-                    pageDeletedTextEventCount++;
-                    pageDeletedTextPayloadBytes += candidate.textPayloadBytes;
+                  row.aggregate_kind === "thread" &&
+                  supersedableThreadEventTypes.has(row.event_type)
+                ) {
+                  if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
+                  else retainedThreadIds.add(row.stream_id);
+                } else if (
+                  row.aggregate_kind === "thread" &&
+                  readStateThreadEventTypes.has(row.event_type)
+                ) {
+                  if (
+                    retainedThreadIds.has(row.stream_id) ||
+                    retainedReadStateThreadIds.has(row.stream_id)
+                  ) {
+                    obsolete.push(row.sequence);
+                  } else retainedReadStateThreadIds.add(row.stream_id);
+                } else if (
+                  row.event_type === "thread.pull-request-link-updated" &&
+                  retainedThreadIds.has(row.stream_id)
+                ) {
+                  // A newer whole-thread payload already carries this link's state.
+                  obsolete.push(row.sequence);
+                } else if (
+                  row.event_type === "thread.pull-request-link-updated" ||
+                  row.event_type === "message.updated" ||
+                  row.event_type === "node.updated" ||
+                  row.text_item_payload_json !== null
+                ) {
+                  let entityId = row.entity_id;
+                  let textPayloadBytes: number | null = null;
+                  if (row.text_item_payload_json !== null) {
+                    const decoded = decodeTurnItemJson(row.text_item_payload_json);
+                    if (
+                      Option.isNone(decoded) ||
+                      (decoded.value.type !== "reasoning" &&
+                        decoded.value.type !== "assistant_message") ||
+                      decoded.value.threadId !== row.stream_id
+                    )
+                      continue;
+                    entityId = decoded.value.id;
+                    textPayloadBytes = Buffer.byteLength(row.text_item_payload_json, "utf8");
+                    consideredTextEventCount++;
+                  }
+                  const key = encodeEntityKey([row.event_type, row.stream_id, entityId]);
+                  const candidate = oldestCandidateByEntityKey.get(key);
+                  if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
+                  else {
+                    if (candidate !== null) {
+                      obsolete.push(candidate.sequence);
+                      if (candidate.textPayloadBytes !== null) {
+                        pageDeletedTextEventCount++;
+                        pageDeletedTextPayloadBytes += candidate.textPayloadBytes;
+                      }
+                    }
+                    oldestCandidateByEntityKey.set(key, {
+                      sequence: row.sequence,
+                      textPayloadBytes,
+                    });
                   }
                 }
-                oldestCandidateByEntityKey.set(key, { sequence: row.sequence, textPayloadBytes });
               }
             }
+            // Yield even without deletions for clients using the synchronous fallback.
+            yield* Effect.yieldNow;
+            if (obsolete.length > 0) {
+              yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
+              deletedEventCount += obsolete.length;
+              deletedTextEventCount += pageDeletedTextEventCount;
+              deletedTextPayloadBytes += pageDeletedTextPayloadBytes;
+              yield* Effect.yieldNow;
+            }
+            throughSequence = (rows.at(-1)?.sequence ?? 1) - 1;
+            if (rows.length < COMPACTION_PAGE_SIZE) break;
           }
-        }
-        // Yield even without deletions for clients using the synchronous fallback.
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
-          deletedEventCount += obsolete.length;
-          deletedTextEventCount += pageDeletedTextEventCount;
-          deletedTextPayloadBytes += pageDeletedTextPayloadBytes;
-          yield* Effect.yieldNow;
-        }
-        throughSequence = (rows.at(-1)?.sequence ?? 1) - 1;
-        if (rows.length < COMPACTION_PAGE_SIZE) break;
-      }
 
-      while (throughReceiptRowId > 0) {
-        yield* startPage;
-        const rows = yield* sql<{
-          readonly row_id: number;
-          readonly command_id: string;
-          readonly imported_legacy_thread: number;
-        }>`
+          while (throughReceiptRowId > 0) {
+            yield* startPage;
+            const rows = yield* sql<{
+              readonly row_id: number;
+              readonly command_id: string;
+              readonly imported_legacy_thread: number;
+            }>`
           SELECT
             receipt.rowid AS row_id,
             receipt.command_id,
@@ -467,34 +474,36 @@ export const layer: Layer.Layer<
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
         `.pipe(NodeSqliteClient.readOnly);
-        rowsScanned += rows.length;
-        const obsolete = rows
-          .filter((row) => row.imported_legacy_thread === 1)
-          .map((row) => row.command_id);
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
-          deletedReceiptCount += obsolete.length;
-          yield* Effect.yieldNow;
-        }
-        throughReceiptRowId = (rows.at(-1)?.row_id ?? 1) - 1;
-        if (rows.length < COMPACTION_PAGE_SIZE) break;
-      }
+            rowsScanned += rows.length;
+            const obsolete = rows
+              .filter((row) => row.imported_legacy_thread === 1)
+              .map((row) => row.command_id);
+            yield* Effect.yieldNow;
+            if (obsolete.length > 0) {
+              yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
+              deletedReceiptCount += obsolete.length;
+              yield* Effect.yieldNow;
+            }
+            throughReceiptRowId = (rows.at(-1)?.row_id ?? 1) - 1;
+            if (rows.length < COMPACTION_PAGE_SIZE) break;
+          }
 
-      const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
-      const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
-      const reclaimableBytes =
-        (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
+          const freelistRows = yield* sql<{
+            readonly freelist_count: number;
+          }>`PRAGMA freelist_count`;
+          const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
+          const reclaimableBytes =
+            (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
-      return {
-        deletedEventCount,
-        deletedReceiptCount,
-        reclaimableBytes,
-        consideredTextEventCount,
-        deletedTextEventCount,
-        retainedTextEventCount: consideredTextEventCount - deletedTextEventCount,
-        deletedTextPayloadBytes,
-      };
+          return {
+            deletedEventCount,
+            deletedReceiptCount,
+            reclaimableBytes,
+            consideredTextEventCount,
+            deletedTextEventCount,
+            retainedTextEventCount: consideredTextEventCount - deletedTextEventCount,
+            deletedTextPayloadBytes,
+          };
         });
 
         if (intervalNanos === 0n) return scan;
@@ -506,20 +515,30 @@ export const layer: Layer.Layer<
           Effect.gen(function* () {
             const started = yield* Clock.monotonicTimeNanos;
             yield* log("Orchestration history compaction started", {
-              pages, rowsScanned, deletedEventCount, deletedReceiptCount,
-              elapsedMs: 0, pacedWaitMs: 0, outcome: "started",
+              pages,
+              rowsScanned,
+              deletedEventCount,
+              deletedReceiptCount,
+              elapsedMs: 0,
+              pacedWaitMs: 0,
+              outcome: "started",
             });
             return yield* restore(scan).pipe(
               Effect.onExit((exit) =>
                 Effect.gen(function* () {
                   const ended = yield* Clock.monotonicTimeNanos;
                   yield* log("Orchestration history compaction ended", {
-                    pages, rowsScanned, deletedEventCount, deletedReceiptCount,
+                    pages,
+                    rowsScanned,
+                    deletedEventCount,
+                    deletedReceiptCount,
                     elapsedMs: Number(ended - started) / 1_000_000,
                     pacedWaitMs: Number(pacedWaitNanos) / 1_000_000,
                     outcome: Exit.isSuccess(exit)
                       ? "success"
-                      : Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failure",
+                      : Cause.hasInterruptsOnly(exit.cause)
+                        ? "interrupted"
+                        : "failure",
                   });
                 }).pipe(Effect.ignoreCause({ log: false })),
               ),
@@ -531,8 +550,11 @@ export const layer: Layer.Layer<
     return ProjectionMaintenanceV2.of({
       verify: mapError("verify")(verify),
       rebuild: mapError("rebuild")(rebuild),
-      compactEventStore: mapError("compact event store")(compactEventStoreWith({ minPageIntervalMs: 0 })),
-      compactEventStoreWith: (options) => mapError("compact event store")(compactEventStoreWith(options)),
+      compactEventStore: mapError("compact event store")(
+        compactEventStoreWith({ minPageIntervalMs: 0 }),
+      ),
+      compactEventStoreWith: (options) =>
+        mapError("compact event store")(compactEventStoreWith(options)),
     });
   }),
 );
