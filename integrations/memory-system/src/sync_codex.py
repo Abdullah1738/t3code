@@ -251,6 +251,8 @@ class CodexSync:
             r for r in transcript_roots.existing() if r["driver"] == DRIVER]
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
         self.mem = sqlite3.connect(MEM_DB, timeout=600)
+        self.mem.execute("PRAGMA wal_autocheckpoint=0")
+        self.mem.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
         self.mem.execute("PRAGMA busy_timeout=600000")
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
