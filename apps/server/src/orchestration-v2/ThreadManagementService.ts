@@ -931,17 +931,36 @@ const make = Effect.gen(function* () {
     "ThreadManagementService.sendToThread",
   )(function* (input) {
     const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
-    if (target.thread.archivedAt !== null) {
-      return yield* new ThreadManagementThreadArchivedError({
-        threadId: input.threadId,
-      });
-    }
     const steerableRun = latestSteerableRun(target);
+    // ardud: an accepted send can be retried after its run finishes or the thread archives.
+    // Only the orchestrator replays the receipt; never turn a missing receipt into a new send.
+    const preflightError =
+      target.thread.archivedAt !== null
+        ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
+        : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
+          ? new ThreadManagementNoSteerableRunError({ threadId: input.threadId, mode: input.mode })
+          : undefined;
+    const receipt =
+      preflightError === undefined
+        ? Option.none()
+        : yield* receipts
+            .getByCommandId(input.commandId)
+            .pipe(Effect.orElseSucceed(() => Option.none()));
+    const replay =
+      Option.isSome(receipt) &&
+      receipt.value.status === "accepted" &&
+      receipt.value.commandType === "message.dispatch" &&
+      receipt.value.threadId === input.threadId;
+    if (preflightError !== undefined && !replay) {
+      return yield* preflightError;
+    }
     let dispatchMode: Extract<
       OrchestrationV2Command,
       { readonly type: "message.dispatch" }
     >["dispatchMode"];
-    if (input.mode === "steer" || input.mode === "restart") {
+    if (replay) {
+      dispatchMode = { type: "start_immediately" };
+    } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {
         return yield* new ThreadManagementNoSteerableRunError({
           threadId: input.threadId,
