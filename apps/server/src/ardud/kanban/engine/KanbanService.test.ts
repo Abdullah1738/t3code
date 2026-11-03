@@ -305,18 +305,20 @@ const observedStoreLayer = (observe: (discussionId: KanbanDiscussionId) => Effec
       KanbanStore.KanbanStore.of({
         ...real,
         putDiscussion: (discussion) =>
-          real.putDiscussion(discussion).pipe(
-            Effect.tap(() =>
-              discussion.participants.some(
-                (participant) =>
-                  participant.actor._tag === "owner" &&
-                  discussion.lastSeq > 0 &&
-                  participant.lastReadSeq === discussion.lastSeq,
-              )
-                ? observe(discussion.id)
-                : Effect.void,
+          real
+            .putDiscussion(discussion)
+            .pipe(
+              Effect.tap(() =>
+                discussion.participants.some(
+                  (participant) =>
+                    participant.actor._tag === "owner" &&
+                    discussion.lastSeq > 0 &&
+                    participant.lastReadSeq === discussion.lastSeq,
+                )
+                  ? observe(discussion.id)
+                  : Effect.void,
+              ),
             ),
-          ),
       }),
     ),
   );
@@ -337,6 +339,154 @@ const observedTestLayer = (
   );
 
 const owner: KanbanActor = { _tag: "owner" };
+
+it.live("saves a 20,000-character description on a 1,700-card board", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const board = yield* kanban.ensureBoard({
+        slug: "large-write",
+        name: "Large write",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Test", title: "Test", description: "Original" },
+        owner,
+      );
+      yield* sql.withTransaction(
+        Effect.forEach(
+          Array.from({ length: 1699 }, (_, i) => i + 2),
+          (number) =>
+            store.putCard({ ...card, id: KanbanCardId.make(`card-seed-${number}`), number }),
+          { discard: true },
+        ),
+      );
+      assert.strictEqual((yield* store.cards(board.id)).length, 1700);
+      const description = "x".repeat(20_000);
+      yield* kanban.editCard(card.id, { description }, owner);
+      assert.strictEqual((yield* kanban.card(card.id)).card.description, description);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a queued write expires without changing the card or recording an event", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const lockHeld = yield* Deferred.make<void>();
+    const releaseLock = yield* Deferred.make<void>();
+    const blockedThreads = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            Deferred.succeed(lockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLock)),
+              Effect.andThen(threads.launch(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "A", description: "Original" },
+        owner,
+      );
+      const before = yield* kanban.card(card.id);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(lockHeld);
+      const queued = yield* Effect.forkChild(
+        kanban.editCard(card.id, { description: "Must not land" }, owner).pipe(Effect.flip),
+      );
+      const queuedPost = yield* Effect.forkChild(
+        kanban
+          .postToCard(card.id, owner, [{ _tag: "md", text: "Must not post" }])
+          .pipe(Effect.flip),
+      );
+      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
+      const error = yield* Fiber.join(queued);
+      assert.strictEqual(error.code, "failed");
+      assert.include(error.message, "Board busy: not written. Safe to retry once.");
+      const postError = yield* Fiber.join(queuedPost);
+      assert.include(postError.message, "Board busy: not written. Safe to retry once.");
+      const afterTimeout = yield* kanban.card(card.id);
+      assert.deepStrictEqual(afterTimeout.card, before.card);
+      assert.deepStrictEqual(afterTimeout.events, before.events);
+      assert.isNull(afterTimeout.card.discussionId);
+      yield* Deferred.succeed(releaseLock, undefined);
+      yield* Fiber.join(dispatch);
+      const after = yield* kanban.card(card.id);
+      assert.strictEqual(after.card.description, before.card.description);
+      assert.isFalse(after.events.some((event) => event.kind === "edited"));
+      // The abandoned waiter can't run after the next permit release either.
+      yield* kanban.editCard(card.id, { description: "Next write" }, owner);
+      assert.strictEqual((yield* kanban.card(card.id)).card.description, "Next write");
+    }).pipe(Effect.provide(testLayer(blockedThreads)));
+  }),
+);
+
+it.effect("a started write finishes after the start deadline", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const started = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    let target: KanbanCardId | null = null;
+    const gatedStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (store) =>
+        KanbanStore.KanbanStore.of({
+          ...store,
+          putCard: (card) =>
+            card.id === target && card.description === "Started"
+              ? Deferred.succeed(started, undefined).pipe(
+                  Effect.andThen(Deferred.await(finish)),
+                  Effect.andThen(store.putCard(card)),
+                )
+              : store.putCard(card),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    const layer = KanbanService.layer.pipe(
+      Layer.provideMerge(fake.layer),
+      Layer.provideMerge(KanbanModels.layerTest(null)),
+      Layer.provideMerge(gatedStore),
+      Layer.provideMerge(Sqlite.layerMemory),
+      Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+      Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+      Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+      Layer.provideMerge(boardFilesLayer),
+    );
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "started",
+        name: "Started",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "A", description: "Original" },
+        owner,
+      );
+      target = card.id;
+      const write = yield* Effect.forkChild(
+        kanban.editCard(card.id, { description: "Started" }, owner),
+      );
+      yield* Deferred.await(started);
+      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
+      assert.isUndefined(write.pollUnsafe());
+      yield* Deferred.succeed(finish, undefined);
+      assert.strictEqual((yield* Fiber.join(write)).description, "Started");
+      assert.strictEqual((yield* kanban.card(card.id)).card.description, "Started");
+    }).pipe(Effect.provide(layer));
+  }),
+);
 
 it.effect("new board defaults follow the migration setting without rewriting existing boards", () =>
   Effect.gen(function* () {
