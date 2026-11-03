@@ -111,11 +111,18 @@ function hasOpenAwaitedWork(
   );
 }
 
-/**
- * A settled run needs a live session, so stale records from an older crash
- * never wake it.
- */
-export function restartContinuationRun(
+// ardud: expose bounded reasons for the single startup recovery summary.
+export type RestartContinuationSkipReason =
+  | "blocked"
+  | "no_provider_thread"
+  | "provider_thread_not_active"
+  | "no_session"
+  | "session_stopped_or_error"
+  | "no_running_turn"
+  | "other";
+
+/** A settled run needs a live session, so an older crash cannot wake it. */
+export function restartContinuationDecision(
   projection: Pick<
     ProjectionRuntimeRecoveryState,
     | "thread"
@@ -127,7 +134,7 @@ export function restartContinuationRun(
     | "turnItems"
   >,
   now: DateTime.Utc,
-): OrchestrationV2Run | undefined {
+): { readonly run: OrchestrationV2Run } | { readonly skip: RestartContinuationSkipReason } {
   const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
     (latest, candidate) =>
       candidate.status !== "queued" &&
@@ -137,43 +144,51 @@ export function restartContinuationRun(
         : latest,
     undefined,
   );
-  if (!run) return;
+  if (!run) return { skip: "other" };
   const preparedContinuation =
     run.status === "starting" && run.restartContinuationOfRunId !== undefined;
   const settled = run.status === "completed" || run.status === "waiting";
-  if (run.status !== "running" && !preparedContinuation && !settled) return;
-  if (restartContinuationBlocked(projection, run, now, settled)) return;
+  if (run.status !== "running" && !preparedContinuation && !settled) return { skip: "other" };
+  if (restartContinuationBlocked(projection, run, now, settled)) return { skip: "blocked" };
   const liveTurnRequired = !preparedContinuation && !settled;
-  if (projection.thread.providerInstanceId !== run.providerInstanceId) return;
+  if (projection.thread.providerInstanceId !== run.providerInstanceId) return { skip: "other" };
   const providerThread = projection.providerThreads.find(
     (thread) => thread.id === run.providerThreadId,
   );
+  if (!providerThread) return { skip: "no_provider_thread" };
   if (
-    !providerThread ||
     providerThread.appThreadId !== projection.thread.id ||
     providerThread.ownerNodeId !== null ||
     providerThread.providerInstanceId !== run.providerInstanceId ||
     providerThread.nativeThreadRef?.nativeId == null ||
     providerThread.nativeThreadRef.strength !== "strong" ||
-    providerThread.nativeThreadRef.driver !== providerThread.driver ||
+    providerThread.nativeThreadRef.driver !== providerThread.driver
+  )
+    return { skip: "other" };
+  if (
     (liveTurnRequired && providerThread.status !== "active") ||
     providerThread.status === "closed" ||
     providerThread.status === "archived"
   )
-    return;
+    return { skip: "provider_thread_not_active" };
   const session = projection.providerSessions.find(
     (candidate) => candidate.id === providerThread.providerSessionId,
   );
-  // Most adapters keep a live session "ready" through its turns, so only a
-  // stopped or failed session rules out a live turn.
   if (
     session === undefined ||
     session.providerInstanceId !== run.providerInstanceId ||
-    session.driver !== providerThread.driver ||
-    (!preparedContinuation && (session.status === "stopped" || session.status === "error"))
+    session.driver !== providerThread.driver
   )
-    return;
-  if (settled) return hasOpenAwaitedWork(projection, providerThread) ? run : undefined;
+    return { skip: "no_session" };
+  // ardud: a shared session describes the instance, not an individual live turn.
+  // Settled runs still require a live session; their old turns prove nothing.
+  if (
+    !preparedContinuation &&
+    (session.status === "stopped" || session.status === "error") &&
+    !(liveTurnRequired && session.capabilities?.sessions.supportsMultipleProviderThreadsPerSession)
+  )
+    return { skip: "session_stopped_or_error" };
+  if (settled) return hasOpenAwaitedWork(projection, providerThread) ? { run } : { skip: "other" };
   if (
     liveTurnRequired &&
     !projection.providerTurns.some(
@@ -183,8 +198,16 @@ export function restartContinuationRun(
         turn.status === "running",
     )
   )
-    return;
-  return run;
+    return { skip: "no_running_turn" };
+  return { run };
+}
+
+export function restartContinuationRun(
+  projection: Parameters<typeof restartContinuationDecision>[0],
+  now: DateTime.Utc,
+): OrchestrationV2Run | undefined {
+  const decision = restartContinuationDecision(projection, now);
+  return "run" in decision ? decision.run : undefined;
 }
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(

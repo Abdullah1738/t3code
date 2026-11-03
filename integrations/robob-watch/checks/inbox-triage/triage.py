@@ -800,7 +800,7 @@ def build_context(items, watchers, now):
     p = HOME / 'Documents/assistant/activity-log.md'
     if p.exists():
         cutoff = dt.datetime.fromtimestamp(now - 3 * 86400, UTC).date().isoformat()
-        for line in p.read_text().splitlines()[-1200:]:
+        for line in p.read_text(errors='replace').split('\n')[-1200:]:
             date = re.search(r'\b(20\d\d-\d\d-\d\d)\b', line)
             if date and date[1] >= cutoff:
                 lines.append(clean(line, 220))

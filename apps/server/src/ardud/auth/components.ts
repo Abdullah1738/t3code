@@ -52,6 +52,10 @@ export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
     description: "PR review workflow: its own threads, review plans, records, holds, approvals.",
   },
   coord: { scopes: READ_OPERATE, description: "coord pump and forward mode." },
+  "harness-hooks": {
+    scopes: [AuthOrchestrationReadScope],
+    description: "Claude Code/Codex hooks: identity and thread reads.",
+  },
   memory: { scopes: READ_OPERATE, description: "memory-system session reaper." },
   rcsim: { scopes: READ_OPERATE, description: "Run Cloud sim monitor nudges." },
   offbox: { scopes: READ_OPERATE, description: "offbox-monitor load nudges." },

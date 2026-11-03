@@ -5,12 +5,17 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   boardModelSelection,
   modelName,
-  modelVariant,
   poolAddLevel,
   poolListed,
   poolViews,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  effortOptionId,
+  mergeSelection,
+  resolveSelection,
+  selectionEffort,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import {
   KANBAN_BOARD_ICONS,
   KANBAN_BOARD_IMAGE_MAX,
@@ -20,11 +25,17 @@ import {
   type KanbanInstructions,
   type ModelSelection,
   type ProviderInstanceId,
+  type ProviderOptionSelection,
+  type ServerProviderModel,
   type ServerProvider,
   type EnvironmentId,
   KANBAN_WS_METHODS,
 } from "@t3tools/contracts";
-import { createModelSelection } from "@t3tools/shared/model";
+import {
+  buildProviderOptionSelectionsFromDescriptors,
+  createModelSelection,
+  getProviderOptionDescriptors,
+} from "@t3tools/shared/model";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
 import { Switch } from "../../components/ui/switch";
@@ -45,8 +56,189 @@ import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { getProviderModelCapabilities } from "../../providerModels";
 
 const MAX_SLOTS = 8;
+
+type SelectionResult = ReturnType<typeof mergeSelection>;
+type ModelCatalog = ReadonlyArray<Pick<ProviderInstanceEntry, "instanceId" | "models">>;
+
+const selectionConflict = (reason: string): SelectionResult => ({ kind: "conflict", reason });
+
+/** Resolve only after checking the source: E1 deliberately drops incompatible options when mapping. */
+export function checkedBoardSelection(selection: ModelSelection, catalog: ModelCatalog): SelectionResult {
+  const seen = new Set<string>();
+  const nativeEffort = effortOptionId(selection.instanceId);
+  for (const option of selection.options ?? []) {
+    if (seen.has(option.id)) return selectionConflict(`Option ${option.id} is specified more than once.`);
+    seen.add(option.id);
+    if (["variant", "effort", "reasoningEffort"].includes(option.id) &&
+        option.id !== "variant" && option.id !== nativeEffort) {
+      return selectionConflict(`Option ${option.id} is not an effort option for ${selection.instanceId}.`);
+    }
+  }
+  const folded = mergeSelection(selection, {});
+  if (folded.kind === "conflict") return folded;
+  const resolved = resolveSelection(folded.selection);
+  if (resolved.kind === "conflict") return resolved;
+  if (resolved.kind === "mapped") {
+    const lost = (folded.selection.options ?? []).find(
+      (option) => option.id !== nativeEffort && option.id !== "variant" &&
+        !resolved.selection.options?.some((carried) => carried.id === option.id && carried.value === option.value),
+    );
+    if (lost) return selectionConflict(`Routing would discard option ${lost.id}.`);
+  }
+  const target = resolved.selection;
+  const model = catalog.find((entry) => entry.instanceId === target.instanceId)?.models
+    .find((entry) => entry.slug === target.model);
+  if (!model) return selectionConflict(`${target.instanceId}/${target.model} is not in the model list.`);
+  const descriptors = model.capabilities?.optionDescriptors ?? [];
+  for (const option of target.options ?? []) {
+    const descriptor = descriptors.find((entry) => entry.id === option.id);
+    if (!descriptor || (descriptor.type === "boolean"
+      ? typeof option.value !== "boolean"
+      : typeof option.value !== "string" || !descriptor.options.some((choice) => choice.id === option.value))) {
+      return selectionConflict(`${target.model} does not offer ${option.id} ${String(option.value)}.`);
+    }
+  }
+  return { kind: "selection", selection: target };
+}
+
+/** Change a target without carrying options to a different model or instance. */
+export function boardModelChange(
+  base: ModelSelection,
+  instanceId: ProviderInstanceId,
+  model: string,
+  catalog: ModelCatalog,
+  apply: boolean,
+): SelectionResult {
+  if (!apply) return { kind: "selection", selection: boardModelSelection({ instanceId, model }) };
+  const checkedBase = mergeSelection(base, {});
+  if (checkedBase.kind === "conflict") return checkedBase;
+  const routedBase = resolveSelection(checkedBase.selection);
+  if (routedBase.kind === "conflict") return routedBase;
+  const target = checkedBoardSelection(boardModelSelection({ instanceId, model }), catalog);
+  if (target.kind === "conflict") return target;
+  const same = routedBase.selection.instanceId === target.selection.instanceId &&
+    routedBase.selection.model === target.selection.model;
+  if (!same) return target;
+  const preserved = checkedBoardSelection(base, catalog);
+  if (preserved.kind === "conflict") return preserved;
+  const effort = selectionEffort(target.selection);
+  const merged = mergeSelection(preserved.selection, effort === null ? {} : { variant: effort });
+  return merged.kind === "conflict" ? merged : checkedBoardSelection(merged.selection, catalog);
+}
+
+/** Only explicit edits from TraitsPicker replace options; its implicit defaults are display-only. */
+export function boardTraitsChange(
+  base: ModelSelection,
+  displayed: ReadonlyArray<ProviderOptionSelection> | undefined,
+  next: ReadonlyArray<ProviderOptionSelection> | undefined,
+  catalog: ModelCatalog,
+): SelectionResult {
+  const checked = mergeSelection(base, {});
+  if (checked.kind === "conflict") return checked;
+  const validBase = checkedBoardSelection(base, catalog);
+  if (validBase.kind === "conflict") return validBase;
+  const before = new Map((displayed ?? []).map((option) => [option.id, option.value]));
+  const after = new Map((next ?? []).map((option) => [option.id, option.value]));
+  if (after.size !== (next?.length ?? 0)) return selectionConflict("An option is specified more than once.");
+  const changed = new Set([...before.keys(), ...after.keys()].filter((id) => before.get(id) !== after.get(id)));
+  const nativeEffort = effortOptionId(base.instanceId);
+  const effortChanged = changed.has(nativeEffort) || changed.has("variant");
+  const options = [
+    ...(base.options ?? []).filter((option) => !changed.has(option.id) &&
+      !(effortChanged && (option.id === nativeEffort || option.id === "variant"))),
+    ...(next ?? []).filter((option) => changed.has(option.id)),
+  ];
+  const suppliedEffort = options.some((option) => option.id === nativeEffort || option.id === "variant");
+  const model = effortChanged && suppliedEffort ? checked.selection.model : base.model;
+  const merged = mergeSelection({ ...base, model }, { options });
+  return merged.kind === "conflict" ? merged : checkedBoardSelection(merged.selection, catalog);
+}
+
+/** A pool level change keeps its secondary options and never changes the pool's model. */
+export function boardPoolLevelChange(
+  base: ModelSelection,
+  effort: string | null,
+  catalog: ModelCatalog,
+): SelectionResult {
+  const checked = mergeSelection(base, {});
+  if (checked.kind === "conflict") return checked;
+  const validBase = checkedBoardSelection(base, catalog);
+  if (validBase.kind === "conflict") return validBase;
+  const merged = mergeSelection(base, { variant: effort });
+  if (merged.kind === "conflict") return merged;
+  const result = checkedBoardSelection(merged.selection, catalog);
+  if (result.kind === "selection" &&
+      (result.selection.instanceId !== base.instanceId || result.selection.model !== base.model)) {
+    return selectionConflict("Migrate this pool before changing its reasoning level.");
+  }
+  return result;
+}
+
+/** Find an unoccupied level after mapping, so adding an alias cannot pause an existing pool. */
+export function boardPoolAddition(
+  instanceId: ProviderInstanceId,
+  model: string,
+  catalog: ModelCatalog,
+  pools: ReadonlyArray<{ readonly model: ModelSelection }>,
+  apply: boolean,
+): SelectionResult | null {
+  if (!apply) {
+    const level = poolAddLevel(instanceId, catalog.find((entry) => entry.instanceId === instanceId)?.models ?? [],
+      model, pools.filter((pool) => pool.model.instanceId === instanceId && pool.model.model === model)
+        .map((pool) => selectionEffort(pool.model)));
+    return level === null ? null : { kind: "selection", selection: boardModelSelection({ instanceId, model, variant: level.variant }) };
+  }
+  const target = checkedBoardSelection(boardModelSelection({ instanceId, model }), catalog);
+  if (target.kind === "conflict") return target;
+  const existing: Array<string | null> = [];
+  for (const pool of pools) {
+    const resolved = resolveSelection(pool.model);
+    if (resolved.kind === "conflict") return resolved;
+    if (resolved.selection.instanceId === target.selection.instanceId && resolved.selection.model === target.selection.model) {
+      if (resolved.kind === "mapped") {
+        return selectionConflict("Migrate the existing pool before adding another reasoning level.");
+      }
+      existing.push(selectionEffort(resolved.selection));
+    }
+  }
+  const level = poolAddLevel(target.selection.instanceId,
+    catalog.find((entry) => entry.instanceId === target.selection.instanceId)?.models ?? [],
+    target.selection.model, existing);
+  if (level === null) return null;
+  return checkedBoardSelection(boardModelSelection({
+    instanceId: target.selection.instanceId, model: target.selection.model, variant: level.variant,
+  }), catalog);
+}
+
+/** The pool picker edits reasoning only; other options stay attached to the pool. */
+export function boardTraitModels(
+  models: ReadonlyArray<ServerProviderModel>,
+  selection: ModelSelection,
+  effortOnly: boolean,
+): ReadonlyArray<ServerProviderModel> {
+  const effortId = effortOptionId(selection.instanceId);
+  return models.map((model) => {
+    if (model.slug !== selection.model || !model.capabilities?.optionDescriptors) return model;
+    return {
+      ...model,
+      capabilities: {
+        ...model.capabilities,
+        optionDescriptors: model.capabilities.optionDescriptors
+          .filter((descriptor) => !effortOnly || descriptor.id === effortId)
+          .map((descriptor) => descriptor.id === effortId ? { ...descriptor, label: "Reasoning" } : descriptor),
+      },
+    };
+  });
+}
+
+function reportSelectionConflict(result: SelectionResult): ModelSelection | null {
+  if (result.kind === "selection") return result.selection;
+  toastManager.add({ type: "error", title: "Couldn't change the model", description: result.reason });
+  return null;
+}
 
 export function SettingsView(props: { state: KanbanBoardState }) {
   const environmentId = usePrimaryEnvironmentId();
@@ -61,6 +253,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
   const providers =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
   const settings = useEnvironmentSettings(environmentId);
+  const apply = settings.ardudHarnessMigration?.selections === "apply";
   const instanceEntries = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings, null),
   );
@@ -70,13 +263,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
-    poolAddLevel(
-      instanceEntries.find((entry) => entry.instanceId === instanceId)?.models ?? [],
-      model,
-      pools
-        .filter((pool) => pool.model.instanceId === instanceId && pool.model.model === model)
-        .map((pool) => pool.variant),
-    );
+    boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
   const editNote = canEdit ? undefined : "Your connection can't change the board";
   const poolNote = canPool ? undefined : "Your connection can't change pools";
 
@@ -100,6 +287,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           const entry = instanceEntries.find(
             (candidate) => candidate.instanceId === pool.model.instanceId,
           );
+          const effort = selectionEffort(pool.model);
           return (
             <div
               key={pool.key}
@@ -108,8 +296,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
               <span className="flex min-w-0 flex-col">
                 <span className="flex min-w-0 items-baseline gap-1.5">
                   <span className="truncate font-medium">{pool.name}</span>
-                  {pool.variant && (!entry || unlisted) ? (
-                    <span className="text-xs text-(--m-muted)">{pool.variant}</span>
+                  {effort && (!entry || unlisted) ? (
+                    <span className="text-xs text-(--m-muted)">{effort}</span>
                   ) : null}
                 </span>
                 {unlisted ? (
@@ -121,7 +309,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                   <TraitsPicker
                     provider={entry.driverKind}
                     instanceId={pool.model.instanceId}
-                    models={entry.models}
+                    models={apply ? boardTraitModels(entry.models, pool.model, true) : entry.models}
                     model={pool.model.model}
                     prompt=""
                     onPromptChange={() => {}}
@@ -130,19 +318,18 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                     planModeEnabled={settings.planModeEnabled}
                     disabled={blocked}
                     onModelOptionsChange={(options) => {
-                      // Only the level is the pool's; the picker's other options (agent) aren't stored.
-                      const variant = modelVariant(
+                      const level = selectionEffort(
                         createModelSelection(pool.model.instanceId, pool.model.model, options),
                       );
-                      if (variant === pool.variant) return;
+                      if (level === effort) return;
+                      const next = apply
+                        ? reportSelectionConflict(boardPoolLevelChange(pool.model, level, instanceEntries))
+                        : boardModelSelection({ instanceId: pool.model.instanceId, model: pool.model.model, variant: level });
+                      if (!next) return;
                       void runAction("Couldn't change the pool's level", () =>
                         kanban.setPool(
                           board.id,
-                          boardModelSelection({
-                            instanceId: pool.model.instanceId,
-                            model: pool.model.model,
-                            variant,
-                          }),
+                          next,
                           undefined,
                           { replaces: pool.key },
                         ),
@@ -236,12 +423,10 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
             onInstanceModelChange={(instanceId, model) => {
               const level = addLevel(instanceId, model);
               if (level === null) return;
+              const selection = reportSelectionConflict(level);
+              if (!selection) return;
               void runAction("Couldn't add the model", () =>
-                kanban.setPool(
-                  board.id,
-                  boardModelSelection({ instanceId, model, variant: level.variant }),
-                  0,
-                ),
+                kanban.setPool(board.id, selection, 0),
               );
             }}
           />
@@ -255,6 +440,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           instanceEntries={instanceEntries}
           settings={settings}
           providers={providers}
+          apply={apply}
           disabled={!canEdit}
           disabledReason={editNote}
           onChange={(managerModel) => update({ managerModel })}
@@ -266,6 +452,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           instanceEntries={instanceEntries}
           settings={settings}
           providers={providers}
+          apply={apply}
           disabled={!canEdit}
           disabledReason={editNote}
           onChange={(evaluatorModel) => update({ evaluatorModel })}
@@ -277,6 +464,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           instanceEntries={instanceEntries}
           settings={settings}
           providers={providers}
+          apply={apply}
           disabled={!canEdit}
           disabledReason={editNote}
           onChange={(defaultCardModel) => update({ defaultCardModel })}
@@ -319,19 +507,27 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                       )}
                       disabled={!canEdit}
                       triggerLabel={modelName(step)}
-                      onInstanceModelChange={(nextInstanceId, model) =>
-                        saveStep(index, boardModelSelection({ instanceId: nextInstanceId, model }))
-                      }
+                      onInstanceModelChange={(nextInstanceId, model) => {
+                        const next = reportSelectionConflict(boardModelChange(step, nextInstanceId, model, instanceEntries, apply));
+                        if (next) saveStep(index, next);
+                      }}
                     />
                     {(() => {
                       const entry = instanceEntries.find(
                         (candidate) => candidate.instanceId === step.instanceId,
                       );
-                      return entry ? (
+                      const models = entry && apply ? boardTraitModels(entry.models, step, false) : entry?.models;
+                      const displayed = entry && models && apply
+                        ? buildProviderOptionSelectionsFromDescriptors(getProviderOptionDescriptors({
+                            caps: getProviderModelCapabilities(models, step.model, entry.driverKind, settings.planModeEnabled),
+                            selections: step.options,
+                          }))
+                        : undefined;
+                      return entry && models ? (
                         <TraitsPicker
                           provider={entry.driverKind}
                           instanceId={step.instanceId}
-                          models={entry.models}
+                          models={models}
                           model={step.model}
                           prompt=""
                           onPromptChange={() => {}}
@@ -339,12 +535,12 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                           allowPromptInjectedEffort={false}
                           planModeEnabled={settings.planModeEnabled}
                           disabled={!canEdit}
-                          onModelOptionsChange={(options) =>
-                            saveStep(
-                              index,
-                              createModelSelection(step.instanceId, step.model, options),
-                            )
-                          }
+                          onModelOptionsChange={(options) => {
+                            const next = apply
+                              ? reportSelectionConflict(boardTraitsChange(step, displayed, options, instanceEntries))
+                              : createModelSelection(step.instanceId, step.model, options);
+                            if (next) saveStep(index, next);
+                          }}
                         />
                       ) : null;
                     })()}
@@ -567,6 +763,7 @@ function ModelPickerRow(props: {
   instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
   settings: UnifiedSettings;
   providers: ReadonlyArray<ServerProvider>;
+  apply: boolean;
   disabled: boolean;
   disabledReason: string | undefined;
   onChange: (model: ModelSelection) => void;
@@ -579,6 +776,13 @@ function ModelPickerRow(props: {
     props.value.model,
   );
   const entry = props.instanceEntries.find((candidate) => candidate.instanceId === instanceId);
+  const models = entry && props.apply ? boardTraitModels(entry.models, props.value, false) : entry?.models;
+  const displayed = entry && models && props.apply
+    ? buildProviderOptionSelectionsFromDescriptors(getProviderOptionDescriptors({
+        caps: getProviderModelCapabilities(models, props.value.model, entry.driverKind, props.settings.planModeEnabled),
+        selections: props.value.options,
+      }))
+    : undefined;
   return (
     <div className="flex min-h-13 flex-wrap items-center justify-between gap-x-4 gap-y-2 py-1.5 not-last:border-b not-last:border-(--m-rule)">
       <span className="font-medium">{props.label}</span>
@@ -592,15 +796,16 @@ function ModelPickerRow(props: {
           modelOptionsByInstance={modelOptions}
           disabled={props.disabled}
           triggerLabel={modelName(props.value)}
-          onInstanceModelChange={(nextInstanceId, model) =>
-            props.onChange(boardModelSelection({ instanceId: nextInstanceId, model }))
-          }
+          onInstanceModelChange={(nextInstanceId, model) => {
+            const next = reportSelectionConflict(boardModelChange(props.value, nextInstanceId, model, props.instanceEntries, props.apply));
+            if (next) props.onChange(next);
+          }}
         />
-        {entry ? (
+        {entry && models ? (
           <TraitsPicker
             provider={entry.driverKind}
             instanceId={instanceId}
-            models={entry.models}
+            models={models}
             model={props.value.model}
             prompt=""
             onPromptChange={() => {}}
@@ -608,9 +813,12 @@ function ModelPickerRow(props: {
             allowPromptInjectedEffort={false}
             planModeEnabled={props.settings.planModeEnabled}
             disabled={props.disabled}
-            onModelOptionsChange={(options) =>
-              props.onChange(createModelSelection(instanceId, props.value.model, options))
-            }
+            onModelOptionsChange={(options) => {
+              const next = props.apply
+                ? reportSelectionConflict(boardTraitsChange(props.value, displayed, options, props.instanceEntries))
+                : createModelSelection(instanceId, props.value.model, options);
+              if (next) props.onChange(next);
+            }}
           />
         ) : null}
       </div>

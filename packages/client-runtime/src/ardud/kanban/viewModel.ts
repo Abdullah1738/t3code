@@ -23,6 +23,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ageView } from "../common/time.ts";
+import { effortOptionId, selectionEffort } from "../models/harnessRouting.ts";
 import type { KanbanBoardState } from "./boardState.ts";
 import { linkLabels } from "./links.ts";
 
@@ -59,9 +60,7 @@ export function modelName(model: ModelSelection | null): string {
 }
 
 export function modelVariant(model: ModelSelection | null): string | null {
-  const options = Array.isArray(model?.options) ? model.options : [];
-  const variant = options.find((option) => option.id === "variant")?.value;
-  return typeof variant === "string" ? variant : null;
+  return selectionEffort(model);
 }
 
 export const modelLetter = (model: ModelSelection | null) =>
@@ -69,7 +68,7 @@ export const modelLetter = (model: ModelSelection | null) =>
 
 /**
  * The composer picker's value (instance, model, effort/variant) as the board's
- * ModelSelection. The board stores the variant as an option named "variant".
+ * ModelSelection. The option name depends on the selected provider instance.
  */
 export function boardModelSelection(input: {
   readonly instanceId: ProviderInstanceId;
@@ -78,7 +77,7 @@ export function boardModelSelection(input: {
 }): ModelSelection {
   const { instanceId, model, variant } = input;
   return variant
-    ? { instanceId, model, options: [{ id: "variant", value: variant }] }
+    ? { instanceId, model, options: [{ id: effortOptionId(instanceId), value: variant }] }
     : { instanceId, model };
 }
 
@@ -90,6 +89,7 @@ export function boardModelSelection(input: {
  * reads that as "resize its only pool".
  */
 export function poolAddLevel(
+  instanceId: ProviderInstanceId,
   models: ReadonlyArray<{
     readonly slug: string;
     readonly capabilities?:
@@ -117,14 +117,20 @@ export function poolAddLevel(
 ): { readonly variant: string | null } | null {
   const descriptor = models
     .find((entry) => entry.slug === model)
-    ?.capabilities?.optionDescriptors?.find((entry) => entry.id === "variant");
+    ?.capabilities?.optionDescriptors?.find((entry) => entry.id === effortOptionId(instanceId));
   const levels = descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
-  const preferred =
+  const preferredCandidate =
     descriptor?.type === "select"
       ? (descriptor.currentValue ??
         descriptor.options.find((option) => option.isDefault)?.id ??
         null)
       : null;
+  const preferred =
+    preferredCandidate !== null && levels.includes(preferredCandidate)
+      ? preferredCandidate
+      : ((descriptor?.type === "select"
+          ? descriptor.options.find((option) => option.isDefault)?.id
+          : undefined) ?? null);
   if (pooled.length === 0) return { variant: preferred };
   const free = [preferred, ...levels].find(
     (level): level is string => level !== null && !pooled.includes(level),

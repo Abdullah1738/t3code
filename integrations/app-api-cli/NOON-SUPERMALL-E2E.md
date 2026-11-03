@@ -214,6 +214,222 @@ generated. Missing provider is a proven request difference; the config-route
 hypothesis is disproved for this bundle, and the mandatory redirect branch
 requires a separately scoped decision before implementation or a live retry.
 
+The CLI now sends the session's `paymentProviderCode`, failing closed unless it
+is `NOON_PAY`, `ADYEN` or `CHECKOUT`, and prints `payment_status_poll` lines.
+Redirect handling is not built.
+
+Live checkout-v2 sessions send `paymentProviderCode` as null (1 Nov). The CLI
+maps an explicit null to `NOON_PAY`, as the app's `getMerchantIDCode` does; a
+missing key or any other value still fails closed.
+
+## Why checkout-v2 payments never start 3DS (1 Nov)
+
+**#286 result: request differences found, but the cause of `CREATED` is not
+proved. Do not spend on another guessed retry.** #272's third attempt still
+returned `payment_pending / CREATED`, no redirect and no 3DS-failure flag, then
+timed out. Opening a redirect cannot explain that attempt: the app only opens
+one *after* `payment_ready_to_redirect`. The audit below separates observable
+differences from a demonstrated fix.
+
+Evidence: the same APK/asset/hash and decimal function-relative offsets as
+#239 above, rechecked from the ZIP in RAM. Only selected function excerpts were
+retained, not a complete dump. CLI comparison is against base `54b8c95357`,
+including #258/#272. Header observations are a **1 Nov storage-only read** of
+the `noon` and `minutes` Keychain lifecycle overlays, passed through the repo's
+pure `_headers` functions; they are not a capture of the failed request. Three
+bounded whoami GETs checked current dynamic-header names/types/equality, with
+no cookie retention or other writes. No session POST, cart/order/payment call,
+phone action, credential export, deploy or change to payment code was made.
+
+### 1. Headers — CLI differs as follows
+
+Both `payment_complete` and `payment_status` use the same header builder in
+each lane and POST to `api-app-st.noon.com`. The marketplace order flows both
+construct `MarketplaceClient('main')`, including Supermall
+(`commerce_main_order.py` / `commerce_supermall_order.py`, constructor and
+resume paths). Thus payment uses `ecom`, **not** the standalone Supermall read
+client's `rocket`. `noon_marketplace_checkout._headers` forces `x-mp:noon` and
+`x-experience:ecom`; `noon_minutes_checkout._headers` preserves their captured
+Minutes values. Both force JSON accept/content-type and identity encoding,
+and remove host, length, connection, cache validators and Sentry trace headers.
+
+**Complete effective inventory (35 explicit headers in each lane):**
+
+| Header(s) | Marketplace vs Minutes; app evidence |
+|---|---|
+| `x-platform`, `x-content`, `x-build` | Match each other: `android`, `mobile`, `21772`. The app sets platform/content/build in f1738 @399–485. Build is `config.build`, not a payment-specific constant. |
+| `x-experience`, `x-mp` | **Differ:** `ecom` / `noon` versus `nooninstant` / `nooninstant`. Expected vertical routing, not a missing 3DS header. Global app setters: f23803 @13–63, f53246 @69–85 and f53247 @69–135. PaymentService does not override them: f29184 @65–94, f29185 @78–104. A real Rocket-context app can instead have experience `rocket`; the earlier captured checkout used `ecom`. Do not switch the payment lane to Minutes or Rocket merely because Minutes works. |
+| `x-locale` | Same `en-ae`; app setter f23802 @22–44. |
+| `x-device-id`, `x-visitor-id` | Present and equal between overlays; values withheld. App setters f23805 @22–44 and f23804 @28–47. No newly generated payment fingerprint in these setters. |
+| `x-addresscode`, `x-addresskey`, `x-uphonecode`, `x-lat`, `x-lng` | Present and equal; values withheld. App adds selected-address/phone/location state in f23811 @156–439. CLI preserves its verified capture, rather than consulting an app store. |
+| `x-device-lat`, `x-device-lng` | **Differ in value** between retained overlays; no coordinates reported. App reads current customer-device location in f23811 @311–533; CLI replays retained coordinates. This is distinct from the equal delivery-location headers. |
+| `x-ab-test` | **Differs in value** between overlays. App overlays current `whoami.data.headers` on every request (f59124 @36–97 → f23811 @620–676). CLI auth revalidation merges only Set-Cookie into old headers (`NoonAuthLifecycle._exchange/_publish`); it does not adopt the returned header map. A fresh whoami GET returned `x-ab-test` as a list; retained text did not match its comma, comma-space or compact-JSON rendering. This proves a refresh/representation gap, not which experiment affects payment. |
+| `x-mp-country`, `x-border-enabled`, `x-rocket-enabled`, `x-aster-zonecode`, `x-ecom-zonecode`, `x-food-zonecode`, `x-nooninstant-zonecode`, `x-noonnownow-zonecode`, `x-out-zonecode`, `x-ping-zonecode`, `x-rocket-mp-zonecode`, `x-rocket-zonecode`, `x-services-zonecode` | Present and equal between overlays. Same dynamic-header merge as above; fresh GET names matched. Fresh boolean flags matched after lowercase wire-string conversion. Their individual names are server-provided, **not** APK literals defining a closed header list. |
+| `user-agent` | Same retained `okhttp/4.12.0`. Neither PaymentService nor f23811 sets a special payment UA. Actual native-stack/TLS behaviour is not reproduced by putting an OkHttp UA on Python urllib. |
+| `cache-control` | Same `no-cache`; app f1738 @364–370. |
+| `content-type` | Same `application/json` after both builders, even though the retained marketplace template lacks it. App f1738 @585–595. **No on-wire difference here.** |
+| `accept` | Same CLI `application/json`; **both differ from app** `application/json, text/plain, */*` (f1739 @3498, shape 509/value offset 604991). Also recorded in the working Minutes capture notes. |
+| `accept-encoding` | Same CLI `identity`; both discard captured compression negotiation. Native transport's actual encoding is outside these JS setters. Not a marketplace-only omission. |
+| `cookie` | **Differs:** Minutes alone contains cookie name `use-st-payment`; marketplace does not. Of the 17 shared names, only `_natnetidv2` has a different value; `_nrtnetid`, `nguestv2`, `RT`, `ak_bmsc`, `dcae`, `review_lang`, `x-available-ae` and the nine `x-location-<experience>-ae` cookies match. Values withheld. App uses `withCredentials:true` (f1738 @571); CLI manually carries its lane's retained Cookie header and response rotations. `use-st-payment` has no literal occurrence in this Hermes string pool or any APK DEX inspected. Its source, path/domain and backend meaning are **unknown**, not a justified cookie to invent or copy across lanes. |
+
+Transport also supplies `Host`, `Content-Length` and `Connection: close` in
+urllib; the payment host matches the app base URL, lengths depend on the body,
+and native connection management is not established by Hermes. HTTP header
+case is not a semantic difference. Both builders strip `if-none-match`,
+`if-modified-since`, `sentry-trace` and `baggage`; no payment dependency on
+these cache/telemetry headers was found in the traced path.
+
+**Additional app header / absence checks:**
+
+- **CLI differs: missing `x-session-source` on checkout-v2**, not on
+  `/paymentintent/complete` or `/status`. f23811 @539–612 tests the URL for
+  `checkout-v2` before setting it. Cart→checkout sets `checkout` in f84319
+  @25–40; f59467 @29–35 defaults to `buynow`, and the buy-now entry points
+  f118609/f118620/f119430/f119444 @22–39 explicitly set `buynow`. f59469 @0–8
+  returns the value; checkout cleanup f119115 @22–37 restores `checkout`.
+  Neither retained lane header map has this key. It affects session/place/
+  order-status requests, so it is a concrete order-context mismatch.
+- **Matches the CLI at this JS boundary:** no explicit `x-forwarded-*`,
+  `browserInfo`, `deviceInfo`, 3DS/browser-info header, Origin or Referer is
+  added by f29184/f29185 or the entire f23811 @0–682. `x-forwarded-host/proto`
+  occurrences in f20634 @14–88 are *reads* in `httpRequestToRequestData`, not
+  payment header writes; `x-forwarded-acl-token` in f133249 @123–150 is read
+  from a whoami response in the config-screen path. No such name was in the
+  fresh whoami body header map. Do not fabricate one from a string search.
+- `X-cpCode` is conditional on a collection-point selection (f23811 @447–456)
+  and absent in both home-delivery overlays. The device-model/OS headers in
+  f29183 @114–186 belong to `/valu/tenures`, **not** complete/status.
+
+This is an exhaustive diff of the current **CLI header inputs/builders** and
+the traced JS payment client, not a claim to have observed every native-stack
+header or the live app's cookie jar. Dynamic server headers and native
+interception are reasons a wire capture is still needed.
+
+### 2. Body — no hidden 3DS fields; one type/source difference remains
+
+**Matches the CLI's core fields:** f134890 @0–219 constructs the previously
+documented 11-slot object. f119063 @621–657 spreads it, adds `clientSecret`
+and drops a nullish provider; it adds no browser/device/return/redirect URL,
+channel, platform or 3DS flag. f29184 @75–94 passes the body argument unchanged;
+its second argument is optional *request config*, unused by f119063 @657.
+The registered request interceptor f23815 @0–17 calls f23811, whose writes are
+headers only. Axios f23841 @92–196 applies the request transform; f23880
+@397–430 → `stringifySafely` f23834 @78–105 does ordinary JSON.stringify for
+this object, without augmenting it. Status remains only `{clientSecret}`
+(f29185 @65–104). No evidence supports adding `browserInfo` or Minutes' seven
+explicit-null optionals to this path.
+
+**CLI differs in card source/type handling:** the app selects the `isSelected`
+card from `paymentMethodsV2.methods` (including flattened `cardSections`),
+f88613 @20–174, predicates f119108 @6–46 / f119109 @0–16 / f119110 @0–9.
+It copies that card's `.id` directly into `idCustomerToken`, f134890 @38–63;
+there is no string coercion in that path or the JSON transform. CLI
+`MarketplacePayment.prepare_payment` selects from legacy `paymentMethods`,
+requires default+selected+last4, and `card_token` converts a positive integer
+to a decimal **string**. Consequently a numeric V2 ID stays numeric in the
+app but is a string in the CLI. The failed run's V2 selected ID/type was not
+read here; legacy/V2 equality and whether noon cares about the JSON type are
+unproved. Minutes' working captured token is a string, which does not settle
+the marketplace contract. Preserve exact ID precision and existing selection
+checks; do not change this on a guess.
+
+For required CVV, the envelope matches: f88586 @95–241 uses the config's public
+key/name and `encryptDataV2`; f29190 @0–117 encrypts a string with RSA-OAEP
+SHA256 and Base64, matching `noon_cvv.encrypt`. **A separate conditional
+difference:** f88586 @49–93 returns without encryption unless method CC and
+`isCvvRequired` is truthy; CLI sends an envelope whenever a CVV was supplied,
+even if the session says false. That is not evidence of the cause in these
+reported CVV-required attempts.
+
+### 3. Extra steps — pending path matches; conditional branches differ
+
+**Matches the CLI between successful place and pending complete:** f134890
+@223–227 invokes the local post-order-message helper (bound in f42598
+@2198–2204, implemented as a React state-setter call in f87928 @0–17 via
+f42334 @242–249/@303–313); @302–354 reads exact order status. f119063 @540–674 completes
+the returned intent. f119067 @13–28 passes its response to the status handler.
+For `payment_pending`, f88590 @67–73 jumps straight to @514–535's one-second
+timer; f119071 @52–64 then calls `PaymentService.getStatus`. No enrol/initiate/
+authorize, device-data-collection or Checkout.com/Cybersource SDK invocation
+exists in this traced pending branch. The CLI instead interleaves order and
+payment reads, sleeping up to two seconds (`MarketplacePayment.await_success`).
+The timing difference does not establish why an intent stays `CREATED`.
+
+**CLI differs in two conditional branches:**
+
+1. **Before place**, f131025 @762–795 awaits `checkBNPLEligibility`
+   (f42598 @409–427 → f88584/f88585 → f119060 @17 → f131024).
+   f131024 @488–543 reads session `bnplEligibilityCheckApi/Payload`; when the
+   API is falsey it returns `{is_eligible_customer:true}` **without HTTP**.
+   When supplied, @545–619 posts that payload plus selected-address `phone`
+   via f29186 @22–81 to the session-provided path under the payment base URL.
+   CLI has no such branch. The retained Main/Supermall fixtures have no
+   non-null eligibility API; no fresh checkout-session POST was allowed here.
+   Thus it is not a proven saved-card prerequisite, but it cannot be dismissed
+   merely because the function is named BNPL. A nonempty current value needs
+   separate scoped evidence, not an arbitrary new endpoint/retry.
+2. **After ready-to-redirect**, f88590 @314–499 opens the webview/native auth
+   already recorded in #239. CLI only alerts/polls. This missing continuation
+   remains real, but is unreachable in #272's observed pending/no-URL state.
+
+Payment config is fetched with session setup before place (f88611 @171–204);
+CVV encryption is local before place (f131025 @130–177). There is no additional
+checkout session refresh in the traced place-success→complete→pending path.
+These claims are bounded to this retained bundle/path, not every payment
+method, current backend behaviour or downloaded webview script.
+
+### 4. Place flags — body matches the CLI
+
+**Matches the CLI:** f131025 @408–424 creates exactly `{total:session.total}`;
+@428–451 supplies `currentMarketplace` separately. f41082 @22–100 turns that
+second argument into an optional **header** override, `x-experience`, then
+posts the original body to `/_svc/checkout-v2/order/place-order`. The mapping
+is `noon→ecom`, `rocket→rocket` (f12591 @66–76; f41006 @9–38).
+There is no paymentMethodCode, is3ds, payment_flow or payment_option in this
+place body. CLI `operation('place')` and both order classes' `place()` send
+only total too. Do not add guessed order/payment flags. The missing
+`x-session-source` and runtime experience/header-state issues in question 1
+are the order-level differences, not omitted JSON flags.
+
+### Smallest follow-up, and what would actually settle the failure
+
+The smallest **proved request-parity correction** is in
+`noon_marketplace_checkout._headers`, with operation/path context threaded
+through `MarketplaceClient._call` and `native_request`: set
+`x-session-source: checkout` only for this cart-based lane's
+`/_svc/checkout-v2/` requests. Do not attach it to paymentintent, cart-v1,
+order-v2 or Minutes; do not change `ecom/noon` routing. Test Main and Supermall
+session/place/order-status plus negative assertions for complete/status,
+cart/detail/refund and Minutes. This corrects a static mismatch; **it is not
+yet a demonstrated fix for 3DS**. The auth refresh gap belongs in
+`NoonAuthLifecycle._exchange/_publish`, but copying arbitrary whoami headers
+could overwrite account/Home/routing fields: specify and test its safe
+merge/serialization separately rather than hiding it in a payment patch.
+
+**Recommendation: one owner-approved real-app Supermall saved-card CVV
+capture before another CLI payment.** Start before checkout session refresh;
+include the session's legacy and V2 selected-card **types and equality**, BNPL
+API presence, config, place, first order-status, complete, status transitions
+and redirect/native-auth handoff. Capture effective request headers and cookie
+name/domain/path/presence (especially `use-st-payment`), and compare opaque
+values only in RAM. Retain a redacted schema/type/diff fixture, never tokens,
+cookie values, CVV/ciphertext, client secrets or raw redirect URLs. This single
+trace establishes the app's actual source header, dynamic headers, card JSON
+type, cookie presence/scope and any pre-complete calls on the presently installed
+version. A cookie already present before capture still has unknown origin unless
+its earlier Set-Cookie source is retained. It requires phone use and a small purchase, **neither authorized nor
+performed by this card**. If the real app also stays CREATED, client parity
+alone is not the explanation and noon-side evidence is needed.
+
+Do not synthesize `use-st-payment`, force 3DS flags, copy Minutes' nulls or
+weaken reservation/consume-before-send, exact-order binding, MAY_HAVE_SENT,
+recovery-only or no-resend guards. No additional financial send is proposed
+for an existing flow. Siblings checked: Main/Supermall shared transport and
+payment mixin; Minutes transport/complete; await-payment/recovery paths;
+order-watch's payment-unconfirmed hold; #239/#258/#272 and the noon skill.
+This doc changes none of their behaviour. No runtime config, skill/watcher
+edit or deploy is required; future code/capture work needs its own approval.
+
 ## Live proof
 
 Lane's own live run, 2026-10-11 00:16-00:23 +04 (flow

@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -25,7 +26,7 @@ def write(path: Path, text: str) -> None:
 
 class HarnessTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="harness-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="harness-test-", dir=PKG))
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.skill_root = self.home / ".config/opencode/skills"
@@ -35,6 +36,10 @@ class HarnessTestCase(unittest.TestCase):
         self.make_skill("cat/beta", None, name="beta")
         self.make_skill("cat/deep/gamma", "gamma")
         self.root = self.tmp / "homes"
+        self.codex_overlay = self.tmp / "codex.md"
+        write(self.codex_overlay, "# Shared Codex fixture\nShared instructions.\n")
+        self.cu_overlay = self.tmp / "codex-cu-draft.md"
+        write(self.cu_overlay, "# CU draft fixture\nUse the desktop lease.\n")
         self.env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
         self.env.start()
         self.manifest_patch = mock.patch.object(gh, "expand", gh.expand)
@@ -56,6 +61,8 @@ class HarnessTestCase(unittest.TestCase):
         m = json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
         m["skillRoots"] = [str(self.skill_root)]
         m["instructions"]["canonical"] = str(self.canonical)
+        m["instructions"]["overlays"]["codex"] = str(self.codex_overlay)
+        m["instructions"]["overlays"]["codex-cu"] = str(self.cu_overlay)
         return m
 
     def run_gen(self, manifest: dict | None = None, extra: list[str] | None = None) -> str:
@@ -82,6 +89,10 @@ class HarnessTestCase(unittest.TestCase):
     def codex(self) -> Path:
         return self.root / "codex"
 
+    @property
+    def codex_cu(self) -> Path:
+        return self.root / "codex-cu"
+
 
 class GenerateTests(HarnessTestCase):
     def test_full_generate_writes_every_file_with_exact_values(self) -> None:
@@ -97,6 +108,9 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(settings["env"]["CLAUDE_CODE_DISABLE_ORG_MEMORY"], "1")
         self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:20128")
         self.assertEqual(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "500000")
+        self.assertEqual(settings["env"]["ENABLE_PROMPT_CACHING_1H"], "1")
+        self.assertEqual(settings["env"]["CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"], "450000")
+        self.assertNotIn("idleCompaction", settings)
         self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"], "1000000")
         self.assertEqual(settings["pluginConfigs"]["cc-plugin-agents-md@builtin"]["options"]["instructionFiles"],
                          "claude-md-and-agents-md")
@@ -131,7 +145,8 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
         self.assertEqual(cfg["notify"], [])
-        self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"],
+                         ":".join(m["shellPathPrefix"] + m["shellPath"]))
         self.assertEqual(cfg["agents"]["max_depth"], 1000000)
         self.assertEqual(cfg["history"], {"persistence": "none"})
 
@@ -140,7 +155,7 @@ class GenerateTests(HarnessTestCase):
             {"type": "command", "command": "/usr/bin/true", "timeout": 5}]}]}})
 
         agents = (self.codex / "AGENTS.md").read_bytes()
-        self.assertEqual(agents, self.canonical.read_bytes() + b"\n\n" + (PKG / "overlays/codex.md").read_bytes())
+        self.assertEqual(agents, self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes())
 
         models = json.loads((self.codex / "models.json").read_text())
         by_slug = {x["slug"]: x for x in models["models"]}
@@ -155,6 +170,55 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(os.path.realpath(self.claude / "skills/gamma"),
                          os.path.realpath(self.skill_root / "cat/deep/gamma"))
 
+    def test_openai_named_provider_and_compaction_flags_apply_to_both_codex_homes(self) -> None:
+        self.run_gen()
+        for home in (self.codex, self.codex_cu):
+            with self.subTest(home=home.name):
+                cfg = tomllib.loads((home / "config.toml").read_text())
+                self.assertEqual(cfg["model_provider"], "ninerouter")
+                provider = cfg["model_providers"]["ninerouter"]
+                self.assertEqual(provider["name"], "OpenAI")
+                self.assertEqual(provider["base_url"], "http://127.0.0.1:20128/v1")
+                self.assertNotIn("capabilities", provider)
+                self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
+                self.assertEqual(cfg["model_auto_compact_token_limit_scope"], "total")
+                self.assertIs(cfg["features"]["output_token_replay"], True)
+                self.assertIs(cfg["features"]["concurrent_reasoning_summaries"], True)
+                self.assertNotIn("async_compaction", cfg["features"])
+                self.assertNotIn("image_generation", cfg["features"])
+
+    def test_check_detects_compaction_setting_drift(self) -> None:
+        self.run_gen()
+        p = self.claude / "settings.json"
+        settings = json.loads(p.read_text())
+        settings["env"]["CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"] = "200000"
+        p.write_text(json.dumps(settings))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("settings.json", out)
+        self.run_gen()
+        p = self.codex_cu / "config.toml"
+        p.write_text(p.read_text().replace('name = "OpenAI"', 'name = "9router"'))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("codex-cu/config.toml", out)
+
+    def test_existing_idle_compaction_override_is_detected_and_removed(self) -> None:
+        self.run_gen()
+        p = self.claude / "settings.json"
+        settings = json.loads(p.read_text())
+        settings["idleCompaction"] = False
+        settings["theme"] = "dark"
+        p.write_text(json.dumps(settings))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1, out)
+        self.run_gen()
+        settings = json.loads(p.read_text())
+        self.assertNotIn("idleCompaction", settings)
+        self.assertEqual(settings["theme"], "dark")
+        rc, out = self.run_check()
+        self.assertEqual(rc, 0, out)
+
     def test_modes_are_restrictive(self) -> None:
         self.run_gen()
         self.assertEqual(os.stat(self.claude).st_mode & 0o777, 0o700)
@@ -164,7 +228,7 @@ class GenerateTests(HarnessTestCase):
     def test_second_generate_prints_nothing_and_keeps_mtimes(self) -> None:
         self.run_gen()
         before = {}
-        for p in list(self.claude.rglob("*")) + list(self.codex.rglob("*")):
+        for p in list(self.claude.rglob("*")) + list(self.codex.rglob("*")) + list(self.codex_cu.rglob("*")):
             before[str(p)] = os.lstat(p).st_mtime_ns
         out = self.run_gen()
         self.assertEqual(out, "")
@@ -190,7 +254,7 @@ class GenerateTests(HarnessTestCase):
         self.assertNotIn("stale", cj["mcpServers"])
         settings = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(settings["theme"], "dark")
-        self.assertEqual(settings["permissions"], {"allow": ["Read"]})
+        self.assertEqual(settings["permissions"], {"allow": ["Read"], "deny": ["Computer", "mcp__node_repl"]})
         self.assertEqual(settings["env"]["MY_OWN"], "1")
         self.assertEqual(settings["env"]["DISABLE_TELEMETRY"], "1")
 
@@ -348,13 +412,34 @@ class GenerateTests(HarnessTestCase):
             {"type": "command", "command": "/bin/echo", "timeout": 3}]}]})
         self.assertTrue((self.codex / "hooks.json").exists())
 
-    def test_no_hooks_leaves_empty_claude_hooks_and_no_codex_hooks(self) -> None:
-        self.run_gen()
+    def test_no_hooks_leaves_empty_blocks_in_both_codex_homes(self) -> None:
+        m = self.manifest()
+        m["hooks"] = []
+        self.run_gen(m)
         settings = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(settings["hooks"], {})
-        self.assertFalse((self.codex / "hooks.json").exists())
+        self.assertEqual(json.loads((self.codex / "hooks.json").read_text()), {"hooks": {}})
+        self.assertEqual(json.loads((self.codex_cu / "hooks.json").read_text()), {"hooks": {}})
         cfg = tomllib.loads((self.codex / "config.toml").read_text())
         self.assertNotIn("hooks", cfg)
+
+    def test_hooks_are_selected_by_harness(self) -> None:
+        m = self.manifest()
+        self.run_gen(m)
+        claude_hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        codex_hooks = json.loads((self.codex / "hooks.json").read_text())["hooks"]
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "SessionStart"})
+        self.assertEqual(set(codex_hooks), {"PreToolUse"})
+        for group in claude_hooks["PreToolUse"] + claude_hooks["SessionStart"]:
+            self.assertTrue(group["hooks"][0]["command"].endswith("/claude.py"))
+        for group in codex_hooks["PreToolUse"]:
+            self.assertTrue(group["hooks"][0]["command"].endswith("/codex.py"))
+        for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
+            patterns = [re.compile(group["matcher"]) for group in groups]
+            for tool in ("Bash", "mcp__betterstack__monitor", "mcp__example__exec_command",
+                         "mcp__example__shell_command"):
+                self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
+            self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))
 
     def test_home_root_pointing_at_personal_claude_is_refused(self) -> None:
         personal = self.home / ".claude"
@@ -386,6 +471,251 @@ class GenerateTests(HarnessTestCase):
         self.run_gen(m)
         cfg = tomllib.loads((self.codex / "config.toml").read_text())
         self.assertEqual(cfg["hooks"]["state"], {"abc": {"trusted_hash": "sha256:xyz"}})
+
+    def test_codex_cu_shared_home_and_native_config(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [
+            {"event": "PreToolUse", "matcher": "Bash", "command": "/bin/echo", "timeoutSec": 3},
+            {"event": "SessionStart", "command": "/usr/bin/true", "timeoutSec": 4, "harness": "codex"},
+            {"event": "PostToolUse", "command": "/bin/echo", "timeoutSec": 5, "harness": "claude"},
+        ]
+        self.run_gen(m)
+        base = tomllib.loads((self.codex / "config.toml").read_text())
+        cu = tomllib.loads((self.codex_cu / "config.toml").read_text())
+        self.assertEqual(cu.pop("model"), "gpt-6.1-terra")
+        self.assertEqual(cu.pop("model_context_window"), 1050000)
+        self.assertEqual(cu.pop("model_auto_compact_token_limit"), 450000)
+        self.assertEqual(cu.pop("model_reasoning_effort"), "low")
+        self.assertEqual(cu.pop("model_catalog_json"), str(self.codex_cu / "models.json"))
+        self.assertIs(cu["features"].pop("computer_use"), True)
+        node = cu["mcp_servers"].pop("node_repl")
+        self.assertEqual(node, {
+            "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "startup_timeout_sec": 30,
+            "tool_timeout_sec": 120,
+            "env": {
+                "CODEX_HOME": str(self.codex_cu),
+                "NODE_REPL_NODE_PATH": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+                "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+                "NODE_REPL_TRUSTED_CODE_PATHS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+                "SKY_CUA_SERVICE_PATH": "/Volumes/ExternalSSD/codex/computer-use/Codex Computer Use.app",
+                "NODE_REPL_DISABLE_ANALYTICS": "1",
+                "BROWSER_USE_DISABLE_AMBIENT_NETWORK": "1",
+            },
+        })
+        self.assertEqual(base.pop("model"), "gpt-6-astra")
+        self.assertEqual(base.pop("model_context_window"), 872000)
+        self.assertEqual(base.pop("model_auto_compact_token_limit"), 450000)
+        self.assertEqual(base.pop("model_catalog_json"), str(self.codex / "models.json"))
+        self.assertIs(base["features"].pop("computer_use"), False)
+        self.assertNotIn("node_repl", base["mcp_servers"])
+        self.assertEqual(cu, base)
+        self.assertEqual(cu["notify"], [])
+        self.assertEqual(cu["analytics"], {"enabled": False})
+        self.assertEqual(cu["feedback"], {"enabled": False})
+        self.assertEqual(json.loads((self.codex / "hooks.json").read_text()),
+                         json.loads((self.codex_cu / "hooks.json").read_text()))
+        self.assertEqual(set(json.loads((self.codex_cu / "hooks.json").read_text())["hooks"]),
+                         {"PreToolUse", "SessionStart"})
+        self.assertEqual(set(json.loads((self.claude / "settings.json").read_text())["hooks"]),
+                         {"PreToolUse", "PostToolUse"})
+        self.assertNotIn("node_repl", json.loads((self.claude / ".claude.json").read_text())["mcpServers"])
+        self.assertIn("Computer", json.loads((self.claude / "settings.json").read_text())["permissions"]["deny"])
+        for farm in (self.claude / "skills", self.codex / "skills", self.codex_cu / "skills"):
+            self.assertEqual({p.name: os.readlink(p) for p in farm.iterdir()},
+                             {"alpha": str(self.skill_root / "alpha"),
+                              "beta": str(self.skill_root / "cat/beta"),
+                              "gamma": str(self.skill_root / "cat/deep/gamma")})
+        self.assertEqual((self.codex_cu / "AGENTS.md").read_bytes(),
+                         self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes()
+                         + b"\n\n" + self.cu_overlay.read_bytes())
+        rc, output = self.run_check(m)
+        self.assertEqual(rc, 0, output)
+
+    def test_cu_catalog_extends_original_terra_without_losing_metadata(self) -> None:
+        self.run_gen()
+        upstream = json.loads((PKG / "vendor/codex-models-0.166.0.json").read_text())
+        plain = json.loads((self.codex / "models.json").read_text())
+        cu = json.loads((self.codex_cu / "models.json").read_text())
+        cu_models = {m["slug"]: m for m in cu["models"]}
+        original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
+        expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
+                              max_context_window=1050000, auto_compact_token_limit=450000)
+        self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)
+        self.assertEqual(cu_models.pop("gpt-6.1-terra"), dict(expected_terra, slug="gpt-6.1-terra"))
+        self.assertEqual(cu_models, {m["slug"]: m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"})
+        self.assertNotIn("cx/gpt-6.1-terra", {m["slug"] for m in plain["models"]})
+        self.assertEqual([m for m in cu["models"] if m["slug"] not in {"gpt-6.1-terra", "cx/gpt-6.1-terra"}],
+                         [m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"])
+
+    def test_check_detects_parity_isolation_analytics_and_catalog_drift(self) -> None:
+        cases = (
+            ("shared MCP", self.codex_cu, "config.toml", "tool_timeout_sec = 660", "tool_timeout_sec = 661"),
+            ("CU analytics", self.codex_cu, "config.toml", 'NODE_REPL_DISABLE_ANALYTICS = "1"', 'NODE_REPL_DISABLE_ANALYTICS = "0"'),
+            ("CU feature", self.codex_cu, "config.toml", "computer_use = true", "computer_use = false"),
+            ("plain feature", self.codex, "config.toml", "computer_use = false", "computer_use = true"),
+            ("plain injection", self.codex, "config.toml", "[mcp_servers.dia]", "[mcp_servers.node_repl]\ncommand = \"bad\"\n[mcp_servers.dia]"),
+            ("CU catalog", self.codex_cu, "models.json", '"tool_mode": "code_mode_only"', '"tool_mode": "bad"'),
+            ("CU hooks", self.codex_cu, "hooks.json", '"PreToolUse"', '"PostToolUse"'),
+            ("Claude deny", self.claude, "settings.json", '"Computer"', '"Other"'),
+            ("Claude MCP", self.claude, ".claude.json", '"https://mcp.betterstack.com"', '"http://example.invalid"'),
+            ("CU shared instructions", self.codex_cu, "AGENTS.md", "Shared instructions.", "Lost instructions."),
+            ("CU instructions", self.codex_cu, "AGENTS.md", "desktop lease", "no lease"),
+        )
+        for description, home, filename, original, corrupted in cases:
+            with self.subTest(description=description):
+                self.run_gen()
+                path = home / filename
+                text = path.read_text()
+                self.assertIn(original, text)
+                path.write_text(text.replace(original, corrupted, 1))
+                rc, output = self.run_check()
+                self.assertEqual(rc, 1, output)
+                self.assertIn(filename, output)
+
+    def test_hooks_are_selected_by_harness_not_command_name(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [
+            {"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 1},
+            {"event": "SessionStart", "command": "/bin/echo", "timeoutSec": 2, "harness": "codex"},
+            {"event": "UserPromptSubmit", "command": "/bin/echo", "timeoutSec": 3, "harness": "claude"},
+        ]
+        self.run_gen(m)
+        self.assertEqual(set(json.loads((self.claude / "settings.json").read_text())["hooks"]),
+                         {"PreToolUse", "UserPromptSubmit"})
+        self.assertEqual(set(json.loads((self.codex / "hooks.json").read_text())["hooks"]),
+                         {"PreToolUse", "SessionStart"})
+        self.assertEqual(set(json.loads((self.codex_cu / "hooks.json").read_text())["hooks"]),
+                         {"PreToolUse", "SessionStart"})
+        self.assertEqual(self.run_check(m)[0], 0)
+        for bad in ("unknown", "codex-cu", ["codex"], None, True, {}):
+            with self.subTest(bad=bad):
+                m["hooks"][0]["harness"] = bad
+                with self.assertRaises(gh.HomeError):
+                    gh.validate_manifest(m)
+        del m["hooks"][0]["harness"]
+        m["hooks"][0]["harnesses"] = ["codex"]
+        with self.assertRaises(gh.HomeError):
+            gh.validate_manifest(m)
+
+    def test_missing_or_blank_cu_overlay_fails_before_any_write(self) -> None:
+        m = self.manifest()
+        for contents in (None, " \n<!-- draft -->\n"):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    self.cu_overlay.unlink()
+                else:
+                    self.cu_overlay.write_text(contents)
+                with mock.patch.object(gh, "load_manifest", return_value=m):
+                    with contextlib.redirect_stderr(io.StringIO()) as errors:
+                        rc = gh.main(["generate", "--home-root", str(self.root)])
+                self.assertEqual(rc, 1)
+                self.assertIn("overlay", errors.getvalue())
+                self.assertFalse(self.root.exists())
+
+    def test_manifest_cu_overlay_is_used_by_generate_and_check(self) -> None:
+        m = self.manifest()
+        self.run_gen(m)
+        self.assertEqual(self.run_check(m)[0], 0)
+        self.cu_overlay.write_text("# Changed CU fixture\n")
+        rc, output = self.run_check(m)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("AGENTS.md", output)
+        self.run_gen(m)
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_packaged_cu_overlay_builds_without_override(self) -> None:
+        m = self.manifest()
+        m["instructions"]["overlays"]["codex-cu"] = "overlays/codex-cu.md"
+        self.run_gen(m)
+        self.assertEqual((self.codex_cu / "AGENTS.md").read_bytes(),
+                         self.canonical.read_bytes() + b"\n\n" + self.codex_overlay.read_bytes()
+                         + b"\n\n" + (PKG / "overlays/codex-cu.md").read_bytes())
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_shared_codex_overlay_changes_require_both_homes_to_regenerate(self) -> None:
+        self.run_gen()
+        self.codex_overlay.write_text("# Changed shared Codex instructions\n")
+        rc, output = self.run_check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn(str(self.codex / "AGENTS.md"), output)
+        self.assertIn(str(self.codex_cu / "AGENTS.md"), output)
+        self.run_gen()
+        self.assertEqual(self.run_check()[0], 0)
+
+    def test_cu_symlink_into_personal_home_refuses_all_writes(self) -> None:
+        personal = self.home / ".codex/skills"
+        personal.mkdir(parents=True)
+        self.codex_cu.mkdir(parents=True)
+        os.symlink(personal, self.codex_cu / "skills")
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = gh.main(["generate", "--home-root", str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(os.listdir(personal), [])
+        self.assertFalse((self.codex / "config.toml").exists())
+
+    def test_manifest_refuses_node_repl_as_shared_mcp(self) -> None:
+        m = self.manifest()
+        m["mcpServers"].append({"id": "node_repl", "command": "/bin/echo", "args": [],
+                                "toolTimeoutSec": 1, "startupTimeoutSec": 1})
+        with self.assertRaises(gh.HomeError):
+            gh.validate_manifest(m)
+
+    def test_cu_hook_trust_is_independent_per_home(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [{"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 3}]
+        self.codex.mkdir(parents=True)
+        self.codex_cu.mkdir(parents=True)
+        (self.codex / "config.toml").write_text('[hooks.state."normal"]\ntrusted_hash = "sha256:one"\n')
+        (self.codex_cu / "config.toml").write_text('[hooks.state."cu"]\ntrusted_hash = "sha256:two"\n')
+        self.run_gen(m)
+        base = tomllib.loads((self.codex / "config.toml").read_text())
+        cu = tomllib.loads((self.codex_cu / "config.toml").read_text())
+        self.assertEqual(base["hooks"]["state"], {"normal": {"trusted_hash": "sha256:one"}})
+        self.assertEqual(cu["hooks"]["state"], {"cu": {"trusted_hash": "sha256:two"}})
+
+    def test_removed_hooks_are_cleared_from_both_homes(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [{"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 3}]
+        self.run_gen(m)
+        m["hooks"] = []
+        self.run_gen(m)
+        for home in (self.codex, self.codex_cu):
+            self.assertEqual(json.loads((home / "hooks.json").read_text()), {"hooks": {}})
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_rescoping_hook_removes_it_from_both_codex_homes(self) -> None:
+        m = self.manifest()
+        m["hooks"] = [{"event": "PreToolUse", "command": "/bin/echo", "timeoutSec": 3,
+                       "harness": "codex"}]
+        self.run_gen(m)
+        m["hooks"][0]["harness"] = "claude"
+        self.run_gen(m)
+        self.assertIn("PreToolUse", json.loads((self.claude / "settings.json").read_text())["hooks"])
+        for home in (self.codex, self.codex_cu):
+            self.assertEqual(json.loads((home / "hooks.json").read_text()), {"hooks": {}})
+            self.assertNotIn("hooks", tomllib.loads((home / "config.toml").read_text()))
+        self.assertEqual(self.run_check(m)[0], 0)
+
+    def test_secret_in_cu_overlay_refuses_all_writes(self) -> None:
+        self.cu_overlay.write_text("draft sk-abcdefghijklmnop\n")
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                rc = gh.main(["generate", "--home-root", str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertIn("secret-looking", errors.getvalue())
+        self.assertFalse(self.root.exists())
+
+    def test_check_fails_if_only_claude_node_repl_deny_is_removed(self) -> None:
+        self.run_gen()
+        path = self.claude / "settings.json"
+        settings = json.loads(path.read_text())
+        settings["permissions"]["deny"].remove("mcp__node_repl")
+        path.write_text(json.dumps(settings))
+        rc, output = self.run_check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("CU deny rules missing", output)
 
     def test_dry_run_writes_nothing(self) -> None:
         out = self.run_gen(extra=["--dry-run"])

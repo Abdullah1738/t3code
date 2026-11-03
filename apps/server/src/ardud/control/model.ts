@@ -10,8 +10,17 @@ import type {
   OrchestrationV2ThreadShell,
   OrchestrationV2TurnItem,
   ProviderOptionSelection,
+  ServerProvider,
+  ServerSettings,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+
+import {
+  mergeSelection,
+  resolveSelection,
+  selectionEffort,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { modelProblem } from "../kanban/engine/modelCheck.ts";
 
 /**
  * The coarse state external callers act on:
@@ -100,45 +109,160 @@ export function runSummary(run: OrchestrationV2Run) {
 /** `provider/model` with `variant` split out, matching how OpenChamber callers name models. */
 export function formatModel(selection: ModelSelection) {
   const variant = selection.options?.find((option) => option.id === "variant")?.value;
+  const effort = selectionEffort(selection);
   return {
     instanceId: selection.instanceId,
     model: selection.model,
+    options: selection.options ?? [],
     ...(typeof variant === "string" ? { variant } : {}),
+    ...(effort !== null ? { effort } : {}),
   };
 }
 
 /**
- * Builds a model selection from the OpenChamber-style `provider/model` string
- * plus an optional reasoning variant. Other options on `base` are kept when the
- * model stays the same, so a plain variant change does not drop them.
+ * Off and dry-run keep the old variant behavior. Apply canonicalizes both sides
+ * before merging so an explicit canonical model inherits only its own options.
  */
 export function modelSelectionFrom(input: {
   readonly model?: string | undefined;
   readonly variant?: string | null | undefined;
   readonly instanceId?: string | undefined;
+  readonly options?: ReadonlyArray<ProviderOptionSelection> | undefined;
   readonly base: ModelSelection;
-}): ModelSelection {
-  const instanceId = (input.instanceId ?? input.base.instanceId) as ModelSelection["instanceId"];
-  const model = input.model ?? input.base.model;
-  const keepOptions = model === input.base.model && instanceId === input.base.instanceId;
-  const kept: Array<ProviderOptionSelection> = keepOptions
-    ? (input.base.options ?? []).filter((option) => option.id !== "variant")
-    : [];
-  const inheritedVariant = keepOptions
-    ? input.base.options?.find((option) => option.id === "variant")
-    : undefined;
-  const variant =
-    input.variant === null
-      ? undefined
-      : input.variant !== undefined
-        ? { id: "variant", value: input.variant }
-        : inheritedVariant;
-  const options = variant === undefined ? kept : [...kept, variant];
-  return {
-    instanceId,
-    model: model as ModelSelection["model"],
-    ...(options.length > 0 ? { options: options as ModelSelection["options"] } : {}),
-  } as ModelSelection;
+  readonly settings?: Pick<ServerSettings, "ardudHarnessMigration"> | undefined;
+}):
+  | { readonly kind: "selection"; readonly selection: ModelSelection }
+  | { readonly kind: "conflict"; readonly reason: string } {
+  const duplicate = (options: ReadonlyArray<ProviderOptionSelection> | undefined) => {
+    const seen = new Set<string>();
+    return options?.find((option) => {
+      if (seen.has(option.id)) return true;
+      seen.add(option.id);
+      return false;
+    });
+  };
+  const duplicatePatch = duplicate(input.options);
+  if (duplicatePatch && selectionMigrationApplies(input.settings)) {
+    return {
+      kind: "conflict",
+      reason: `Option ${duplicatePatch.id} was specified more than once.`,
+    };
+  }
+  if (!selectionMigrationApplies(input.settings)) {
+    const instanceId = (input.instanceId ?? input.base.instanceId) as ModelSelection["instanceId"];
+    const model = input.model ?? input.base.model;
+    const same = instanceId === input.base.instanceId && model === input.base.model;
+    const source = input.options ?? (same ? (input.base.options ?? []) : []);
+    const kept = source.filter((option) => option.id !== "variant");
+    const oldVariant = source.find((option) => option.id === "variant");
+    const variant =
+      input.variant === null
+        ? undefined
+        : input.variant !== undefined
+          ? { id: "variant", value: input.variant }
+          : oldVariant;
+    const options = variant === undefined ? kept : [...kept, variant];
+    return {
+      kind: "selection",
+      selection: {
+        instanceId,
+        model,
+        ...(options.length > 0 ? { options } : {}),
+      } as ModelSelection,
+    };
+  }
+
+  // Resolve the identity before the options: an explicit replacement or a
+  // different target must be able to repair obsolete stored options.
+  const identityBase = resolveSelection({ ...input.base, options: [] });
+  if (identityBase.kind === "conflict") return identityBase;
+  const inferredInstance =
+    input.instanceId ??
+    (input.model?.includes("/") ? "opencode" : identityBase.selection.instanceId);
+  const target =
+    input.model === undefined && input.instanceId === undefined
+      ? identityBase
+      : resolveSelection({
+          instanceId: inferredInstance,
+          model:
+            input.model ??
+            (input.instanceId === input.base.instanceId
+              ? input.base.model
+              : identityBase.selection.model),
+        } as ModelSelection);
+  if (target.kind === "conflict") return target;
+  const sameTarget =
+    target.selection.instanceId === identityBase.selection.instanceId &&
+    target.selection.model === identityBase.selection.model;
+  const inherit = input.options === undefined && sameTarget;
+  const retainEffort = inherit && input.variant === undefined;
+  const duplicateBase = inherit ? duplicate(input.base.options) : undefined;
+  if (duplicateBase)
+    return { kind: "conflict", reason: `Stored option ${duplicateBase.id} occurs more than once.` };
+  const baseToMerge = inherit
+    ? retainEffort
+      ? input.base
+      : {
+          ...input.base,
+          // A new effort supersedes both stored compatibility and native effort.
+          options: (input.base.options ?? []).filter(
+            (option) => !["variant", "effort", "reasoningEffort"].includes(option.id),
+          ),
+        }
+    : { ...input.base, options: [] };
+  const foldedBase = mergeSelection(baseToMerge, {});
+  if (foldedBase.kind === "conflict") return foldedBase;
+  const routedBase = resolveSelection(foldedBase.selection);
+  if (routedBase.kind === "conflict") return routedBase;
+  if (inherit && routedBase.kind === "mapped") {
+    const dropped = foldedBase.selection.options?.find(
+      (option) =>
+        option.id !== "variant" &&
+        !routedBase.selection.options?.some((carried) => carried.id === option.id),
+    );
+    if (dropped !== undefined) {
+      return {
+        kind: "conflict",
+        reason: `Cannot map stored option ${dropped.id} from ${input.base.model} without dropping it.`,
+      };
+    }
+  }
+  const base = routedBase.selection;
+
+  const suffix = input.model !== undefined && target.kind === "mapped" ? target.effort : null;
+  if (
+    suffix !== null &&
+    (input.variant === null || (input.variant !== undefined && input.variant !== suffix))
+  ) {
+    return { kind: "conflict", reason: `${input.model} names conflicting efforts.` };
+  }
+  return mergeSelection(base, {
+    instanceId: target.selection.instanceId,
+    model: target.selection.model,
+    ...(input.options === undefined ? {} : { options: input.options }),
+    variant: suffix ?? input.variant,
+  });
+}
+
+export const selectionMigrationApplies = (
+  settings: Pick<ServerSettings, "ardudHarnessMigration"> | undefined,
+) => settings?.ardudHarnessMigration?.selections === "apply";
+
+/** Fail closed when a selected option cannot be checked against the current catalog. */
+export function selectionProblem(
+  providers: ReadonlyArray<ServerProvider>,
+  selection: ModelSelection,
+): string | null {
+  const problem = modelProblem(providers, selection);
+  if (problem !== null) return problem;
+  if ((selection.options?.length ?? 0) === 0) return null;
+  const model = providers
+    .find((provider) => provider.instanceId === selection.instanceId)
+    ?.models.find((candidate) => candidate.slug === selection.model);
+  if (model?.capabilities?.optionDescriptors === undefined) {
+    return `Options for ${selection.model} on ${selection.instanceId} cannot be checked against the provider catalog.`;
+  }
+  return null;
 }
 
 export function pendingRequestSummary(

@@ -188,6 +188,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<SummaryCard>, KanbanStoreError>;
   readonly card: (cardId: KanbanCardId) => Effect.Effect<KanbanCard | null, KanbanStoreError>;
+  readonly cardByNumber: (
+    boardId: KanbanBoardId,
+    number: number,
+  ) => Effect.Effect<KanbanCard | null, KanbanStoreError>;
   /** Cards a thread is running now; one work thread may carry several. */
   readonly cardsByThread: (
     threadId: string,
@@ -414,6 +418,14 @@ const make = Effect.gen(function* () {
       "read card",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE id = ${cardId}`,
+        (rows) => Effect.map(decodeAll(rows, Card.decode), first),
+      ),
+    );
+  const cardByNumber = (boardId: KanbanBoardId, number: number) =>
+    run(
+      "read card by number",
+      Effect.flatMap(
+        sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
         (rows) => Effect.map(decodeAll(rows, Card.decode), first),
       ),
     );
@@ -842,6 +854,7 @@ const make = Effect.gen(function* () {
     cards,
     summaryCards,
     card,
+    cardByNumber,
     cardsByThread,
     cardsInStage,
     nextCardNumber,

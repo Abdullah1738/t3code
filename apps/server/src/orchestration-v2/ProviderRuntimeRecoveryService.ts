@@ -22,7 +22,12 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { restartContinuationRun } from "./RestartContinuation.ts";
+// ardud: startup logs one bounded summary of continuation decisions.
+import {
+  restartContinuationDecision,
+  restartContinuationRun,
+  type RestartContinuationSkipReason,
+} from "./RestartContinuation.ts";
 import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
 import {
   endOrphanedNativeSubagent,
@@ -199,7 +204,8 @@ export const make = Effect.gen(function* () {
     function* (
       projection: ProjectionStore.ProjectionRuntimeRecoveryState,
       trigger: "startup" | "shutdown",
-      continueAfterRestart: boolean,
+      // ardud: keep the settings failure distinct from an explicit opt-out.
+      continuationSetting: "enabled" | "settings_disabled" | "settings_unreadable",
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
     ) {
       const now = yield* DateTime.now;
@@ -621,12 +627,22 @@ export const make = Effect.gen(function* () {
           },
         });
       }
+      // ardud: take the decision before cancellation, while per-thread facts are still live.
+      const continuationDecision =
+        trigger !== "startup"
+          ? undefined
+          : continuationSetting !== "enabled"
+            ? { skip: continuationSetting }
+            : restartContinuationDecision(
+                {
+                  ...projection,
+                  providerSessions: sessionsLiveAtStart(projection, stoppedThisPass),
+                },
+                now,
+              );
       const continuationRun =
-        continueAfterRestart && trigger === "startup"
-          ? restartContinuationRun(
-              { ...projection, providerSessions: sessionsLiveAtStart(projection, stoppedThisPass) },
-              now,
-            )
+        continuationDecision && "run" in continuationDecision
+          ? continuationDecision.run
           : undefined;
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
@@ -642,6 +658,8 @@ export const make = Effect.gen(function* () {
         (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
       ).length;
       let retiredEffects: number;
+      // ardud: count only continuation effects submitted with a committed reconciliation.
+      let continuationsQueued = 0;
       if (events.length === 0) {
         const retiredEffectIds = yield* outbox
           .cancelUnsettled({
@@ -686,12 +704,20 @@ export const make = Effect.gen(function* () {
             ),
           );
         retiredEffects = result.cancelledEffectCount;
+        if (result.committed) continuationsQueued = effects.length;
       }
       return {
         terminalizedRuns: runs.length,
         stoppedSessions,
         closedRequests: requests.length,
         retiredEffects,
+        continuationsQueued,
+        continuationSkip:
+          continuationDecision && "skip" in continuationDecision
+            ? continuationDecision.skip
+            : continuationRun && continuationsQueued === 0
+              ? ("other" as const)
+              : undefined,
       };
     },
   );
@@ -699,7 +725,11 @@ export const make = Effect.gen(function* () {
   const reconcile = Effect.fn("ProviderRuntimeRecoveryService.reconcile")(function* (
     trigger: "startup" | "shutdown",
   ) {
-    const continueAfterRestart = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
+    // ardud: malformed settings silently fall back to an opt-out, but should not be logged as one.
+    const settingsSnapshot =
+      trigger === "startup"
+        ? yield* settings.getSettingsWithTrust.pipe(Effect.orElseSucceed(() => null))
+        : null;
     const threadIds = yield* projections
       .getRecoveryThreadIds("runtime")
       .pipe(
@@ -711,6 +741,22 @@ export const make = Effect.gen(function* () {
     let stoppedSessions = 0;
     let closedRequests = 0;
     let retiredEffects = 0;
+    // ardud: these counts are per recovery projection, not per emitted event.
+    let continuationsQueued = 0;
+    const skipped: Record<
+      RestartContinuationSkipReason | "settings_disabled" | "settings_unreadable",
+      number
+    > = {
+      settings_disabled: 0,
+      settings_unreadable: 0,
+      blocked: 0,
+      no_provider_thread: 0,
+      provider_thread_not_active: 0,
+      no_session: 0,
+      session_stopped_or_error: 0,
+      no_running_turn: 0,
+      other: 0,
+    };
     const stoppedThisPass = new Map<string, RecoverySession>();
     for (const threadId of threadIds) {
       const projection = yield* projections.getRuntimeRecoveryProjection(threadId).pipe(
@@ -723,11 +769,20 @@ export const make = Effect.gen(function* () {
             }),
         ),
       );
-      const enabled =
-        continueAfterRestart !== null &&
-        resolveProjectSettings(continueAfterRestart, projection.thread.projectId).settings
-          .continueThreadsAfterServerUpdate;
-      const result = yield* reconcileProjection(projection, trigger, enabled, stoppedThisPass);
+      // ardud: unreadable settings never enable continuation, even with a project override.
+      const continuationSetting =
+        settingsSnapshot === null || !settingsSnapshot.trusted
+          ? ("settings_unreadable" as const)
+          : resolveProjectSettings(settingsSnapshot.settings, projection.thread.projectId).settings
+                .continueThreadsAfterServerUpdate
+            ? ("enabled" as const)
+            : ("settings_disabled" as const);
+      const result = yield* reconcileProjection(
+        projection,
+        trigger,
+        continuationSetting,
+        stoppedThisPass,
+      );
       for (const session of projection.providerSessions) {
         if (session.status !== "stopped" && session.status !== "error") {
           stoppedThisPass.set(session.id, session);
@@ -737,12 +792,23 @@ export const make = Effect.gen(function* () {
       stoppedSessions += result.stoppedSessions;
       closedRequests += result.closedRequests;
       retiredEffects += result.retiredEffects;
+      continuationsQueued += result.continuationsQueued;
+      if (result.continuationSkip !== undefined) skipped[result.continuationSkip]++;
     }
     const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
       Effect.mapError(
         (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
       ),
     );
+    // ardud: one startup log, including zero-candidate starts, for post-restart diagnosis.
+    if (trigger === "startup") {
+      yield* Effect.logInfo("orchestration-v2.restart-continuation.summary", {
+        threadsRead: threadIds.length,
+        runsCancelled: terminalizedRuns,
+        continuationsQueued,
+        skipped,
+      });
+    }
     return {
       terminalizedRuns,
       stoppedSessions,

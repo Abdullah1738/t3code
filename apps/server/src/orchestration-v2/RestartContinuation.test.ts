@@ -11,6 +11,7 @@ import {
   RunAttemptId,
   RunId,
   RuntimeRequestId,
+  ServerSettingsError,
   ThreadId,
   type OrchestrationV2Command,
   type OrchestrationV2ThreadProjection,
@@ -18,8 +19,13 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as ServerSettings from "../serverSettings.ts";
-import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
+import {
+  restartContinuationDecision,
+  restartContinuationRun,
+  continueRestartedRun,
+} from "./RestartContinuation.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -141,6 +147,88 @@ it("continues a live turn whose session the adapter never marked running", () =>
     assert.equal(restartContinuationRun(withSessionStatus(status), now)?.id, runId, status);
   for (const status of ["stopped", "error"])
     assert.isUndefined(restartContinuationRun(withSessionStatus(status), now), status);
+});
+
+// ardud: a shared session's status describes the instance, not this running turn.
+it.each(["error", "stopped"] as const)(
+  "continues a live turn when its shared session is %s",
+  (status) => {
+    const projection = makeProjection();
+    const shared = {
+      ...projection,
+      providerSessions: [
+        {
+          ...projection.providerSessions[0]!,
+          status,
+          capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.equal(restartContinuationRun(shared, now)?.id, runId);
+  },
+);
+
+// ardud: shared-session recovery still requires a live, matching root turn.
+it("does not revive a dead or unrelated turn on a failed shared session", () => {
+  const projection = makeProjection();
+  const shared = {
+    ...projection,
+    providerSessions: [
+      {
+        ...projection.providerSessions[0]!,
+        status: "error",
+        capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+      },
+    ],
+  } as unknown as OrchestrationV2ThreadProjection;
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    assert.deepEqual(
+      restartContinuationDecision(
+        {
+          ...shared,
+          providerTurns: [{ ...shared.providerTurns[0]!, status }],
+        },
+        now,
+      ),
+      { skip: "blocked" },
+    );
+  }
+  for (const providerTurns of [
+    [],
+    [{ ...shared.providerTurns[0]!, runAttemptId: RunAttemptId.make("attempt:other") }],
+    [{ ...shared.providerTurns[0]!, providerThreadId: ProviderThreadId.make("thread:other") }],
+  ]) {
+    assert.deepEqual(restartContinuationDecision({ ...shared, providerTurns }, now), {
+      skip: "no_running_turn",
+    });
+  }
+  assert.deepEqual(
+    restartContinuationDecision(
+      {
+        ...shared,
+        providerThreads: [{ ...shared.providerThreads[0]!, status: "idle" }],
+      },
+      now,
+    ),
+    { skip: "provider_thread_not_active" },
+  );
+  assert.deepEqual(restartContinuationDecision({ ...shared, providerThreads: [] }, now), {
+    skip: "no_provider_thread",
+  });
+  assert.deepEqual(restartContinuationDecision({ ...shared, providerSessions: [] }, now), {
+    skip: "no_session",
+  });
+  assert.deepEqual(
+    restartContinuationDecision(
+      {
+        ...shared,
+        providerSessions: [{ ...projection.providerSessions[0]!, status: "error" }],
+      },
+      now,
+    ),
+    { skip: "session_stopped_or_error" },
+  );
+  assert.deepEqual(restartContinuationDecision({ ...shared, runs: [] }, now), { skip: "other" });
 });
 
 it("recovers an admitted continuation after another crash before provider start", () => {
@@ -358,6 +446,83 @@ it.effect.each([
           type: "provider-runtime.continue",
           sourceRunId: runId,
         });
+    }),
+);
+
+// ardud: report settings failures and per-thread opt-outs distinctly, once per startup.
+it.effect.each(["disabled", "unreadable", "read_failed"] as const)(
+  "summarizes %s settings without queuing a continuation",
+  (state) =>
+    Effect.gen(function* () {
+      const baseSettings = yield* ServerSettings.ServerSettingsService.pipe(
+        Effect.provide(
+          ServerSettings.layerTest({
+            continueThreadsAfterServerUpdate: state !== "disabled",
+            projectSettingsOverrides:
+              state === "disabled"
+                ? {
+                    [ProjectId.make("restart-project")]: {
+                      continueThreadsAfterServerUpdate: false,
+                    },
+                  }
+                : {},
+          }),
+        ),
+      );
+      const summaries: Array<{
+        threadsRead: number;
+        runsCancelled: number;
+        continuationsQueued: number;
+        skipped: { settings_disabled: number; settings_unreadable: number };
+      }> = [];
+      const logger = Logger.make(({ message }) => {
+        const [text, fields] = Array.isArray(message) ? message : [message];
+        if (text === "orchestration-v2.restart-continuation.summary")
+          summaries.push(fields as (typeof summaries)[number]);
+      });
+      const settings = ServerSettings.ServerSettingsService.of({
+        ...baseSettings,
+        getSettingsWithTrust:
+          state === "read_failed"
+            ? Effect.fail(new ServerSettingsError({ settingsPath: "test", operation: "read-file" }))
+            : baseSettings.getSettings.pipe(
+                Effect.map((settings) => ({ settings, trusted: state !== "unreadable" })),
+              ),
+      });
+      const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(ServerSettings.ServerSettingsService, settings),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getRecoveryThreadIds: () => Effect.succeed([threadId]),
+              getRuntimeRecoveryProjection: () => Effect.succeed(makeProjection()),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              commitCommand: (input) =>
+                Effect.sync(() => {
+                  commits.push(input);
+                  return { committed: true, cancelledEffectCount: 0 } as never;
+                }),
+            }),
+            IdAllocator.layer,
+            Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+            Layer.mock(EffectOutbox.EffectOutboxV2)({
+              reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+            }),
+          ),
+        ),
+      );
+      yield* recovery.reconcile("startup").pipe(Effect.provide(Logger.layer([logger])));
+      assert.equal(summaries.length, 1);
+      assert.equal(summaries[0]!.threadsRead, 1);
+      assert.equal(summaries[0]!.runsCancelled, 1);
+      assert.equal(summaries[0]!.continuationsQueued, 0);
+      assert.equal(summaries[0]!.skipped.settings_disabled, state === "disabled" ? 1 : 0);
+      assert.equal(summaries[0]!.skipped.settings_unreadable, state === "disabled" ? 0 : 1);
+      assert.lengthOf(commits[0]!.effects, 0);
+      yield* recovery.reconcile("shutdown").pipe(Effect.provide(Logger.layer([logger])));
+      assert.equal(summaries.length, 1);
     }),
 );
 
@@ -763,16 +928,23 @@ it("does not wake a settled run for work left by a session that already stopped"
   } as unknown as OrchestrationV2ThreadProjection;
   assert.equal(restartContinuationRun(projection, now)?.id, runId);
   for (const status of ["stopped", "error"])
-    assert.isUndefined(
-      restartContinuationRun(
-        {
-          ...projection,
-          providerSessions: [{ ...projection.providerSessions[0]!, status }],
-        } as OrchestrationV2ThreadProjection,
-        now,
-      ),
-      status,
-    );
+    for (const shared of [false, true])
+      assert.isUndefined(
+        restartContinuationRun(
+          {
+            ...projection,
+            providerSessions: [
+              {
+                ...projection.providerSessions[0]!,
+                status,
+                capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: shared } },
+              },
+            ],
+          } as unknown as OrchestrationV2ThreadProjection,
+          now,
+        ),
+        `${status}, shared=${shared}`,
+      );
 });
 
 it.effect("wakes a run whose subagent's own shell the restart cut, past a wake it cut first", () =>

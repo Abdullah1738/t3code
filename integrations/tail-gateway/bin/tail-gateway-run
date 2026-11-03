@@ -1,0 +1,32 @@
+#!/bin/zsh -f
+# launchd entry point for the three gateway processes:  tail-gateway-run node|dns|proxy
+#   node   userspace tailscaled "tail-gateway" (its own tailnet IP, so :443/:80/:53 are free there);
+#          tailscale serve forwards tcp 443 -> Caddy :7443 and 80 -> :7080 (kept in its own state)
+#   dns    CoreDNS answering *.tail with the node's IP (Tailscale split DNS points "tail" at it)
+#   proxy  Caddy terminating TLS with the .tail CA and proxying to 127.0.0.1 services from routes.json
+set -eu
+G="${TAIL_GATEWAY_HOME:-$HOME/.local/share/tail-gateway}"
+TS=("$G/tailscale" "--socket=$G/tailscaled.sock")
+case "${1:-}" in
+  node)
+    exec "$G/tailscaled" --tun=userspace-networking --statedir="$G/ts-state" --socket="$G/tailscaled.sock" --port=41700
+    ;;
+  dns)
+    # Wait for the node to have its tailnet IPs (it can take a few seconds after boot).
+    for i in {1..60}; do
+      ip4="$("${TS[@]}" ip -4 2>/dev/null || true)"
+      [[ $ip4 == 100.* ]] && break
+      sleep 2
+    done
+    [[ $ip4 == 100.* ]] || { print -u2 "tail-gateway dns: node has no tailnet IP"; exit 1 }
+    ip6="$("${TS[@]}" ip -6 2>/dev/null || true)"
+    [[ $ip6 == fd7a:* ]] || { print -u2 "tail-gateway dns: node has no tailnet IPv6"; exit 1 }
+    export GATEWAY_IP="$ip4" GATEWAY_IP6="$ip6"
+    exec /opt/homebrew/bin/coredns -conf "$G/Corefile"
+    ;;
+  proxy)
+    [[ -f "$G/Caddyfile" ]] || "$G/bin/tailname" render >/dev/null
+    exec /opt/homebrew/bin/caddy run --config "$G/Caddyfile" --adapter caddyfile
+    ;;
+  *) print -u2 "usage: tail-gateway-run node|dns|proxy"; exit 2 ;;
+esac

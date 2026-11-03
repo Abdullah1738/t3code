@@ -16,20 +16,26 @@ const HELP = `t3ctl <command> [options]
   projects                             list projects
   models                               default model and available models
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
-  create [--prompt P] [--title T] [--dir D | --project ID] [--model provider/model]
-         [--variant V] [--mode full-access|approval-required|...] [--origin O] [--plan]
+  create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
+         [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
-  native SES_ID                        thread for an OpenCode session id
+  native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
+  identity NATIVE_ID [--driver D] [--instance I] [--agent A]
+                                       resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
-  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
+  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--instance I] [--variant V] [--option K=V ...] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
-  interrupt THREAD
+  interrupt THREAD [--expect-run RUN] [--expect-attempt ATTEMPT] [--reason TEXT]
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
   origin THREAD ORIGIN|none
-  set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
+  set THREAD [--mode RUNTIME_MODE] [--model M] [--instance I] [--variant V] [--option K=V ...] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
+  desktop-lease status
+  desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
+  desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
+  desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
@@ -40,12 +46,16 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
   options: {
     url: { type: "string" },
     token: { type: "string" },
+    driver: { type: "string" },
+    instance: { type: "string" },
+    agent: { type: "string" },
     prompt: { type: "string" },
     title: { type: "string" },
     dir: { type: "string" },
     project: { type: "string" },
     model: { type: "string" },
     variant: { type: "string" },
+    option: { type: "string", multiple: true },
     mode: { type: "string" },
     origin: { type: "string" },
     plan: { type: "boolean" },
@@ -70,6 +80,15 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     unsettle: { type: "boolean" },
     thread: { type: "string" },
     session: { type: "string" },
+    "expect-run": { type: "string" },
+    "expect-attempt": { type: "string" },
+    reason: { type: "string" },
+    "native-id": { type: "string" },
+    "agent-id": { type: "string" },
+    task: { type: "string" },
+    scope: { type: "string" },
+    ticket: { type: "string" },
+    evidence: { type: "string" },
     types: { type: "string" },
     after: { type: "string" },
     text: { type: "boolean" },
@@ -87,6 +106,16 @@ const need = (value, name) => {
   return value;
 };
 const timeoutMs = () => (flags.timeout ? Number(flags.timeout) * 1000 : 10 * 60_000);
+const modelOptions = () =>
+  flags.option?.map((entry) => {
+    const index = entry.indexOf("=");
+    if (index <= 0 || index === entry.length - 1) {
+      throw new Error("--option needs a non-empty K=V");
+    }
+    const id = entry.slice(0, index);
+    const value = entry.slice(index + 1);
+    return { id, value: value === "true" ? true : value === "false" ? false : value };
+  });
 
 async function main() {
   if (!command || flags.help) {
@@ -114,6 +143,49 @@ async function main() {
       return print(await client.projects());
     case "models":
       return print(await client.models());
+    case "desktop-lease": {
+      const action = need(args[0], "desktop-lease action");
+      const path = "/desktop-lease";
+      if (action === "status") return print(await client.request("GET", path));
+      if (action === "reconcile")
+        return print(
+          await client.request("POST", `${path}/reconcile`, {
+            ticket: need(flags.ticket, "--ticket"),
+            evidence: need(flags.evidence, "--evidence"),
+          }),
+        );
+      if (!["acquire", "heartbeat", "release"].includes(action)) {
+        console.error(`unknown desktop-lease action ${action}`);
+        process.exit(2);
+      }
+      const envCaller = process.env.CODEX_THREAD_ID
+        ? { driver: "codex", nativeId: process.env.CODEX_THREAD_ID }
+        : process.env.OPENCODE_SESSION_ID
+          ? { driver: "opencode", nativeId: process.env.OPENCODE_SESSION_ID }
+          : null;
+      const explicit = flags.driver !== undefined || flags["native-id"] !== undefined;
+      const caller = explicit ? { driver: flags.driver, nativeId: flags["native-id"] } : envCaller;
+      if (!caller?.driver || !caller.nativeId) {
+        console.error("no caller identity");
+        process.exit(2);
+      }
+      const identity = { ...caller, ...(flags["agent-id"] ? { agentId: flags["agent-id"] } : {}) };
+      if (action === "acquire")
+        return print(
+          await client.request("POST", `${path}/acquire`, {
+            ...identity,
+            taskId: need(flags.task, "--task"),
+            scope: need(flags.scope, "--scope"),
+            mode: need(flags.mode, "--mode"),
+          }),
+        );
+      return print(
+        await client.request("POST", `${path}/${action}`, {
+          ...identity,
+          ticket: need(flags.ticket, "--ticket"),
+        }),
+      );
+    }
     case "threads": {
       const result = await client.listThreads({
         origin: flags.origin,
@@ -141,6 +213,8 @@ async function main() {
         ...(flags.project ? { projectId: flags.project } : {}),
         model: flags.model,
         variant: flags.variant,
+        providerInstanceId: flags.instance,
+        options: modelOptions(),
         runtimeMode: flags.mode,
         origin: flags.origin,
         ...(flags.plan ? { interactionMode: "plan" } : {}),
@@ -153,7 +227,17 @@ async function main() {
     case "status":
       return print(await client.thread(need(args[0], "THREAD")));
     case "native":
-      return print(await client.threadByNativeSession(need(args[0], "SES_ID")));
+      return print(
+        await client.threadByNativeSession(need(args[0], "SES_ID"), { driver: flags.driver }),
+      );
+    case "identity":
+      return print(
+        await client.identity(need(args[0], "NATIVE_ID"), {
+          driver: flags.driver,
+          instance: flags.instance,
+          agentId: flags.agent,
+        }),
+      );
     case "messages": {
       const threadId = need(args[0], "THREAD");
       const result = await client.messages(threadId, {
@@ -173,6 +257,8 @@ async function main() {
         mode: flags.mode,
         model: flags.model,
         variant: flags.variant,
+        providerInstanceId: flags.instance,
+        options: modelOptions(),
       });
       if (!flags.wait) return print(sent);
       const waited = await client.wait(threadId, { timeoutMs: timeoutMs(), runId: sent.runId });
@@ -188,7 +274,13 @@ async function main() {
       return print(waited);
     }
     case "interrupt":
-      return print(await client.interrupt(need(args[0], "THREAD")));
+      return print(
+        await client.interrupt(need(args[0], "THREAD"), {
+          expectedRunId: flags["expect-run"],
+          expectedAttemptId: flags["expect-attempt"],
+          reason: flags.reason,
+        }),
+      );
     case "respond": {
       const threadId = need(args[0], "THREAD");
       const requestId = need(args[1], "REQUEST");
@@ -231,6 +323,8 @@ async function main() {
           runtimeMode: flags.mode,
           model: flags.model,
           variant: flags.variant,
+          providerInstanceId: flags.instance,
+          options: modelOptions(),
           title: flags.title,
           ...(flags.archive ? { archived: true } : flags.unarchive ? { archived: false } : {}),
           ...(flags.settle ? { settled: true } : flags.unsettle ? { settled: false } : {}),

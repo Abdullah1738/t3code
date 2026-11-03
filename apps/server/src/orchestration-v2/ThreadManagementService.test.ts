@@ -1,9 +1,11 @@
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
+  type ModelSelection,
   MessageId,
   NodeId,
   type OrchestrationV2Command,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
   type OrchestrationV2ProviderThread,
@@ -493,6 +495,392 @@ it.effect(
     }).pipe(Effect.provide(layerTest));
   },
 );
+
+const migrationProjectId = ProjectId.make("project:selection-migration");
+const migrationThreadId = ThreadId.make("thread:selection-migration");
+const legacySelection: ModelSelection = {
+  instanceId: ProviderInstanceId.make("opencode"),
+  model: "opus/claude-opus-5-5#high",
+};
+const mappedSelection: ModelSelection = {
+  instanceId: ProviderInstanceId.make("claudeAgent"),
+  model: "claude-opus-5-5",
+  options: [{ id: "effort", value: "high" }],
+};
+const migrationMessage = (
+  id: string,
+  modelSelection?: ModelSelection,
+): Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }> => ({
+  type: "message.dispatch",
+  commandId: CommandId.make(`command:migration:${id}`),
+  threadId: migrationThreadId,
+  messageId: MessageId.make(`message:migration:${id}`),
+  text: "Continue",
+  attachments: [],
+  dispatchMode: { type: "start_immediately" },
+  createdBy: "user",
+  creationSource: "web",
+  ...(modelSelection === undefined ? {} : { modelSelection }),
+});
+
+// Mutable projection and receipts model the orchestrator boundary while the
+// actual flag, receipt store, resolver and management dispatch remain real.
+const migrationHarness = (input: {
+  readonly mode?: "off" | "dryrun" | "apply";
+  readonly allowConflicts?: boolean;
+  readonly stored?: ModelSelection;
+  readonly targetEnabled?: boolean;
+  readonly sourceEnabled?: boolean;
+  readonly runs?: ReadonlyArray<{ readonly status: OrchestrationV2Run["status"] }>;
+  readonly failSelection?: boolean;
+  readonly failMessageOnce?: boolean;
+}) => {
+  const calls: Array<OrchestrationV2ServerCommand> = [];
+  let stored = input.stored ?? legacySelection;
+  let failMessageOnce = input.failMessageOnce ?? false;
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () =>
+          Effect.sync(
+            () =>
+              ({
+                thread: {
+                  id: migrationThreadId,
+                  projectId: migrationProjectId,
+                  deletedAt: null,
+                  archivedAt: null,
+                  lineage: { relationshipToParent: "root" },
+                  creationSource: "web",
+                  modelSelection: stored,
+                },
+                runs: input.runs ?? [],
+              }) as unknown as OrchestrationV2ThreadProjection,
+          ),
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            calls.push(command);
+            if (command.type === "thread.model-selection.set" && input.failSelection) {
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "selection failed",
+              });
+            }
+            if (command.type === "message.dispatch" && failMessageOnce) {
+              failMessageOnce = false;
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "send failed",
+              });
+            }
+            if (
+              command.type === "thread.model-selection.set" ||
+              command.type === "provider.switch"
+            ) {
+              stored = command.modelSelection;
+            }
+            return { sequence: calls.length, storedEvents: [] };
+          }),
+      }),
+    ),
+    Layer.provide(
+      ServerSettings.layerTest({
+        ...(input.mode === undefined
+          ? {}
+          : {
+              ardudHarnessMigration: {
+                selections: input.mode,
+                ...(input.allowConflicts === undefined
+                  ? {}
+                  : { allowConflicts: input.allowConflicts }),
+              },
+            }),
+        providerInstances: {
+          [ProviderInstanceId.make("opencode")]: {
+            driver: "opencode",
+            enabled: input.sourceEnabled ?? true,
+          },
+          [ProviderInstanceId.make("claudeAgent")]: {
+            driver: "claudeAgent",
+            enabled: input.targetEnabled ?? true,
+          },
+        },
+      }),
+    ),
+    Layer.provideMerge(layerReceiptsTest),
+  );
+  return { layerTest, calls, getStored: () => stored };
+};
+
+it.effect("migrates a dormant stored selection once before multiple inherited sends", () => {
+  const harness = migrationHarness({ mode: "apply", sourceEnabled: false });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("first"));
+    yield* threads.dispatch(migrationMessage("second"));
+    expect(harness.calls.map((command) => command.type)).toEqual([
+      "thread.model-selection.set",
+      "message.dispatch",
+      "message.dispatch",
+    ]);
+    expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
+    expect(harness.calls[1]).not.toHaveProperty("modelSelection");
+    expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect.each([
+  { instance: "claudeAgent", model: "claude-opus-5-5", option: "effort" },
+  { instance: "codex", model: "gpt-6.1-sol", option: "reasoningEffort" },
+] as const)(
+  "normalizes stored and explicitly requested variant on $instance",
+  ({ instance, model, option }) => {
+    const legacyNative: ModelSelection = {
+      instanceId: ProviderInstanceId.make(instance),
+      model,
+      options: [{ id: "variant", value: "high" }],
+    };
+    const expected = { instanceId: instance, model, options: [{ id: option, value: "high" }] };
+    const harness = migrationHarness({ mode: "apply", stored: legacyNative });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("native-first"));
+      yield* threads.dispatch(migrationMessage("native-explicit", legacyNative));
+      expect(harness.calls[0]).toMatchObject({
+        type: "thread.model-selection.set",
+        modelSelection: expected,
+      });
+      expect(harness.calls[1]).not.toHaveProperty("modelSelection");
+      expect(harness.calls[2]).toMatchObject({
+        type: "message.dispatch",
+        modelSelection: expected,
+      });
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("rejects conflicting native effort names before dispatch", () => {
+  const harness = migrationHarness({
+    mode: "apply",
+    stored: {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-5-5",
+      options: [
+        { id: "variant", value: "high" },
+        { id: "effort", value: "max" },
+      ],
+    },
+  });
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    yield* Effect.flip(service.dispatch(migrationMessage("native-conflict")));
+    expect(harness.calls).toEqual([]);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("rejects duplicate and wrong-driver reasoning options before dispatch", () =>
+  Effect.gen(function* () {
+    for (const options of [
+      [
+        { id: "effort", value: "high" },
+        { id: "effort", value: "high" },
+      ],
+      [{ id: "reasoningEffort", value: "high" }],
+    ]) {
+      const harness = migrationHarness({
+        mode: "apply",
+        stored: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-5-5",
+          options,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        yield* Effect.flip(service.dispatch(migrationMessage("invalid-native")));
+        expect(harness.calls).toEqual([]);
+      }).pipe(Effect.provide(harness.layerTest));
+    }
+  }),
+);
+
+it.effect.each([undefined, "off", "dryrun"] as const)(
+  "leaves legacy selections untouched when the flag is %s",
+  (mode) => {
+    const harness = migrationHarness(mode === undefined ? {} : { mode });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("one"));
+      yield* threads.dispatch(migrationMessage("two", legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "message.dispatch",
+        "message.dispatch",
+      ]);
+      expect(harness.calls[1]).toMatchObject({ modelSelection: legacySelection });
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect.each(["same", "resolved", "different"] as const)(
+  "resolves an explicit %s selection without restoring a legacy route",
+  (caseName) => {
+    const harness = migrationHarness({ mode: "apply" });
+    const different: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/cc/claude-haiku-5-5#xhigh",
+    };
+    const requested =
+      caseName === "same" ? legacySelection : caseName === "resolved" ? mappedSelection : different;
+    const expected =
+      caseName === "different"
+        ? {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "claude-haiku-5-5",
+            options: [{ id: "effort", value: "xhigh" }],
+          }
+        : mappedSelection;
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage(caseName, requested));
+      expect(harness.calls.at(-1)).toMatchObject({
+        type: "message.dispatch",
+        modelSelection: expected,
+      });
+      expect(
+        harness.calls.filter((command) => command.type === "thread.model-selection.set"),
+      ).toHaveLength(caseName === "different" ? 0 : 1);
+      expect(harness.getStored()).toEqual(
+        caseName === "different" ? legacySelection : mappedSelection,
+      );
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("refuses a conflicting selection even when allowConflicts is true", () => {
+  const conflict: ModelSelection = {
+    ...legacySelection,
+    options: [{ id: "variant", value: "xhigh" }],
+  };
+  const harness = migrationHarness({ mode: "apply", allowConflicts: true, stored: conflict });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("conflict")));
+    expect(error).toMatchObject({
+      _tag: "OrchestratorCommandRejectedError",
+      cause: expect.stringContaining("conflicts with its effort"),
+    });
+    expect(harness.calls).toEqual([]);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("checks the mapped provider before committing any selection change", () => {
+  const harness = migrationHarness({ mode: "apply", targetEnabled: false });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("disabled")));
+    expect(error).toMatchObject({
+      _tag: "ThreadManagementProviderInstanceDisabledError",
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+    });
+    expect(harness.calls).toEqual([]);
+    expect(harness.getStored()).toEqual(legacySelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect.each(["running", "queued"] as const)(
+  "does not detach an old provider with a %s run",
+  (status) => {
+    const harness = migrationHarness({ mode: "apply", runs: [{ status }] });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(threads.dispatch(migrationMessage(status)));
+      expect(error).toMatchObject({
+        _tag: "OrchestratorCommandRejectedError",
+        cause: expect.stringContaining("active or queued"),
+      });
+      expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("propagates a failed selection update without dispatching the message", () => {
+  const harness = migrationHarness({ mode: "apply", failSelection: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("selection-fails")));
+    expect(error).toMatchObject({ _tag: "OrchestratorDispatchError", cause: "selection failed" });
+    expect(harness.calls.map((command) => command.type)).toEqual(["thread.model-selection.set"]);
+    expect(harness.getStored()).toEqual(legacySelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("does not repeat a successful selection update if the send fails and is retried", () => {
+  const harness = migrationHarness({ mode: "apply", failMessageOnce: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const message = migrationMessage("retry");
+    yield* Effect.flip(threads.dispatch(message));
+    yield* threads.dispatch(message);
+    expect(harness.calls.map((command) => command.type)).toEqual([
+      "thread.model-selection.set",
+      "message.dispatch",
+      "message.dispatch",
+    ]);
+    expect(harness.calls[1]).toEqual(message);
+    expect(harness.calls[2]).toEqual(message);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
+  "leaves %s receipt replay and conflicts to the orchestrator without migrating",
+  (kind) => {
+    const harness = migrationHarness({ mode: "apply", targetEnabled: false });
+    const message = migrationMessage(`receipt-${kind}`);
+    return Effect.gen(function* () {
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      yield* receipts.insertIfAbsent({
+        commandId: message.commandId,
+        ...(kind === "project"
+          ? { projectId: migrationProjectId }
+          : {
+              threadId: kind === "other-thread" ? ThreadId.make("thread:other") : migrationThreadId,
+            }),
+        commandType: kind === "project" ? "project.create" : "message.dispatch",
+        acceptedAt: yield* DateTime.now,
+        resultSequence: 1,
+        status: kind === "rejected" ? "rejected" : "accepted",
+        error: kind === "rejected" ? "Earlier refusal" : null,
+      });
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(message);
+      expect(harness.calls).toEqual([message]);
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("serializes simultaneous sends so the dormant selection is only updated once", () => {
+  const harness = migrationHarness({ mode: "apply" });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* Effect.all(
+      [
+        threads.dispatch(migrationMessage("concurrent-one")),
+        threads.dispatch(migrationMessage("concurrent-two")),
+      ],
+      { concurrency: "unbounded" },
+    );
+    expect(harness.calls.map((command) => command.type)).toEqual([
+      "thread.model-selection.set",
+      "message.dispatch",
+      "message.dispatch",
+    ]);
+  }).pipe(Effect.provide(harness.layerTest));
+});
 
 it.effect("classifies projection infrastructure failures separately from a missing thread", () => {
   const projectId = ProjectId.make("project:thread-management:projection-failure");

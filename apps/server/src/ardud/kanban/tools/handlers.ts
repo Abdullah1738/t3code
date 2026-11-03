@@ -20,8 +20,9 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
-import { modelSelectionOf } from "../engine/defaults.ts";
+import { modelSelectionResult } from "../engine/defaults.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
+import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 
 const toolFailure = (error: KanbanError) =>
@@ -168,8 +169,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
     const board = yield* boardFor(service, caller, boardId);
-    const snapshot = yield* service.snapshot(board.id);
-    const card = snapshot.cards.find((candidate) => candidate.number === number);
+    const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
     return card;
   }
@@ -217,12 +217,23 @@ const stampHandOn = Effect.fn("KanbanTools.stampHandOn")(function* (
   return `Handed on by a ${link.role} thread on the ${boardName}${cardPart}, thread [${caller.threadId}](t3-thread://v1/${caller.threadId}).\n\n${text}`;
 });
 
-const modelOf = (input: ModelInput): ModelSelection => modelSelectionOf(input);
+const modelOf = (
+  input: ModelInput,
+  apply: boolean,
+): Effect.Effect<ModelSelection, OrchestratorMcpFailure> => {
+  const result = modelSelectionResult(input, apply);
+  return result.kind === "conflict" ? invalid(result.reason) : Effect.succeed(result.selection);
+};
 
 const modelsOf = (
   input: ReadonlyArray<ModelInput & { readonly weight: number }> | undefined,
-): ReadonlyArray<KanbanCardModel> | undefined =>
-  input?.map((entry) => ({ model: modelOf(entry), weight: entry.weight }));
+  apply: boolean,
+): Effect.Effect<ReadonlyArray<KanbanCardModel> | undefined, OrchestratorMcpFailure> =>
+  input === undefined
+    ? Effect.succeed(undefined)
+    : Effect.forEach(input, (entry) =>
+        modelOf(entry, apply).pipe(Effect.map((model) => ({ model, weight: entry.weight }))),
+      );
 
 const blocksOf = (input: {
   readonly text?: string | undefined;
@@ -308,7 +319,11 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId);
-        return { board: yield* service.snapshot(board.id) };
+        const snapshot = yield* service.snapshot(board.id);
+        return {
+          board: { ...snapshot, cards: snapshot.cards.map((card) => ({ ...card, prompt: "" })) },
+          prompts: "omitted; card_get returns a card's prompt",
+        };
       }),
     ),
   ),
@@ -317,8 +332,8 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId);
-        const snapshot = yield* service.snapshot(board.id);
-        const found = snapshot.cards
+        const cards = yield* service.cards(board.id);
+        const found = cards
           .filter(
             (card) =>
               (input.includeSettled === true || card.settledAt === null) &&
@@ -493,7 +508,7 @@ const handlers = {
           input.afterSeq !== undefined ? { afterSeq: input.afterSeq } : undefined,
         );
         if (discussion.lastSeq > 0)
-          yield* service.markRead(discussion.id, caller.actor, discussion.lastSeq);
+          yield* service.markReadSoon(discussion.id, caller.actor, discussion.lastSeq);
         // Agents open attachments by path; the id alone is not enough to read the file.
         const withPaths = messages.map((message) => ({
           ...message,
@@ -533,6 +548,9 @@ const handlers = {
         }
         const board = yield* boardFor(service, caller);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy);
+        const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
+        const model = input.model ? yield* modelOf(input.model, apply) : undefined;
+        const models = yield* modelsOf(input.models, apply);
         // Follow-up work keeps the review chain and goal of the card it came from.
         const origin = isWorker ? yield* workOrigin(service, caller) : null;
         const fields = {
@@ -542,8 +560,8 @@ const handlers = {
           priority: input.priority,
           goalId: input.goalId ? KanbanGoalId.make(input.goalId) : (origin?.goalId ?? null),
           projects: input.projects,
-          model: input.model ? modelOf(input.model) : undefined,
-          models: modelsOf(input.models),
+          model,
+          models,
           projectId: input.projectId ? ProjectId.make(input.projectId) : null,
           links: input.links,
           blockedBy,
@@ -608,6 +626,9 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy);
+        const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
+        const model = input.model ? yield* modelOf(input.model, apply) : undefined;
+        const models = yield* modelsOf(input.models, apply);
         const edited = yield* service.editCard(
           card.id,
           {
@@ -619,8 +640,8 @@ const handlers = {
               ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
               : {}),
             projects: input.projects,
-            model: input.model ? modelOf(input.model) : undefined,
-            models: modelsOf(input.models),
+            model,
+            models,
             ...(input.projectId !== undefined
               ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
               : {}),
@@ -676,8 +697,10 @@ const handlers = {
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
+        const apply = yield* selectionRoutingEnabled;
+        const model = yield* modelOf(input.model, apply);
         return {
-          pools: yield* service.setPool(board.id, modelOf(input.model), input.slots, {
+          pools: yield* service.setPool(board.id, model, input.slots, {
             replaces: input.replaces,
           }),
         };
@@ -689,7 +712,9 @@ const handlers = {
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller);
-        return { pools: yield* service.removePool(board.id, modelOf(input.model)) };
+        const apply = yield* selectionRoutingEnabled;
+        const model = yield* modelOf(input.model, apply);
+        return { pools: yield* service.removePool(board.id, model) };
       }),
     ),
   ),

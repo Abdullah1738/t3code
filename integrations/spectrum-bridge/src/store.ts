@@ -84,6 +84,7 @@ export class Store {
           attempts INTEGER NOT NULL DEFAULT 0, providerId TEXT UNIQUE
         );
         CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state);
+        CREATE INDEX IF NOT EXISTS outbox_sent_reply ON outbox(json_extract(payload, '$.replyTo')) WHERE state = 'sent';
         CREATE INDEX IF NOT EXISTS kv_sent_at ON kv(CAST(value AS INTEGER)) WHERE substr(key, 1, 8) = 'sent-at:';
         CREATE TABLE IF NOT EXISTS blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS session_notices (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL);

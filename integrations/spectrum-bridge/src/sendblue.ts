@@ -51,6 +51,7 @@ export function toInbound(message: Json): LineInbound {
   const type = str(message.message_type);
   const kind: LineInbound["kind"] = type === "location" ? "location" : type === "message" || type === "group" ? "message" : "other";
   const replyTo = isObject(message.reply_to) ? str(message.reply_to.message_handle) : undefined;
+  const threadOrigin = isObject(message.thread_originator) ? str(message.thread_originator.message_handle) : undefined;
   const location = isObject(message.location) ? toLocation(message.location) : undefined;
   return {
     handle: str(message.message_handle) ?? str(message.message_id) ?? "",
@@ -59,6 +60,7 @@ export function toInbound(message: Json): LineInbound {
     text: str(message.content) ?? "",
     mediaUrl: str(message.media_url),
     replyTo,
+    threadOrigin,
     kind,
     location,
     service: str(message.service) ?? "",

@@ -29,22 +29,53 @@ describe("poolAddLevel", () => {
   ];
 
   it("adds a new model at the provider's default level, or none", () => {
-    expect(poolAddLevel(models, "a", [])).toEqual({ variant: "high" });
-    expect(poolAddLevel(models, "b", [])).toEqual({ variant: "max" });
-    expect(poolAddLevel(models, "c", [])).toEqual({ variant: null });
-    expect(poolAddLevel(models, "d", [])).toEqual({ variant: null });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", [])).toEqual({
+      variant: "high",
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "b", [])).toEqual({
+      variant: "max",
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", [])).toEqual({
+      variant: null,
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "d", [])).toEqual({
+      variant: null,
+    });
   });
 
   it("adds a pooled model at a level none of its pools has, never with no level", () => {
-    expect(poolAddLevel(models, "a", ["low"])).toEqual({ variant: "high" });
-    expect(poolAddLevel(models, "a", ["high"])).toEqual({ variant: "low" });
-    expect(poolAddLevel(models, "c", ["max"])).toEqual({ variant: "low" });
-    expect(poolAddLevel(models, "c", [null])).toEqual({ variant: "low" });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["low"])).toEqual({
+      variant: "high",
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["high"])).toEqual({
+      variant: "low",
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", ["max"])).toEqual({
+      variant: "low",
+    });
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "c", [null])).toEqual({
+      variant: "low",
+    });
   });
 
   it("has nothing to add once every level is pooled, or for a pooled model with no levels", () => {
-    expect(poolAddLevel(models, "a", ["low", "high", "max"])).toBeNull();
-    expect(poolAddLevel(models, "d", [null])).toBeNull();
+    expect(
+      poolAddLevel(ProviderInstanceId.make("opencode"), models, "a", ["low", "high", "max"]),
+    ).toBeNull();
+    expect(poolAddLevel(ProviderInstanceId.make("opencode"), models, "d", [null])).toBeNull();
+  });
+
+  it("uses the native reasoning descriptor and never writes an unavailable current value", () => {
+    const nativeModels = [
+      {
+        slug: "gpt",
+        capabilities: {
+          optionDescriptors: [{ ...select("retired", "high"), id: "reasoningEffort" }],
+        },
+      },
+    ];
+    expect(poolAddLevel(id("codex"), nativeModels, "gpt", [])).toEqual({ variant: "high" });
+    expect(poolAddLevel(id("codex-cu"), nativeModels, "gpt", ["high"])).toEqual({ variant: "low" });
   });
 });
 
@@ -65,6 +96,18 @@ describe("boardModelSelection", () => {
       model: "gpt",
     });
   });
+
+  it.each([
+    ["claudeAgent", "effort"],
+    ["codex", "reasoningEffort"],
+    ["codex-cu", "reasoningEffort"],
+  ])("writes the native effort option for %s", (instance, option) => {
+    expect(boardModelSelection({ instanceId: id(instance), model: "m", variant: "max" })).toEqual({
+      instanceId: instance,
+      model: "m",
+      options: [{ id: option, value: "max" }],
+    });
+  });
 });
 
 describe("poolListed", () => {
@@ -79,17 +122,13 @@ describe("poolListed", () => {
 
   it("is not listed when the model is hidden in settings", () => {
     const settings = { providerModelPreferences: { codex: { hiddenModels: ["gpt-hidden"] } } };
-    expect(poolListed(at("codex", "gpt-hidden"), providers, settings)).toBe(
-      false,
-    );
+    expect(poolListed(at("codex", "gpt-hidden"), providers, settings)).toBe(false);
   });
 
   it("stays listed when a custom model is hidden", () => {
     const withCustom = [provider("codex", [{ slug: "my-custom", isCustom: true }])];
     const settings = { providerModelPreferences: { codex: { hiddenModels: ["my-custom"] } } };
-    expect(poolListed(at("codex", "my-custom"), withCustom, settings)).toBe(
-      true,
-    );
+    expect(poolListed(at("codex", "my-custom"), withCustom, settings)).toBe(true);
   });
 
   it("is not listed when the instance is disabled", () => {

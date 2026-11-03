@@ -95,6 +95,9 @@ it.layer(TestLayer)("kanban store", (it) => {
       yield* store.putCard(card(2, "working"));
       assert.equal(yield* store.nextCardNumber(boardId), 3);
       assert.equal((yield* store.cards(boardId)).length, 2);
+      assert.deepStrictEqual(yield* store.cardByNumber(boardId, 2), card(2, "working"));
+      assert.isNull(yield* store.cardByNumber(boardId, 99999));
+      assert.isNull(yield* store.cardByNumber(KanbanBoardId.make("board-other"), 2));
       assert.deepStrictEqual(
         (yield* store.cardsByThread("thread-2")).map((entry) => entry.number),
         [2],

@@ -1,0 +1,3 @@
+#!/bin/sh
+unset BUN_INSPECT
+exec /opt/homebrew/bin/python3 -B "${0%/*}/../src/coord_shim.py" terraform "$@"

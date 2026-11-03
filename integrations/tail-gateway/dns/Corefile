@@ -1,0 +1,23 @@
+# .tail DNS for the tailnet. Tailscale split DNS sends "tail" here (admin console > DNS > tail -> the gateway IP).
+# Every *.tail name answers with the tail-gateway node's tailnet IP; Caddy on that node decides what exists.
+# Binds the wildcard because macOS lets a normal user take :53 only there (127.0.0.1:53 needs root).
+# The acl refuses everyone but loopback/tailnet, and with no forward plugin it is never an open resolver.
+# tail-gateway-run fills GATEWAY_IP/GATEWAY_IP6 from the gateway node.
+tail:53 {
+    bind 0.0.0.0 ::
+    acl {
+        allow net 127.0.0.0/8 ::1/128 100.64.0.0/10 fd7a:115c:a1e0::/48
+        block
+    }
+    template IN A tail {
+        answer "{{ .Name }} 60 IN A {$GATEWAY_IP}"
+    }
+    template IN AAAA tail {
+        answer "{{ .Name }} 60 IN AAAA {$GATEWAY_IP6}"
+    }
+    template ANY ANY tail {
+        rcode NOERROR
+    }
+    reload 10s
+    errors
+}

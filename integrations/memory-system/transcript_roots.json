@@ -1,0 +1,5 @@
+[
+  {"driver": "claudeAgent", "instance": "claudeAgent", "root": "~/.robob/harness-homes/claude"},
+  {"driver": "codex", "instance": "codex", "root": "~/.robob/harness-homes/codex"},
+  {"driver": "codex", "instance": "codex-cu", "root": "~/.robob/harness-homes/codex-cu"}
+]

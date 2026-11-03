@@ -66,6 +66,11 @@ import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
 } from "@t3tools/shared/threadPullRequests";
+import {
+  effortOptionId,
+  mergeSelection,
+  resolveSelection,
+} from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -1252,11 +1257,20 @@ const make = Effect.gen(function* () {
       .pipe(Effect.mapError(threadManagementFailure));
 
   const resolveTargetRechecking = (input: Parameters<typeof resolveTarget>[0]) => {
-    const instanceId =
+    let instanceId =
       input.target?.providerInstanceId ??
       (input.target?.driverKind === undefined
         ? input.parent.thread.modelSelection.instanceId
         : undefined);
+    if (input.migrateSelection && instanceId !== undefined) {
+      const inherited = input.parent.thread.modelSelection;
+      const candidateModel =
+        input.target?.model ?? (instanceId === inherited.instanceId ? inherited.model : undefined);
+      if (candidateModel !== undefined) {
+        const routed = resolveSelection({ instanceId, model: candidateModel });
+        if (routed.kind === "mapped") instanceId = routed.selection.instanceId;
+      }
+    }
     const resolved = resolveTarget(input);
     if (instanceId === undefined) return resolved;
     return resolved.pipe(
@@ -1274,6 +1288,8 @@ const make = Effect.gen(function* () {
     readonly parent: Pick<OrchestrationV2ThreadProjection, "thread">;
     readonly target: OrchestratorMcpTarget | undefined;
     readonly providers: ReadonlyArray<ServerProvider>;
+    readonly delegateSelection?: boolean;
+    readonly migrateSelection?: boolean;
     /**
      * Set only when the command that will dispatch this target already has a receipt: that
      * dispatch can only replay the recorded result, never start anything new, so filtering
@@ -1283,8 +1299,112 @@ const make = Effect.gen(function* () {
      */
     readonly skipProjectEnablementFilter?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
-    const requestedInstanceId = input.target?.providerInstanceId;
-    const requestedDriver = input.target?.driverKind;
+    let requestedInstanceId = input.target?.providerInstanceId;
+    let requestedDriver = input.target?.driverKind;
+    let requestedModel = input.target?.model;
+    let requestedSuffix: string | undefined;
+    let inheritedSelection = input.parent.thread.modelSelection;
+    const originalSelection = inheritedSelection;
+    const requestedOptions = input.target?.options;
+    let inheritedWasMapped = false;
+    let requestedWasMapped = false;
+
+    // A duplicate must not disappear when the compatibility merge canonicalizes effort ids.
+    if (input.delegateSelection && requestedOptions !== undefined) {
+      const invalid = invalidOptionSelections(requestedOptions, undefined);
+      if (invalid.length > 0) return yield* failure("invalid_request", invalid.join(" "));
+    }
+    if (
+      input.delegateSelection &&
+      (input.migrateSelection || inheritedSelection.instanceId !== "opencode")
+    ) {
+      const invalid = invalidOptionSelections(inheritedSelection.options ?? [], undefined);
+      if (invalid.length > 0) return yield* failure("invalid_request", invalid.join(" "));
+      if (input.migrateSelection && inheritedSelection.instanceId === "opencode") {
+        const folded = mergeSelection(inheritedSelection, {});
+        if (folded.kind === "conflict") return yield* failure("invalid_request", folded.reason);
+        inheritedSelection = folded.selection;
+        const routed = resolveSelection(inheritedSelection);
+        if (routed.kind === "conflict") return yield* failure("invalid_request", routed.reason);
+        inheritedWasMapped = routed.kind === "mapped";
+        inheritedSelection = routed.selection;
+      }
+    }
+    if (input.delegateSelection && input.migrateSelection && input.target?.model !== undefined) {
+      // Older callers can name a legacy OpenCode slug after the parent moved to a native driver.
+      if (input.target.providerInstanceId !== undefined && input.target.driverKind !== undefined) {
+        const source = input.providers.find(
+          (provider) => provider.instanceId === input.target?.providerInstanceId,
+        );
+        if (source !== undefined && source.driver !== input.target.driverKind) {
+          return yield* failure(
+            "invalid_request",
+            `Provider instance ${source.instanceId} does not use driver ${input.target.driverKind}.`,
+          );
+        }
+      }
+      const explicitSource = input.target.providerInstanceId ??
+        (input.target.driverKind === undefined || input.target.driverKind === "opencode"
+          ? "opencode"
+          : undefined);
+      if (explicitSource === "opencode") {
+        const explicit = resolveSelection({
+          instanceId: "opencode" as ProviderInstanceId,
+          model: input.target.model,
+        });
+        if (explicit.kind === "mapped") {
+          requestedWasMapped = true;
+          requestedInstanceId = explicit.selection.instanceId;
+          requestedModel = explicit.selection.model;
+          requestedSuffix = explicit.effort ?? undefined;
+          requestedDriver = undefined;
+        }
+      }
+    }
+    let mappedDestination = requestedWasMapped;
+    if (input.delegateSelection && input.migrateSelection) {
+      // Resolve the requested legacy identity before looking up its destination provider/model.
+      const candidateInstance =
+        requestedInstanceId ??
+        (requestedDriver === undefined || requestedDriver === "opencode"
+          ? originalSelection.instanceId
+          : undefined);
+      const candidateModel =
+        requestedModel ??
+        (candidateInstance === originalSelection.instanceId ? originalSelection.model : undefined);
+      if (
+        candidateInstance !== undefined &&
+        candidateModel !== undefined &&
+        (requestedDriver === undefined || requestedDriver === "opencode")
+      ) {
+        const routed = resolveSelection({
+          instanceId: candidateInstance,
+          model: candidateModel,
+        });
+        if (routed.kind === "conflict") return yield* failure("invalid_request", routed.reason);
+        if (routed.kind === "mapped") {
+          mappedDestination = true;
+          requestedInstanceId = routed.selection.instanceId;
+          requestedModel = routed.selection.model;
+          // An inherited suffix is an old value, not a new override.
+          if (!requestedWasMapped && input.target?.model !== undefined) {
+            requestedSuffix = routed.effort ?? undefined;
+          }
+          requestedDriver = undefined;
+        }
+      }
+    }
+    if (
+      input.delegateSelection &&
+      input.migrateSelection &&
+      originalSelection.instanceId === "opencode" &&
+      inheritedSelection.instanceId !== originalSelection.instanceId &&
+      requestedInstanceId === undefined &&
+      requestedDriver === undefined &&
+      requestedModel === undefined
+    ) {
+      mappedDestination = true;
+    }
     const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
     let instanceId = requestedInstanceId;
 
@@ -1304,7 +1424,7 @@ const make = Effect.gen(function* () {
         (candidate) => providerConstraints(candidate, true).length === 0,
       );
       const inheritedCandidate = healthyCandidates.find(
-        (candidate) => candidate.instanceId === input.parent.thread.modelSelection.instanceId,
+        (candidate) => candidate.instanceId === inheritedSelection.instanceId,
       );
       const orderedCandidates = [
         ...(inheritedCandidate === undefined ? [] : [inheritedCandidate]),
@@ -1331,7 +1451,14 @@ const make = Effect.gen(function* () {
         );
       }
     }
-    instanceId ??= input.parent.thread.modelSelection.instanceId;
+    instanceId ??= inheritedSelection.instanceId;
+    if (
+      inheritedWasMapped &&
+      instanceId === inheritedSelection.instanceId &&
+      (requestedModel === undefined || requestedModel === inheritedSelection.model)
+    ) {
+      mappedDestination = true;
+    }
 
     const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
     if (provider === undefined) {
@@ -1346,6 +1473,15 @@ const make = Effect.gen(function* () {
         `Provider instance ${instanceId} uses driver ${provider.driver}, not ${requestedDriver}.`,
       );
     }
+    if (
+      mappedDestination &&
+      provider.driver !== (instanceId === "codex-cu" ? "codex" : instanceId)
+    ) {
+      return yield* failure(
+        "invalid_request",
+        `Mapped provider instance ${instanceId} uses unexpected driver ${provider.driver}.`,
+      );
+    }
     const constraints = providerConstraints(
       provider,
       orchestrationCapableInstanceIds.has(provider.instanceId),
@@ -1357,8 +1493,14 @@ const make = Effect.gen(function* () {
       );
     }
 
-    const inheritedSelection = input.parent.thread.modelSelection;
-    const requestedModel = input.target?.model;
+    // Harness routing names default instances; custom instance ids still use their driver's effort.
+    const effortInstanceId = (
+      (provider.driver === "claudeAgent" || provider.driver === "codex") &&
+      effortOptionId(instanceId) === "variant"
+        ? provider.driver
+        : instanceId
+    ) as ProviderInstanceId;
+
     const model =
       requestedModel ??
       (instanceId === inheritedSelection.instanceId
@@ -1371,19 +1513,18 @@ const make = Effect.gen(function* () {
       );
     }
     if (
-      requestedModel !== undefined &&
+      (requestedModel !== undefined || input.delegateSelection === true) &&
       provider !== undefined &&
-      provider.models.length > 0 &&
-      !provider.models.some((candidate) => candidate.slug === requestedModel)
+      (provider.models.length > 0 || mappedDestination) &&
+      !provider.models.some((candidate) => candidate.slug === model)
     ) {
       return yield* failure(
         "model_unavailable",
-        `Model ${requestedModel} is not advertised by provider ${instanceId}.`,
+        `Model ${model} is not advertised by provider ${instanceId}.`,
       );
     }
 
-    const requestedOptions = input.target?.options;
-    if (requestedOptions !== undefined) {
+    if (!input.delegateSelection && requestedOptions !== undefined) {
       const descriptors = provider.models.find((candidate) => candidate.slug === model)
         ?.capabilities?.optionDescriptors;
       const invalid = invalidOptionSelections(requestedOptions, descriptors);
@@ -1398,7 +1539,72 @@ const make = Effect.gen(function* () {
     const inheritsOptions =
       instanceId === inheritedSelection.instanceId && model === inheritedSelection.model;
     let options = inheritsOptions ? inheritedSelection.options : undefined;
-    if (requestedOptions !== undefined) {
+    if (
+      input.delegateSelection &&
+      (input.migrateSelection ||
+        effortInstanceId === "claudeAgent" ||
+        effortInstanceId === "codex" ||
+        effortInstanceId === "codex-cu")
+    ) {
+      const effortId = effortOptionId(effortInstanceId);
+      const optionOverridesEffort =
+        requestedOptions?.some((option) => option.id === effortId || option.id === "variant") ===
+        true;
+      const overridesEffort =
+        requestedSuffix !== undefined || optionOverridesEffort;
+      const requestedIds = new Set(requestedOptions?.map((option) => option.id));
+      const mergedOptions =
+        requestedOptions === undefined
+          ? undefined
+          : requestedOptions.length === 0
+            ? []
+            : [
+                ...(options ?? []).filter(
+                  (option) =>
+                    !requestedIds.has(option.id) &&
+                    !(overridesEffort && (option.id === effortId || option.id === "variant")),
+                ),
+                ...requestedOptions,
+              ];
+      const merged = mergeSelection(
+        inheritsOptions
+          ? {
+              ...inheritedSelection,
+              instanceId: effortInstanceId,
+              ...(overridesEffort || requestedOptions?.length === 0
+                ? { options: (inheritedSelection.options ?? []).filter(
+                    (option) => option.id !== effortId && option.id !== "variant",
+                  ) }
+                : {}),
+            }
+          : { instanceId, model, options: [] },
+        {
+          instanceId: effortInstanceId,
+          model,
+          ...(mergedOptions === undefined ? {} : { options: mergedOptions }),
+          ...(requestedSuffix === undefined
+            ? {}
+            : requestedOptions?.length === 0
+              ? { variant: null }
+              : { variant: requestedSuffix }),
+        },
+      );
+      if (merged.kind === "conflict") return yield* failure("invalid_request", merged.reason);
+      options = requestedOptions?.length === 0 ? [] : merged.selection.options;
+      if (options !== undefined && options.length > 1) {
+        const order = [
+          ...(inheritsOptions ? (inheritedSelection.options ?? []) : []),
+          ...(requestedOptions ?? []),
+        ];
+        const position = (id: string) => {
+          const index = order.findIndex((option) =>
+            option.id === id || (id === effortId && option.id === "variant"),
+          );
+          return index < 0 ? order.length : index;
+        };
+        options = [...options].sort((a, b) => position(a.id) - position(b.id));
+      }
+    } else if (requestedOptions !== undefined) {
       const selections = new Map(
         (requestedOptions.length === 0 ? [] : (options ?? [])).map((selection) => [
           selection.id,
@@ -1409,6 +1615,31 @@ const make = Effect.gen(function* () {
         selections.set(selection.id, selection);
       }
       options = [...selections.values()];
+    }
+    if (input.delegateSelection) {
+      const descriptors = provider.models.find((candidate) => candidate.slug === model)
+        ?.capabilities?.optionDescriptors;
+      if (
+        (effortInstanceId === "claudeAgent" ||
+          effortInstanceId === "codex" ||
+          effortInstanceId === "codex-cu") &&
+        options?.some((option) => option.id === "variant")
+      ) {
+        return yield* failure("invalid_request", `Model ${model} cannot use a variant option.`);
+      }
+      if (mappedDestination && (options?.length ?? 0) > 0 && descriptors === undefined) {
+        return yield* failure(
+          "invalid_request",
+          `Options for ${model} on provider ${instanceId} cannot be checked against the provider catalog.`,
+        );
+      }
+      const invalid = invalidOptionSelections(options ?? [], descriptors);
+      if (invalid.length > 0) {
+        return yield* failure(
+          "invalid_request",
+          `Model ${model} on provider ${instanceId} rejected options: ${invalid.join(" ")}`,
+        );
+      }
     }
     return {
       modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
@@ -2092,10 +2323,15 @@ const make = Effect.gen(function* () {
         operation: "delegate-task",
       });
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+      );
       const target = yield* resolveTargetRechecking({
         parent,
         target: input.target,
         providers,
+        delegateSelection: true,
+        migrateSelection: settings.ardudHarnessMigration?.selections === "apply",
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
       const runtimeMode = yield* resolveRuntimeMode(

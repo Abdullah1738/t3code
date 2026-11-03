@@ -178,6 +178,12 @@ export class ServerSettingsService extends Context.Service<
 
     readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
 
+    // ardud: distinguish an unreadable settings file from an explicit opt-out in recovery logs.
+    readonly getSettingsWithTrust: Effect.Effect<
+      { readonly settings: ServerSettings; readonly trusted: boolean },
+      ServerSettingsError
+    >;
+
     readonly updateSettings: (
       patch: ServerSettingsPatch,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
@@ -238,6 +244,7 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
     start: Effect.void,
     ready: Effect.void,
     getSettings,
+    getSettingsWithTrust: getSettings.pipe(Effect.map((settings) => ({ settings, trusted: true }))),
     updateSettings: (patch) =>
       updateTestSettings((currentSettings) =>
         Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
@@ -1151,6 +1158,17 @@ const make = Effect.gen(function* () {
     getSettings: getSettingsFromCache.pipe(
       Effect.flatMap(materializeSettingsSecrets),
       Effect.map(resolveTextGenerationProvider),
+    ),
+    // ardud: read settings and parse status from the same cached snapshot.
+    getSettingsWithTrust: Cache.get(settingsCache, cacheKey).pipe(
+      Effect.flatMap(({ settings, parseFailure }) =>
+        materializeSettingsSecrets(settings).pipe(
+          Effect.map((materialized) => ({
+            settings: resolveTextGenerationProvider(materialized),
+            trusted: Option.isNone(parseFailure),
+          })),
+        ),
+      ),
     ),
     updateSettings: (patch) =>
       updateAndPersistSettings((current) =>

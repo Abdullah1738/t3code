@@ -134,6 +134,8 @@ offbox-person wa moni events 20               # connected / logged_out / warning
 offbox-person wa moni setup                   # (re)install wacli, wa, wa-db and the unit; idempotent
 ```
 
+- Exit 90 means her box didn't start; it says nothing about WhatsApp. 'offline (not linked)', 'not linked yet',
+  or 'not linked' from link-status indicate a not-linked state.
 - Sending: it's her account. Send only what she asked for, in her words or a draft she OKed in her chat.
   Never test-send to her contacts.
 - Linking or re-linking (her phone removed the device, `logged_out` in events): `offbox-person wa moni link

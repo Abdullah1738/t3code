@@ -185,6 +185,7 @@ import { loopbackUrlHostForAddress } from "./startupAccess.ts";
 import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
+import { desktopLeaseRouteLayer } from "./ardud/desktop-lease/http.ts";
 import { deferIdleSocketClose } from "./ardud/http/deferIdleSocketClose.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
@@ -714,6 +715,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    desktopLeaseRouteLayer,
     openCodeImportRouteLayer,
     // ardud: missions board
     kanbanRouteLayer,

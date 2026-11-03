@@ -17,6 +17,8 @@ import {
   ProjectId,
   ProviderApprovalDecision,
   ProviderInteractionMode,
+  ProviderOptionSelection,
+  RunId,
   RuntimeMode,
   RuntimeRequestId,
   ThreadId,
@@ -46,6 +48,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
 import {
   GUIDANCE_MAX_CHARS,
@@ -63,6 +66,8 @@ import {
   pendingRequestSummary,
   runSummary,
   runsNewestFirst,
+  selectionMigrationApplies,
+  selectionProblem,
   shellSummary,
   stateFromRuns,
   stateFromShell,
@@ -106,6 +111,16 @@ const STATUS: Record<ControlErrorCode, number> = {
 };
 
 const fail = (code: ControlErrorCode, message: string) => new ControlError({ code, message });
+
+/** A merged selection, or the conflict as a 400: a stale effort is never silently picked. */
+const selectionOrFail = (
+  result:
+    | { readonly kind: "selection"; readonly selection: ModelSelection }
+    | { readonly kind: "conflict"; readonly reason: string },
+) =>
+  result.kind === "selection"
+    ? Effect.succeed(result.selection)
+    : Effect.fail(fail("invalid_request", result.reason));
 
 const errorDetail = (cause: unknown): string =>
   userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
@@ -197,6 +212,7 @@ const boolParam = (raw: string | null): boolean | undefined =>
 // ---------------------------------------------------------------------------
 
 const OptionalString = Schema.optional(Schema.String);
+const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
 const Attachment = Schema.Struct({
   attachmentId: Schema.String,
   type: Schema.optional(Schema.Literals(["image", "file"])),
@@ -213,8 +229,9 @@ const CreateThreadBody = Schema.Struct({
   title: OptionalString,
   prompt: OptionalString,
   model: OptionalString,
-  variant: OptionalString,
+  variant: Schema.optional(Schema.NullOr(Schema.String)),
   providerInstanceId: OptionalString,
+  options: ModelOptions,
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
   worktree: Schema.optional(
@@ -233,7 +250,9 @@ const SendBody = Schema.Struct({
   text: Schema.String,
   mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
   model: OptionalString,
-  variant: OptionalString,
+  variant: Schema.optional(Schema.NullOr(Schema.String)),
+  providerInstanceId: OptionalString,
+  options: ModelOptions,
   attachments: Schema.optional(Schema.Array(Attachment)),
   clientRequestId: OptionalString,
   // The iMessage bridge still sends the relayed message's id; it is accepted and ignored.
@@ -245,6 +264,8 @@ const SendBody = Schema.Struct({
 const InterruptBody = Schema.Struct({
   reason: OptionalString,
   clientRequestId: OptionalString,
+  expectedRunId: OptionalString,
+  expectedAttemptId: OptionalString,
 });
 
 const RespondBody = Schema.Struct({
@@ -265,6 +286,8 @@ const SettingsBody = Schema.Struct({
   interactionMode: Schema.optional(ProviderInteractionMode),
   model: OptionalString,
   variant: Schema.optional(Schema.NullOr(Schema.String)),
+  providerInstanceId: OptionalString,
+  options: ModelOptions,
   title: OptionalString,
   archived: Schema.optional(Schema.Boolean),
   settled: Schema.optional(Schema.Boolean),
@@ -423,6 +446,7 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -433,6 +457,53 @@ const makeRoutes = Effect.gen(function* () {
   >();
   const uploadContext =
     yield* Effect.context<Effect.Services<ReturnType<typeof issueAttachmentUploadUrl>>>();
+
+  const resolveControlSelection = Effect.fn("ControlApi.resolveSelection")(function* (
+    input: Parameters<typeof modelSelectionFrom>[0],
+  ) {
+    const settings =
+      input.settings ??
+      (yield* settingsService.getSettings.pipe(
+        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      ));
+    const selection = yield* selectionOrFail(modelSelectionFrom({ ...input, settings }));
+    if (selectionMigrationApplies(settings)) {
+      const catalog = yield* providers.getProviders;
+      const problem = selectionProblem(catalog, selection);
+      if (problem !== null) return yield* fail("invalid_request", problem);
+    } else if (input.options !== undefined) {
+      // Explicit native options have no legacy semantics; never silently prefer
+      // one duplicate or a conflicting compatibility variant.
+      const ids = new Set<string>();
+      for (const option of input.options) {
+        if (ids.has(option.id)) {
+          return yield* fail(
+            "invalid_request",
+            `Option ${option.id} was specified more than once.`,
+          );
+        }
+        ids.add(option.id);
+        if (
+          option.id === "variant" &&
+          input.variant !== undefined &&
+          option.value !== input.variant
+        ) {
+          return yield* fail("invalid_request", "variant conflicts with the options list.");
+        }
+        if (
+          (option.id === "effort" || option.id === "reasoningEffort") &&
+          input.variant !== undefined &&
+          option.value !== input.variant
+        ) {
+          return yield* fail("invalid_request", "variant conflicts with the native effort option.");
+        }
+      }
+      const catalog = yield* providers.getProviders;
+      const problem = selectionProblem(catalog, selection);
+      if (problem !== null) return yield* fail("invalid_request", problem);
+    }
+    return selection;
+  });
 
   const authenticate = (scope: Scope) =>
     Effect.gen(function* () {
@@ -516,9 +587,10 @@ const makeRoutes = Effect.gen(function* () {
   const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
     Effect.gen(function* () {
       const ids = shells.map((shell) => shell.id);
-      const [origins, natives] = yield* Effect.all([
+      const [origins, natives, bindings] = yield* Effect.all([
         store.getOrigins(ids),
         store.nativeSessionIds(ids),
+        store.nativeBindings(ids),
       ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       // Children inherit the root's origin.
       const rootIds = shells
@@ -530,8 +602,8 @@ const makeRoutes = Effect.gen(function* () {
           : yield* store
               .getOrigins(rootIds)
               .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      return shells.map((shell) =>
-        shellSummary(shell, {
+      return shells.map((shell) => ({
+        ...shellSummary(shell, {
           origin:
             origins.get(shell.id) ??
             origins.get(shell.lineage.rootThreadId) ??
@@ -539,7 +611,8 @@ const makeRoutes = Effect.gen(function* () {
             null,
           nativeSessionId: natives.get(shell.id) ?? null,
         }),
-      );
+        native: bindings.get(shell.id) ?? null,
+      }));
     });
 
   const threadDetail = (threadId: string) =>
@@ -605,6 +678,7 @@ const makeRoutes = Effect.gen(function* () {
         models: provider.models.map((model) => ({
           model: model.slug,
           name: model.name,
+          optionDescriptors: model.capabilities?.optionDescriptors ?? [],
           variants:
             model.capabilities?.optionDescriptors?.find((descriptor) => descriptor.id === "variant")
               ?.type === "select"
@@ -704,11 +778,13 @@ const makeRoutes = Effect.gen(function* () {
     if (base === null && body.model === undefined) {
       return yield* fail("invalid_request", "No default model is configured; pass model.");
     }
-    const modelSelection = modelSelectionFrom({
+    const modelSelection = yield* resolveControlSelection({
       model: body.model,
       variant: body.variant,
       instanceId: body.providerInstanceId,
+      options: body.options,
       base: base ?? ({ instanceId: "opencode", model: body.model! } as ModelSelection),
+      settings,
     });
     const commandId = yield* commandIdFor("thread", body.clientRequestId);
     const threadId = ThreadId.make(commandId);
@@ -856,13 +932,38 @@ const makeRoutes = Effect.gen(function* () {
   const byNative = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const nativeId = yield* param("sessionId");
+    const driver = (yield* searchParams).get("driver") ?? undefined;
     const threadId = yield* store
-      .threadIdForNativeSession(nativeId)
+      .threadIdForNativeSession(nativeId, driver)
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     if (threadId === null) {
       return yield* fail("not_found", `No thread maps to session ${nativeId}.`);
     }
     return json({ ok: true, nativeSessionId: nativeId, thread: yield* threadDetail(threadId) });
+  });
+
+  // Any native id a hook or tool sees, resolved to its Robob execution.
+  // Ambiguous and unknown ids come back as a resolution, not an error, so
+  // callers can tell "not yet" from "never".
+  const identityResolve = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const nativeId = params.get("nativeId");
+    if (nativeId === null || nativeId.length === 0) {
+      return yield* fail("invalid_request", "nativeId is required.");
+    }
+    const driver = params.get("driver");
+    const providerInstanceId = params.get("instance");
+    const agentId = params.get("agentId");
+    const identity = yield* identities
+      .resolve({
+        nativeId,
+        ...(driver === null ? {} : { driver }),
+        ...(providerInstanceId === null ? {} : { providerInstanceId }),
+        ...(agentId === null ? {} : { agentId }),
+      })
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return json({ ok: true, identity });
   });
 
   const getMessages = Effect.gen(function* () {
@@ -925,14 +1026,25 @@ const makeRoutes = Effect.gen(function* () {
       );
     }
     const context = guidanceContext(body.guidance);
+    const hasSelection =
+      body.model !== undefined ||
+      body.variant !== undefined ||
+      body.providerInstanceId !== undefined ||
+      body.options !== undefined;
+    const settings = yield* settingsService.getSettings.pipe(
+      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+    );
     const modelSelection =
-      body.model === undefined && body.variant === undefined
-        ? undefined
-        : modelSelectionFrom({
+      hasSelection || selectionMigrationApplies(settings)
+        ? yield* resolveControlSelection({
             model: body.model,
             variant: body.variant,
+            instanceId: body.providerInstanceId,
+            options: body.options,
             base: shell.modelSelection,
-          });
+            settings,
+          })
+        : undefined;
     const result = yield* startup
       .enqueueCommand(
         ThreadMessageIntake.sendToThread({
@@ -971,7 +1083,31 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeInterruptBody);
+    if (body.expectedAttemptId !== undefined && body.expectedRunId === undefined) {
+      return yield* fail("invalid_request", "expectedAttemptId needs expectedRunId");
+    }
+    const expectedRunId = body.expectedRunId?.trim();
+    if (expectedRunId === "") {
+      return yield* fail("invalid_request", "expectedRunId must not be empty.");
+    }
     const shell = yield* getShell(threadId);
+    if (expectedRunId !== undefined) {
+      const records = yield* threads
+        .getThreadRecords(shell.id, ["runs"])
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      const run = records.runs.find((candidate) => candidate.id === expectedRunId);
+      if (
+        run !== undefined &&
+        !TERMINAL_RUN_STATUSES.has(run.status) &&
+        body.expectedAttemptId !== undefined &&
+        run.activeAttemptId !== body.expectedAttemptId
+      ) {
+        return yield* fail(
+          "conflict",
+          `Run ${expectedRunId} is on attempt ${run.activeAttemptId}, not ${body.expectedAttemptId}.`,
+        );
+      }
+    }
     const result = yield* startup
       .enqueueCommand(
         threads.interruptThread({
@@ -979,6 +1115,7 @@ const makeRoutes = Effect.gen(function* () {
           commandId: yield* commandIdFor(`interrupt:${threadId}`, body.clientRequestId),
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
+          ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
         }),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
@@ -1083,6 +1220,21 @@ const makeRoutes = Effect.gen(function* () {
     const shell = yield* getShell(threadId);
     const id = ThreadId.make(threadId);
     const next = (operation: string) => commandIdFor(`${operation}:${threadId}`, undefined);
+    const hasSelection =
+      body.model !== undefined ||
+      body.variant !== undefined ||
+      body.providerInstanceId !== undefined ||
+      body.options !== undefined;
+    // Resolve before any other mutation in a multi-field PATCH.
+    const modelSelection = hasSelection
+      ? yield* resolveControlSelection({
+          model: body.model,
+          variant: body.variant,
+          instanceId: body.providerInstanceId,
+          options: body.options,
+          base: shell.modelSelection,
+        })
+      : undefined;
     if (body.runtimeMode !== undefined && body.runtimeMode !== shell.runtimeMode) {
       yield* dispatch({
         type: "thread.runtime-mode.set",
@@ -1099,12 +1251,7 @@ const makeRoutes = Effect.gen(function* () {
         interactionMode: body.interactionMode,
       });
     }
-    if (body.model !== undefined || body.variant !== undefined) {
-      const modelSelection = modelSelectionFrom({
-        model: body.model,
-        variant: body.variant,
-        base: shell.modelSelection,
-      });
+    if (modelSelection !== undefined) {
       yield* dispatch({
         type:
           modelSelection.instanceId === shell.providerInstanceId
@@ -1399,6 +1546,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
+    HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
     HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
@@ -1414,5 +1562,5 @@ const makeRoutes = Effect.gen(function* () {
 });
 
 export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
-  Layer.provide(ControlStore.layer),
+  Layer.provide(Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer)),
 );

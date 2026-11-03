@@ -105,13 +105,15 @@ describe("chat slugs", () => {
 describe("inbound mapping", () => {
   test("text becomes the row, attachments keep the media URL, audio is flagged", () => {
     const mapped = inboundFromLine({ handle: "h", text: "", from: moni, mediaUrl: "https://cdn/x/voice.caf", kind: "message",
-      service: "iMessage", sentAt: 5 });
+      service: "iMessage", sentAt: 5, replyTo: "before", threadOrigin: "root" });
     expect(mapped.id).toBe("h");
     expect(mapped.isAudioMessage).toBe(true);
     expect(mapped.attachments[0]).toMatchObject({ guid: "https://cdn/x/voice.caf", mimeType: "audio/x-caf", totalBytes: 0 });
     expect(mapped.source).toBe("typed");
     expect(mapped.sender).toBe(moni);
     expect(mapped.sentAt).toBe(5);
+    expect(mapped.replyTo).toBe("before");
+    expect(mapped.threadOrigin).toBe("root");
   });
 
   test("a location share becomes the shared-location text and keeps coordinates", () => {
@@ -119,6 +121,7 @@ describe("inbound mapping", () => {
       location: { latitude: 25.2, longitude: 55.3, accuracy: 12 } });
     expect(mapped.text).toBe("[Shared location] 25.2,55.3 (±12 m)");
     expect(mapped.location).toMatchObject({ latitude: 25.2, longitude: 55.3, accuracy: 12 });
+    expect(mapped.threadOrigin).toBeUndefined();
   });
 });
 

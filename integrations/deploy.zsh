@@ -11,7 +11,9 @@ case "$name" in
   offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
   local-helpers) exec "${0:A:h}/local-helpers/install.zsh" "$@" ;;  # files under ~/.local, see local-helpers/README.md
   harness-homes) exec "${0:A:h}/harness-homes/install.zsh" "$@" ;;  # Robob's Claude/Codex homes, see harness-homes/README.md
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes> [--dry-run]"; exit 2 ;;
+  tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
+  harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes|tail-gateway|harness-hooks> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"

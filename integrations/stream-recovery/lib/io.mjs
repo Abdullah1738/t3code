@@ -507,10 +507,10 @@ export function telegram({ text, severity = "info", key }) {
 const statePath = () => join(PATHS.dataDir, "state.json");
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {}, servers: [], ghosts: {} };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, lastStallScan: null, watch: {}, stalls: {}, servers: [], ghosts: {} };
   const s = parse(readFileSync(statePath(), "utf8"));
   return {
-    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
+    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, lastStallScan: s.lastStallScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
     servers: s.servers ?? [], ghosts: s.ghosts ?? {},
   };
 }

@@ -15,6 +15,7 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -24,11 +25,8 @@ export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "sy
 
 export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
-/** A model's reasoning level (its string "variant" option), or null. */
-export const modelLevel = (model: ModelSelection): string | null => {
-  const value = model.options?.find((option) => option.id === "variant")?.value;
-  return typeof value === "string" ? value : null;
-};
+/** A model's reasoning level (its effort option for its driver), or null. */
+export const modelLevel = (model: ModelSelection): string | null => selectionEffort(model);
 
 /** One key per model, whatever its level: outages and the composer's list are per model. */
 export const modelKey = (model: ModelSelection): string => `${model.instanceId}/${model.model}`;
@@ -40,21 +38,45 @@ export const poolKey = (model: ModelSelection): string => {
 };
 
 /**
- * The pool a model runs on: the pool at its exact level, else the first pool (in pool
- * order) of the same model at any level. A board with one pool per model behaves as
- * before levels were part of the key.
+ * The pool a model runs on. A named level is exact, for every driver: its own pool, or none.
+ * Another level's pool never runs it (max on an xhigh-only pool would have its options
+ * replaced by xhigh). Only a model with no level takes the first pool of its model.
  */
 export function poolFor(
   pools: ReadonlyArray<KanbanPool>,
   model: ModelSelection,
 ): KanbanPool | undefined {
   const key = poolKey(model);
-  const base = modelKey(model);
   // Compared by each pool's model, not its stored key, so a pool not yet rekeyed still matches.
-  return (
-    pools.find((pool) => poolKey(pool.model) === key) ??
-    pools.find((pool) => modelKey(pool.model) === base)
+  const exact = pools.find((pool) => poolKey(pool.model) === key);
+  if (exact !== undefined) return exact;
+  if (modelLevel(model) !== null) return undefined;
+  const base = modelKey(model);
+  return pools.find((pool) => modelKey(pool.model) === base);
+}
+
+/**
+ * The pool an alias names. An alias is written without its instance, or with a short name,
+ * so it is matched to the pool model it means: a short name is unambiguous when its pools all
+ * belong to one model (one key per level is still one model). The level rule is poolFor's:
+ * a named level is exact, for every driver.
+ */
+export function aliasPool(
+  pools: ReadonlyArray<KanbanPool>,
+  model: ModelSelection,
+): KanbanPool | undefined {
+  const joined = `${model.instanceId}/${model.model}`;
+  const byName = pools.filter(
+    (pool) => pool.model.model === joined || pool.model.model === model.model,
   );
+  const bySuffix = pools.filter((pool) => pool.model.model.endsWith(`/${model.model}`));
+  const suffixModels = new Set(bySuffix.map((pool) => modelKey(pool.model)));
+  const same = byName.length > 0 ? byName : suffixModels.size === 1 ? bySuffix : [];
+  const [first] = same;
+  if (first === undefined) return undefined;
+  const level = modelLevel(model);
+  if (level === null) return first;
+  return same.find((pool) => modelLevel(pool.model) === level);
 }
 
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);
@@ -278,9 +300,16 @@ export function isOutage(failure: {
 const CONTEXT_FULL_TEXT =
   /prompt is too long|input is too long|context[ _]length|maximum context|context window|too many tokens|request_too_large|insufficient context allowance|too little context for a provider handoff/i;
 
-/** A failed run only a fresh thread gets past: the thread is too long to send again. */
+/** A failed run whose context no longer fits. */
 export function isContextFull(failure: { readonly message: string }): boolean {
   return CONTEXT_FULL_TEXT.test(failure.message);
+}
+
+/** A T3 handoff-budget failure, which provider-side compaction cannot reliably fix. */
+export function isHandoffBudget(failure: { readonly message: string }): boolean {
+  return /insufficient context allowance|too little context for a provider handoff/i.test(
+    failure.message,
+  );
 }
 
 /** How long after a fresh start a second context-full run is flagged instead of restarted. */

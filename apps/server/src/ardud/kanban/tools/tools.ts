@@ -11,6 +11,7 @@ import {
   NonNegativeInt,
   OrchestratorMcpFailure,
   PositiveInt,
+  ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
@@ -18,12 +19,14 @@ import * as Schema from "effect/Schema";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
 import { MAX_BATCH } from "../engine/rules.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
   ThreadManagementService.ThreadManagementService,
+  ServerSettings.ServerSettingsService,
   KanbanService,
 ];
 
@@ -38,7 +41,7 @@ const CardRef = describe(
   'Card id or number ("#12" or "12"). Defaults to your own card when you are a card thread carrying one card.',
 );
 
-export const ModelInput = Schema.Struct({
+const ModelInputFields = {
   model: describe(
     TrimmedNonEmptyString,
     'Model id exactly as the board pools list it (board_get), e.g. "opus/claude-opus-5-5".',
@@ -46,19 +49,29 @@ export const ModelInput = Schema.Struct({
   instanceId: Schema.optional(
     describe(TrimmedNonEmptyString, 'Provider instance; leave out to use "opencode".'),
   ),
+  effort: Schema.optional(
+    describe(TrimmedNonEmptyString, 'Thinking effort, e.g. "xhigh". Prefer this over variant.'),
+  ),
   variant: Schema.optional(
     describe(
       TrimmedNonEmptyString,
-      'Thinking variant, e.g. "xhigh". Each model offers its own set (orchestrator_capabilities lists them); one the model doesn\'t offer is refused with the list it does.',
+      'Legacy name for effort. If both are supplied, they must agree.',
     ),
   ),
-});
+  options: Schema.optional(
+    describe(
+      Schema.Array(ProviderOptionSelection),
+      "Full provider options, including fastMode or serviceTier.",
+    ),
+  ),
+};
+export const ModelInput = Schema.Struct(ModelInputFields);
 export type ModelInput = typeof ModelInput.Type;
 
 const WeightedModels = describe(
   Schema.Array(
     Schema.Struct({
-      ...ModelInput.fields,
+      ...ModelInputFields,
       weight: describe(
         PositiveInt,
         "Higher wins when its pool has room; equal weights split at random.",
@@ -142,9 +155,9 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "The Missions board you work on: board settings and instructions, every card, goals, pools, groups, live thread states and unread counts. Threads outside a board pass boardId.",
+  "The Missions board you work on: board settings and instructions, every card, goals, pools, groups, live thread states and unread counts. Card prompts are left out; card_get returns them. Threads outside a board pass boardId.",
   { boardId: Schema.optional(TrimmedNonEmptyString) },
-  { board: Record },
+  { board: Record, prompts: Schema.String },
   { readonly: true },
 );
 
@@ -419,7 +432,7 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
   {
     model: ModelInput,
     slots: Schema.optional(NonNegativeInt),
@@ -437,7 +450,7 @@ const PoolSet = tool(
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
-  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses. Name the variant when the model has pools at several levels.",
   { model: ModelInput },
   { pools: Records },
   { readonly: false, destructive: true },

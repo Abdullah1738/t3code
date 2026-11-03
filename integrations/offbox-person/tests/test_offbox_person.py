@@ -70,6 +70,15 @@ class OffboxPersonTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.calls.read_text().splitlines() if line]
 
+    def ssh_responses(self, *responses):
+        path = self.tmp / "ssh-responses.json"
+        path.write_text(json.dumps(responses))
+        self.env["FAKE_SSH_RESPONSES"] = str(path)
+        self.calls.write_text("")
+
+    def ssh_calls(self):
+        return [c for c in self.offbox_calls() if c["args"][0] == "ssh"]
+
     def ab_calls(self):
         if not self.ab_log.exists():
             return []
@@ -186,6 +195,107 @@ class OffboxPersonTest(unittest.TestCase):
         self.tool("run", "moni", "--", "echo", "hi")
         runs = [c for c in self.offbox_calls() if c["args"][0] == "run"]
         self.assertIn("cd ~/person/work && echo hi", runs[-1]["args"][-1])
+
+    def test_wa_read_retries_box_start_once_and_returns_second_output(self):
+        for command in ((), ("status",), ("link-status",), ("chats",), ("find", "Ana's $name"),
+                        ("read",), ("search",), ("ids",), ("events",)):
+            for code in (90, 92):
+                with self.subTest(command=command, code=code):
+                    self.ssh_responses({"exit": code, "stderr": "offbox: not ready\n"},
+                                       {"exit": 0, "stdout": "second result\n"})
+                    result = self.tool("wa", "moni", *command)
+                    self.assertEqual(result.stdout, "second result\n")
+                    self.assertEqual(result.stderr, "offbox: not ready\n"
+                                     f"offbox-person: her box didn't start in time (offbox exit {code}); retrying once\n")
+                    calls = self.ssh_calls()
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(calls[0]["args"], calls[1]["args"])
+                    self.assertEqual(calls[0]["thread"], "person:moni")
+                    self.assertEqual(calls[0]["pool"], "1")
+
+    def test_wa_read_reports_last_box_failure_after_one_retry(self):
+        for first, second in ((90, 90), (90, 92), (92, 90), (92, 92)):
+            with self.subTest(first=first, second=second):
+                self.ssh_responses({"exit": first}, {"exit": second})
+                result = self.tool("wa", "moni", "status", check=False)
+                self.assertEqual(result.returncode, 90)
+                self.assertEqual(result.stderr,
+                                 f"offbox-person: her box didn't start in time (offbox exit {first}); retrying once\n"
+                                 f"offbox-person: her box didn't start (offbox exit {second}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n")
+                self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_wa_read_discards_failed_attempt_output_before_retry(self):
+        self.ssh_responses({"exit": 90, "stdout": "offline (not linked)\n"},
+                           {"exit": 0, "stdout": "online pid 1\n"})
+        result = self.tool("wa", "moni", "status")
+        self.assertEqual(result.stdout, "online pid 1\n")
+        self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_wa_read_without_retry_preserves_stdout_and_trailing_newlines(self):
+        self.ssh_responses({"exit": 1, "stdout": "offline (linked)\n\n"})
+        result = self.tool("wa", "moni", "status", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "offline (linked)\n\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_wa_not_linked_and_other_exits_pass_through(self):
+        for command, response in (
+            (("status",), {"exit": 1, "stdout": "offline (not linked)\n"}),
+            (("link-status",), {"exit": 0, "stdout": "not linked\n"}),
+            (("chats",), {"exit": 2, "stderr": "wa: not linked yet\n"}),
+            (("status",), {"exit": 17, "stderr": "remote error\n"}),
+            (("send", "jid", "text"), {"exit": 2, "stderr": "wa: not linked yet\n"}),
+        ):
+            with self.subTest(command=command):
+                self.ssh_responses(response)
+                result = self.tool("wa", "moni", *command, check=False)
+                self.assertEqual(result.returncode, response["exit"])
+                self.assertEqual(result.stdout, response.get("stdout", ""))
+                self.assertEqual(result.stderr, response.get("stderr", ""))
+                self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_wa_read_retry_can_return_not_linked_without_box_error(self):
+        self.ssh_responses({"exit": 90}, {"exit": 2, "stderr": "wa: not linked yet\n"})
+        result = self.tool("wa", "moni", "chats", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr,
+                         "offbox-person: her box didn't start in time (offbox exit 90); retrying once\n"
+                         "wa: not linked yet\n")
+        self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_wa_writes_and_unknown_commands_never_retry(self):
+        for command in ("send", "sendfile", "new", "link", "start", "restart", "stop", "download", "unknown"):
+            for code in (90, 92):
+                with self.subTest(command=command, code=code):
+                    self.ssh_responses({"exit": code}, {"exit": 0})
+                    result = self.tool("wa", "moni", command, "arg", check=False)
+                    self.assertEqual(result.returncode, 90)
+                    self.assertEqual(result.stderr,
+                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n"
+                                     "offbox-person: the command may have run; check before repeating it.\n")
+                    self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_wa_setup_stops_on_box_failure_at_each_step_without_retry(self):
+        for step in range(3):
+            for code in (90, 92):
+                with self.subTest(step=step, code=code):
+                    self.ssh_responses(*([{"exit": 0}] * step), {"exit": code}, {"exit": 0})
+                    result = self.tool("wa", "moni", "setup", check=False)
+                    self.assertEqual(result.returncode, 90)
+                    self.assertEqual(result.stderr,
+                                     f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n"
+                                     "offbox-person: the command may have run; check before repeating it.\n")
+                    self.assertEqual(len(self.ssh_calls()), step + 1)
+
+    def test_wa_setup_other_failure_passes_through_without_retry(self):
+        for step in range(3):
+            with self.subTest(step=step):
+                self.ssh_responses(*([{"exit": 0}] * step), {"exit": 17, "stderr": "setup failed\n"})
+                result = self.tool("wa", "moni", "setup", check=False)
+                self.assertEqual(result.returncode, 17)
+                self.assertEqual(result.stderr, "setup failed\n")
+                self.assertEqual(len(self.ssh_calls()), step + 1)
 
     def test_down_cleans_state_and_stops_tunnels_and_socks(self):
         self.tool("up", "moni")

@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - script files live on disk and runs get random ids.
 // @effect-diagnostics globalDate:off - runs are stamped like every other board record.
+// @effect-diagnostics preferSchemaOverJson:off - child environment values are JSON strings.
 /**
  * Board scripts: owner-approved programs the board runs on a schedule, on a
  * board event, or by hand. They run as plain child processes, with no model.
@@ -10,7 +11,10 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
+import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   KanbanDiscussionId,
   KanbanError,
@@ -38,8 +42,11 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService } from "./KanbanService.ts";
+import { modelSelectionResult } from "./defaults.ts";
+import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
 
@@ -153,6 +160,19 @@ interface Slot {
 type Slots = ReadonlyMap<KanbanScript["id"], Slot>;
 
 const make = Effect.gen(function* () {
+  const context = yield* Effect.context<ServerSettings.ServerSettingsService>();
+  const routingEnabled = selectionRoutingEnabled.pipe(Effect.provideContext(context));
+  const settings = yield* ServerSettings.ServerSettingsService;
+  const executable = yield* HostProcess.ExecutablePath;
+  const isExecutable = yield* HostProcess.IsExecutable;
+  const bridgeEntry = import.meta.url.endsWith(".ts")
+    ? NodeURL.fileURLToPath(new URL("../../../bin.ts", import.meta.url))
+    : NodeURL.fileURLToPath(new URL("./bin.mjs", import.meta.url));
+  const bridgeCommand = [
+    executable,
+    ...(isExecutable ? [] : [bridgeEntry]),
+    "__kanban-resolve-selection",
+  ];
   const store = yield* KanbanStore;
   const service = yield* KanbanService;
   const scope = yield* Effect.scope;
@@ -226,27 +246,53 @@ const make = Effect.gen(function* () {
     return yield* ownDiscussion(script);
   });
 
-  // Only resizes a pool the board already has, keeping its variant.
+  // Only resizes a pool the board already has, keeping its full selection.
   const resizePool = Effect.fn("KanbanScripts.resizePool")(function* (
     script: KanbanScript,
     command: Scripts.PoolCommand,
   ) {
     const pools = yield* io(store.pools(script.boardId));
+    const apply = yield* routingEnabled;
+    const selected = modelSelectionResult(command, apply);
+    if (selected.kind === "conflict") {
+      return `Couldn't resize the ${command.model} pool: ${selected.reason}`;
+    }
+    const exact = pools.filter((entry) => entry.key === command.model);
+    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
+    const namedLevel = selectionEffort(selected.selection);
+    const keyedPool = exact[0];
+    if (
+      keyedPool &&
+      ((command.instanceId !== undefined && command.instanceId !== keyedPool.model.instanceId) ||
+        (namedLevel !== null && namedLevel !== Rules.modelLevel(keyedPool.model)))
+    ) {
+      return `The pool key ${command.model} conflicts with its instance or effort.`;
+    }
+    const mapped =
+      apply &&
+      (selected.selection.instanceId !== (command.instanceId ?? "opencode") ||
+        selected.selection.model !== command.model);
     const same = pools.filter(
       (entry) =>
-        entry.model.model === command.model &&
-        (command.instanceId === undefined || entry.model.instanceId === command.instanceId),
+        entry.model.model === selected.selection.model &&
+        (mapped
+          ? entry.model.instanceId === selected.selection.instanceId
+          : command.instanceId === undefined || entry.model.instanceId === command.instanceId),
     );
-    if (command.variant === undefined && same.length > 1) {
+    if (!keyedPool && namedLevel === null && same.length > 1) {
       const levels = same.map((entry) => Rules.modelLevel(entry.model) ?? "no level").join(", ");
       return `The ${command.model} pools run at ${levels}; name the variant.`;
     }
-    const pool =
-      command.variant === undefined
-        ? same[0]
-        : same.find((entry) => Rules.modelLevel(entry.model) === command.variant);
+    const matching =
+      namedLevel === null
+        ? same
+        : same.filter((entry) => Rules.modelLevel(entry.model) === namedLevel);
+    if (!keyedPool && matching.length > 1) {
+      return `More than one pool matches ${command.model} ${namedLevel ?? ""}.`;
+    }
+    const pool = keyedPool ?? matching[0];
     if (!pool) {
-      return `There's no ${command.model}${command.variant ? ` ${command.variant}` : ""} pool on this board.`;
+      return `There's no ${command.model}${namedLevel ? ` ${namedLevel}` : ""} pool on this board.`;
     }
     const resized = yield* Effect.result(
       service.setPool(script.boardId, pool.model, command.slots),
@@ -297,15 +343,28 @@ const make = Effect.gen(function* () {
         notes.push(yield* resizePool(script, command));
         continue;
       }
-      if (command.kanban === "subtask" || command.kanban === "handback" || command.kanban === "move") {
+      if (
+        command.kanban === "subtask" ||
+        command.kanban === "handback" ||
+        command.kanban === "move"
+      ) {
         const card = cards.find((entry) => entry.number === command.card);
         if (!card) {
-          notes.push(`Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`);
+          notes.push(
+            `Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`,
+          );
           continue;
         }
         if (command.kanban === "subtask") {
           const marked = yield* Effect.result(
-            service.markSubtask(card.id, command.subtask, command.state, command.note ?? null, actor, "script"),
+            service.markSubtask(
+              card.id,
+              command.subtask,
+              command.state,
+              command.note ?? null,
+              actor,
+              "script",
+            ),
           );
           notes.push(
             Result.isSuccess(marked)
@@ -417,6 +476,7 @@ const make = Effect.gen(function* () {
     if (interpreter === null || !(yield* isFile(script.path))) {
       return yield* close(script, run, null, `There is no script at ${script.path}.`);
     }
+    const current = yield* settings.getSettings.pipe(Effect.mapError(asKanbanError));
     const result = yield* runProcess({
       argv: [interpreter, script.path],
       cwd: NodePath.dirname(script.path),
@@ -425,6 +485,8 @@ const make = Effect.gen(function* () {
         KANBAN_BOARD_ID: script.boardId,
         KANBAN_SCRIPT_ID: script.id,
         KANBAN_TRIGGER: run.trigger,
+        KANBAN_HARNESS_MIGRATION: JSON.stringify(current.ardudHarnessMigration ?? {}),
+        KANBAN_HARNESS_ROUTING_COMMAND: JSON.stringify(bridgeCommand),
         ...(event === null ? {} : { KANBAN_EVENT: event }),
       },
       timeoutMs: RUN_TIMEOUT_MS,

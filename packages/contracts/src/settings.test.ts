@@ -23,6 +23,23 @@ const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
+describe("harness migration settings", () => {
+  it("keeps existing installations opt-out and round-trips the cutover flag", () => {
+    expect(decodeServerSettings({}).ardudHarnessMigration).toBeUndefined();
+    for (const selections of ["off", "dryrun", "apply"]) {
+      const input = { ardudHarnessMigration: { selections, allowConflicts: false } };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    }
+  });
+
+  it("rejects an invalid mode rather than accidentally enabling migration", () => {
+    const input = { ardudHarnessMigration: { selections: "on" } };
+    expect(() => decodeServerSettings(input)).toThrow();
+    expect(() => decodeServerSettingsPatch(input)).toThrow();
+  });
+});
+
 describe("ServerSettings response streaming", () => {
   it("defaults to paragraph buffering", () => {
     expect(decodeServerSettings({}).responseStreamingMode).toBe("paragraph");

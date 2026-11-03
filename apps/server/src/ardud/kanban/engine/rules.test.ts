@@ -20,6 +20,7 @@ import {
   discussionSettleDue,
   isBlocked,
   isContextFull,
+  isHandoffBudget,
   isOutage,
   MAX_BATCH,
   maskDownPools,
@@ -28,6 +29,7 @@ import {
   modelOnPool,
   nextProbeDelay,
   planDispatch,
+  aliasPool,
   poolFor,
   poolKey,
   prsLanded,
@@ -1021,6 +1023,18 @@ describe("isContextFull", () => {
   });
 });
 
+describe("isHandoffBudget", () => {
+  it("distinguishes handoff budget errors from provider overflows", () => {
+    expect(
+      isHandoffBudget({ message: "Insufficient context allowance for the provider handoff." }),
+    ).toBe(true);
+    expect(
+      isHandoffBudget({ message: "The request leaves too little context for a provider handoff." }),
+    ).toBe(true);
+    expect(isHandoffBudget({ message: "prompt is too long" })).toBe(false);
+  });
+});
+
 describe("isOutage", () => {
   it("treats out-of-usage, rate-limit and expired-token failures as outages", () => {
     expect(
@@ -1149,9 +1163,12 @@ describe("pool levels", () => {
       [opus, 1],
     ]);
     expect(poolFor(all, at(haiku, "xhigh"))?.key).toBe(poolKey(at(haiku, "xhigh")));
-    expect(poolFor(all, at(haiku, "low"))?.key).toBe(poolKey(at(haiku, "max")));
+    // A named level is exact: a low card has no low pool here, so it gets none.
+    expect(poolFor(all, at(haiku, "low"))).toBeUndefined();
     expect(poolFor(all, haiku)?.key).toBe(poolKey(at(haiku, "max")));
-    expect(poolFor(all, at(opus, "high"))?.key).toBe(poolKey(opus));
+    // A named level on a model whose only pool has no level gets no pool: levels never mix.
+    expect(poolFor(all, at(opus, "high"))).toBeUndefined();
+    expect(poolFor(all, opus)?.key).toBe(poolKey(opus));
     expect(poolFor(all, sol)).toBeUndefined();
   });
 
@@ -1167,10 +1184,10 @@ describe("pool levels", () => {
       [card({ model: xhigh }), card({ model: max }), card({ model: at(haiku, "low") })],
       all,
     );
-    // The low card would run on max (the first Haiku pool), but max's one slot is taken.
+    // The low card has no pool of its own here, so it waits instead of taking max's slot.
     expect(plan.map((d) => d.pool)).toEqual([poolKey(xhigh), poolKey(max)]);
     const alone = planDispatch(board, [card({ model: at(haiku, "low") })], all);
-    expect(alone.map((d) => d.pool)).toEqual([poolKey(max)]);
+    expect(alone).toEqual([]);
   });
 
   it("lets a thread claim a card whose level runs on the thread's pool", () => {
@@ -1184,8 +1201,84 @@ describe("pool levels", () => {
       carrying: 0,
       slots: 1,
     };
-    expect(checkClaim(board, c, ctx).ok).toBe(false);
-    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(true);
-    expect(modelOnPool(c, poolKey(max), pools([[max, 1]]))).toEqual(c.model);
+    // A low card can't be claimed on the thread's max pool: its level has no pool here.
+    expect(checkClaim(board, c, { ...ctx, pools: pools([[max, 1]]) }).ok).toBe(false);
+    const own = card({ model: max });
+    expect(
+      checkClaim(board, own, {
+        ...ctx,
+        byId: new Map([[own.id as string, own]]),
+        pools: pools([[max, 1]]),
+      }).ok,
+    ).toBe(true);
+    expect(modelOnPool(own, poolKey(max), pools([[max, 1]]))).toEqual(own.model);
+  });
+});
+
+describe("claude effort pools", () => {
+  const claude = (level: string | null): ModelSelection => ({
+    instanceId: ProviderInstanceId.make("claudeAgent"),
+    model: "claude-haiku-5-5",
+    ...(level === null ? {} : { options: [{ id: "effort", value: level }] }),
+  });
+  const maxPool = claude("max");
+  const xhighPool = claude("xhigh");
+
+  it("keeps max and xhigh on their own pools, and a named level without a pool gets none", () => {
+    const all = pools([
+      [maxPool, 1],
+      [xhighPool, 1],
+    ]);
+    expect(poolFor(all, claude("max"))?.key).toBe(poolKey(maxPool));
+    expect(poolFor(all, claude("xhigh"))?.key).toBe(poolKey(xhighPool));
+    expect(poolFor(all, claude("low"))).toBeUndefined();
+  });
+
+  it("a card with no level falls back to the model's first pool", () => {
+    const all = pools([
+      [maxPool, 1],
+      [xhighPool, 1],
+    ]);
+    expect(poolFor(all, claude(null))?.key).toBe(poolKey(maxPool));
+  });
+
+  it("an alias keeps the same level rule: its own level's pool, or none", () => {
+    const all = pools([
+      [maxPool, 1],
+      [xhighPool, 1],
+    ]);
+    expect(aliasPool(all, claude("xhigh"))?.key).toBe(poolKey(xhighPool));
+    expect(aliasPool(all, claude("low"))).toBeUndefined();
+    expect(aliasPool(all, claude(null))?.key).toBe(poolKey(maxPool));
+  });
+
+  it("a named level is exact on OpenCode too: an xhigh-only pool never runs a max card", () => {
+    const opencode = (level: string): ModelSelection => ({
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/gpt-6-astra",
+      options: [{ id: "variant", value: level }],
+    });
+    const xhighOnly = pools([[opencode("xhigh"), 1]]);
+    expect(poolFor(xhighOnly, opencode("xhigh"))?.key).toBe(poolKey(opencode("xhigh")));
+    expect(poolFor(xhighOnly, opencode("max"))).toBeUndefined();
+    const maxAlias: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opus"),
+      model: "gpt-6-astra",
+      options: [{ id: "variant", value: "max" }],
+    };
+    expect(aliasPool(xhighOnly, maxAlias)).toBeUndefined();
+  });
+
+  it("OpenCode levels with no pool are refused, and a card with no level still takes the model's pool", () => {
+    const opencodeHigh: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/cc/claude-haiku-5-5",
+      options: [{ id: "variant", value: "high" }],
+    };
+    const all = pools([[opencodeHigh, 1]]);
+    const max: ModelSelection = { ...opencodeHigh, options: [{ id: "variant", value: "max" }] };
+    expect(poolFor(all, max)).toBeUndefined();
+    const bare: ModelSelection = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/cc/claude-haiku-5-5" };
+    expect(poolFor(all, bare)?.key).toBe(poolKey(opencodeHigh));
   });
 });

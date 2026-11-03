@@ -352,6 +352,7 @@ test("toInbound maps group, location and reply fields", () => {
   });
   expect(group).toMatchObject({ handle: "g1", chat: "group:grp9", groupName: "Crew", kind: "message", participants: ["+15550002", "+15550003"] });
   expect(group.sentAt).toBe(Date.parse("2026-10-21T10:00:00.000Z"));
+  expect(group.threadOrigin).toBeUndefined();
 
   const location = toInbound({
     message_handle: "l1",
@@ -361,8 +362,11 @@ test("toInbound maps group, location and reply fields", () => {
   });
   expect(location).toMatchObject({ kind: "location", chat: "dm:+15550001", location: { latitude: 25.1, longitude: 55.2, accuracy: 5 } });
 
-  const reply = toInbound({ message_handle: "r1", from_number: "+15550001", content: "re", reply_to: { message_handle: "h1" } });
+  const reply = toInbound({ message_handle: "r1", from_number: "+15550001", content: "re", reply_to: { message_handle: "h1" },
+    thread_originator: { message_handle: "t1", part: "0:0:3" } });
   expect(reply.replyTo).toBe("h1");
+  expect(reply.threadOrigin).toBe("t1");
+  expect(toInbound({ thread_originator: "bad" }).threadOrigin).toBeUndefined();
 });
 
 test("events parses split frames, skips heartbeats, dedupes across reconnects and stops on abort", async () => {

@@ -462,6 +462,8 @@ export type NormalizedInbound = {
   id: string;
   text: string;
   replyTo?: string;
+  /** Sendblue mode: handle of the inline-reply thread's first message (thread_originator). */
+  threadOrigin?: string;
   isAudioMessage: boolean;
   attachments: AttachmentInfo[];
   receivedAt?: number;
