@@ -121,13 +121,20 @@ function taskChildRuns(db, childThreadId, taskRef) {
               where i.run_id=r.run_id and i.type='run_interrupt_request') stop_requested
        from orchestration_v2_projection_runs r where thread_id=? order by ordinal`,
   ).all(childThreadId);
-  // Legacy initial tasks have no delegatedTaskId. A later task sharing that
-  // thread must never inherit another task's completed follow-up.
+  // The original delegate has no delegatedTaskId. Until its result is
+  // published, additional child turns can also be uncorrelated. Limit those
+  // turns to the original task's lifetime; separately correlated tasks keep
+  // their own runs.
   const initial = rows.filter((r) => r.task_id === taskRef);
   const first = rows[0];
   const legacyTask = childThreadId.startsWith('thread:delegated-task:')
     ? `node:delegated-task:${childThreadId.slice('thread:delegated-task:'.length)}` : null;
-  if (!initial.length && taskRef === legacyTask && first && !first.task_id) initial.push(first);
+  if (!initial.length && taskRef === legacyTask && first && !first.task_id) {
+    const task = db.prepare(
+      `select completed_at from orchestration_v2_projection_subagents where subagent_id=?`,
+    ).get(taskRef);
+    initial.push(...rows.filter((r) => !r.task_id && r.requested_at <= (task?.completed_at ?? '9999')));
+  }
   if (!initial.length) return [];
   const ids = new Set(initial.map((r) => r.run_id));
   for (const r of rows) if (ids.has(r.continued_from)) ids.add(r.run_id);

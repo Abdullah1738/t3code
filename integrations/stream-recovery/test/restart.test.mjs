@@ -298,6 +298,32 @@ test('a cancelled unstarted buffered notification cannot hide a stopped task run
   } finally { db.close(); }
 });
 
+test('a Stop on an unpublished original task’s uncorrelated later run is excluded', async () => {
+  const { db, task, addRun, stop } = delegatedFixture();
+  try {
+    const stopped = task('uncorrelated-stop');
+    addRun('original-run', stopped.child_thread_id, 1, 'completed', T0 - 50_000, T0 - 10_000,
+      { startedAt: iso(T0 - 49_000) });
+    addRun('later-work', stopped.child_thread_id, 2, 'interrupted', T0 - 5_000, T0,
+      { startedAt: iso(T0 - 4_000) });
+    stop('later-work', stopped.child_thread_id, T0);
+    // The task finalizes after the Stop, so the later-stop guard alone cannot catch it.
+    const safe = task('uncorrelated-safe');
+    addRun('safe-first', safe.child_thread_id, 1, 'completed', T0 - 50_000, T0 - 10_000,
+      { startedAt: iso(T0 - 49_000) });
+    addRun('other-task-stop', safe.child_thread_id, 2, 'interrupted', T0 - 5_000, T0,
+      { startedAt: iso(T0 - 4_000), delegatedTaskId: 'node:delegated-task:another' });
+    stop('other-task-stop', safe.child_thread_id, T0);
+    assert.deepEqual(dbIo.cancelledDelegatedTasksSince(db, iso(T0)).map((r) => r.subagent_id), [safe.subagent_id]);
+    const { io, calls } = fakeIo({ threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    assert.match(calls.send[0].text, /Task uncorrelated-safe/);
+    assert.doesNotMatch(calls.send[0].text, /Task uncorrelated-stop/);
+  } finally { db.close(); }
+});
+
 test('mixed native and delegated tasks share the prompt budget and use separate recovery instructions', async () => {
   const { db, task } = delegatedFixture();
   try {
