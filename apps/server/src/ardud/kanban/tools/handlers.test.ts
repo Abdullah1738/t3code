@@ -441,6 +441,74 @@ it.effect("discussion_post to a card leaves no discussion when the write is refu
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("card_update with an unchanged description returns ok and adds no event", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "retry-edit",
+      name: "Retry",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+    running.add(thread);
+    const first = yield* call(thread, "card_update", {
+      card: card.id,
+      description: "New description",
+    });
+    assert.isFalse(first.isError, first.text);
+    const before = yield* kanban.card(card.id);
+    assert.lengthOf(
+      before.events.filter((event) => event.kind === "edited"),
+      1,
+    );
+    const repeat = yield* call(thread, "card_update", {
+      card: card.id,
+      description: "New description",
+    });
+    assert.isFalse(repeat.isError, repeat.text);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion_post repeated returns the same message", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "retry-post",
+      name: "Retry",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+    running.add(thread);
+    const first = yield* call(thread, "discussion_post", { card: card.id, text: "Status update" });
+    assert.isFalse(first.isError, first.text);
+    const second = yield* call(thread, "discussion_post", { card: card.id, text: "Status update" });
+    assert.isFalse(second.isError, second.text);
+    const firstMessage = first.structured.message as {
+      discussionId: KanbanDiscussionId;
+      seq: number;
+    };
+    const secondMessage = second.structured.message as {
+      discussionId: KanbanDiscussionId;
+      seq: number;
+    };
+    assert.deepStrictEqual(secondMessage, firstMessage);
+    assert.lengthOf(yield* kanban.messages(firstMessage.discussionId), 1);
+    assert.lengthOf(
+      (yield* kanban.discussions(board.id)).filter((entry) => entry.cardId === card.id),
+      1,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect(
   "a thread with several cards picks a card's discussion, but only of its own cards",
   () => {
