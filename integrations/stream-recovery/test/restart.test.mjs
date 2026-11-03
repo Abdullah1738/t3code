@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import * as dbIo from '../lib/io.mjs';
 import { restartRunsSince, queuedRuns, restartNoteRun, stoppedSince } from '../lib/io.mjs';
 import {
   findRestartIncidents, serverStartWindow, trackServer, findRedispatch, normTitle, childOutcome,
@@ -149,7 +150,7 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
 
 // ---------- restartScan with a fake io ----------
 
-function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [] }) {
+function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [] }) {
   const calls = { send: [], telegram: [], commands: [], saves: [] };
   const io = {
     OC_URL: 'http://oc',
@@ -162,6 +163,9 @@ function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered 
     dispatchCommand: async (command) => { calls.commands.push(command); },
     saveState: (state) => { calls.saves.push(JSON.parse(JSON.stringify(state))); },
     cancelledSubagentsSince: () => subs.map((s) => ({ ...s })),
+    cancelledDelegatedTasksSince: () => delegated.map((s) => ({ ...s })),
+    childRunOutcomeSince: () => null,
+    runMessages: () => [],
     subagentParent: () => null,
     threadRoot: () => null,
     subagentsStartedSince: (_db, threadId) => later[threadId] ?? [],
@@ -180,6 +184,156 @@ function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered 
   };
   return { io, calls };
 }
+
+function delegatedFixture() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`create table orchestration_v2_projection_threads(thread_id text, payload_json text);
+    create table orchestration_v2_projection_runs(run_id text,thread_id text,ordinal integer,status text,requested_at text,completed_at text,payload_json text);
+    create table orchestration_v2_projection_turn_items(run_id text,type text,thread_id text,updated_at text);
+    create table orchestration_v2_projection_messages(message_id text,thread_id text,run_id text,role text,created_at text,payload_json text);
+    create table orchestration_v2_projection_subagents(subagent_id text,thread_id text,run_id text,provider_thread_id text,child_thread_id text,started_at text,completed_at text,origin text,status text,payload_json text);`);
+  const task = (id, { status = 'interrupted', origin = 'app_owned', nodeId = `node:delegated-task:${id}`, payload = {}, parent = 'batch' } = {}) => {
+    const child = `thread:delegated-task:${id}`;
+    const row = { subagent_id: nodeId, thread_id: parent, run_id: `parent-run:${id}`, child_thread_id: child,
+      started_at: iso(T0 - 60_000), completed_at: iso(T0 + 1_000) };
+    db.prepare('insert into orchestration_v2_projection_subagents values (?,?,?,?,?,?,?,?,?,?)').run(
+      row.subagent_id, row.thread_id, row.run_id, null, child, row.started_at, row.completed_at, origin, status,
+      JSON.stringify({ id: nodeId, title: `Task ${id}`, model: 'test/model', prompt: `Prompt ${id}`, result: 'Partial work', ...payload }),
+    );
+    return row;
+  };
+  const addRun = (id, thread, ordinal, status, requested, completed, payload = {}) => {
+    db.prepare('insert into orchestration_v2_projection_runs values (?,?,?,?,?,?,?)').run(id, thread, ordinal, status, iso(requested), completed == null ? null : iso(completed), JSON.stringify(payload));
+  };
+  const stop = (id, thread, at = T0 + 1_000) => db.prepare('insert into orchestration_v2_projection_turn_items values (?,?,?,?)')
+    .run(id, 'run_interrupt_request', thread, iso(at));
+  return { db, task, addRun, stop };
+}
+
+test('restartScan includes delegated tasks, excludes Stops and distinguishes a later finished child', async () => {
+  const { db, task, addRun, stop } = delegatedFixture();
+  try {
+    const cut = task('cut');
+    const finished = task('finished');
+    const equal = task('same-time');
+    const parentStopped = task('parent-stop');
+    const childStopped = task('child-stop');
+    task('explicit-cancel', { payload: { completionDelivery: { state: 'disposed' } } });
+    task('wrong-kind', { nodeId: 'node:app-other:wrong-kind' });
+    task('wrong-origin', { origin: 'provider_native' });
+    task('completed', { status: 'completed' });
+    stop(parentStopped.run_id, 'batch');
+    addRun('child-stopped-run', childStopped.child_thread_id, 1, 'interrupted', T0 - 50_000, T0 + 1_000);
+    addRun('held-queued-run', childStopped.child_thread_id, 2, 'queued', T0, null, { queueHeld: true });
+    stop('child-stopped-run', childStopped.child_thread_id);
+    addRun('equal-run', equal.child_thread_id, 1, 'completed', T0 - 50_000, T0 + 1_000);
+    addRun('finished-run', finished.child_thread_id, 1, 'completed', T0 - 50_000, T0 + 2_000);
+    db.prepare('insert into orchestration_v2_projection_messages values (?,?,?,?,?,?)').run('m', finished.child_thread_id, 'finished-run', 'assistant', iso(T0 + 1_900), JSON.stringify({ text: 'Finished the work.' }));
+    const rows = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    assert.deepEqual(rows.map((r) => r.subagent_id), [cut.subagent_id, finished.subagent_id, equal.subagent_id]);
+    assert.equal(rows[0].taskRef, cut.subagent_id);
+    assert.equal(rows[0].childThreadId, cut.child_thread_id);
+    const { io, calls } = fakeIo({ runs: [run('batch')], threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    io.runMessages = dbIo.runMessages;
+    const [report] = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    const lost = report.results[0].lostSubs;
+    assert.deepEqual(lost.map((l) => l.status), ['cut', 'finished', 'cut']);
+    const note = calls.send[0].text;
+    assert.match(note, /Your own turn was cut off/);
+    assert.match(note, /delegated task "Task cut" \(test\/model\), child thread thread:delegated-task:cut: cut off by the restart\. Check it with task_status node:delegated-task:cut before relaunching; relaunch with delegate_task only if it didn't finish and no continuation is active or pending\./);
+    assert.match(note, /Original prompt:\n\s*```\nPrompt cut/);
+    assert.match(note, /delegated task "Task finished".*: finished at .*Check it with task_status node:delegated-task:finished for the result/);
+    assert.match(note, /Finished the work\./);
+    assert.doesNotMatch(note, /Task parent-stop|Task child-stop|Task explicit-cancel|Task wrong-kind/);
+    assert.doesNotMatch(note, /pass its session id|api\/session\/<ses>/);
+    assert.match(calls.telegram[0].text, /0 background subagent\(s\) and 3 delegated task\(s\) interrupted/);
+    assert.match(calls.telegram[0].text, /3 delegated task\(s\) to pick up/);
+  } finally { db.close(); }
+});
+
+test('delegated lookup uses the task node ID and never mistakes an earlier stopped child run for the cut', () => {
+  const { db, task, addRun, stop } = delegatedFixture();
+  try {
+    const row = task('retry', { payload: { id: undefined, taskId: 'not-a-node-id', clientRequestId: 'request-retry' } });
+    addRun('old-stop', row.child_thread_id, 1, 'interrupted', T0 - 120_000, T0 - 60_000);
+    stop('old-stop', row.child_thread_id, T0 - 60_000);
+    addRun('cut-run', row.child_thread_id, 2, 'interrupted', T0 - 50_000, T0 + 1_000);
+    const [found] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+    assert.equal(found.taskRef, row.subagent_id);
+    assert.equal(found.clientRequestId, 'request-retry');
+    assert.equal(dbIo.childRunOutcomeSince(db, row.child_thread_id, row.subagent_id, row.completed_at), null);
+    assert.equal(dbIo.childRunOutcomeSince(db, null, row.subagent_id, row.completed_at), null);
+  } finally { db.close(); }
+});
+
+test('mixed native and delegated tasks share the prompt budget and use separate recovery instructions', async () => {
+  const { db, task } = delegatedFixture();
+  try {
+    const row = task('mixed', { payload: { prompt: 'd'.repeat(2_000) } });
+    const { io, calls } = fakeIo({
+      subs: [sub('native', 'batch', 1_000, { prompt: 'n'.repeat(2_000) })], threads: { batch: { title: 'Batch' } },
+    });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    io.runMessages = dbIo.runMessages;
+    await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    const note = calls.send[0].text;
+    assert.match(note, /session ses_native.*cut off/);
+    assert.match(note, /delegated task "Task mixed".*task_status node:delegated-task:mixed/);
+    assert.match(note, /pass its session id as the session to continue/);
+    assert.match(note, /Read a subagent's output with: curl/);
+    assert.equal((note.match(/Original prompt \(start\)/g) ?? []).length, 2);
+    assert.doesNotMatch(note, /n{1201}|d{1201}/);
+    assert.match(calls.telegram[0].text, /1 background subagent\(s\) and 1 delegated task\(s\) interrupted/);
+    assert.match(calls.telegram[0].text, /1 subagent\(s\) to pick up, 1 delegated task\(s\) to pick up/);
+    assert.equal(row.child_thread_id, 'thread:delegated-task:mixed');
+  } finally { db.close(); }
+});
+
+test('delegated child whose finished run has no assistant text is still finished', async () => {
+  const { db, task, addRun } = delegatedFixture();
+  try {
+    const row = task('no-text');
+    addRun('completed-no-text', row.child_thread_id, 1, 'completed', T0 - 50_000, T0 + 2_000);
+    const { io, calls } = fakeIo({ threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    io.runMessages = dbIo.runMessages;
+    const [report] = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    assert.equal(report.results[0].lostSubs[0].status, 'finished');
+    assert.match(calls.send[0].text, /delegated task "Task no-text".*: finished/);
+    assert.match(calls.send[0].text, /affected 1 delegated task\(s\)/);
+    assert.doesNotMatch(calls.send[0].text, /interrupted 1 delegated task/);
+    assert.doesNotMatch(calls.send[0].text, /cut off by the restart/);
+  } finally { db.close(); }
+});
+
+test('delegated tasks follow their restart continuation, not unrelated child runs', async () => {
+  const { db, task, addRun } = delegatedFixture();
+  try {
+    const running = task('running');
+    const done = task('continued');
+    const unrelated = task('unrelated');
+    for (const r of [running, done, unrelated]) addRun(`${r.subagent_id}:first`, r.child_thread_id, 1, 'cancelled', T0 - 50_000, T0 + 1_000);
+    addRun('running-again', running.child_thread_id, 2, 'running', T0 + 2_000, null,
+      { restartContinuationOfRunId: `${running.subagent_id}:first` });
+    addRun('done-again', done.child_thread_id, 2, 'completed', T0 + 2_000, T0 + 3_000,
+      { restartContinuationOfRunId: `${done.subagent_id}:first` });
+    addRun('unrelated-followup', unrelated.child_thread_id, 2, 'completed', T0 + 2_000, T0 + 3_000,
+      { delegatedTaskId: 'node:delegated-task:some-other-task' });
+    const { io, calls } = fakeIo({ threads: { batch: { title: 'Batch' } } });
+    io.cancelledDelegatedTasksSince = dbIo.cancelledDelegatedTasksSince;
+    io.childRunOutcomeSince = dbIo.childRunOutcomeSince;
+    io.runMessages = dbIo.runMessages;
+    const [report] = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), io);
+    assert.deepEqual(report.results[0].lostSubs.map((l) => l.status), ['running', 'finished', 'cut']);
+    assert.match(calls.send[0].text, /Task running.*a continuation is running or queued.*don't relaunch/);
+    assert.match(calls.send[0].text, /Task continued.*: finished/);
+    assert.match(calls.send[0].text, /Task unrelated.*: cut off by the restart/);
+  } finally { db.close(); }
+});
 
 const threads = {
   batch: { threadId: 'batch', title: 'Batch-fix Crpko tickets', origin: null, archived: false },

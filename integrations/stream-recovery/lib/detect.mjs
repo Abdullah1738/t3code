@@ -296,15 +296,16 @@ export function trackServer(servers, current, now, { keep = 20 } = {}) {
   return list.slice(-keep);
 }
 
-// subs: cancelled subagent rows {completed_at, result, thread_id,
-// parentThreadId, rootThreadId}. Clusters the result-less ones (gap <= gapMs).
+// subs: cancelled native subagents and delegated tasks {completed_at, result,
+// thread_id, parentThreadId, rootThreadId}. Clusters candidates (gap <= gapMs).
 // A cluster is a restart when it spans >= minThreads root threads with >=
 // minBurst rows, or when any row falls in a server start window. A burst in
 // one thread tree alone is a Stop (or task_cancel), not a restart.
 export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs = 10_000, minBurst = 3, minThreads = 2 } = {}) {
   const windows = serverStarts.map((s) => serverStartWindow(s)).filter(Boolean);
   const rows = subs
-    .filter((s) => s.result == null)
+    // App-owned tasks can retain partial assistant text even when interrupted.
+    .filter((s) => s.kind === 'delegated' || s.result == null)
     .map((s) => ({ ...s, ms: toMs(s.completed_at) }))
     .filter((s) => Number.isFinite(s.ms))
     .sort((a, b) => a.ms - b.ms);
@@ -472,15 +473,26 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
   const at = hhmm(incident.failAllMs ?? incident.startMs);
   const needs = lost.filter((l) => NEEDS.has(l.status));
   const done = lost.filter((l) => l.status === "redispatched" || l.status === "delivered");
+  const delegated = needs.filter((l) => l.kind === 'delegated');
+  const native = needs.filter((l) => l.kind !== 'delegated');
   const auth = `-u "opencode:$(cat ~/.config/opencode-service/password)"`;
   const parts = [
     `[stream-recovery] ${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restarted at ${at}` +
-      (needs.length ? ` and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` : '.') +
+      (delegated.length
+        ? ` and affected ${[native.length ? `${native.length} background subagent(s)` : '', `${delegated.length} delegated task(s)`].filter(Boolean).join(' and ')} this thread had running. Check their status before resuming them.`
+        : needs.length ? ` and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` : '.') +
       (turnCut ? ` Your own turn was cut off by the same restart; carry on from where you were.` : ""),
     `On every macOS boot, dirhelper -machineBoot fully wipes $TMPDIR. Scratch files under $TMPDIR/opencode are gone after a Mac reboot; reconstruct missing briefs and reports from durable files or session history before resuming work.`,
   ];
   let budget = PROMPTS_TOTAL;
   const lines = needs.map((l, i) => {
+    if (l.kind === 'delegated' && l.status === 'finished') {
+      const quote = l.excerpt ? `:\n   > ${fence(l.excerpt).replace(/\n/g, "\n   > ")}` : ".";
+      return `${i + 1}. delegated task "${truncate(l.title ?? 'task', 100)}"${l.model ? ` (${l.model})` : ''}, child thread ${l.childThreadId ?? 'unknown'}: finished${l.finishedMs ? ` at ${hhmm(l.finishedMs)}` : ''}. Check it with task_status ${l.taskRef} for the result${quote}`;
+    }
+    if (l.kind === 'delegated' && l.status === 'running') {
+      return `${i + 1}. delegated task "${truncate(l.title ?? 'task', 100)}"${l.model ? ` (${l.model})` : ''}, child thread ${l.childThreadId ?? 'unknown'}: a continuation is running or queued. Check it with task_status ${l.taskRef}; don't relaunch while it is active.`;
+    }
     const head = `${i + 1}. "${truncate(l.title ?? "subagent", 100)}"${l.model ? ` (${l.model})` : ""}, session ${l.sessionId ?? "unknown"}, started ${l.startedAt ? hhmm(l.startedAt) : "?"}${l.nestedUnder ? `, launched by ${l.nestedUnder}` : ""}: `;
     if (l.status === "running") return `${head}still running in OpenCode, but its wake-up won't reach you through Robob. Don't relaunch it; check its output before you finish your turn.`;
     if (l.status === "finished") {
@@ -494,6 +506,9 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
       prompt = `\n   Original prompt${text.length < l.prompt.trim().length ? " (start)" : ""}:\n   \`\`\`\n${fence(text)}\n   \`\`\``;
     } else if (l.prompt) {
       prompt = `\n   Original prompt: in your earlier subagent call.`;
+    }
+    if (l.kind === 'delegated') {
+      return `${i + 1}. delegated task "${truncate(l.title ?? 'task', 100)}"${l.model ? ` (${l.model})` : ''}, child thread ${l.childThreadId ?? 'unknown'}: cut off by the restart. Check it with task_status ${l.taskRef} before relaunching; relaunch with delegate_task only if it didn't finish and no continuation is active or pending.${prompt}`;
     }
     return `${head}cut off by the restart.${prompt}`;
   });
@@ -511,7 +526,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
         ".",
     );
   }
-  if (needs.some((l) => l.status === "cut")) {
+  if (needs.some((l) => l.status === "cut" && l.kind !== 'delegated')) {
     parts.push(
       `For each cut-off subagent you still need, resume it with your subagent tool: pass its session id as the session to continue, with a short prompt such as "Robob restarted and cut you off. Carry on from where you stopped and finish the task." It keeps its context. Re-dispatch from the original prompt only if the resume fails. Skip any you no longer need or already relaunched.`,
     );
@@ -520,8 +535,8 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
     `- ${r.run_id}, queued ${hhmm(r.requested_at)}: ${fence(truncate(r.text ?? '', 240))}`).join('\n'));
   if (held.length) parts.push(`Robob had held ${held.length} queued message(s). Recovery is releasing the queue; these reach you as separate turns.`);
   parts.push(
-    (lost.length ? `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). ` : '') +
-    `Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass this recovery note, including every listed child session and result, to it and stop.`,
+    (lost.some((l) => l.kind !== 'delegated') ? `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). ` : '') +
+    `Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass this recovery note, including every listed child session${delegated.length ? ', delegated task' : ''} and result, to it and stop.`,
   );
   return parts.join("\n\n");
 }
@@ -533,16 +548,22 @@ export function buildRestartSummary({ incident, results }) {
   const threads = new Set([...incident.subagents.map((s) => s.parentThreadId ?? s.thread_id), ...runs.map((r) => r.thread_id)]);
   for (const r of results) threads.add(r.plan.threadId);
   const turnThreads = new Set(runs.map((r) => r.thread_id));
+  const delegatedCount = incident.subagents.filter((s) => s.kind === 'delegated').length;
+  const children = delegatedCount
+    ? `${incident.subagents.length - delegatedCount} background subagent(s) and ${delegatedCount} delegated task(s) interrupted`
+    : `${incident.subagents.length} background subagent(s) cancelled`;
   const lines = [
-    `${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restart at ${hhmm(incident.failAllMs ?? incident.startMs)} hit ${threads.size} thread(s): ${turnThreads.size} with their own turn cut off, ${incident.subagents.length} background subagent(s) cancelled.`,
+    `${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restart at ${hhmm(incident.failAllMs ?? incident.startMs)} hit ${threads.size} thread(s): ${turnThreads.size} with their own turn cut off, ${children}.`,
   ];
   const name = (r) => truncate(r.plan.title || r.plan.threadId, 40);
   const what = (r) => {
     const parts = [];
     if (r.turnCut) parts.push("turn cut");
-    const need = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).length;
+    const need = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status) && l.kind !== 'delegated').length;
+    const delegatedNeed = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status) && l.kind === 'delegated').length;
     const done = (r.lostSubs ?? []).filter((l) => HANDLED.has(l.status)).length;
     if (need) parts.push(`${need} subagent(s) to pick up`);
+    if (delegatedNeed) parts.push(`${delegatedNeed} delegated task(s) to pick up`);
     if (done) parts.push(`${done} handled subagent(s) listed`);
     return parts.length ? ` (${parts.join(", ")})` : "";
   };
@@ -559,7 +580,8 @@ export function buildRestartSummary({ incident, results }) {
   const skipped = results.filter((r) => r.plan.action === "skip" && !r.error);
   if (skipped.length) lines.push(`Skipped: ${list(skipped, (r) => `${name(r)} (${r.plan.reason})`)}.`);
   for (const r of results.filter((x) => x.plan.action === "report")) {
-    const lost = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).map((l) => `"${truncate(l.title ?? l.sessionId, 60)}" (${l.sessionId})`);
+    const lost = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).map((l) =>
+      `"${truncate(l.title ?? l.sessionId ?? l.taskRef, 60)}" (${l.kind === 'delegated' ? l.taskRef : l.sessionId})`);
     const bits = [r.turnCut ? "turn cut" : null, lost.length ? `lost ${lost.join(", ")}` : null].filter(Boolean);
     lines.push(`iMessage (${name(r)}): ${bits.join("; ") || "affected"}; the thread was not told.`);
   }

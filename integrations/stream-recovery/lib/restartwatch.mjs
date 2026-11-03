@@ -1,7 +1,6 @@
-// Restart watch: Robob's startup recovery cancels every native subagent it
-// still had open, with no result and no wake-up for the parent. Spot those
-// cancels, tell each parent thread what it lost (once), and send one Telegram
-// summary per restart. The caller loads and saves state.
+// Restart watch: spot interrupted native subagents, delegated tasks and turns,
+// tell each parent thread what it lost (once), and send one summary per restart.
+// The caller loads and saves state.
 import * as realIo from "./io.mjs";
 import {
   buildRestartNote, buildRestartSummary, childOutcome, findRedispatch, findRestartIncidents, hhmm,
@@ -38,6 +37,19 @@ function topParent(io, db, threadId) {
 }
 
 async function lostSubagent({ io, db, sub, active, incident }) {
+  if (sub.kind === 'delegated') {
+    const base = {
+      kind: 'delegated', subagentId: sub.subagent_id, title: sub.title ?? null, model: sub.model ?? null,
+      prompt: sub.prompt ?? null, startedAt: sub.started_at ?? null, cancelledAt: sub.completed_at,
+      childThreadId: sub.childThreadId, taskRef: sub.taskRef,
+    };
+    const outcome = io.childRunOutcomeSince(db, sub.childThreadId, sub.taskRef, sub.completed_at);
+    if (!outcome) return { ...base, status: 'cut' };
+    if (outcome.status === 'running') return { ...base, status: 'running' };
+    const messages = await safe(() => io.runMessages(db, outcome.run_id), []);
+    const text = messages.findLast((m) => m.role === 'assistant' && m.text)?.text;
+    return { ...base, status: 'finished', finishedMs: toMs(outcome.completed_at), excerpt: text ? truncate(text, 600) : null };
+  }
   const sessionId = sessionFromProviderThread(sub.provider_thread_id);
   const base = {
     subagentId: sub.subagent_id, sessionId, title: sub.title ?? null, model: sub.model ?? null,
@@ -173,7 +185,8 @@ const summaryResult = (r) => ({
   plan: { threadId: r.plan.threadId, title: r.plan.title ?? null, action: r.plan.action, reason: r.plan.reason },
   ok: r.ok, error: r.error ?? null, turnCut: Boolean(r.turnCut), held: r.held ?? 0, queueOk: r.queueOk ?? null,
   staleHeld: (r.staleHeld ?? []).map((s) => ({ run_id: s.run_id })),
-  lostSubs: (r.lostSubs ?? []).map((l) => ({ status: l.status, title: l.title ?? null, sessionId: l.sessionId ?? null })),
+  lostSubs: (r.lostSubs ?? []).map((l) => ({ status: l.status, title: l.title ?? null, sessionId: l.sessionId ?? null,
+    kind: l.kind, childThreadId: l.childThreadId ?? null, taskRef: l.taskRef ?? null })),
 });
 
 // A finished incident keeps only what idempotency needs (per-thread done and
@@ -199,8 +212,9 @@ function stallInterrupted(state, ses, cancelMs) {
 export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
-  const subs = io.cancelledSubagentsSince(db, sinceIso)
+  const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
     .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
+  const subs = [...nativeSubs, ...io.cancelledDelegatedTasksSince(db, sinceIso)];
   for (const s of subs) {
     s.parentThreadId = topParent(io, db, s.thread_id) ?? s.thread_id;
     s.rootThreadId = io.threadRoot(db, s.parentThreadId) ?? s.parentThreadId;

@@ -78,6 +78,60 @@ export function cancelledSubagentsSince(db, sinceIso) {
     .all(sinceIso);
 }
 
+// A delegated task can also be stopped directly in its child thread, without
+// interrupting the parent run. Only the child run current at the cut matters.
+export function cancelledDelegatedTasksSince(db, sinceIso) {
+  return db.prepare(
+    `select s.subagent_id, s.thread_id, s.run_id, s.provider_thread_id, s.child_thread_id, s.started_at, s.completed_at,
+            json_extract(s.payload_json,'$.result') result, json_extract(s.payload_json,'$.title') title,
+            json_extract(s.payload_json,'$.prompt') prompt, json_extract(s.payload_json,'$.model') model,
+            json_extract(s.payload_json,'$.clientRequestId') client_request_id
+       from orchestration_v2_projection_subagents s
+      where s.origin='app_owned' and s.subagent_id glob 'node:delegated-task:*'
+        and s.completed_at >= ? and s.status in ('cancelled','interrupted')
+        and coalesce(json_extract(s.payload_json,'$.completionDelivery.state'),'') != 'disposed'
+        and not exists(select 1 from orchestration_v2_projection_turn_items i
+          where i.run_id=s.run_id and i.type='run_interrupt_request')
+        and not exists(select 1 from orchestration_v2_projection_turn_items i
+          where i.run_id=(select r.run_id from orchestration_v2_projection_runs r
+            where r.thread_id=s.child_thread_id and r.status != 'queued' and r.requested_at <= s.completed_at
+            order by r.ordinal desc limit 1) and i.type='run_interrupt_request')
+      order by s.completed_at`,
+  ).all(sinceIso).map(({ client_request_id, ...row }) => ({
+    ...row, kind: 'delegated', childThreadId: row.child_thread_id,
+    // task_status takes a node ID, not the client request ID used to make it.
+    taskRef: row.subagent_id,
+    clientRequestId: client_request_id ?? null,
+  }));
+}
+
+export function childRunOutcomeSince(db, childThreadId, taskRef, sinceIso) {
+  if (!childThreadId) return null;
+  const rows = db.prepare(
+    `select run_id, ordinal, status, requested_at, completed_at,
+            json_extract(payload_json,'$.delegatedTaskId') task_id,
+            json_extract(payload_json,'$.restartContinuationOfRunId') continued_from,
+            json_extract(payload_json,'$.queueHeld') queue_held
+       from orchestration_v2_projection_runs where thread_id=? order by ordinal`,
+  ).all(childThreadId);
+  // Legacy initial tasks have no delegatedTaskId. A later task sharing that
+  // thread must never inherit another task's completed follow-up.
+  const initial = rows.filter((r) => r.task_id === taskRef);
+  const first = rows[0];
+  const legacyTask = childThreadId.startsWith('thread:delegated-task:')
+    ? `node:delegated-task:${childThreadId.slice('thread:delegated-task:'.length)}` : null;
+  if (!initial.length && taskRef === legacyTask && first && !first.task_id) initial.push(first);
+  if (!initial.length) return null;
+  const ids = new Set(initial.map((r) => r.run_id));
+  for (const r of rows) if (ids.has(r.continued_from)) ids.add(r.run_id);
+  const owned = rows.filter((r) => ids.has(r.run_id));
+  const active = owned.findLast((r) => ['preparing', 'starting', 'running', 'waiting'].includes(r.status)
+    || (r.status === 'queued' && r.queue_held !== 1 && r.queue_held !== true));
+  if (active) return { status: 'running', run_id: active.run_id };
+  const completed = owned.findLast((r) => r.status === 'completed' && r.completed_at > sinceIso);
+  return completed ? { status: 'finished', run_id: completed.run_id, completed_at: completed.completed_at } : null;
+}
+
 // A user_message turn item materializes when a queued turn starts, before
 // startedAt is set. It distinguishes cancelled starts from cancelled queues.
 // An OpenCode crash leaves Robob's turns 'interrupted' with no
