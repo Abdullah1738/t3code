@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - the CLI under test is plain Node.
-import * as assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -39,30 +39,30 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
     buildCommit,
   });
 
-  assert.deepEqual(await checkLive(older, { repo, health: health(newer.slice(0, 12)) }), {
+  NodeAssert.deepEqual(await checkLive(older, { repo, health: health(newer.slice(0, 12)) }), {
     commit: older,
     buildCommit: newer.slice(0, 12),
     live: true,
     reason: "ancestor of build",
   });
-  assert.equal((await checkLive(newer, { repo, health: health(older) })).live, false);
-  assert.equal((await checkLive("HEAD", { repo, health: health(newer) })).live, true);
-  assert.equal((await checkLive("garbage", { repo, health: health(newer) })).live, null);
-  assert.equal((await checkLive(older, { repo, health: health(null) })).live, null);
-  assert.equal((await checkLive(older, { repo, health: health("unknown") })).live, null);
-  assert.equal((await checkLive(older, { repo, health: health("abcdef0\n") })).live, null);
-  assert.equal((await checkLive(older, { repo, health: health("000000000000") })).live, null);
+  NodeAssert.equal((await checkLive(newer, { repo, health: health(older) })).live, false);
+  NodeAssert.equal((await checkLive("HEAD", { repo, health: health(newer) })).live, true);
+  NodeAssert.equal((await checkLive("garbage", { repo, health: health(newer) })).live, null);
+  NodeAssert.equal((await checkLive(older, { repo, health: health(null) })).live, null);
+  NodeAssert.equal((await checkLive(older, { repo, health: health("unknown") })).live, null);
+  NodeAssert.equal((await checkLive(older, { repo, health: health("abcdef0\n") })).live, null);
+  NodeAssert.equal((await checkLive(older, { repo, health: health("000000000000") })).live, null);
   git("branch", "000000000000", newer);
-  assert.equal((await checkLive(older, { repo, health: health("000000000000") })).live, null);
-  assert.equal((await checkLive("000000000000", { repo, health: health(newer) })).live, null);
-  assert.equal(
+  NodeAssert.equal((await checkLive(older, { repo, health: health("000000000000") })).live, null);
+  NodeAssert.equal((await checkLive("000000000000", { repo, health: health(newer) })).live, null);
+  NodeAssert.equal(
     (await checkLive(older, { repo, health: async () => ({ buildCommit: newer }) })).live,
     null,
   );
   const previousGitDir = process.env.GIT_DIR;
   process.env.GIT_DIR = NodePath.join(repo, "does-not-exist");
   try {
-    assert.equal((await checkLive(older, { repo, health: health(newer) })).live, true);
+    NodeAssert.equal((await checkLive(older, { repo, health: health(newer) })).live, true);
   } finally {
     if (previousGitDir === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = previousGitDir;
@@ -79,12 +79,12 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
   NodeChildProcess.execFileSync("git", ["fetch", "-q", "--depth=1", "origin", older], {
     cwd: shallow,
   });
-  assert.equal((await checkLive(older, { repo: shallow, health: health(newer) })).live, null);
-  assert.equal(
+  NodeAssert.equal((await checkLive(older, { repo: shallow, health: health(newer) })).live, null);
+  NodeAssert.equal(
     (await checkLive(older, { repo: `${repo}/missing`, health: health(newer) })).live,
     null,
   );
-  assert.equal(
+  NodeAssert.equal(
     (
       await checkLive(older, {
         repo,
@@ -139,19 +139,19 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
   ] as const) {
     runningBuild = build;
     const result = await invoke(commit);
-    assert.equal(result.code, code);
-    assert.equal(JSON.parse(result.stdout).live, live);
-    assert.doesNotMatch(result.stdout + result.stderr, /test-secret-not-for-output/);
+    NodeAssert.equal(result.code, code);
+    NodeAssert.equal(JSON.parse(result.stdout).live, live);
+    NodeAssert.doesNotMatch(result.stdout + result.stderr, /test-secret-not-for-output/);
   }
   const link = NodePath.join(repo, "t3ctl");
   NodeFS.symlinkSync(cli, link);
   runningBuild = newer;
-  assert.equal((await invoke(older, link)).code, 0);
-  assert.equal((await invoke("--bad-ref")).code, 2);
+  NodeAssert.equal((await invoke(older, link)).code, 0);
+  NodeAssert.equal((await invoke("--bad-ref")).code, 2);
   const imported = NodeChildProcess.spawnSync(
     process.execPath,
     ["-e", `import(${JSON.stringify(NodeURL.pathToFileURL(cli).href)})`, "nonexistent-entry"],
     { encoding: "utf8" },
   );
-  assert.equal(imported.status, 0);
+  NodeAssert.equal(imported.status, 0);
 });
