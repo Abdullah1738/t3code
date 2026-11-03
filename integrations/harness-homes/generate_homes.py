@@ -24,7 +24,7 @@ PERSONAL_HOMES = ("~/.claude", "~/.codex", "/Volumes/ExternalSSD/codex")
 INLINE_KEYS = {"http_headers", "env", "set"}
 CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
-HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "SessionStart")
+HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SessionStart")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 HARNESSES = ("claude", "codex", "codex-cu")
 NODE_REPL = "node_repl"
@@ -512,6 +512,8 @@ def validate_manifest(manifest: dict) -> None:
             raise HomeError("hook harness must be claude or codex")
         if h["event"] not in HOOK_EVENTS:
             raise HomeError(f"unknown hook event {h['event']!r}")
+        if h["event"] == "PostToolUseFailure" and h.get("harness") != "claude":
+            raise HomeError("PostToolUseFailure is only supported by Claude")
         if not os.path.isabs(h["command"]):
             raise HomeError(f"hook command must be an absolute path: {h['command']}")
 
