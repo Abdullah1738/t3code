@@ -2145,6 +2145,98 @@ it.effect("a failed thread read retries the compact path on the next tick", () =
   }),
 );
 
+it.effect("a failed worker that resumes during PR sync keeps its working card", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const state = (yield* Ref.get(fake.threads)).get(thread)!;
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "invalid previous request",
+      } as OrchestrationV2ProviderFailure);
+      const reached = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      fake.findCalls.length = 0;
+      fake.findControl.beforeRead = (id, attempt) =>
+        id === thread && attempt === 4
+          ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+          : Effect.void;
+      const tick = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(reached);
+      state.running = true;
+      fake.failures.delete(thread);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(tick);
+      const after = yield* kanban.card(created.id);
+      assert.strictEqual(after.card.stage, "working");
+      assert.strictEqual(after.card.activeThreadId, thread);
+      assert.isNull(after.card.stalled);
+      assert.isFalse(after.events.some((event) => event.body?.includes("invalid previous request")));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a new failed run during PR sync does not release cards for the old failure", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const failure = {
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "invalid previous request",
+      } as OrchestrationV2ProviderFailure;
+      fake.failures.set(thread, failure);
+      const reached = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      fake.findCalls.length = 0;
+      fake.findControl.beforeRead = (id, attempt) =>
+        id === thread && attempt === 5
+          ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+          : Effect.void;
+      const tick = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(reached);
+      fake.failures.set(thread, { ...failure });
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(tick);
+      const after = yield* kanban.card(created.id);
+      assert.strictEqual(after.card.stage, "working");
+      assert.strictEqual(after.card.activeThreadId, thread);
+      assert.isNull(after.card.stalled);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a failed worker whose run has not changed is still flagged on tick", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "invalid previous request",
+      } as OrchestrationV2ProviderFailure);
+      yield* kanban.tick;
+      const after = yield* kanban.card(created.id);
+      assert.strictEqual(after.card.stage, "todo");
+      assert.isNull(after.card.activeThreadId);
+      assert.strictEqual(after.card.stalled?.reason, "Run failed: invalid previous request");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("later ticks ignore the same failure after its work card is released", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

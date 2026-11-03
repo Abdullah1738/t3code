@@ -1262,7 +1262,10 @@ const make = Effect.gen(function* () {
    * card. A thread that carried several cards attaches PRs per card itself, so
    * then only the states of PRs already on the card are refreshed.
    */
-  const syncPrs = Effect.fn("KanbanService.syncPrs")(function* (card: KanbanCard) {
+  const syncPrs = Effect.fn("KanbanService.syncPrs")(function* (
+    card: KanbanCard,
+    canSave?: () => Effect.Effect<boolean>,
+  ) {
     if (card.workThreadId === null) return card;
     const view = yield* threads.view(card.workThreadId);
     if (!view || view.prs.length === 0) return card;
@@ -1283,6 +1286,7 @@ const make = Effect.gen(function* () {
       return { ...link, state: pr.state, checkedAt: at };
     });
     if (!changed) return card;
+    if (canSave && !(yield* canSave())) return card;
     const next = { ...card, links, updatedAt: at };
     yield* saveCard(next);
     return next;
@@ -3289,6 +3293,7 @@ const make = Effect.gen(function* () {
 
   const turnEndedUnlocked = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
+    expectedFailedWorkRunId?: string,
   ) {
     const link = yield* store.threadLink(threadId);
     if (!link) return;
@@ -3332,6 +3337,22 @@ const make = Effect.gen(function* () {
       return next;
     });
     const failure = lastFailure.success;
+    const failedRunIsCurrent = Effect.fn("KanbanService.failedRunIsCurrent")(function* () {
+      if (expectedFailedWorkRunId === undefined) return true;
+      const found = yield* Effect.result(threads.find(threadId));
+      if (Result.isFailure(found) || found.success?.state !== "idle") return false;
+      const latest = yield* Effect.result(threads.findLastFailure(threadId));
+      if (Result.isFailure(latest)) {
+        yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+        return false;
+      }
+      return latest.success?.runId === expectedFailedWorkRunId;
+    });
+    if (
+      expectedFailedWorkRunId !== undefined &&
+      (failure?.runId !== expectedFailedWorkRunId ||
+        !(yield* failedRunIsCurrent()))
+    ) return;
     // Out of usage or down: a nudge or a flag can't help, so the thread waits for
     // probeOutages to wake it on the same model.
     const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
@@ -3478,7 +3499,9 @@ const make = Effect.gen(function* () {
         yield* dropHold(threadId);
         yield* kick;
       }
-      const carried = yield* Effect.forEach(yield* store.cardsByThread(threadId), syncPrs);
+      const carried = yield* Effect.forEach(yield* store.cardsByThread(threadId), (entry) =>
+        syncPrs(entry, expectedFailedWorkRunId === undefined ? undefined : failedRunIsCurrent),
+      );
       if (carried.length === 0) {
         yield* kick;
         return;
@@ -3487,6 +3510,18 @@ const make = Effect.gen(function* () {
       if (outage !== null) return;
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
+        const carriedWorkIsCurrent = Effect.fn("KanbanService.carriedWorkIsCurrent")(function* () {
+          if (!(yield* failedRunIsCurrent())) return false;
+          for (const entry of carried) {
+            const current = yield* store.card(entry.id);
+            if (
+              current === null || current.stage !== "working" ||
+              current.activeRole !== "work" || current.activeThreadId !== threadId ||
+              current.stalled !== null
+            ) return false;
+          }
+          return yield* failedRunIsCurrent();
+        });
         const recentCompactions = yield* Effect.forEach(carried, (entry) =>
           compactedRecently(entry, at),
         );
@@ -3503,13 +3538,31 @@ const make = Effect.gen(function* () {
         if (found?._tag === "Failure") return;
         const view = found?.success ?? null;
         if (view !== null && view.state !== "idle") return;
+        if (expectedFailedWorkRunId !== undefined && !(yield* carriedWorkIsCurrent())) return;
         // The send-then-save gap is accepted: a crash leaves /compact's turn
         // end to normal handling (usually a nudge or flag).
         const compactSent =
           view?.state === "idle"
             ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
             : null;
-        for (const entry of carried) {
+        for (const oldEntry of carried) {
+          let entry = oldEntry;
+          if (expectedFailedWorkRunId !== undefined) {
+            const current = yield* store.card(entry.id);
+            if (
+              current === null || current.stage !== "working" ||
+              current.activeRole !== "work" || current.activeThreadId !== threadId ||
+              current.stalled !== null
+            ) continue;
+            entry = current;
+            if (compactSent?._tag === "Success") {
+              // The accepted maintenance turn replaces the failed run; only its
+              // own recorded run may release these cards after the send.
+              if (typeof compactSent.success !== "string") return;
+              const latest = yield* Effect.result(threads.latestRun(threadId));
+              if (Result.isFailure(latest) || latest.success?.runId !== compactSent.success) return;
+            } else if (!(yield* failedRunIsCurrent())) return;
+          }
           if (
             compactSent?._tag === "Success" &&
             candidates.some((candidate) => candidate.id === entry.id)
@@ -3536,7 +3589,19 @@ const make = Effect.gen(function* () {
           }
           // A thread too long to send again can't run the card: the next
           // dispatch starts it on a fresh thread.
-          if (Rules.isContextFull(failure) && !(yield* freshStartedRecently(entry, at))) {
+          const startFresh =
+            Rules.isContextFull(failure) && !(yield* freshStartedRecently(entry, at));
+          if (expectedFailedWorkRunId !== undefined) {
+            const current = yield* store.card(entry.id);
+            if (
+              current === null || current.stage !== "working" || current.activeRole !== "work" ||
+              current.activeThreadId !== threadId || current.stalled !== null
+            ) continue;
+            entry = current;
+          }
+          if (startFresh) {
+            if (expectedFailedWorkRunId !== undefined && compactSent?._tag !== "Success" &&
+              !(yield* failedRunIsCurrent())) return;
             const fresh: KanbanCard = {
               ...release(entry),
               stage: "todo",
@@ -3563,6 +3628,8 @@ const make = Effect.gen(function* () {
             movedAt: at,
             updatedAt: at,
           };
+          if (expectedFailedWorkRunId !== undefined && compactSent?._tag !== "Success" &&
+            !(yield* failedRunIsCurrent())) return;
           yield* logEvent(next, system, "flagged", {
             fromStage: entry.stage,
             toStage: "todo",
@@ -3890,8 +3957,15 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (foundFailure.success !== null) {
+          const fresh = yield* freshFind(threadId);
+          const current = yield* store.card(card.id);
+          if (
+            Option.isNone(fresh) || fresh.value?.state !== "idle" ||
+            current?.activeThreadId !== threadId || current.activeRole !== "work" ||
+            (yield* store.threadLink(threadId))?.paused || foundFailure.success.runId == null
+          ) continue;
           views.clear();
-          yield* turnEndedUnlocked(threadId).pipe(Effect.ensuring(Effect.sync(() => {
+          yield* turnEndedUnlocked(threadId, foundFailure.success.runId).pipe(Effect.ensuring(Effect.sync(() => {
             views.clear();
             invalidateCards();
           })));
