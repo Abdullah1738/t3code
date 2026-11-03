@@ -19,6 +19,7 @@ const HELP = `t3ctl <command> [options]
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
   models                               default model and available models
+  usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
@@ -149,7 +150,10 @@ async function main() {
       active: { type: "boolean" },
       state: { type: "string" },
       since: { type: "string" },
+      until: { type: "string" },
+      board: { type: "string" },
       limit: { type: "string" },
+      "all-pages": { type: "boolean" },
       "all-kinds": { type: "boolean" },
       last: { type: "boolean" },
       role: { type: "string" },
@@ -237,6 +241,34 @@ async function main() {
       return print(await client.projects());
     case "models":
       return print(await client.models());
+    case "usage": {
+      const filters = {
+        since: need(flags.since, "--since"),
+        until: flags.until,
+        boardId: flags.board,
+        limit: flags.limit,
+      };
+      const first = await client.usage(filters);
+      if (!flags["all-pages"]) return print(first);
+      const items = [];
+      const seen = new Set();
+      let page = first;
+      while (true) {
+        if (
+          !page ||
+          !Array.isArray(page.items) ||
+          (page.nextCursor !== null && typeof page.nextCursor !== "string")
+        ) {
+          throw new Error("invalid usage page");
+        }
+        for (const item of page.items) items.push(item);
+        const cursor = page.nextCursor;
+        if (cursor === null) return print({ ...first, items, nextCursor: null });
+        if (seen.has(cursor)) throw new Error("usage pagination returned a repeated cursor");
+        seen.add(cursor);
+        page = await client.usage({ ...filters, cursor });
+      }
+    }
     case "desktop-lease": {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";

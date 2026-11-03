@@ -11,4 +11,14 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
   `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
+    ON orchestration_v2_projection_provider_turns(completed_at)
+  `;
+  // Only unfinished running turns need the second range scan.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_turns_running_started_idx
+    ON orchestration_v2_projection_provider_turns(started_at)
+    WHERE completed_at IS NULL AND status = 'running'
+  `;
 });

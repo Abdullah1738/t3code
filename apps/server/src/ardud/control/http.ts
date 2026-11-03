@@ -51,6 +51,7 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as Usage from "./usage.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
 import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
@@ -459,6 +460,7 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const usage = yield* Usage.Usage;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
   const crypto = yield* Crypto.Crypto;
@@ -649,6 +651,27 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   // -- projects -------------------------------------------------------------
+
+  const listUsage = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const result = yield* usage
+      .list({
+        since: params.get("since"),
+        until: params.get("until"),
+        cursor: params.get("cursor"),
+        limit: params.get("limit"),
+        boardId: params.get("boardId"),
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "UsageInputError"
+            ? fail("invalid_request", error.message)
+            : fail("internal", "Could not read usage."),
+        ),
+      );
+    return json({ ok: true, ...result });
+  });
 
   const listProjects = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1642,6 +1665,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/requests`, handle(listRequests)),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
+    HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
@@ -1667,6 +1691,10 @@ const makeRoutes = Effect.gen(function* () {
 const controlServices = Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer);
 export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
   Layer.provide(
-    Layer.mergeAll(controlServices, RecoverySnapshot.layer.pipe(Layer.provide(controlServices))),
+    Layer.mergeAll(
+      controlServices,
+      Usage.layer,
+      RecoverySnapshot.layer.pipe(Layer.provide(controlServices)),
+    ),
   ),
 );
