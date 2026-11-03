@@ -19,6 +19,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ControlStore from "../control/ControlStore.ts";
 import { runsNewestFirst, TERMINAL_RUN_STATUSES } from "../control/model.ts";
@@ -185,6 +186,7 @@ const make = Effect.gen(function* () {
   const control = yield* ControlStore.ControlStore;
   const identity = yield* ExecutionIdentity.ExecutionIdentity;
   const threads = yield* ThreadManagementService.ThreadManagementService;
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
   const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
 
   const threadIds = Effect.fn("RecoverySnapshot.threadIds")(function* (active: boolean) {
@@ -215,7 +217,9 @@ const make = Effect.gen(function* () {
     const shellRead = yield* threads.getThreadShell(id).pipe(Effect.option);
     const shell: OrchestrationV2ThreadShell | null = Option.getOrNull(shellRead) ?? null;
     if (shell === null) return unknownEntry(threadId, nativeId, null);
-    const recordsRead = yield* threads
+    // ThreadManagementService hydrates legacy transcripts on record reads;
+    // recovery must read the existing projection without loading a session.
+    const recordsRead = yield* orchestrator
       .getThreadRecords(id, ["runs", "runtimeRequests", "providerThreads", "subagents"])
       .pipe(Effect.option);
     if (Option.isNone(recordsRead)) {

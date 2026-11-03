@@ -16,13 +16,18 @@ import {
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
+import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "../control/ControlStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as RecoverySnapshot from "./RecoverySnapshot.ts";
@@ -104,6 +109,8 @@ const layerFor = (
         archivedThreads: [],
       } as never),
     getThreadShell: (id) => Effect.succeed(fixture.shells.get(id) ?? null),
+  });
+  const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
     getThreadRecords: (id) =>
       Effect.succeed({
         runs: fixture.runs.get(id) ?? [],
@@ -114,7 +121,7 @@ const layerFor = (
   });
   const sessionLayer = Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)(sessions);
   return RecoverySnapshot.layer.pipe(
-    Layer.provide(Layer.mergeAll(control, identity, threads, sessionLayer)),
+    Layer.provide(Layer.mergeAll(control, identity, threads, orchestrator, sessionLayer)),
   );
 };
 
@@ -142,6 +149,75 @@ const liveFixture = (count: number): Fixture => {
 };
 
 describe("RecoverySnapshot", () => {
+  it.effect("reads a legacy thread without materializing its transcript", () => {
+    const targetId = ThreadId.make("legacy-target");
+    const controlId = ThreadId.make("legacy-control");
+    const shell = shellFor(targetId);
+    const hydrated: Array<string> = [];
+    const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
+      getThreadShell: () => Effect.succeed(shell),
+      getShellSnapshot: () =>
+        Effect.succeed({
+          schemaVersion: 1,
+          snapshotSequence: 1,
+          threads: [shell],
+          archivedThreads: [],
+        } as never),
+      getThreadRecords: (id) =>
+        Effect.succeed({
+          runs: [runFor(id, "running")],
+          providerThreads: [providerThreadFor(id, null)],
+          runtimeRequests: [],
+          subagents: [],
+        } as never),
+    });
+    const sessions = Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({});
+    const management = ThreadManagementService.layerWithLegacyImporter.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          orchestrator,
+          sessions,
+          Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+            ensureTranscript: (id) =>
+              Effect.sync(() => {
+                hydrated.push(id);
+                return { importedThreadCount: 1, importedMessageCount: 1 };
+              }),
+          }),
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({}),
+          ServerSettings.layerTest(),
+        ),
+      ),
+    );
+    const dependencies = Layer.mergeAll(
+      orchestrator,
+      management,
+      sessions,
+      Layer.mock(ControlStore.ControlStore)({ liveThreadIds: () => Effect.succeed([targetId]) }),
+      Layer.mock(ExecutionIdentity.ExecutionIdentity)({
+        currentNative: () => Effect.succeed(new Map()),
+      }),
+    );
+    const layer = RecoverySnapshot.layer.pipe(Layer.provideMerge(dependencies));
+
+    return Effect.gen(function* () {
+      // Verify this really is the hydrating management implementation, not a stub.
+      const managementService = yield* ThreadManagementService.ThreadManagementService;
+      yield* managementService.getThreadRecords(controlId, ["runs"]);
+      assert.deepStrictEqual(hydrated, [controlId]);
+      const snapshot = yield* RecoverySnapshot.RecoverySnapshot;
+      for (const active of [true, false]) {
+        const page = yield* snapshot
+          .page({ active, cursor: null, limit: 10 })
+          .pipe(NodeSqliteClient.readOnly);
+        assert.strictEqual(page.threads[0]?.threadId, targetId);
+        assert.strictEqual(page.threads[0]?.run?.id, `run-${targetId}`);
+        assert.strictEqual(page.threads[0]?.runtime, "absent");
+      }
+      assert.deepStrictEqual(hydrated, [controlId]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("pages 1,200 live ids as 500, 500 and 200 with every id once", () =>
     Effect.gen(function* () {
       const fixture = liveFixture(1200);
