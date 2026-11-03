@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
-import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -62,6 +62,35 @@ class Store:
             CREATE TABLE IF NOT EXISTS prompt_guards (
                 native_key TEXT PRIMARY KEY, generation TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS child_generations (
+                key_hash TEXT PRIMARY KEY, generation INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS job_generations (
+                job TEXT PRIMARY KEY, generation INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailbox_generations (
+                mailbox_rowid INTEGER PRIMARY KEY, generation INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS seed_owners (
+                seed_key TEXT PRIMARY KEY, owner_key TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated);
+            CREATE INDEX IF NOT EXISTS notes_created ON notes(created);
+            CREATE INDEX IF NOT EXISTS jobs_key ON jobs(key);
+            CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created);
+            CREATE INDEX IF NOT EXISTS mailbox_key ON mailbox(key);
+            CREATE INDEX IF NOT EXISTS mailbox_created ON mailbox(created);
+            CREATE INDEX IF NOT EXISTS seeds_created ON seeds(created);
+            CREATE INDEX IF NOT EXISTS seed_owners_owner ON seed_owners(owner_key);
+            CREATE TRIGGER IF NOT EXISTS jobs_generation_delete AFTER DELETE ON jobs BEGIN
+                DELETE FROM job_generations WHERE job=OLD.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS mailbox_generation_delete AFTER DELETE ON mailbox BEGIN
+                DELETE FROM mailbox_generations WHERE mailbox_rowid=OLD.rowid;
+            END;
+            CREATE TRIGGER IF NOT EXISTS seed_owner_delete AFTER DELETE ON seeds BEGIN
+                DELETE FROM seed_owners WHERE seed_key=OLD.key;
+            END;
             """)
         except BaseException:
             self.db.close()
@@ -79,22 +108,96 @@ class Store:
             raise
 
     def prune(self, now: float):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.prune(now)
+            return
         cutoff = now - self.ttl
-        for table in ("jobs", "mailbox"):
-            self.db.execute(f"DELETE FROM {table} WHERE key IN (SELECT key FROM sessions WHERE updated < ?)",
-                            (cutoff,))
-        for table, column in (("sessions", "updated"), ("notes", "created"),
-                              ("jobs", "created"), ("mailbox", "created"), ("seeds", "created")):
-            self.db.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+        # Keep an expired session until all of its dependants have been swept;
+        # otherwise a fresh job for an expired key could outlive the key itself.
+        for table in ("jobs", "mailbox", "notes"):
+            self.db.execute(
+                f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} "
+                "WHERE created < ? OR key IN (SELECT key FROM sessions WHERE updated < ?) "
+                "ORDER BY rowid LIMIT 200)", (cutoff, cutoff))
+        self.db.execute(
+            "DELETE FROM seeds WHERE rowid IN (SELECT s.rowid FROM seeds s "
+            "LEFT JOIN seed_owners o ON o.seed_key=s.key WHERE s.created < ? OR "
+            "s.key IN (SELECT key FROM sessions WHERE updated < ?) OR "
+            "o.owner_key IN (SELECT key FROM sessions WHERE updated < ?) "
+            "ORDER BY s.rowid LIMIT 200)", (cutoff, cutoff, cutoff))
+        self.db.execute(
+            "DELETE FROM sessions WHERE rowid IN (SELECT s.rowid FROM sessions s WHERE s.updated < ? "
+            "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.key=s.key) "
+            "AND NOT EXISTS (SELECT 1 FROM mailbox m WHERE m.key=s.key) "
+            "AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.key=s.key) "
+            "AND NOT EXISTS (SELECT 1 FROM seeds seed WHERE seed.key=s.key) "
+            "AND NOT EXISTS (SELECT 1 FROM seed_owners o WHERE o.owner_key=s.key) "
+            "ORDER BY s.rowid LIMIT 200)", (cutoff,))
+
+    @staticmethod
+    def _key_hash(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _current_generation(self, key: str, state: dict) -> int | None:
+        generation = state.get("execution_generation", 0)
+        if type(generation) is not int or generation < 0:
+            return None
+        row = self.db.execute("SELECT generation FROM child_generations WHERE key_hash=?",
+                              (self._key_hash(key),)).fetchone()
+        if (row[0] if row else 0) != generation:
+            return None
+        return generation
 
     def get(self, key: str) -> dict | None:
         row = self.db.execute("SELECT state FROM sessions WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
     def save(self, key: str, state: dict, now: float):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.save(key, state, now)
+            return
+        if self._current_generation(key, state) is None:
+            raise ValueError("stale execution generation")
         self.db.execute("INSERT INTO sessions VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
                         "state=excluded.state, updated=excluded.updated",
                         (key, json.dumps(state), now))
+
+    def start_child(self, key: str, native: str, turn: str | None, now: float,
+                    seed: dict | None = None, seed_key: str | None = None,
+                    pending_key: str | None = None) -> dict:
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.start_child(key, native, turn, now, seed, seed_key, pending_key)
+        key_hash = self._key_hash(key)
+        self.db.execute("INSERT INTO child_generations VALUES (?, 1) ON CONFLICT(key_hash) "
+                        "DO UPDATE SET generation=generation+1", (key_hash,))
+        generation = self.db.execute("SELECT generation FROM child_generations WHERE key_hash=?",
+                                     (key_hash,)).fetchone()[0]
+        self.db.execute("DELETE FROM jobs WHERE key=?", (key,))
+        self.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
+        self.db.execute("DELETE FROM seeds WHERE key IN "
+                        "(SELECT seed_key FROM seed_owners WHERE owner_key=?)", (key,))
+        if seed_key:
+            # Also drop an older unresolved seed written without an instance.
+            try:
+                identity = json.loads(seed_key)
+            except (TypeError, ValueError):
+                identity = None
+            if isinstance(identity, list) and len(identity) == 4:
+                pending_identity = "pending:" + json.dumps(
+                    [identity[0], "", identity[2], identity[3]], separators=(",", ":"))
+                self.db.execute("DELETE FROM seeds WHERE key=?", (pending_identity,))
+        target_seed = seed_key or key
+        self.db.execute("DELETE FROM seeds WHERE key IN (?, ?, ?)", (key, target_seed, pending_key))
+        if seed is not None:
+            self.seed(target_seed, seed, now, owner_key=key)
+        state = new_turn(turn or ("seed:" + uuid.uuid4().hex), "", now, provisional=not bool(turn))
+        state["_native_key"] = native
+        state["execution_generation"] = generation
+        self.save(key, state, now)
+        return state
 
     def guard_prompt(self, native_key: str, generation: str):
         self.db.execute("INSERT INTO prompt_guards VALUES (?, ?) ON CONFLICT(native_key) "
@@ -112,6 +215,12 @@ class Store:
         self.db.execute("DELETE FROM prompt_guards WHERE native_key=? AND generation=?", (native_key, generation))
 
     def discard_turn(self, key: str, state: dict):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.discard_turn(key, state)
+            return
+        if self._current_generation(key, state) is None:
+            return
         # Jobs contain the same excerpts as the session, and may be waiting for a worker.
         self.db.execute("DELETE FROM jobs WHERE key=?", (key,))
         self.db.execute("DELETE FROM mailbox WHERE key=?", (key,))
@@ -121,6 +230,10 @@ class Store:
         state["inflight"] = state["prompt_inflight"] = None
 
     def end_turn(self, native_key: str, turn: str | None, now: float):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.end_turn(native_key, turn, now)
+            return
         rows = self.db.execute("SELECT key, state FROM sessions WHERE json_extract(state, '$._native_key')=?",
                                (native_key,)).fetchall()
         for key, encoded in rows:
@@ -140,6 +253,10 @@ class Store:
             self.save(key, state, now)
 
     def invalidate_prompt(self, native_key: str, generation: str, now: float, except_key: str | None = None):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.invalidate_prompt(native_key, generation, now, except_key)
+            return
         # A failed older lookup must not invalidate a newer successful prompt.
         if not self.prompt_is_current(native_key, generation):
             return
@@ -168,9 +285,16 @@ class Store:
         ).fetchall()
         return [row[0] for row in reversed(rows)]
 
-    def seed(self, key: str, task: dict, now: float):
+    def seed(self, key: str, task: dict, now: float, owner_key: str | None = None):
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.seed(key, task, now, owner_key)
+            return
         self.db.execute("INSERT INTO seeds VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
                         "task=excluded.task, created=excluded.created", (key, json.dumps(task), now))
+        if owner_key is not None:
+            self.db.execute("INSERT INTO seed_owners VALUES (?, ?) ON CONFLICT(seed_key) "
+                            "DO UPDATE SET owner_key=excluded.owner_key", (key, owner_key))
 
     def take_seed(self, key: str) -> dict | None:
         row = self.db.execute("SELECT task FROM seeds WHERE key=?", (key,)).fetchone()
@@ -198,6 +322,11 @@ class Store:
                 self.db.execute("DELETE FROM seeds WHERE key=?", (key,))
 
     def adopt_turn(self, key: str, state: dict, turn: str) -> bool:
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.adopt_turn(key, state, turn)
+        if self._current_generation(key, state) is None:
+            return False
         if not state.get("provisional") or state.get("adoption_blocked") or turn in state.get("retired_turns", []):
             return False
         old = state["turn"]
@@ -208,6 +337,11 @@ class Store:
         return True
 
     def remember(self, key: str, state: dict, result: dict, now: float):
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.remember(key, state, result, now)
+        if self._current_generation(key, state) is None:
+            return None
         note = result.get("note")
         if not isinstance(note, str) or not note.strip():
             return None
@@ -223,39 +357,92 @@ class Store:
         return note
 
     def enqueue(self, key: str, state: dict, body: dict, now: float) -> str:
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.enqueue(key, state, body, now)
+        generation = self._current_generation(key, state)
+        if generation is None:
+            raise ValueError("stale execution generation")
         job = uuid.uuid4().hex
-        state["inflight"] = job
+        inflight = "prompt_inflight" if body.get("mode") == "prompt" else "inflight"
+        state[inflight] = job
         self.db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?)",
                         (job, key, state["turn"], json.dumps(body), now))
+        self.db.execute("INSERT INTO job_generations VALUES (?, ?)", (job, generation))
         return job
 
     def job(self, job: str):
         row = self.db.execute("SELECT key, turn, body FROM jobs WHERE id=?", (job,)).fetchone()
         return (row[0], row[1], json.loads(row[2])) if row else None
 
+    def _job_current(self, job: str, row: tuple, state: dict | None) -> bool:
+        key, turn, body = row
+        if not state or state.get("turn") != turn:
+            return False
+        generation = self._current_generation(key, state)
+        saved = self.db.execute("SELECT generation FROM job_generations WHERE job=?", (job,)).fetchone()
+        job_generation = saved[0] if saved else 0
+        inflight = "prompt_inflight" if body.get("mode") == "prompt" else "inflight"
+        return (generation is not None and generation == job_generation and state.get(inflight) == job and
+                not state.get("invalidated") and not self.prompt_guarded(state.get("_native_key")))
+
+    def job_is_current(self, job: str) -> bool:
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.job_is_current(job)
+        row = self.job(job)
+        return bool(row and self._job_current(job, row, self.get(row[0])))
+
     def finish(self, job: str, result: dict | None, now: float, mode: str, max_backoff: int):
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.finish(job, result, now, mode, max_backoff)
         row = self.job(job)
         if not row:
             return
-        key, turn, _ = row
-        self.db.execute("DELETE FROM jobs WHERE id=?", (job,))
+        key, turn, body = row
+        saved = self.db.execute("SELECT generation FROM job_generations WHERE job=?", (job,)).fetchone()
+        job_generation = saved[0] if saved else 0
         state = self.get(key)
-        if not state or state["turn"] != turn or state.get("inflight") != job:
+        current = self._job_current(job, row, state)
+        self.db.execute("DELETE FROM jobs WHERE id=?", (job,))
+        if not state:
             return
-        state["inflight"] = None
-        if state.get("invalidated") or self.prompt_guarded(state.get("_native_key")):
-            self.save(key, state, now)
+        inflight = "prompt_inflight" if body.get("mode") == "prompt" else "inflight"
+        if not current:
+            # Clear the old job's marker only when it still belongs to this
+            # execution; a late worker must not mutate its replacement.
+            if (state.get(inflight) == job and self._current_generation(key, state) == job_generation and
+                state.get("turn") == turn):
+                state[inflight] = None
+                self.save(key, state, now)
             return
-        if result is not None:
+        state[inflight] = None
+        if result is not None and mode != "off":
             note = self.remember(key, state, result, now)
-            state["backoff"] = 1 if note else min(state["backoff"] * 2, max_backoff)
+            if inflight == "inflight":
+                state["backoff"] = 1 if note else min(state["backoff"] * 2, max_backoff)
             if note and mode == "on":
-                self.db.execute("INSERT INTO mailbox VALUES (?, ?, ?, ?)", (key, turn, note, now))
+                cursor = self.db.execute("INSERT INTO mailbox VALUES (?, ?, ?, ?)", (key, turn, note, now))
+                self.db.execute("INSERT INTO mailbox_generations VALUES (?, ?)",
+                                (cursor.lastrowid, self._current_generation(key, state)))
         self.save(key, state, now)
 
     def consume(self, key: str, turn: str, mode: str) -> str | None:
-        # A different turn can never inherit an older job's result.
-        self.db.execute("DELETE FROM mailbox WHERE key=? AND turn<>?", (key, turn))
+        if not self.db.in_transaction:
+            with self.transaction():
+                return self.consume(key, turn, mode)
+        state = self.get(key)
+        generation = self._current_generation(key, state) if state else None
+        if generation is None or state.get("invalidated"):
+            return None
+        if generation and state.get("turn") != turn:
+            return None
+        # Legacy untagged entries are generation zero. They remain usable for
+        # existing top-level sessions, but never for a restarted child.
+        self.db.execute("DELETE FROM mailbox WHERE key=? AND (turn<>? OR "
+                        "COALESCE((SELECT generation FROM mailbox_generations "
+                        "WHERE mailbox_rowid=mailbox.rowid), 0)<>?)", (key, turn, generation))
         rows = self.db.execute("SELECT rowid, note FROM mailbox WHERE key=? AND turn=? ORDER BY rowid",
                                (key, turn)).fetchall()
         if not rows:

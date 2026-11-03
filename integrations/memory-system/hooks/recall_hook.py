@@ -394,8 +394,11 @@ def next_turn(state: dict | None, tid: str, task: str, now: float, provisional: 
     # An unseen ID from an unresolved preceding turn is indistinguishable from
     # this turn's first ID, so do not guess until a later explicit prompt ID.
     blocked = bool(provisional and state and state.get("provisional"))
-    return new_turn(tid, task, now, state.get("task", "") if state else "", provisional,
-                    list(dict.fromkeys(retired)), blocked)
+    result = new_turn(tid, task, now, state.get("task", "") if state else "", provisional,
+                      list(dict.fromkeys(retired)), blocked)
+    if state and "execution_generation" in state:
+        result["execution_generation"] = state["execution_generation"]
+    return result
 
 
 def wrapped(note: str) -> str:
@@ -474,17 +477,9 @@ def worker(job: str):
     try:
         with db.transaction():
             row = db.job(job)
-            if row:
-                key, turn, body = row
-                state = db.get(key)
-                expected_job = "prompt_inflight" if body.get("mode") == "prompt" else "inflight"
-                if (not state or state["turn"] != turn or state.get(expected_job) != job or
-                    state.get("invalidated") or db.prompt_guarded(state.get("_native_key"))):
-                    db.db.execute("DELETE FROM jobs WHERE id=?", (job,))
-                    if state and state.get(expected_job) == job:
-                        state[expected_job] = None
-                        db.save(key, state, time.time())
-                    return
+            if row and not db.job_is_current(job):
+                db.finish(job, None, time.time(), cfg["mode"], int(cfg["work_max_backoff"]))
+                return
         if not row:
             return
         _, _, body = row
@@ -496,25 +491,8 @@ def worker(job: str):
             result = None
         current = config()
         with db.transaction():
-            if body.get("mode") == "prompt":
-                record = db.job(job)
-                if not record:
-                    return
-                key, turn, _ = record
-                db.db.execute("DELETE FROM jobs WHERE id=?", (job,))
-                state = db.get(key)
-                if state and state["turn"] == turn and state.get("prompt_inflight") == job:
-                    state["prompt_inflight"] = None
-                    if (result is not None and current["mode"] != "off" and
-                        not state.get("invalidated") and not db.prompt_guarded(state.get("_native_key"))):
-                        note = db.remember(key, state, result, time.time())
-                        if note and current["mode"] == "on":
-                            db.db.execute("INSERT INTO mailbox VALUES (?, ?, ?, ?)",
-                                          (key, turn, note, time.time()))
-                    db.save(key, state, time.time())
-            else:
-                db.finish(job, result if current["mode"] != "off" else None,
-                          time.time(), current["mode"], int(cfg["work_max_backoff"]))
+            db.finish(job, result if current["mode"] != "off" else None,
+                      time.time(), current["mode"], int(cfg["work_max_backoff"]))
     finally:
         db.close()
 
@@ -522,6 +500,14 @@ def worker(job: str):
 def handle(harness: str, event: dict):
     cfg = config()
     name = event.get("hook_event_name")
+    # Cleanup is traffic-driven, including disabled and filtered hook calls.
+    if os.path.exists(state_path()):
+        db = Store(state_path(), cfg["note_ttl_days"])
+        try:
+            with db.transaction():
+                db.prune(time.time())
+        finally:
+            db.close()
     if name not in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart",
                     "Stop", "SubagentStop", "SessionEnd"):
         return
@@ -558,6 +544,8 @@ def handle(harness: str, event: dict):
                     generation = uuid.uuid4().hex
                     db.guard_prompt(native, generation)
                     db.prune(time.time())
+                    if event.get("agent_id"):
+                        db.drop_seeds_for_native(harness, event.get("session_id"), event.get("agent_id"), None)
                     db.invalidate_prompt(native, generation, time.time())
             finally:
                 db.close()
@@ -572,11 +560,15 @@ def handle(harness: str, event: dict):
         db = Store(state_path(), cfg["note_ttl_days"])
         try:
             with db.transaction():
+                # Quarantine any existing execution before a slow or failed
+                # identity lookup can expose its mailbox to the next hook.
+                generation = uuid.uuid4().hex
+                db.guard_prompt(native, generation)
+                db.invalidate_prompt(native, generation, seed["started"])
                 db.seed(pending_seed_key(harness, event), seed, seed["started"])
         finally:
             db.close()
-    identity_event = ({k: v for k, v in event.items() if k != "agent_id"}
-                      if name == "SubagentStart" and harness == "claude" else event)
+    identity_event = event
     if not native:
         return
     prompt_generation = uuid.uuid4().hex if name == "UserPromptSubmit" else None
@@ -618,17 +610,20 @@ def handle(harness: str, event: dict):
     pending, job, prompt_job = None, None, None
     try:
         if name == "SubagentStart":
-            if seed:
-                # Start payloads contain identity and transcript path, not task text.
+            if seed and is_child:
+                # Start is the execution boundary, even when prompt_id is reused.
+                # A late old tool event may nudge this generation's cadence or
+                # activity; lineage exclusion still covers the whole tree.
                 with db.transaction():
-                    db.seed(seed_key(harness, event, identity["providerInstanceId"]),
-                            seed, now)
-                    db.take_seed(pending_seed_key(harness, event))
-                    if harness == "codex" and identity["executionKind"] == "provider-native-child" and not db.get(key):
-                        state = new_turn(turn_id(harness, event) or ("seed:" + child_id), "", now,
-                                         provisional=not bool(turn_id(harness, event)))
-                        state["_native_key"] = native
-                        db.save(key, state, now)
+                    if not db.prompt_is_current(native, generation):
+                        return
+                    old = db.get(key)
+                    skey = seed_key(harness, event, identity["providerInstanceId"])
+                    started = db.start_child(key, native, turn_id(harness, event), now, seed=seed,
+                                             seed_key=skey, pending_key=pending_seed_key(harness, event))
+                    seed["restarted"] = old is not None or started["execution_generation"] > 1
+                    db.seed(skey, seed, now, owner_key=key)
+                    db.release_prompt(native, generation)
             return
         with db.transaction():
             db.prune(now)
@@ -637,7 +632,22 @@ def handle(harness: str, event: dict):
                     return
                 db.invalidate_prompt(native, prompt_generation, now, except_key=key)
             elif db.prompt_guarded(native):
-                return
+                # A start may have preceded its canonical identity projection.
+                # Recover it when identity becomes available, still atomically.
+                pending_start = db.get_seed(pending_seed_key(harness, event)) if is_child else None
+                if not pending_start:
+                    return
+                current_guard = db.db.execute("SELECT generation FROM prompt_guards WHERE native_key=?", (native,)).fetchone()
+                if not current_guard:
+                    return
+                old = db.get(key)
+                skey = seed_key(harness, event, identity["providerInstanceId"])
+                started = db.start_child(key, native, pending_start.get("turn"), pending_start["started"],
+                                         seed=pending_start, seed_key=skey,
+                                         pending_key=pending_seed_key(harness, event))
+                pending_start["restarted"] = old is not None or started["execution_generation"] > 1
+                db.seed(skey, pending_start, now, owner_key=key)
+                db.release_prompt(native, current_guard[0])
             state = db.get(key)
             if state and state.get("_native_key") != native:
                 # Existing pre-guard state cannot be safely bound retroactively.
@@ -645,6 +655,8 @@ def handle(harness: str, event: dict):
                     return
                 db.discard_turn(key, state)
                 state = None
+            if is_child and state and state.get("invalidated") and name != "UserPromptSubmit":
+                return
             if is_child:
                 skey = seed_key(harness, event, identity["providerInstanceId"])
                 pending_seed = db.take_seed(pending_seed_key(harness, event))
@@ -653,28 +665,6 @@ def handle(harness: str, event: dict):
                     seed = pending_seed
                     db.seed(skey, seed, now)
                 tid = turn_id(harness, event)
-                if state and name != "UserPromptSubmit" and (
-                    state.get("invalidated") or (seed and seed.get("turn") and seed["turn"] != state["turn"])):
-                    # A start and a tool must agree on a genuinely new native
-                    # turn; a delayed event or duplicate start cannot revive it.
-                    if (not seed or not tid or seed.get("turn") != tid or
-                        tid in (state["turn"], state.get("ended_turn")) or
-                        tid in state.get("retired_turns", [])):
-                        return
-                    # Do not attribute the child's first historical prompt to a
-                    # resume; wait for an authored task matching the new start.
-                    if seed.get("resume_offset") is None:
-                        return
-                    path = event.get("transcript_path") or seed.get("path")
-                    task = transcript_task(harness, path, str(child_id or ""), event.get("session_id"),
-                                           event.get("agent_transcript_path") or seed.get("child_path"),
-                                           seed.get("path"), seed.get("resume_offset"))
-                    if not task:
-                        return
-                    db.discard_turn(key, state)
-                    state = next_turn(state, tid, task, seed.get("started", now), False)
-                    state["_native_key"] = native
-                    db.take_seed(skey)
                 if seed and not state:
                     if seed.get("turn") and tid and seed["turn"] != tid:
                         return
@@ -683,10 +673,12 @@ def handle(harness: str, event: dict):
                     state["_native_key"] = native
                 if state and not state["task"]:
                     seed = seed or {}
-                    task = transcript_task(harness, event.get("transcript_path") or seed.get("path"),
-                                           str(child_id or ""), event.get("session_id"),
-                                           event.get("agent_transcript_path") or seed.get("child_path"),
-                                           seed.get("path"))
+                    offset = seed.get("resume_offset") if seed.get("restarted") else None
+                    task = None if seed.get("restarted") and offset is None else transcript_task(
+                        harness, event.get("transcript_path") or seed.get("path"),
+                        str(child_id or ""), event.get("session_id"),
+                        event.get("agent_transcript_path") or seed.get("child_path"),
+                        seed.get("path"), offset)
                     if task:
                         state["task"] = task
                         db.take_seed(skey)
@@ -724,10 +716,7 @@ def handle(harness: str, event: dict):
                     state["prompt_checked"] = True
                     prompt_body = {**body_base(identity, event, cfg), "mode": "prompt", "prompt": prompt,
                                    "context": state["previous"], "known": db.recent(key), "already": state["cited"][-100:]}
-                    prompt_job = uuid.uuid4().hex
-                    state["prompt_inflight"] = prompt_job
-                    db.db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?)",
-                                  (prompt_job, key, tid, json.dumps(prompt_body), now))
+                    prompt_job = db.enqueue(key, state, prompt_body, now)
                 state_generation = state.get("generation")
                 db.save(key, state, now)
                 db.release_prompt(native, prompt_generation)
@@ -736,7 +725,7 @@ def handle(harness: str, event: dict):
                     return
                 # Native versions may omit the prompt/turn ID on tool events;
                 # use the saved active turn until another prompt replaces it.
-                if tid and state["turn"] != tid:
+                if not is_child and tid and state["turn"] != tid:
                     if not db.adopt_turn(key, state, tid):
                         return
                 pending = db.consume(key, state["turn"], cfg["mode"])
