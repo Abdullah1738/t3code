@@ -21,9 +21,19 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
     readonly rejectRunningServer?: boolean;
   },
 ) {
+  const buildCommit = process.env.ROBOB_BUILD_COMMIT;
+  delete process.env.ROBOB_BUILD_COMMIT;
   const logLevel = yield* GlobalFlag.LogLevel;
   const config = yield* resolveServerConfig(flags, logLevel, options);
-  const run = runServer.pipe(Effect.provideService(ServerConfig.ServerConfig, config));
+  const run = runServer.pipe(
+    Effect.provideService(ServerConfig.ServerConfig, {
+      ...config,
+      robobBuildCommit:
+        config.mode === "desktop" && config.desktopBootstrapToken !== undefined
+          ? buildCommit
+          : null,
+    }),
+  );
   if (config.mode !== "desktop" || config.desktopBootstrapToken === undefined) return yield* run;
   return yield* Effect.raceFirst(
     run,

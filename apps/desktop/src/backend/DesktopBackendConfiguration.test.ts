@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as DesktopAppIdentity from "../app/DesktopAppIdentity.ts";
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
 import * as DesktopShellEnvironment from "../shell/DesktopShellEnvironment.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
@@ -43,8 +44,17 @@ const layerShellEnvironment = (prepared = true) =>
     installIntoProcess: Effect.succeed(prepared),
   });
 
-const layerBackendConfiguration = (prepared = true) =>
-  DesktopBackendConfiguration.layer.pipe(Layer.provide(layerShellEnvironment(prepared)));
+const layerBackendConfiguration = (prepared = true, buildCommit = Option.none<string>()) =>
+  DesktopBackendConfiguration.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerShellEnvironment(prepared),
+        Layer.mock(DesktopAppIdentity.DesktopAppIdentity)({
+          resolveAboutCommitHash: Effect.succeed(buildCommit),
+        }),
+      ),
+    ),
+  );
 
 const layerServerExposure = Layer.succeed(DesktopServerExposure.DesktopServerExposure, {
   getState: Effect.die("unexpected getState"),
@@ -124,6 +134,8 @@ const withHarness = <A, E, R>(
     | DesktopBackendConfiguration.DesktopBackendConfiguration
   >,
   prepared = true,
+  buildCommit = Option.none<string>(),
+  isPackaged = true,
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -133,12 +145,12 @@ const withHarness = <A, E, R>(
 
     return yield* effect.pipe(
       Effect.provide(
-        layerBackendConfiguration(prepared).pipe(
+        layerBackendConfiguration(prepared, buildCommit).pipe(
           Layer.provideMerge(layerServerExposure),
           Layer.provideMerge(DesktopAppSettings.layerTest()),
           Layer.provideMerge(DesktopWslEnvironment.layerTest()),
           Layer.provideMerge(DesktopWslServerTree.layerTest()),
-          Layer.provideMerge(layerEnvironment(baseDir)),
+          Layer.provideMerge(layerEnvironment(baseDir, { isPackaged })),
         ),
       ),
     );
@@ -259,6 +271,7 @@ describe("DesktopBackendConfiguration", () => {
         assert.isUndefined(first.env.T3CODE_PORT);
         assert.isUndefined(first.env.T3CODE_MODE);
         assert.isUndefined(first.env.T3CODE_DESKTOP_LAN_HOST);
+        assert.isUndefined(first.env.ROBOB_BUILD_COMMIT);
 
         assert.equal(first.bootstrap.mode, "desktop");
         assert.equal(first.bootstrap.noBrowser, true);
@@ -285,6 +298,56 @@ describe("DesktopBackendConfiguration", () => {
         );
       }),
     ),
+  );
+
+  it.effect("passes the packaged identity's commit to the local backend only", () =>
+    withHarness(
+      Effect.gen(function* () {
+        const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+        const primary = yield* configuration.resolvePrimary;
+        const wsl = yield* configuration.resolveWsl({ port: 5000, distro: null });
+        assert.strictEqual(primary.env.ROBOB_BUILD_COMMIT, "abcdef012345");
+        assert.isUndefined(wsl.env.ROBOB_BUILD_COMMIT);
+      }),
+      true,
+      Option.some("abcdef012345"),
+    ),
+  );
+
+  it.effect(
+    "does not pass a commit for a development backend, even with an identity override",
+    () =>
+      withHarness(
+        Effect.gen(function* () {
+          const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+          const primary = yield* configuration.resolvePrimary;
+          assert.isUndefined(primary.env.ROBOB_BUILD_COMMIT);
+        }),
+        true,
+        Option.some("abcdef012345"),
+        false,
+      ),
+  );
+
+  it.effect("does not forward a parent build identity into WSL", () =>
+    Effect.gen(function* () {
+      const previous = process.env.ROBOB_BUILD_COMMIT;
+      const previousWslEnv = process.env.WSLENV;
+      process.env.ROBOB_BUILD_COMMIT = "abcdef012345";
+      process.env.WSLENV = "ROBOB_BUILD_COMMIT";
+      try {
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const wsl = yield* configuration.resolveWsl({ port: 5000, distro: null });
+            assert.isUndefined(wsl.env.ROBOB_BUILD_COMMIT);
+          }),
+        );
+      } finally {
+        restoreEnv("ROBOB_BUILD_COMMIT", previous);
+        restoreEnv("WSLENV", previousWslEnv);
+      }
+    }),
   );
 
   it.effect("resolvePrimary starts from server.asar without materializing the WSL tree", () =>
