@@ -77,6 +77,7 @@ const makeFake = Effect.gen(function* () {
     string,
     OrchestrationV2ProviderFailure & { readonly model?: ModelSelection | null }
   >();
+  const failureReads: Array<string> = [];
   const lastRuns = new Map<string, { runId: string; status: string; message: string | null }>();
   const runHistory = new Map<string, { status: string; message: string | null }>();
   // One run id per stored failure object (the same run reports the same id).
@@ -183,7 +184,10 @@ const makeFake = Effect.gen(function* () {
       setModel: (threadId, model) =>
         Effect.sync(() => void modelSwitches.push({ threadId, model })),
       // Each stored failure is one executed run; a repeat notification of it reports the same runId.
-      lastFailure: (threadId) => Effect.succeed(failureOf(threadId)),
+      lastFailure: (threadId) => Effect.sync(() => {
+        failureReads.push(threadId);
+        return failureOf(threadId);
+      }),
       latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
@@ -195,6 +199,7 @@ const makeFake = Effect.gen(function* () {
     interrupted,
     prs,
     failures,
+    failureReads,
     lastRuns,
     runHistory,
     sends,
@@ -1586,6 +1591,65 @@ it.effect("a failed thread read retries the compact path on the next tick", () =
       yield* kanban.tick;
       assert.include(messages, "/compact");
       assert.strictEqual((yield* kanban.card(created.id)).card.workThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("later ticks ignore the same failure after its work card is released", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "x", title: "x" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const threadState = (yield* Ref.get(fake.threads)).get(thread)!;
+      fake.failures.set(thread, { ...overflow });
+
+      // Keep the same failed-run identity and prevent the normal dispatcher
+      // from waking it, while the thread remains idle for the backstop.
+      yield* kanban.turnEnded(thread);
+      const released = yield* kanban.card(created.id);
+      assert.strictEqual(released.card.stage, "todo");
+      assert.isNull(released.card.activeThreadId);
+      assert.strictEqual(released.card.workThreadId, thread);
+      assert.strictEqual(threadState.messages.filter((message) => message === "/compact").length, 1);
+      yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+      const messages = [...threadState.messages];
+      const eventIds = released.events.map((event) => event.id);
+      const reads = fake.failureReads.length;
+
+      yield* kanban.tick;
+      yield* kanban.tick;
+      const after = yield* kanban.card(created.id);
+      assert.strictEqual(after.card.stage, "todo");
+      assert.strictEqual(after.card.workThreadId, thread);
+      assert.isNull(after.card.activeThreadId);
+      assert.deepStrictEqual(threadState.messages, messages);
+      assert.deepStrictEqual(after.events.map((event) => event.id), eventIds);
+      assert.strictEqual(fake.failureReads.length, reads);
+
+      // The fresh-thread path likewise releases it; stale failures cannot be replayed.
+      fake.failures.delete(thread);
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(created.id)).card.activeThreadId, thread);
+      fake.failures.set(thread, { ...overflow });
+      yield* kanban.turnEnded(thread);
+      const fresh = yield* kanban.card(created.id);
+      assert.strictEqual(fresh.card.stage, "todo");
+      assert.isNull(fresh.card.workThreadId);
+      assert.isNull(fresh.card.activeThreadId);
+      const freshEventIds = fresh.events.map((event) => event.id);
+      const freshMessages = [...threadState.messages];
+      const freshReads = fake.failureReads.length;
+      // Prevent tick's normal dispatcher from launching the replacement yet.
+      yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+      yield* kanban.tick;
+      yield* kanban.tick;
+      assert.deepStrictEqual((yield* kanban.card(created.id)).events.map((event) => event.id), freshEventIds);
+      assert.deepStrictEqual(threadState.messages, freshMessages);
+      assert.strictEqual(fake.failureReads.length, freshReads);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

@@ -2975,6 +2975,8 @@ const make = Effect.gen(function* () {
         if (found?._tag === "Failure") return;
         const view = found?.success ?? null;
         if (view !== null && view.state !== "idle") return;
+        // The send-then-save gap is accepted: a crash leaves /compact's turn
+        // end to normal handling (usually a nudge or flag).
         const compactSent = view?.state === "idle"
           ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
           : null;
