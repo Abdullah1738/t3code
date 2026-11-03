@@ -7,6 +7,7 @@ import {
   failedSlot,
   observeSlots,
   sentSlots,
+  type SlotWrites,
 } from "./slotCount";
 
 describe("committedSlots", () => {
@@ -47,6 +48,18 @@ describe("committedSlots", () => {
     const third = sentSlots(intermediate, { id: 3, value: 14 });
     expect(currentSlots(observeSlots(third, 13))).toBe(14);
     expect(currentSlots(observeSlots(third, 14))).toBe(14);
+  });
+
+  it("retires every write a coalesced feed covers, then follows a real change", () => {
+    const sent = [12, 13, 12].reduce(
+      (state, value, index) => sentSlots(state, { id: index + 1, value }),
+      { feed: 5, sent: [] } as SlotWrites,
+    );
+    const coalesced = observeSlots(sent, 12);
+    expect(coalesced.sent).toEqual([]);
+    const remote = observeSlots(coalesced, 13);
+    expect(currentSlots(remote)).toBe(13);
+    expect(currentSlots(remote) + 1).toBe(14);
   });
 
   it("adopts an unrelated feed change and removes failed writes", () => {

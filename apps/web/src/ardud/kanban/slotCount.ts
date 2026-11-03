@@ -34,10 +34,14 @@ export interface SlotWrites {
   readonly sent: ReadonlyArray<SlotWrite>;
 }
 
-/** Reconcile local writes with intermediate pool snapshots, preserving newer edits. */
+/**
+ * Reconcile local writes with intermediate pool snapshots, preserving newer edits.
+ * Matching the last equal write makes a coalesced feed (12, 13, 12 seen only as 12) retire all
+ * three; an uncoalesced repeat at worst shows an older count until the next feed update.
+ */
 export function observeSlots(state: SlotWrites, feed: number): SlotWrites {
   if (state.feed === feed) return state;
-  const match = state.sent.findIndex((write) => write.value === feed);
+  const match = state.sent.findLastIndex((write) => write.value === feed);
   return { feed, sent: match < 0 ? [] : state.sent.slice(match + 1) };
 }
 
