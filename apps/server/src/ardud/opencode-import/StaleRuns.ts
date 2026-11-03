@@ -3,6 +3,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ServerSettings from "../../serverSettings.ts";
@@ -30,10 +31,21 @@ export const layer = Layer.effect(
   StaleOpenCodeSessions,
   Effect.gen(function* () {
     const settings = yield* ServerSettings.ServerSettingsService;
+    // ardud: avoid waiting three seconds for every projection when OpenCode is down.
+    const gaveUp = yield* Ref.make(false);
     return StaleOpenCodeSessions.of({
       abort: (sessions) =>
         Effect.gen(function* () {
           if (sessions.length === 0) return { aborted: 0, failed: 0 };
+          if (yield* Ref.get(gaveUp)) {
+            yield* Effect.logWarning(
+              "Skipping stale OpenCode interrupts after a connection failure",
+              {
+                sessions: sessions.length,
+              },
+            );
+            return { aborted: 0, failed: sessions.length };
+          }
           const instanceIds = [...new Set(sessions.map((session) => session.providerInstanceId))];
           const configs = new Map(
             yield* Effect.forEach(
@@ -49,6 +61,7 @@ export const layer = Layer.effect(
             sessions,
             (session) =>
               Effect.gen(function* () {
+                if (yield* Ref.get(gaveUp)) return "breaker" as const;
                 const configured = configs.get(session.providerInstanceId);
                 if (configured?.kind !== "external") return "skipped" as const;
                 const result = yield* abortSession(configured.connection, session.sessionId).pipe(
@@ -57,13 +70,22 @@ export const layer = Layer.effect(
                     Effect.succeed(
                       Schema.is(OpenCodeHttpError)(error) && error.status === 404
                         ? { status: "aborted" as const }
-                        : { status: error.status ?? "request failed" },
+                        : {
+                            status: error.status ?? "request failed",
+                            connectionFailure: error.status === undefined,
+                          },
                     ),
                   ),
                   Effect.timeoutOption(ABORT_TIMEOUT),
                 );
                 if (Option.isSome(result) && result.value.status === "aborted")
                   return "aborted" as const;
+                if (
+                  Option.isNone(result) ||
+                  ("connectionFailure" in result.value && result.value.connectionFailure)
+                ) {
+                  yield* Ref.set(gaveUp, true);
+                }
                 yield* Effect.logWarning("Failed to abort stale OpenCode session", {
                   sessionId: session.sessionId,
                   status: Option.isNone(result) ? "timeout" : result.value.status,
@@ -82,9 +104,18 @@ export const layer = Layer.effect(
               ),
             { concurrency: 4 },
           );
+          const skippedByBreaker = results.filter((result) => result === "breaker").length;
+          if (skippedByBreaker > 0) {
+            yield* Effect.logWarning(
+              "Skipping stale OpenCode interrupts after a connection failure",
+              {
+                sessions: skippedByBreaker,
+              },
+            );
+          }
           return {
             aborted: results.filter((result) => result === "aborted").length,
-            failed: results.filter((result) => result === "failed").length,
+            failed: results.filter((result) => result === "failed").length + skippedByBreaker,
           };
         }).pipe(
           // ardud: recovery must continue even if settings or the abort service defects.

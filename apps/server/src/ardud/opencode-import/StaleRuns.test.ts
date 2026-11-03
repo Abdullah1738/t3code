@@ -101,6 +101,84 @@ describe("StaleOpenCodeSessions", () => {
     }
   }, 8_000);
 
+  it("stops issuing requests on subsequent passes after a timeout", async () => {
+    let requests = 0;
+    const server = await serve(() => {
+      requests++;
+    });
+    try {
+      const sessions = [{ sessionId: "ses_hang", directory: null, providerInstanceId: "opencode" }];
+      const results = await Effect.runPromise(
+        Effect.gen(function* () {
+          const service = yield* StaleOpenCodeSessions;
+          const first = yield* service.abort(sessions);
+          const second = yield* service.abort(sessions).pipe(Effect.timeout("1 second"));
+          return [first, second];
+        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
+      );
+      expect(results).toEqual([
+        { aborted: 0, failed: 1 },
+        { aborted: 0, failed: 1 },
+      ]);
+      expect(requests).toBe(1);
+    } finally {
+      server.close();
+    }
+  }, 8_000);
+
+  it("keeps trying after an HTTP failure", async () => {
+    let requests = 0;
+    const server = await serve((_req, res) => {
+      requests++;
+      res.writeHead(500);
+      res.end();
+    });
+    try {
+      const sessions = [
+        { sessionId: "ses_error", directory: null, providerInstanceId: "opencode" },
+      ];
+      const results = await Effect.runPromise(
+        Effect.gen(function* () {
+          const service = yield* StaleOpenCodeSessions;
+          return [yield* service.abort(sessions), yield* service.abort(sessions)];
+        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
+      );
+      expect(results).toEqual([
+        { aborted: 0, failed: 1 },
+        { aborted: 0, failed: 1 },
+      ]);
+      expect(requests).toBe(2);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("trips the breaker when the connection drops", async () => {
+    let requests = 0;
+    const server = await serve((req) => {
+      requests++;
+      req.socket.destroy();
+    });
+    try {
+      const sessions = [
+        { sessionId: "ses_reset", directory: null, providerInstanceId: "opencode" },
+      ];
+      const results = await Effect.runPromise(
+        Effect.gen(function* () {
+          const service = yield* StaleOpenCodeSessions;
+          return [yield* service.abort(sessions), yield* service.abort(sessions)];
+        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
+      );
+      expect(results).toEqual([
+        { aborted: 0, failed: 1 },
+        { aborted: 0, failed: 1 },
+      ]);
+      expect(requests).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
   it("makes no request for local or unknown configurations", async () => {
     let requests = 0;
     const server = await serve((_req, res) => {
