@@ -296,7 +296,7 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
         lookup = _lookup_key(*parts)
         if lookup is not None:
             lookup_claimants.setdefault(lookup, set()).add(row["canonical"])
-    blocked = set()
+    blocked = {lookup for lookup, canonicals in lookup_claimants.items() if len(canonicals) > 1}
     unresolved = list(getattr(rows, "unresolved", ()))
     for row in rows:
         parts = (row["driver"], row["instance"], row["native"], row.get("agent"))

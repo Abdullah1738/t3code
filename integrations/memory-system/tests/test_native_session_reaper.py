@@ -19,6 +19,7 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 sys.path.insert(0, SRC)
 
 import native_session_reaper as nsr  # noqa: E402
+import native_identity as ni  # noqa: E402
 import sync_thread_identity as ti  # noqa: E402
 import transcript_backup_manifest as tbm  # noqa: E402
 import transcript_capture as tc  # noqa: E402
@@ -134,6 +135,29 @@ class ReportOnly(unittest.TestCase):
         with closing(sqlite3.connect(db)) as con, con:
             con.execute("DELETE FROM thread_aliases")
         self.assertEqual(nsr.load_ledger(db), {})
+
+    def test_parent_child_collision_stays_ambiguous_on_every_refresh(self):
+        db = self.make_ledger("SHARED")
+        rows = [
+            dict(canonical="PARENT", root="PARENT", driver="codex", instance="codex", native="SHARED", agent=None),
+            dict(canonical="CHILD", root="PARENT", driver="codex", instance="codex", native="OWNER", agent="SHARED"),
+        ]
+        with closing(sqlite3.connect(db)) as con, con:
+            con.execute("DELETE FROM thread_aliases")
+            con.execute("CREATE TABLE harness_schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            # Exercise the dangerous transition from existing, separately keyed aliases.
+            con.execute("INSERT INTO thread_aliases(alias_key,canonical_thread_id,root_thread_id,driver,instance,native_id)"
+                        " VALUES('codex|codex|SHARED|','PARENT','PARENT','codex','codex','SHARED')")
+            con.execute("INSERT INTO thread_aliases(alias_key,canonical_thread_id,root_thread_id,driver,instance,native_id,agent_id)"
+                        " VALUES('codex|codex|OWNER|SHARED','CHILD','PARENT','codex','codex','OWNER','SHARED')")
+        for now in (100, 101, 102, 103):
+            with closing(sqlite3.connect(db)) as con:
+                ti.write(con, rows, now=now)
+                self.assertIsNone(ni.resolve_thread(con, "codex", "codex", "SHARED"))
+                self.assertIsNone(ni.ThreadResolver(con).resolve_thread("codex", "codex", "SHARED"))
+            ledger = nsr.load_ledger(db)
+            self.assertNotIn(self.file, ledger)
+            self.assertEqual(nsr.plan(self.roots(), ledger, self.manifest, {"PARENT", "CHILD"}, now=self.now), [])
 
     def test_codex_child_alias_qualifies_its_own_settled_thread(self):
         db = self.make_ledger("child-session")
