@@ -13,6 +13,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
@@ -523,6 +525,8 @@ describe("usage feed", () => {
                         }),
                     }),
                     Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+                    Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                    Layer.mock(Orchestrator.OrchestratorV2)({}),
                     Layer.mock(ProjectService.ProjectService)({}),
                     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
                       namedProjectsRoot: "/tmp/named",
