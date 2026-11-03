@@ -48,6 +48,7 @@ import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
+import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
@@ -442,6 +443,14 @@ const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: st
 // ---------------------------------------------------------------------------
 
 const makeRoutes = Effect.gen(function* () {
+  const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
+  const buildCommit =
+    typeof candidateBuildCommit === "string" &&
+    candidateBuildCommit.trim() === candidateBuildCommit &&
+    /^[0-9a-f]{7,40}$/.test(candidateBuildCommit)
+      ? candidateBuildCommit
+      : null;
+  const serverStartedAt = DateTime.formatIso(yield* DateTime.now);
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
@@ -1486,6 +1495,8 @@ const makeRoutes = Effect.gen(function* () {
       status: "healthy",
       sequence,
       time: DateTime.formatIso(yield* DateTime.now),
+      buildCommit,
+      serverStartedAt,
     });
   });
 
