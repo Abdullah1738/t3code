@@ -26,11 +26,12 @@ import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/or
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { type ControlThreadState, stateFromRunStatus } from "../../control/model.ts";
 
 export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
   "KanbanThreadError",
-  { operation: Schema.String, detail: Schema.String },
+  { operation: Schema.String, detail: Schema.String, rejected: Schema.optional(Schema.Boolean) },
 ) {}
 
 const isKanbanThreadError = Schema.is(KanbanThreadError);
@@ -69,6 +70,8 @@ export interface KanbanLaunchInput {
 export interface KanbanSendInput {
   readonly threadId: ThreadId;
   readonly text: string;
+  /** Stable across retries of one logical delivery. */
+  readonly key?: string;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
 }
@@ -88,6 +91,9 @@ export interface KanbanThreadsShape {
   readonly lastFailure: (
     threadId: ThreadId,
   ) => Effect.Effect<(OrchestrationV2ProviderFailure & { readonly runId?: string | null }) | null>;
+  readonly findLastFailure: (
+    threadId: ThreadId,
+  ) => Effect.Effect<(OrchestrationV2ProviderFailure & { readonly runId?: string | null }) | null, KanbanThreadError>;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
@@ -183,7 +189,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
-  const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
+  const findLastFailure: KanbanThreadsShape["findLastFailure"] = (threadId) =>
     threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
       Effect.map((records) => {
         const run = latestExecutedRun(records.runs);
@@ -200,8 +206,10 @@ const make = Effect.gen(function* () {
         }
         return failure === null ? null : { ...failure, runId: run?.id ?? null };
       }),
-      Effect.catchCause(() => Effect.succeed(null)),
+      Effect.mapError((error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) })),
     );
+  const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
+    findLastFailure(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
 
   const launch: KanbanThreadsShape["launch"] = (input) =>
     launcher
@@ -230,7 +238,7 @@ const make = Effect.gen(function* () {
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
-      const id = NodeCrypto.randomUUID();
+      const id = input.key ?? NodeCrypto.randomUUID();
       yield* threads.sendToThread({
         projectId: shell.projectId,
         commandId: CommandId.make(`kanban:send:${id}`),
@@ -247,7 +255,11 @@ const make = Effect.gen(function* () {
     Effect.mapError((error) =>
       isKanbanThreadError(error)
         ? error
-        : new KanbanThreadError({ operation: "send", detail: detailOf(error) }),
+        : new KanbanThreadError({
+            operation: "send",
+            detail: detailOf(error),
+            rejected: Schema.is(Orchestrator.OrchestratorCommandPreviouslyRejectedError)(error),
+          }),
     ),
   );
 
@@ -286,7 +298,7 @@ const make = Effect.gen(function* () {
     Effect.catchCause(() => Effect.void),
   );
 
-  return KanbanThreads.of({ view, find, model, lastFailure, launch, send, setModel, interrupt });
+  return KanbanThreads.of({ view, find, model, lastFailure, findLastFailure, launch, send, setModel, interrupt });
 });
 
 export const layer = Layer.effect(KanbanThreads, make);
