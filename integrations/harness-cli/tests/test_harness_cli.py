@@ -656,6 +656,16 @@ class CanaryTests(FakeCliTestCase):
         self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
             "old memory: the user prefers short replies"}]}, sentinel), (False, True))
 
+    def test_codex_canonical_instructions_do_not_count_as_loaded_memory(self) -> None:
+        instructions = "# AGENTS.md instructions\nThe old memory MCP is retired."
+        body = {"input": [{"role": "user", "content": [{"type": "input_text",
+                "text": instructions}]}]}
+        self.assertEqual(hc.codex_memory_in_body(body, "unrelated-sentinel", instructions), (False, False))
+        self.assertEqual(hc.codex_memory_in_body(body, "old memory", instructions), (True, False))
+        self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
+            instructions + "\nPrior memories include the user's preference for blue."}]},
+            "unrelated-sentinel", instructions), (False, True))
+
     def test_codex_memory_baseline_detects_top_level_phase2_files(self) -> None:
         home = self.tmp / "codex-snapshot"
         home.mkdir()

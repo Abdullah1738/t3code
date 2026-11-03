@@ -880,7 +880,7 @@ def codex_memory_snapshot(chome: Path) -> dict[str, str]:
     return snapshot
 
 
-def codex_memory_in_body(body, sentinel: str) -> tuple[bool, bool]:
+def codex_memory_in_body(body, sentinel: str, instruction_text: str | None = None) -> tuple[bool, bool]:
     """Inspect decoded JSON strings, including nested Responses API input/content items."""
     sentinel_seen = False
     section_seen = False
@@ -888,7 +888,10 @@ def codex_memory_in_body(body, sentinel: str) -> tuple[bool, bool]:
         nonlocal sentinel_seen, section_seen
         if isinstance(value, str):
             sentinel_seen = sentinel_seen or sentinel in value
-            section_seen = section_seen or bool(CODEX_MEMORY_SECTION_RE.search(value))
+            # Known AGENTS.md text is not evidence of built-in memory injection. Still scan the
+            # complete payload for the sentinel, and scan everything outside the exact copy.
+            other = value.replace(instruction_text, "") if instruction_text else value
+            section_seen = section_seen or bool(CODEX_MEMORY_SECTION_RE.search(other))
         elif isinstance(value, dict):
             for item in value.values():
                 visit(item)
@@ -946,6 +949,8 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
     results: dict = {"positiveControl": enable_memory, "models": {}}
     try:
         prepare_isolated_home(work / "codex-home")
+        instructions_path = chome / "AGENTS.md"
+        instructions = instructions_path.read_text(encoding="utf-8") if instructions_path.is_file() else None
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(work / "codex-home"),
                "CODEX_HOME": str(chome), "NINEROUTER_KEY": nine_router_key(),
                "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
@@ -959,7 +964,7 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                            cwd=work)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
-            observations = [codex_memory_in_body(r.get("body"), sentinel) for r in records]
+            observations = [codex_memory_in_body(r.get("body"), sentinel, instructions) for r in records]
             sentinel_seen = any(item[0] for item in observations)
             section = any(item[1] for item in observations)
             bodies_decoded = all(isinstance(r.get("body"), dict) for r in records)
