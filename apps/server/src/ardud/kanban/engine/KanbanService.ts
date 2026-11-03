@@ -228,6 +228,12 @@ export interface KanbanServiceShape {
     readonly defaultProjectId: ProjectId | null;
     readonly evaluatorModel?: ModelSelection | undefined;
   }) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly openBoard: (input: {
+    readonly slug: string;
+    readonly name: string;
+    readonly defaultProjectId: ProjectId | null;
+    readonly icon?: string | null | undefined;
+  }) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly updateBoard: (
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
@@ -375,6 +381,7 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     title: string,
     actor: KanbanActor,
+    blocks?: ReadonlyArray<KanbanBlock>,
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
   /** Owner only: rename, settle, snooze or pin a discussion. */
   readonly updateDiscussion: (
@@ -4207,7 +4214,11 @@ const make = Effect.gen(function* () {
         );
         // The winner sets the state synchronously, before a late permit can start a write.
         return Effect.raceFirst(write, deadline).pipe(
-          Effect.onInterrupt(() => Effect.sync(() => { expired = true; })),
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              expired = true;
+            }),
+          ),
           Effect.mapError(toKanbanError),
         );
       }),
@@ -4318,61 +4329,83 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const updateBoardUnlocked = Effect.fn("KanbanService.updateBoardUnlocked")(function* (
+    boardId: KanbanBoard["id"],
+    patch: BoardPatch,
+  ) {
+    const board = yield* boardOf(boardId);
+    const managerModel = patch.managerModel
+      ? yield* canonicalModel(patch.managerModel)
+      : board.managerModel;
+    const evaluatorModel = patch.evaluatorModel
+      ? yield* canonicalModel(patch.evaluatorModel)
+      : board.evaluatorModel;
+    const defaultCardModel = patch.defaultCardModel
+      ? yield* canonicalModel(patch.defaultCardModel)
+      : board.defaultCardModel;
+    const reviewChains =
+      patch.reviewChains === undefined
+        ? board.reviewChains
+        : yield* Effect.forEach(patch.reviewChains, (chain) =>
+            Effect.map(Effect.forEach(chain.steps, canonicalModel), (steps) => ({
+              ...chain,
+              steps,
+            })),
+          );
+    const next: KanbanBoard = {
+      ...board,
+      ...patch,
+      managerModel,
+      evaluatorModel,
+      defaultCardModel,
+      reviewChains,
+    };
+    if (patch.managerModel) yield* checkModel(managerModel);
+    if (patch.evaluatorModel) yield* checkModel(evaluatorModel);
+    if (patch.defaultCardModel) yield* checkModel(defaultCardModel);
+    // Only steps that differ from the stored chain are checked. A step already saved
+    // (even if its model has since left the catalog) must not block fixing another step.
+    for (const chain of patch.reviewChains === undefined ? [] : reviewChains) {
+      const stored = board.reviewChains.find((c) => c.name === chain.name);
+      for (const [index, step] of chain.steps.entries()) {
+        const previous = stored?.steps[index];
+        const unchanged =
+          previous !== undefined &&
+          previous.instanceId === step.instanceId &&
+          previous.model === step.model &&
+          sameOptions(previous.options ?? [], step.options ?? []);
+        if (!unchanged) yield* checkModel(step);
+      }
+    }
+    const pools = missingPools(yield* store.pools(board.id), boardModels(next));
+    yield* store.putBoardWithPools(next, pools);
+    if (pools.length > 0) {
+      yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
+    }
+    yield* publish(board.id, { _tag: "board", board: next });
+    yield* kick;
+    return next;
+  });
+
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
+    guard(updateBoardUnlocked(boardId, patch));
+
+  const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
-        const board = yield* boardOf(boardId);
-        const managerModel = patch.managerModel
-          ? yield* canonicalModel(patch.managerModel)
-          : board.managerModel;
-        const evaluatorModel = patch.evaluatorModel
-          ? yield* canonicalModel(patch.evaluatorModel)
-          : board.evaluatorModel;
-        const defaultCardModel = patch.defaultCardModel
-          ? yield* canonicalModel(patch.defaultCardModel)
-          : board.defaultCardModel;
-        const reviewChains =
-          patch.reviewChains === undefined
-            ? board.reviewChains
-            : yield* Effect.forEach(patch.reviewChains, (chain) =>
-                Effect.map(Effect.forEach(chain.steps, canonicalModel), (steps) => ({
-                  ...chain,
-                  steps,
-                })),
-              );
-        const next: KanbanBoard = {
-          ...board,
-          ...patch,
-          managerModel,
-          evaluatorModel,
-          defaultCardModel,
-          reviewChains,
+        const slug = input.slug.trim().toLowerCase();
+        const board =
+          (yield* store.boards).find((existing) => existing.slug === slug) ??
+          (yield* insertBoardUnlocked({ ...input, slug }));
+        const patch: BoardPatch = {
+          ...(input.defaultProjectId && board.defaultProjectId === null
+            ? { defaultProjectId: input.defaultProjectId }
+            : {}),
+          ...(input.icon && board.icon === null ? { icon: input.icon } : {}),
         };
-        if (patch.managerModel) yield* checkModel(managerModel);
-        if (patch.evaluatorModel) yield* checkModel(evaluatorModel);
-        if (patch.defaultCardModel) yield* checkModel(defaultCardModel);
-        // Only steps that differ from the stored chain are checked. A step already saved
-        // (even if its model has since left the catalog) must not block fixing another step.
-        for (const chain of patch.reviewChains === undefined ? [] : reviewChains) {
-          const stored = board.reviewChains.find((c) => c.name === chain.name);
-          for (const [index, step] of chain.steps.entries()) {
-            const previous = stored?.steps[index];
-            const unchanged =
-              previous !== undefined &&
-              previous.instanceId === step.instanceId &&
-              previous.model === step.model &&
-              sameOptions(previous.options ?? [], step.options ?? []);
-            if (!unchanged) yield* checkModel(step);
-          }
-        }
-        const pools = missingPools(yield* store.pools(board.id), boardModels(next));
-        yield* store.putBoardWithPools(next, pools);
-        if (pools.length > 0) {
-          yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
-        }
-        yield* publish(board.id, { _tag: "board", board: next });
-        yield* kick;
-        return next;
+        return Object.keys(patch).length === 0
+          ? board
+          : yield* updateBoardUnlocked(board.id, patch);
       }),
     );
 
@@ -5851,11 +5884,19 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const createDiscussion: KanbanServiceShape["createDiscussion"] = (boardId, title, actor) =>
+  const createDiscussion: KanbanServiceShape["createDiscussion"] = (
+    boardId,
+    title,
+    actor,
+    blocks,
+  ) =>
     guard(
       Effect.gen(function* () {
         yield* boardOf(boardId);
-        return yield* newDiscussion(boardId, title, null, actor);
+        const discussion = yield* newDiscussion(boardId, title, null, actor);
+        if (!blocks?.length) return discussion;
+        yield* postUnlocked(discussion.id, actor, blocks);
+        return yield* discussionOf(discussion.id);
       }),
     );
 
@@ -6155,6 +6196,7 @@ const make = Effect.gen(function* () {
   return KanbanService.of({
     boards: readDb(store.boards),
     ensureBoard,
+    openBoard,
     createBoard,
     updateBoard,
     snapshot: (boardId) => readDb(snapshotOf(boardId)),

@@ -305,18 +305,20 @@ const observedStoreLayer = (observe: (discussionId: KanbanDiscussionId) => Effec
       KanbanStore.KanbanStore.of({
         ...real,
         putDiscussion: (discussion) =>
-          real.putDiscussion(discussion).pipe(
-            Effect.tap(() =>
-              discussion.participants.some(
-                (participant) =>
-                  participant.actor._tag === "owner" &&
-                  discussion.lastSeq > 0 &&
-                  participant.lastReadSeq === discussion.lastSeq,
-              )
-                ? observe(discussion.id)
-                : Effect.void,
+          real
+            .putDiscussion(discussion)
+            .pipe(
+              Effect.tap(() =>
+                discussion.participants.some(
+                  (participant) =>
+                    participant.actor._tag === "owner" &&
+                    discussion.lastSeq > 0 &&
+                    participant.lastReadSeq === discussion.lastSeq,
+                )
+                  ? observe(discussion.id)
+                  : Effect.void,
+              ),
             ),
-          ),
       }),
     ),
   );
@@ -358,7 +360,8 @@ it.live("saves a 20,000-character description on a 1,700-card board", () =>
       yield* sql.withTransaction(
         Effect.forEach(
           Array.from({ length: 1699 }, (_, i) => i + 2),
-          (number) => store.putCard({ ...card, id: KanbanCardId.make(`card-seed-${number}`), number }),
+          (number) =>
+            store.putCard({ ...card, id: KanbanCardId.make(`card-seed-${number}`), number }),
           { discard: true },
         ),
       );
@@ -402,7 +405,9 @@ it.effect("a queued write expires without changing the card or recording an even
         kanban.editCard(card.id, { description: "Must not land" }, owner).pipe(Effect.flip),
       );
       const queuedPost = yield* Effect.forkChild(
-        kanban.postToCard(card.id, owner, [{ _tag: "md", text: "Must not post" }]).pipe(Effect.flip),
+        kanban
+          .postToCard(card.id, owner, [{ _tag: "md", text: "Must not post" }])
+          .pipe(Effect.flip),
       );
       yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       const error = yield* Fiber.join(queued);
@@ -459,10 +464,20 @@ it.effect("a started write finishes after the start deadline", () =>
     );
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
-      const board = yield* kanban.ensureBoard({ slug: "started", name: "Started", defaultProjectId: null });
-      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A", description: "Original" }, owner);
+      const board = yield* kanban.ensureBoard({
+        slug: "started",
+        name: "Started",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "A", description: "Original" },
+        owner,
+      );
       target = card.id;
-      const write = yield* Effect.forkChild(kanban.editCard(card.id, { description: "Started" }, owner));
+      const write = yield* Effect.forkChild(
+        kanban.editCard(card.id, { description: "Started" }, owner),
+      );
       yield* Deferred.await(started);
       yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       assert.isUndefined(write.pollUnsafe());
