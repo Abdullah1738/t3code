@@ -847,11 +847,15 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
       "narration",
     );
     assert.equal(
-      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Done." }], "end_turn")),
+      ClaudeAdapterV2.claudeAssistantPhase(
+        assistant([{ type: "text", text: "Done." }], "end_turn"),
+      ),
       "answer",
     );
     assert.equal(
-      ClaudeAdapterV2.claudeAssistantPhase(assistant([{ type: "text", text: "Cut" }], "max_tokens")),
+      ClaudeAdapterV2.claudeAssistantPhase(
+        assistant([{ type: "text", text: "Cut" }], "max_tokens"),
+      ),
       "unknown",
     );
     assert.equal(
@@ -3471,78 +3475,166 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
-  it.effect("gives split text and tool frames their own phases: narration before a tool, the reply after it", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeWakeHarness;
-      yield* harness.runtime.startTurn(
-        makeClaudeTestTurnInput({
+  it.effect(
+    "gives split text and tool frames their own phases: narration before a tool, the reply after it",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("split-phase-attempt"),
+            text: "Check the prices and reply",
+            attachments: [],
+          }),
+        );
+        const message = (
+          id: string,
+          uuid: string,
+          content: ReadonlyArray<unknown>,
+          stopReason: string | null,
+        ) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: { id, model: "claude-opus-5-5", content, stop_reason: stopReason },
+          });
+        const frames = [
+          // Group A: the narration text and the tool call are separate messages that share one id.
+          message("group-a", "split-text", [{ type: "text", text: "Checking prices now." }], null),
+          message(
+            "group-a",
+            "split-tool",
+            [{ type: "tool_use", id: "tool-p", name: "Bash", input: { command: "ls" } }],
+            "tool_use",
+          ),
+          // Group B: the reply, ended by end_turn.
+          message("group-b", "split-answer", [{ type: "text", text: "Booked for 11:50." }], null),
+          makeResultFrame({
+            uuid: "split-result",
+            result: "Booked for 11:50.",
+            stopReason: "end_turn",
+          }),
+        ];
+        for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
+        yield* Queue.take(harness.terminalReceipts);
+        const latest = new Map(
+          harness.events.flatMap((event) =>
+            event.type === "message.updated" && event.message.role === "assistant"
+              ? [[event.message.text, event.message] as const]
+              : [],
+          ),
+        );
+        assert.equal(latest.get("Checking prices now.")?.phase, "narration");
+        assert.equal(latest.get("Booked for 11:50.")?.phase, "answer");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect(
+    "review r3: an end_turn message before a steer keeps answer phase when the run continues",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const attemptId = RunAttemptId.make("review-steer-phases");
+        const input = makeClaudeTestTurnInput({
           threadId: harness.threadId,
           providerThread: harness.providerThread,
           now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("split-phase-attempt"),
-          text: "Check the prices and reply",
+          attemptId,
+          text: "Book the car",
           attachments: [],
-        }),
-      );
-      const message = (id: string, uuid: string, content: ReadonlyArray<unknown>, stopReason: string | null) =>
-        claudeSdkFrame({
-          type: "assistant",
-          uuid,
-          session_id: WAKE_NATIVE_SESSION,
-          parent_tool_use_id: null,
-          message: { id, model: "claude-opus-5-5", content, stop_reason: stopReason },
         });
-      const frames = [
-        // Group A: the narration text and the tool call are separate messages that share one id.
-        message("group-a", "split-text", [{ type: "text", text: "Checking prices now." }], null),
-        message("group-a", "split-tool", [{ type: "tool_use", id: "tool-p", name: "Bash", input: { command: "ls" } }], "tool_use"),
-        // Group B: the reply, ended by end_turn.
-        message("group-b", "split-answer", [{ type: "text", text: "Booked for 11:50." }], null),
-        makeResultFrame({ uuid: "split-result", result: "Booked for 11:50.", stopReason: "end_turn" }),
-      ];
-      for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
-      yield* Queue.take(harness.terminalReceipts);
-      const latest = new Map(
-        harness.events.flatMap((event) =>
-          event.type === "message.updated" && event.message.role === "assistant"
-            ? [[event.message.text, event.message] as const]
-            : [],
+        yield* harness.runtime.startTurn(input);
+        const frame = (id: string, text: string) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: id,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id,
+              model: "claude-opus-5-5",
+              content: [{ type: "text", text }],
+              stop_reason: null,
+            },
+          });
+        yield* Queue.offer(
+          harness.sdkMessages,
+          usageStreamFrame({
+            type: "message_start",
+            message: { id: "review-a", usage: zeroUsage },
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, frame("review-a", "Booked for 11:50"));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          usageStreamFrame({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: zeroUsage,
+          }),
+        );
+        yield* awaitUntil(
+          () =>
+            harness.events.some(
+              (event) =>
+                event.type === "message.updated" && event.message.text === "Booked for 11:50",
+            ),
+          "answer A arrived",
+        );
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${attemptId}`,
+          }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("review-steer"),
+            text: "Also draft the clinic message",
+            attachments: [],
+          },
+        });
+        yield* Queue.offer(harness.sdkMessages, frame("review-b", "Here's the draft"));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "review-terminal",
+            result: "Here's the draft",
+            stopReason: "end_turn",
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const phases = new Map(
+          harness.events.flatMap((event) =>
+            event.type === "message.updated"
+              ? [[event.message.text, event.message.phase] as const]
+              : [],
+          ),
+        );
+        assert.deepEqual(
+          [phases.get("Booked for 11:50"), phases.get("Here's the draft")],
+          ["answer", "answer"],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
-      );
-      assert.equal(latest.get("Checking prices now.")?.phase, "narration");
-      assert.equal(latest.get("Booked for 11:50.")?.phase, "answer");
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
-    ),
-  );
-
-  it.effect("review r3: an end_turn message before a steer keeps answer phase when the run continues", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeWakeHarness;
-      const idAllocator = yield* IdAllocator.IdAllocatorV2;
-      const attemptId = RunAttemptId.make("review-steer-phases");
-      const input = makeClaudeTestTurnInput({threadId: harness.threadId, providerThread: harness.providerThread,
-        now: yield* DateTime.now, attemptId, text: "Book the car", attachments: []});
-      yield* harness.runtime.startTurn(input);
-      const frame = (id: string, text: string) => claudeSdkFrame({type: "assistant", uuid: id,
-        session_id: WAKE_NATIVE_SESSION, parent_tool_use_id: null,
-        message: {id, model: "claude-opus-5-5", content: [{type: "text", text}], stop_reason: null}});
-      yield* Queue.offer(harness.sdkMessages, usageStreamFrame({type: "message_start", message: {id: "review-a", usage: zeroUsage}}));
-      yield* Queue.offer(harness.sdkMessages, frame("review-a", "Booked for 11:50"));
-      yield* Queue.offer(harness.sdkMessages, usageStreamFrame({type: "message_delta", delta: {stop_reason: "end_turn", stop_sequence: null}, usage: zeroUsage}));
-      yield* awaitUntil(() => harness.events.some(event => event.type === "message.updated" && event.message.text === "Booked for 11:50"), "answer A arrived");
-      yield* harness.runtime.steerTurn({threadId: harness.threadId, runId: input.runId, providerThread: harness.providerThread,
-        providerTurnId: idAllocator.derive.providerTurn({driver: ClaudeAdapterV2.CLAUDE_PROVIDER, nativeTurnId: `turn:${attemptId}`}),
-        message: {createdBy: "user", creationSource: "web", messageId: MessageId.make("review-steer"), text: "Also draft the clinic message", attachments: []}});
-      yield* Queue.offer(harness.sdkMessages, frame("review-b", "Here's the draft"));
-      yield* Queue.offer(harness.sdkMessages, makeResultFrame({uuid: "review-terminal", result: "Here's the draft", stopReason: "end_turn"}));
-      yield* Queue.take(harness.terminalReceipts);
-      const phases = new Map(harness.events.flatMap(event => event.type === "message.updated" ? [[event.message.text, event.message.phase] as const] : []));
-      assert.deepEqual([phases.get("Booked for 11:50"), phases.get("Here's the draft")], ["answer", "answer"]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer))),
   );
 
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
@@ -8309,16 +8401,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           });
         // One entry per assistant message, from its latest update: the projection upserts by id, so a
         // phase correction re-emits the same message rather than adding one.
-        const assistantTexts = () =>
-          [
-            ...new Map(
-              harness.events.flatMap((event) =>
-                event.type === "message.updated" && event.message.role === "assistant"
-                  ? [[event.message.id, event.message.text] as const]
-                  : [],
-              ),
-            ).values(),
-          ];
+        const assistantTexts = () => [
+          ...new Map(
+            harness.events.flatMap((event) =>
+              event.type === "message.updated" && event.message.role === "assistant"
+                ? [[event.message.id, event.message.text] as const]
+                : [],
+            ),
+          ).values(),
+        ];
 
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({

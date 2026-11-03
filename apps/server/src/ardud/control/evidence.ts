@@ -70,7 +70,5 @@ export function runToolEvidence(input: {
 
 /** A message's visible text, cut to the preview length the control API returns. */
 export function messagePreview(message: Pick<OrchestrationV2ConversationMessage, "text">): string {
-  return message.text.length <= PREVIEW_CHARS
-    ? message.text
-    : message.text.slice(0, PREVIEW_CHARS);
+  return message.text.length <= PREVIEW_CHARS ? message.text : message.text.slice(0, PREVIEW_CHARS);
 }

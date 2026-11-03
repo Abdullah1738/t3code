@@ -4726,7 +4726,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
 
         const phases = new Map(
-          assistantMessages(harness.events).map((event) => [event.message.text, event.message.phase]),
+          assistantMessages(harness.events).map((event) => [
+            event.message.text,
+            event.message.phase,
+          ]),
         );
         assert.strictEqual(phases.get("Looking at the repo."), "narration");
         assert.strictEqual(phases.get("All set."), "answer");

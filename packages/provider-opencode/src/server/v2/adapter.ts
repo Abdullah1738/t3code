@@ -217,7 +217,10 @@ interface ActiveTurn {
   /** Texts a recovered message shows a tool call after: narration whatever the step's finish says. */
   readonly narrationTexts: Set<string>;
   /** Completed texts whose step has not ended yet; they are re-emitted with their phase then. */
-  readonly awaitingFinish: Map<string, { readonly block: OpenBlock["block"]; readonly text: string }>;
+  readonly awaitingFinish: Map<
+    string,
+    { readonly block: OpenBlock["block"]; readonly text: string }
+  >;
   before: string | null | undefined;
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -1076,7 +1079,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       entry.text = update(entry.text);
       if (completed) {
         turn.texts.delete(nativeId);
-        if (kind === "text" && entry.text.length > 0 && !turn.finishByMessage.has(data.assistantMessageID)) {
+        if (
+          kind === "text" &&
+          entry.text.length > 0 &&
+          !turn.finishByMessage.has(data.assistantMessageID)
+        ) {
           turn.awaitingFinish.set(nativeId, { block: entry.block, text: entry.text });
         }
       } else turn.texts.set(nativeId, entry);
@@ -2798,7 +2805,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         // The listed message carries its step's native finish, as the live step-ended event does. Record
         // it before its texts are emitted, so each text gets the same phase the live path would give it.
         if (typeof message.finish === "string") {
-          if (!turn.finishByMessage.has(message.id)) turn.finishByMessage.set(message.id, message.finish);
+          if (!turn.finishByMessage.has(message.id))
+            turn.finishByMessage.set(message.id, message.finish);
           // History runs oldest first, so the turn ends on its newest step's finish, as live.
           turn.lastFinish = message.finish;
         }

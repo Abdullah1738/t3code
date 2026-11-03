@@ -1,6 +1,4 @@
-import {
-  T3_CODE_BROWSER_TOOL_INSTRUCTIONS,
-} from "@t3tools/provider-core/server/orchestrationInstructions";
+import { T3_CODE_BROWSER_TOOL_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 export const T3_CODE_DEVICE_TOOL_INSTRUCTIONS = `## T3 Code devices
 

@@ -2,9 +2,7 @@ import type { ProviderInteractionMode } from "@t3tools/contracts";
 import type { V2TurnStartParams__AdditionalContextEntry } from "effect-codex-app-server/schema";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
-import {
-  T3_CODE_ORCHESTRATION_SECTIONS,
-} from "@t3tools/provider-core/server/orchestrationInstructions";
+import { T3_CODE_ORCHESTRATION_SECTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 import { t3ToolInstructions, type T3CodeToolAvailability } from "./T3ToolInstructions.ts";
 

@@ -1299,7 +1299,9 @@ export function makeClaudeQueryOptions(input: {
         (input.mcpServers === undefined
           ? ""
           : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
-            t3ToolInstructionsSuffix(input.t3ToolAvailability ?? { browser: false, device: false })),
+            t3ToolInstructionsSuffix(
+              input.t3ToolAvailability ?? { browser: false, device: false },
+            )),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -6777,9 +6779,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
           yield* Effect.all(
             [
-              emitProviderEvent({ type: "node.updated", driver: CLAUDE_PROVIDER, node: artifacts.node }),
-              emitProviderEvent({ type: "message.updated", driver: CLAUDE_PROVIDER, message: artifacts.message }),
-              emitProviderEvent({ type: "turn_item.updated", driver: CLAUDE_PROVIDER, turnItem: artifacts.turnItem }),
+              emitProviderEvent({
+                type: "node.updated",
+                driver: CLAUDE_PROVIDER,
+                node: artifacts.node,
+              }),
+              emitProviderEvent({
+                type: "message.updated",
+                driver: CLAUDE_PROVIDER,
+                message: artifacts.message,
+              }),
+              emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: artifacts.turnItem,
+              }),
             ],
             { concurrency: 1 },
           );
@@ -8332,7 +8346,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const groupId = typeof message.message.id === "string" ? message.message.id : null;
             // A tool call in this message makes the message's texts narration, and so does an earlier
             // text from the same message group that the CLI split out before the tool call.
-            if (groupId !== null && message.message.content.some((block) => block.type === "tool_use")) {
+            if (
+              groupId !== null &&
+              message.message.content.some((block) => block.type === "tool_use")
+            ) {
               context.assistant.toolGroups.add(groupId);
               for (const recorded of context.assistant.textGroups.values()) {
                 if (recorded.groupId === groupId) {
@@ -8347,7 +8364,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
           if (assistantText !== null && assistantText.text.length > 0) {
             const textGroupId =
-              message.type === "assistant" && typeof message.message.id === "string" ? message.message.id : null;
+              message.type === "assistant" && typeof message.message.id === "string"
+                ? message.message.id
+                : null;
             const nativePhase = claudeAssistantPhase(message);
             // The stream can report the group's end_turn before the CLI writes its text line.
             const endedReply =
@@ -8516,7 +8535,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               // Only the last tool-free text is the reply. An earlier one that no tool call followed is
               // still an aside, so it stays unknown rather than being presented as the answer.
               const tailFree = [...context.assistant.textGroups.values()].filter(
-                (recorded) => recorded.groupId === null || !context.assistant.toolGroups.has(recorded.groupId),
+                (recorded) =>
+                  recorded.groupId === null || !context.assistant.toolGroups.has(recorded.groupId),
               );
               const reply = tailFree.at(-1);
               if (reply !== undefined) {

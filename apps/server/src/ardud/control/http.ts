@@ -1019,11 +1019,15 @@ const makeRoutes = Effect.gen(function* () {
     const runId = yield* param("runId");
     yield* getShell(threadId);
     const records = yield* threads
-      .getThreadRecords(ThreadId.make(threadId), ["runs", "messages", "turnItems", "attempts", "providerTurns"], {
-        runIds: [RunId.make(runId)],
-        messageRunIds: [RunId.make(runId)],
-        turnItemRunIds: [RunId.make(runId)],
-      })
+      .getThreadRecords(
+        ThreadId.make(threadId),
+        ["runs", "messages", "turnItems", "attempts", "providerTurns"],
+        {
+          runIds: [RunId.make(runId)],
+          messageRunIds: [RunId.make(runId)],
+          turnItemRunIds: [RunId.make(runId)],
+        },
+      )
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     const run = records.runs.find((candidate) => candidate.id === runId);
     if (run === undefined) {
@@ -1031,8 +1035,12 @@ const makeRoutes = Effect.gen(function* () {
     }
     // A provider turn is this run's only when its attempt belongs to the run. Each native
     // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
-    const attemptIds = new Set(records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id));
-    const runTurns = records.providerTurns.filter((turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId));
+    const attemptIds = new Set(
+      records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id),
+    );
+    const runTurns = records.providerTurns.filter(
+      (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
+    );
     const messages = records.messages
       .filter((message) => message.runId === run.id && message.role === "assistant")
       .toSorted(
