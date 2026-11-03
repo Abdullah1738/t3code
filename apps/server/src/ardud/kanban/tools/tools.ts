@@ -432,7 +432,7 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model; a model with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
   {
     model: ModelInput,
     slots: Schema.optional(NonNegativeInt),
@@ -450,7 +450,7 @@ const PoolSet = tool(
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
-  "Evaluators: drop a pool at 0 slots that nothing on the board uses.",
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses. Name the variant when the model has pools at several levels.",
   { model: ModelInput },
   { pools: Records },
   { readonly: false, destructive: true },
