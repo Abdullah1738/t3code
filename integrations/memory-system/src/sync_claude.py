@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
 import sys
 import time
 
@@ -111,23 +112,35 @@ def is_child_path(path):
 def session_files(root):
     """Yield the transcript files under a Claude home, sorted for stable scheduling."""
     proj = os.path.join(root, "projects")
-    if not os.path.isdir(proj):
+    try:
+        mode = os.stat(proj).st_mode
+    except FileNotFoundError:
         return
+    if not stat.S_ISDIR(mode):
+        raise NotADirectoryError(proj)
     for slug in sorted(os.listdir(proj)):
         d = os.path.join(proj, slug)
-        if not os.path.isdir(d):
+        try:
+            mode = os.stat(d).st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(mode):
             continue
         for name in sorted(os.listdir(d)):
             p = os.path.join(d, name)
             if name.endswith(".jsonl") and os.path.isfile(p):
                 yield p
-        for dirpath, dirnames, filenames in os.walk(d):
+        for dirpath, dirnames, filenames in os.walk(d, onerror=_walk_error):
             dirnames.sort()
             if os.path.basename(dirpath) != "subagents":
                 continue
             for name in sorted(filenames):
                 if name.startswith("agent-") and name.endswith(".jsonl"):
                     yield os.path.join(dirpath, name)
+
+
+def _walk_error(error):
+    raise error
 
 
 def _blocks(msg):
@@ -165,6 +178,8 @@ def project(rec, path, line_no):
     agent = rec.get("agentId") if isinstance(rec.get("agentId"), str) and rec.get("agentId") else None
     if is_child_path(path) and not agent:
         agent = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+        if not agent:
+            return []
     key = session_key(sid, agent)
     ts = parse_ts(rec.get("timestamp"))
     base = {"file": os.path.basename(path), "line": line_no, "cwd": rec.get("cwd"), "parent_session": sid,
@@ -231,11 +246,14 @@ class ClaudeSync:
 
     def _key_of_line(self, path, rec):
         """Capture identity of one line; child files use their own agentId (the parent id is not a key)."""
-        if not isinstance(rec, dict) or not isinstance(rec.get("sessionId"), str):
+        if not isinstance(rec, dict) or not isinstance(rec.get("sessionId"), str) or not rec["sessionId"]:
             return None
         agent = rec.get("agentId") if isinstance(rec.get("agentId"), str) and rec.get("agentId") else None
         if is_child_path(path) and not agent:
             agent = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+        # A child without an agent id must not acquire its parent's identity.
+        if is_child_path(path) and not agent:
+            return None
         return session_key(rec["sessionId"], agent)
 
     def key_of(self, path):
@@ -273,15 +291,21 @@ class ClaudeSync:
         if tc.quarantined(self.mem, key):
             self.stats["quarantined"] += 1
             return
-        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key))
+        instance = self._root_of(path)["instance"]
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
         if self._unchanged(path, st, rep):
+            if rep["session_key"] is None:
+                self._restore_identity(path, rep)
             self.stats["unchanged"] += 1
             return  # nothing new since the last clean pass, and the consumed bytes still match
         file_ident = tc.seed_identity(path, self.seed_roots)
         events, raw = [], []
+        session_key = rep["session_key"]
+        if session_key is None and rep["offset"]:
+            session_key = self._key_from_raw(path, rep["rep_id"])
         pos = rep["offset"]
         line_no = rep["lines"]  # lines already journaled for this representation
         for line, end in tc.read_complete_lines(path, pos, max_bytes=tc.BATCH_BYTES):
@@ -295,13 +319,30 @@ class ClaudeSync:
             if rec is None:
                 continue
             key_line = self._key_of_line(path, rec)
+            session_key = tc.merge_session_key(session_key, key_line)
             if is_seeded(self.seeded, file_ident, line_no, key_line):
                 self.stats["skipped_seeded"] += 1
                 continue
             events.extend(project(rec, path, line_no))
-        self._write(path, rep, pos, st, events, raw, line_no)
+        self._write(path, rep, pos, st, events, raw, line_no, session_key)
 
-    def _write(self, path, rep, pos, st, events, raw, lines_total):
+    def _key_from_raw(self, path, rep_id):
+        key = None
+        for (line,) in self.mem.execute("SELECT raw FROM native_capture_raw WHERE rep_id=? ORDER BY line_no", (rep_id,)):
+            try:
+                key = tc.merge_session_key(key, self._key_of_line(path, json.loads(line)))
+            except (ValueError, UnicodeDecodeError):
+                continue
+        return key
+
+    def _restore_identity(self, path, rep):
+        key = self._key_from_raw(path, rep["rep_id"])
+        if key is not None:
+            with_retry(self.mem, lambda: self.mem.execute(
+                "UPDATE native_capture_files SET session_key=? WHERE rep_id=? AND session_key IS NULL",
+                (key, rep["rep_id"])))
+
+    def _write(self, path, rep, pos, st, events, raw, lines_total, session_key):
         def txn():
             if raw:
                 self.mem.executemany(
@@ -317,7 +358,8 @@ class ClaudeSync:
                      for tid, ts, spk, ctype, content, model, m, key in events],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
-                         tail=tc.tail_sha1(path, pos) if pos else None)
+                         tail=tc.tail_sha1(path, pos) if pos else None,
+                         instance=self._root_of(path)["instance"], session_key=session_key)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)
@@ -342,12 +384,16 @@ class ClaudeSync:
             (key,)).fetchone()
         if row is None and st is not None:
             def ins():
+                now = int(time.time())
                 cur = self.mem.execute(
                     "INSERT INTO native_capture_files(path, logical, inode, head_len, head_sha1, offset, phys_size,"
-                    " mtime, error, error_count, quarantined_until) VALUES(?,?,?,0,NULL,0,?,?,?,1,?)",
-                    (path, key, st.st_ino, st.st_size, st.st_mtime, msg[:500], int(time.time()) + tc.QUARANTINE_SECS))
+                    " mtime, instance, error, error_count, error_since, quarantined_until)"
+                    " VALUES(?,?,?,0,NULL,0,?,?,?,?,1,?,?)",
+                    (path, key, st.st_ino, st.st_size, st.st_mtime, self._root_of(path)["instance"],
+                     str(msg)[:500], now, now + tc.QUARANTINE_SECS))
                 return cur.lastrowid
-            row = (with_retry(self.mem, ins),)
+            with_retry(self.mem, ins)
+            return
         if row:
             with_retry(self.mem, lambda: tc.record_error(self.mem, row[0], msg))
 
@@ -357,9 +403,16 @@ class ClaudeSync:
             if not r["exists"]:
                 self.stats["missing_roots"].append(r["path"])
         for r in self.roots:
+            if not os.path.isdir(r["path"]):
+                continue
+            if self.args.deadline and time.time() - t0 > self.args.deadline:
+                break
+            files_before, errors_before = self.stats["files"], self.stats["errors"]
+            finished = True
             for path in session_files(r["path"]):
                 if self.args.deadline and time.time() - t0 > self.args.deadline:
                     print("soft deadline reached; rest next run", flush=True)
+                    finished = False
                     break
                 self.stats["files"] += 1
                 try:
@@ -373,6 +426,11 @@ class ClaudeSync:
                     self._fail(path, str(e))
                 except Exception as e:  # noqa: BLE001 - one bad file must not block the others
                     self._fail(path, f"{type(e).__name__}: {str(e)[:200]}")
+            if (finished and os.path.isdir(r["path"]) and
+                    (not self.args.deadline or time.time() - t0 <= self.args.deadline)):
+                with_retry(self.mem, lambda: tc.record_root_pass(
+                    self.mem, r["instance"], r["path"], self.stats["files"] - files_before,
+                    self.stats["errors"] - errors_before))
         self.stats["secs"] = round(time.time() - t0, 2)
         self.mem.close()
         print("DONE", json.dumps(self.stats), flush=True)

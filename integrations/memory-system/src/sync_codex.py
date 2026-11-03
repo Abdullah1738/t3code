@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -88,16 +89,36 @@ def _physical_lines(path, start_offset=0):
     yield from tc.read_complete_lines(path, start_offset, max_bytes=1 << 62)
 
 
-def session_files(root):
+def session_files(root, on_alias=None):
     for sub in ("sessions", "archived_sessions"):
         base = os.path.join(root, sub)
-        if not os.path.isdir(base):
+        try:
+            mode = os.stat(base).st_mode
+        except FileNotFoundError:
             continue
-        for dirpath, dirnames, filenames in os.walk(base):
+        if not stat.S_ISDIR(mode):
+            raise NotADirectoryError(base)
+        for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
             dirnames.sort()
             for name in sorted(filenames):
                 if name.startswith("rollout-") and (name.endswith(".jsonl") or name.endswith(".jsonl.zst")):
-                    yield os.path.join(dirpath, name)
+                    path = os.path.join(dirpath, name)
+                    if path.endswith(tc.ZST):
+                        parts = os.path.relpath(path[:-len(tc.ZST)], root).split(os.sep)
+                        plain_paths = [os.path.join(root, *parts)]
+                        if parts[0] in ("sessions", "archived_sessions"):
+                            parts[0] = "archived_sessions" if parts[0] == "sessions" else "sessions"
+                            plain_paths.append(os.path.join(root, *parts))
+                        if any(os.path.isfile(plain) and tc.compressed_equals_plain(path, plain)
+                               for plain in plain_paths):
+                            if on_alias:
+                                on_alias()
+                            continue
+                    yield path
+
+
+def _walk_error(error):
+    raise error
 
 
 def _text_of(content):
@@ -265,6 +286,7 @@ class CodexSync:
 
     def sync_file(self, path, st):
         key = self.key_of(path)
+        instance = self._root_of(path)["instance"]
         if tc.quarantined(self.mem, key):
             self.stats["quarantined"] += 1
             return
@@ -273,24 +295,47 @@ class CodexSync:
         if path.endswith(tc.ZST):
             known = self._latest(key)
             if self._zst_unchanged(known, st):
+                if known["path"] != path or known["instance"] != instance:
+                    def update_known():
+                        self.mem.execute("UPDATE native_capture_files SET path=?, instance=? WHERE rep_id=?",
+                                         (path, instance, known["rep_id"]))
+                    with_retry(self.mem, update_known)
+                if known["session_key"] is None:
+                    self._restore_identity(known["rep_id"])
                 self.stats["unchanged"] += 1
                 return  # archive unchanged: no decode, no head probe, no re-journal
-        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key))
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance))
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
         if not path.endswith(tc.ZST) and self._plain_unchanged(path, st, rep):
+            if rep["session_key"] is None:
+                self._restore_identity(rep["rep_id"])
             self.stats["unchanged"] += 1
             return  # nothing new, and the consumed bytes still match the checkpoint
         self._capture(path, key, rep, st)
 
     def _latest(self, key):
         row = self.mem.execute(
-            "SELECT rep_id, offset, phys_size, inode, error, quarantined_until, complete FROM native_capture_files"
+            "SELECT rep_id, offset, phys_size, inode, error, quarantined_until, complete, session_key, path, instance FROM native_capture_files"
             " WHERE logical=? AND retired=0 ORDER BY rep_id DESC LIMIT 1", (key,)).fetchone()
         if not row:
             return None
-        return dict(zip(("rep_id", "offset", "phys_size", "inode", "error", "quarantined_until", "complete"), row))
+        return dict(zip(("rep_id", "offset", "phys_size", "inode", "error", "quarantined_until", "complete",
+                         "session_key", "path", "instance"), row))
+
+    def _restore_identity(self, rep_id):
+        key = None
+        for (line,) in self.mem.execute("SELECT raw FROM native_capture_raw WHERE rep_id=? ORDER BY line_no", (rep_id,)):
+            try:
+                rec = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "session_meta" and isinstance(rec.get("payload"), dict):
+                key = tc.merge_session_key(key, rec["payload"].get("id"))
+        if key is not None:
+            with_retry(self.mem, lambda: self.mem.execute(
+                "UPDATE native_capture_files SET session_key=? WHERE rep_id=? AND session_key IS NULL", (key, rep_id)))
 
     @staticmethod
     def _plain_unchanged(path, st, rep):
@@ -308,6 +353,7 @@ class CodexSync:
         file_ident = tc.seed_identity(path, self.seed_roots)
         file_hash = _first_line_hash(path)
         proj = CodexProjector(file_hash)
+        session_key = rep["session_key"]
         line_no = 0
         pos = 0
         if rep["offset"]:
@@ -321,6 +367,7 @@ class CodexSync:
                     continue
                 if isinstance(rec, dict):
                     proj.feed(rec, line_no, line_sha=tc.raw_sha1(line))  # state only: same as the live path
+                    session_key = tc.merge_session_key(session_key, proj.session_id)
             proj.inherited = 0
             pos = rep["offset"]
         batch_rows, batch_raw, batch_end, batch_bytes = [], [], pos, 0
@@ -339,20 +386,31 @@ class CodexSync:
                     self.stats["skipped_seeded"] += 1
                 else:
                     for row in proj.feed(rec, line_no, line_sha=tc.raw_sha1(line)):
-                        batch_rows.append(row)
+                        batch_rows.append((proj.session_id, *row))
+                session_key = tc.merge_session_key(session_key, proj.session_id)
             if batch_bytes >= tc.BATCH_BYTES:
-                self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=False)
+                self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no,
+                            eof=False, session_key=session_key)
                 batch_rows, batch_raw, batch_bytes = [], [], 0
         # Reached only when the loop read the stream to its end (a read or zstd error raises first).
         # The final commit marks the checkpoint complete. It also runs when the physical identity
         # changed: a plain rollout converted to .zst under the same name keeps its old inode
         # otherwise, the unchanged shortcut never fires, and every tick decodes the archive again.
         # An unchanged, complete file costs no write.
-        if batch_raw or batch_end != rep["offset"] or not rep.get("complete") or rep.get("inode") != st.st_ino:
-            self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no, eof=True)
+        if (batch_raw or batch_end != rep["offset"] or not rep.get("complete") or rep.get("inode") != st.st_ino
+                or rep.get("error") or rep.get("error_count")
+                or session_key != rep["session_key"]):
+            self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no,
+                        eof=True, session_key=session_key)
         self.stats["skipped_inherited"] += proj.inherited
 
-    def _write(self, path, logical, rep, pos, st, proj, events, raw, lines_total, eof=False):
+    def _write(self, path, logical, rep, pos, st, proj, events, raw, lines_total, eof=False, session_key=None):
+        tail = ((tc.compressed_tail_sha1(path, pos) if path.endswith(tc.ZST) else tc.tail_sha1(path, pos))
+                if pos else None)
+
+        if pos and path.endswith(tc.ZST) and tail is None:
+            raise ValueError("compressed stream shorter than capture checkpoint")
+
         def txn():
             if raw:
                 self.mem.executemany(
@@ -360,17 +418,18 @@ class CodexSync:
                     [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line))
                      for line, ln in raw],
                 )
-            if events and proj.session_id:
+            if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, proj.session_id, tid, ts or int(time.time()), spk, text, ctype, model,
-                      json.dumps(m, ensure_ascii=False)) for tid, spk, ctype, text, model, m, ts in events],
+                     [(SOURCE, event_session, tid, ts or int(time.time()), spk, text, ctype, model,
+                       json.dumps(m, ensure_ascii=False)) for event_session, tid, spk, ctype, text, model, m, ts in events],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
-                         tail=tc.tail_sha1(path, pos) if pos and not path.endswith(tc.ZST) else None,
-                         complete=eof, inode=st.st_ino)
+                         tail=tail,
+                         complete=eof, inode=st.st_ino, instance=self._root_of(path)["instance"],
+                         session_key=session_key, clear_error=eof)
 
         with_retry(self.mem, txn)
         self.stats["rows"] += len(events)
@@ -405,10 +464,12 @@ class CodexSync:
             st = os.stat(path)
         except OSError:
             return  # gone entirely: nothing to quarantine
+        now = int(time.time())
         cur = self.mem.execute(
             "INSERT INTO native_capture_files(path, logical, inode, head_len, head_sha1, offset, phys_size, mtime,"
-            " error, error_count, quarantined_until) VALUES(?,?,?,0,NULL,0,?,?,?,1,?)",
-            (path, key, st.st_ino, st.st_size, st.st_mtime, str(msg)[:500], int(time.time()) + tc.QUARANTINE_SECS))
+            " error, error_count, error_since, quarantined_until, instance) VALUES(?,?,?,0,NULL,0,?,?,?,1,?,?,?)",
+            (path, key, st.st_ino, st.st_size, st.st_mtime, str(msg)[:500], now, now + tc.QUARANTINE_SECS,
+             self._root_of(path)["instance"]))
         return cur.lastrowid
 
     def run(self):
@@ -417,9 +478,20 @@ class CodexSync:
             if not r["exists"]:
                 self.stats["missing_roots"].append(r["path"])
         for r in self.roots:
-            for path in session_files(r["path"]):
+            if not os.path.isdir(r["path"]):
+                continue
+            if self.args.deadline and time.time() - t0 > self.args.deadline:
+                break
+            files_before, errors_before = self.stats["files"], self.stats["errors"]
+            finished = True
+            def skip_alias():
+                self.stats["files"] += 1
+                self.stats["unchanged"] += 1
+
+            for path in session_files(r["path"], on_alias=skip_alias):
                 if self.args.deadline and time.time() - t0 > self.args.deadline:
                     print("soft deadline reached; rest next run", flush=True)
+                    finished = False
                     break
                 self.stats["files"] += 1
                 try:
@@ -440,6 +512,11 @@ class CodexSync:
                     self._fail(path, f"zstd failed rc={e.returncode}")
                 except Exception as e:  # noqa: BLE001 - one bad file must not block the others
                     self._fail(path, f"{type(e).__name__}: {str(e)[:200]}")
+            if (finished and os.path.isdir(r["path"]) and
+                    (not self.args.deadline or time.time() - t0 <= self.args.deadline)):
+                with_retry(self.mem, lambda: tc.record_root_pass(
+                    self.mem, r["instance"], r["path"], self.stats["files"] - files_before,
+                    self.stats["errors"] - errors_before))
         self.stats["secs"] = round(time.time() - t0, 2)
         self.mem.close()
         print("DONE", json.dumps(self.stats), flush=True)
