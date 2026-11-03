@@ -34,18 +34,28 @@ import * as ThreadManagementService from "../../orchestration-v2/ThreadManagemen
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { planBoard, type BoardPlan, type BoardSnapshot } from "./boardPlan.ts";
 import { planSettings, type SettingsPlan } from "./settingsPlan.ts";
-import { planSelection } from "./selectionPlan.ts";
+import { planFallbacks, type FallbackPlan } from "./fallbackPlan.ts";
+import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
+import { planSelection, sameValue } from "./selectionPlan.ts";
 
 /** The version stamped on every ledger row this migration writes. */
 export const SELECTION_MIGRATION_VERSION = 1;
 
-export type MigrationScope = "settings" | "project" | "board" | "schedule" | "queued-run" | "thread";
+export type MigrationScope =
+  | "settings"
+  | "project"
+  | "board"
+  | "schedule"
+  | "schedule-fallbacks"
+  | "queued-run"
+  | "thread";
 
 const SCOPES: ReadonlyArray<MigrationScope> = [
   "settings",
   "project",
   "board",
   "schedule",
+  "schedule-fallbacks",
   "queued-run",
   "thread",
 ];
@@ -207,6 +217,11 @@ interface Plans {
     readonly before: ModelSelection;
     readonly next: ModelSelection;
   }>;
+  readonly fallbacks: ReadonlyArray<{
+    readonly task: { readonly id: ScheduledTaskId; readonly createdAt: string };
+    readonly stored: BlockRetry;
+    readonly plan: FallbackPlan;
+  }>;
   readonly queued: ReadonlyArray<{
     readonly threadId: ThreadId;
     readonly runId: string;
@@ -314,12 +329,31 @@ export const make = Effect.gen(function* () {
       Effect.mapError((cause) => migrationError("read schedules", cause)),
     );
     const schedules: Array<Plans["schedules"][number]> = [];
+    const fallbacks: Array<Plans["fallbacks"][number]> = [];
     for (const task of listed.tasks) {
       const plan = planSelection(task.modelSelection);
       if (plan._tag === "conflict") {
         conflicts.push({ scope: "schedule", ref: task.id, reason: plan.reason });
       } else if (plan._tag === "mapped") {
         schedules.push({ id: task.id, before: task.modelSelection, next: plan.next });
+      }
+
+      // The provider-block fallbacks: read through the table's own reader, planned, and written back
+      // through its own writer, so the task's creation-time guard and limits stay as they are.
+      const stored = yield* readBlockRetry(sql, task).pipe(
+        Effect.mapError((cause) => migrationError(`read fallbacks ${task.id}`, cause)),
+      );
+      if (stored === null || stored.fallbacks.length === 0) continue;
+      const fallbackPlan = planFallbacks({ taskId: task.id, fallbacks: stored.fallbacks });
+      for (const conflict of fallbackPlan.conflicts) {
+        conflicts.push({
+          scope: "schedule",
+          ref: `${task.id}:fallbacks[${conflict.index}]`,
+          reason: conflict.reason,
+        });
+      }
+      if (fallbackPlan.changed) {
+        fallbacks.push({ task, stored, plan: fallbackPlan });
       }
     }
 
@@ -379,6 +413,7 @@ export const make = Effect.gen(function* () {
       projectDefaults,
       boards,
       schedules,
+      fallbacks,
       queued,
       threads: threadPlans,
       conflicts,
@@ -407,6 +442,15 @@ export const make = Effect.gen(function* () {
     for (const plan of plans.schedules) {
       counts.schedule += 1;
       changes.push({ scope: "schedule", ref: plan.id, before: plan.before, after: plan.next });
+    }
+    for (const entry of plans.fallbacks) {
+      counts["schedule-fallbacks"] += 1;
+      changes.push({
+        scope: "schedule-fallbacks",
+        ref: entry.task.id,
+        before: entry.plan.before,
+        after: entry.plan.after,
+      });
     }
     for (const plan of plans.queued) {
       counts["queued-run"] += 1;
@@ -521,6 +565,18 @@ export const make = Effect.gen(function* () {
         .pipe(Effect.mapError((cause) => migrationError(`write schedule ${plan.id}`, cause)));
       if (wrote) yield* record("schedule", plan.id, plan.before, plan.next);
     }
+    // Provider-block fallbacks: written through the table's own writer, keeping its creation-time guard
+    // and limits. Each list is re-read first, and only written while it still equals what was planned.
+    for (const entry of plans.fallbacks) {
+      const current = yield* readBlockRetry(sql, entry.task).pipe(
+        Effect.mapError((cause) => migrationError(`reread fallbacks ${entry.task.id}`, cause)),
+      );
+      if (current === null || !sameValue(current.fallbacks, entry.plan.before)) continue;
+      yield* writeBlockRetry(sql, entry.task, { ...entry.stored, fallbacks: entry.plan.after }).pipe(
+        Effect.mapError((cause) => migrationError(`write fallbacks ${entry.task.id}`, cause)),
+      );
+      yield* record("schedule-fallbacks", entry.task.id, entry.plan.before, entry.plan.after);
+    }
     // Queued runs: the orchestrator's rebind, which keeps order, attachments and the hold.
     for (const plan of plans.queued) {
       const queuedCommandId = yield* newCommandId(`queued:${plan.runId}`);
@@ -618,6 +674,7 @@ export const make = Effect.gen(function* () {
         case "queued-run":
         case "thread":
         case "board":
+        case "schedule-fallbacks":
           return undefined;
       }
     });
@@ -667,6 +724,10 @@ export const make = Effect.gen(function* () {
         case "thread":
           // Board rows are restored together by restoreBoards; a lone row is never written.
           return `${scope} rows restore with their board, not alone`;
+        case "schedule-fallbacks":
+          // The fallback list is restorable in principle, but the restore path is not built yet. It is
+          // reported as skipped, never stamped as reverted.
+          return "schedule-fallbacks rollback is not implemented yet";
       }
     });
 
