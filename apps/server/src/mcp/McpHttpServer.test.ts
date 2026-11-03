@@ -1298,7 +1298,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("preserves the missing-token response when OAuth is unavailable", () =>
+it.effect("preserves missing and OAuth-shaped token responses when OAuth is unavailable", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const serverLayer = McpHttpServer.layerMcpTransport.pipe(
@@ -1317,6 +1317,15 @@ it.effect("preserves the missing-token response when OAuth is unavailable", () =
       expect(response.headers["cache-control"]).toBe("no-store");
       expect(response.headers["www-authenticate"]).toBe("Bearer");
       expect(yield* response.json).toEqual({
+        error: "invalid_mcp_credential",
+        message: "A valid T3 Code MCP credential is required.",
+      });
+      const client = yield* httpClient.post("/mcp", {
+        headers: { authorization: "Bearer stale-payload.stale-signature" },
+      });
+      expect(client.status).toBe(401);
+      expect(client.headers["www-authenticate"]).toBe('Bearer error="invalid_token"');
+      expect(yield* client.json).toEqual({
         error: "invalid_mcp_credential",
         message: "A valid T3 Code MCP credential is required.",
       });
