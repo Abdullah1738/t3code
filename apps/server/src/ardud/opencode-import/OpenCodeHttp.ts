@@ -1,5 +1,5 @@
 /**
- * Read-only access to the shared OpenCode 2 service over its HTTP API.
+ * Access to the shared OpenCode 2 service over its HTTP API.
  * Lenient decoding, so fields an older or newer server adds or drops do not
  * break the import.
  */
@@ -176,12 +176,27 @@ const SETTINGS_READ_TIMEOUT = "2 seconds";
 
 export const configuredConnection = (
   settings: ServerSettings.ServerSettingsService["Service"],
+  providerInstanceId?: string,
 ): Effect.Effect<ConfiguredConnection> =>
   settings.getSettings.pipe(
     Effect.timeoutOption(SETTINGS_READ_TIMEOUT),
     Effect.map((read): ConfiguredConnection => {
       if (read._tag === "None") return { kind: "unknown" };
-      const instances = read.value.providerInstances;
+      const allInstances: Readonly<
+        Record<string, { readonly driver: string; readonly config?: unknown }>
+      > = read.value.providerInstances;
+      // ardud: an interrupt must target the instance that owns this session, not
+      // whichever OpenCode server happens to be configured first.
+      const instance =
+        providerInstanceId === undefined ? undefined : allInstances[providerInstanceId];
+      if (
+        providerInstanceId !== undefined &&
+        (instance === undefined || instance.driver !== "opencode")
+      ) {
+        return { kind: "unknown" };
+      }
+      const instances =
+        providerInstanceId === undefined ? allInstances : { [providerInstanceId]: instance! };
       const opencode = openCodeServerConfig(instances);
       if (opencode !== undefined) {
         return {
@@ -265,6 +280,26 @@ const getJson = <A>(
     Effect.provide(FetchHttpClient.layer),
   );
 
+// ardud: abort only needs the status, not the response body.
+const post = (connection: OpenCodeConnection, path: string, operation: string) =>
+  Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient;
+    const response = yield* client.execute(
+      HttpClientRequest.post(`${connection.baseUrl}${path}`).pipe(
+        HttpClientRequest.setHeader("authorization", connection.authorization),
+        HttpClientRequest.acceptJson,
+      ),
+    );
+    if (response.status < 200 || response.status >= 300) {
+      return yield* new OpenCodeHttpError({ operation, status: response.status });
+    }
+  }).pipe(
+    Effect.mapError((cause) =>
+      isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+    ),
+    Effect.provide(FetchHttpClient.layer),
+  );
+
 const query = (params: Record<string, string | number | undefined>) => {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -272,6 +307,10 @@ const query = (params: Record<string, string | number | undefined>) => {
   }
   return search.toString();
 };
+
+// ardud: OpenCode 2 interrupts an execution by session ID, without a location query.
+export const abortSession = (connection: OpenCodeConnection, sessionId: string) =>
+  post(connection, `/api/session/${encodeURIComponent(sessionId)}/interrupt`, "interrupt session");
 
 /**
  * Pages a list newest first. `keepGoing` sees each page and can stop early;

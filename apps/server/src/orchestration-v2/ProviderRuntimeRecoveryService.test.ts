@@ -16,7 +16,9 @@ import {
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Ref from "effect/Ref";
@@ -28,6 +30,10 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  StaleOpenCodeSessions,
+  type StaleOpenCodeSession,
+} from "../ardud/opencode-import/StaleRuns.ts";
 
 it.effect("leaves durable effects for the worker after runtime reconciliation", () =>
   Effect.gen(function* () {
@@ -62,8 +68,381 @@ it.effect("leaves durable effects for the worker after runtime reconciliation", 
       closedRequests: 0,
       retiredEffects: 0,
       requeuedEffects: 0,
+      staleOpenCodeAborted: 0,
+      staleOpenCodeAbortFailed: 0,
     });
     assert.equal(yield* Ref.get(runs), 0);
+  }),
+);
+
+type RecoveryCommit = Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0];
+
+function staleRecoveryProjection(
+  suffix: string,
+  options: {
+    readonly driver?: "opencode" | "codex";
+    readonly worktreePath?: string | null;
+    readonly ownerNodeId?: NodeId | null;
+    readonly nativeId?: string;
+    readonly providerThreadStatus?: "active" | "idle";
+    readonly runStatus?: "running" | "waiting" | "completed" | "none";
+    readonly differentRunProviderThread?: boolean;
+  } = {},
+) {
+  const threadId = ThreadId.make(`thread:stale-${suffix}`);
+  const providerThreadId = ProviderThreadId.make(`provider-thread:stale-${suffix}`);
+  const providerSessionId = ProviderSessionId.make(`provider-session:stale-${suffix}`);
+  const runId = RunId.make(`run:stale-${suffix}`);
+  const attemptId = RunAttemptId.make(`attempt:stale-${suffix}`);
+  const driver = ProviderDriverKind.make(options.driver ?? "opencode");
+  const providerInstanceId = ProviderInstanceId.make(options.driver ?? "opencode");
+  const startedAt = DateTime.makeUnsafe("2026-10-30T00:00:00.000Z");
+
+  return {
+    thread: {
+      id: threadId,
+      projectId: ProjectId.make("project:stale"),
+      providerInstanceId,
+      worktreePath: options.worktreePath ?? null,
+      archivedAt: null,
+      deletedAt: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    },
+    runs:
+      options.runStatus === "none"
+        ? []
+        : [
+            {
+              id: runId,
+              ordinal: 1,
+              status: options.runStatus ?? "running",
+              providerInstanceId,
+              providerThreadId: options.differentRunProviderThread
+                ? ProviderThreadId.make(`provider-thread:other-${suffix}`)
+                : providerThreadId,
+              activeAttemptId: attemptId,
+              requestedAt: startedAt,
+              startedAt,
+              completedAt: options.runStatus === "completed" ? startedAt : null,
+            },
+          ],
+    providerThreads: [
+      {
+        id: providerThreadId,
+        appThreadId: threadId,
+        ownerNodeId: options.ownerNodeId ?? null,
+        driver,
+        providerInstanceId,
+        providerSessionId,
+        nativeThreadRef: {
+          driver,
+          nativeId: options.nativeId ?? `ses_stale_${suffix}`,
+          strength: "strong",
+        },
+        status: options.providerThreadStatus ?? "active",
+        pendingBackgroundTasks: [],
+      },
+    ],
+    providerSessions: [{ id: providerSessionId, driver, providerInstanceId, status: "ready" }],
+    providerTurns: [
+      {
+        id: ProviderTurnId.make(`turn:stale-${suffix}`),
+        providerThreadId,
+        runAttemptId: attemptId,
+        status: "running",
+      },
+    ],
+    runtimeRequests: [],
+    attempts: [],
+    nodes: [],
+    subagents: [],
+    messages: [],
+    turnItems: [],
+  } as unknown as ProjectionStore.ProjectionRuntimeRecoveryState;
+}
+
+function staleRecoveryLayer(input: {
+  readonly projections: ReadonlyArray<ProjectionStore.ProjectionRuntimeRecoveryState>;
+  readonly commits: Array<RecoveryCommit>;
+  readonly abort?: StaleOpenCodeSessions["Service"]["abort"];
+  readonly replayableRunId?: RunId;
+  readonly onCommit?: () => void;
+}) {
+  return ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () =>
+            Effect.succeed(input.projections.map(({ thread }) => thread.id)),
+          getRuntimeRecoveryProjection: (id) =>
+            Effect.succeed(input.projections.find(({ thread }) => thread.id === id)!),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (command) =>
+            Effect.sync(() => {
+              input.onCommit?.();
+              input.commits.push(command);
+              return { committed: true, cancelledEffectCount: 0 } as never;
+            }),
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listByCommandId: () =>
+            Effect.succeed(
+              input.replayableRunId === undefined
+                ? []
+                : ([
+                    {
+                      request: { type: "checkpoint.capture", runId: input.replayableRunId },
+                      status: "pending",
+                    },
+                  ] as never),
+            ),
+          cancelUnsettled: () => Effect.succeed([]),
+          signalCancellations: () => Effect.void,
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+        input.abort === undefined
+          ? Layer.empty
+          : Layer.succeed(StaleOpenCodeSessions, { abort: input.abort }),
+      ),
+    ),
+  );
+}
+
+it.effect("awaits the stale OpenCode abort before committing startup recovery", () =>
+  Effect.gen(function* () {
+    const projection = staleRecoveryProjection("worktree", { worktreePath: "/repo/worktree" });
+    const commits: Array<RecoveryCommit> = [];
+    const order: Array<string> = [];
+    const releaseAbort = yield* Deferred.make<void>();
+    const abort = vi.fn((_sessions: ReadonlyArray<StaleOpenCodeSession>) =>
+      Effect.gen(function* () {
+        order.push("abort started");
+        yield* Deferred.await(releaseAbort);
+        order.push("abort finished");
+        return { aborted: 1, failed: 0 };
+      }),
+    );
+    const layer = staleRecoveryLayer({
+      projections: [projection],
+      commits,
+      abort,
+      onCommit: () => order.push("commit"),
+    });
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(layer),
+    );
+    const fiber = yield* recovery
+      .reconcile("startup")
+      .pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Effect.yieldNow;
+    const orderWhileBlocked = [...order];
+    const commitsWhileBlocked = commits.length;
+    yield* Deferred.succeed(releaseAbort, undefined);
+    const summary = yield* Fiber.join(fiber);
+
+    assert.deepEqual(orderWhileBlocked, ["abort started"]);
+    assert.equal(commitsWhileBlocked, 0);
+    assert.deepEqual(order, ["abort started", "abort finished", "commit"]);
+    assert.equal(abort.mock.calls.length, 1);
+    assert.deepEqual(abort.mock.calls[0], [
+      [
+        {
+          sessionId: "ses_stale_worktree",
+          directory: "/repo/worktree",
+          providerInstanceId: "opencode",
+        },
+      ],
+    ]);
+    assert.equal(summary.terminalizedRuns, 1);
+    assert.equal(summary.staleOpenCodeAborted, 1);
+    assert.equal(summary.staleOpenCodeAbortFailed, 0);
+    assert.equal(commits.length, 1);
+    assert.isTrue(
+      commits[0]!.events.some(
+        (event) => event.type === "run.updated" && event.payload.status === "cancelled",
+      ),
+    );
+    assert.deepEqual(
+      commits[0]!.effects.map((effect) => effect.request),
+      [{ type: "provider-runtime.continue", sourceRunId: projection.runs[0]!.id }],
+    );
+  }),
+);
+
+it.effect("uses null without a worktree and aggregates abort counts across projections", () =>
+  Effect.gen(function* () {
+    const projections = [
+      staleRecoveryProjection("no-path"),
+      staleRecoveryProjection("second", { worktreePath: "/repo/second" }),
+    ];
+    const commits: Array<RecoveryCommit> = [];
+    const abort = vi.fn((sessions: ReadonlyArray<StaleOpenCodeSession>) =>
+      Effect.succeed(
+        sessions[0]?.sessionId === "ses_stale_no-path"
+          ? { aborted: 0, failed: 1 }
+          : { aborted: 1, failed: 0 },
+      ),
+    );
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(staleRecoveryLayer({ projections, commits, abort })),
+    );
+    const summary = yield* recovery.reconcile("startup");
+
+    assert.deepEqual(abort.mock.calls, [
+      [[{ sessionId: "ses_stale_no-path", directory: null, providerInstanceId: "opencode" }]],
+      [
+        [
+          {
+            sessionId: "ses_stale_second",
+            directory: "/repo/second",
+            providerInstanceId: "opencode",
+          },
+        ],
+      ],
+    ]);
+    assert.equal(summary.terminalizedRuns, 2);
+    assert.equal(summary.staleOpenCodeAborted, 1);
+    assert.equal(summary.staleOpenCodeAbortFailed, 1);
+    assert.equal(commits.length, 2);
+  }),
+);
+
+it.effect("does not abort stale OpenCode sessions during shutdown", () =>
+  Effect.gen(function* () {
+    const commits: Array<RecoveryCommit> = [];
+    const abort = vi.fn((_sessions: ReadonlyArray<StaleOpenCodeSession>) =>
+      Effect.succeed({ aborted: 0, failed: 0 }),
+    );
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({ projections: [staleRecoveryProjection("shutdown")], commits, abort }),
+      ),
+    );
+    const summary = yield* recovery.reconcile("shutdown");
+
+    assert.equal(abort.mock.calls.length, 0);
+    assert.equal(summary.terminalizedRuns, 1);
+    assert.equal(summary.staleOpenCodeAborted, 0);
+    assert.equal(summary.staleOpenCodeAbortFailed, 0);
+    assert.isTrue(commits[0]!.events.some((event) => event.type === "run.updated"));
+  }),
+);
+
+it.effect.each([
+  { name: "another provider", options: { driver: "codex" as const }, terminalizedRuns: 1 },
+  {
+    name: "a non-root provider thread",
+    options: { ownerNodeId: NodeId.make("child") },
+    terminalizedRuns: 1,
+  },
+  {
+    name: "an idle provider thread",
+    options: { providerThreadStatus: "idle" as const },
+    terminalizedRuns: 1,
+  },
+  {
+    name: "a non-session native id",
+    options: { nativeId: "native-not-a-session" },
+    terminalizedRuns: 1,
+  },
+  { name: "a completed run", options: { runStatus: "completed" as const }, terminalizedRuns: 0 },
+  { name: "no run", options: { runStatus: "none" as const }, terminalizedRuns: 0 },
+  {
+    name: "a run belonging to another provider thread",
+    options: { differentRunProviderThread: true },
+    terminalizedRuns: 1,
+  },
+])("does not abort for $name", ({ options, terminalizedRuns }) =>
+  Effect.gen(function* () {
+    const commits: Array<RecoveryCommit> = [];
+    const abort = vi.fn((_sessions: ReadonlyArray<StaleOpenCodeSession>) =>
+      Effect.succeed({ aborted: 0, failed: 0 }),
+    );
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({
+          projections: [staleRecoveryProjection("skipped", options)],
+          commits,
+          abort,
+        }),
+      ),
+    );
+    const summary = yield* recovery.reconcile("startup");
+
+    assert.equal(abort.mock.calls.length, 0);
+    assert.equal(summary.terminalizedRuns, terminalizedRuns);
+    assert.equal(summary.staleOpenCodeAborted, 0);
+    assert.equal(summary.staleOpenCodeAbortFailed, 0);
+    assert.equal(commits.length, 1);
+  }),
+);
+
+it.effect("does not abort a waiting run whose checkpoint can be replayed", () =>
+  Effect.gen(function* () {
+    const projection = staleRecoveryProjection("replay", { runStatus: "waiting" });
+    const commits: Array<RecoveryCommit> = [];
+    const abort = vi.fn((_sessions: ReadonlyArray<StaleOpenCodeSession>) =>
+      Effect.succeed({ aborted: 0, failed: 0 }),
+    );
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({
+          projections: [projection],
+          commits,
+          abort,
+          replayableRunId: projection.runs[0]!.id,
+        }),
+      ),
+    );
+    const summary = yield* recovery.reconcile("startup");
+
+    assert.equal(abort.mock.calls.length, 0);
+    assert.equal(summary.terminalizedRuns, 0);
+    assert.equal(summary.staleOpenCodeAborted, 0);
+    assert.equal(summary.staleOpenCodeAbortFailed, 0);
+    assert.equal(commits.length, 1);
+    assert.isFalse(commits[0]!.events.some((event) => event.type === "run.updated"));
+  }),
+);
+
+it.effect("recovers without an optional stale OpenCode abort service", () =>
+  Effect.gen(function* () {
+    const commits: Array<RecoveryCommit> = [];
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({ projections: [staleRecoveryProjection("no-service")], commits }),
+      ),
+    );
+    const summary = yield* recovery.reconcile("startup");
+
+    assert.equal(summary.terminalizedRuns, 1);
+    assert.equal(summary.staleOpenCodeAborted, 0);
+    assert.equal(summary.staleOpenCodeAbortFailed, 0);
+    assert.equal(commits.length, 1);
+    assert.isTrue(commits[0]!.events.some((event) => event.type === "run.updated"));
+  }),
+);
+
+it.effect("continues recovery and counts a defective stale abort as failed", () =>
+  Effect.gen(function* () {
+    const commits: Array<RecoveryCommit> = [];
+    const abort = vi.fn((_sessions: ReadonlyArray<StaleOpenCodeSession>) => Effect.die("failed"));
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({ projections: [staleRecoveryProjection("defect")], commits, abort }),
+      ),
+    );
+    const summary = yield* recovery.reconcile("startup");
+
+    assert.equal(abort.mock.calls.length, 1);
+    assert.equal(summary.terminalizedRuns, 1);
+    assert.equal(summary.staleOpenCodeAborted, 0);
+    assert.equal(summary.staleOpenCodeAbortFailed, 1);
+    assert.equal(commits.length, 1);
   }),
 );
 
