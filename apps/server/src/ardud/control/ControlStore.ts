@@ -4,6 +4,7 @@
  * that touches these tables, created idempotently, never a numbered migration.
  */
 import type { ThreadId } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -111,6 +112,7 @@ export const make = Effect.gen(function* () {
         `,
       { concurrency: 1 },
     ).pipe(
+      NodeSqliteClient.readOnly,
       Effect.map((pages) => new Map(pages.flat().map((row) => [row.thread_id, row.origin]))),
       Effect.mapError(fail("read-origins")),
     );
@@ -157,6 +159,7 @@ export const make = Effect.gen(function* () {
       // Two app threads claim this id: refuse rather than pick one.
       return threadIds.size === 1 ? [...threadIds][0]! : null;
     },
+    NodeSqliteClient.readOnly,
     Effect.mapError(fail("read-native-session")),
   );
 
@@ -181,6 +184,7 @@ export const make = Effect.gen(function* () {
         `,
       { concurrency: 1 },
     ).pipe(
+      NodeSqliteClient.readOnly,
       Effect.map((pages) => {
         const out = new Map<
           string,
@@ -226,6 +230,7 @@ export const make = Effect.gen(function* () {
       SELECT thread_id FROM orchestration_v2_projection_runtime_requests
       WHERE status = 'pending'
     `.pipe(
+      NodeSqliteClient.readOnly,
       Effect.map((rows) => rows.map((row) => row.thread_id)),
       Effect.mapError(fail("read-live-threads")),
     );
@@ -235,6 +240,7 @@ export const make = Effect.gen(function* () {
       SELECT DISTINCT thread_id FROM orchestration_v2_projection_runtime_requests
       WHERE status = 'pending'
     `.pipe(
+      NodeSqliteClient.readOnly,
       Effect.map((rows) => rows.map((row) => row.thread_id)),
       Effect.mapError(fail("read-pending-request-threads")),
     );

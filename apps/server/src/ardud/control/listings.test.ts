@@ -13,8 +13,13 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
@@ -28,6 +33,7 @@ import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.t
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -205,6 +211,7 @@ const snapshotFor = (location: "active" | "archive") => {
 const makeHarness = (buildCommit?: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const projects = yield* ProjectStore.make;
     yield* seedRows;
     const snapshotReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
@@ -241,9 +248,21 @@ const makeHarness = (buildCommit?: string) =>
                 threads,
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                 Layer.mock(Orchestrator.OrchestratorV2)({}),
-                Layer.mock(ProjectService.ProjectService)({}),
+                Layer.mock(ProjectService.ProjectService)({
+                  listShells: (options) =>
+                    projects.listShells(options).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProjectService.ProjectOperationError({
+                            operation: "list-projects",
+                            cause,
+                          }),
+                      ),
+                    ),
+                }),
                 Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
                   namedProjectsRoot: "/tmp/named",
+                  scratchRoot: Effect.succeed(Option.none()),
                 }),
                 Layer.mock(ProviderRegistry.ProviderRegistry)({}),
                 ServerSettings.layerTest(),
@@ -330,6 +349,46 @@ describe("control listings", () => {
         );
       }
     }),
+  );
+  it.live("lists projects from the reader while the writer is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-projects-reader-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        yield* sql`INSERT INTO projection_projects
+          (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+          VALUES ('reader-project', 'Reader project', '/workspace/reader', '[]',
+            '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`;
+        // Initialize route layers and their DDL before testing a request.
+        assert.strictEqual((yield* harness.get("/projects")).status, 200);
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        yield* Deferred.await(held);
+        const response = yield* harness.get("/projects").pipe(
+          Effect.timeout("5 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(writer);
+        assert.strictEqual(response.status, 200);
+        assert.deepStrictEqual(response.body.projects, [
+          {
+            projectId: "reader-project",
+            title: "Reader project",
+            workspaceRoot: "/workspace/reader",
+            defaultModel: null,
+            scratch: false,
+          },
+        ]);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads }) =>

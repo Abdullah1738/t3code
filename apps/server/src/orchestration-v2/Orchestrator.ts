@@ -64,6 +64,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
@@ -12425,9 +12426,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         ),
     getThreadRecords: (threadId, fields, filter) =>
-      projectionStore
-        .getThreadRecords(threadId, fields, filter)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getThreadRecords(threadId, fields, filter).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getThreadProjection: (threadId) =>
       projectionStore
         .getThreadProjection(threadId)
@@ -12437,15 +12439,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .getCheckpointContext(threadId)
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
     getThreadSnapshot: (threadId) =>
-      projectionStore
-        .getThreadSnapshot(threadId)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getThreadSnapshot(threadId).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getThreadSnapshotWindow: (threadId, options) =>
-      projectionStore
-        .getThreadSnapshotWindow(threadId, options)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getThreadSnapshotWindow(threadId, options).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getShellSnapshot: (options) =>
-      projectionStore.getShellSnapshot(options).pipe(Effect.mapError(shellProjectionError)),
+      projectionStore
+        .getShellSnapshot(options)
+        .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     readShellSnapshot: (options) =>
       projectionStore
         .readShellSnapshot(options)
@@ -12454,9 +12460,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.map(Effect.mapError(shellProjectionError)),
         ),
     getThreadShell: (threadId) =>
-      projectionStore
-        .getThreadShell(threadId)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getThreadShell(threadId).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getThreadEventSequence: (threadId) =>
       eventSink
         .latestSequence({ threadId })

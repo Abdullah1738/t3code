@@ -7,16 +7,21 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -677,6 +682,278 @@ layer("OrchestrationEventStore", (it) => {
       }),
   );
 });
+
+it.live(
+  "restores prompts and preserves unknown and malformed replay decoding while the writer is held",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-event-reader-decode-",
+      });
+      const layerFile = OrchestrationEventStore.layer.pipe(
+        Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"))),
+        Layer.provide(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread:reader-decode");
+        const projectId = ProjectId.make("project:reader-decode");
+        const now = DateTime.makeUnsafe("2026-09-03T00:00:00.000Z");
+        const nowString = DateTime.formatIso(now);
+        const driver = ProviderDriverKind.make("claudeAgent");
+        const providerInstanceId = ProviderInstanceId.make("claudeAgent");
+        const subagentId = NodeId.make("node:reader-decode");
+        const prompt = "Read the original prompt. ".repeat(100);
+        const subagent = (id: string) =>
+          ({
+            id: EventId.make(id),
+            type: "subagent.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: subagentId,
+              threadId,
+              runId: null,
+              parentNodeId: NodeId.make("node:reader-parent"),
+              origin: "provider_native",
+              createdBy: "agent",
+              driver,
+              providerInstanceId,
+              providerThreadId: null,
+              childThreadId: null,
+              nativeTaskRef: null,
+              prompt,
+              progress: id,
+              title: "Reader",
+              model: null,
+              status: "running",
+              result: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+            },
+          }) satisfies OrchestrationV2DomainEvent;
+        const item = (id: string) =>
+          ({
+            id: EventId.make(id),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("item:reader-decode"),
+              type: "subagent",
+              threadId,
+              runId: null,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 1,
+              status: "running",
+              title: "Reader",
+              subagentId,
+              origin: "provider_native",
+              driver,
+              providerInstanceId,
+              childThreadId: null,
+              prompt,
+              progress: id,
+              result: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+            },
+          }) satisfies OrchestrationV2DomainEvent;
+
+        const project = yield* store.appendProjectEvent({
+          type: "project.created",
+          eventId: EventId.make("project:reader-decode:created"),
+          aggregateKind: "project",
+          aggregateId: projectId,
+          occurredAt: nowString,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: {
+            projectId,
+            title: "Reader",
+            workspaceRoot: "/tmp/reader-decode",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: nowString,
+            updatedAt: nowString,
+          },
+        });
+        const anchors = yield* store.appendAgentEvents({
+          events: [subagent("anchor:subagent"), item("anchor:item")],
+        });
+        const unknown = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO orchestration_events ${sql.insert(
+          Array.from({ length: 1_000 }, (_, index) => ({
+            event_id: `unknown:thread:${index}`,
+            aggregate_kind: "thread",
+            stream_id: threadId,
+            stream_version: index + 2,
+            event_type: "future.unknown",
+            occurred_at: nowString,
+            actor_kind: "server",
+            payload_json: "not JSON",
+            metadata_json: "{}",
+            application_event_version: 2,
+          })),
+        )} RETURNING sequence
+      `;
+        const [unknownProject] = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'unknown:project', 'project', 'project:future', 0, 'future.project',
+          ${nowString}, 'server', 'not JSON', '{}', 2
+        ) RETURNING sequence
+      `;
+        const known = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO orchestration_events ${sql.insert(
+          Array.from({ length: 510 }, (_, index) => ({
+            event_id: `known:thread:${index}`,
+            aggregate_kind: "thread",
+            stream_id: threadId,
+            stream_version: index + 1_002,
+            event_type: "provider-session.detached",
+            occurred_at: nowString,
+            actor_kind: "server",
+            payload_json: JSON.stringify({
+              providerSessionId: ProviderSessionId.make(`session:reader:${index}`),
+              detachedAt: nowString,
+            }),
+            metadata_json: "{}",
+            application_event_version: 2,
+          })),
+        )} RETURNING sequence
+      `;
+        const copies = yield* store.appendAgentEvents({
+          events: [subagent("copy:subagent"), item("copy:item")],
+        });
+        const storedCopies = yield* sql<{
+          readonly prompt: string;
+          readonly promptSequence: number;
+        }>`
+        SELECT json_extract(payload_json, '$.prompt') AS prompt,
+          json_extract(payload_json, '$.promptSequence') AS "promptSequence"
+        FROM orchestration_events WHERE event_id IN ('copy:subagent', 'copy:item') ORDER BY sequence
+      `;
+        assert.deepEqual(storedCopies, [
+          { prompt: "", promptSequence: anchors[0]!.sequence },
+          { prompt: "", promptSequence: anchors[1]!.sequence },
+        ]);
+        const highWater = copies.at(-1)!.sequence;
+        const [broken] = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'malformed:known', 'thread', ${threadId}, 1514, 'provider-session.detached',
+          ${nowString}, 'server', '{}', '{}', 2
+        ) RETURNING sequence
+      `;
+
+        const range = { afterSequence: 0, throughSequence: highWater };
+        const agentReplay = store.readAgentEvents({
+          ...range,
+          threadId,
+          skipUnknownEventTypes: true,
+        });
+        const applicationReplay = store.readApplicationEvents({
+          ...range,
+          skipUnknownEventTypes: true,
+        });
+        const strictAgent = store.readAgentEvents({ ...range, threadId });
+        const strictApplication = store.readApplicationEvents(range);
+        const strictProject = store.readApplicationEvents({
+          afterSequence: unknown.at(-1)!.sequence,
+          throughSequence: unknownProject!.sequence,
+        });
+        const malformedAgent = store.readAgentEvents({
+          threadId,
+          afterSequence: highWater,
+          throughSequence: broken!.sequence,
+          skipUnknownEventTypes: true,
+        });
+        const malformedApplication = store.readApplicationEvents({
+          afterSequence: highWater,
+          throughSequence: broken!.sequence,
+          skipUnknownEventTypes: true,
+        });
+        const reads = Effect.gen(function* () {
+          return {
+            agent: yield* Stream.runCollect(agentReplay),
+            application: yield* Stream.runCollect(applicationReplay),
+            agentStats: yield* store.getAgentReplayStats({ ...range, threadId, maxEvents: 2_000 }),
+            applicationStats: yield* store.getReplayStats(range),
+            strictAgent: isPersistenceDecodeError(
+              yield* Stream.runCollect(strictAgent).pipe(Effect.flip),
+            ),
+            strictApplication: isPersistenceDecodeError(
+              yield* Stream.runCollect(strictApplication).pipe(Effect.flip),
+            ),
+            strictProject: isPersistenceDecodeError(
+              yield* Stream.runCollect(strictProject).pipe(Effect.flip),
+            ),
+            malformedAgent: isPersistenceDecodeError(
+              yield* Stream.runCollect(malformedAgent).pipe(Effect.flip),
+            ),
+            malformedApplication: isPersistenceDecodeError(
+              yield* Stream.runCollect(malformedApplication).pipe(Effect.flip),
+            ),
+          };
+        }).pipe(Effect.provideService(References.MinimumLogLevel, "Error"));
+        const baseline = yield* reads;
+        assert.deepEqual(
+          baseline.agent.map((event) => event.sequence),
+          [
+            ...anchors.map((event) => event.sequence),
+            ...known.map((row) => row.sequence),
+            ...copies.map((event) => event.sequence),
+          ],
+        );
+        assert.deepEqual(
+          baseline.application.map((event) => event.sequence),
+          [project.sequence, ...baseline.agent.map((event) => event.sequence)],
+        );
+        assert.deepEqual(baseline.agent.slice(-2), copies);
+        assert.equal(baseline.agentStats.eventCount, 1_514);
+        assert.equal(baseline.applicationStats.eventCount, 1_516);
+        assert.isAbove(baseline.agentStats.rawPayloadBytes, prompt.length * 4);
+        assert.isAbove(baseline.applicationStats.rawPayloadBytes, prompt.length * 4);
+        assert.isTrue(baseline.strictAgent);
+        assert.isTrue(baseline.strictApplication);
+        assert.isTrue(baseline.strictProject);
+        assert.isTrue(baseline.malformedAgent);
+        assert.isTrue(baseline.malformedApplication);
+
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        const during = yield* Deferred.await(held).pipe(
+          Effect.andThen(reads),
+          Effect.timeout("15 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(writer);
+        assert.deepEqual(during, baseline);
+      }).pipe(Effect.provide(layerFile));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect.each(["high-water", "replay"] as const)(
   "bounds application live events while the %s query is blocked",

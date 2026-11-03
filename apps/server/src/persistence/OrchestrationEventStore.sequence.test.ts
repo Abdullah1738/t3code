@@ -1,8 +1,20 @@
-import { CommandId, EventId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EventId,
+  ProjectId,
+  ProviderSessionId,
+  ThreadId,
+  type OrchestrationV2DomainEvent,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
@@ -70,6 +82,273 @@ const seedEvents = Effect.fn("test.seedSequenceEvents")(function* (
     RETURNING sequence, aggregate_kind, application_event_version, stream_id, command_id
   `;
 });
+
+it.live(
+  "replays every page and reads both high-waters and replay stats while the writer is held",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-event-reader-pages-",
+      });
+      const layerFile = OrchestrationEventStore.layer.pipe(
+        Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"))),
+        Layer.provide(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread:reader-pages");
+        const commandId = CommandId.make("command:reader-pages");
+        const rows = yield* seedEvents([
+          ...Array.from({ length: 1_110 }, (_, index) =>
+            eventRow(
+              index,
+              index % 10 === 0 ? "project" : "thread",
+              2,
+              index % 10 === 0 ? `project:reader-pages:${index}` : threadId,
+              commandId,
+            ),
+          ),
+          eventRow(1_110, "thread", 2, "thread:reader-pages-other", commandId),
+          eventRow(1_111, "project", 2, "project:reader-pages-last", commandId),
+        ]);
+        const threadRows = rows.filter(
+          (row) => row.aggregate_kind === "thread" && row.stream_id === threadId,
+        );
+        const highWater = rows.at(-1)!.sequence;
+        const agentInput = { afterSequence: 0, throughSequence: highWater, threadId, commandId };
+        const applicationInput = { afterSequence: 0, throughSequence: highWater };
+        const statsInput = { ...applicationInput, threadId, maxEvents: 2_000 };
+        // The streams are built before the writer is held; their SQL is evaluated on consumption.
+        const agentStream = store.readAgentEvents(agentInput);
+        const applicationStream = store.readApplicationEvents(applicationInput);
+        const baseline = yield* Effect.all({
+          agent: Stream.runCollect(agentStream),
+          application: Stream.runCollect(applicationStream),
+          agentStats: store.getAgentReplayStats(statsInput),
+          applicationStats: store.getReplayStats(applicationInput),
+          agentHighWater: store.latestAgentSequence(),
+          threadHighWater: store.latestAgentSequence(threadId),
+          missingHighWater: store.latestAgentSequence(ThreadId.make("thread:missing")),
+          applicationHighWater: store.latestApplicationSequence,
+        });
+        assert.isAbove(baseline.agent.length, 500);
+        assert.isAbove(baseline.application.length, 1_000);
+        assert.deepEqual(
+          baseline.agent.map((event) => event.sequence),
+          threadRows.map((row) => row.sequence),
+        );
+        assert.deepEqual(
+          baseline.application.map((event) => event.sequence),
+          rows.map((row) => row.sequence),
+        );
+        assert.equal(baseline.agentStats.eventCount, baseline.agent.length);
+        assert.equal(baseline.applicationStats.eventCount, baseline.application.length);
+        assert.equal(baseline.applicationHighWater, highWater);
+        assert.equal(baseline.agentHighWater, rows.at(-2)!.sequence);
+        assert.equal(baseline.threadHighWater, threadRows.at(-1)!.sequence);
+        assert.equal(baseline.missingHighWater, 0);
+
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        const during = yield* Effect.gen(function* () {
+          yield* Deferred.await(held);
+          return yield* Effect.all({
+            agent: Stream.runCollect(agentStream),
+            application: Stream.runCollect(applicationStream),
+            agentStats: store.getAgentReplayStats(statsInput),
+            applicationStats: store.getReplayStats(applicationInput),
+            agentHighWater: store.latestAgentSequence(),
+            threadHighWater: store.latestAgentSequence(threadId),
+            missingHighWater: store.latestAgentSequence(ThreadId.make("thread:missing")),
+            applicationHighWater: store.latestApplicationSequence,
+          });
+        }).pipe(
+          Effect.timeout("15 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(writer);
+        assert.deepEqual(during, baseline);
+
+        const [next] = yield* store.appendAgentEvents({
+          commandId,
+          events: [
+            {
+              id: EventId.make("event:reader-pages:committed-after-hold"),
+              type: "provider-session.detached",
+              threadId,
+              occurredAt: DateTime.makeUnsafe(occurredAt),
+              payload: {
+                providerSessionId: ProviderSessionId.make("session:reader-pages-after-hold"),
+                detachedAt: DateTime.makeUnsafe(occurredAt),
+              },
+            },
+          ],
+        });
+        assert.ok(next);
+        assert.isAbove(next.sequence, highWater);
+        assert.equal(yield* store.latestAgentSequence(threadId), next.sequence);
+        assert.equal(yield* store.latestAgentSequence(), next.sequence);
+        assert.equal(yield* store.latestApplicationSequence, next.sequence);
+        assert.deepEqual(
+          yield* store
+            .readApplicationEvents({ afterSequence: highWater, throughSequence: next.sequence })
+            .pipe(Stream.runCollect),
+          [next],
+        );
+      }).pipe(Effect.provide(layerFile));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "reads uncommitted appends inside the writer transaction but not from the external reader",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-event-reader-tx-",
+      });
+      const layerFile = OrchestrationEventStore.layer.pipe(
+        Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"))),
+        Layer.provide(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread:reader-tx");
+        const projectId = ProjectId.make("project:reader-tx");
+        const commandId = CommandId.make("command:reader-tx");
+        const at = DateTime.makeUnsafe(occurredAt);
+        const agentEvent = (id: string): OrchestrationV2DomainEvent => ({
+          id: EventId.make(id),
+          type: "provider-session.detached",
+          threadId,
+          occurredAt: at,
+          payload: { providerSessionId: ProviderSessionId.make(`session:${id}`), detachedAt: at },
+        });
+        const projectEvent = (id: string) => ({
+          type: "project.created" as const,
+          eventId: EventId.make(id),
+          aggregateKind: "project" as const,
+          aggregateId: projectId,
+          occurredAt,
+          commandId,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: {
+            projectId,
+            title: id,
+            workspaceRoot: "/tmp/reader-tx",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: occurredAt,
+            updatedAt: occurredAt,
+          },
+        });
+        yield* store.appendAgentEvents({
+          commandId,
+          events: [agentEvent("event:committed-agent")],
+        });
+        yield* store.appendProjectEvent(projectEvent("event:committed-project"));
+
+        const range = { afterSequence: 0, throughSequence: Number.MAX_SAFE_INTEGER };
+        const readAll = Effect.gen(function* () {
+          return {
+            agent: yield* store
+              .readAgentEvents({ ...range, threadId, commandId })
+              .pipe(Stream.runCollect),
+            typeFiltered: yield* store
+              .readAgentEvents({
+                ...range,
+                threadId,
+                eventType: "provider-session.detached",
+              })
+              .pipe(Stream.runCollect),
+            application: yield* store.readApplicationEvents(range).pipe(Stream.runCollect),
+            agentStats: yield* store.getAgentReplayStats({ ...range, threadId, maxEvents: 100 }),
+            applicationStats: yield* store.getReplayStats(range),
+            agentHighWater: yield* store.latestAgentSequence(),
+            threadHighWater: yield* store.latestAgentSequence(threadId),
+            missingHighWater: yield* store.latestAgentSequence(ThreadId.make("thread:missing")),
+            applicationHighWater: yield* store.latestApplicationSequence,
+          };
+        });
+        const baseline = yield* readAll;
+        const ready = yield* Deferred.make<typeof baseline>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* store.appendAgentEvents({
+                  commandId,
+                  events: [agentEvent("event:uncommitted-agent")],
+                });
+                yield* store.appendProjectEvent(projectEvent("event:uncommitted-project"));
+                const own = yield* readAll;
+                yield* Deferred.succeed(ready, own);
+                yield* Deferred.await(release);
+                return yield* Effect.fail("rollback");
+              }),
+            )
+            .pipe(Effect.result),
+        );
+        const results = yield* Effect.gen(function* () {
+          const own = yield* Deferred.await(ready);
+          const external = yield* readAll;
+          return { own, external };
+        }).pipe(
+          Effect.timeout("15 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        const rolledBack = yield* Fiber.join(writer);
+        assert.equal(rolledBack._tag, "Failure");
+        if (rolledBack._tag === "Failure") assert.equal(rolledBack.failure, "rollback");
+        const { own, external } = results;
+        assert.deepEqual(external, baseline);
+        assert.deepEqual(yield* readAll, baseline);
+        assert.deepEqual(own.agent.slice(0, baseline.agent.length), baseline.agent);
+        assert.deepEqual(own.typeFiltered, own.agent);
+        assert.deepEqual(
+          own.application.slice(0, baseline.application.length),
+          baseline.application,
+        );
+        assert.equal(own.agent.length, baseline.agent.length + 1);
+        assert.equal(own.application.length, baseline.application.length + 2);
+        assert.equal(own.agent.at(-1)?.event.id, "event:uncommitted-agent");
+        assert.equal(own.application.at(-1)?.sequence, own.applicationHighWater);
+        assert.equal(own.agent.at(-1)?.sequence, own.agentHighWater);
+        assert.equal(own.threadHighWater, own.agentHighWater);
+        assert.equal(own.missingHighWater, 0);
+        assert.isAbove(own.applicationHighWater, own.agentHighWater);
+        assert.equal(own.agentStats.eventCount, baseline.agentStats.eventCount + 1);
+        assert.equal(own.applicationStats.eventCount, baseline.applicationStats.eventCount + 2);
+        assert.isFalse(own.agentStats.hasCreateEvent);
+        assert.isAbove(own.agentStats.rawPayloadBytes, baseline.agentStats.rawPayloadBytes);
+        assert.isAbove(
+          own.applicationStats.rawPayloadBytes,
+          baseline.applicationStats.rawPayloadBytes,
+        );
+        const lastApplication = own.application.at(-1);
+        assert.isTrue(
+          lastApplication !== undefined &&
+            "eventId" in lastApplication &&
+            lastApplication.eventId === "event:uncommitted-project",
+        );
+      }).pipe(Effect.provide(layerFile));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect("keeps application and scoped agent high-water marks separate from legacy history", () =>
   Effect.gen(function* () {

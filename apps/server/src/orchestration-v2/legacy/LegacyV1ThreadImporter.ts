@@ -22,6 +22,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -755,7 +756,23 @@ const make = Effect.gen(function* () {
   const ensureTranscript = (threadId: ThreadId) =>
     confirmedTranscriptThreadIds.has(threadId)
       ? Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 })
-      : ensureTranscriptBase(threadId).pipe(
+      : Effect.gen(function* () {
+          const imports = yield* sql<LegacyImportRow>`
+            SELECT thread_id, transcript_imported_at
+            FROM orchestration_v2_legacy_imports
+            WHERE thread_id = ${threadId}
+            LIMIT 1
+          `.pipe(NodeSqliteClient.readOnly);
+          const imported = imports[0];
+          if (imported === undefined) {
+            return { importedThreadCount: 0, importedMessageCount: 0 };
+          }
+          if (imported.transcript_imported_at !== null) {
+            confirmedTranscriptThreadIds.add(threadId);
+            return { importedThreadCount: 0, importedMessageCount: 0 };
+          }
+          return yield* ensureTranscriptBase(threadId);
+        }).pipe(
           Effect.mapError(
             (cause) =>
               new LegacyV1ThreadImportError({

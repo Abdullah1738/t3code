@@ -6217,7 +6217,7 @@ const make = Effect.gen(function* () {
   const boardSummaries: KanbanServiceShape["boardSummaries"] = Stream.unwrap(
     Effect.gen(function* () {
       const subscription = yield* PubSub.subscribe(changes);
-      const boards = yield* read(
+      const boards = yield* readDb(
         Effect.flatMap(store.boards, (all) =>
           Effect.forEach(all, (board) =>
             Effect.all({
