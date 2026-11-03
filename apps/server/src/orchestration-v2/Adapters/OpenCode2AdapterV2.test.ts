@@ -894,6 +894,50 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("a stale Stop leaves the newer turn and its background subagent running", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        ...backgroundLaunch(CHILD),
+      ]);
+      const first = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(withLineage(thread));
+      assert.equal((yield* Fiber.join(first))?.status, "completed");
+      const attached = yield* Deferred.make<void>();
+      const newerEnded = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.tap((event) => {
+          if (event.type === "subagent.updated" && event.subagent.childThreadId !== null) {
+            return Deferred.succeed(attached, undefined);
+          }
+          return event.type === "turn.terminal"
+            ? Deferred.succeed(newerEnded, undefined)
+            : Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn({
+        ...withLineage(thread),
+        runId: RunId.make("run:opencode2-adapter:new"),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+        attemptId: RunAttemptId.make("attempt:opencode2-adapter:new"),
+      });
+      yield* Deferred.await(attached);
+      yield* runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: yield* providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      assert.isFalse(yield* Deferred.isDone(newerEnded));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("keeps tracking a background subagent whose Stop did not reach it", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
@@ -1135,26 +1179,28 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("keeps a turn OpenCode started on its own pending while its continuation is set up", () =>
-    Effect.gen(function* () {
-      const reached = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const offered = yield* Deferred.make<void>();
-      const { runtime, thread } = yield* resumed(
-        [event("session.execution.started", { sessionID: SESSION })],
-        { idAllocator: gatedIds(reached, release) },
-      ).pipe(
-        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
-          offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
-          take: Effect.never,
-        }),
-      );
-      yield* Deferred.await(reached);
-      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
-      yield* Deferred.succeed(release, undefined);
-      yield* Deferred.await(offered);
-      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
-    }).pipe(Effect.scoped),
+  it.effect(
+    "keeps a turn OpenCode started on its own pending while its continuation is set up",
+    () =>
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const offered = yield* Deferred.make<void>();
+        const { runtime, thread } = yield* resumed(
+          [event("session.execution.started", { sessionID: SESSION })],
+          { idAllocator: gatedIds(reached, release) },
+        ).pipe(
+          Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+            offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
+            take: Effect.never,
+          }),
+        );
+        yield* Deferred.await(reached);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(offered);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      }).pipe(Effect.scoped),
   );
 
   /** Another call in the same turn that resumes `child`, by default a background one. */

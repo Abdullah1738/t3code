@@ -232,6 +232,10 @@ describe("control interrupt", () => {
           (yield* Ref.get(calls)).map((input) => input.runId),
           [RunId.make("run-new"), RunId.make("run-new")],
         );
+        assert.deepStrictEqual(
+          (yield* Ref.get(calls)).map((input) => input.attemptId),
+          [undefined, RunAttemptId.make("att-2")],
+        );
         assert.deepStrictEqual(yield* Ref.get(dispatched), ["run-new", "run-new"]);
       }),
     ),

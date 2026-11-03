@@ -11,6 +11,7 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderTurnId,
+  RunAttemptId,
   RuntimeRequestId,
   ScheduledTaskId,
   ThreadId,
@@ -482,6 +483,112 @@ it.effect("Stop ends watches, holds queues, and stops the delegated tasks under 
     yield* threads.stopDelegatedTasks({ threadId: parentThreadId, commandId: stopCommandId });
     assert.deepEqual((yield* threadState(childThreadId)).runs, ["interrupted", "queued:held"]);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "fenced interrupts validate the run and attempt in dispatch before emitting anything",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const events = yield* EventStore.EventStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread:interrupt-fence-real");
+      yield* createWatchingThread(threadId, 42);
+      yield* send(threadId, "old", "start_immediately");
+      const old = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const now = yield* DateTime.now;
+      // Keep the old run nonterminal so the latest-run fence, not the terminal
+      // fence, rejects it after the new run starts.
+      yield* projections.apply({
+        id: EventId.make("event:interrupt-fence:old-complete"),
+        type: "run.updated",
+        threadId,
+        runId: old.id,
+        occurredAt: now,
+        payload: { ...old, status: "completed", completedAt: now },
+      });
+      yield* send(threadId, "new", "start_immediately");
+      const current = (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
+      yield* projections.apply({
+        id: EventId.make("event:interrupt-fence:old-still-running"),
+        type: "run.updated",
+        threadId,
+        runId: old.id,
+        occurredAt: now,
+        payload: old,
+      });
+      const baseline = yield* events.latestSequence({ threadId });
+      const rejected = [
+        {
+          commandId: CommandId.make("fence:old"),
+          runId: old.id,
+          cause: `Run ${old.id} is not the thread's current run.`,
+        },
+        {
+          commandId: CommandId.make("fence:attempt"),
+          runId: current.id,
+          expectedAttemptId: RunAttemptId.make("attempt:wrong"),
+          cause: `Run ${current.id} is on attempt ${current.activeAttemptId}, not attempt:wrong.`,
+        },
+      ];
+      for (const { commandId, runId, cause, ...rest } of rejected) {
+        const error = yield* Effect.flip(
+          orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId,
+            threadId,
+            runId,
+            fenced: true,
+            ...rest,
+          }),
+        );
+        assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+        assert.equal((error as Orchestrator.OrchestratorDispatchError).cause, cause);
+      }
+      assert.equal(yield* events.latestSequence({ threadId }), baseline);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        after.turnItems.filter((item) => item.type === "run_interrupt_request"),
+        [],
+      );
+      const effects = yield* sql<{ command_id: string }>`
+      SELECT command_id FROM orchestration_v2_effect_outbox
+      WHERE command_id IN ('fence:old', 'fence:attempt')
+    `;
+      assert.deepEqual(effects, []);
+
+      yield* orchestrator.dispatch({
+        type: "run.interrupt",
+        commandId: CommandId.make("fence:current"),
+        threadId,
+        runId: current.id,
+        fenced: true,
+        expectedAttemptId: current.activeAttemptId!,
+      });
+      const interrupted = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(interrupted.runs.find((run) => run.id === current.id)?.status, "interrupted");
+      assert.equal(
+        interrupted.turnItems.filter((item) => item.type === "run_interrupt_request").length,
+        1,
+      );
+      const afterInterrupt = yield* events.latestSequence({ threadId });
+      const terminal = yield* Effect.flip(
+        orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make("fence:terminal"),
+          threadId,
+          runId: current.id,
+          fenced: true,
+        }),
+      );
+      assert.instanceOf(terminal, Orchestrator.OrchestratorDispatchError);
+      assert.equal(
+        (terminal as Orchestrator.OrchestratorDispatchError).cause,
+        `Run ${current.id} already ended.`,
+      );
+      assert.equal(yield* events.latestSequence({ threadId }), afterInterrupt);
+    }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect.each([1, 2, 8])(
