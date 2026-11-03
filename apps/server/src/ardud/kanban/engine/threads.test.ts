@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import {
   CommandId,
   ProjectId,
@@ -23,7 +24,13 @@ import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdap
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
-import { backgroundWorkOf, KanbanThreads, layer, viewStateOf } from "./threads.ts";
+import {
+  backgroundWorkOf,
+  KanbanThreadError,
+  KanbanThreads,
+  layer,
+  viewStateOf,
+} from "./threads.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -150,6 +157,43 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       ),
     );
   }),
+);
+
+it.effect("a keyed send fails closed when its receipt can't be read", () =>
+  Effect.gen(function* () {
+    const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+      sendToThread: (input) =>
+        Effect.sync(() => {
+          sent.push(input);
+          return {} as never;
+        }),
+    });
+    const sql = yield* SqlClient.SqlClient;
+    // Make the real receipt repository's SELECT fail without replacing its layer.
+    yield* sql`DROP TABLE orchestration_command_receipts`;
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const result = yield* Effect.result(
+        threads.send({ threadId: ThreadId.make("thread-wake"), text: "Back", key: "wake:abc" }),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("send");
+      }
+      expect(sent).toHaveLength(0);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
 
 it.effect("a rejected keyed wake can retry with real orchestrator receipts", () => {
@@ -291,5 +335,76 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         1,
       );
     }).pipe(Effect.provide(Layer.fresh(layer).pipe(Layer.provide(instrumentedManagement))));
+  }).pipe(Effect.provide(dependencies));
+});
+
+it.effect("an accepted keyed wake replays once but a new key sends another message", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:wake-epochs");
+  const threadId = ThreadId.make("thread:wake-epochs");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry(
+    { name: "kanban-wake-epochs" },
+    registry,
+    { databaseLayer: db, runEffectWorker: false },
+  );
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  const dependencies = Layer.mergeAll(
+    management,
+    receipts,
+    Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const receiptStore = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("kanban-wake-epochs:create"),
+      threadId,
+      projectId,
+      title: "Outage wake epochs",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const wake = { threadId, text: "Model answers again", key: "wake:k1" };
+      yield* threads.send(wake);
+      const receipt = yield* receiptStore.getByCommandId(CommandId.make("kanban:send:wake:k1"));
+      expect(Option.isSome(receipt) && receipt.value.status).toBe("accepted");
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        1,
+      );
+      yield* threads.send(wake);
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        1,
+      );
+      yield* threads.send({ ...wake, key: "wake:k2" });
+      expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
+        2,
+      );
+    }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(dependencies));
 });

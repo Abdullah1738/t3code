@@ -88,6 +88,7 @@ const makeFake = Effect.gen(function* () {
     OrchestrationV2ProviderFailure & { readonly model?: ModelSelection | null }
   >();
   const failureReads: Array<string> = [];
+  const missingFailureRunIds = new Set<string>();
   const lastRuns = new Map<string, { runId: string; status: string; message: string | null }>();
   const runHistory = new Map<string, { status: string; message: string | null }>();
   // One run id per stored failure object (the same run reports the same id).
@@ -97,7 +98,7 @@ const makeFake = Effect.gen(function* () {
     const failure = failures.get(threadId);
     if (!failure) return null;
     if (!runIds.has(failure)) runIds.set(failure, `run-${(nextRun += 1)}`);
-    return { ...failure, runId: runIds.get(failure)! };
+    return { ...failure, runId: missingFailureRunIds.has(threadId) ? null : runIds.get(failure)! };
   };
   const sends: Array<{
     threadId: string;
@@ -244,6 +245,7 @@ const makeFake = Effect.gen(function* () {
     prs,
     failures,
     failureReads,
+    missingFailureRunIds,
     lastRuns,
     runHistory,
     sends,
@@ -6653,6 +6655,107 @@ it.effect("a wake reuses one command key per outage", () =>
   }),
 );
 
+it.effect("a new failed run after an accepted but uncleared wake gets its own wake", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const saved = yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const { board } = yield* toyBoard;
+        const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+        fake.failures.set(threadId, outage);
+        yield* kanban.turnEnded(threadId);
+        const link = (yield* kanban.caller(threadId))!;
+        assert.isNotNull(link.paused);
+        assert.isString(link.paused!.runId);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+        assert.strictEqual(fake.sends.filter((send) => send.threadId === threadId).length, 1);
+        return link;
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+
+      // The accepted wake survived but its pause clear didn't.
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putThreadLink(saved);
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        fake.failures.set(saved.threadId, { ...outage });
+        yield* TestClock.adjust("1 minute");
+        yield* kanban.turnEnded(saved.threadId);
+        const next = (yield* kanban.caller(saved.threadId))?.paused;
+        assert.isNotNull(next);
+        assert.isDefined(next);
+        assert.isString(next?.runId);
+        assert.notStrictEqual(next?.at, saved.paused?.at);
+        assert.notStrictEqual(next?.runId, saved.paused?.runId);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        const wakes = fake.sends.filter((send) => send.threadId === saved.threadId);
+        assert.strictEqual(wakes.length, 2);
+        assert.match(wakes[0]?.key ?? "", /^wake:[a-f0-9]{32}$/);
+        assert.match(wakes[1]?.key ?? "", /^wake:[a-f0-9]{32}$/);
+        assert.notStrictEqual(wakes[1]?.key, wakes[0]?.key);
+        assert.isNull((yield* kanban.caller(saved.threadId))?.paused ?? null);
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+    }).pipe(Effect.provide(probeDeps(fake.layer)));
+  }),
+);
+
+it.effect("the same failed run reported twice keeps its outage epoch", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    probe.ok = true;
+    probe.calls = 0;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+      fake.failures.set(threadId, outage);
+      yield* kanban.turnEnded(threadId);
+      const first = (yield* kanban.caller(threadId))?.paused;
+      assert.isNotNull(first);
+      assert.isDefined(first);
+      assert.isString(first?.runId);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.turnEnded(threadId);
+      const second = (yield* kanban.caller(threadId))?.paused;
+      assert.strictEqual(second?.at, first?.at);
+      assert.strictEqual(second?.runId, first?.runId);
+      yield* TestClock.adjust("5 minutes");
+      yield* kanban.probeOutages;
+      yield* kanban.probeOutages;
+      assert.strictEqual(fake.sends.filter((send) => send.threadId === threadId).length, 1);
+      assert.isNull((yield* kanban.caller(threadId))?.paused ?? null);
+    }).pipe(Effect.provide(probeLayer(fake.layer)));
+  }),
+);
+
+it.effect("a legacy pause keeps its epoch when the failure has no run id", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const threadId = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look" });
+      fake.failures.set(threadId, outage);
+      fake.missingFailureRunIds.add(threadId);
+      yield* kanban.turnEnded(threadId);
+      const first = (yield* kanban.caller(threadId))?.paused;
+      assert.isDefined(first);
+      assert.isNotNull(first);
+      assert.isNull(first?.runId);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.turnEnded(threadId);
+      const second = (yield* kanban.caller(threadId))?.paused;
+      assert.strictEqual(second?.at, first?.at);
+      assert.isNull(second?.runId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a rejected wake keeps the pause and is retried on the next probe", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -7964,7 +8067,10 @@ it.effect("new board and setup defaults follow canonical model routing", () =>
       assert.strictEqual(Rules.modelLevel(ensured.defaultCardModel), "high");
       assert.strictEqual(ensured.defaultCardModel.instanceId, native.instanceId);
 
-      const explicit = { ...native, options: [...native.options, { id: "effort", value: "xhigh" }] };
+      const explicit = {
+        ...native,
+        options: [...native.options, { id: "effort", value: "xhigh" }],
+      };
       const explicitBoard = yield* kanban.createBoard({
         slug: "native-explicit",
         name: "Native explicit",
@@ -7996,7 +8102,10 @@ it.effect("new board and setup defaults follow canonical model routing", () =>
       );
     }).pipe(
       Effect.provide(
-        testLayer(fake.layer, KanbanModels.layerTest(null), [opencodeTestProvider(), nativeProvider]),
+        testLayer(fake.layer, KanbanModels.layerTest(null), [
+          opencodeTestProvider(),
+          nativeProvider,
+        ]),
       ),
     );
   }),

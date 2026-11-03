@@ -2781,7 +2781,7 @@ const make = Effect.gen(function* () {
     yield* Ref.set(scanned, true);
   });
 
-  /** Marks a thread paused on the model its failed run used. A reused evaluator is reopened so it stays wakeable. */
+  /** Pauses on the failed run's model, keeping its epoch on repeat reports and reopening evaluators. */
   const pauseThread = Effect.fn("KanbanService.pauseThread")(function* (
     link: KanbanThreadLink,
     model: ModelSelection,
@@ -2795,11 +2795,12 @@ const make = Effect.gen(function* () {
     });
     const at = yield* nowIso;
     const now = yield* nowMillis;
+    const sameRun = link.paused !== null && link.paused.runId === runId;
     yield* store.putThreadLink({
       ...link,
       model,
       endedAt: link.role === "evaluator" ? null : link.endedAt,
-      paused: { at: link.paused?.at ?? at, message, runId },
+      paused: { at: sameRun ? link.paused!.at : at, message, runId },
     });
     const key = Rules.modelKey(model);
     if (runId === null || link.paused?.runId !== runId) {

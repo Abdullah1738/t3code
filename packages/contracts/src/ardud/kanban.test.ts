@@ -233,18 +233,18 @@ describe("kanbanBoardIcon", () => {
     expect(valid(`data:image/png;base64,${"A".repeat(KANBAN_BOARD_IMAGE_MAX)}`)).toBe(false);
   });
 
-describe("own answers", () => {
-  it("decodes an answer saved before own words existed with text null", () => {
-    const decoded = Schema.decodeUnknownSync(KanbanAnswer)({
-      blockId: "q1",
-      by: { _tag: "owner" },
-      choice: ["o1"],
-      at: "2026-10-27T10:00:00.000Z",
+  describe("own answers", () => {
+    it("decodes an answer saved before own words existed with text null", () => {
+      const decoded = Schema.decodeUnknownSync(KanbanAnswer)({
+        blockId: "q1",
+        by: { _tag: "owner" },
+        choice: ["o1"],
+        at: "2026-10-27T10:00:00.000Z",
+      });
+      expect(decoded.text).toBeNull();
+      expect(decoded.choice).toEqual(["o1"]);
     });
-    expect(decoded.text).toBeNull();
-    expect(decoded.choice).toEqual(["o1"]);
   });
-});
 });
 
 const decodeThreadLink = Schema.decodeUnknownSync(KanbanThreadLink);
@@ -263,6 +263,26 @@ describe("KanbanThreadLink", () => {
       endedAt: null,
     });
     expect(decoded.paused).toBeNull();
+  });
+
+  it("decodes a pause written before run ids existed", () => {
+    const decoded = decodeThreadLink({
+      threadId: "thread-1",
+      boardId: "board-1",
+      cardId: null,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model: null,
+      startedAt: "2026-10-28T00:00:00.000Z",
+      endedAt: null,
+      paused: { at: "2026-10-28T01:00:00.000Z", message: "provider down" },
+    });
+    expect(decoded.paused).toEqual({
+      at: "2026-10-28T01:00:00.000Z",
+      message: "provider down",
+      runId: null,
+    });
   });
 });
 
@@ -301,9 +321,9 @@ describe("board script steps", () => {
   });
 
   it("an evaluator-only step, or evaluator plus script, wakes the evaluator", () => {
-    expect(
-      kanbanEvaluatorStep({ subtasks: [scriptSubtask("s1", 1, "Tell", "evaluator")] }),
-    ).toBe(true);
+    expect(kanbanEvaluatorStep({ subtasks: [scriptSubtask("s1", 1, "Tell", "evaluator")] })).toBe(
+      true,
+    );
     expect(
       kanbanEvaluatorStep({
         subtasks: [

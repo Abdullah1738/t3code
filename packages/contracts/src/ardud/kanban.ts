@@ -91,7 +91,8 @@ export type KanbanReviewChain = typeof KanbanReviewChain.Type;
 export const KanbanThreadPause = Schema.Struct({
   at: IsoDateTime,
   message: Schema.String,
-  runId: Schema.optional(Schema.NullOr(Schema.String)),
+  /** The failed run this pause is for; a different run is a new outage. */
+  runId: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanThreadPause = typeof KanbanThreadPause.Type;
 
