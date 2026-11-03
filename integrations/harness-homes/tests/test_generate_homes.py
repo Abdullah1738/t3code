@@ -141,7 +141,7 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["features"]["chronicle"], False)
         self.assertEqual(cfg["memories"], {"generate_memories": False, "use_memories": False})
         self.assertEqual(cfg["model_providers"]["ninerouter"]["http_headers"],
-                         {"x-9router-token-saver": "off"})
+                         {"x-9router-token-saver": "off", "x-openai-actor-authorization": "robob-9router-local"})
         self.assertEqual(cfg["mcp_servers"]["cua-driver"]["args"], ["mcp"])
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
@@ -180,13 +180,15 @@ class GenerateTests(HarnessTestCase):
                 provider = cfg["model_providers"]["ninerouter"]
                 self.assertEqual(provider["name"], "OpenAI")
                 self.assertEqual(provider["base_url"], "http://127.0.0.1:20128/v1")
+                self.assertIs(provider["requires_openai_auth"], False)
+                self.assertEqual(provider["http_headers"]["x-openai-actor-authorization"], "robob-9router-local")
                 self.assertNotIn("capabilities", provider)
                 self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
                 self.assertEqual(cfg["model_auto_compact_token_limit_scope"], "total")
                 self.assertIs(cfg["features"]["output_token_replay"], True)
                 self.assertIs(cfg["features"]["concurrent_reasoning_summaries"], True)
                 self.assertNotIn("async_compaction", cfg["features"])
-                self.assertNotIn("image_generation", cfg["features"])
+                self.assertIs(cfg["features"]["image_generation"], True)
 
     def test_check_detects_compaction_setting_drift(self) -> None:
         self.run_gen()
@@ -203,6 +205,28 @@ class GenerateTests(HarnessTestCase):
         rc, out = self.run_check()
         self.assertEqual(rc, 1)
         self.assertIn("codex-cu/config.toml", out)
+
+    def test_check_detects_image_generation_setting_drift(self) -> None:
+        self.run_gen()
+        p = self.codex_cu / "config.toml"
+        cfg = tomllib.loads(p.read_text())
+        del cfg["features"]["image_generation"]
+        p.write_text(gh.toml_dump(cfg))
+        rc, out = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("codex-cu/config.toml", out)
+
+    def test_check_detects_actor_header_drift_in_both_codex_homes(self) -> None:
+        for home in (self.codex, self.codex_cu):
+            with self.subTest(home=home.name):
+                self.run_gen()
+                p = home / "config.toml"
+                cfg = tomllib.loads(p.read_text())
+                del cfg["model_providers"]["ninerouter"]["http_headers"]["x-openai-actor-authorization"]
+                p.write_text(gh.toml_dump(cfg))
+                rc, out = self.run_check()
+                self.assertEqual(rc, 1)
+                self.assertIn(f"{home.name}/config.toml", out)
 
     def test_existing_idle_compaction_override_is_detected_and_removed(self) -> None:
         self.run_gen()
