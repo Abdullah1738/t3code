@@ -53,8 +53,8 @@ export const COMPONENTS: Readonly<Record<string, ComponentSpec>> = {
   },
   coord: { scopes: READ_OPERATE, description: "coord pump and forward mode." },
   "harness-hooks": {
-    scopes: [AuthOrchestrationReadScope],
-    description: "Claude Code/Codex hooks: identity and thread reads.",
+    scopes: READ_OPERATE,
+    description: "Claude Code/Codex hooks: identity reads and desktop lease calls.",
   },
   memory: { scopes: READ_OPERATE, description: "memory-system session reaper." },
   rcsim: { scopes: READ_OPERATE, description: "Run Cloud sim monitor nudges." },

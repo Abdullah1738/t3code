@@ -428,18 +428,38 @@ class GenerateTests(HarnessTestCase):
         self.run_gen(m)
         claude_hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
         codex_hooks = json.loads((self.codex / "hooks.json").read_text())["hooks"]
-        self.assertEqual(set(claude_hooks), {"PreToolUse", "SessionStart"})
-        self.assertEqual(set(codex_hooks), {"PreToolUse"})
-        for group in claude_hooks["PreToolUse"] + claude_hooks["SessionStart"]:
-            self.assertTrue(group["hooks"][0]["command"].endswith("/claude.py"))
-        for group in codex_hooks["PreToolUse"]:
-            self.assertTrue(group["hooks"][0]["command"].endswith("/codex.py"))
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
+        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse"})
+        self.assertEqual(codex_hooks, json.loads((self.codex_cu / "hooks.json").read_text())["hooks"])
+        for groups in claude_hooks.values():
+            for group in groups:
+                self.assertIn("/claude.py", group["hooks"][0]["command"])
+        for groups in codex_hooks.values():
+            for group in groups:
+                self.assertIn("/codex.py", group["hooks"][0]["command"])
         for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
             patterns = [re.compile(group["matcher"]) for group in groups]
             for tool in ("Bash", "mcp__betterstack__monitor", "mcp__example__exec_command",
                          "mcp__example__shell_command"):
                 self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
             self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))
+        for hooks in (claude_hooks, codex_hooks):
+            for event in ("PreToolUse", "PostToolUse"):
+                patterns = [re.compile(group["matcher"]) for group in hooks[event]]
+                for tool in ("mcp__cua-driver__click", "mcp__cua_driver__click", "mcp__node_repl__js"):
+                    self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), (event, tool))
+        self.assertEqual(claude_hooks["PostToolUseFailure"][0]["matcher"],
+                         codex_hooks["PostToolUse"][0]["matcher"])
+
+    def test_post_tool_use_failure_rejects_codex_and_unscoped_hooks(self) -> None:
+        m = self.manifest()
+        for harness in ("codex", None):
+            hook = {"event": "PostToolUseFailure", "command": "/bin/echo", "timeoutSec": 3}
+            if harness:
+                hook["harness"] = harness
+            m["hooks"] = [hook]
+            with self.assertRaises(gh.HomeError):
+                gh.validate_manifest(m)
 
     def test_home_root_pointing_at_personal_claude_is_refused(self) -> None:
         personal = self.home / ".claude"
