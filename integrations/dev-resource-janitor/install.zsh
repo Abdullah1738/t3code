@@ -1,7 +1,7 @@
 #!/bin/zsh -f
 # Install the dev-resource-janitor skill from this repo onto the Mac, or check that the Mac matches it.
 #
-#   install.zsh [--dry-run]    copy skill/ over the live skill, keeping a .bak-<stamp> of every file replaced
+#   install.zsh [--dry-run]    copy skill/ over the live skill, keeping a backup outside the skills directory
 #   install.zsh --check        exit 1 if the live skill differs from this tree
 #
 # The live skill is ~/.config/opencode/skills/dev-resource-janitor. The hourly scheduled janitor and the
@@ -37,7 +37,7 @@ if [[ $mode == check ]]; then
   exit 0
 fi
 
-backup_dir="$live.bak-$stamp"
+backup_dir="$HOME/.local/share/dev-janitor/backups/skill-$stamp"
 changes="$(rsync -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/" 2>/dev/null || true)"
 if [[ -z "$changes" ]]; then
   print "dev-resource-janitor: nothing to install (live skill already matches)"

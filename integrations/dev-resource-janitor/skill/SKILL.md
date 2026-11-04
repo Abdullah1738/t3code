@@ -48,7 +48,10 @@ itself) and sessions titled "Dev resource janitor..." are not counted as usage.
 ## Scheduled agent flow
 
 (nightly 2026-10-15) Now a robob-watch watcher `dev-janitor` (mode notify, hourly), not an LLM run. Check script
-`scripts/janitor_watch.sh` runs scan, then apply --ids for candidates only. Silent on success; prints one line only if a scan or apply step fails. The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
+`scripts/janitor_watch.sh` starts a detached, locked worker for scan and apply --ids. The worker re-scans before
+each action, can run beyond the watcher's 60-second check deadline, and records its result for the next check.
+An overlapping check doesn't start a second worker. A failed, interrupted, or four-hour-overdue worker is reported
+on the next check. The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
 
 ## $TMPDIR prune (hourly, same watcher, 2026-10-22)
 
