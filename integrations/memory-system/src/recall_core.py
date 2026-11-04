@@ -1019,7 +1019,10 @@ def _state_changed(con: sqlite3.Connection, start: int, end: int, relevant: set[
     """Check the indexed event window for changes that can affect these aliases."""
     while start < end:
         rows = con.execute(
-            "SELECT sequence,event_type,stream_id,payload_json FROM orchestration_events "
+            # Skip copying large payloads (turn items) that are never parsed.
+            "SELECT sequence,event_type,stream_id,"
+            "CASE WHEN event_type LIKE 'thread.%' OR event_type IN ('provider-thread.updated','subagent.updated') "
+            "THEN payload_json END FROM orchestration_events "
             "WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
             (start, end, _STATE_CHUNK),
         ).fetchall()
@@ -1516,8 +1519,7 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
             _local.state_subagents = {}
             _local.state_subagent_read_sequence = {}
             snapshot = _state_cache(caller=canonical_or_native_id.strip())
-            with _state_reads, closing(connect_ro(STATE_DB)) as con:
-                start = snapshot.sequence
+            start = snapshot.sequence
             try:
                 result = _lineage_exclusions_once(canonical_or_native_id, fresh_legacy=fresh_legacy)
                 error = None
