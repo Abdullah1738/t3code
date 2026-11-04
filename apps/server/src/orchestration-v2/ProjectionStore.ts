@@ -1,4 +1,5 @@
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
@@ -4694,9 +4695,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     )(
       function* (node) {
         const payloadJson = yield* encodeNodePayload(node);
+        // Ingest dedupe runs before its write, outside any transaction; the
+        // reader sees every committed node, so it need not queue on the writer.
         const rows = yield* sql<PayloadRow>`
           SELECT payload_json FROM orchestration_v2_projection_nodes WHERE node_id = ${node.id}
-        `;
+        `.pipe(NodeSqliteClient.readOnly);
         return rows[0]?.payload_json === payloadJson;
       },
       (effect, node) => effect.pipe(Effect.mapError(controlReadError(node.threadId))),
