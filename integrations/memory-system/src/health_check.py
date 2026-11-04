@@ -7,7 +7,7 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   muse_lag  Muse capture ran cleanly; logs quiet for 10 min are fully captured
   recall    recall server answers on :18765 and its session catalog keeps up
   backup    last memory backup succeeded recently
-  backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
+  backup_lock  no backup run is hung (>4 h) or died holding logs/backup.lock
   health_backup  health backup had a successful run in the last 13 h
   person_backup  every offbox-person (Moni) backup had a successful run in the last 13 h
   dropbox   Dropbox copy of the live backup repo is complete (name + size)
@@ -54,7 +54,7 @@ MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
-BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
+BACKUP_LOCK_MAX_AGE = 4 * 3600  # replica limit 3 h plus restic; runs can take ~3.5 h
 HEALTH_BACKUP_STATUS = os.path.join(HOME, ".local/share/health-backup/backup_last.json")
 PERSON_BACKUP_DIR = os.path.join(HOME, ".local/share/offbox-person/state")
 OTHER_BACKUP_MAX_AGE = 13 * 3600  # these run every 6 h: two missed runs plus slack
