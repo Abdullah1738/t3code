@@ -30,7 +30,11 @@ import {
   type KanbanMessage,
   type ServerProviderSkill,
 } from "@t3tools/contracts";
-import { clampFileAttachmentUploadBytes, fileAttachmentTooLargeMessage, formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
+import {
+  clampFileAttachmentUploadBytes,
+  fileAttachmentTooLargeMessage,
+  formatAttachmentSize,
+} from "@t3tools/client-runtime/state/attachments";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import { formatThreadLink, parseThreadLinkHref } from "@t3tools/shared/threadLinks";
 
@@ -123,6 +127,9 @@ export function Chat(props: {
               </button>
             </p>
           ) : null}
+          {messages !== undefined && (messages[0]?.seq ?? 1) > 1 ? (
+            <LoadEarlier boardId={boardId} discussionId={discussion.id} />
+          ) : null}
           {messages === undefined ? null : messages.length === 0 ? (
             <p className="text-(--m-muted)">No messages yet.</p>
           ) : (
@@ -184,7 +191,7 @@ const Message = memo(function Message(props: {
   );
   // A run of attachments lays out as one wrapping row, not one per line.
   const blocks: ReactNode[] = [];
-  for (let index = 0; index < message.blocks.length; ) {
+  for (let index = 0; index < message.blocks.length;) {
     const block = message.blocks[index]!;
     if (block._tag !== "attachment") {
       blocks.push(renderBlock(block, index));
@@ -254,6 +261,12 @@ function Block(props: {
   onOpenCard: ((cardId: string) => void) | undefined;
 }) {
   const { block } = props;
+  if (
+    (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
+    block.truncated
+  ) {
+    return <TruncatedBlock block={block} boardId={props.boardId} message={props.message} />;
+  }
   switch (block._tag) {
     case "md":
       return (
@@ -277,15 +290,7 @@ function Block(props: {
         </details>
       );
     case "html":
-      return (
-        <iframe
-          title={block.title ?? "Attachment"}
-          sandbox=""
-          srcDoc={block.html}
-          className="w-full rounded-xl bg-(--m-ground)"
-          style={{ height: block.height ?? 240 }}
-        />
-      );
+      return <LazyHtml block={block} />;
     case "image":
       return (
         <img
@@ -314,6 +319,103 @@ function Block(props: {
     case "choice":
       return <ChoiceBlock block={block} boardId={props.boardId} message={props.message} />;
   }
+}
+
+const quietButton =
+  "h-7 w-fit shrink-0 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-60";
+
+/** Reads the page before the oldest message shown. */
+function LoadEarlier(props: { boardId: string; discussionId: string }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      className={cn(quietButton, "self-center")}
+      onClick={() => {
+        setBusy(true);
+        void runAction("Couldn't load earlier messages", () =>
+          kanban.loadEarlier(props.boardId, props.discussionId),
+        ).finally(() => setBusy(false));
+      }}
+    >
+      {busy ? "Loading…" : "Load earlier messages"}
+    </button>
+  );
+}
+
+/** A big block sent as a preview: shows it with a button that reads the message in full. */
+function TruncatedBlock(props: {
+  block: Extract<KanbanBlock, { _tag: "md" | "collapse" | "html" }>;
+  boardId: string;
+  message: KanbanMessage;
+}) {
+  const { block } = props;
+  const [busy, setBusy] = useState(false);
+  const size = `${Math.max(1, Math.round((block.fullBytes ?? 0) / 1024))} KB`;
+  const expand = () => {
+    setBusy(true);
+    void runAction("Couldn't load the message", () =>
+      kanban.expandMessage(props.boardId, props.message.discussionId, props.message.seq),
+    ).finally(() => setBusy(false));
+  };
+  return (
+    <div className="flex min-w-0 flex-col gap-2 text-sm leading-normal">
+      {block._tag === "html" ? (
+        <p className="text-(--m-muted)">{block.title ?? "Page"}</p>
+      ) : (
+        <>
+          {block._tag === "collapse" ? <b className="font-medium">{block.title}</b> : null}
+          <KanbanMarkdown text={block.text} />
+        </>
+      )}
+      <button type="button" disabled={busy} onClick={expand} className={quietButton}>
+        {busy ? "Loading…" : `Show full (${size})`}
+      </button>
+    </div>
+  );
+}
+
+/** An html block mounts its frame once it scrolls into view, or when tapped. */
+function LazyHtml(props: { block: Extract<KanbanBlock, { _tag: "html" }> }) {
+  const { block } = props;
+  const [shown, setShown] = useState(false);
+  const holder = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const element = holder.current;
+    if (shown || element === null || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setShown(true);
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [shown]);
+  const height = block.height ?? 240;
+  if (!shown) {
+    return (
+      <div
+        ref={holder}
+        className="flex w-full items-center justify-center rounded-xl bg-(--m-ground)"
+        style={{ height }}
+      >
+        <button type="button" className={quietButton} onClick={() => setShown(true)}>
+          Show {block.title ?? "page"}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <iframe
+      title={block.title ?? "Attachment"}
+      sandbox=""
+      srcDoc={block.html}
+      className="w-full rounded-xl bg-(--m-ground)"
+      style={{ height }}
+    />
+  );
 }
 
 /** A posted file: images as a thumbnail that opens full size, other files as a chip. */
@@ -908,37 +1010,35 @@ export function Composer(props: {
           </>
         ) : null}
         <div className="min-w-0 flex-1 py-1.5">
-        <ComposerPromptEditor
-          value={text}
-          cursor={cursor}
-          contextRecords={records}
-          skills={NO_SKILLS}
-          disabled={blocked !== null}
-          placeholder={blocked ?? props.placeholder}
-          ariaLabel={props.placeholder}
-          className="max-h-40 min-h-5 text-sm leading-5 text-(--m-text)"
-          placeholderClassName="leading-5 text-(--m-muted)"
-          editorRef={editorRef}
-          onPaste={(event) => {
-            onPasteFiles(event);
-            if (!event.defaultPrevented) onPaste(event);
-          }}
-          onChange={(value, nextCursor) => {
-            setText(value);
-            setCursor(nextCursor);
-          }}
-          onCommandKeyDown={(key, event) => {
-            if (key !== "Enter" || event.shiftKey) return false;
-            void send();
-            return true;
-          }}
-        />
+          <ComposerPromptEditor
+            value={text}
+            cursor={cursor}
+            contextRecords={records}
+            skills={NO_SKILLS}
+            disabled={blocked !== null}
+            placeholder={blocked ?? props.placeholder}
+            ariaLabel={props.placeholder}
+            className="max-h-40 min-h-5 text-sm leading-5 text-(--m-text)"
+            placeholderClassName="leading-5 text-(--m-muted)"
+            editorRef={editorRef}
+            onPaste={(event) => {
+              onPasteFiles(event);
+              if (!event.defaultPrevented) onPaste(event);
+            }}
+            onChange={(value, nextCursor) => {
+              setText(value);
+              setCursor(nextCursor);
+            }}
+            onCommandKeyDown={(key, event) => {
+              if (key !== "Enter" || event.shiftKey) return false;
+              void send();
+              return true;
+            }}
+          />
         </div>
         <button
           type="submit"
-          disabled={
-            (text.trim().length === 0 && files.length === 0) || sending || blocked !== null
-          }
+          disabled={(text.trim().length === 0 && files.length === 0) || sending || blocked !== null}
           title={blocked ?? undefined}
           aria-label="Send"
           className="grid size-8 shrink-0 place-items-center rounded-full bg-(--m-text) text-(--m-ground) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-40"

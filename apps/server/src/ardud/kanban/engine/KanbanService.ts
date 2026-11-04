@@ -79,6 +79,7 @@ import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
+import * as Pages from "./messagePages.ts";
 import { KanbanThreads } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
@@ -393,10 +394,20 @@ export interface KanbanServiceShape {
   readonly cardDiscussion: (
     cardId: KanbanCard["id"],
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
+  /**
+   * The newest messages after `afterSeq` and before `beforeSeq`, oldest first, cut by count
+   * and by encoded size (never empty while any match). List reads stub big blocks; `full`
+   * keeps them whole for agents, under its own `maxBytes`.
+   */
   readonly messages: (
     id: KanbanDiscussion["id"],
-    options?: { readonly afterSeq?: number; readonly limit?: number },
+    options?: MessagePageOptions,
   ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanError>;
+  /** One message with every block in full. */
+  readonly message: (
+    id: KanbanDiscussion["id"],
+    seq: number,
+  ) => Effect.Effect<KanbanMessage, KanbanError>;
   /** Absolute path an agent can open for a board attachment, or null. */
   readonly attachmentPath: (attachment: ChatAttachment) => string | null;
   readonly post: (
@@ -534,6 +545,16 @@ const OWNER_WAIT_MS = 15 * 60_000;
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
 const DISCUSSION_TITLE_MAX = 80;
+export interface MessagePageOptions {
+  readonly afterSeq?: number;
+  readonly beforeSeq?: number;
+  /** Default 50 for list reads, 200 for full ones; never more than 200. */
+  readonly limit?: number;
+  /** Big blocks whole (agent reads); list reads send them as stubs. */
+  readonly full?: boolean;
+  readonly maxBytes?: number;
+}
+
 /** Past this many messages a discussion has long had the owner's first one. */
 const TITLE_SCAN_MAX = 20;
 
@@ -550,17 +571,22 @@ const checkText = (fields: ReadonlyArray<readonly [string, string | null | undef
   return problem ? failWith("invalid", problem) : Effect.void;
 };
 
-const cardTextFields = (input: NewCard | CardPatch) => [
-  ["title", input.title],
-  ["description", input.description],
-  ["prompt", input.prompt],
-  ...("question" in input ? [["question", input.question] as const] : []),
-  ...("comment" in input ? [["comment", input.comment] as const] : []),
-  ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
-] as const;
+const cardTextFields = (input: NewCard | CardPatch) =>
+  [
+    ["title", input.title],
+    ["description", input.description],
+    ["prompt", input.prompt],
+    ...("question" in input ? [["question", input.question] as const] : []),
+    ...("comment" in input ? [["comment", input.comment] as const] : []),
+    ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
+  ] as const;
 
 const normalizeMessageBlock = (block: KanbanBlock): KanbanBlock => {
-  if (block._tag === "collapse") return { ...block, title: block.title.trim() };
+  // Stub marks belong to list reads; a stored block is always whole.
+  if (block._tag === "md" || block._tag === "collapse" || block._tag === "html") {
+    const { truncated: _truncated, fullBytes: _fullBytes, ...whole } = block;
+    return whole._tag === "collapse" ? { ...whole, title: whole.title.trim() } : whole;
+  }
   if (block._tag === "choice") {
     return {
       ...block,
@@ -1567,9 +1593,10 @@ const make = Effect.gen(function* () {
   ): KanbanDiscussion =>
     withParticipant(discussion, participant.actor, participant.name, {
       deferred: true,
-      deferredKey: participant.deferred && participant.deferredKey
-        ? participant.deferredKey
-        : NodeCrypto.randomUUID(),
+      deferredKey:
+        participant.deferred && participant.deferredKey
+          ? participant.deferredKey
+          : NodeCrypto.randomUUID(),
     });
 
   const adoptEvaluator = (
@@ -1592,8 +1619,8 @@ const make = Effect.gen(function* () {
       discussion.settledAt !== null || discussion.archivedAt !== null
         ? {
             ...discussion,
-          participants: discussion.participants.map((participant) =>
-            participant.deferred
+            participants: discussion.participants.map((participant) =>
+              participant.deferred
                 ? { ...participant, deferred: false, owes: null, typingUntil: null }
                 : participant,
             ),
@@ -1883,7 +1910,10 @@ const make = Effect.gen(function* () {
     for (const id of callerAncestors) {
       const link = yield* store.threadLink(id);
       if (link?.role === "work" || link?.role === "review") {
-        return yield* failWith("denied", "Only evaluators use this tool, not card threads or their children.");
+        return yield* failWith(
+          "denied",
+          "Only evaluators use this tool, not card threads or their children.",
+        );
       }
     }
     const board = yield* boardOf(boardId);
@@ -2432,13 +2462,18 @@ const make = Effect.gen(function* () {
       if (initial.settledAt !== null || initial.archivedAt !== null) continue;
       let discussion = initial;
       for (const participant of initial.participants) {
-        if (participant.actor._tag !== "thread" || participant.owes !== "asked" || participant.deferred)
+        if (
+          participant.actor._tag !== "thread" ||
+          participant.owes !== "asked" ||
+          participant.deferred
+        )
           continue;
         const threadId = participant.actor.threadId;
         const link = yield* store.threadLink(threadId);
         if (!link || link.boardId !== board.id || link.role === "evaluator") continue;
         if (!(yield* isHome(discussion, threadId))) continue;
-        if (!discussionHeld(board, discussion, link, yield* store.cardsByThread(threadId))) continue;
+        if (!discussionHeld(board, discussion, link, yield* store.cardsByThread(threadId)))
+          continue;
         discussion = deferParticipant(discussion, participant);
       }
       if (discussion !== initial) yield* saveDiscussion(discussion);
@@ -2464,10 +2499,14 @@ const make = Effect.gen(function* () {
       if (board.pause && link && link.role !== "evaluator") {
         const carried = yield* store.cardsByThread(threadId);
         if (discussionHeld(board, discussion, link, carried)) {
-          yield* saveDiscussion(withParticipant(
-            deferParticipant(discussion, participant), participant.actor, participant.name,
-            { typingUntil: null },
-          ));
+          yield* saveDiscussion(
+            withParticipant(
+              deferParticipant(discussion, participant),
+              participant.actor,
+              participant.name,
+              { typingUntil: null },
+            ),
+          );
           return;
         }
       }
@@ -2476,15 +2515,19 @@ const make = Effect.gen(function* () {
           threadId,
           text: Briefs.nudgeDiscussionText(discussion.id),
           ...(participant.deferred
-            ? { key: `discussion:${participant.deferredKey ?? `${discussion.id}:${threadId}:${participant.lastReadSeq}`}` }
+            ? {
+                key: `discussion:${participant.deferredKey ?? `${discussion.id}:${threadId}:${participant.lastReadSeq}`}`,
+              }
             : {}),
         })
         .pipe(Effect.result);
       if (Result.isFailure(sent)) {
         if (participant.deferred && sent.failure.rejected) {
-          yield* saveDiscussion(withParticipant(discussion, participant.actor, participant.name, {
-            deferredKey: NodeCrypto.randomUUID(),
-          }));
+          yield* saveDiscussion(
+            withParticipant(discussion, participant.actor, participant.name, {
+              deferredKey: NodeCrypto.randomUUID(),
+            }),
+          );
         }
         if (retry || participant.deferred) return;
       }
@@ -2538,7 +2581,12 @@ const make = Effect.gen(function* () {
         return false;
       }
       const view = yield* threads.view(threadId);
-      if (!view || view.archived || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis))
+      if (
+        !view ||
+        view.archived ||
+        view.state !== "idle" ||
+        Rules.waitingOnBackground(view, yield* nowMillis)
+      )
         return false;
       yield* settleParticipant(discussion, threadId, true);
       return true;
@@ -2933,8 +2981,8 @@ const make = Effect.gen(function* () {
       if (board.pause && link.role !== "evaluator") {
         const carried = yield* store.cardsByThread(link.threadId);
         if (carried.some((card) => !board.pause!.keep.includes(card.id))) {
-          const runId = link.paused?.runId ??
-            (yield* threads.lastFailure(link.threadId))?.runId ?? null;
+          const runId =
+            link.paused?.runId ?? (yield* threads.lastFailure(link.threadId))?.runId ?? null;
           yield* Ref.update(recoveredThreads, (map) => new Map(map).set(link.threadId, runId));
           continue;
         }
@@ -3011,7 +3059,8 @@ const make = Effect.gen(function* () {
     const recovered = yield* Ref.get(recoveredThreads);
     if (recovered.size === 0) return;
     for (const { link } of yield* pausedLinks) {
-      if (link.boardId !== board.id || link.paused === null || !recovered.has(link.threadId)) continue;
+      if (link.boardId !== board.id || link.paused === null || !recovered.has(link.threadId))
+        continue;
       const carried = yield* store.cardsByThread(link.threadId);
       if (carried.length === 0) {
         yield* store.putThreadLink({ ...link, paused: null });
@@ -3030,7 +3079,10 @@ const make = Effect.gen(function* () {
       if (view !== null && !view.archived && view.state === "idle") {
         const sent = yield* threads
           .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
-          .pipe(Effect.as(true), Effect.catchCause(() => Effect.succeed(false)));
+          .pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(false)),
+          );
         if (!sent) continue;
       }
       yield* store.putThreadLink({ ...link, paused: null });
@@ -3056,7 +3108,10 @@ const make = Effect.gen(function* () {
         card.stalled === null &&
         (!board?.pause || board.pause.keep.includes(card.id)),
     );
-    if (nudge.length === 0 && cards.some((card) => card.stage === "working" && card.stalled === null)) {
+    if (
+      nudge.length === 0 &&
+      cards.some((card) => card.stage === "working" && card.stalled === null)
+    ) {
       yield* Ref.update(deferredNudges, (set) => new Set(set).add(threadId));
     }
     if (nudge.length === 0) return;
@@ -3145,7 +3200,8 @@ const make = Effect.gen(function* () {
         continue;
       }
       const view = yield* threads.view(threadId);
-      if (!view || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis)) continue;
+      if (!view || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis))
+        continue;
       const review = carried.find((card) => card.activeRole === "review");
       if (review) yield* reviewerStopped(review, threadId);
       else yield* nudgeWorker(threadId, carried);
@@ -3165,7 +3221,8 @@ const make = Effect.gen(function* () {
         if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) continue;
         if (wakes.has(threadId)) continue;
         const discussion = yield* store.discussion(initial.id);
-        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null) continue;
+        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
+          continue;
         const participant = discussion.participants.find(
           (candidate) => candidate.actor._tag === "thread" && candidate.actor.threadId === threadId,
         );
@@ -3184,7 +3241,12 @@ const make = Effect.gen(function* () {
           continue;
         }
         const view = yield* threads.view(threadId);
-        if (!view || view.archived || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis))
+        if (
+          !view ||
+          view.archived ||
+          view.state !== "idle" ||
+          Rules.waitingOnBackground(view, yield* nowMillis)
+        )
           continue;
         const failure = yield* Effect.result(threads.findLastFailure(threadId));
         if (Result.isFailure(failure) || failure.success !== null) {
@@ -3349,8 +3411,7 @@ const make = Effect.gen(function* () {
       if (!recovered.has(threadId) || runId === null || recovered.get(threadId) !== runId) {
         yield* pauseThread(link, model, outage.message, runId);
       }
-    }
-    else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
+    } else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
     // Discussions the thread evaluates, or is still typing or owing in after
     // being told something there (which the link and card don't name).
     let discussionAttempted = false;
@@ -3373,7 +3434,11 @@ const make = Effect.gen(function* () {
       if (yield* isHome(discussion, threadId)) {
         // A failed run gets no discussion nudge: it would start another run on the same selection.
         if (failure === null) {
-          const attempted: boolean = yield* settleWhenTurnEnds(discussion, threadId, discussionAttempted);
+          const attempted: boolean = yield* settleWhenTurnEnds(
+            discussion,
+            threadId,
+            discussionAttempted,
+          );
           discussionAttempted ||= attempted;
         } else if (participant?.deferred && participant.owes === "asked") {
           if (participant.typingUntil !== null) {
@@ -3951,14 +4016,9 @@ const make = Effect.gen(function* () {
         if (owing.length === 0) continue;
         // A failed read skips only this discussion, never the tick.
         yield* Effect.gen(function* () {
-          // The whole history, not a window: the owner's message may be older than any recent page.
-          const messages = yield* store.allMessages(discussion.id);
-          const ask = messages.findLast((message) => message.author._tag === "owner");
-          if (ask === undefined) return;
-          const answered = messages.some(
-            (message) => message.seq > ask.seq && message.author._tag === "evaluator",
-          );
-          if (answered) return;
+          // The owner's latest message wherever it is, read without decoding the history.
+          const ask = yield* store.ownerWait(discussion.id);
+          if (ask === null || ask.answered) return;
           const idleMs = now - Date.parse(ask.createdAt);
           if (idleMs < OWNER_WAIT_MS) return;
           if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) return;
@@ -5525,7 +5585,9 @@ const make = Effect.gen(function* () {
           }
           if (
             board.pause &&
-            (yield* store.cardsByThread(threadId)).some((entry) => !board.pause!.keep.includes(entry.id))
+            (yield* store.cardsByThread(threadId)).some(
+              (entry) => !board.pause!.keep.includes(entry.id),
+            )
           ) {
             return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
           }
@@ -6133,22 +6195,33 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const markRead: KanbanServiceShape["markRead"] = (discussionId, actor, seq) =>
-    guard(
-      Effect.gen(function* () {
-        const discussion = yield* discussionOf(discussionId);
-        const key = actorKey(actor);
-        const current = discussion.participants.find(
-          (participant) => actorKey(participant.actor) === key,
-        );
-        if (current && current.lastReadSeq >= seq) return;
-        yield* saveDiscussion(
-          withParticipant(discussion, actor, current?.name ?? OWNER_NAME, {
-            lastReadSeq: Math.min(seq, discussion.lastSeq),
-          }),
-        );
-      }),
+  // Null when the read is already recorded, else the discussion to save.
+  const readMark = (discussion: KanbanDiscussion, actor: KanbanActor, seq: number) => {
+    const key = actorKey(actor);
+    const current = discussion.participants.find(
+      (participant) => actorKey(participant.actor) === key,
     );
+    const target = Math.min(seq, discussion.lastSeq);
+    if (current && current.lastReadSeq >= target) return null;
+    return withParticipant(discussion, actor, current?.name ?? OWNER_NAME, {
+      lastReadSeq: target,
+    });
+  };
+
+  // Opening a discussion marks it read every time. A read already recorded never queues
+  // behind the board write lock or republishes the discussion.
+  const markRead: KanbanServiceShape["markRead"] = Effect.fn("KanbanService.markRead")(
+    function* (discussionId, actor, seq) {
+      const seen = yield* readDb(discussionOf(discussionId));
+      if (readMark(seen, actor, seq) === null) return;
+      yield* guard(
+        Effect.gen(function* () {
+          const next = readMark(yield* discussionOf(discussionId), actor, seq);
+          if (next !== null) yield* saveDiscussion(next);
+        }),
+      );
+    },
+  );
 
   const markReadSoon: KanbanServiceShape["markReadSoon"] = (discussionId, actor, seq) =>
     markRead(discussionId, actor, seq).pipe(
@@ -6188,8 +6261,13 @@ const make = Effect.gen(function* () {
 
   // The apps never show a card's prompt (they read one card in full through card), and on big boards prompts are most of the feed.
   const feedCard = (card: KanbanCard): KanbanCard => ({ ...card, prompt: "" });
+  // Big message blocks go out as stubs too; the chat reads the full message by seq.
   const feedChange = (change: KanbanChange): KanbanChange =>
-    change._tag === "card" ? { ...change, card: feedCard(change.card) } : change;
+    change._tag === "card"
+      ? { ...change, card: feedCard(change.card) }
+      : change._tag === "message"
+        ? { ...change, message: Pages.stubMessage(change.message) }
+        : change;
 
   const watch: KanbanServiceShape["watch"] = (boardId) =>
     Stream.unwrap(
@@ -6342,7 +6420,31 @@ const make = Effect.gen(function* () {
       );
       return existing ?? (yield* guard(cardDiscussionUnlocked(cardId)));
     }),
-    messages: (id, options) => readDb(store.messages(id, options)),
+    messages: (id, options = {}) =>
+      readDb(
+        Effect.map(
+          store.messages(id, {
+            ...(options.afterSeq === undefined ? {} : { afterSeq: options.afterSeq }),
+            ...(options.beforeSeq === undefined ? {} : { beforeSeq: options.beforeSeq }),
+            limit: Pages.pageLimit(
+              options.limit,
+              options.full ? Pages.MESSAGE_PAGE_MAX : undefined,
+            ),
+          }),
+          (page) =>
+            options.full
+              ? Pages.fitNewest(page, options.maxBytes ?? Pages.AGENT_READ_BYTES)
+              : Pages.listPage(page, options.maxBytes),
+        ),
+      ),
+    message: (id, seq) =>
+      readDb(
+        Effect.gen(function* () {
+          const message = yield* store.message(id, seq);
+          if (!message) return yield* failWith("not-found", `message ${seq}`);
+          return message;
+        }),
+      ),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
     postToCard: (cardId, author, blocks) =>
       guard(

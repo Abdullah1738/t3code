@@ -56,7 +56,7 @@ const ModelInputFields = {
   variant: Schema.optional(
     describe(
       TrimmedNonEmptyString,
-      'Legacy name for effort. If both are supplied, they must agree.',
+      "Legacy name for effort. If both are supplied, they must agree.",
     ),
   ),
   options: Schema.optional(
@@ -298,13 +298,25 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion (latest 200, or those after afterSeq), with answers to polls and picks. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
+    beforeSeq: Schema.optional(NonNegativeInt),
+    seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
-  { discussion: Record, messages: Records },
+  {
+    discussion: Record,
+    messages: Records,
+    earlierBefore: Schema.optional(
+      describe(
+        NonNegativeInt,
+        "Older messages were left out; pass this as beforeSeq to read them.",
+      ),
+    ),
+    note: Schema.optional(Schema.String),
+  },
   { readonly: true },
 );
 

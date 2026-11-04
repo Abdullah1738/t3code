@@ -250,12 +250,25 @@ export interface KanbanStoreShape {
     threadId: string,
   ) => Effect.Effect<KanbanDiscussion | null, KanbanStoreError>;
   readonly putDiscussion: (discussion: KanbanDiscussion) => Effect.Effect<void, KanbanStoreError>;
+  /** The newest `limit` (default 200) after `afterSeq` and before `beforeSeq`, oldest first. */
   readonly messages: (
     id: KanbanDiscussionId,
-    options?: { readonly afterSeq?: number; readonly limit?: number },
+    options?: { readonly afterSeq?: number; readonly beforeSeq?: number; readonly limit?: number },
   ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
+  /**
+   * The owner's latest message and whether an evaluator spoke after it, without decoding the
+   * history. Null when the owner never wrote.
+   */
+  readonly ownerWait: (
+    id: KanbanDiscussionId,
+  ) => Effect.Effect<
+    { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
+    KanbanStoreError
+  >;
   /** Every message of a discussion, oldest first. */
-  readonly allMessages: (id: KanbanDiscussionId) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
+  readonly allMessages: (
+    id: KanbanDiscussionId,
+  ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
   readonly message: (
     id: KanbanDiscussionId,
     seq: number,
@@ -630,7 +643,7 @@ const make = Effect.gen(function* () {
     );
   const messages = (
     id: KanbanDiscussionId,
-    options?: { readonly afterSeq?: number; readonly limit?: number },
+    options?: { readonly afterSeq?: number; readonly beforeSeq?: number; readonly limit?: number },
   ) =>
     run(
       "read messages",
@@ -639,10 +652,41 @@ const make = Effect.gen(function* () {
           SELECT json FROM (
             SELECT seq, json FROM ardud_kanban_messages
             WHERE discussion_id = ${id} AND seq > ${options?.afterSeq ?? 0}
+              AND seq < ${options?.beforeSeq ?? Number.MAX_SAFE_INTEGER}
             ORDER BY seq DESC LIMIT ${options?.limit ?? 200}
           ) ORDER BY seq
         `,
         (rows) => decodeAll(rows, Message.decode),
+      ),
+    );
+  // Walks the discussion's primary key newest first; json_extract stays in SQLite, so a
+  // multi-MB history is never decoded.
+  const ownerWait = (id: KanbanDiscussionId) =>
+    run(
+      "read owner wait",
+      Effect.map(
+        sql<{ readonly seq: number; readonly createdAt: string; readonly answered: number }>`
+          SELECT m.seq AS seq,
+            json_extract(m.json, '$.createdAt') AS createdAt,
+            EXISTS (
+              SELECT 1 FROM ardud_kanban_messages e
+              WHERE e.discussion_id = m.discussion_id AND e.seq > m.seq
+                AND json_extract(e.json, '$.author._tag') = 'evaluator'
+            ) AS answered
+          FROM ardud_kanban_messages m
+          WHERE m.discussion_id = ${id} AND json_extract(m.json, '$.author._tag') = 'owner'
+          ORDER BY m.seq DESC LIMIT 1
+        `,
+        (rows) => {
+          const row = rows[0];
+          return row
+            ? {
+                seq: Number(row.seq),
+                createdAt: String(row.createdAt),
+                answered: Number(row.answered) === 1,
+              }
+            : null;
+        },
       ),
     );
   const allMessages = (id: KanbanDiscussionId) =>
@@ -874,6 +918,7 @@ const make = Effect.gen(function* () {
     discussionByEvaluator,
     putDiscussion,
     messages,
+    ownerWait,
     allMessages,
     message,
     putMessage,

@@ -187,7 +187,9 @@ const makeFake = Effect.gen(function* () {
               return Effect.void;
             }
             if (conclusiveReject.delete(input.threadId)) {
-              return Effect.fail(new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }));
+              return Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }),
+              );
             }
             if (rejectSends.has(input.threadId)) {
               return Effect.fail(new KanbanThreadError({ operation: "send", detail: "refused" }));
@@ -214,7 +216,9 @@ const makeFake = Effect.gen(function* () {
             sends.push({ threadId: input.threadId, model: input.model, key: input.key });
             if (input.key) acceptedKeys.add(input.key);
             if (commitThenReject.delete(input.threadId)) {
-              return Effect.fail(new KanbanThreadError({ operation: "send", detail: "projection read failed" }));
+              return Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "projection read failed" }),
+              );
             }
             return Effect.void;
           }),
@@ -232,7 +236,9 @@ const makeFake = Effect.gen(function* () {
           failureReads.push(threadId);
           if (failFailureReads.left === 0) return Effect.succeed(failureOf(threadId));
           failFailureReads.left -= 1;
-          return Effect.fail(new KanbanThreadError({ operation: "lastFailure", detail: "read failed" }));
+          return Effect.fail(
+            new KanbanThreadError({ operation: "lastFailure", detail: "read failed" }),
+          );
         }),
       latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
@@ -395,8 +401,22 @@ it.effect("refuses corrupted board text before saving and preserves clean commen
         { _tag: "collapse", title: "bad\u0002", text: "ok" },
         { _tag: "html", title: null, html: "bad\u0002", height: null },
         { _tag: "html", title: "bad\u0002", html: "ok", height: null },
-        { _tag: "choice", id: "id", style: "pick", question: "bad\u0002", options: [], multi: false },
-        { _tag: "choice", id: "id", style: "pick", question: "ok", options: [{ id: "id", label: "bad\u0002" }], multi: false },
+        {
+          _tag: "choice",
+          id: "id",
+          style: "pick",
+          question: "bad\u0002",
+          options: [],
+          multi: false,
+        },
+        {
+          _tag: "choice",
+          id: "id",
+          style: "pick",
+          question: "ok",
+          options: [{ id: "id", label: "bad\u0002" }],
+          multi: false,
+        },
         { _tag: "image", url: "https://example.com/image", alt: "bad\u0002" },
       ];
       for (const block of blocks) {
@@ -3099,7 +3119,8 @@ it.effect("an owner reminder is keyed to the owner's message, not later system p
   }),
 );
 
-// Fails the next `allReadFailures.remaining` full-history message reads.
+// Fails the next `allReadFailures.remaining` owner-wait reads; a full-history read always dies,
+// so the tick is shown never to read the whole discussion.
 const allReadFailures = { remaining: 0 };
 const failingAllReadStore = Layer.effect(
   KanbanStore.KanbanStore,
@@ -3107,17 +3128,57 @@ const failingAllReadStore = Layer.effect(
     const real = yield* KanbanStore.KanbanStore;
     return {
       ...real,
-      allMessages: (id) =>
+      allMessages: () => Effect.die("the tick read a whole discussion"),
+      ownerWait: (id) =>
         allReadFailures.remaining > 0
           ? ((allReadFailures.remaining -= 1),
             Effect.fail(
               new KanbanStore.KanbanStoreError({
-                operation: "read all messages",
+                operation: "read owner wait",
                 cause: "injected",
               }),
             ))
-          : real.allMessages(id),
+          : real.ownerWait(id),
     };
+  }),
+);
+
+it.effect("the owner-wait reminder reads no whole discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Big talk", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "First" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "x".repeat(200_000) },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Second" }]);
+      for (let i = 0; i < 5; i++) {
+        yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+          { _tag: "md", text: `Status ${i}` },
+        ]);
+      }
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+      // The evaluator answers after the owner's latest message: no more reminders.
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Done" },
+      ]);
+      yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+        { _tag: "md", text: "Later status" },
+      ]);
+      const ask = yield* (yield* KanbanStore.KanbanStore).ownerWait(channel.id);
+      assert.deepStrictEqual(ask && { seq: ask.seq, answered: ask.answered }, {
+        seq: 3,
+        answered: true,
+      });
+    }).pipe(Effect.provide(failingAllReadLayer(fake.layer)));
   }),
 );
 
@@ -4745,10 +4806,16 @@ it.effect("pauses a board for kept cards, validates the request and lifts the ho
       });
       assert.strictEqual((yield* kanban.snapshot(board.id)).board.pause?.reason, "Ship first");
       const published = yield* Stream.runHead(
-        Stream.filter(changes, ({ change }) => change._tag === "board" && change.board.pause !== null),
+        Stream.filter(
+          changes,
+          ({ change }) => change._tag === "board" && change.board.pause !== null,
+        ),
       );
       assert.isTrue(Option.isSome(published));
-      assert.strictEqual((yield* kanban.card(alreadyRunning.id)).card.activeThreadId, runningThread);
+      assert.strictEqual(
+        (yield* kanban.card(alreadyRunning.id)).card.activeThreadId,
+        runningThread,
+      );
       assert.notInclude(fake.interrupted, runningThread);
       const deniedSteer = yield* kanban
         .cardThread(alreadyRunning.id, "steer", "Resume work", owner)
@@ -4815,34 +4882,36 @@ it.effect("pauses a board for kept cards, validates the request and lifts the ho
   }),
 );
 
-it.effect("the owner pause RPC is guarded, records the owner, and legacy boards decode unpaused", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const { pause: _pause, ...legacy } = board;
-      assert.isNull((yield* Schema.decodeEffect(KanbanBoard)(legacy)).pause);
-      assert.strictEqual(
-        RPC_REQUIRED_SCOPES[KANBAN_WS_METHODS.boardPause],
-        AuthOrchestrationOperateScope,
-      );
-      assert.deepStrictEqual(clientRpcRequiredScopes(KANBAN_WS_METHODS.boardPause, {}), [
-        AuthOrchestrationOperateScope,
-      ]);
-      const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
-      const paused = yield* handlers[KANBAN_WS_METHODS.boardPause]({
-        boardId: board.id,
-        reason: "Hold",
-      });
-      assert.strictEqual(paused.pause?.by, "owner");
-      assert.deepStrictEqual(paused.pause?.keep, []);
-      const lifted = yield* handlers[KANBAN_WS_METHODS.boardPause]({
-        boardId: board.id,
-        clear: true,
-      });
-      assert.isNull(lifted.pause);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "the owner pause RPC is guarded, records the owner, and legacy boards decode unpaused",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const { pause: _pause, ...legacy } = board;
+        assert.isNull((yield* Schema.decodeEffect(KanbanBoard)(legacy)).pause);
+        assert.strictEqual(
+          RPC_REQUIRED_SCOPES[KANBAN_WS_METHODS.boardPause],
+          AuthOrchestrationOperateScope,
+        );
+        assert.deepStrictEqual(clientRpcRequiredScopes(KANBAN_WS_METHODS.boardPause, {}), [
+          AuthOrchestrationOperateScope,
+        ]);
+        const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+        const paused = yield* handlers[KANBAN_WS_METHODS.boardPause]({
+          boardId: board.id,
+          reason: "Hold",
+        });
+        assert.strictEqual(paused.pause?.by, "owner");
+        assert.deepStrictEqual(paused.pause?.keep, []);
+        const lifted = yield* handlers[KANBAN_WS_METHODS.boardPause]({
+          boardId: board.id,
+          clear: true,
+        });
+        assert.isNull(lifted.pause);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("holds worker and reviewer turn-end nudges until the board is unpaused", () =>
@@ -4887,7 +4956,8 @@ it.effect("defers an unanswered card discussion for held workers and reviewers u
       const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
       const reviewWorker = (yield* kanban.card(review.id)).card.activeThreadId!;
       yield* kanban.moveCard(review.id, "needs_review", "cardThread", {
-        _tag: "thread", threadId: reviewWorker,
+        _tag: "thread",
+        threadId: reviewWorker,
       });
       yield* kanban.dispatchNow;
       const reviewer = (yield* kanban.card(review.id)).card.activeThreadId!;
@@ -4900,7 +4970,10 @@ it.effect("defers an unanswered card discussion for held workers and reviewers u
       yield* kanban.turnEnded(worker);
       yield* kanban.turnEnded(reviewer);
       assert.lengthOf(fake.sends, before);
-      for (const [talk, thread] of [[workTalk, worker], [reviewTalk, reviewer]] as const) {
+      for (const [talk, thread] of [
+        [workTalk, worker],
+        [reviewTalk, reviewer],
+      ] as const) {
         const participant = (yield* kanban.discussion(talk.id)).participants.find(
           (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
         );
@@ -4910,19 +4983,28 @@ it.effect("defers an unanswered card discussion for held workers and reviewers u
       fake.runOnSend.add(worker);
       fake.runOnSend.add(reviewer);
       yield* kanban.pauseBoard(board.id, null, owner);
-      for (const [talk, thread] of [[workTalk, worker], [reviewTalk, reviewer]] as const) {
+      for (const [talk, thread] of [
+        [workTalk, worker],
+        [reviewTalk, reviewer],
+      ] as const) {
         const participant = (yield* kanban.discussion(talk.id)).participants.find(
           (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
         );
         assert.strictEqual(participant?.owes, "nudged");
         const texts = (yield* Ref.get(fake.threads)).get(thread)!.messages;
-        assert.lengthOf(texts.filter((text) => text.includes("The owner is waiting for your reply")), 1);
+        assert.lengthOf(
+          texts.filter((text) => text.includes("The owner is waiting for your reply")),
+          1,
+        );
         assert.isTrue((yield* Ref.get(fake.threads)).get(thread)!.running);
       }
       yield* kanban.tick;
       for (const thread of [worker, reviewer]) {
         const texts = (yield* Ref.get(fake.threads)).get(thread)!.messages;
-        assert.lengthOf(texts.filter((text) => text.includes("The owner is waiting for your reply")), 1);
+        assert.lengthOf(
+          texts.filter((text) => text.includes("The owner is waiting for your reply")),
+          1,
+        );
       }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -4969,7 +5051,10 @@ it.effect("a refused deferred review reminder takes priority over duplicate revi
       const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
       yield* kanban.dispatchNow;
       const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-      yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: worker,
+      });
       yield* kanban.turnEnded(worker);
       yield* kanban.dispatchNow;
       const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
@@ -4986,15 +5071,21 @@ it.effect("a refused deferred review reminder takes priority over duplicate revi
       const stillReviewing = (yield* kanban.card(card.id)).card;
       assert.strictEqual(stillReviewing.stage, "in_review");
       assert.strictEqual(stillReviewing.nudgedAt, nudgedAt);
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
-      )?.owes, "asked");
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
+        )?.owes,
+        "asked",
+      );
       fake.rejectSends.delete(reviewer);
       yield* kanban.tick;
       assert.strictEqual((yield* kanban.card(card.id)).card.stage, "in_review");
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(reviewer)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 1);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(reviewer)!
+          .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -5013,17 +5104,26 @@ it.effect("a deferred reminder retry uses the same delivery after an ambiguous s
       yield* kanban.turnEnded(thread);
       fake.commitThenReject.add(thread);
       yield* kanban.pauseBoard(board.id, null, owner);
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "asked");
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "asked",
+      );
       yield* kanban.tick;
       yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 1);
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "nudged");
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        1,
+      );
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "nudged",
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -5052,9 +5152,12 @@ it.effect("a conclusively rejected reminder rotates its key and retries", () =>
       assert.strictEqual(deferred?.owes, "asked");
       assert.notStrictEqual(deferred?.deferredKey, oldKey);
       yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 1);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -5073,13 +5176,19 @@ it.effect("a failed failure-state read keeps the deferred reminder until the rea
       yield* kanban.turnEnded(thread);
       fake.failFailureReads.left = 1;
       yield* kanban.pauseBoard(board.id, null, owner);
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 0);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        0,
+      );
       yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 1);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -5096,50 +5205,67 @@ it.effect("an unreadable failure on a delayed turn end never restarts the failed
       yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
       yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
       yield* kanban.turnEnded(thread);
-      fake.failures.set(thread, { class: "provider_error", code: "provider.internal", message: "failed", retryable: false });
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.internal",
+        message: "failed",
+        retryable: false,
+      });
       yield* kanban.pauseBoard(board.id, null, owner);
       const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
       fake.failFailureReads.left = 1;
       yield* kanban.turnEnded(thread);
       assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
-      assert.isTrue((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.deferred);
+      assert.isTrue(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.deferred,
+      );
       yield* kanban.tick;
       assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("a missed failed worker turn is retried before an eligible sibling's quiet backstop", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const held = yield* kanban.createCard(board.id, { prompt: "Held" }, owner);
-      yield* kanban.dispatchNow;
-      const thread = (yield* kanban.card(held.id)).card.activeThreadId!;
-      const kept = (yield* kanban.createForThread(thread, { prompt: "Kept" })).card;
-      const talk = yield* kanban.cardDiscussion(held.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [kept.id] }, owner);
-      yield* kanban.turnEnded(thread);
-      yield* kanban.moveCard(held.id, "needs_review", "cardThread", { _tag: "thread", threadId: thread });
-      fake.failures.set(thread, { class: "provider_error", code: "provider.internal", message: "failed", retryable: false });
-      fake.failFailureReads.left = 2;
-      const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
-      yield* kanban.turnEnded(thread);
-      yield* TestClock.adjust("31 minutes");
-      yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
-      assert.strictEqual((yield* kanban.card(kept.id)).card.stage, "working");
-      yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
-      const failed = (yield* kanban.card(kept.id)).card;
-      assert.strictEqual(failed.stage, "todo");
-      assert.include(failed.stalled?.reason ?? "", "Run failed");
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "a missed failed worker turn is retried before an eligible sibling's quiet backstop",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const held = yield* kanban.createCard(board.id, { prompt: "Held" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(held.id)).card.activeThreadId!;
+        const kept = (yield* kanban.createForThread(thread, { prompt: "Kept" })).card;
+        const talk = yield* kanban.cardDiscussion(held.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [kept.id] }, owner);
+        yield* kanban.turnEnded(thread);
+        yield* kanban.moveCard(held.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        fake.failures.set(thread, {
+          class: "provider_error",
+          code: "provider.internal",
+          message: "failed",
+          retryable: false,
+        });
+        fake.failFailureReads.left = 2;
+        const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
+        yield* kanban.turnEnded(thread);
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
+        assert.strictEqual((yield* kanban.card(kept.id)).card.stage, "working");
+        yield* kanban.tick;
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
+        const failed = (yield* kanban.card(kept.id)).card;
+        assert.strictEqual(failed.stage, "todo");
+        assert.include(failed.stalled?.reason ?? "", "Run failed");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("one deferred retry leaves another asked discussion for a later turn", () =>
@@ -5169,51 +5295,62 @@ it.effect("one deferred retry leaves another asked discussion for a later turn",
       yield* kanban.tick;
       yield* kanban.tick;
       const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
-      assert.lengthOf(messages.filter((text) => text.includes("The owner is waiting for your reply")), 2);
+      assert.lengthOf(
+        messages.filter((text) => text.includes("The owner is waiting for your reply")),
+        2,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("keeps each deferred participant in the same discussion and drops a settled reminder", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
-      const card = yield* kanban.createCard(board.id, { prompt: "Both" }, owner);
-      yield* kanban.dispatchNow;
-      const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-      const talk = yield* kanban.cardDiscussion(card.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Worker question" }]);
-      yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
-      yield* kanban.dispatchNow;
-      const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Reviewer question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
-      yield* kanban.turnEnded(worker);
-      yield* kanban.turnEnded(reviewer);
-      yield* kanban.pauseBoard(board.id, null, owner);
-      const participants = (yield* kanban.discussion(talk.id)).participants;
-      for (const thread of [worker, reviewer]) {
-        assert.strictEqual(participants.find(
-          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-        )?.owes, "nudged");
-      }
-      const settled = yield* kanban.createCard(board.id, { prompt: "Settled" }, owner);
-      yield* kanban.dispatchNow;
-      const held = (yield* kanban.card(settled.id)).card.activeThreadId!;
-      const settledTalk = yield* kanban.cardDiscussion(settled.id);
-      yield* kanban.post(settledTalk.id, owner, [{ _tag: "md", text: "No longer needed" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      yield* kanban.turnEnded(held);
-      yield* kanban.updateDiscussion(settledTalk.id, { settled: true }, owner);
-      const before = (yield* Ref.get(fake.threads)).get(held)!.messages.length;
-      yield* kanban.pauseBoard(board.id, null, owner);
-      const after = (yield* Ref.get(fake.threads)).get(held)!.messages.slice(before);
-      assert.isFalse(after.some((text) => text.includes("The owner is waiting for your reply")));
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "keeps each deferred participant in the same discussion and drops a settled reminder",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const card = yield* kanban.createCard(board.id, { prompt: "Both" }, owner);
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const talk = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Worker question" }]);
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
+        yield* kanban.dispatchNow;
+        const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Reviewer question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
+        yield* kanban.turnEnded(worker);
+        yield* kanban.turnEnded(reviewer);
+        yield* kanban.pauseBoard(board.id, null, owner);
+        const participants = (yield* kanban.discussion(talk.id)).participants;
+        for (const thread of [worker, reviewer]) {
+          assert.strictEqual(
+            participants.find(
+              (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+            )?.owes,
+            "nudged",
+          );
+        }
+        const settled = yield* kanban.createCard(board.id, { prompt: "Settled" }, owner);
+        yield* kanban.dispatchNow;
+        const held = (yield* kanban.card(settled.id)).card.activeThreadId!;
+        const settledTalk = yield* kanban.cardDiscussion(settled.id);
+        yield* kanban.post(settledTalk.id, owner, [{ _tag: "md", text: "No longer needed" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        yield* kanban.turnEnded(held);
+        yield* kanban.updateDiscussion(settledTalk.id, { settled: true }, owner);
+        const before = (yield* Ref.get(fake.threads)).get(held)!.messages.length;
+        yield* kanban.pauseBoard(board.id, null, owner);
+        const after = (yield* Ref.get(fake.threads)).get(held)!.messages.slice(before);
+        assert.isFalse(after.some((text) => text.includes("The owner is waiting for your reply")));
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("settling a held sibling discussion does not block the kept sibling's work", () =>
@@ -5229,7 +5366,10 @@ it.effect("settling a held sibling discussion does not block the kept sibling's 
       yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
       yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [kept.id] }, owner);
       yield* kanban.turnEnded(thread);
-      yield* kanban.moveCard(held.id, "needs_review", "cardThread", { _tag: "thread", threadId: thread });
+      yield* kanban.moveCard(held.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
       yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
       const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
       yield* kanban.tick;
@@ -5253,109 +5393,152 @@ it.effect("an open held sibling discussion does not block the kept sibling's wor
       yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
       yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [kept.id] }, owner);
       yield* kanban.turnEnded(thread);
-      yield* kanban.moveCard(held.id, "needs_review", "cardThread", { _tag: "thread", threadId: thread });
+      yield* kanban.moveCard(held.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
       const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
       fake.runOnSend.add(thread);
       yield* kanban.tick;
       const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages.slice(before);
       assert.isTrue(messages.some((text) => text.includes("Working")));
       assert.isFalse(messages.some((text) => text.includes("The owner is waiting for your reply")));
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "asked");
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "asked",
+      );
       yield* setRunning(fake, thread, false);
       yield* kanban.turnEnded(thread);
       assert.isTrue((yield* Ref.get(fake.threads)).get(thread)!.running);
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "asked");
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "asked",
+      );
       // A duplicate event while the next kept turn is running cannot clear it either.
       yield* kanban.turnEnded(thread);
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "asked");
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "asked",
+      );
       // A heartbeat for the active sibling must not clear the held deferral.
       yield* kanban.tick;
       yield* setRunning(fake, thread, false);
       yield* TestClock.adjust("2 minutes");
       yield* kanban.tick;
-      assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes, "asked");
-      assert.isTrue((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.deferred);
+      assert.strictEqual(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+        "asked",
+      );
+      assert.isTrue(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.deferred,
+      );
       // A failed turn on the kept card must not consume the held question.
-      fake.failures.set(thread, { class: "provider_error", code: "provider.internal", message: "failed", retryable: false });
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.internal",
+        message: "failed",
+        retryable: false,
+      });
       yield* setRunning(fake, thread, false);
       yield* kanban.turnEnded(thread);
-      assert.isTrue((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.deferred);
+      assert.isTrue(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.deferred,
+      );
       yield* setRunning(fake, thread, false);
       yield* kanban.pauseBoard(board.id, null, owner);
-      assert.isFalse((yield* Ref.get(fake.threads)).get(thread)!.messages.some(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ));
+      assert.isFalse(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.some((text) => text.includes("The owner is waiting for your reply")),
+      );
       fake.failures.delete(thread);
       yield* kanban.tick;
       const all = (yield* Ref.get(fake.threads)).get(thread)!.messages;
-      assert.lengthOf(all.filter((text) => text.includes("The owner is waiting for your reply")), 1);
+      assert.lengthOf(
+        all.filter((text) => text.includes("The owner is waiting for your reply")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("a released reviewer's deferred discussion survives a service restart and board lift", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { board, reviewer, talk } = yield* Effect.gen(function* () {
-        const { kanban, board } = yield* toyBoard;
-        const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
-        yield* kanban.dispatchNow;
-        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-        yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
-        yield* kanban.turnEnded(worker);
-        yield* kanban.dispatchNow;
-        const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
-        const talk = yield* kanban.cardDiscussion(card.id);
-        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Check this" }]);
-        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-        yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
-        assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
-        yield* kanban.turnEnded(reviewer);
-        const participant = (yield* kanban.discussion(talk.id)).participants.find(
-          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
-        );
-        assert.isTrue(participant?.deferred);
-        return { board, reviewer, talk };
-      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+it.effect(
+  "a released reviewer's deferred discussion survives a service restart and board lift",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
       yield* Effect.gen(function* () {
-        const kanban = yield* KanbanService.KanbanService;
-        const count = () => (Ref.get(fake.threads)).pipe(Effect.map((threads) =>
-          threads.get(reviewer)!.messages.filter((text) => text.includes("The owner is waiting for your reply")).length,
-        ));
-        yield* kanban.tick;
-        assert.strictEqual(yield* count(), 0);
-        // A failed send is still pending after a restart and is retried by tick.
-        fake.rejectSends.add(reviewer);
-        yield* kanban.pauseBoard(board.id, null, owner);
-        assert.isTrue((yield* kanban.discussion(talk.id)).participants.find(
-          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
-        )?.deferred);
-        fake.rejectSends.delete(reviewer);
-        yield* kanban.tick;
-        assert.strictEqual(yield* count(), 1);
-        const participant = (yield* kanban.discussion(talk.id)).participants.find(
-          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
-        );
-        assert.strictEqual(participant?.owes, "nudged");
-        assert.isNotTrue(participant?.deferred);
-        yield* kanban.tick;
-        assert.strictEqual(yield* count(), 1);
-      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
-    }).pipe(Effect.provide(probeDeps(fake.layer)));
-  }),
+        const { board, reviewer, talk } = yield* Effect.gen(function* () {
+          const { kanban, board } = yield* toyBoard;
+          const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
+          yield* kanban.dispatchNow;
+          const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+          yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: worker,
+          });
+          yield* kanban.turnEnded(worker);
+          yield* kanban.dispatchNow;
+          const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+          const talk = yield* kanban.cardDiscussion(card.id);
+          yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Check this" }]);
+          yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+          yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
+          assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+          yield* kanban.turnEnded(reviewer);
+          const participant = (yield* kanban.discussion(talk.id)).participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
+          );
+          assert.isTrue(participant?.deferred);
+          return { board, reviewer, talk };
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+        yield* Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          const count = () =>
+            Ref.get(fake.threads).pipe(
+              Effect.map(
+                (threads) =>
+                  threads
+                    .get(reviewer)!
+                    .messages.filter((text) => text.includes("The owner is waiting for your reply"))
+                    .length,
+              ),
+            );
+          yield* kanban.tick;
+          assert.strictEqual(yield* count(), 0);
+          // A failed send is still pending after a restart and is retried by tick.
+          fake.rejectSends.add(reviewer);
+          yield* kanban.pauseBoard(board.id, null, owner);
+          assert.isTrue(
+            (yield* kanban.discussion(talk.id)).participants.find(
+              (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
+            )?.deferred,
+          );
+          fake.rejectSends.delete(reviewer);
+          yield* kanban.tick;
+          assert.strictEqual(yield* count(), 1);
+          const participant = (yield* kanban.discussion(talk.id)).participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
+          );
+          assert.strictEqual(participant?.owes, "nudged");
+          assert.isNotTrue(participant?.deferred);
+          yield* kanban.tick;
+          assert.strictEqual(yield* count(), 1);
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+      }).pipe(Effect.provide(probeDeps(fake.layer)));
+    }),
 );
 
 it.effect("reconciles a missed reviewer turn-end across restart before lifting the board", () =>
@@ -5367,7 +5550,10 @@ it.effect("reconciles a missed reviewer turn-end across restart before lifting t
         const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
         yield* kanban.dispatchNow;
         const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-        yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
         yield* kanban.turnEnded(worker);
         yield* kanban.dispatchNow;
         const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
@@ -5385,43 +5571,57 @@ it.effect("reconciles a missed reviewer turn-end across restart before lifting t
         yield* kanban.pauseBoard(board.id, null, owner);
         fake.failReads.left = 0;
         yield* kanban.tick;
-        assert.lengthOf((yield* Ref.get(fake.threads)).get(reviewer)!.messages.filter(
-          (text) => text.includes("The owner is waiting for your reply"),
-        ), 1);
-        assert.strictEqual((yield* kanban.discussion(talk.id)).participants.find(
-          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
-        )?.owes, "nudged");
+        assert.lengthOf(
+          (yield* Ref.get(fake.threads))
+            .get(reviewer)!
+            .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+          1,
+        );
+        assert.strictEqual(
+          (yield* kanban.discussion(talk.id)).participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === reviewer,
+          )?.owes,
+          "nudged",
+        );
       }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
     }).pipe(Effect.provide(probeDeps(fake.layer)));
   }),
 );
 
-it.effect("preserves a question on a running held reviewer if the board lifts before turn end", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
-      yield* kanban.dispatchNow;
-      const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-      yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
-      yield* kanban.turnEnded(worker);
-      yield* kanban.dispatchNow;
-      const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
-      yield* setRunning(fake, reviewer, true);
-      const talk = yield* kanban.cardDiscussion(card.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
-      yield* kanban.tick;
-      yield* kanban.pauseBoard(board.id, null, owner);
-      const before = (yield* Ref.get(fake.threads)).get(reviewer)!.messages.length;
-      yield* setRunning(fake, reviewer, false);
-      yield* kanban.turnEnded(reviewer);
-      const messages = (yield* Ref.get(fake.threads)).get(reviewer)!.messages.slice(before);
-      assert.lengthOf(messages.filter((text) => text.includes("The owner is waiting for your reply")), 1);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "preserves a question on a running held reviewer if the board lifts before turn end",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
+        yield* kanban.turnEnded(worker);
+        yield* kanban.dispatchNow;
+        const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* setRunning(fake, reviewer, true);
+        const talk = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        yield* kanban.reviewResult(reviewer, "findings", ["Fix"]);
+        yield* kanban.tick;
+        yield* kanban.pauseBoard(board.id, null, owner);
+        const before = (yield* Ref.get(fake.threads)).get(reviewer)!.messages.length;
+        yield* setRunning(fake, reviewer, false);
+        yield* kanban.turnEnded(reviewer);
+        const messages = (yield* Ref.get(fake.threads)).get(reviewer)!.messages.slice(before);
+        assert.lengthOf(
+          messages.filter((text) => text.includes("The owner is waiting for your reply")),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("settling a question while its reviewer is running prevents a later reminder", () =>
@@ -5432,7 +5632,10 @@ it.effect("settling a question while its reviewer is running prevents a later re
       const card = yield* kanban.createCard(board.id, { prompt: "Review" }, owner);
       yield* kanban.dispatchNow;
       const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-      yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId: worker });
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: worker,
+      });
       yield* kanban.turnEnded(worker);
       yield* kanban.dispatchNow;
       const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
@@ -5445,42 +5648,50 @@ it.effect("settling a question while its reviewer is running prevents a later re
       const before = (yield* Ref.get(fake.threads)).get(reviewer)!.messages.length;
       yield* setRunning(fake, reviewer, false);
       yield* kanban.turnEnded(reviewer);
-      assert.isFalse((yield* Ref.get(fake.threads)).get(reviewer)!.messages.slice(before).some(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ));
+      assert.isFalse(
+        (yield* Ref.get(fake.threads))
+          .get(reviewer)!
+          .messages.slice(before)
+          .some((text) => text.includes("The owner is waiting for your reply")),
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("a stale event cannot deliver a deferred reminder while its new kept turn is running", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
-      yield* kanban.dispatchNow;
-      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
-      const talk = yield* kanban.cardDiscussion(card.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      yield* kanban.turnEnded(thread);
-      yield* setRunning(fake, thread, true);
-      const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
-      yield* kanban.pauseBoard(board.id, null, owner);
-      yield* kanban.turnEnded(thread);
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
-      const participant = (yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      );
-      assert.strictEqual(participant?.owes, "asked");
-      assert.isTrue(participant?.deferred);
-      yield* setRunning(fake, thread, false);
-      yield* kanban.tick;
-      assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages.filter(
-        (text) => text.includes("The owner is waiting for your reply"),
-      ), 1);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "a stale event cannot deliver a deferred reminder while its new kept turn is running",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const talk = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        yield* kanban.turnEnded(thread);
+        yield* setRunning(fake, thread, true);
+        const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
+        yield* kanban.pauseBoard(board.id, null, owner);
+        yield* kanban.turnEnded(thread);
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, before);
+        const participant = (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        );
+        assert.strictEqual(participant?.owes, "asked");
+        assert.isTrue(participant?.deferred);
+        yield* setRunning(fake, thread, false);
+        yield* kanban.tick;
+        assert.lengthOf(
+          (yield* Ref.get(fake.threads))
+            .get(thread)!
+            .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("an owner-settled deferred discussion stays silent at a later turn end", () =>
@@ -5496,9 +5707,11 @@ it.effect("an owner-settled deferred discussion stays silent at a later turn end
       yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
       yield* kanban.turnEnded(thread);
       yield* kanban.updateDiscussion(talk.id, { settled: true }, owner);
-      assert.isNull((yield* kanban.discussion(talk.id)).participants.find(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
-      )?.owes);
+      assert.isNull(
+        (yield* kanban.discussion(talk.id)).participants.find(
+          (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread,
+        )?.owes,
+      );
       const before = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
       yield* kanban.turnEnded(thread);
       yield* kanban.pauseBoard(board.id, null, owner);
@@ -5520,7 +5733,9 @@ it.effect("does not nudge a batched worker for a kept card while it carries a he
       const worker = (yield* kanban.card(first.id)).card.activeThreadId!;
       const second = (yield* kanban.createForThread(worker, { prompt: "Second" })).card;
       yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [first.id] }, owner);
-      const deniedSteer = yield* kanban.cardThread(first.id, "steer", "Go", owner).pipe(Effect.flip);
+      const deniedSteer = yield* kanban
+        .cardThread(first.id, "steer", "Go", owner)
+        .pipe(Effect.flip);
       const deniedWake = yield* kanban.cardThread(first.id, "wake", "Go", owner).pipe(Effect.flip);
       assert.include(deniedSteer.message, "the board is paused");
       assert.include(deniedWake.message, "the board is paused");
@@ -5903,15 +6118,16 @@ const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(
       Layer.mock(TextGeneration.TextGeneration)({
-        generateJson: (() => Effect.gen(function* () {
-          probe.calls += 1;
-          if (probe.block) {
-            const { reached, release } = probe.block;
-            yield* Deferred.succeed(reached, undefined);
-            yield* Deferred.await(release);
-          }
-          return yield* probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
-        })) as never,
+        generateJson: (() =>
+          Effect.gen(function* () {
+            probe.calls += 1;
+            if (probe.block) {
+              const { reached, release } = probe.block;
+              yield* Deferred.succeed(reached, undefined);
+              yield* Deferred.await(release);
+            }
+            return yield* probe.ok ? Effect.succeed({ ok: true }) : Effect.die("out of usage");
+          })) as never,
       }),
     ),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -5942,64 +6158,81 @@ it.effect("review259r3: the quiet backstop records a missed outage so probes can
   }),
 );
 
-it.effect("review259r3: a deferred question must not hide a missed failed turn from the backstop", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
-      yield* kanban.dispatchNow;
-      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
-      const talk = yield* kanban.cardDiscussion(card.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      fake.failures.set(thread, {
-        class: "provider_error", code: "provider.internal", message: "failed", retryable: false,
-      });
-      yield* kanban.pauseBoard(board.id, null, owner);
-      yield* TestClock.adjust("31 minutes");
-      yield* kanban.tick;
-      yield* kanban.tick;
-      const failed = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(failed.stage, "todo");
-      assert.include(failed.stalled?.reason ?? "", "Run failed");
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect(
+  "review259r3: a deferred question must not hide a missed failed turn from the backstop",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const talk = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        fake.failures.set(thread, {
+          class: "provider_error",
+          code: "provider.internal",
+          message: "failed",
+          retryable: false,
+        });
+        yield* kanban.pauseBoard(board.id, null, owner);
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        yield* kanban.tick;
+        const failed = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(failed.stage, "todo");
+        assert.include(failed.stalled?.reason ?? "", "Run failed");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
-it.effect("a missed outage during a board pause is handled on lift and its deferred question waits for recovery", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    probe.ok = true;
-    probe.calls = 0;
-    yield* Effect.gen(function* () {
-      const { kanban, board } = yield* toyBoard;
-      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
-      yield* kanban.dispatchNow;
-      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
-      const talk = yield* kanban.cardDiscussion(card.id);
-      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
-      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
-      fake.failures.set(thread, outage);
-      yield* kanban.pauseBoard(board.id, null, owner);
-      yield* kanban.tick;
-      assert.isNotNull((yield* kanban.caller(thread))?.paused ?? null);
-      assert.isTrue((yield* kanban.discussion(talk.id)).participants.some(
-        (entry) => entry.actor._tag === "thread" && entry.actor.threadId === thread &&
-          entry.deferred && entry.owes === "asked",
-      ));
-      const reminders = () => (Ref.get(fake.threads)).pipe(Effect.map((all) =>
-        all.get(thread)!.messages.filter((text) => text.includes("The owner is waiting for your reply")),
-      ));
-      assert.lengthOf(yield* reminders(), 0);
-      yield* TestClock.adjust("5 minutes");
-      yield* kanban.probeOutages;
-      assert.isTrue(probe.calls > 0);
-      fake.failures.delete(thread); // The recovery run is now eligible to answer.
-      yield* kanban.tick;
-      assert.lengthOf(yield* reminders(), 1);
-    }).pipe(Effect.provide(probeLayer(fake.layer)));
-  }),
+it.effect(
+  "a missed outage during a board pause is handled on lift and its deferred question waits for recovery",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      probe.ok = true;
+      probe.calls = 0;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const talk = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+        fake.failures.set(thread, outage);
+        yield* kanban.pauseBoard(board.id, null, owner);
+        yield* kanban.tick;
+        assert.isNotNull((yield* kanban.caller(thread))?.paused ?? null);
+        assert.isTrue(
+          (yield* kanban.discussion(talk.id)).participants.some(
+            (entry) =>
+              entry.actor._tag === "thread" &&
+              entry.actor.threadId === thread &&
+              entry.deferred &&
+              entry.owes === "asked",
+          ),
+        );
+        const reminders = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map((all) =>
+              all
+                .get(thread)!
+                .messages.filter((text) => text.includes("The owner is waiting for your reply")),
+            ),
+          );
+        assert.lengthOf(yield* reminders(), 0);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        assert.isTrue(probe.calls > 0);
+        fake.failures.delete(thread); // The recovery run is now eligible to answer.
+        yield* kanban.tick;
+        assert.lengthOf(yield* reminders(), 1);
+      }).pipe(Effect.provide(probeLayer(fake.layer)));
+    }),
 );
 
 it.effect("a stale successful probe cannot clear an outage reported during the probe", () =>
@@ -6033,7 +6266,15 @@ it.effect("a stale successful probe cannot clear an outage reported during the p
       yield* kanban.probeOutages;
       assert.isNull((yield* kanban.caller(a))?.paused ?? null);
       assert.isNull((yield* kanban.caller(b))?.paused ?? null);
-    }).pipe(Effect.ensuring(Effect.sync(() => { delete probe.block; })), Effect.scoped, Effect.provide(probeLayer(fake.layer)));
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          delete probe.block;
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(probeLayer(fake.layer)),
+    );
   }),
 );
 
@@ -7365,7 +7606,7 @@ it.effect(
           asked.filter((prompt) => prompt.startsWith("You suggest goals")),
           1,
         );
-        assert.lengthOf(yield* kanban.messages(ideas.id, { limit: 300 }), 206);
+        assert.lengthOf(yield* (yield* KanbanStore.KanbanStore).allMessages(ideas.id), 206);
       }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
     }),
 );
@@ -7393,7 +7634,7 @@ it.effect("a skipped proposal is not proposed again after 100+ replies", () =>
       yield* TestClock.adjust("25 hours");
       yield* kanban.tick;
       // The skipped Search proposal is still in the history: it is not posted again.
-      const messages = yield* kanban.messages(ideas.id, { limit: 300 });
+      const messages = yield* (yield* KanbanStore.KanbanStore).allMessages(ideas.id);
       const choices = messages.flatMap((message) =>
         message.blocks.filter((block) => block._tag === "choice"),
       );
@@ -10479,5 +10720,170 @@ it.live("markReadSoon logs a failed read mark without failing the caller", () =>
         Layer.merge(testLayer(fake.layer), Logger.layer([logger], { mergeWithExisting: false })),
       ),
     );
+  }),
+);
+
+const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+
+it.effect("message pages are cut by size, page back with beforeSeq and stub big blocks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Big", owner);
+      const bigMd = "m".repeat(900 * 1024);
+      const bigHtml = `<h1>Report</h1>${"h".repeat(1024 * 1024)}`;
+      // 250 messages with three 1 MB-ish blocks among them.
+      for (let seq = 1; seq <= 250; seq++) {
+        const blocks: Array<KanbanBlock> =
+          seq === 10
+            ? [{ _tag: "html", html: bigHtml, title: "Report", height: null }]
+            : seq === 120 || seq === 249
+              ? [{ _tag: "md", text: bigMd }]
+              : [{ _tag: "md", text: `${seq} ${"w".repeat(4_000)}` }];
+        yield* kanban.post(channel.id, scribe, blocks);
+      }
+      const latest = yield* kanban.messages(channel.id);
+      const bytes = latest.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
+      assert.isAtMost(latest.length, 50);
+      assert.isAtLeast(latest.length, 1);
+      assert.isAtMost(bytes, 256 * 1024);
+      assert.strictEqual(latest.at(-1)!.seq, 250);
+      // Seqs have no holes inside a page.
+      latest.forEach((message, index) => assert.strictEqual(message.seq, latest[0]!.seq + index));
+      const stub = latest.find((message) => message.seq === 249)!.blocks[0]!;
+      assert.strictEqual(stub._tag, "md");
+      if (stub._tag === "md") {
+        assert.isTrue(stub.truncated);
+        assert.strictEqual(stub.fullBytes, bigMd.length);
+        assert.isAtMost(stub.text.length, 2_100);
+      }
+      // Older clients asking for 200 still get a size-bounded page.
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const legacy = yield* ws[M.messages]({ discussionId: channel.id, limit: 200 });
+      assert.isAtMost(
+        legacy.reduce((sum, message) => sum + JSON.stringify(message).length, 0),
+        256 * 1024,
+      );
+      assert.strictEqual(legacy.at(-1)!.seq, 250);
+      // Paging back reaches the first message without gaps or repeats.
+      const seen: Array<number> = latest.map((message) => message.seq);
+      let before = latest[0]!.seq;
+      while (before > 1) {
+        const page = yield* ws[M.messages]({ discussionId: channel.id, beforeSeq: before });
+        assert.isAbove(page.length, 0);
+        assert.strictEqual(page.at(-1)!.seq, before - 1);
+        seen.unshift(...page.map((message) => message.seq));
+        before = page[0]!.seq;
+      }
+      assert.deepStrictEqual(
+        seen,
+        Array.from({ length: 250 }, (_, index) => index + 1),
+      );
+      // The html stub keeps its tag and title; the full message comes by seq.
+      const early = yield* ws[M.messages]({ discussionId: channel.id, beforeSeq: 11, limit: 1 });
+      const html = early[0]!.blocks[0]!;
+      assert.strictEqual(html._tag, "html");
+      if (html._tag === "html") {
+        assert.isTrue(html.truncated);
+        assert.strictEqual(html.title, "Report");
+        assert.include(html.html, "Report");
+        assert.isBelow(html.html.length, 200);
+      }
+      const full = yield* ws[M.message]({ discussionId: channel.id, seq: 10 });
+      const fullBlock = full.blocks[0]!;
+      assert.strictEqual(fullBlock._tag === "html" ? fullBlock.html : "", bigHtml);
+      assert.isUndefined(fullBlock._tag === "html" ? fullBlock.truncated : true);
+      const missing = yield* ws[M.message]({ discussionId: channel.id, seq: 999 }).pipe(
+        Effect.flip,
+      );
+      assert.strictEqual(missing.code, "not-found");
+      // A stub decodes as a block, so older and newer clients read the same shape.
+      yield* Schema.decodeUnknownEffect(KanbanBlock)(stub);
+      // A window between two cursors.
+      const one = yield* ws[M.messages]({
+        discussionId: channel.id,
+        afterSeq: 248,
+        beforeSeq: 250,
+      });
+      assert.deepStrictEqual(
+        one.map((message) => message.seq),
+        [249],
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the board feed sends big message blocks as stubs", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Feed", owner);
+      const events = yield* kanban.watch(board.id).pipe(
+        Stream.filter((event) => event._tag === "change" && event.change._tag === "message"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      const posted = yield* kanban.post(channel.id, scribe, [
+        { _tag: "md", text: "z".repeat(100 * 1024) },
+      ]);
+      // The poster gets the message in full.
+      assert.strictEqual(
+        posted.blocks[0]?._tag === "md" && posted.blocks[0].text.length,
+        100 * 1024,
+      );
+      const [event] = yield* Fiber.join(events);
+      assert.strictEqual(event?._tag, "change");
+      if (event?._tag === "change" && event.change._tag === "message") {
+        const block = event.change.message.blocks[0]!;
+        assert.isTrue(block._tag === "md" && block.truncated === true);
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a read already marked never waits on the board lock", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const lockHeld = yield* Deferred.make<void>();
+    const releaseLock = yield* Deferred.make<void>();
+    const blockedThreads = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            Deferred.succeed(lockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLock)),
+              Effect.andThen(threads.launch(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Read", owner);
+      const message = yield* kanban.post(channel.id, scribe, [{ _tag: "md", text: "Hi" }]);
+      yield* kanban.markRead(channel.id, owner, message.seq);
+      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(lockHeld);
+      // The lock is held: a read already recorded (or past lastSeq) returns at once.
+      yield* kanban.markRead(channel.id, owner, message.seq);
+      yield* kanban.markRead(channel.id, owner, message.seq + 5);
+      // A real write still waits for the lock and expires like any write.
+      const queued = yield* Effect.forkChild(
+        kanban
+          .markRead(channel.id, { _tag: "evaluator", threadId: ThreadId.make("e") }, 1)
+          .pipe(Effect.flip),
+      );
+      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
+      assert.include((yield* Fiber.join(queued)).message, "Board busy");
+      yield* Deferred.succeed(releaseLock, undefined);
+      yield* Fiber.join(dispatch);
+    }).pipe(Effect.provide(testLayer(blockedThreads)));
   }),
 );
