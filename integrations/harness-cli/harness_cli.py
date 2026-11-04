@@ -28,6 +28,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -112,7 +114,8 @@ CLAUDE_MODEL_IDS = {
     "claude-haiku-5-5": "cc/claude-haiku-5-5",
 }
 DEFAULT_TIMEOUT = 600
-CANARY_SCHEMA_VERSION = 2
+CANARY_SCHEMA_VERSION = 6
+CODEX_OBSERVATION_SECONDS = 120
 SANDBOX_SYSTEM_READ_ROOTS = ("/System", "/usr", "/bin", "/dev", "/private/etc",
                              "/private/var/db", "/private/var/run", "/private/var/protected")
 SANDBOX_EXEC_ALLOWLIST: tuple[str, ...] = ()  # The selected binary is added per invocation.
@@ -524,9 +527,11 @@ class Recorder:
         self.hold_primary = None
         self.server = None
         self.thread = None
+        self.errors: list[str] = []
 
     def start(self) -> str:
         import http.server
+        import socketserver
         import threading
         import urllib.request
         recorder = self
@@ -536,6 +541,25 @@ class Recorder:
 
             def log_message(self, *args):  # keep test output clean
                 pass
+
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(10)
+
+            def log_error(self, *args):
+                # An idle keep-alive timeout follows a complete request; a partial request
+                # is caught by its body read or by send_error during header parsing.
+                if not (getattr(self, "completed_request", False) and args and isinstance(args[0], str)
+                        and args[0].startswith("Request timed out")):
+                    recorder.errors.append("HTTP parse or transport error")
+
+            def parse_request(self):
+                self.completed_request = False
+                return super().parse_request()
+
+            def send_error(self, code, message=None, explain=None):
+                recorder.errors.append("HTTP rejection")
+                return super().send_error(code, message, explain)
 
             def reject(self):
                 recorder.violations.append({"method": self.command, "path": self.path[:256]})
@@ -553,8 +577,16 @@ class Recorder:
                 if self.path not in ("/v1/messages", "/v1/messages?beta=true", "/v1/responses"):
                     self.reject()
                     return
-                length = int(self.headers.get("content-length", "0"))
-                body = self.rfile.read(length)
+                try:
+                    length = int(self.headers.get("content-length", "0"))
+                    if length < 0:
+                        raise ValueError("negative content length")
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        raise ValueError("incomplete request")
+                except (ValueError, OSError):
+                    recorder.errors.append("could not read request body")
+                    return
                 recorder.bodies.append(body)
                 recorder.paths.append(self.path)
                 safe_headers = {k.lower(): v for k, v in self.headers.items()
@@ -565,6 +597,11 @@ class Recorder:
                     parsed = None
                 record = {"path": self.path, "headers": safe_headers, "body": parsed}
                 recorder.requests.append(record)
+                if self.path.startswith("/v1/messages") and (
+                        not isinstance(parsed, dict) or not isinstance(parsed.get("messages"), list)):
+                    recorder.errors.append("malformed Claude request")
+                    self.send_error(400)
+                    return
                 allowed_headers = {"content-type", "accept", "anthropic-version", "anthropic-beta",
                                    "user-agent", "x-app", "x-9router-token-saver"}
                 headers = {k: v for k, v in self.headers.items() if k.lower() in allowed_headers}
@@ -599,9 +636,11 @@ class Recorder:
                         self.send_header("content-length", str(len(payload)))
                         self.end_headers()
                         self.wfile.write(payload)
+                        self.completed_request = True
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 except Exception as exc:  # report, do not leak the key
+                    recorder.errors.append(type(exc).__name__)
                     msg = f"proxy upstream error: {type(exc).__name__}".encode()
                     try:
                         self.send_response(502)
@@ -611,7 +650,33 @@ class Recorder:
                     except (BrokenPipeError, ConnectionResetError):
                         pass
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class DrainingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            # A bounded drain fails closed instead of keeping the global state lock forever.
+            daemon_threads = True
+            def __init__(self, *args):
+                self.active = 0
+                self.active_cv = threading.Condition()
+                super().__init__(*args)
+            def process_request(self, request, client_address):
+                with self.active_cv:
+                    self.active += 1
+                try:
+                    super().process_request(request, client_address)
+                except BaseException:
+                    with self.active_cv:
+                        self.active -= 1
+                        self.active_cv.notify_all()
+                    raise
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    with self.active_cv:
+                        self.active -= 1
+                        self.active_cv.notify_all()
+            def handle_error(self, request, client_address):
+                recorder.errors.append("uncaught HTTP handler error")
+        self.server = DrainingServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -619,6 +684,10 @@ class Recorder:
     def stop(self) -> None:
         if self.server:
             self.server.shutdown()
+            with self.server.active_cv:
+                drained = self.server.active_cv.wait_for(lambda: self.server.active == 0, timeout=15)
+            if not drained:
+                self.errors.append("HTTP handlers did not drain")
             self.server.server_close()
             if self.thread:
                 self.thread.join(timeout=5)
@@ -698,7 +767,7 @@ def nine_router_key() -> str:
 
 def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
             cwd: Path | None = None, sandbox_root: Path | None = None,
-            recorder_url: str | None = None) -> subprocess.CompletedProcess:
+            recorder_url: str | None = None, hold_complete: Callable[[], bool] | None = None) -> subprocess.CompletedProcess:
     """Run only the selected binary, with writes and network confined to the probe."""
     require_isolated_home(env)
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
@@ -742,8 +811,19 @@ def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
     proc = subprocess.Popen(["/usr/bin/sandbox-exec", "-p", profile, str(binary), *args], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(cwd), start_new_session=True)
     import signal
+    import threading
+    exit_verified = threading.Event()
+    hold_verified_at_exit = []
+    def monitor_exit():
+        proc.wait()
+        hold_verified_at_exit.append(hold_complete is None or hold_complete())
+        exit_verified.set()
+    waiter = threading.Thread(target=monitor_exit, daemon=True)
+    waiter.start()
     try:
         out, err = proc.communicate(timeout=timeout)
+        if not exit_verified.wait(timeout=5) or not hold_verified_at_exit[0]:
+            raise HarnessError("Codex exited before its memory observation window completed")
     finally:
         # The sandbox denies signalling outside the candidate; the unsandboxed parent
         # owns this process group and kills any surviving in-group descendants.
@@ -841,13 +921,16 @@ def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> di
         body = rec.get("body")
         if not isinstance(body, dict):
             continue
-        for message in body.get("messages", []):
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            raise HarnessError("cannot inspect Claude messages; refusing canary")
+        for message in messages:
             if isinstance(message, dict) and message.get("role") == "assistant":
                 content = message.get("content")
                 if isinstance(content, list):
                     blocks = [block_identity(b) for b in content if isinstance(b, dict)
                               and b.get("type") in ("thinking", "redacted_thinking")]
-                    this_match = bool(expected and all(expected) and blocks == expected)
+                    this_match = bool(replies and expected and all(expected) and blocks == expected)
                     if this_match:
                         matched = True
                         transformations = rec.get("response_transformations") or []
@@ -859,7 +942,8 @@ def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> di
             "turn1SignedBlocks": len(replies), "thinkingReplayed": matched,
             "inputTransformationsObserved": observed,
             "responseTransformationsObserved": bool(all_transformations),
-            "inputTransformationsEmpty": bool(reports) and all(reports)}
+            "inputTransformationsEmpty": (bool(reports) and all(reports) and bool(all_transformations)
+                                           and all(v == [] for v in all_transformations))}
 
 
 def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> dict:
@@ -917,10 +1001,17 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         results["thinkingCheckChecked"] = bool(first_turn and recorder.requests[boundary:])
         results["thinkingReplayed"] = preserved["thinkingReplayed"]
         results["inputTransformationsEmpty"] = preserved["inputTransformationsEmpty"]
+        before_haiku = len(recorder.requests)
         haiku = run_cli(binary, ["-p", "Reply exactly OK.", "--model", CLAUDE_MODEL_IDS["claude-haiku-5-5"],
                                   "--effort", "low", "--output-format", "text"], env=env, timeout=240, cwd=project,
                         sandbox_root=work, recorder_url=base)
-        results["claude-haiku-5-5"] = {"ok": haiku.returncode == 0 and "OK" in haiku.stdout}
+        results["claude-haiku-5-5"] = {"ok": haiku.returncode == 0 and "OK" in haiku.stdout
+                                      and len(recorder.requests) > before_haiku}
+        before_drain = len(recorder.requests)
+        recorder.stop()
+        # Late accepted requests cannot safely be assigned to a turn.
+        if len(recorder.requests) != before_drain:
+            results["thinkingCheckChecked"] = False
         # Informational diagnostics for the record (never promotion failures).
         results["diagnostics"] = {
             "contextManagement": [(r.get("body") or {}).get("context_management")
@@ -932,11 +1023,14 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         # The marker must be absent from every request body the CLI sent, and the seed must
         # have been there to be read (a seed the CLI never reads proves nothing).
         seed_present = (mem_dir / "MEMORY.md").is_file()
-        leaked = any(CLAUDE_MEMORY_CANARY.encode() in body for body in recorder.bodies)
+        if any(not isinstance(record.get("body"), dict) for record in recorder.requests):
+            raise HarnessError("Claude request body could not be inspected")
+        leaked = any(CLAUDE_MEMORY_CANARY.encode() in body for body in recorder.bodies) or any(
+            CLAUDE_MEMORY_CANARY in json.dumps(record["body"], ensure_ascii=False) for record in recorder.requests)
         results["memoryCanaryLeaked"] = leaked
         results["memoryCanaryChecked"] = seed_present and len(recorder.bodies) > 0
         results["requests"] = len(recorder.bodies)
-        results["recorderViolations"] = len(recorder.violations)
+        results["recorderViolations"] = len(recorder.violations) + len(recorder.errors)
     finally:
         recorder.stop()
     return results
@@ -1020,7 +1114,8 @@ def seed_codex_rollout(chome: Path, work: Path, version: str) -> str:
     return thread_id
 
 
-def codex_memory_pipeline_evidence(chome: Path, baseline: dict[str, str], after: dict[str, str]) -> list[str]:
+def codex_memory_pipeline_evidence(chome: Path, baseline: dict[str, str], after: dict[str, str],
+                                   *, initializing: bool = False) -> list[str]:
     """Distinguish extracted content/jobs from an initialized, empty memory database."""
     import sqlite3
     from contextlib import closing
@@ -1043,7 +1138,12 @@ def codex_memory_pipeline_evidence(chome: Path, baseline: dict[str, str], after:
     if db.is_file() and db.stat().st_size:
         try:
             with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as conn:
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table in ("stage1_outputs", "jobs"):
+                    if table not in tables:
+                        if initializing:
+                            continue
+                        raise HarnessError("Codex memory database schema is unsupported; refusing canary")
                     if conn.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()[0]:
                         evidence.append("memories_1.sqlite:" + table)
         except sqlite3.Error as exc:
@@ -1066,7 +1166,7 @@ def codex_memory_positive_evidence(chome: Path, fixture_id: str) -> list[str]:
     return ["memories_1.sqlite:stage1_outputs:content"] if rows else []
 
 
-def wait_for_codex_fixture(chome: Path, fixture_id: str, timeout: float = 120) -> bool:
+def wait_for_codex_fixture(chome: Path, fixture_id: str, timeout: float = CODEX_OBSERVATION_SECONDS) -> bool:
     """Observe async extraction while the primary response keeps Codex alive."""
     import sqlite3
     from contextlib import closing
@@ -1108,8 +1208,31 @@ def codex_memory_in_body(body, sentinel: str, instruction_text: str | None = Non
     return sentinel_seen, section_seen
 
 
+def codex_pipeline_request(body) -> bool:
+    """Identify Codex's extraction/consolidation request independently of disk artifacts."""
+    if not isinstance(body, dict):
+        return False
+    text_format = body.get("text")
+    if text_format is not None and not isinstance(text_format, dict):
+        raise HarnessError("cannot inspect Codex request text format; refusing canary")
+    text_format = text_format.get("format") if isinstance(text_format, dict) else None
+    if text_format is not None and not isinstance(text_format, dict):
+        raise HarnessError("cannot inspect Codex request format; refusing canary")
+    schema = text_format.get("schema") if isinstance(text_format, dict) else None
+    if schema is not None and not isinstance(schema, dict):
+        raise HarnessError("cannot inspect Codex request schema; refusing canary")
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if properties is not None and not isinstance(properties, dict):
+        raise HarnessError("cannot inspect Codex request schema properties; refusing canary")
+    if isinstance(properties, dict) and "raw_memory" in properties:
+        return True
+    text = json.dumps(body, ensure_ascii=False)
+    return "Memory Writing Agent: Phase 2" in text or "phase2_workspace_diff.md" in text
+
+
 def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, models: list[str],
-                           *, enable_memory: bool, version: str) -> dict:
+                           *, enable_memory: bool, version: str,
+                           observation_seconds: float | None = None) -> dict:
     """Run Codex against a disposable copy of a generated home, with the memory check.
 
     Not ephemeral: Codex 0.166.0 disables the memory pipeline for ephemeral sessions, so an
@@ -1119,6 +1242,8 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
     enable_memory=True turns memory ON in the copy: the positive control. The detector must fire
     there, otherwise a "clean" result on the real home could just mean the detector is blind.
     """
+    if observation_seconds is None:
+        observation_seconds = CODEX_OBSERVATION_SECONDS
     chome = work / "codex-home" / ".codex"
     shutil.copytree(generated_home, chome, dirs_exist_ok=True)
     # The copied catalog must stay inside the confined probe, not the generator's sibling tree.
@@ -1145,6 +1270,22 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
     results: dict = {"positiveControl": enable_memory, "models": {}}
+    observed_pipeline = set()
+    observation_errors = []
+    monitor_done = threading.Event()
+    def monitor_pipeline():
+        while not monitor_done.is_set():
+            try:
+                snapshot = codex_memory_snapshot(chome)
+                observed_pipeline.update(codex_memory_pipeline_evidence(chome, baseline, snapshot,
+                                                                        initializing=True))
+            except Exception as exc:
+                observation_errors.append(type(exc).__name__)
+                return
+            monitor_done.wait(0.1)
+    monitor = threading.Thread(target=monitor_pipeline, daemon=True)
+    if not enable_memory:
+        monitor.start()
     try:
         prepare_isolated_home(work / "codex-home")
         instructions_path = chome / "AGENTS.md"
@@ -1155,48 +1296,116 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
         cfg += ["-c", "memories.min_rollout_idle_hours=1", "-c", "memories.max_rollouts_per_startup=1",
                 "-c", f'memories.extract_model="{models[0]}"']
+        bootstrap_prompt = "Reply exactly OK. This is bootstrap probe " + uuid.uuid4().hex
         bootstrap = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
-                                    "-m", models[0], *cfg, "-c", "features.memories=false", "Reply exactly OK."], env=env, timeout=240,
+                                    "-m", models[0], *cfg, "-c", "features.memories=false", bootstrap_prompt], env=env, timeout=240,
                             cwd=work, sandbox_root=work, recorder_url=base)
         if bootstrap.returncode or not recorder.requests:
             raise HarnessError("Codex memory-control bootstrap failed")
         fixture_id = seed_codex_rollout(chome, work, version)
-        prompt = "Reply exactly OK. This is primary probe " + uuid.uuid4().hex
+        completed_prompts = set()
+        control_observed = False
+        control_elapsed = None
+        invocation_started = None
+        observed_seconds = {}
+        prompt = None
         def hold_primary(record):
-            if prompt in json.dumps(record.get("body")):
+            nonlocal control_observed, control_elapsed
+            matched_prompt = prompt
+            if matched_prompt and matched_prompt in json.dumps(record.get("body")):
                 # The disabled run needs an observation window too, or a fast answer can
                 # terminate Codex before an incorrectly enabled async pipeline starts.
                 if enable_memory:
-                    wait_for_codex_fixture(chome, fixture_id)
+                    control_observed = wait_for_codex_fixture(chome, fixture_id, timeout=observation_seconds)
+                    if control_observed:
+                        control_elapsed = time.monotonic() - invocation_started
                 else:
-                    time.sleep(5)
+                    start = time.monotonic()
+                    deadline = start + observation_seconds
+                    while True:
+                        snapshot = codex_memory_snapshot(chome)
+                        observed_pipeline.update(codex_memory_pipeline_evidence(chome, baseline, snapshot,
+                                                                                initializing=True))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.5, remaining))
+                    observed_seconds[matched_prompt] = time.monotonic() - start
+                completed_prompts.add(matched_prompt)
         recorder.hold_primary = hold_primary
+        prompts = []
         for model in models:
+            prompt = "Reply exactly OK. This is primary probe " + uuid.uuid4().hex
+            prompts.append(prompt)
             before = len(recorder.requests)
+            invocation_started = time.monotonic()
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
-                                    "-m", model, *cfg, prompt], env=env, timeout=240,
-                           cwd=work, sandbox_root=work, recorder_url=base)
+                                    "-m", model, *cfg, prompt], env=env, timeout=int(observation_seconds) + 240,
+                           cwd=work, sandbox_root=work, recorder_url=base,
+                           hold_complete=lambda: prompt in completed_prompts)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
             observations = [codex_memory_in_body(r.get("body"), sentinel, instructions) for r in records]
             sentinel_seen = any(item[0] for item in observations)
             section = any(item[1] for item in observations)
+            primary = [r for r in records if prompt in json.dumps(r.get("body"))]
+            primary_sentinel = any(codex_memory_in_body(r.get("body"), sentinel, instructions)[0] for r in primary)
             bodies_decoded = all(isinstance(r.get("body"), dict) for r in records)
             results["models"][model] = {"ok": ok and bool(records) and bodies_decoded, "requests": len(records),
                                         "memorySentinelInRequest": sentinel_seen,
+                                        "memorySentinelInPrimaryRequest": primary_sentinel,
+                                        "memoryPipelineRequests": sum(codex_pipeline_request(r.get("body")) for r in records),
                                         "memorySectionInRequest": section}
+            # Completion must precede process exit, not merely the subsequent recorder scan.
+            if prompt not in completed_prompts:
+                raise HarnessError("Codex exited before its memory observation window completed")
+        # Stop acceptance and drain already-accepted handlers before taking the verdict.
+        recorder.stop()
+        monitor_done.set()
+        if not enable_memory:
+            monitor.join(timeout=5)
+            if monitor.is_alive() or observation_errors:
+                raise HarnessError("Codex memory observation could not be completed")
+        if recorder.errors:
+            raise HarnessError("Codex recorder could not inspect every accepted request")
         after = codex_memory_snapshot(chome)
         artifacts = sorted(path for path in set(baseline) | set(after) if baseline.get(path) != after.get(path))
         results["memoryBaseline"] = baseline
         results["memoryArtifacts"] = artifacts
-        results["memoryPipelineEvidence"] = codex_memory_pipeline_evidence(chome, baseline, after)
+        observed_pipeline.update(codex_memory_pipeline_evidence(chome, baseline, after))
+        results["memoryPipelineEvidence"] = sorted(observed_pipeline)
+        unexpected_requests = sum(1 for r in recorder.requests
+                                  if not any(p in json.dumps(r.get("body")) for p in [bootstrap_prompt, *prompts]))
+        if not enable_memory and unexpected_requests:
+            results["memoryPipelineEvidence"].append("unaccounted-request")
+        pipeline_requests = sum(1 for r in recorder.requests if codex_pipeline_request(r.get("body")))
+        if pipeline_requests:
+            results["memoryPipelineEvidence"].append("recorded-pipeline-request")
+        results["memoryPipelineRequests"] = pipeline_requests
         results["memoryPipelineRan"] = bool(results["memoryPipelineEvidence"])
         results["memoryPositiveEvidence"] = codex_memory_positive_evidence(chome, fixture_id) if enable_memory else []
-        results["memorySentinelSeen"] = any(m.get("memorySentinelInRequest") for m in results["models"].values())
-        results["memoryPromptSeen"] = any(m.get("memorySectionInRequest") for m in results["models"].values())
+        # The seeded memory exists before bootstrap, so scan every request from this
+        # home, not just the per-model slices after the indexed rollout is added.
+        all_observations = [codex_memory_in_body(r.get("body"), sentinel, instructions) for r in recorder.requests]
+        if not all(isinstance(r.get("body"), dict) for r in recorder.requests):
+            raise HarnessError("Codex request body could not be inspected")
+        results["memorySentinelSeen"] = any(item[0] for item in all_observations)
+        results["memoryPromptSeen"] = any(item[1] for item in all_observations)
         results["requests"] = len(recorder.requests)
         results["recorderViolations"] = len(recorder.violations)
+        results["observationWindowSeconds"] = observation_seconds
+        results["observedSeconds"] = [observed_seconds[p] for p in prompts if p in observed_seconds]
+        results["observationComplete"] = (all(p in completed_prompts for p in prompts) and
+                                          (enable_memory or all(observed_seconds.get(p, 0) >= observation_seconds
+                                                                for p in prompts)))
+        results["positiveObservedDuringHold"] = control_observed
+        results["positiveElapsedSeconds"] = control_elapsed
+        if not results["observationComplete"]:
+            raise HarnessError("Codex memory observation window was not completed")
     finally:
+        monitor_done.set()
+        if not enable_memory and monitor.is_alive():
+            monitor.join(timeout=5)
         recorder.stop()
     return results
 
@@ -1214,24 +1423,37 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
     control_work = work / "control"
     control_work.mkdir(parents=True, exist_ok=True)
     control = run_codex_memory_probe(binary, generated_home, control_work, models[:1], enable_memory=True, version=version)
-    detector_fires = bool(control["memoryPositiveEvidence"])
-    read_control_fires = control["memorySentinelSeen"] is True
+    detector_fires = (bool(control["memoryPositiveEvidence"]) and control["observationComplete"] is True
+                      and control["positiveObservedDuringHold"] is True
+                      and all(m["ok"] for m in control["models"].values())
+                      and any(m["memoryPipelineRequests"] > 0 for m in control["models"].values()))
+    read_control_fires = any(m["memorySentinelInPrimaryRequest"] for m in control["models"].values())
     real_work = work / "real"
     real_work.mkdir(parents=True, exist_ok=True)
-    real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False, version=version)
+    observation_seconds = max(CODEX_OBSERVATION_SECONDS, control["positiveElapsedSeconds"] or 0)
+    real = run_codex_memory_probe(binary, generated_home, real_work, models, enable_memory=False, version=version,
+                                  observation_seconds=observation_seconds)
     results = {
         "positiveControlFired": detector_fires,
         "positiveControlEvidence": control["memoryPositiveEvidence"],
+        "positiveElapsedSeconds": control["positiveElapsedSeconds"],
         "readControlFired": read_control_fires,
         "positiveControlArtifacts": control["memoryArtifacts"],
         "memoryPipelineEvidence": real["memoryPipelineEvidence"],
+        "memoryPipelineRequests": real["memoryPipelineRequests"],
         "models": real["models"],
         "memoryBaseline": real["memoryBaseline"],
         "memoryArtifacts": real["memoryArtifacts"],
         "memoryPipelineRan": real["memoryPipelineRan"],
         "memorySentinelSeen": real["memorySentinelSeen"],
         "memoryPromptSeen": real["memoryPromptSeen"],
-        "memoryCanaryChecked": bool(detector_fires and read_control_fires and real["requests"] > 0),
+        # Snapshot polling can miss a job that is created and deleted between reads.
+        # Until that interval is observable without gaps, a clean snapshot is not proof.
+        "memoryCanaryChecked": False,
+        "memoryObservationLimitation": "transient jobs between filesystem snapshots are not ruled out",
+        "observationWindowSeconds": real["observationWindowSeconds"],
+        "observedSeconds": real["observedSeconds"],
+        "observationComplete": real["observationComplete"],
         "requests": real["requests"],
         "recorderViolations": control["recorderViolations"] + real["recorderViolations"],
     }
@@ -1251,6 +1473,9 @@ def canary(tool: str, version: str) -> dict:
     reasons: list[str] = []
     result: dict = {}
     digest = None
+    # Supersede any older pass before executing untrusted candidates, even if a run hangs.
+    write_record("canary", tool, version, "failed", binarySha256=None, canary={},
+                 reasons=["canary run did not complete"], canarySchemaVersion=CANARY_SCHEMA_VERSION)
     try:
         check_minimums(tool, version)
         if not binary.is_file():
@@ -1317,9 +1542,14 @@ def canary(tool: str, version: str) -> dict:
             reasons.append("no request reached the recording proxy")
         if result.get("recorderViolations", 0) or (result.get("cu") or {}).get("recorderViolations", 0):
             reasons.append("recording proxy rejected an unexpected request")
+        valid = (valid_claude_canary(result) if tool == "claude" else
+                 valid_codex_canary_home(result, MODEL_CANARIES["codex"])
+                 and valid_codex_canary_home(result.get("cu"), CODEX_CU_MODELS))
+        if not valid:
+            reasons.append("canary evidence is incomplete or inconsistent")
     except HarnessError as exc:
         reasons.append(str(exc))
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+    except Exception as exc:
         reasons.append(f"canary error: {type(exc).__name__}")
     passed = not reasons
     write_record("canary", tool, version, "passed" if passed else "failed",
@@ -1472,6 +1702,58 @@ def rollback(tool: str) -> dict:
     return {"tool": tool, "version": target, "previous": previous}
 
 
+def valid_codex_canary_home(body, models: list[str]) -> bool:
+    # The current snapshot observer cannot rule out short-lived jobs between reads.
+    # No record produced by this implementation is sufficient for promotion.
+    return False
+
+
+def _valid_codex_canary_home_fields(body, models: list[str]) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if any(body.get(k) is not True for k in ("memoryCanaryChecked", "positiveControlFired",
+                                               "readControlFired", "observationComplete")):
+        return False
+    if any(body.get(k) is not False for k in ("memoryPipelineRan", "memoryPromptSeen", "memorySentinelSeen")):
+        return False
+    if body.get("memoryPipelineEvidence") != [] or type(body.get("memoryPipelineRequests")) is not int \
+            or body["memoryPipelineRequests"] != 0:
+        return False
+    evidence = body.get("positiveControlEvidence")
+    if not isinstance(evidence, list) or "memories_1.sqlite:stage1_outputs:content" not in evidence:
+        return False
+    window, elapsed, observed = (body.get("observationWindowSeconds"), body.get("positiveElapsedSeconds"),
+                                 body.get("observedSeconds"))
+    def nonnegative_finite(value):
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    if not (nonnegative_finite(window) and nonnegative_finite(elapsed)
+            and window >= max(CODEX_OBSERVATION_SECONDS, elapsed) and isinstance(observed, list)
+            and len(observed) == len(models)
+            and all(nonnegative_finite(value) and value >= window for value in observed)):
+        return False
+    if type(body.get("recorderViolations")) is not int or body["recorderViolations"] != 0:
+        return False
+    if type(body.get("requests")) is not int or body["requests"] <= 0:
+        return False
+    actual = body.get("models")
+    return (isinstance(actual, dict) and all(isinstance(actual.get(model), dict)
+            and actual[model].get("ok") is True and type(actual[model].get("requests")) is int
+            and actual[model]["requests"] > 0 for model in models))
+
+
+def valid_claude_canary(body) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if any(body.get(k) is not True for k in ("memoryCanaryChecked", "thinkingCheckChecked",
+                                              "thinkingReplayed", "inputTransformationsEmpty")):
+        return False
+    if body.get("memoryCanaryLeaked") is not False or type(body.get("recorderViolations")) is not int \
+            or body["recorderViolations"] != 0 or type(body.get("requests")) is not int or body["requests"] < 3:
+        return False
+    return all(isinstance(body.get(model), dict) and body[model].get("ok") is True
+               for model in MODEL_CANARIES["claude"])
+
+
 def latest_canary(tool: str, version: str) -> dict | None:
     """The most recent canary record for this exact tool/version, or None."""
     if not records_path().exists():
@@ -1486,28 +1768,26 @@ def latest_canary(tool: str, version: str) -> dict | None:
     if found is None:
         return None
     canary_body = found.get("canary") or {}
+    if not isinstance(canary_body, dict):
+        canary_body = {}
+    cu_body = canary_body.get("cu") if isinstance(canary_body.get("cu"), dict) else {}
     # Same rule as canary(): a pass needs no reasons, the memory check ran, and it found nothing.
     memory_ok = canary_body.get("memoryCanaryChecked") is True and not (
         canary_body.get("memoryCanaryLeaked") is True if tool == "claude"
         else (canary_body.get("memoryPipelineRan") or canary_body.get("memoryPromptSeen")
               or canary_body.get("memorySentinelSeen")
-              or (canary_body.get("cu") or {}).get("memoryPipelineRan")
-              or (canary_body.get("cu") or {}).get("memorySentinelSeen")
-              or (canary_body.get("cu") or {}).get("memoryPromptSeen")))
+              or cu_body.get("memoryPipelineRan")
+              or cu_body.get("memorySentinelSeen")
+              or cu_body.get("memoryPromptSeen")))
     if tool == "claude":
-        checks_ok = (canary_body.get("thinkingCheckChecked") is True
-                     and canary_body.get("thinkingReplayed") is True
-                     and canary_body.get("inputTransformationsEmpty") is True)
+        checks_ok = valid_claude_canary(canary_body)
     else:
-        checks_ok = ((canary_body.get("cu") or {}).get("memoryCanaryChecked") is True
-                     and canary_body.get("positiveControlFired") is True
-                     and (canary_body.get("cu") or {}).get("positiveControlFired") is True
-                     and canary_body.get("readControlFired") is True
-                     and (canary_body.get("cu") or {}).get("readControlFired") is True)
+        checks_ok = (valid_codex_canary_home(canary_body, MODEL_CANARIES["codex"])
+                     and valid_codex_canary_home(canary_body.get("cu"), CODEX_CU_MODELS))
     passed = (found.get("canarySchemaVersion") == CANARY_SCHEMA_VERSION
               and found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
               and not canary_body.get("recorderViolations")
-              and not (canary_body.get("cu") or {}).get("recorderViolations"))
+               and not cu_body.get("recorderViolations"))
     return {
         "passed": passed,
         "binarySha256": found.get("binarySha256"),
