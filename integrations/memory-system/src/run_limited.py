@@ -11,6 +11,7 @@ import tempfile
 import time
 
 KILL_GRACE_SECONDS = 30
+MAX_REPLAY_BYTES = 65536
 
 
 def child_exited_unreaped(process):
@@ -36,49 +37,115 @@ def positive_seconds(value):
     return seconds
 
 
+def replay_capture(capture, stream):
+    # A positional read does not move the offset shared with a surviving writer.
+    size = os.fstat(capture.fileno()).st_size
+    offset = max(0, size - MAX_REPLAY_BYTES)
+    if offset:
+        stream.write(f"[run_limited: {offset} earlier bytes dropped]\n".encode())
+    while offset < size:
+        chunk = os.pread(capture.fileno(), min(MAX_REPLAY_BYTES, size - offset), offset)
+        if not chunk:
+            break
+        stream.write(chunk)
+        offset += len(chunk)
+    stream.flush()
+
+
 def run(command, seconds):
-    # A child stuck in uninterruptible I/O can hold a shell capture pipe open
-    # even after SIGKILL; files let the wrapper return without waiting for it.
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        try:
-            process = subprocess.Popen(command, start_new_session=True, stdout=stdout, stderr=stderr)
-        except OSError as exc:
-            print(f"cannot start {command[0]}: {exc}", file=sys.stderr)
-            return 127 if isinstance(exc, FileNotFoundError) else 126
-        deadline = time.monotonic() + seconds
-        while not child_exited_unreaped(process):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.1, remaining))
-        if child_exited_unreaped(process):
-            code = process.wait()
-            code = code if code >= 0 else 128 - code
-        else:
-            # Keep the leader unreaped during the grace period: a child can
-            # outlive it, and its PID must not be reused before the group kill.
-            signal_group(process.pid, signal.SIGTERM)
-            time.sleep(KILL_GRACE_SECONDS)
-            signal_group(process.pid, signal.SIGKILL)
-            deadline = time.monotonic() + 1
-            while not child_exited_unreaped(process) and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if child_exited_unreaped(process):
-                process.wait()
-            # Otherwise an uninterruptible kernel wait has outlasted SIGKILL.
-            code = 124
-        for capture, stream in ((stdout, sys.stdout.buffer), (stderr, sys.stderr.buffer)):
-            # Do not chase a still-writing, uninterruptible child's output.
-            remaining = os.fstat(capture.fileno()).st_size
-            capture.seek(0)
-            while remaining:
-                chunk = capture.read(min(65536, remaining))
-                if not chunk:
+    received_signal = None
+
+    def stopped(signum, _frame):
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = signum
+
+    previous_handlers = {}
+    try:
+        # Handle a stop that arrives while Popen is launching the new session.
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous_handlers[sig] = signal.signal(sig, stopped)
+        if received_signal is not None:
+            return 128 + received_signal
+
+        # Files let the wrapper return even if a killed child is stuck in I/O.
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                process = subprocess.Popen(command, start_new_session=True, stdout=stdout, stderr=stderr)
+            except OSError as exc:
+                if received_signal is not None:
+                    return 128 + received_signal
+                print(f"cannot start {command[0]}: {exc}", file=sys.stderr)
+                return 127 if isinstance(exc, FileNotFoundError) else 126
+
+            def stop_group(grace_deadline):
+                # Keep the leader unreaped until after SIGKILL so its PID cannot
+                # be reused while a descendant is still in the group.
+                while not child_exited_unreaped(process):
+                    remaining = grace_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.1, remaining))
+                signal_group(process.pid, signal.SIGKILL)
+
+            def wait_after_kill():
+                deadline = time.monotonic() + 1
+                while not child_exited_unreaped(process) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+
+            deadline = time.monotonic() + seconds
+            while received_signal is None and not child_exited_unreaped(process):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                stream.write(chunk)
-                remaining -= len(chunk)
-            stream.flush()
-        return code
+                time.sleep(min(0.1, remaining))
+
+            timed_out = killed = False
+            if received_signal is None and not child_exited_unreaped(process):
+                # The timeout still gives the whole group the full grace period,
+                # even if its leader exits. A stop signal can interrupt that wait.
+                timed_out = True
+                signal_group(process.pid, signal.SIGTERM)
+                deadline = time.monotonic() + KILL_GRACE_SECONDS
+                while received_signal is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.1, remaining))
+                if received_signal is not None:
+                    stop_group(deadline)
+                else:
+                    signal_group(process.pid, signal.SIGKILL)
+                killed = True
+            elif received_signal is not None:
+                signal_group(process.pid, signal.SIGTERM)
+                stop_group(time.monotonic() + KILL_GRACE_SECONDS)
+                killed = True
+
+            if killed:
+                wait_after_kill()
+
+            # Retain the leader through replay in case a stop arrives after it
+            # exits but while a descendant is still writing to a capture.
+            try:
+                for capture, stream in ((stdout, sys.stdout.buffer), (stderr, sys.stderr.buffer)):
+                    replay_capture(capture, stream)
+            finally:
+                if received_signal is not None and not killed:
+                    signal_group(process.pid, signal.SIGTERM)
+                    stop_group(time.monotonic() + KILL_GRACE_SECONDS)
+                    wait_after_kill()
+
+            # An uninterruptible kernel wait can outlast SIGKILL.
+            code = process.wait() if child_exited_unreaped(process) else None
+            if received_signal is not None:
+                return 128 + received_signal
+            if timed_out:
+                return 124
+            return code if code >= 0 else 128 - code
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 def main():
