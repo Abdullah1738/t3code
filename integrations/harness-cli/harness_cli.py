@@ -114,7 +114,7 @@ CLAUDE_MODEL_IDS = {
 DEFAULT_TIMEOUT = 600
 CANARY_SCHEMA_VERSION = 2
 SANDBOX_SYSTEM_READ_ROOTS = ("/System", "/usr", "/bin", "/dev", "/private/etc",
-                             "/private/var/db", "/private/var/run", "/private/var/protected", "/private/var/tmp")
+                             "/private/var/db", "/private/var/run", "/private/var/protected")
 SANDBOX_EXEC_ALLOWLIST: tuple[str, ...] = ()  # The selected binary is added per invocation.
 
 
@@ -826,6 +826,14 @@ def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> di
     """Require a matching signed block in turn two and explicit empty response transformations."""
     all_blocks = [b for rec in first_turn for b in rec.get("response_thinking", [])]
     replies = [b for b in all_blocks if b.get("signature")]
+    def block_identity(block):
+        typ = block.get("type", "thinking")
+        if typ == "thinking" and block.get("signature"):
+            return (typ, block.get("thinking", ""), block["signature"])
+        if typ == "redacted_thinking" and block.get("data"):
+            return (typ, block["data"])
+        return None
+    expected = [block_identity(b) for b in all_blocks]
     matched = False
     reports = []
     observed = False
@@ -837,9 +845,9 @@ def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> di
             if isinstance(message, dict) and message.get("role") == "assistant":
                 content = message.get("content")
                 if isinstance(content, list):
-                    blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
-                    this_match = any(b.get("thinking", "") == r.get("thinking", "") and b.get("signature") == r["signature"]
-                                     for b in blocks for r in replies)
+                    blocks = [block_identity(b) for b in content if isinstance(b, dict)
+                              and b.get("type") in ("thinking", "redacted_thinking")]
+                    this_match = bool(expected and all(expected) and blocks == expected)
                     if this_match:
                         matched = True
                         transformations = rec.get("response_transformations") or []
@@ -1154,11 +1162,15 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
             raise HarnessError("Codex memory-control bootstrap failed")
         fixture_id = seed_codex_rollout(chome, work, version)
         prompt = "Reply exactly OK. This is primary probe " + uuid.uuid4().hex
-        if enable_memory:
-            def hold_primary(record):
-                if prompt in json.dumps(record.get("body")):
+        def hold_primary(record):
+            if prompt in json.dumps(record.get("body")):
+                # The disabled run needs an observation window too, or a fast answer can
+                # terminate Codex before an incorrectly enabled async pipeline starts.
+                if enable_memory:
                     wait_for_codex_fixture(chome, fixture_id)
-            recorder.hold_primary = hold_primary
+                else:
+                    time.sleep(5)
+        recorder.hold_primary = hold_primary
         for model in models:
             before = len(recorder.requests)
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",

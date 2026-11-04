@@ -657,6 +657,17 @@ class CanaryTests(FakeCliTestCase):
         self.assertEqual(result["turn1SignedBlocks"], 1)
         self.assertTrue(result["inputTransformationsEmpty"])
 
+    def test_all_thinking_blocks_must_replay_in_order(self) -> None:
+        first = [{"response_thinking": [{"type": "thinking", "thinking": "a", "signature": "one"},
+                                       {"type": "redacted_thinking", "data": "opaque"}]}]
+        def request(blocks):
+            return {"body": {"messages": [{"role": "assistant", "content": blocks}]}, "response_transformations": [[]]}
+        a = {"type": "thinking", "thinking": "a", "signature": "one"}
+        b = {"type": "redacted_thinking", "data": "opaque"}
+        self.assertFalse(hc.thinking_replay_check(first, [request([a])])["thinkingReplayed"])
+        self.assertFalse(hc.thinking_replay_check(first, [request([b, a])])["thinkingReplayed"])
+        self.assertTrue(hc.thinking_replay_check(first, [request([a, b])])["thinkingReplayed"])
+
     def test_nested_tool_input_is_not_transformation_evidence(self) -> None:
         record = {}
         hc.Recorder("http://127.0.0.1:20128", "dummy").capture_response(
