@@ -471,6 +471,13 @@ it.effect("card_update with an unchanged description returns ok and adds no even
     });
     assert.isFalse(repeat.isError, repeat.text);
     assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    const comment = { card: card.id, comment: "Same comment" };
+    const firstComment = yield* call(thread, "card_update", comment);
+    assert.isFalse(firstComment.isError, firstComment.text);
+    const beforeRepeatComment = yield* kanban.card(card.id);
+    const repeatComment = yield* call(thread, "card_update", comment);
+    assert.isFalse(repeatComment.isError, repeatComment.text);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).events, beforeRepeatComment.events);
   }).pipe(Effect.provide(layer));
 });
 

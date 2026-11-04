@@ -675,6 +675,9 @@ export const mergeLinks = (
 
 const RETRY_WINDOW_MS = 10 * 60_000;
 
+const isRetryActor = (actor: KanbanActor) =>
+  actor._tag === "thread" || actor._tag === "evaluator";
+
 const withinRetryWindow = (at: string, nowMs: number) => {
   return nowMs - Date.parse(at) <= RETRY_WINDOW_MS;
 };
@@ -686,6 +689,7 @@ export const editRepeats = (
   actor: KanbanActor,
   nowMs: number,
 ): boolean => {
+  if (!isRetryActor(actor)) return false;
   const fields = Object.entries(patch).filter(([, value]) => value !== undefined);
   if (
     fields.length === 0 ||
@@ -2381,7 +2385,7 @@ const make = Effect.gen(function* () {
     const discussion = yield* discussionOf(discussionId);
     if (
       dedupe &&
-      author._tag !== "system" &&
+      isRetryActor(author) &&
       discussion.lastSeq > 0 &&
       !blocks.some((block) => block._tag === "attachment" || block._tag === "image")
     ) {
@@ -5410,7 +5414,8 @@ const make = Effect.gen(function* () {
         yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
         // A retry of an already saved edit must not emit another event or update the card.
-        const events = patch.comment?.trim() ? yield* store.cardEvents(card.id) : [];
+        const events =
+          isRetryActor(actor) && patch.comment?.trim() ? yield* store.cardEvents(card.id) : [];
         if (editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)) return card;
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
